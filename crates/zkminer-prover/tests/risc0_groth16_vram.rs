@@ -20,8 +20,8 @@
 //! The 5080's ceiling is still po2 20. At 21 and 22 the FIRST STARK segment of a fresh worker asks for a
 //! single buffer the card cannot hold (3.46 GB with 12.8 GB in use; 14.16 GB), unrelated to the wrap.
 //! Production does not ask for more of an uncalibrated card: it proves jobs at
-//! `RISC0_DEFAULT_JOB_PO2`, 20, and its peak here is why a card under 14 GiB proves none at that size
-//! (`benchmark::RISC0_JOB_MIN_VRAM_BYTES`). Set `ZKMINER_TEST_PO2` to probe other sizes.
+//! `RISC0_DEFAULT_JOB_PO2`, 20, and its peak here is why a card under 14 GiB proves at a smaller one
+//! (`benchmark::RISC0_GPU_MEASURED_PEAK_MIB`). Set `ZKMINER_TEST_PO2` to probe other sizes.
 //!
 //! `#[ignore]`d — real GPU proofs. Run with:
 //!   ZKMINER_TEST_RISC0_SLOT=risc0:cuda:0 cargo test -p zkminer-prover --test risc0_groth16_vram \

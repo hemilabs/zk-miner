@@ -1293,8 +1293,8 @@ impl World {
     }
 
     /// The miner's config with every worker in `workers` discovered (one per card each), and risc0
-    /// job sizes for the cards in `risc0_po2` (device id, po2): a card under 14 GiB proves risc0 jobs
-    /// only with a size, from calibration or the config.
+    /// job sizes for the cards in `risc0_po2` (device id, po2): a card under 6.5 GiB proves risc0
+    /// jobs only with a size, from calibration or the config.
     fn write_config_for(
         &self,
         dir: &Path,

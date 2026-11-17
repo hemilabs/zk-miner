@@ -431,6 +431,10 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             "nothing on this host can prove a job the miner claims, so it will claim none",
         );
     }
+    #[cfg(windows)]
+    if survey.gpus.iter().any(|g| g.gpu_tag == "cuda") {
+        sysmem_fallback_check(report);
+    }
     report.say(
         Level::Info,
         "workers",
@@ -445,6 +449,55 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
              `zkminer benchmark` beforehand)",
         );
     }
+}
+
+/// What the NVIDIA driver does, under Windows, when a CUDA worker's allocation finds its card full:
+/// its CUDA - Sysmem Fallback Policy, for the programs that allocate on the card. Information, not a
+/// verdict: falling back keeps a proof going, slowly, where failing ends it at once.
+#[cfg(windows)]
+fn sysmem_fallback_check(report: &mut Report) {
+    use zkminer_prover::windows_nvapi::cuda_sysmem_fallback_policy;
+    const PROGRAMS: [&str; 3] = [
+        "zkminer-prove-risc0-cuda.exe",
+        "zkminer-prove-sp1.exe",
+        "sp1-gpu-server.exe",
+    ];
+    let what = "CUDA sysmem fallback";
+    let Some(policy) = cuda_sysmem_fallback_policy(&PROGRAMS) else {
+        report.say(
+            Level::Info,
+            what,
+            "unknown: the NVIDIA driver's settings could not be read",
+        );
+        return;
+    };
+    let own: Vec<String> = policy
+        .programs
+        .iter()
+        .filter(|(_, v)| *v != policy.global)
+        .map(|(name, v)| format!("{v} for {name}"))
+        .collect();
+    let setting = if own.is_empty() {
+        format!("{} for the workers", policy.global)
+    } else {
+        format!("{} globally, {}", policy.global, own.join(", "))
+    };
+    let detail = if policy.programs.iter().any(|(_, v)| v.falls_back()) {
+        format!(
+            "{setting}. A proof that outgrows its card (something took VRAM after it started) then \
+             moves into system memory and runs several times slower: it may still finish, or miss \
+             its deadline. \"Prefer No Sysmem Fallback\" (NVIDIA Control Panel → Manage 3D \
+             settings → CUDA - Sysmem Fallback Policy, globally or for {}) makes it fail at once, \
+             and the job is retried or released",
+            PROGRAMS.join(", ")
+        )
+    } else {
+        format!(
+            "{setting}: a proof that outgrows its card fails at once and the job is retried or \
+             released, rather than slowing down in system memory"
+        )
+    };
+    report.say(Level::Info, what, detail);
 }
 
 pub async fn run(config_path: Option<&Path>) -> Result<()> {

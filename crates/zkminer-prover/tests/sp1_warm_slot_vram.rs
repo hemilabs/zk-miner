@@ -72,7 +72,7 @@ fn our_own_device_memory_is_never_counted_as_foreign() {
 
     // The rule is now "the backend's floor must be FREE", so what this test must show is that our
     // own server's VRAM does not count against that floor. See `min_available_vram_bytes_for_backend`.
-    let needed = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1")
+    let needed = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1", None)
         .expect("sp1 must require free VRAM for this test to mean anything");
 
     // What the card holds for others before the proof: a display (1.3 GB of a desktop's RTX 5090

@@ -1698,7 +1698,8 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
 /// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
 /// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
-/// measured question, which keeps 12 GB cards out by default until their peaks are measured.
+/// measured question, answered for 12-16 GB cards from an RTX 4070's peaks (2026-11-16); it also
+/// refuses a card of 11 GiB or less, which passes this decimal floor but not the server's.
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
         "sp1" => Some(11_000_000_000),
@@ -1730,18 +1731,22 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// held by a display still has 18 GiB free — plenty for the lower tier — and a 512 MiB allowance
 /// refused it outright. Requiring the FLOOR to be free instead admits that card and leaves the sizing
 /// to [`sp1_element_threshold_for_available_vram`], which steps the tier down to match. The floor
-/// itself is the smaller tier's measured peak plus margin — 15,604 MiB — so a card that clears the
-/// floor has room for the configuration it will actually be given.
+/// itself is the smaller tier's measured peak plus margin — 15,604 MiB on a card above 16 GiB, 9,167
+/// MiB on one of 16 GiB or less, whose server runs leaner — so a card that clears the floor has room
+/// for the configuration it will actually be given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
 /// (`benchmark::risc0_job_po2`), and one too small for any proves none.
-pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
+///
+/// `total` is the card's capacity, which picks SP1's measured table (a 16 GB card's server runs
+/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown.
+pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -> Option<u64> {
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and
         // the tier the worker will actually be given cannot disagree about whether a card is usable.
         // They did in the first draft: a 16e9 floor admitted cards the tier function had no
         // configuration for.
-        "sp1" => zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
+        "sp1" => zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total),
         _ => return None,
     };
     match std::env::var(MIN_AVAILABLE_VRAM_MB_ENV) {
@@ -1769,11 +1774,11 @@ pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
 /// Delegates to the shared arithmetic in `zkminer-prover-protocol` so the dispatcher and the worker
 /// that actually applies it cannot drift apart: the dispatcher uses this to notice that a live worker
 /// is sized for more VRAM than is now free, and the worker uses the same function to size itself.
-pub fn vram_sizing_tier(backend: &str, available: u64) -> Option<u64> {
+pub fn vram_sizing_tier(backend: &str, available: u64, total: Option<u64>) -> Option<u64> {
     match backend {
-        "sp1" => {
-            zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(available)
-        }
+        "sp1" => zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+            available, total,
+        ),
         // risc0 and openvm size per segment from `po2`, which the dispatcher clamps per run in
         // `calibrate_slot_po2`; there is no spawn-time tier to go stale.
         _ => None,
@@ -1790,9 +1795,9 @@ pub fn vram_sizing_tier(backend: &str, available: u64) -> Option<u64> {
 /// beside one that leaves too little kills the worker part-way through a claimed job — unless the
 /// backend's floor cannot be reached even then, in which case nothing is recycled and the floor
 /// refuses (see `room_needed`).
-pub fn vram_required_for_tier(backend: &str, tier: u64) -> Option<u64> {
+pub fn vram_required_for_tier(backend: &str, tier: u64, total: Option<u64>) -> Option<u64> {
     match backend {
-        "sp1" => zkminer_prover_protocol::types::sp1_vram_required_for_threshold(tier),
+        "sp1" => zkminer_prover_protocol::types::sp1_vram_required_for_threshold(tier, total),
         // No spawn-time tier, so no figure: risc0's need depends on the segment size of the job in
         // hand, and nothing here has measured it per po2 yet. Unknown, so all the room is made.
         _ => None,

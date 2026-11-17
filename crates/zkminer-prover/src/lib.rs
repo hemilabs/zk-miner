@@ -11,6 +11,8 @@ mod windows_gpu_memory;
 #[cfg(windows)]
 mod windows_job;
 #[cfg(windows)]
+pub mod windows_nvapi;
+#[cfg(windows)]
 pub mod windows_telemetry;
 pub mod worker;
 

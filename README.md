@@ -350,11 +350,14 @@ Worth knowing:
   found (with the directories searched) or isn't executable, a card the build has no GPU code
   for, too little VRAM. The ones that need attention also go to the dashboard's activity log.
   `zkminer doctor` prints the same table on demand, with the config, chain, gas and stake
-  checks, and starts nothing. Cards with 12 GB are the common case: SP1 work needs about
-  15.2 GiB of VRAM free (`ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, untested: 12 GB cards
-  have proved small SP1 jobs, but a larger job can run out part-way and lose its lock), and
-  RISC Zero gives a card under 14 GiB no segment size until `zkminer benchmark --calibrate`
-  measures one or you set one (`[prover.risc0_job_po2]`, below; untested on such cards).
+  checks, and starts nothing.
+- **12 GB NVIDIA cards prove both zkVMs** (measured on an RTX 4070). SP1 runs at its larger
+  shard size when about 11.6 GiB of the card is free, which an idle 12 GB card has, and at the
+  smaller one (about 20% slower) from 9 GiB, so a card driving a display steps down by itself; on cards
+  above 16 GB it needs 15.2 GiB free. RISC Zero proves at po2 19 on a 12 GB card, 20 from 14
+  GiB. Under Windows, a proof that outgrows the card doesn't fail: the driver moves part of it
+  into system memory and it runs several times slower, which can cost a lock, so leave the card
+  the room these figures say.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
@@ -368,11 +371,13 @@ Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
   or a po2 under Settings → Advanced, which applies for the session while Advanced mode is on.
   The config is read when the miner starts. The log lists each card's size whenever it changes,
   and names a configured card that isn't here;
-- else po2 20, or none for a card with less than 14 GiB of VRAM (po2 20 peaks around 12.1 GiB).
+- else the largest measured size that fits the card with 1.9 GiB to spare: 20 from 14 GiB of
+  VRAM (po2 20 peaks around 12.1 GiB), 19 from 9.8 GiB (8.0 GiB), 18 from 6.5 GiB (4.6 GiB),
+  and none below that.
   A card whose VRAM isn't known gets 20: an Intel card, a CUDA query that failed, or the card
   behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card);
 - `benchmark --calibrate` proves a 62M-cycle Groth16 job at each size, on a card whose VRAM
-  is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with the miner
+  is known (NVIDIA; an AMD card under 6.5 GiB needs a size set for it). Run it with the miner
   stopped. A card then uses its fastest size,
   up to one step below the largest that proved when a larger one failed (or at 22, past which
   the prover refuses). Calibration can raise a card above 20, or give a smaller card a size, but

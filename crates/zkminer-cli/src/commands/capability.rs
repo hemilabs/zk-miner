@@ -121,19 +121,28 @@ fn running_verdict(
                     }
                 )),
                 None => Verdict::Idle(format!(
-                    "no segment size for a card under {:.0} GiB, so it proves no RISC Zero job. \
+                    "no segment size for a card under {:.1} GiB, so it proves no RISC Zero job. \
                      Run `zkminer benchmark --calibrate` with the miner stopped to measure one, or \
-                     set one (`[prover.risc0_job_po2]` {device} = 19; untested on cards this \
+                     set one (`[prover.risc0_job_po2]` {device} = 18; untested on cards this \
                      size).",
                     zkminer_prover::benchmark::RISC0_JOB_MIN_VRAM_BYTES as f64 / GIB
                 )),
             }
         }
         BACKEND_SP1 => {
-            let floor =
-                zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1);
+            let floor = zkminer_prover::discovery::min_available_vram_bytes_for_backend(
+                BACKEND_SP1,
+                slot.vram_bytes,
+            );
             // What SP1's smallest measured configuration needs free, whatever the override.
-            let measured = zkminer_prover_protocol::types::sp1_min_available_vram_bytes();
+            let measured =
+                zkminer_prover_protocol::types::sp1_min_available_vram_bytes(slot.vram_bytes);
+            if measured == u64::MAX {
+                return Verdict::Idle(
+                    "SP1's GPU server refuses cards of 11 GiB or less, so it gets no SP1 work"
+                        .to_string(),
+                );
+            }
             let small = slot.vram_bytes.is_some_and(|v| v < measured);
             if !free_vram_checked(&slot.gpu_tag, slot.vram_bytes.is_some()) {
                 // The dispatcher cannot read this card's occupancy, so its free-VRAM gate lets
@@ -362,17 +371,19 @@ mod tests {
             .verdict
     }
 
-    /// A 24 GiB card proves both; a 12 GiB card runs both workers and proves neither, and says why
-    /// and what to change.
+    /// A 24 GiB card proves both; a 12 GiB card proves both at the sizes measured on an RTX 4070; a
+    /// 6 GiB card runs both workers and proves neither, and says why and what to change.
     #[test]
-    fn a_12_gib_card_says_why_it_proves_nothing() {
+    fn a_card_too_small_says_why_it_proves_nothing() {
         let survey = WorkerSurvey {
-            gpus: vec![gpu(0, "RTX 4090"), gpu(1, "RTX 4070")],
+            gpus: vec![gpu(0, "RTX 4090"), gpu(1, "RTX 4070"), gpu(2, "RTX 2060")],
             slots: vec![
                 slot(BACKEND_RISC0, 0, 24, SlotOutcome::Started),
                 slot(BACKEND_SP1, 0, 24, SlotOutcome::Started),
                 slot(BACKEND_RISC0, 1, 12, SlotOutcome::Started),
                 slot(BACKEND_SP1, 1, 12, SlotOutcome::Started),
+                slot(BACKEND_RISC0, 2, 6, SlotOutcome::Started),
+                slot(BACKEND_SP1, 2, 6, SlotOutcome::Started),
             ],
             searched: vec![],
         };
@@ -387,21 +398,29 @@ mod tests {
             &Verdict::Ready("segment size 2^20".into())
         );
         assert!(verdict(&rows, "GPU 0", "SP1").is_ready());
-        let Verdict::Idle(why) = verdict(&rows, "GPU 1", "RISC Zero") else {
-            panic!("{rows:#?}")
-        };
-        assert!(why.contains("gpu1 = 19"), "{why}");
-        let Verdict::Idle(why) = verdict(&rows, "GPU 1", "SP1") else {
-            panic!("{rows:#?}")
-        };
-        assert!(why.contains("ZKMINER_MIN_AVAILABLE_VRAM_MB"), "{why}");
-        assert!(anything_proves(&rows));
-        // A size set for the card makes RISC Zero prove there.
-        let sizes = HashMap::from([("gpu1".to_string(), 19u8)]);
-        let rows = super::rows(&survey, &[BACKEND_RISC0, BACKEND_SP1], &sizes, None);
         assert_eq!(
             verdict(&rows, "GPU 1", "RISC Zero"),
-            &Verdict::Ready("segment size 2^19 (set in the config)".into())
+            &Verdict::Ready("segment size 2^19".into())
+        );
+        assert_eq!(
+            verdict(&rows, "GPU 1", "SP1"),
+            &Verdict::Ready("when 9.0 GiB of its VRAM is free".into())
+        );
+        let Verdict::Idle(why) = verdict(&rows, "GPU 2", "RISC Zero") else {
+            panic!("{rows:#?}")
+        };
+        assert!(why.contains("gpu2 = 18"), "{why}");
+        let Verdict::Idle(why) = verdict(&rows, "GPU 2", "SP1") else {
+            panic!("{rows:#?}")
+        };
+        assert!(why.contains("11 GiB or less"), "{why}");
+        assert!(anything_proves(&rows));
+        // A size set for the card makes RISC Zero prove there.
+        let sizes = HashMap::from([("gpu2".to_string(), 18u8)]);
+        let rows = super::rows(&survey, &[BACKEND_RISC0, BACKEND_SP1], &sizes, None);
+        assert_eq!(
+            verdict(&rows, "GPU 2", "RISC Zero"),
+            &Verdict::Ready("segment size 2^18 (set in the config)".into())
         );
     }
 
