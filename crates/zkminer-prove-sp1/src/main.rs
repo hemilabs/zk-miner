@@ -468,6 +468,8 @@ fn main() {
                     "cannot start sp1-gpu-server through its confinement ({e}): this worker will \
                      start no server"
                 );
+                // So the handshake declines SP1 (`sp1_usability`), before any job is claimed.
+                let _ = SERVER_ROUTE_FAILURE.set(e);
             }
         }
     }
@@ -686,6 +688,22 @@ fn server_needs_no_download() -> std::result::Result<(), String> {
             server.display(),
             stdout.trim()
         )),
+        // And it must share memory through descriptors (`SERVER_CAPABILITY`), checked again here,
+        // with a full budget, for a handshake that could not tell: unsettled is a no here.
+        #[cfg(target_os = "linux")]
+        _ => match server_capability(&server, PROBE_TIMEOUT) {
+            Capability::Present => Ok(()),
+            Capability::Absent(why) => Err(format!(
+                "{}: {why}",
+                zkminer_prover_protocol::types::WORKER_DECLINED
+            )),
+            Capability::Unknown(why) => Err(format!(
+                "could not tell whether {} shares memory through descriptors ({why}), so this \
+                 worker starts no server",
+                server.display()
+            )),
+        },
+        #[cfg(not(target_os = "linux"))]
         _ => Ok(()),
     }
 }
@@ -1276,7 +1294,15 @@ fn sp1_measure_only() -> bool {
         == Some("1")
 }
 
+/// Why this worker cannot start its server through the confining shim, if it cannot
+/// (`confinement::route_server_through_shim`, at startup): such a worker proves nothing, so its
+/// handshake declines SP1.
+static SERVER_ROUTE_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn sp1_usability() -> Result<(), String> {
+    if let Some(e) = SERVER_ROUTE_FAILURE.get() {
+        return Err(format!("sp1-gpu-server cannot be started confined: {e}"));
+    }
     // The SDK does `env::var("HOME").expect(...)` to locate the server (hemilabs/sp1 falls back to
     // USERPROFILE, which is all Windows sets), so an unset HOME is a panic rather than an error.
     // Systemd units routinely have no HOME.
@@ -1289,6 +1315,12 @@ fn sp1_usability() -> Result<(), String> {
             )
         }
     };
+
+    // The server this release ships beside the worker could not be installed: what runs instead is
+    // not the one this worker was built with (see `bundled_server::install_failure`).
+    if let Some(failure) = bundled_server::install_failure() {
+        return Err(failure.to_string());
+    }
 
     // SP1 here is CUDA-only: `.cuda()` is unconditional, there is no CPU path. With no
     // NVIDIA GPU at all, nothing this worker advertises can ever be proved.
@@ -1344,8 +1376,34 @@ fn sp1_usability() -> Result<(), String> {
     // What does NOT self-heal is a loader failure: the asset is pinned to the SDK's own
     // version, so a re-download reproduces the same libcudart.so.12 ABI gap. That, and a
     // binary that cannot be exec'd at all, is the only case worth declining.
+    let probed = Instant::now();
     match probe_server_version(&server, PROBE_TIMEOUT) {
-        Outcome::Ran { success: true, .. } => Ok(()),
+        // It runs. Then what it can do: see `server_capability`. Only here, where `--version` came
+        // back, so the two probes fit the handshake: the second has what is left of the first's
+        // budget, and at least a second (the binary is in the page cache by now).
+        #[cfg(target_os = "linux")]
+        Outcome::Ran { success: true, .. } => {
+            let timeout = PROBE_TIMEOUT
+                .saturating_sub(probed.elapsed())
+                .max(Duration::from_secs(1));
+            match server_capability(&server, timeout) {
+                Capability::Present => Ok(()),
+                Capability::Absent(why) => Err(why),
+                Capability::Unknown(why) => {
+                    tracing::warn!(
+                        "could not tell whether {} shares memory through descriptors ({why}); \
+                         leaving SP1 advertised, and checking again before its server starts",
+                        server.display()
+                    );
+                    Ok(())
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Outcome::Ran { success: true, .. } => {
+            let _ = probed;
+            Ok(())
+        }
         // Never came back inside the budget. The verdict stays `Ok` because this function's
         // contract is to decline only what provably cannot work, and a timeout is also what a
         // transiently overloaded host produces. But the warning must not pretend this is an
@@ -1424,6 +1482,68 @@ fn sp1_usability() -> Result<(), String> {
         Outcome::SpawnFailed { err, .. } => {
             Err(format!("cannot execute {}: {err}", server.display()))
         }
+    }
+}
+
+/// What a worker needs of its server, which `sp1-gpu-server --capabilities` lists: its executor
+/// shares the guest's memory and trace ring with its runner process through file descriptors, never
+/// names in `/dev/shm`. The confinement gives no SP1 process `/dev/shm`, so a server without it
+/// fails every proof, after the job is claimed. A server built before the flag reports the same
+/// `--version` and refuses `--capabilities`.
+const SERVER_CAPABILITY: &str = "fd-shared-memory";
+
+/// Whether the server has [`SERVER_CAPABILITY`].
+#[derive(Debug, PartialEq)]
+enum Capability {
+    Present,
+    /// It answered without it, or refused the flag: why, to decline with.
+    Absent(String),
+    /// The probe did not settle it (it timed out, or could not run just now): why.
+    Unknown(String),
+}
+
+/// Runs `server --capabilities`, bounded by `timeout`, and looks for [`SERVER_CAPABILITY`].
+#[cfg(target_os = "linux")]
+fn server_capability(server: &std::path::Path, timeout: Duration) -> Capability {
+    let (outcome, stdout) = proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new(server).arg("--capabilities"),
+        timeout,
+        PROBE_STDERR_CAP,
+    );
+    capability_of(server, outcome, &stdout)
+}
+
+/// [`server_capability`]'s verdict on what the probe gave.
+fn capability_of(server: &std::path::Path, outcome: Outcome, stdout: &str) -> Capability {
+    let lacks = |detail: String| {
+        Capability::Absent(format!(
+            "{} cannot share memory with its executor's runner except through /dev/shm, which no \
+             confined SP1 process may reach: {detail}. Install the sp1-gpu-server this release \
+             ships",
+            server.display()
+        ))
+    };
+    match outcome {
+        Outcome::Ran { success: true, .. } => {
+            if stdout.lines().any(|line| line.trim() == SERVER_CAPABILITY) {
+                Capability::Present
+            } else {
+                lacks(format!(
+                    "its --capabilities do not include {SERVER_CAPABILITY}"
+                ))
+            }
+        }
+        Outcome::Ran { stderr, .. } => lacks(format!(
+            "it is older than --capabilities ({})",
+            stderr.lines().next().unwrap_or("").trim()
+        )),
+        Outcome::SpawnFailed {
+            err,
+            transient: false,
+        } => lacks(format!("it cannot be run ({err})")),
+        Outcome::SpawnFailed { err, .. } => Capability::Unknown(err.to_string()),
+        Outcome::TimedOut { .. } => Capability::Unknown("--capabilities timed out".to_string()),
+        Outcome::Unsettled(e) => Capability::Unknown(e.to_string()),
     }
 }
 
