@@ -73,7 +73,8 @@ fn dev_miner() -> zkminer_config::ZkMinerConfig {
     let mut c = zkminer_config::ZkMinerConfig::default();
     c.chain.chain_id = 31337;
     c.dev.private_network = true;
-    c.egress.discover_public_addresses = false;
+    c.dev.chain_id = Some(31337);
+    assert_eq!(c.net_mode(), zkminer_netguard::NetMode::DevPrivate);
     c
 }
 
