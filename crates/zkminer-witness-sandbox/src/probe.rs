@@ -110,7 +110,15 @@ const COMMON_CHECKS: &[&str] = &[
     "execve",
 ];
 
-const NO_NETWORK_CHECKS: &[&str] = &["socket_inet", "socket_inet6", "tcp_connect_loopback"];
+const NO_NETWORK_CHECKS: &[&str] = &[
+    "socket_inet",
+    "socket_inet6",
+    "tcp_connect_loopback",
+    "setsockopt_refused",
+];
+
+/// The runner's and the worker's own socket checks: no socket option at all.
+const RUNNER_WORKER_SOCKET_CHECKS: &[&str] = &["setsockopt_nodelay_refused"];
 
 /// The runner's and the worker's host-metadata checks (review r1 broker F3): what an escaped
 /// builder could read about the host without opening anything.
@@ -160,6 +168,8 @@ const BROKER_CHECKS: &[&str] = &[
     "connect_syscall",
     "listen_syscall",
     "accept_syscall",
+    "setsockopt_inherited_tcp",
+    "setsockopt_nodelay_allowed",
     "reconnect_inherited_tcp",
     "fastopen_inherited_tcp",
     "tcp_bind",
@@ -172,6 +182,7 @@ const BROKER_CHECKS: &[&str] = &[
 /// Checks that something the profile *allows* still works: they pass without the sandbox too.
 pub const POSITIVE_CHECKS: &[&str] = &[
     "socketpair_unix_stream_allowed",
+    "setsockopt_nodelay_allowed",
     "read_readable",
     "write_writable",
 ];
@@ -201,7 +212,10 @@ pub fn expected_checks(kind: ProfileKind) -> Vec<&'static str> {
     v.extend_from_slice(NO_NETWORK_CHECKS);
     match kind {
         ProfileKind::Broker => v.extend_from_slice(BROKER_CHECKS),
-        _ => v.extend_from_slice(METADATA_CHECKS),
+        _ => {
+            v.extend_from_slice(RUNNER_WORKER_SOCKET_CHECKS);
+            v.extend_from_slice(METADATA_CHECKS);
+        }
     }
     v
 }
@@ -930,6 +944,7 @@ fn run_checks(a: &ProbeArgs) -> i32 {
     if is_broker {
         broker_checks(a, conn_sock, &mut out);
     } else {
+        runner_worker_socket_checks(&mut out);
         metadata_checks(root_dir, &mut out);
     }
     close(unix_sock);
@@ -1198,6 +1213,48 @@ fn no_network_checks(a: &ProbeArgs, inet_sock: RawFd, out: &mut Out) {
             "could not create a socket before restricting",
         ),
     }
+    // Socket options that re-route a socket at the IP layer: the filter's EPERM on fd -1 (a
+    // missing filter says EBADF) and on the TCP socket made before restricting.
+    let mut wrong = Vec::new();
+    for o in crate::REFUSED_SOCKET_OPTIONS {
+        for fd in [-1, inet_sock] {
+            match crate::set_socket_option(fd, o) {
+                Err(libc::EPERM) => {}
+                r => wrong.push(format!(
+                    "{}(fd {fd})={}",
+                    o.name,
+                    r.map(|()| "ok".to_string()).unwrap_or_else(errname)
+                )),
+            }
+        }
+    }
+    out.check(
+        "setsockopt_refused",
+        wrong.is_empty() && inet_sock >= 0,
+        if inet_sock < 0 {
+            "could not create a socket before restricting".to_string()
+        } else if wrong.is_empty() {
+            format!(
+                "all {} options EPERM on fd -1 and on a TCP socket",
+                crate::REFUSED_SOCKET_OPTIONS.len()
+            )
+        } else {
+            format!("not EPERM: {}", wrong.join(","))
+        },
+    );
+}
+
+/// The runner and the worker set no socket option at all, the broker's `TCP_NODELAY` included.
+fn runner_worker_socket_checks(out: &mut Out) {
+    let r = crate::set_socket_option(-1, &crate::BROKER_SOCKET_OPTION);
+    out.check(
+        "setsockopt_nodelay_refused",
+        r == Err(libc::EPERM),
+        format!(
+            "TCP_NODELAY on fd -1: {}",
+            r.map(|()| "ok".to_string()).unwrap_or_else(errname)
+        ),
+    );
 }
 
 /// The runner's and the worker's host metadata (see [`METADATA_CHECKS`]): each read fails with the
@@ -1570,15 +1627,50 @@ fn broker_checks(a: &ProbeArgs, conn_sock: RawFd, out: &mut Out) {
     out.result("accept_syscall", denied(r, e, &[libc::EPERM]));
 
     // A connected TCP socket like the ones the connector hands over: it cannot be disconnected
-    // (`connect(AF_UNSPEC)`) and aimed elsewhere, nor re-aimed by TCP Fast Open.
+    // (`connect(AF_UNSPEC)`) and aimed elsewhere, nor re-aimed by TCP Fast Open, nor re-routed by
+    // a socket option; `TCP_NODELAY` is the one option the broker sets.
     if conn_sock < 0 {
         let why = match a.listen_port {
             None => missing("--listen-port"),
             Some(p) => format!("could not connect to 127.0.0.1:{p} before restricting"),
         };
+        out.check("setsockopt_inherited_tcp", false, why.clone());
+        out.check("setsockopt_nodelay_allowed", false, why.clone());
         out.check("reconnect_inherited_tcp", false, why.clone());
         out.check("fastopen_inherited_tcp", false, why);
     } else {
+        let wrong: Vec<String> = crate::REFUSED_SOCKET_OPTIONS
+            .iter()
+            .filter_map(|o| match crate::set_socket_option(conn_sock, o) {
+                Err(libc::EPERM) => None,
+                r => Some(format!(
+                    "{}={}",
+                    o.name,
+                    r.map(|()| "ok".to_string()).unwrap_or_else(errname)
+                )),
+            })
+            .collect();
+        out.check(
+            "setsockopt_inherited_tcp",
+            wrong.is_empty(),
+            if wrong.is_empty() {
+                format!(
+                    "all {} options EPERM on the connected socket",
+                    crate::REFUSED_SOCKET_OPTIONS.len()
+                )
+            } else {
+                format!("not EPERM: {}", wrong.join(","))
+            },
+        );
+        let r = crate::set_socket_option(conn_sock, &crate::BROKER_SOCKET_OPTION);
+        out.check(
+            "setsockopt_nodelay_allowed",
+            r.is_ok(),
+            format!(
+                "TCP_NODELAY: {}",
+                r.map(|()| "ok".to_string()).unwrap_or_else(errname)
+            ),
+        );
         // SAFETY: an all-zero sockaddr with family AF_UNSPEC.
         let mut unspec: libc::sockaddr = unsafe { std::mem::zeroed() };
         unspec.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
@@ -1911,6 +2003,11 @@ mod tests {
             assert!(broker.contains(&c) && !runner.contains(&c) || c == "tcp_connect_loopback", "{c}");
         }
         assert!(runner.contains(&"listmount") && !broker.contains(&"listmount"));
+        assert!(runner.contains(&"setsockopt_refused") && broker.contains(&"setsockopt_refused"));
+        assert!(runner.contains(&"setsockopt_nodelay_refused") && !broker.contains(&"setsockopt_nodelay_refused"));
+        for c in ["setsockopt_inherited_tcp", "setsockopt_nodelay_allowed"] {
+            assert!(broker.contains(&c) && !runner.contains(&c), "{c}");
+        }
         assert!(runner.contains(&"getsid_parent") && broker.contains(&"getsid_parent"));
         for c in ["uname", "sysinfo", "statx_enosys", "chdir", "cwd_root"] {
             assert!(runner.contains(&c) && !broker.contains(&c), "{c}");

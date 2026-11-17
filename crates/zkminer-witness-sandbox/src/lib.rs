@@ -15,9 +15,10 @@
 //! - the **child side** (the sandboxed binary itself, at startup, before it starts threads or reads
 //!   any untrusted input): [`restrict_self`] applies Landlock (no filesystem access, no TCP
 //!   bind/connect, scoped signals and abstract Unix sockets), a seccomp denylist (no `socket`,
-//!   `connect`, `bind`, `listen` or `accept*` for any profile; SysV IPC; metadata writes through
-//!   inherited fds; for the runner and the worker, host metadata), `NO_NEW_PRIVS`,
-//!   `PR_SET_DUMPABLE(0)` (locked) and `RLIMIT_CORE=0`. The broker, whose only socket calls are
+//!   `connect`, `bind`, `listen` or `accept*` for any profile; no socket option but the broker's
+//!   `TCP_NODELAY`; SysV IPC; metadata writes through inherited fds; for the runner and the
+//!   worker, host metadata), `NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)` (locked) and `RLIMIT_CORE=0`.
+//!   The broker, whose only socket calls are
 //!   `socketpair(AF_UNIX, SOCK_STREAM)` for its runtime, then calls [`seal_socket_creation`] once
 //!   its runtime is up. Its network connections are made for it by the miner's connector.
 //!
@@ -55,7 +56,10 @@ mod spawn;
 pub mod supervise;
 
 pub use cgroup::{delegated_root, Cgroup};
-pub use restrict::{landlock_abi, restrict_self, seal_socket_creation, MIN_LANDLOCK_ABI};
+pub use restrict::{
+    landlock_abi, restrict_self, seal_socket_creation, set_socket_option, SocketOption, BROKER_SOCKET_OPTION,
+    MIN_LANDLOCK_ABI, REFUSED_SOCKET_OPTIONS,
+};
 pub use selftest::{self_test, self_test_profile};
 pub use spawn::prepare_command;
 
@@ -81,7 +85,8 @@ pub enum Profile {
     /// `bind`, `listen` and `accept*` are denied outright, as for the runner and the worker, and
     /// Landlock handles TCP bind and connect with no rule. It keeps the fds it was started with:
     /// its control socket (fd 3) and its socket to the miner's connector (fd 4), which hands it
-    /// already-connected TCP sockets to the operator's endpoints by `SCM_RIGHTS`. Its only way to
+    /// already-connected TCP sockets to the operator's endpoints by `SCM_RIGHTS`, on which it may
+    /// set `TCP_NODELAY` and no other option ([`REFUSED_SOCKET_OPTIONS`]). Its only way to
     /// make a socket is `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected pair reaches nothing;
     /// tokio's signal driver makes one when the runtime starts), which
     /// [`seal_socket_creation`] then denies too. Every listed path must exist when

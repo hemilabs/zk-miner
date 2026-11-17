@@ -91,12 +91,19 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 ///    (`listmount`/`statmount`), the LSMs (`lsm_list_modules`, `lsm_get_self_attr`), `ustat` and
 ///    `sysfs`, and `statx` fails with `ENOSYS` (std and glibc fall back to `fstat`/`newfstatat`,
 ///    which stay: a path's existence, size, owner and times remain readable without a mount
-///    namespace). The broker additionally may `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected
+///    namespace). Runner and worker also set no socket option (`setsockopt`). The broker
+///    additionally may `socketpair(AF_UNIX, SOCK_STREAM, ..)` (a connected
 ///    stream pair reaches nothing; tokio's signal driver needs one; a datagram pair could `sendto`
 ///    any pathname socket, which Landlock ABI 8 cannot restrict) until it calls
 ///    [`seal_socket_creation`], and open files (which Landlock confines). It has no `socket` and
 ///    no `connect`: its TCP connections come from the miner's connector, already connected, and
-///    without `connect` it cannot disconnect one (`connect(AF_UNSPEC)`) to aim it elsewhere.
+///    without `connect` it cannot disconnect one (`connect(AF_UNSPEC)`) to aim it elsewhere. Its
+///    only socket option is `setsockopt(IPPROTO_TCP, TCP_NODELAY)`; every other level and option
+///    fails with `EPERM`, so it cannot re-route a connected socket at the IP layer either (an IPv6
+///    routing header, IPv4 source routing, binding it to an interface, a next hop, a mark, a TTL:
+///    [`REFUSED_SOCKET_OPTIONS`]). Ancillary data on `sendmsg` cannot do it instead: TCP ignores
+///    `IPPROTO_IP`/`IPPROTO_IPV6` control messages, and the one `SOL_SOCKET` message that steers
+///    routing (`SO_MARK`) needs `CAP_NET_ADMIN`.
 /// 4. Verification: `PR_GET_SECCOMP == 2`, `PR_GET_NO_NEW_PRIVS == 1`, `PR_GET_DUMPABLE == 0`,
 ///    `RLIMIT_CORE == 0`.
 ///
@@ -472,6 +479,95 @@ fn socketpair() -> Vec<Denied> {
     vec![d("socketpair", libc::SYS_socketpair)]
 }
 
+/// `setsockopt`: denied to the runner and the worker (they set no option on anything; a socket
+/// that reached one could otherwise be re-routed with it); argument-filtered for the broker
+/// (`IPPROTO_TCP`/`TCP_NODELAY` only, see [`conditional_denials`]).
+fn socket_options() -> Vec<Denied> {
+    vec![d("setsockopt", libc::SYS_setsockopt)]
+}
+
+/// A socket option as the self-tests and the escape tests try it: level, name, and a value that
+/// would take effect if nothing refused it.
+#[derive(Debug, Clone, Copy)]
+pub struct SocketOption {
+    pub name: &'static str,
+    pub level: libc::c_int,
+    pub option: libc::c_int,
+    pub value: &'static [u8],
+}
+
+const fn ne_int(v: i32) -> [u8; 4] {
+    v.to_ne_bytes()
+}
+
+const ONE: [u8; 4] = ne_int(1);
+/// `struct ip_options` source route: NOP, LSRR (length 7, pointer 4) through 127.0.0.1.
+const LSRR_VIA_LOOPBACK: [u8; 8] = [1, 0x83, 7, 4, 127, 0, 0, 1];
+/// An IPv6 type-2 routing header (8 bytes and one address, `::1`): the kernel sends the
+/// segments to the address in the header.
+const RTHDR_TYPE2_LOOPBACK: [u8; 24] = [0, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+/// A `sockaddr_in6` for `::1`, port 0.
+const SOCKADDR_IN6_LOOPBACK: [u8; 28] = {
+    let mut a = [0u8; 28];
+    let fam = (libc::AF_INET6 as u16).to_ne_bytes();
+    a[0] = fam[0];
+    a[1] = fam[1];
+    a[23] = 1;
+    a
+};
+
+/// Socket options that send a connected socket's packets somewhere other than its peer, out
+/// another interface, through another route, under a firewall mark, or past the network's
+/// expectations (a TTL, a priority): every sandbox profile refuses each with `EPERM` (the broker
+/// sets only `IPPROTO_TCP`/`TCP_NODELAY`, the runner and the worker nothing). Unprivileged on
+/// Linux: `IPV6_RTHDR` (type 2), `SO_BINDTODEVICE` on an unbound socket, `IP_UNICAST_IF`,
+/// `IPV6_UNICAST_IF`, `IPV6_NEXTHOP`, the TTLs; the others need a capability the sandboxes do not
+/// have.
+pub const REFUSED_SOCKET_OPTIONS: &[SocketOption] = &[
+    SocketOption { name: "IPV6_RTHDR", level: libc::IPPROTO_IPV6, option: libc::IPV6_RTHDR, value: &RTHDR_TYPE2_LOOPBACK },
+    SocketOption {
+        name: "IPV6_2292RTHDR",
+        level: libc::IPPROTO_IPV6,
+        option: libc::IPV6_2292RTHDR,
+        value: &RTHDR_TYPE2_LOOPBACK,
+    },
+    SocketOption { name: "IP_OPTIONS", level: libc::IPPROTO_IP, option: libc::IP_OPTIONS, value: &LSRR_VIA_LOOPBACK },
+    SocketOption { name: "SO_BINDTODEVICE", level: libc::SOL_SOCKET, option: libc::SO_BINDTODEVICE, value: b"lo\0" },
+    SocketOption { name: "SO_BINDTOIFINDEX", level: libc::SOL_SOCKET, option: libc::SO_BINDTOIFINDEX, value: &ONE },
+    // The interface index in network byte order.
+    SocketOption { name: "IP_UNICAST_IF", level: libc::IPPROTO_IP, option: libc::IP_UNICAST_IF, value: &[0, 0, 0, 1] },
+    SocketOption { name: "IPV6_UNICAST_IF", level: libc::IPPROTO_IPV6, option: libc::IPV6_UNICAST_IF, value: &ONE },
+    SocketOption {
+        name: "IPV6_NEXTHOP",
+        level: libc::IPPROTO_IPV6,
+        option: libc::IPV6_NEXTHOP,
+        value: &SOCKADDR_IN6_LOOPBACK,
+    },
+    SocketOption { name: "IP_TRANSPARENT", level: libc::IPPROTO_IP, option: libc::IP_TRANSPARENT, value: &ONE },
+    SocketOption { name: "SO_MARK", level: libc::SOL_SOCKET, option: libc::SO_MARK, value: &ONE },
+    SocketOption { name: "SO_DONTROUTE", level: libc::SOL_SOCKET, option: libc::SO_DONTROUTE, value: &ONE },
+    SocketOption { name: "SO_PRIORITY", level: libc::SOL_SOCKET, option: libc::SO_PRIORITY, value: &ONE },
+    SocketOption { name: "IP_TTL", level: libc::IPPROTO_IP, option: libc::IP_TTL, value: &ONE },
+    SocketOption { name: "IPV6_UNICAST_HOPS", level: libc::IPPROTO_IPV6, option: libc::IPV6_UNICAST_HOPS, value: &ONE },
+    SocketOption { name: "TCP_ULP", level: libc::IPPROTO_TCP, option: libc::TCP_ULP, value: b"tls\0" },
+    SocketOption { name: "TCP_MAXSEG", level: libc::IPPROTO_TCP, option: libc::TCP_MAXSEG, value: &ne_int(536) },
+];
+
+/// The one socket option the broker may set (on the sockets the connector hands it).
+pub const BROKER_SOCKET_OPTION: SocketOption =
+    SocketOption { name: "TCP_NODELAY", level: libc::IPPROTO_TCP, option: libc::TCP_NODELAY, value: &ONE };
+
+/// `setsockopt(fd, o.level, o.option, o.value)`: `Ok(())` or the errno.
+pub fn set_socket_option(fd: std::os::fd::RawFd, o: &SocketOption) -> Result<(), i32> {
+    // SAFETY: `o.value` is a valid buffer of its stated length; the kernel only reads it.
+    let r = unsafe { libc::setsockopt(fd, o.level, o.option, o.value.as_ptr().cast(), o.value.len() as libc::socklen_t) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+}
+
 /// Denied for every profile.
 fn always_denied() -> Vec<Denied> {
     use libc::*;
@@ -613,6 +709,7 @@ pub(crate) fn denied_syscalls(profile: &Profile) -> Vec<Denied> {
     if !matches!(profile, Profile::Broker { .. }) {
         v.extend(path_opens());
         v.extend(socketpair());
+        v.extend(socket_options());
         v.extend(host_metadata());
     }
     v
@@ -738,6 +835,19 @@ fn conditional_denials(profile: &Profile) -> Result<Vec<(i64, Vec<SeccompRule>)>
         let mut pair_rules = vec![rule(vec![cond(0, Dword, Ne, libc::AF_UNIX as u64)?])?];
         pair_rules.extend(non_stream_types(1)?);
         v.push((libc::SYS_socketpair, pair_rules));
+        // A handed socket's peer is fixed by the connector's `connect`, but socket options
+        // re-route it at the IP layer without one: an IPv6 type-2 routing header (unprivileged)
+        // sends later segments to the address it names, `SO_BINDTODEVICE` picks the interface,
+        // `IP_UNICAST_IF`/`IPV6_NEXTHOP` the way out. The broker's only call is
+        // `set_nodelay` (net.rs), so every other level and option fails: `level != IPPROTO_TCP`
+        // or `optname != TCP_NODELAY` (both `int`s).
+        v.push((
+            libc::SYS_setsockopt,
+            vec![
+                rule(vec![cond(1, Dword, Ne, libc::IPPROTO_TCP as u64)?])?,
+                rule(vec![cond(2, Dword, Ne, libc::TCP_NODELAY as u64)?])?,
+            ],
+        ));
     }
     Ok(v)
 }
@@ -1464,6 +1574,58 @@ mod tests {
             assert_eq!(call(&b, nr, [3, 0x1000, 16, 0, 0, 0]), ERRNO_EPERM, "broker {nr}");
             assert_eq!(call(&runner, nr, [3, 0x1000, 16, 0, 0, 0]), ERRNO_EPERM, "runner {nr}");
         }
+    }
+
+    /// The broker sets `IPPROTO_TCP`/`TCP_NODELAY` and nothing else; the runner and the worker set
+    /// no socket option at all, before or after the broker's seal.
+    #[test]
+    fn socket_options_per_profile() {
+        use libc::*;
+        let u = |v: c_int| v as u64;
+        let b = seccomp_filters(&broker()).unwrap();
+        let mut sealed = b.clone();
+        sealed.push(sealed_sockets_filter().unwrap());
+        let nodelay = [5, u(IPPROTO_TCP), u(TCP_NODELAY), 0x1000, 4, 0];
+        for f in [&b, &sealed] {
+            assert_eq!(call(f, SYS_setsockopt, nodelay), ALLOW);
+            // The kernel takes `int`s: bits above them are not part of the level or the name.
+            assert_eq!(call(f, SYS_setsockopt, [5, (1 << 32) | u(IPPROTO_TCP), (7 << 32) | u(TCP_NODELAY), 0x1000, 4, 0]), ALLOW);
+            for o in REFUSED_SOCKET_OPTIONS {
+                assert_eq!(call(f, SYS_setsockopt, [5, u(o.level), u(o.option), 0x1000, 4, 0]), ERRNO_EPERM, "broker {}", o.name);
+            }
+            // TCP_NODELAY's number at another level, and other TCP options.
+            for (level, opt) in [(SOL_SOCKET, TCP_NODELAY), (IPPROTO_IP, TCP_NODELAY), (IPPROTO_IPV6, TCP_NODELAY), (SOL_TCP, TCP_KEEPIDLE), (SOL_TCP, TCP_USER_TIMEOUT), (SOL_TCP, 19 /* TCP_REPAIR */), (SOL_TCP, TCP_FASTOPEN_CONNECT), (SOL_TCP, TCP_MD5SIG), (0, 0), (-1, TCP_NODELAY)] {
+                assert_eq!(call(f, SYS_setsockopt, [5, u(level), u(opt), 0x1000, 4, 0]), ERRNO_EPERM, "broker {level}/{opt}");
+            }
+            // Reading options stays.
+            assert_eq!(call(f, SYS_getsockopt, [5, u(SOL_SOCKET), u(SO_TYPE), 0x1000, 0x2000, 0]), ALLOW);
+        }
+        for p in [Profile::BuilderRunner, Profile::ExecuteWorker] {
+            let f = seccomp_filters(&p).unwrap();
+            assert!(denied_syscalls(&p).iter().any(|s| s.name == "setsockopt"), "{p:?}");
+            assert_eq!(call(&f, SYS_setsockopt, nodelay), ERRNO_EPERM, "{p:?}");
+            for o in REFUSED_SOCKET_OPTIONS {
+                assert_eq!(call(&f, SYS_setsockopt, [5, u(o.level), u(o.option), 0x1000, 4, 0]), ERRNO_EPERM, "{p:?} {}", o.name);
+            }
+        }
+        // The list covers what the review named, and nothing in it is the broker's option.
+        for name in [
+            "IPV6_RTHDR",
+            "IPV6_2292RTHDR",
+            "IP_OPTIONS",
+            "SO_BINDTODEVICE",
+            "SO_BINDTOIFINDEX",
+            "IP_UNICAST_IF",
+            "IPV6_UNICAST_IF",
+            "IPV6_NEXTHOP",
+            "IP_TRANSPARENT",
+            "SO_MARK",
+        ] {
+            assert!(REFUSED_SOCKET_OPTIONS.iter().any(|o| o.name == name), "{name}");
+        }
+        assert!(!REFUSED_SOCKET_OPTIONS
+            .iter()
+            .any(|o| o.level == BROKER_SOCKET_OPTION.level && o.option == BROKER_SOCKET_OPTION.option));
     }
 
     /// After `seal_socket_creation` the broker cannot make even a Unix stream pair.
