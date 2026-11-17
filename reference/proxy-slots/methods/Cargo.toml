@@ -1,13 +1,13 @@
 [package]
 name = "hemiprove-proxy-slots-methods"
-description = "Builds the proxy-slots reference guest (and the lint control guest) with risc0-build, and tests them on the risc0 executor"
+description = "Builds the proxy-slots reference guest (and the lint control and host-input test guests) with risc0-build, and tests them on the risc0 executor"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
 
 [package.metadata.risc0]
-methods = ["../guest", "../lint-control"]
+methods = ["../guest", "../lint-control", "../hostdep"]
 
 [build-dependencies]
 risc0-build = "3.0"
