@@ -18,7 +18,14 @@
 //!   connect are refused by Landlock too;
 //! - **other processes**: no signal to, and no `ptrace`-class access (`/proc/<pid>/mem`, `environ`,
 //!   `fd`) to, a process outside its Landlock domain (the miner, other workers); no abstract Unix
-//!   socket of another domain. The miner can still signal it.
+//!   socket of another domain. The miner can still signal it;
+//! - **kernel surface**: no namespace and no mount, no `userfaultfd`, `perf_event_open` or file
+//!   handles (see [`crate::netdeny`]).
+//!
+//! Since Landlock does not govern the path walk (a `stat` or a lookup reaches any directory), a
+//! process confines itself only where no filesystem it can reach is a network or FUSE filesystem or
+//! an automount map ([`crate::localfs`]): it refuses before applying anything, and checks again
+//! after.
 //!
 //! Landlock is applied to every thread at once with `LANDLOCK_RESTRICT_SELF_TSYNC` (ABI 8). On an
 //! older kernel the process must still be single-threaded, or confinement fails. Everything fails
@@ -36,7 +43,7 @@ use landlock::{
 
 pub use crate::netdeny::{OpenSocket, Sockets};
 use crate::restrict::{landlock_abi, thread_count, MIN_LANDLOCK_ABI};
-use crate::{netdeny, SandboxError};
+use crate::{localfs, netdeny, SandboxError};
 
 /// The Landlock ABI with `LANDLOCK_RESTRICT_SELF_TSYNC`.
 pub const TSYNC_LANDLOCK_ABI: i32 = 8;
@@ -178,6 +185,11 @@ impl Confinement {
         &self.rules
     }
 
+    /// Every path a rule names, whatever its rights.
+    pub fn granted_paths(&self) -> Vec<PathBuf> {
+        self.rules.iter().map(|(p, _)| p.clone()).collect()
+    }
+
     /// The Landlock ruleset: every filesystem right is handled (those of ABI 6 required, later ones
     /// where the kernel has them), and granted only by the rules; TCP bind and connect are handled
     /// and never granted; signals and abstract Unix sockets are scoped to the domain. With `tsync`,
@@ -275,11 +287,16 @@ impl std::fmt::Display for ConfinementReport {
 /// its life: see the [module docs](self). Idempotent: a second call checks the open sockets again
 /// and returns the first call's report.
 ///
+/// First it refuses if a filesystem the process can reach is not local
+/// ([`localfs::check_local_filesystems`]: a network or FUSE filesystem, or an automount map, anywhere
+/// a path lookup gets to, or under a path `c` grants), before applying anything.
+///
 /// After applying it checks the result rather than the calls: `PR_GET_SECCOMP == 2`,
 /// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode, sockets of every kind refused,
-/// the root directory unreadable (Landlock is on), the parent process unreachable by signal. Then it
-/// fails if a socket the policy does not let the process keep is still open, which no filter can
-/// take back: the caller must not run a guest then.
+/// `unshare` refused and `clone3` unimplemented (no namespace), the root directory unreadable
+/// (Landlock is on), the parent process unreachable by signal, and still no filesystem in reach
+/// that is not local. Then it fails if a socket the policy does not let the process keep is still
+/// open, which no filter can take back: the caller must not run a guest then.
 ///
 /// Fails closed: on any error the caller must not run the guest. Once anything is applied it stays
 /// applied, error or not ([`is_active`]).
@@ -313,6 +330,9 @@ pub fn confine_all_threads(c: &Confinement) -> Result<ConfinementReport, Sandbox
             return Err(SandboxError::MultiThreaded { threads });
         }
     }
+    // No network filesystem within reach: refused before anything is applied, so a later call
+    // can try again once it is unmounted.
+    localfs::check_local_filesystems(&c.granted_paths())?;
     // Everything that allocates or opens a path happens before anything is applied.
     let ruleset = c.landlock_ruleset(tsync)?;
     let filters = netdeny::filters(c.sockets)?;
@@ -444,6 +464,10 @@ fn verify(c: &Confinement) -> Result<Vec<&'static str>, SandboxError> {
         return fail("a datagram socketpair still succeeds".into());
     }
     passed.push("datagram socketpair refused");
+    if let Err(what) = netdeny::namespaces_refused() {
+        return fail(what);
+    }
+    passed.push("namespaces refused");
     if !c.rules.iter().any(|(p, _)| p == Path::new("/")) {
         // SAFETY: a NUL-terminated path; an fd it returns is closed below.
         let fd = unsafe {
@@ -475,6 +499,8 @@ fn verify(c: &Confinement) -> Result<Vec<&'static str>, SandboxError> {
         }
         passed.push("parent unreachable by signal");
     }
+    localfs::check_local_filesystems(&c.granted_paths())?;
+    passed.push("no network filesystem in reach");
     Ok(passed)
 }
 

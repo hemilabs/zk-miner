@@ -104,8 +104,8 @@ fn os_err(what: &str) -> SandboxError {
 /// `/dev/null` and it inherits no file descriptor but stdout and stderr.
 ///
 /// Call it from a single-threaded process (it forks). Fails before starting anything if the
-/// confinement cannot be built; a child that cannot be confined exits with [`EXIT_NOT_CONFINED`]
-/// without running `program`.
+/// confinement cannot be built or a filesystem in reach is not local ([`crate::localfs`]); a child
+/// that cannot be confined exits with [`EXIT_NOT_CONFINED`] without running `program`.
 pub fn run_supervised(
     program: &Path,
     args: &[OsString],
@@ -128,6 +128,10 @@ pub fn run_supervised(
         });
     }
 
+    // No network filesystem within reach of the server (see `crate::localfs`); the child checks
+    // again once confined.
+    let granted = confinement.granted_paths();
+    crate::localfs::check_local_filesystems(&granted)?;
     // Everything that allocates happens before the fork.
     let ruleset = confinement.landlock_ruleset(false)?;
     let filters = netdeny::filters(Sockets::Supervised)?;
@@ -201,7 +205,7 @@ pub fn run_supervised(
             libc::close(sv[0]);
             libc::close(parent_fd);
         }
-        let code = confine_child(me, sv[1], ruleset, &notify_prog, &filters);
+        let code = confine_child(me, sv[1], ruleset, &notify_prog, &filters, &granted);
         if code != 0 {
             // SAFETY: _exit is always safe.
             unsafe { libc::_exit(code) };
@@ -257,6 +261,7 @@ fn confine_child(
     ruleset: landlock::RulesetCreated,
     notify: &libc::sock_fprog,
     filters: &[seccompiler::BpfProgram],
+    granted: &[std::path::PathBuf],
 ) -> i32 {
     let fail = |what: &str| {
         eprintln!("zkminer: cannot confine sp1-gpu-server: {what}");
@@ -312,7 +317,8 @@ fn confine_child(
             return fail(&format!("seccomp: {e}"));
         }
     }
-    // Checked, not assumed: filter mode, no new privileges, no network socket.
+    // Checked, not assumed: filter mode, no new privileges, no network socket, no namespace, no
+    // network filesystem in reach.
     // SAFETY: getter prctls and a socket call whose fd is closed.
     unsafe {
         if libc::prctl(libc::PR_GET_SECCOMP, 0, 0, 0, 0) != 2
@@ -324,6 +330,12 @@ fn confine_child(
         if fd >= 0 || errno() != libc::EPERM {
             return fail("socket(AF_INET) still succeeds");
         }
+    }
+    if let Err(what) = netdeny::namespaces_refused() {
+        return fail(&what);
+    }
+    if let Err(e) = crate::localfs::check_local_filesystems(granted) {
+        return fail(&e.to_string());
     }
     if !send_fd(sock, notif_fd) {
         return fail("cannot hand the listener to the supervisor");

@@ -272,8 +272,14 @@ home directory but `~/.risc0`/`~/.sp1` and a private temporary directory), and n
 miner or other processes; `sp1-gpu-server` likewise, under a supervisor (its socket is now
 `/tmp/zkminer-confined-<server>-<device>.sock`). This needs Linux with Landlock ABI 6, and ABI 8
 (`TSYNC`) for the SP1 worker and GPU workers that start threads before their first guest; a worker
-that cannot confine itself refuses to run guests. The CPU risc0 worker's Docker Groth16
-wrap runs in a helper process with `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
+that cannot confine itself refuses to run guests. Workers (and the witness sandboxes) also refuse
+to run guests while **any network or FUSE filesystem, or an automount map, is mounted where this
+user can reach it** (NFS, SMB, sshfs, rclone, a desktop's gvfs, autofs `/net`, ...): Landlock
+cannot stop a path lookup, which would query that filesystem's server. Unmount it, or run the miner
+as a dedicated user (another user's FUSE mount without `allow_other` is closed to it) or in a
+container or mount namespace that leaves it out. The CPU risc0 worker's Docker Groth16 wrap runs in
+a helper process that accepts only a strictly checked prover input, with the image pinned by digest
+and `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
 
 Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
 instead of being ignored. `ZKMINER_ELF_ALLOW_PRIVATE_URLS`, which older builds read, is no

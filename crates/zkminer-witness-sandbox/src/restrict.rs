@@ -61,6 +61,8 @@ pub(crate) fn thread_count() -> std::io::Result<usize> {
 /// created afterwards inherits them.
 ///
 /// In order:
+/// 0. **No network filesystem in reach** ([`crate::localfs::check_local_filesystems`], with the
+///    broker's paths): else [`SandboxError::NotLocal`], before anything is applied.
 /// 1. **Landlock** (ABI >= [`MIN_LANDLOCK_ABI`], else [`SandboxError::LandlockUnavailable`]): every
 ///    filesystem right of ABI 6 is handled (plus newer ones the kernel knows, best effort) with no
 ///    rules, except read-only rules for [`Profile::Broker`]'s `readable` paths and read-write rules
@@ -126,6 +128,13 @@ pub fn restrict_self(profile: &Profile) -> Result<RestrictReport, SandboxError> 
         });
     }
 
+    // No network filesystem within reach: a path lookup, which Landlock does not restrict, would
+    // reach its server (see `crate::localfs`). The broker's paths are judged by `statfs` too.
+    let granted: Vec<std::path::PathBuf> = match profile {
+        Profile::Broker { readable, writable } => readable.iter().chain(writable).cloned().collect(),
+        Profile::BuilderRunner | Profile::ExecuteWorker => Vec::new(),
+    };
+    crate::localfs::check_local_filesystems(&granted)?;
     // Everything that allocates or opens a path happens before any restriction is applied.
     let ruleset = landlock_ruleset(profile)?;
     let filters = seccomp_filters(profile)?;
@@ -433,7 +442,7 @@ const SYS_SETXATTRAT: i64 = 463;
 const SYS_GETXATTRAT: i64 = 464;
 const SYS_LISTXATTRAT: i64 = 465;
 const SYS_REMOVEXATTRAT: i64 = 466;
-const SYS_OPEN_TREE_ATTR: i64 = 467;
+pub(crate) const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_GETATTR: i64 = 468;
 const SYS_FILE_SETATTR: i64 = 469;
 const SYS_STATMOUNT: i64 = 457;

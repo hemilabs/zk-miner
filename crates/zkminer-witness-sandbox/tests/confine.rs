@@ -5,7 +5,10 @@
 //! Among them the ways out a guest that escaped its executor in such a worker would try: the
 //! session bus (`systemd --user` StartTransientUnit), the Docker socket, systemd-resolved, writes to
 //! the home directory (autostart, user units, `environment.d`, `.bashrc`, the provers, the miner's
-//! config), signals and `/proc` access to the miner (the probe's parent stands in for it).
+//! config), signals (by every syscall that sends one) and `/proc` access to the miner (the probe's
+//! parent stands in for it), and the kernel surface the filters take away: namespaces (`unshare`,
+//! `setns`, `clone` with a `CLONE_NEW*` flag; `clone3` is unimplemented), mounts and the new mount
+//! API, `userfaultfd`, `perf_event_open` and file handles; threads and `posix_spawn` still work.
 //!
 //! Needs Landlock ABI >= 6 (else SKIPPED, or a failure with `ZKMINER_SANDBOX_TESTS_REQUIRED=1`); no
 //! cgroup, no GPU.
@@ -87,6 +90,53 @@ fn failures(log: &str) -> Vec<&str> {
 fn checked(log: &str, name: &str) -> bool {
     log.lines()
         .any(|l| l.starts_with(&format!("CHECK {name} ok")))
+}
+
+/// The namespace, mount and kernel-surface checks both probes run (`kernel_surface_checks`).
+const KERNEL_SURFACE: &[&str] = &[
+    "unshare_none",
+    "unshare_newuser",
+    "unshare_newnet",
+    "setns",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "chroot",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "fspick",
+    "move_mount",
+    "open_tree",
+    "open_tree_attr",
+    "mount_setattr",
+    "userfaultfd",
+    "perf_event_open",
+    "name_to_handle_at",
+    "open_by_handle_at",
+    "clone_newns",
+    "clone_newcgroup",
+    "clone_newuts",
+    "clone_newipc",
+    "clone_newuser",
+    "clone_newpid",
+    "clone_newnet",
+    "clone_newtime",
+    "clone3_enosys",
+    "thread_after_confinement",
+];
+
+/// Signals by every syscall but `kill` (`signal_checks`), to `who`.
+fn signal_checks(who: &str) -> Vec<String> {
+    [
+        "tgkill",
+        "rt_sigqueueinfo",
+        "rt_tgsigqueueinfo",
+        "pidfd_send_signal",
+    ]
+    .iter()
+    .map(|s| format!("{s}_{who}"))
+    .collect()
 }
 
 struct Killed(Child);
@@ -197,8 +247,15 @@ fn a_confined_worker_reaches_no_socket_no_home_and_not_the_miner() {
         "old_thread_home_write",
         "exec_unnamed",
         "exec_named",
+        "spawn_after_confinement",
     ] {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
+    }
+    for name in KERNEL_SURFACE {
+        assert!(checked(&log, name), "{name} not checked:\n{log}");
+    }
+    for name in signal_checks("parent") {
+        assert!(checked(&log, &name), "{name} not checked:\n{log}");
     }
     // Nothing was written where it was refused.
     assert!(!home.path().join(".config/autostart/zk.desktop").exists());
@@ -355,6 +412,12 @@ fn a_supervised_server_listens_until_its_first_connection_and_never_after() {
         "spawn_own_helper",
     ] {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
+    }
+    for name in KERNEL_SURFACE {
+        assert!(checked(&log, name), "{name} not checked:\n{log}");
+    }
+    for name in signal_checks("supervisor") {
+        assert!(checked(&log, &name), "{name} not checked:\n{log}");
     }
     for pivot in ["session_bus", "docker", "resolved_varlink"] {
         if log.contains(&format!("pre_accept_connect_{pivot}")) {

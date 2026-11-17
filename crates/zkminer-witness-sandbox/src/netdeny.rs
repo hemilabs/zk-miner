@@ -28,9 +28,21 @@
 //! `request_key`: the uid's keys are not the worker's), a seccomp filter with a user-notification
 //! listener of its own, `TIOCSTI`/`TIOCLINUX` (keystrokes into an inherited terminal), and
 //! `PR_SET_PTRACER`; on x86_64, every x32 syscall. A syscall of a foreign ABI (`int 0x80` on
-//! x86_64) kills the process. The filters are installed with `SECCOMP_FILTER_FLAG_TSYNC` after
-//! `NO_NEW_PRIVS`: every thread the process has, and every thread and process it creates afterwards
-//! (across `exec` too), carries them.
+//! x86_64) kills the process.
+//!
+//! None of these processes needs a namespace or a mount, and where unprivileged user namespaces
+//! are allowed, a user namespace is the door to most of the kernel's attack surface (its
+//! capabilities reach netfilter, mounts and the rest). So every policy also refuses `unshare`,
+//! `setns`, `clone` with any `CLONE_NEW*` flag, `mount`, `umount2`, `pivot_root`, `chroot` and
+//! the new mount API (`fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`,
+//! `open_tree_attr`, `mount_setattr`), as well as `userfaultfd`, `perf_event_open` and file
+//! handles (`name_to_handle_at`, `open_by_handle_at`). `clone3` fails with `ENOSYS`: its flags
+//! live in memory, out of a filter's sight, and libc then falls back to `clone`, whose flags the
+//! filter reads (threads, `fork`, `vfork` and `posix_spawn` keep working).
+//!
+//! The filters are installed with `SECCOMP_FILTER_FLAG_TSYNC` after `NO_NEW_PRIVS`: every thread
+//! the process has, and every thread and process it creates afterwards (across `exec` too),
+//! carries them.
 
 use std::collections::BTreeMap;
 use std::os::unix::io::RawFd;
@@ -40,7 +52,7 @@ use seccompiler::{
     SeccompRule, TargetArch,
 };
 
-use crate::restrict::{PR_SET_PTRACER, SOCK_TYPE_MASK};
+use crate::restrict::{PR_SET_PTRACER, SOCK_TYPE_MASK, SYS_OPEN_TREE_ATTR};
 use crate::SandboxError;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -92,11 +104,48 @@ fn always_denied() -> Vec<(&'static str, i64)> {
         ("add_key", SYS_add_key),
         ("keyctl", SYS_keyctl),
         ("request_key", SYS_request_key),
+        // Namespaces and mounts (see the module docs; `clone` is filtered by its flags).
+        ("unshare", SYS_unshare),
+        ("setns", SYS_setns),
+        ("mount", SYS_mount),
+        ("umount2", SYS_umount2),
+        ("pivot_root", SYS_pivot_root),
+        ("chroot", SYS_chroot),
+        ("fsopen", SYS_fsopen),
+        ("fsconfig", SYS_fsconfig),
+        ("fsmount", SYS_fsmount),
+        ("fspick", SYS_fspick),
+        ("move_mount", SYS_move_mount),
+        ("open_tree", SYS_open_tree),
+        ("open_tree_attr", SYS_OPEN_TREE_ATTR),
+        ("mount_setattr", SYS_mount_setattr),
+        // Kernel surface no worker needs.
+        ("userfaultfd", SYS_userfaultfd),
+        ("perf_event_open", SYS_perf_event_open),
+        ("name_to_handle_at", SYS_name_to_handle_at),
+        ("open_by_handle_at", SYS_open_by_handle_at),
     ];
     #[cfg(target_arch = "x86_64")]
     v.push(("mknod", SYS_mknod));
     v
 }
+
+/// Every `CLONE_NEW*` flag. `clone` reads its low byte as the child's exit signal, so it cannot
+/// ask for a time namespace (`CLONE_NEWTIME` is that byte's top bit, which no valid signal sets);
+/// the filter refuses the bit all the same.
+pub(crate) const CLONE_NEW_FLAGS: [(&str, libc::c_int); 8] = [
+    ("CLONE_NEWNS", libc::CLONE_NEWNS),
+    ("CLONE_NEWCGROUP", libc::CLONE_NEWCGROUP),
+    ("CLONE_NEWUTS", libc::CLONE_NEWUTS),
+    ("CLONE_NEWIPC", libc::CLONE_NEWIPC),
+    ("CLONE_NEWUSER", libc::CLONE_NEWUSER),
+    ("CLONE_NEWPID", libc::CLONE_NEWPID),
+    ("CLONE_NEWNET", libc::CLONE_NEWNET),
+    ("CLONE_NEWTIME", libc::CLONE_NEWTIME),
+];
+
+/// Syscalls that fail with `ENOSYS` under every policy ([`raw_filter`]).
+pub(crate) const ENOSYS_SYSCALLS: [(&str, i64); 1] = [("clone3", libc::SYS_clone3)];
 
 /// Further syscalls denied whatever their arguments under `sockets`.
 fn denied_for(sockets: Sockets) -> Vec<(&'static str, i64)> {
@@ -167,6 +216,15 @@ fn conditional_denials(sockets: Sockets) -> Result<Vec<(i64, Vec<SeccompRule>)>,
         (
             libc::SYS_prctl,
             vec![rule(vec![cond(0, Eq, PR_SET_PTRACER as u64)?])?],
+        ),
+        // Threads, `fork`, `vfork` and `posix_spawn`, never a new namespace. The kernel reads
+        // only the low 32 bits of the flags, and so do these `Dword` comparisons.
+        (
+            libc::SYS_clone,
+            CLONE_NEW_FLAGS
+                .iter()
+                .map(|&(_, flag)| rule(vec![cond(0, MaskedEq(flag as u64), flag as u64)?]))
+                .collect::<Result<Vec<_>, _>>()?,
         ),
     ];
     match sockets {
@@ -249,26 +307,40 @@ fn insn(code: u16, jt: u8, jf: u8, k: u32) -> seccompiler::sock_filter {
     seccompiler::sock_filter { code, jt, jf, k }
 }
 
-/// On x86_64, a hand-written filter for what a denylist keyed by 64-bit syscall numbers misses: every
-/// x32 syscall (`nr >= 0x40000000`, the same architecture to seccomp) fails with `EPERM`. It checks
-/// the architecture too, killing on a foreign one. On aarch64 there is no such alias.
-fn x32_filter() -> Option<BpfProgram> {
+/// A hand-written filter for what the denylist (one action per filter, keyed by 64-bit syscall
+/// numbers) cannot express: the [`ENOSYS_SYSCALLS`] (`clone3`) fail with `ENOSYS`, and on x86_64
+/// every x32 syscall (`nr >= 0x40000000`, the same architecture to seccomp) fails with `EPERM`. It
+/// checks the architecture too, killing on a foreign one.
+fn raw_filter() -> BpfProgram {
+    let [(_, clone3)] = ENOSYS_SYSCALLS;
+    let enosys = libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+    // Jump offsets count from the next instruction.
     #[cfg(target_arch = "x86_64")]
     {
         let eperm = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
-        Some(vec![
+        vec![
             /* 0 */ insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
-            /* 1 */ insn(BPF_JEQ_K, 0, 4, AUDIT_ARCH), // else -> 6 (kill)
+            /* 1 */ insn(BPF_JEQ_K, 0, 6, AUDIT_ARCH), // else -> 8 (kill)
             /* 2 */ insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
-            /* 3 */ insn(BPF_JGE_K, 1, 0, 0x4000_0000), // x32 -> 5 (EPERM)
-            /* 4 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
-            /* 5 */ insn(BPF_RET_K, 0, 0, eperm),
-            /* 6 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
-        ])
+            /* 3 */ insn(BPF_JGE_K, 3, 0, 0x4000_0000), // x32 -> 7 (EPERM)
+            /* 4 */ insn(BPF_JEQ_K, 1, 0, clone3 as u32), // -> 6 (ENOSYS)
+            /* 5 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+            /* 6 */ insn(BPF_RET_K, 0, 0, enosys),
+            /* 7 */ insn(BPF_RET_K, 0, 0, eperm),
+            /* 8 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+        ]
     }
     #[cfg(target_arch = "aarch64")]
     {
-        None
+        vec![
+            /* 0 */ insn(BPF_LD_W_ABS, 0, 0, ARCH_OFFSET),
+            /* 1 */ insn(BPF_JEQ_K, 0, 4, AUDIT_ARCH), // else -> 6 (kill)
+            /* 2 */ insn(BPF_LD_W_ABS, 0, 0, NR_OFFSET),
+            /* 3 */ insn(BPF_JEQ_K, 1, 0, clone3 as u32), // -> 5 (ENOSYS)
+            /* 4 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+            /* 5 */ insn(BPF_RET_K, 0, 0, enosys),
+            /* 6 */ insn(BPF_RET_K, 0, 0, libc::SECCOMP_RET_KILL_PROCESS),
+        ]
     }
 }
 
@@ -309,9 +381,25 @@ pub(crate) fn notify_filter() -> BpfProgram {
 /// The filters for `sockets`, in the order they are installed (the notifying filter of
 /// [`Sockets::Supervised`] is not among them: [`crate::supervise`] installs it itself).
 pub(crate) fn filters(sockets: Sockets) -> Result<Vec<BpfProgram>, SandboxError> {
-    let mut v: Vec<BpfProgram> = x32_filter().into_iter().collect();
-    v.push(denylist(sockets)?);
-    Ok(v)
+    Ok(vec![raw_filter(), denylist(sockets)?])
+}
+
+/// Checks, in a process the filters are on, that no namespace can be made: `unshare(0)` (a no-op
+/// without the filter) fails with `EPERM`, and `clone3` with `ENOSYS` (without the filter, its
+/// empty arguments are `EINVAL`). Neither call can change anything.
+pub(crate) fn namespaces_refused() -> Result<(), String> {
+    // SAFETY: unshare with no flags, and clone3 with no arguments; both take no pointer the
+    // kernel would write through.
+    let (rc, e) = unsafe { (libc::unshare(0), std::io::Error::last_os_error()) };
+    if rc == 0 || e.raw_os_error() != Some(libc::EPERM) {
+        return Err(format!("unshare is not refused ({rc}, {e})"));
+    }
+    let rc = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<u8>(), 0usize) };
+    let e = std::io::Error::last_os_error();
+    if rc >= 0 || e.raw_os_error() != Some(libc::ENOSYS) {
+        return Err(format!("clone3 does not fail with ENOSYS ({rc}, {e})"));
+    }
+    Ok(())
 }
 
 /// One socket open in this process.
@@ -767,7 +855,6 @@ pub(crate) mod tests {
             SYS_mmap,
             SYS_munmap,
             SYS_clone,
-            SYS_clone3,
             SYS_execve,
             SYS_openat,
             SYS_read,
@@ -776,6 +863,10 @@ pub(crate) mod tests {
             SYS_getpid,
             SYS_pidfd_open,
             SYS_kill,
+            SYS_statfs,
+            SYS_fstatfs,
+            SYS_newfstatat,
+            SYS_statx,
         ];
         #[cfg(target_arch = "x86_64")]
         allowed.extend([SYS_fork, SYS_vfork, SYS_open]);
@@ -787,6 +878,87 @@ pub(crate) mod tests {
                     "{nr}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn no_namespace_no_mount_and_clone3_unimplemented() {
+        use libc::*;
+        let named: Vec<&str> = always_denied().iter().map(|(n, _)| *n).collect();
+        for name in [
+            "unshare",
+            "setns",
+            "mount",
+            "umount2",
+            "pivot_root",
+            "chroot",
+            "fsopen",
+            "fsconfig",
+            "fsmount",
+            "fspick",
+            "move_mount",
+            "open_tree",
+            "open_tree_attr",
+            "mount_setattr",
+            "userfaultfd",
+            "perf_event_open",
+            "name_to_handle_at",
+            "open_by_handle_at",
+        ] {
+            assert!(named.contains(&name), "{name} is not denied");
+        }
+        let enosys = libc::SECCOMP_RET_ERRNO | ENOSYS as u32;
+        // pthread_create, fork, vfork/posix_spawn: their clone flags.
+        let thread = (CLONE_VM
+            | CLONE_FS
+            | CLONE_FILES
+            | CLONE_SIGHAND
+            | CLONE_THREAD
+            | CLONE_SYSVSEM
+            | CLONE_SETTLS
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_CLEARTID) as u64;
+        let fork = (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD) as u64;
+        let vfork = (CLONE_VM | CLONE_VFORK | SIGCHLD) as u64;
+        for policy in POLICIES {
+            for flags in [thread, fork, vfork, SIGCHLD as u64] {
+                assert_eq!(
+                    call(policy, SYS_clone, [flags, 0, 0, 0, 0, 0]),
+                    RET_ALLOW,
+                    "{policy:?} clone({flags:#x})"
+                );
+            }
+            for (name, flag) in CLONE_NEW_FLAGS {
+                for base in [fork, thread, 0] {
+                    for high in [0u64, 0xffff_ffff_0000_0000] {
+                        let flags = high | base | flag as u64;
+                        assert_eq!(
+                            call(policy, SYS_clone, [flags, 0, 0, 0, 0, 0]),
+                            RET_EPERM,
+                            "{policy:?} clone with {name} ({flags:#x})"
+                        );
+                    }
+                }
+            }
+            // The upper half of the flags, which the kernel ignores, does not refuse a fork.
+            assert_eq!(
+                call(
+                    policy,
+                    SYS_clone,
+                    [0xffff_ffff_0000_0000 | fork, 0, 0, 0, 0, 0]
+                ),
+                RET_ALLOW
+            );
+            // clone3, whatever its arguments: unimplemented, so libc falls back to clone.
+            for args in [[0; 6], [u64::MAX; 6], [0x7f00_0000_1000, 88, 0, 0, 0, 0]] {
+                assert_eq!(call(policy, SYS_clone3, args), enosys, "{policy:?}");
+            }
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                call(policy, 0x4000_0000 | SYS_clone3, [0; 6]),
+                RET_EPERM,
+                "x32 clone3"
+            );
         }
     }
 

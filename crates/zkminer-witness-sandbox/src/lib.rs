@@ -27,6 +27,10 @@
 //! themselves with [`confine`] before their first guest: Landlock and seccomp, no sockets. An SP1
 //! worker's `sp1-gpu-server` runs under [`supervise`].
 //!
+//! Every one of them refuses to start while a network or FUSE filesystem, or an automount map, is
+//! within reach ([`localfs`]): Landlock does not restrict the path walk, and a lookup there would
+//! query that filesystem's server.
+//!
 //! [`self_test`] checks the resulting *properties* (plan §10.3) by running the
 //! `zkminer-witness-sandbox-probe` binary inside each sandbox profile, not just that calls
 //! succeeded.
@@ -47,6 +51,7 @@ mod cgroup;
 pub mod confine;
 #[doc(hidden)]
 pub mod confine_probe;
+pub mod localfs;
 pub mod netdeny;
 #[doc(hidden)]
 pub mod probe;
@@ -119,6 +124,14 @@ pub enum SandboxError {
     Cgroup(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error(
+        "a filesystem this process can reach is not local: {0}. A lookup or `stat` there, which \
+         Landlock does not restrict, would reach another host or a user-space daemon, so this \
+         process runs no untrusted code. Unmount it, or run the miner where it is not mounted (as \
+         another user, for a FUSE mount without allow_other; in a container or a mount namespace \
+         that leaves it out)"
+    )]
+    NotLocal(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
