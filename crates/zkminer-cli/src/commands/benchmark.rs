@@ -40,6 +40,9 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
             .collect(),
         benchmark_timeout,
     );
+    // Each card's SP1 shard-size cap, recorded when a proof there ran out of GPU memory, so a
+    // benchmark measures the size jobs run at.
+    pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
     let connected = pool.discover_and_spawn();
     init_worker_pool(pool);
 

@@ -3248,6 +3248,8 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
+    // Each card's SP1 shard-size cap, recorded when a proof there ran out of GPU memory.
+    pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
     // One `sys_rand` key for every risc0 worker this miner spawns, loaded once: a measured journal is
     // only worth checking a binding against if the proof that follows, on whichever worker, seeds the
     // guest alike — and the measurements live in this process, as long as the key does.

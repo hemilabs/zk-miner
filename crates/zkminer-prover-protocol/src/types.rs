@@ -594,6 +594,24 @@ pub fn sp1_element_threshold_for_available_vram(available: u64, total: Option<u6
 /// card's total (`sp1_fork_threshold_for_total_vram`) still caps it.
 pub const SP1_ELEMENT_THRESHOLD_ENV: &str = "SP1_GPU_ELEMENT_THRESHOLD";
 
+/// The largest element threshold an SP1 worker may run at on its card, set by the dispatcher for a
+/// card whose SP1 proof once ran out of GPU memory (`zkminer_prover::sp1_shard_caps`). The worker
+/// takes the smaller of it and its own bounds; an operator's [`SP1_ELEMENT_THRESHOLD_ENV`] still
+/// wins.
+pub const SP1_ELEMENT_THRESHOLD_CAP_ENV: &str = "ZKMINER_SP1_ELEMENT_THRESHOLD_CAP";
+
+/// The measured tier one below `ran_at` (`None`: nothing bounded it, so the server's own) on a card
+/// of `total` bytes (`None` when its server tier is not modelled): what an SP1 worker that ran out
+/// of GPU memory at `ran_at` is lowered to. `None` when it already ran at the smallest measured
+/// tier.
+pub fn sp1_tier_below(ran_at: Option<u64>, total: Option<u64>) -> Option<u64> {
+    let ran_at = ran_at.unwrap_or(u64::MAX);
+    sp1_measured_tiers(total)
+        .iter()
+        .map(|(threshold, _)| *threshold)
+        .find(|threshold| *threshold < ran_at)
+}
+
 /// Set to disable the SP1 worker's host-memory tuning, for bisecting a proving failure against stock
 /// SDK behaviour.
 pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
@@ -1407,6 +1425,25 @@ mod tests {
         assert!(super::sp1_savers_are_the_default(12_282 * MIB));
         assert!(super::sp1_savers_are_the_default(16 * 1024 * MIB));
         assert!(!super::sp1_savers_are_the_default(24_564 * MIB));
+    }
+
+    #[test]
+    fn an_sp1_worker_that_ran_out_is_lowered_one_measured_tier() {
+        const MIB: u64 = 1 << 20;
+        let rtx4070 = Some(12_282 * MIB);
+        assert_eq!(
+            super::sp1_tier_below(Some(268_435_456), rtx4070),
+            Some(134_217_728)
+        );
+        // Already at the smallest: nothing lower has been measured.
+        assert_eq!(super::sp1_tier_below(Some(134_217_728), rtx4070), None);
+        // Unbounded (the server's own tier): the largest measured.
+        assert_eq!(super::sp1_tier_below(None, None), Some(268_435_456));
+        // Between tiers (an operator-shaped or host-bounded value): the next measured below it.
+        assert_eq!(
+            super::sp1_tier_below(Some(200_000_000), rtx4070),
+            Some(134_217_728)
+        );
     }
 
     #[test]
