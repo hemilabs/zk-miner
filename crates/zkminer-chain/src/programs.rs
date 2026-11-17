@@ -75,11 +75,15 @@ const ARWEAVE_GATEWAY: &str = "https://arweave.net";
 /// Every storage URI is submitter-controlled, so every hop of every fetch (the URI and each
 /// redirect, up to [`MAX_ELF_REDIRECTS`]) passes [`zkminer_netguard::check_url`], and every
 /// connection goes only to an address the guarded resolver admitted from its one lookup: in the
-/// default [`NetMode::Public`], a globally routable address that is not this host's (public NAT
-/// addresses included), not on a network it is connected to or in its IPv6 site, not a DNS server
-/// it uses, reached by its default route, and not in `[egress] deny_cidrs`. No proxy is used. The
-/// only way to reach a private address is `[dev] private_network = true`
-/// ([`NetMode::DevPrivate`]), which is refused on mainnet; there is no environment-variable bypass.
+/// default [`NetMode::Public`], names are resolved over DNS-over-HTTPS to fixed public resolvers
+/// (never the system resolver), and an address is admitted only if it is globally routable, not
+/// this host's (public NAT addresses included), not on a network it is connected to or in its
+/// IPv6 or IPv4 site, not a DNS server it uses, reached by its default route (the kernel asked
+/// with the port), not in `[egress] deny_cidrs` or `internal_ranges`, on a path whose public
+/// address is known, and — probed right before the connection — not within `[egress]
+/// near_hop_limit` hops. No proxy is used. The only way to reach a private address is `[dev]
+/// private_network = true` with `[dev] chain_id` ([`NetMode::DevPrivate`]), which is refused on
+/// mainnet; there is no environment-variable bypass.
 #[derive(Debug, Clone)]
 pub struct ElfFetcher {
     client: GuardedClient,
@@ -122,6 +126,28 @@ impl ElfFetcher {
     /// The network mode its fetches run under.
     pub fn mode(&self) -> NetMode {
         self.client.policy().mode()
+    }
+
+    /// What the network guard refuses for want of configuration, as lines to show the operator:
+    /// each path whose public address is not known (every requester connection over it is
+    /// refused), and what to set. Empty when there is none (and in developer mode).
+    pub fn guard_warnings(&self) -> Vec<String> {
+        if self.mode() != NetMode::Public {
+            return Vec::new();
+        }
+        self.client
+            .policy()
+            .facts()
+            .unknown_paths()
+            .into_iter()
+            .map(|path| {
+                format!(
+                    "network guard: this host's public {path} address is not known, so requester \
+                     connections over {path} are refused. To fix: {}",
+                    path.advice()
+                )
+            })
+            .collect()
     }
 }
 
@@ -972,9 +998,12 @@ mod fetch_tests {
     }
 
     /// Public mode over this host's real facts, names from [`staged`], and every admitted (public)
-    /// address connected to on loopback.
+    /// address connected to on loopback (so the near-hop probe, which would find loopback near,
+    /// is a fake that finds every address far; no probe goes to the staged public addresses).
     fn public_via_loopback() -> ElfFetcher {
-        let policy = NetPolicy::new(NetMode::Public, Vec::new()).unwrap();
+        let policy = NetPolicy::new(NetMode::Public, Vec::new())
+            .unwrap()
+            .with_near_probe(zkminer_netguard::FixedProbe::far());
         let map: zkminer_netguard::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
         let client = zkminer_netguard::guarded_client_for_test(
             &policy,

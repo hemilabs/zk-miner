@@ -53,7 +53,19 @@ fn private_and_own_ipv4_under_a_network_specific_nat64_prefix_are_refused() {
     assert_eq!(nat64::configured().len(), 3, "a bad list changes nothing");
 
     let own_pub = [168, 93, 61, 57];
-    let facts = HostFacts::assemble(
+    // An IPv6-only host (no IPv4 default route) whose translator's IPv4 address is known: what
+    // reaches IPv4 through NAT64.
+    let raw = |v4_default: bool| {
+        let mut routes = vec![
+            Route::on_link(p("192.168.1.0/24"), 2),
+            Route::via(p("::/0"), ip("fe80::1"), 2),
+            // A public range behind a VPN, as IPv4.
+            Route::on_link(p("10.8.0.0/24"), 7),
+            Route::via(p("45.60.1.0/24"), ip("10.8.0.1"), 7),
+        ];
+        if v4_default {
+            routes.push(Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2));
+        }
         RawFacts {
             interface_prefixes: vec![
                 p("127.0.0.0/8"),
@@ -65,23 +77,20 @@ fn private_and_own_ipv4_under_a_network_specific_nat64_prefix_are_refused() {
                 ip("192.168.1.33"),
                 ip("2606:a300:9024:184::33"),
             ],
-            routes: vec![
-                Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2),
-                Route::on_link(p("192.168.1.0/24"), 2),
-                Route::via(p("::/0"), ip("fe80::1"), 2),
-                // A public range behind a VPN, as IPv4.
-                Route::on_link(p("10.8.0.0/24"), 7),
-                Route::via(p("45.60.1.0/24"), ip("10.8.0.1"), 7),
-            ],
+            routes,
             resolvers: vec![ip("127.0.0.53"), ip("9.9.9.9")],
             public_addresses: vec![IpAddr::from(own_pub)],
             ..RawFacts::default()
-        },
-        &FactsOptions {
-            discover_public_addresses: false,
-            ..FactsOptions::default()
-        },
-    );
+        }
+    };
+    let options = FactsOptions {
+        discover_public_addresses: false,
+        public_addresses: vec![IpAddr::from(own_pub), ip("2606:a300:9024:184::33")],
+        ..FactsOptions::default()
+    };
+    let facts = HostFacts::assemble(raw(false), &options);
+    // The same host with IPv4 of its own never connects through a translator.
+    let dual_stack = HostFacts::assemble(raw(true), &options);
     let refused: [(&str, [u8; 4]); 8] = [
         ("RFC 1918", [10, 0, 0, 1]),
         ("loopback", [127, 0, 0, 1]),
@@ -104,6 +113,14 @@ fn private_and_own_ipv4_under_a_network_specific_nat64_prefix_are_refused() {
         assert_eq!(
             admit(NetMode::Public, control, &facts, &[]),
             Ok(()),
+            "{control}"
+        );
+        assert_eq!(
+            admit(NetMode::Public, control, &dual_stack, &[]),
+            Err(zkminer_netguard::Denied::PublicAddressUnknown {
+                ip: control,
+                path: zkminer_netguard::EgressPath::Nat64
+            }),
             "{control}"
         );
         // The operator's deny CIDR written as IPv4 holds the NAT64 spelling.

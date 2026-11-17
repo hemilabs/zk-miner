@@ -585,6 +585,7 @@ impl ZkMinerConfig {
         let o = zkminer_netguard::FactsOptions {
             ipv6_site_prefix_len: self.egress.ipv6_site_prefix_len,
             discover_public_addresses: self.egress.discover_public_addresses,
+            ..zkminer_netguard::FactsOptions::default()
         };
         o.validate()
             .map_err(|e| anyhow::anyhow!("egress.{e}"))?;
@@ -896,21 +897,21 @@ mod validation_tests {
             c.egress_facts_options().unwrap(),
             zkminer_netguard::FactsOptions::default()
         );
-        assert_eq!(c.egress.ipv6_site_prefix_len, 56);
+        assert_eq!(c.egress.ipv6_site_prefix_len, 48);
         assert!(c.egress.discover_public_addresses);
         let c = parse(
-            "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = 48\ndiscover_public_addresses = false\n",
+            "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = 56\ndiscover_public_addresses = false\n",
         )
         .unwrap();
         let o = c.egress_facts_options().unwrap();
-        assert_eq!(o.ipv6_site_prefix_len, 48);
+        assert_eq!(o.ipv6_site_prefix_len, 56);
         assert!(!o.discover_public_addresses);
         assert!(c.validate_network().is_ok());
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("ipv6_site_prefix_len = 48"), "{text}");
+        assert!(text.contains("ipv6_site_prefix_len = 56"), "{text}");
         assert!(text.contains("discover_public_addresses = false"), "{text}");
         assert_eq!(parse(&text).unwrap().egress, c.egress);
-        for (len, ok) in [(47, false), (48, true), (56, true), (64, true), (65, false), (0, false)] {
+        for (len, ok) in [(31, false), (32, true), (48, true), (56, true), (64, true), (65, false), (0, false)] {
             let c = parse(&format!(
                 "[chain]\nchain_id = 743111\n[egress]\nipv6_site_prefix_len = {len}\n"
             ))

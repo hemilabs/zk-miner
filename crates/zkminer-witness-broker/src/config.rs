@@ -20,7 +20,7 @@
 //!
 //! [egress]
 //! deny_cidrs = ["203.0.113.7/32"]   # the fleet's addresses, the VPC's ranges
-//! ipv6_site_prefix_len = 56         # the site refused around each own IPv6 address (48..=64)
+//! ipv6_site_prefix_len = 48         # the site refused around each own IPv6 address (32..=64)
 //! discover_public_addresses = true  # learn the NAT public addresses from fixed reflectors
 //!
 //! [dns]
@@ -754,6 +754,7 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode, keys: Keys) -> Result
     let facts_options = zkminer_netguard::FactsOptions {
         ipv6_site_prefix_len: f.egress.ipv6_site_prefix_len.unwrap_or(zkminer_netguard::DEFAULT_IPV6_SITE_PREFIX_LEN),
         discover_public_addresses: f.egress.discover_public_addresses.unwrap_or(true),
+        ..zkminer_netguard::FactsOptions::default()
     };
     facts_options.validate().map_err(|e| ConfigError::Invalid(format!("egress.{e}")))?;
     if f.dns.reresolve_secs == 0 {

@@ -11,9 +11,16 @@
 //! - **connected prefixes:** every interface address under its netmask, the peer of a
 //!   point-to-point link, and every on-link route (no gateway, not on loopback, not a default
 //!   route): a DHCPv6 address is a /128 whose /64 is only a route ([`crate::routes`]);
-//! - **site prefixes:** the enclosing /`ipv6_site_prefix_len` (default /56) of every own global
-//!   IPv6 address. A home or office is delegated a /56 (or a /48) and numbers its other networks
-//!   from it, none of which the host's own /64 shows;
+//! - **site prefixes:** the enclosing /`ipv6_site_prefix_len` (default /48) of every own global
+//!   IPv6 address. A home or office is delegated a /56 or a /48 and numbers its other networks
+//!   from it, none of which the host's own /64 shows; and the enclosing /`ipv4_site_prefix_len`
+//!   (default /16) of every global IPv4 address on an interface (a campus or data centre numbered
+//!   from public space reaches its other subnets through the default gateway);
+//! - **public-address knowledge:** per family the host routes, whether its public address is
+//!   known (learned reliably or configured); a family whose is not refuses every connection
+//!   ([`HostFacts::unknown_paths`]);
+//! - **tunnel uplinks and global IPv4 interface addresses**, which make a public-mode start need
+//!   `[egress] internal_ranges` ([`HostFacts::needs_internal_ranges`]);
 //! - **DNS servers:** the `nameserver`s of `/etc/resolv.conf` and of systemd-resolved's
 //!   `/run/systemd/resolve/resolv.conf` (the upstream servers behind its `127.0.0.53` stub), which
 //!   may answer only their own customers;
@@ -40,45 +47,171 @@ use crate::ip::{is_global, Prefix};
 use crate::policy::Denied;
 use crate::routes::{Route, RouteOracle, RouteRefusal, RouteTable, Rule};
 
-/// The default `[egress] ipv6_site_prefix_len`.
-pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 56;
+/// The default `[egress] ipv6_site_prefix_len`: a /48, the most a site is usually delegated.
+pub const DEFAULT_IPV6_SITE_PREFIX_LEN: u8 = 48;
 /// The lengths `[egress] ipv6_site_prefix_len` may take.
-pub const IPV6_SITE_PREFIX_LENS: RangeInclusive<u8> = 48..=64;
+pub const IPV6_SITE_PREFIX_LENS: RangeInclusive<u8> = 32..=64;
+/// The default `[egress] ipv4_site_prefix_len`.
+pub const DEFAULT_IPV4_SITE_PREFIX_LEN: u8 = 16;
+/// The lengths `[egress] ipv4_site_prefix_len` may take.
+pub const IPV4_SITE_PREFIX_LENS: RangeInclusive<u8> = 8..=32;
+/// The default `[egress] near_hop_limit` ([`crate::nearhop`]).
+pub const DEFAULT_NEAR_HOP_LIMIT: u8 = 2;
+/// The values `[egress] near_hop_limit` may take.
+pub const NEAR_HOP_LIMITS: RangeInclusive<u8> = 2..=16;
 
-/// The operator's settings for gathering host facts (`[egress]`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The operator's `[egress]` settings the guard runs with: how the host's facts are gathered,
+/// what the operator says about its network, and how connections are checked before they are
+/// made.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactsOptions {
     /// The site around each of the host's own global IPv6 addresses that is refused
     /// ([`IPV6_SITE_PREFIX_LENS`], default [`DEFAULT_IPV6_SITE_PREFIX_LEN`]).
     pub ipv6_site_prefix_len: u8,
+    /// The site around each global IPv4 address on one of the host's interfaces that is refused
+    /// ([`IPV4_SITE_PREFIX_LENS`], default [`DEFAULT_IPV4_SITE_PREFIX_LEN`]).
+    pub ipv4_site_prefix_len: u8,
     /// Whether to learn the host's public (NAT) addresses from fixed reflectors
     /// ([`crate::public`]). Default true.
     pub discover_public_addresses: bool,
+    /// The host's public addresses as the operator states them (`[egress] public_addresses`):
+    /// refused as its own, and a family named here counts as known whether or not discovery
+    /// works (see [`HostFacts::unknown_paths`]).
+    pub public_addresses: Vec<IpAddr>,
+    /// The ranges of the operator's own network that the internet path also reaches
+    /// (`[egress] internal_ranges`), refused like deny CIDRs. `None` when the operator has not
+    /// said; `Some(vec![])` is the statement that there are none. A host with a global IPv4
+    /// interface address or a default route through a tunnel needs it to start
+    /// ([`HostFacts::needs_internal_ranges`]).
+    pub internal_ranges: Option<Vec<Prefix>>,
+    /// The hop limit of the probe sent before every connection under the floor
+    /// ([`crate::nearhop`]; [`NEAR_HOP_LIMITS`], default [`DEFAULT_NEAR_HOP_LIMIT`]).
+    pub near_hop_limit: u8,
+    /// The DNS-over-HTTPS resolvers requester names are resolved with in public mode; empty: the
+    /// compiled-in ones ([`crate::doh::DEFAULT_SERVERS`]).
+    pub doh_resolvers: Vec<crate::doh::DohServer>,
 }
 
 impl Default for FactsOptions {
     fn default() -> Self {
         FactsOptions {
             ipv6_site_prefix_len: DEFAULT_IPV6_SITE_PREFIX_LEN,
+            ipv4_site_prefix_len: DEFAULT_IPV4_SITE_PREFIX_LEN,
             discover_public_addresses: true,
+            public_addresses: Vec::new(),
+            internal_ranges: None,
+            near_hop_limit: DEFAULT_NEAR_HOP_LIMIT,
+            doh_resolvers: Vec::new(),
         }
     }
 }
 
 impl FactsOptions {
-    /// Refuses a site prefix length outside [`IPV6_SITE_PREFIX_LENS`].
+    /// Refuses a site prefix length or hop limit outside its range, a stated public address
+    /// that is not global, and a DNS-over-HTTPS resolver that is not.
     pub fn validate(&self) -> Result<(), String> {
-        if IPV6_SITE_PREFIX_LENS.contains(&self.ipv6_site_prefix_len) {
-            Ok(())
-        } else {
-            Err(format!(
-                "ipv6_site_prefix_len = {} is outside {}..={}",
-                self.ipv6_site_prefix_len,
-                IPV6_SITE_PREFIX_LENS.start(),
-                IPV6_SITE_PREFIX_LENS.end()
-            ))
+        let range = |name: &str, v: u8, r: &RangeInclusive<u8>| {
+            if r.contains(&v) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{name} = {v} is outside {}..={}",
+                    r.start(),
+                    r.end()
+                ))
+            }
+        };
+        range(
+            "ipv6_site_prefix_len",
+            self.ipv6_site_prefix_len,
+            &IPV6_SITE_PREFIX_LENS,
+        )?;
+        range(
+            "ipv4_site_prefix_len",
+            self.ipv4_site_prefix_len,
+            &IPV4_SITE_PREFIX_LENS,
+        )?;
+        range("near_hop_limit", self.near_hop_limit, &NEAR_HOP_LIMITS)?;
+        if let Some(a) = self.public_addresses.iter().find(|a| !is_global(**a)) {
+            return Err(format!(
+                "public_addresses: {a} is not a public internet address"
+            ));
+        }
+        for d in &self.doh_resolvers {
+            d.check()?;
+        }
+        Ok(())
+    }
+}
+
+/// The path a connection to a destination leaves this host by, for the public-address check
+/// ([`HostFacts::unknown_paths`]): native IPv4, native IPv6, or IPv4 through a NAT64 translator
+/// (an IPv6 address that carries an IPv4 one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EgressPath {
+    Ipv4,
+    Ipv6,
+    /// To the IPv4 address an IPv6 address carries, through the translator of its NAT64
+    /// prefix (or a SIIT translator), from that translator's own IPv4 address.
+    Nat64,
+}
+
+impl std::fmt::Display for EgressPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EgressPath::Ipv4 => "IPv4",
+            EgressPath::Ipv6 => "IPv6",
+            EgressPath::Nat64 => "IPv4 through NAT64",
+        })
+    }
+}
+
+impl EgressPath {
+    /// The path a connection to `ip` takes: IPv4 for an IPv4 address or an IPv4-mapped one
+    /// (which a dual-stack socket connects as IPv4), NAT64 for another IPv6 spelling of an IPv4
+    /// address, else IPv6.
+    pub fn of(ip: IpAddr) -> EgressPath {
+        match ip {
+            IpAddr::V4(_) => EgressPath::Ipv4,
+            IpAddr::V6(a) if a.to_ipv4_mapped().is_some() => EgressPath::Ipv4,
+            IpAddr::V6(_) if crate::canonical_ip(ip).is_ipv4() => EgressPath::Nat64,
+            IpAddr::V6(_) => EgressPath::Ipv6,
         }
     }
+
+    /// What the operator can set so connections over this path go out again.
+    pub fn advice(&self) -> &'static str {
+        match self {
+            EgressPath::Ipv4 => {
+                "set `public_addresses = [\"<this host's public IPv4 address>\"]` in [egress] (or \
+                 let outbound DNS to 216.239.32.10 and 1.1.1.1, or HTTPS to 1.1.1.1, through)"
+            }
+            EgressPath::Ipv6 => {
+                "set `public_addresses = [\"<this host's public IPv6 address>\"]` in [egress] (or \
+                 let outbound DNS to 2001:4860:4802:32::a and 2606:4700:4700::1111, or HTTPS to \
+                 2606:4700:4700::1111, through)"
+            }
+            EgressPath::Nat64 => {
+                "on an IPv6-only host, set `public_addresses = [\"<the NAT64 translator's public \
+                 IPv4 address>\"]` in [egress] (or let the reflectors be reached through the \
+                 translator); a host with IPv4 of its own never connects through NAT64"
+            }
+        }
+    }
+}
+
+/// What the facts know about the host's public addresses per path (see
+/// [`HostFacts::unknown_paths`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EgressState {
+    /// [IPv4, IPv6]: the host has a default route of the family.
+    routed: [bool; 2],
+    /// [IPv4, IPv6]: a public address of the family was learned reliably or is configured.
+    known: [bool; 2],
+    /// The NAT64 prefixes through which this host's IPv4 public address was learned.
+    nat64: Vec<Prefix>,
+    /// An IPv4 public address is configured (it stands for the NAT64 path too).
+    v4_configured: bool,
 }
 
 /// What the system said, before it is judged: the injectable input of [`HostFacts::assemble`]
@@ -97,9 +230,17 @@ pub struct RawFacts {
     pub resolvers: Vec<IpAddr>,
     /// The host's public addresses as reflectors see them (refused as its own).
     pub public_addresses: Vec<IpAddr>,
-    /// The public addresses both reflectors of their family reported alike: only these (and the
-    /// interface addresses) give an IPv6 site ([`crate::public`]).
+    /// The public addresses discovery learned reliably ([`crate::public::Learned::confirmed`]:
+    /// the TLS reflector's answer, or two DNS reflectors' alike): only these (and the interface
+    /// addresses) give an IPv6 site, and a family with one counts as known.
     pub public_confirmed: Vec<IpAddr>,
+    /// The NAT64 prefixes through which an IPv4 public address was learned reliably.
+    pub public_via_nat64: Vec<Prefix>,
+    /// Every network interface, with its kind.
+    pub links: Vec<crate::routes::Link>,
+    /// The interfaces the kernel sends internet traffic out of (for default routes through a
+    /// nexthop object, whose interface the route dump does not show).
+    pub internet_interfaces: Vec<u32>,
 }
 
 /// A snapshot of the host's facts (see the module doc).
@@ -114,8 +255,15 @@ pub struct HostFacts {
     /// Asked per destination by [`crate::admit`] ([`Self::with_route_oracle`]); the kernel for
     /// facts read from this host.
     oracle: Option<Arc<dyn RouteOracle>>,
-    /// The oracle's verdicts, per destination, for as long as these facts are in force.
-    verdicts: Arc<Mutex<HashMap<IpAddr, Result<(), KernelRefusal>>>>,
+    /// The oracle's verdicts, per destination and port, for as long as these facts are in force.
+    verdicts: Arc<Mutex<Verdicts>>,
+    /// What is known about the host's public addresses, for facts read from a host (`None` for
+    /// facts given by the caller, which say nothing about it).
+    egress: Option<EgressState>,
+    /// `(name, kind)` of every tunnel interface a default route goes out of.
+    tunnel_uplinks: Vec<(String, String)>,
+    /// The global IPv4 addresses on the host's interfaces.
+    global_v4_interfaces: Vec<IpAddr>,
 }
 
 /// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict`]).
@@ -124,6 +272,9 @@ enum KernelRefusal {
     Route(RouteRefusal),
     QueryFailed(String),
 }
+
+/// The route oracle's verdicts, per destination and destination port.
+type Verdicts = HashMap<(IpAddr, Option<u16>), Result<(), KernelRefusal>>;
 
 /// Most per-destination verdicts one facts snapshot keeps (it lives about a second).
 const MAX_VERDICTS: usize = 4096;
@@ -146,6 +297,20 @@ pub fn site_prefixes(own: &[IpAddr], len: u8) -> Vec<Prefix> {
     )
 }
 
+/// The enclosing /`len` of every global IPv4 address in `interface_addresses` (`len` clamped to
+/// [`IPV4_SITE_PREFIX_LENS`]): a host numbered from global IPv4 space sits in a network (a
+/// campus, a data centre) whose other subnets are reached through the default gateway.
+pub fn ipv4_site_prefixes(interface_addresses: &[IpAddr], len: u8) -> Vec<Prefix> {
+    let len = len.clamp(*IPV4_SITE_PREFIX_LENS.start(), *IPV4_SITE_PREFIX_LENS.end());
+    sorted(
+        interface_addresses
+            .iter()
+            .filter(|a| a.is_ipv4() && is_global(**a))
+            .map(|a| Prefix::new(*a, len))
+            .collect(),
+    )
+}
+
 impl HostFacts {
     /// Facts given by the caller: connected prefixes and own addresses only (no site prefixes,
     /// DNS servers or routes). Tests, and the witness broker, which is told the facts.
@@ -159,6 +324,9 @@ impl HostFacts {
             gathered_at: Instant::now(),
             oracle: None,
             verdicts: Arc::default(),
+            egress: None,
+            tunnel_uplinks: Vec::new(),
+            global_v4_interfaces: Vec::new(),
         }
     }
 
@@ -175,26 +343,147 @@ impl HostFacts {
         // Review r2 R2-NG-7: a public address one reflector alone reported (or a forger) is
         // refused as an own address, but gives no site: that would refuse a /48-/56 of whoever
         // the forged address belongs to.
+        let configured: Vec<IpAddr> = opts
+            .public_addresses
+            .iter()
+            .copied()
+            .filter(|a| is_global(*a))
+            .collect();
         let mut site_from = raw.interface_addresses.clone();
         site_from.extend(raw.public_confirmed.iter().filter(|a| is_global(**a)));
+        site_from.extend(&configured);
+        let mut site = site_prefixes(&site_from, opts.ipv6_site_prefix_len);
+        site.extend(ipv4_site_prefixes(
+            &raw.interface_addresses,
+            opts.ipv4_site_prefix_len,
+        ));
+        let global_v4_interfaces = sorted(
+            raw.interface_addresses
+                .iter()
+                .copied()
+                .filter(|a| a.is_ipv4() && is_global(*a))
+                .collect(),
+        );
+        // A public address of a family is known when discovery learned one reliably or the
+        // operator stated one; only then may a connection go out over that family.
+        let known_of = |v6: bool| {
+            raw.public_confirmed
+                .iter()
+                .chain(&configured)
+                .any(|a| a.is_ipv6() == v6 && is_global(*a))
+        };
+        let egress = EgressState {
+            routed: [routes.routes_family(false), routes.routes_family(true)],
+            known: [known_of(false), known_of(true)],
+            nat64: sorted(raw.public_via_nat64.clone()),
+            v4_configured: configured.iter().any(IpAddr::is_ipv4),
+        };
+        // The interfaces internet traffic leaves by: those of the default routes, and the
+        // kernel's answer where a route names a nexthop object instead.
+        let mut uplink_ifs = routes.default_interfaces();
+        uplink_ifs.retain(|i| *i != 0);
+        uplink_ifs.extend(&raw.internet_interfaces);
+        let tunnel_uplinks = sorted(
+            raw.links
+                .iter()
+                .filter(|l| uplink_ifs.contains(&l.index) && l.is_tunnel())
+                .map(|l| (l.name.clone(), l.kind.clone().unwrap_or_default()))
+                .collect(),
+        );
         let mut own = raw.interface_addresses;
         own.extend(
             raw.public_addresses
                 .into_iter()
                 .chain(raw.public_confirmed)
+                .chain(configured)
                 .filter(|a| is_global(*a)),
         );
         let own = sorted(own);
         HostFacts {
             connected: sorted(connected),
-            site: site_prefixes(&site_from, opts.ipv6_site_prefix_len),
+            site: sorted(site),
             own,
             resolvers: sorted(raw.resolvers),
             routes,
             gathered_at: Instant::now(),
             oracle: None,
             verdicts: Arc::default(),
+            egress: Some(egress),
+            tunnel_uplinks,
+            global_v4_interfaces,
         }
+    }
+
+    /// The paths over which no connection may go out because this host's public address on them
+    /// is not known: a family the host routes whose public address discovery has not learned
+    /// (or learned only from one DNS reflector) and `[egress] public_addresses` does not name.
+    /// Behind NAT a destination at that unknown address would reach this host or its router by
+    /// hairpin, so the family is refused until it is known. On an IPv6-only host the NAT64 path
+    /// is listed until the translator's IPv4 address is learned through a NAT64 prefix (or an
+    /// IPv4 address is configured). (On a host with IPv4 of its own the NAT64 path is always
+    /// refused, [`Self::path_known`], and not listed: nothing needs setting.) Empty for facts
+    /// given by the caller ([`Self::new`]).
+    pub fn unknown_paths(&self) -> Vec<EgressPath> {
+        let Some(e) = &self.egress else {
+            return Vec::new();
+        };
+        let mut v = Vec::new();
+        if e.routed[0] && !e.known[0] {
+            v.push(EgressPath::Ipv4);
+        }
+        if e.routed[1] && !e.known[1] {
+            v.push(EgressPath::Ipv6);
+        }
+        if e.routed[1] && !e.routed[0] && !e.v4_configured && e.nat64.is_empty() {
+            v.push(EgressPath::Nat64);
+        }
+        v
+    }
+
+    /// Whether a connection to `ip` may go out on its path ([`Self::unknown_paths`]): `Err` with
+    /// the path when it may not.
+    pub(crate) fn path_known(&self, ip: IpAddr) -> Result<(), EgressPath> {
+        let Some(e) = &self.egress else {
+            return Ok(());
+        };
+        let path = EgressPath::of(ip);
+        let v6 = path != EgressPath::Ipv4;
+        if e.routed[usize::from(v6)] && !e.known[usize::from(v6)] {
+            return Err(if v6 {
+                EgressPath::Ipv6
+            } else {
+                EgressPath::Ipv4
+            });
+        }
+        if path == EgressPath::Nat64 {
+            // A host with IPv4 of its own never needs a translator; on an IPv6-only host the
+            // translator's IPv4 address must be known, through this address's prefix.
+            let through = match ip {
+                IpAddr::V6(a) => crate::nat64::prefix_of(a),
+                IpAddr::V4(_) => None,
+            };
+            let learned = through.is_some_and(|p| e.nat64.contains(&p));
+            if e.routed[0] || !(learned || e.v4_configured) {
+                return Err(EgressPath::Nat64);
+            }
+        }
+        Ok(())
+    }
+
+    /// Why this host may not start in public mode without `[egress] internal_ranges`: each
+    /// global IPv4 address on its interfaces (its network is numbered from public space, and its
+    /// other subnets are reached through the default gateway), and each tunnel a default route
+    /// goes out of (the far side's own hosts look like the internet). Empty when neither holds.
+    pub fn needs_internal_ranges(&self) -> Vec<String> {
+        let mut why: Vec<String> = self
+            .global_v4_interfaces
+            .iter()
+            .map(|a| format!("this host has the global IPv4 address {a} on an interface"))
+            .collect();
+        why.extend(self.tunnel_uplinks.iter().map(|(name, kind)| {
+            format!("this host's default route goes out of {name}, a {kind} tunnel")
+        }));
+        why
     }
 
     /// These facts, with `oracle` asked how each destination is routed ([`crate::admit`] refuses
@@ -211,11 +500,12 @@ impl HostFacts {
         self.oracle.as_ref()
     }
 
-    /// The route oracle's verdict on a connection to `ip` (admitted when there is no oracle):
-    /// asked once per destination for as long as these facts are in force (a snapshot lives
-    /// about a second, [`crate::FACTS_TTL`]). An IPv4-mapped address is asked as its IPv4
-    /// address, which is how a dual-stack socket connects to it.
-    pub(crate) fn kernel_verdict(&self, ip: IpAddr) -> Result<(), Denied> {
+    /// The route oracle's verdict on a connection to `ip` (on destination port `dport` when
+    /// given; admitted when there is no oracle): asked once per destination and port for as long
+    /// as these facts are in force (a snapshot lives about a second, [`crate::FACTS_TTL`]). An
+    /// IPv4-mapped address is asked as its IPv4 address, which is how a dual-stack socket
+    /// connects to it.
+    pub(crate) fn kernel_verdict(&self, ip: IpAddr, dport: Option<u16>) -> Result<(), Denied> {
         let Some(oracle) = &self.oracle else {
             return Ok(());
         };
@@ -227,15 +517,15 @@ impl HostFacts {
             .verdicts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&dst)
+            .get(&(dst, dport))
             .cloned();
         let verdict = match cached {
             Some(v) => v,
             None => {
-                let v = match oracle.route_to(dst) {
+                let v = match oracle.route_to(dst, dport) {
                     Ok(answer) => self
                         .routes
-                        .judge(answer.as_deref().unwrap_or_default())
+                        .judge_answer(&answer)
                         .map_err(KernelRefusal::Route),
                     Err(e) => Err(KernelRefusal::QueryFailed(e.to_string())),
                 };
@@ -243,7 +533,7 @@ impl HostFacts {
                 if cache.len() >= MAX_VERDICTS {
                     cache.clear();
                 }
-                cache.insert(dst, v.clone());
+                cache.insert((dst, dport), v.clone());
                 v
             }
         };
@@ -282,6 +572,7 @@ impl HostFacts {
         // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
         crate::nat64::ensure_discovered();
         let (routes, rules) = crate::routes::read_routing(&loopback)?;
+        let links = crate::routes::read_links()?;
         let public = if opts.discover_public_addresses {
             crate::public::learned()
         } else {
@@ -296,6 +587,9 @@ impl HostFacts {
                 resolvers: system_resolvers(),
                 public_addresses: public.addresses,
                 public_confirmed: public.confirmed,
+                public_via_nat64: public.via_nat64,
+                links,
+                internet_interfaces: crate::routes::internet_interfaces(),
             },
             opts,
         )
@@ -698,31 +992,43 @@ mod tests {
             public_confirmed: vec![ip("2a01:4f8:1:2::9")],
             ..RawFacts::default()
         };
+        // The default: a /48, the most a site is usually delegated.
         let f = HostFacts::assemble(raw.clone(), &offline());
         assert_eq!(
             f.site_prefixes(),
-            &[p("2606:a300:9024:100::/56"), p("2a01:4f8:1::/56")]
+            &[p("2606:a300:9024::/48"), p("2a01:4f8:1::/48")]
         );
         // A public address is an own address; a non-global "public" answer is dropped.
         assert!(f.own_addresses().contains(&ip("2a01:4f8:1:2::9")));
         assert!(!f.own_addresses().contains(&ip("10.0.0.1")));
-        let f48 = HostFacts::assemble(
-            raw,
+        let f56 = HostFacts::assemble(
+            raw.clone(),
             &FactsOptions {
-                ipv6_site_prefix_len: 48,
+                ipv6_site_prefix_len: 56,
                 ..offline()
             },
         );
         assert_eq!(
-            f48.site_prefixes(),
-            &[p("2606:a300:9024::/48"), p("2a01:4f8:1::/48")]
+            f56.site_prefixes(),
+            &[p("2606:a300:9024:100::/56"), p("2a01:4f8:1::/56")]
+        );
+        let f32 = HostFacts::assemble(
+            raw,
+            &FactsOptions {
+                ipv6_site_prefix_len: 32,
+                ..offline()
+            },
+        );
+        assert_eq!(
+            f32.site_prefixes(),
+            &[p("2606:a300::/32"), p("2a01:4f8::/32")]
         );
         assert_eq!(
             site_prefixes(&[ip("2606:a300::1")], 99),
             vec![p("2606:a300::/64")]
         );
         assert!(FactsOptions::default().validate().is_ok());
-        for bad in [47u8, 65, 0, 128] {
+        for bad in [31u8, 65, 0, 128] {
             let o = FactsOptions {
                 ipv6_site_prefix_len: bad,
                 ..offline()
@@ -748,6 +1054,7 @@ mod tests {
         let opts = FactsOptions {
             discover_public_addresses: false,
             ipv6_site_prefix_len: 48,
+            ..FactsOptions::default()
         };
         let f = HostFacts::assemble(raw.clone(), &opts);
         assert!(f.site_prefixes().is_empty(), "{:?}", f.site_prefixes());
@@ -818,7 +1125,7 @@ mod tests {
                 p("9.9.9.9/32"),
                 p("192.168.1.0/24"),
                 p("198.51.100.0/24"),
-                p("2606:a300:9024:100::/56"),
+                p("2606:a300:9024::/48"),
                 p("2606:a300:9024:184::/64"),
             ]
         );

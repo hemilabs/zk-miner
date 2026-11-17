@@ -190,6 +190,43 @@ pub fn prefix_of_answer(a: Ipv6Addr) -> Option<Prefix> {
     })
 }
 
+/// The NAT64 prefix `a` sits under: the well-known prefix, or the longest network-specific
+/// prefix in force that holds it (`None` for any other address, an SIIT one included).
+pub fn prefix_of(a: Ipv6Addr) -> Option<Prefix> {
+    let ip = IpAddr::V6(a);
+    if crate::ip::mask(ip, 96) == WELL_KNOWN_PREFIX.addr {
+        return Some(WELL_KNOWN_PREFIX);
+    }
+    current()
+        .iter()
+        .filter(|n| n.addr.is_ipv6() && crate::ip::mask(ip, n.len) == n.addr)
+        .max_by_key(|n| n.len)
+        .copied()
+}
+
+/// `v4` as an address under the NAT64 prefix `nsp` (RFC 6052's layout for its length, the u
+/// octet zero): what a DNS64 resolver would synthesize for it.
+pub fn synthesize(nsp: Prefix, v4: Ipv4Addr) -> Ipv6Addr {
+    match nsp_embed(nsp, Prefix::host(IpAddr::V4(v4))).addr {
+        IpAddr::V6(a) => a,
+        IpAddr::V4(_) => Ipv6Addr::UNSPECIFIED,
+    }
+}
+
+/// The NAT64 prefixes in force for synthesizing addresses: the configured ones, then the learned
+/// ones, the well-known prefix included when it is either (the order a translator is preferred
+/// in).
+pub fn in_force() -> Vec<Prefix> {
+    let r = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<Prefix> = Vec::new();
+    for p in r.configured.iter().chain(&r.learned) {
+        if !v.contains(p) {
+            v.push(*p);
+        }
+    }
+    v
+}
+
 /// What [`crate::HostFacts::refused_prefixes`] adds for the NSPs in force, for a consumer that
 /// knows only prefixes and may not know the NSPs (the witness broker): under each one, every
 /// non-global IPv4 range and every one of `v4_refused` (the host's own IPv4 addresses and its
@@ -466,6 +503,40 @@ mod tests {
             assert_eq!(prefix_of_answer(ip6(answer)), Some(p(nsp)), "{answer}");
         }
         assert_eq!(prefix_of_answer(ip6("2606:4700::1111")), None);
+    }
+
+    /// An address is under the well-known prefix, under a network-specific one in force, or
+    /// under none; synthesizing an IPv4 address under a prefix and reading it back agree.
+    #[test]
+    fn the_prefix_an_address_is_under_and_synthesis() {
+        assert_eq!(prefix_of(ip6("64:ff9b::101:101")), Some(WELL_KNOWN_PREFIX));
+        assert_eq!(prefix_of(ip6("64:ff9b:1::101:101")), None);
+        assert_eq!(prefix_of(ip6("::ffff:0:101:101")), None);
+        assert_eq!(prefix_of(ip6("2606:4700::1111")), None);
+        assert_eq!(
+            synthesize(WELL_KNOWN_PREFIX, Ipv4Addr::new(1, 1, 1, 1)),
+            ip6("64:ff9b::101:101")
+        );
+        for (nsp, v4, want) in [
+            (
+                "2001:db8:64::/96",
+                "216.239.32.10",
+                "2001:db8:64::d8ef:200a",
+            ),
+            (
+                "2001:db8:122:344::/64",
+                "192.0.0.170",
+                "2001:db8:122:344:c0:0:aa00:0",
+            ),
+            ("2001:db8::/32", "192.0.0.170", "2001:db8:c000:aa::"),
+        ] {
+            let got = synthesize(p(nsp), v4.parse().unwrap());
+            assert_eq!(got, ip6(want), "{nsp} {v4}");
+        }
+        assert_eq!(
+            prefix_of_answer(synthesize(p("2001:db8::/32"), WELL_KNOWN_V4[0])),
+            Some(p("2001:db8::/32"))
+        );
     }
 
     #[test]

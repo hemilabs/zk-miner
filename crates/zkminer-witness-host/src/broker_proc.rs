@@ -92,7 +92,7 @@ impl BrokerProcess {
         // mode. Nothing the broker says ever reaches it.
         let broker_cfg = BrokerConfig::load_for_connector(config, net_mode)
             .with_context(|| format!("the broker config {}", config.display()))?;
-        let connector = Connector::for_miner(&broker_cfg, &miner_deny, facts_options).context("the broker's connector")?;
+        let connector = Connector::for_miner(&broker_cfg, &miner_deny, facts_options.clone()).context("the broker's connector")?;
         drop(broker_cfg);
         let cgroup = Cgroup::create(
             cgroup_root,
@@ -195,7 +195,8 @@ async fn refresh_facts(client: Arc<BrokerClient>, opts: zkminer_netguard::FactsO
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let facts = match tokio::task::spawn_blocking(move || zkminer_netguard::HostFacts::gather_with(&opts)).await {
+        let o = opts.clone();
+        let facts = match tokio::task::spawn_blocking(move || zkminer_netguard::HostFacts::gather_with(&o)).await {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
                 tracing::warn!("network guard: re-reading this host's facts for the witness broker failed: {e}");

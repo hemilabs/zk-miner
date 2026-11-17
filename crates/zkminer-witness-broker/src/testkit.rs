@@ -432,7 +432,7 @@ pub async fn test_connector(config: &BrokerConfig, hooks: &Hooks) -> Arc<Connect
     let (facts, deny) = match &config.host {
         Some(h) => (zkminer_netguard::HostFacts::new(h.connected.clone(), h.own_addresses.clone()), config.effective_deny_for(h)),
         None => {
-            let (e, o) = (hooks.egress.clone(), config.facts_options);
+            let (e, o) = (hooks.egress.clone(), config.facts_options.clone());
             let facts = tokio::task::spawn_blocking(move || e.host_facts(&o)).await.expect("facts task").expect("host facts");
             (facts, config.effective_deny(&dns_servers))
         }

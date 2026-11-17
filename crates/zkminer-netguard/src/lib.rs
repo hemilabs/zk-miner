@@ -26,19 +26,25 @@
 //!   the URL standard's parser must agree with, host hygiene, and IP literals through [`admit`]);
 //! - [`NetPolicy`]: the mode, refreshing host facts and the operator's deny CIDRs, as one value;
 //! - [`ipfs_gateway_url`] / [`arweave_gateway_url`]: content ids syntax-checked into gateway URLs;
-//! - with the `client` feature (default): [`GuardedResolver`], reqwest's DNS hook that hands the
-//!   connector only admitted addresses from one lookup (no DNS rebinding), and [`guarded_client`],
-//!   an HTTP client that refuses unchecked URLs, ignores proxies, follows redirects only by hand
-//!   ([`GuardedClient::get_following_redirects`]), and decodes no compression.
+//! - [`NetPolicy::vet_connection`]: the last check right before a connection, with its port: the
+//!   kernel's route for it, and the near-hop probe ([`nearhop`]: a destination that answers within
+//!   a few hops of this host is its own network);
+//! - with the `client` feature (default): [`GuardedResolver`], which hands a connection only
+//!   admitted addresses from one lookup (no DNS rebinding), over DNS-over-HTTPS to fixed public
+//!   resolvers in public mode ([`doh`]), and [`guarded_client`], an HTTP client that refuses
+//!   unchecked URLs, vets and pins every hop's addresses, ignores proxies, follows redirects only
+//!   by hand ([`GuardedClient::get_following_redirects`]), and decodes no compression.
 //!
 //! Without the `client` feature the crate needs only `url` (and libc or windows-sys for the
 //! interfaces), for crates that only parse configuration.
 
 pub mod content;
+pub mod doh;
 mod facts;
 mod host;
 pub mod ip;
 pub mod nat64;
+pub mod nearhop;
 mod policy;
 pub mod public;
 pub mod routes;
@@ -52,19 +58,23 @@ mod resolve;
 pub use crate::url::{check_url, MAX_URL_LEN};
 pub use ::url::Url;
 pub use content::{arweave_gateway_url, ipfs_gateway_url, ContentIdDenied};
+pub use doh::DohServer;
 pub use facts::{
-    parse_nameservers, site_prefixes, system_resolvers, FactsOptions, HostFacts, RawFacts,
-    DEFAULT_IPV6_SITE_PREFIX_LEN, IPV6_SITE_PREFIX_LENS, RESOLV_CONF_PATHS,
+    ipv4_site_prefixes, parse_nameservers, site_prefixes, system_resolvers, EgressPath,
+    FactsOptions, HostFacts, RawFacts, DEFAULT_IPV4_SITE_PREFIX_LEN, DEFAULT_IPV6_SITE_PREFIX_LEN,
+    DEFAULT_NEAR_HOP_LIMIT, IPV4_SITE_PREFIX_LENS, IPV6_SITE_PREFIX_LENS, NEAR_HOP_LIMITS,
+    RESOLV_CONF_PATHS,
 };
 pub use host::{check_host_name, HostDenied, INTERNAL_SUFFIXES};
 pub use ip::{canonical_ip, is_global, prefix_is_global, Prefix, PrefixParseError};
+pub use nearhop::{NearProbe, ProbeOutcome, TtlProbe};
 pub use policy::{
-    admit, admit_prefix, Denied, NetMode, NetPolicy, RouteKind, UrlDenied, FACTS_TTL,
+    admit, admit_prefix, admit_to, Denied, NetMode, NetPolicy, RouteKind, UrlDenied, FACTS_TTL,
     FORCED_REFRESH_MIN_AGE,
 };
 pub use routes::{
-    Hop, KernelRoutes, Route, RouteOracle, RouteRefusal, RouteTable, RouteType, Rule, RuleAction,
-    RuleMatch,
+    Hop, KernelAnswer, KernelRoutes, Link, Route, RouteOracle, RouteRefusal, RouteTable, RouteType,
+    Rule, RuleAction, RuleMatch, TUNNEL_KINDS,
 };
 
 /// Chain ids zkminer treats as production markets, where developer mode
@@ -86,6 +96,8 @@ pub use client::{
     guarded_client, guarded_client_with, ClientOptions, FetchError, GuardedClient, USER_AGENT,
 };
 #[cfg(feature = "client")]
+pub use doh::DohLookup;
+#[cfg(feature = "client")]
 pub use resolve::{
     absolute_name, GuardedResolver, Lookup, LookupFuture, ResolveError, SystemLookup, DNS_TIMEOUT,
     MAX_CONCURRENT_LOOKUPS,
@@ -93,6 +105,8 @@ pub use resolve::{
 
 #[cfg(any(test, feature = "test-util"))]
 pub use client::guarded_client_for_test;
+#[cfg(any(test, feature = "test-util"))]
+pub use nearhop::FixedProbe;
 #[cfg(any(test, feature = "test-util"))]
 pub use resolve::ConnectMap;
 
@@ -114,6 +128,9 @@ pub(crate) fn printable(s: &str, max: usize) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod floor_tests;
 
 #[cfg(test)]
 mod tests {

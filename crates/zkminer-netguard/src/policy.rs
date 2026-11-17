@@ -2,13 +2,14 @@
 
 use std::fmt;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::facts::{FactsOptions, HostFacts};
+use crate::facts::{EgressPath, FactsOptions, HostFacts};
 use crate::host::HostDenied;
 use crate::ip::{canonical_ip, is_global, prefix_is_global, Prefix};
+use crate::nearhop::{NearProbe, TtlProbe, Verdict, PROBE_TIMEOUT};
 
 /// Whether connections a requester causes may reach non-public destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -37,7 +38,8 @@ pub enum Denied {
     /// On a prefix one of the host's interfaces is connected to.
     ConnectedPrefix { ip: IpAddr, prefix: Prefix },
     /// In the site around one of the host's own global IPv6 addresses (`[egress]
-    /// ipv6_site_prefix_len`).
+    /// ipv6_site_prefix_len`), or around a global IPv4 address on one of its interfaces
+    /// (`[egress] ipv4_site_prefix_len`).
     SitePrefix { ip: IpAddr, prefix: Prefix },
     /// One of the DNS servers the host uses.
     DnsServer(IpAddr),
@@ -63,7 +65,7 @@ pub enum Denied {
     PrefixHoldsOwnAddress { prefix: Prefix, ip: IpAddr },
     /// A prefix overlaps a network the host is connected to.
     PrefixOverlapsConnected { prefix: Prefix, connected: Prefix },
-    /// A prefix overlaps the site around one of the host's own IPv6 addresses.
+    /// A prefix overlaps the site around one of the host's own addresses.
     PrefixOverlapsSite { prefix: Prefix, site: Prefix },
     /// A prefix holds one of the DNS servers the host uses.
     PrefixHoldsDnsServer { prefix: Prefix, ip: IpAddr },
@@ -72,6 +74,16 @@ pub enum Denied {
     PrefixOverlapsRoute { prefix: Prefix, route: Prefix },
     /// A prefix overlaps one of the operator's deny CIDRs.
     PrefixOverlapsDeny { prefix: Prefix, deny: Prefix },
+    /// This host's public address on the path a connection to `ip` takes is not known (see
+    /// [`HostFacts::unknown_paths`]): it could be this host or its router, reached by hairpin.
+    PublicAddressUnknown { ip: IpAddr, path: EgressPath },
+    /// The destination answered within `hops` hops of this host ([`crate::nearhop`]), or the
+    /// probe that asks failed: `what` says which.
+    NearHop {
+        addr: SocketAddr,
+        hops: u8,
+        what: String,
+    },
 }
 
 /// What is wrong with a URL, apart from where it points.
@@ -141,7 +153,7 @@ impl Denied {
             }
             Denied::SitePrefix { ip, prefix } => write!(
                 f,
-                "{ip} is in {prefix}, the site around this host's own IPv6 address"
+                "{ip} is in {prefix}, the site around one of this host's own addresses"
             ),
             Denied::DnsServer(ip) => write!(f, "{ip} is a DNS server this host uses"),
             Denied::OffDefaultRoute { ip, route, kind } => match kind {
@@ -189,7 +201,7 @@ impl Denied {
             }
             Denied::PrefixOverlapsSite { prefix, site } => write!(
                 f,
-                "{prefix} overlaps {site}, the site around this host's own IPv6 address"
+                "{prefix} overlaps {site}, the site around one of this host's own addresses"
             ),
             Denied::PrefixHoldsDnsServer { prefix, ip } => {
                 write!(f, "{prefix} holds {ip}, a DNS server this host uses")
@@ -198,6 +210,29 @@ impl Denied {
                 f,
                 "{prefix} overlaps {route}, which this host routes other than by its default \
                  route (another gateway, on-link, to itself, or by a policy rule)"
+            ),
+            Denied::PublicAddressUnknown { ip, path } => {
+                if *path == EgressPath::Nat64 {
+                    write!(
+                        f,
+                        "{ip} is reached through a NAT64 translator whose own IPv4 address this \
+                         host has not learned (it could hairpin to the translator or this host); \
+                         {}",
+                        path.advice()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{ip} is reached over {path}, and this host's public {path} address is \
+                         not known (it could be this host or its router, reached by hairpin); {}",
+                        path.advice()
+                    )
+                }
+            }
+            Denied::NearHop { addr, hops, what } => write!(
+                f,
+                "{addr} is within {hops} hops of this host, on its own network (a probe limited \
+                 to {hops} hops: {what})"
             ),
             Denied::NoAdmittedAddress { host, refused } => {
                 write!(f, "{host:?} resolves to no admitted address (")?;
@@ -227,6 +262,7 @@ impl Denied {
                 | Denied::DnsServer(_)
                 | Denied::OffDefaultRoute { .. }
                 | Denied::RouteQueryFailed { .. }
+                | Denied::PublicAddressUnknown { .. }
         )
     }
 }
@@ -242,10 +278,32 @@ impl Denied {
 /// ([`crate::routes::RouteTable::off_default_path`]), and — for facts read from this host — the
 /// kernel, asked how it would route a connection to `ip`, answers with the default path
 /// ([`crate::routes::RouteTable::judge`]; one netlink round trip per destination and facts
-/// snapshot).
+/// snapshot). Last, the host's public address on the path the connection takes must be known
+/// ([`HostFacts::unknown_paths`]).
 pub fn admit(
     mode: NetMode,
     ip: IpAddr,
+    facts: &HostFacts,
+    extra_deny: &[Prefix],
+) -> Result<(), Denied> {
+    admit_inner(mode, ip, None, facts, extra_deny)
+}
+
+/// [`admit`] for a connection to `addr`, its port included: the kernel is asked how it routes a
+/// connection to that address and destination port (a rule may select by port).
+pub fn admit_to(
+    mode: NetMode,
+    addr: SocketAddr,
+    facts: &HostFacts,
+    extra_deny: &[Prefix],
+) -> Result<(), Denied> {
+    admit_inner(mode, addr.ip(), Some(addr.port()), facts, extra_deny)
+}
+
+fn admit_inner(
+    mode: NetMode,
+    ip: IpAddr,
+    dport: Option<u16>,
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
@@ -288,7 +346,10 @@ pub fn admit(
     }
     // Review r2 R2-NG-3: the kernel applies the policy rules exactly; the tables above are the
     // prefix model, which a destination rule into a default-only table slipped past.
-    facts.kernel_verdict(ip)
+    facts.kernel_verdict(ip, dport)?;
+    facts
+        .path_known(ip)
+        .map_err(|path| Denied::PublicAddressUnknown { ip, path })
 }
 
 /// [`admit`] for every address of a prefix at once (an operator's role entry, which admits
@@ -363,6 +424,8 @@ struct FactsCell {
     current: RwLock<Arc<HostFacts>>,
     refresh: bool,
     options: FactsOptions,
+    /// The paths last warned about as unknown ([`HostFacts::unknown_paths`]).
+    warned: std::sync::Mutex<Vec<EgressPath>>,
 }
 
 impl FactsCell {
@@ -383,6 +446,7 @@ impl FactsCell {
         match HostFacts::gather_with(&self.options) {
             Ok(fresh) => {
                 let fresh = Arc::new(fresh);
+                self.warn_unknown(&fresh);
                 *self.current.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
                 fresh
             }
@@ -396,9 +460,46 @@ impl FactsCell {
     }
 }
 
-/// Refuses, at startup, facts under which every destination would be refused, with why (the
-/// host's local routes hold every public address it routes: [`crate::RouteTable::local_refuses_everything`]).
-fn usable(facts: &HostFacts) -> io::Result<()> {
+/// Refuses, at startup in public mode, what the guard cannot run safely or usefully with, saying
+/// what to change:
+///
+/// - a host with a global IPv4 interface address or a default route through a tunnel, unless
+///   `[egress] internal_ranges` is set ([`HostFacts::needs_internal_ranges`]);
+/// - public-address discovery turned off while `[egress] public_addresses` names no address of a
+///   family the host routes;
+/// - local routes that hold every public address the host routes
+///   ([`crate::RouteTable::local_refuses_everything`]).
+fn usable(facts: &HostFacts, options: &FactsOptions) -> io::Result<()> {
+    let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
+    if options.internal_ranges.is_none() {
+        let why = facts.needs_internal_ranges();
+        if !why.is_empty() {
+            return Err(invalid(format!(
+                "{}. Other hosts of a network like that are reached by the same route as the \
+                 internet, and the network guard cannot tell them apart from it. Add \
+                 `internal_ranges = [\"<cidr>\", ...]` to [egress] in the config, listing every \
+                 range of your own network (campus, data centre or VPC ranges, what the tunnel \
+                 leads to); they are refused like deny_cidrs. `internal_ranges = []` states that \
+                 there are none",
+                why.join("; ")
+            )));
+        }
+    }
+    if !options.discover_public_addresses {
+        for v6 in [false, true] {
+            let named = options.public_addresses.iter().any(|a| a.is_ipv6() == v6);
+            if facts.routes().routes_family(v6) && !named {
+                let fam = if v6 { "IPv6" } else { "IPv4" };
+                return Err(invalid(format!(
+                    "[egress] discover_public_addresses = false, but [egress] public_addresses \
+                     names no {fam} address and this host routes {fam}: the network guard must \
+                     know this host's public {fam} address to refuse it. Add `public_addresses = \
+                     [\"<this host's public {fam} address>\"]` to [egress], or turn discovery \
+                     back on"
+                )));
+            }
+        }
+    }
     let Some(local) = facts.routes().local_refuses_everything() else {
         return Ok(());
     };
@@ -415,14 +516,40 @@ fn usable(facts: &HostFacts) -> io::Result<()> {
     ))
 }
 
+impl FactsCell {
+    /// Says loudly, when it changes, which paths no connection may go out over because this
+    /// host's public address on them is not known, and what to set.
+    fn warn_unknown(&self, facts: &HostFacts) {
+        let now = facts.unknown_paths();
+        let mut last = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == now {
+            return;
+        }
+        for path in &now {
+            tracing::warn!(
+                "network guard: this host's public {path} address is not known, so every \
+                 requester-caused connection over {path} is refused (it could reach this host or \
+                 its router by hairpin). To fix: {}",
+                path.advice()
+            );
+        }
+        if now.is_empty() && !last.is_empty() {
+            tracing::info!("network guard: this host's public addresses are known again");
+        }
+        *last = now;
+    }
+}
+
 /// A network policy: the mode, the host's facts, and the operator's extra deny CIDRs. Cheap to clone
 /// (shared state). Every requester-caused connection is judged by one: [`NetPolicy::admit`] for an
-/// address, [`NetPolicy::check_url`] for a URL, and the guarded resolver and client built from it.
+/// address, [`NetPolicy::check_url`] for a URL, [`NetPolicy::vet_connection`] right before a
+/// connection is made, and the guarded resolver and client built from it.
 #[derive(Debug, Clone)]
 pub struct NetPolicy {
     mode: NetMode,
     facts: Arc<FactsCell>,
     deny: Arc<[Prefix]>,
+    probe: Arc<dyn NearProbe>,
 }
 
 impl NetPolicy {
@@ -433,25 +560,38 @@ impl NetPolicy {
     }
 
     /// A policy over this host's own facts, gathered now with `options` (in [`NetMode::Public`])
-    /// and re-read once older than [`FACTS_TTL`], or before a refusal that rests on them. Fails if
-    /// the interfaces or the routing table cannot be read, or `options` is invalid: a public-mode
-    /// policy that does not know the host cannot refuse it.
+    /// and re-read once older than [`FACTS_TTL`], or before a refusal that rests on them; `deny`
+    /// and `options`' `internal_ranges` are refused. Fails if the interfaces or the routing table
+    /// cannot be read, `options` is invalid, or (public mode) the guard cannot run on this host
+    /// as configured (`usable`: a global IPv4 interface address or a tunnel uplink without
+    /// `[egress] internal_ranges`, discovery off without `[egress] public_addresses`, local routes
+    /// that hold every address): a public-mode policy that does not know the host cannot refuse
+    /// it. Warns about every path whose public address is not known.
     pub fn with_options(
         mode: NetMode,
-        deny: Vec<Prefix>,
+        mut deny: Vec<Prefix>,
         options: FactsOptions,
     ) -> io::Result<Self> {
         options
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        for p in options.internal_ranges.iter().flatten() {
+            if !deny.contains(p) {
+                deny.push(*p);
+            }
+        }
         let (facts, refresh) = match mode {
             NetMode::Public => (HostFacts::gather_with(&options)?, true),
             NetMode::DevPrivate => (HostFacts::empty(), false),
         };
         if mode == NetMode::Public {
-            usable(&facts)?;
+            usable(&facts, &options)?;
         }
-        Ok(Self::build(mode, facts, refresh, deny, options))
+        let policy = Self::build(mode, facts, refresh, deny, options);
+        if mode == NetMode::Public {
+            policy.facts.warn_unknown(&policy.facts.get());
+        }
+        Ok(policy)
     }
 
     /// A policy over fixed facts, never re-read: for tests, and for a caller that refreshes the
@@ -473,9 +613,20 @@ impl NetPolicy {
                 current: RwLock::new(Arc::new(facts)),
                 refresh,
                 options,
+                warned: std::sync::Mutex::new(Vec::new()),
             }),
             deny: deny.into(),
+            probe: Arc::new(TtlProbe),
         }
+    }
+
+    /// This policy with `probe` in place of the real near-hop probe: a test, where a server on
+    /// loopback stands in for a public address, says what the probe would have found. Test builds
+    /// only (the `test-util` feature, which only `[dev-dependencies]` enable).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_near_probe(mut self, probe: Arc<dyn NearProbe>) -> Self {
+        self.probe = probe;
+        self
     }
 
     pub fn mode(&self) -> NetMode {
@@ -494,7 +645,12 @@ impl NetPolicy {
 
     /// The options the facts are gathered with.
     pub fn options(&self) -> FactsOptions {
-        self.facts.options
+        self.facts.options.clone()
+    }
+
+    /// The hop limit of the near-hop probe (`[egress] near_hop_limit`).
+    pub fn near_hop_limit(&self) -> u8 {
+        self.facts.options.near_hop_limit
     }
 
     /// [`admit`] under this policy. A refusal that rests on the host's facts is judged again on
@@ -509,6 +665,54 @@ impl NetPolicy {
                 admit(self.mode, ip, &fresh, &self.deny)
             }
             r => r,
+        }
+    }
+
+    /// [`admit_to`] under this policy (a refusal that rests on the facts is judged again on facts
+    /// read now, as [`Self::admit`] does).
+    pub fn admit_to(&self, addr: SocketAddr) -> Result<(), Denied> {
+        if self.mode == NetMode::DevPrivate {
+            return Ok(());
+        }
+        match admit_to(self.mode, addr, &self.facts(), &self.deny) {
+            Err(d) if d.depends_on_facts() && self.facts.refresh => {
+                let fresh = self.facts.get_fresher_than(FORCED_REFRESH_MIN_AGE);
+                admit_to(self.mode, addr, &fresh, &self.deny)
+            }
+            r => r,
+        }
+    }
+
+    /// The last check before a connection to `addr` is made, right before it (public mode;
+    /// developer mode admits everything): [`Self::admit_to`], then the near-hop probe
+    /// ([`crate::nearhop`]): refused when the destination answers within `[egress]
+    /// near_hop_limit` hops, or the probe fails. Blocking (up to the probe's
+    /// [`PROBE_TIMEOUT`]): call it off an async runtime's worker threads.
+    pub fn vet_connection(&self, addr: SocketAddr) -> Result<(), Denied> {
+        if self.mode == NetMode::DevPrivate {
+            return Ok(());
+        }
+        self.admit_to(addr)?;
+        // An IPv4-mapped address is connected to as its IPv4 address: probe that.
+        let target = match addr.ip() {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(addr, |v4| SocketAddr::new(IpAddr::V4(v4), addr.port())),
+            IpAddr::V4(_) => addr,
+        };
+        let hops = self.near_hop_limit();
+        match self.probe.probe(target, hops, PROBE_TIMEOUT).verdict() {
+            Verdict::Far => Ok(()),
+            Verdict::Near(how) => Err(Denied::NearHop {
+                addr,
+                hops,
+                what: format!("it {how}"),
+            }),
+            Verdict::Failed(why) => Err(Denied::NearHop {
+                addr,
+                hops,
+                what: format!("the probe failed: {why}"),
+            }),
         }
     }
 
@@ -720,9 +924,11 @@ mod tests {
         ));
     }
 
+    /// No discovery: the host's public addresses as the operator states them.
     fn offline() -> FactsOptions {
         FactsOptions {
             discover_public_addresses: false,
+            public_addresses: vec![ip("198.51.99.7"), ip("2a02:db8:99::7")],
             ..FactsOptions::default()
         }
     }
@@ -768,7 +974,7 @@ mod tests {
             a("2606:4700:1:5::1"),
             Err(Denied::SitePrefix { .. })
         ));
-        assert_eq!(a("2606:4700:1:100::1"), Ok(()));
+        assert_eq!(a("2606:4700:2::1"), Ok(()));
         // The NAT public address (learned) is the host's own.
         assert!(matches!(a("168.1.2.57"), Err(Denied::OwnAddress(_))));
         // The upstream DNS servers behind the stub.
@@ -901,11 +1107,12 @@ mod tests {
     }
 
     impl crate::routes::RouteOracle for Staged {
-        fn route_to(&self, dst: IpAddr) -> io::Result<Option<Vec<crate::routes::Route>>> {
+        fn route_to(&self, dst: IpAddr, _: Option<u16>) -> io::Result<crate::routes::KernelAnswer> {
             self.asked.lock().unwrap().push(dst);
             self.answers
                 .get(&dst)
                 .cloned()
+                .map(crate::routes::KernelAnswer::from)
                 .ok_or_else(|| io::Error::other("no staged answer"))
         }
     }
@@ -1139,7 +1346,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(fixed.facts().gathered_at(), t);
         let bad = FactsOptions {
-            ipv6_site_prefix_len: 40,
+            ipv6_site_prefix_len: 30,
             ..offline()
         };
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());
@@ -1161,11 +1368,14 @@ mod tests {
             )
         };
         let default = Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2);
-        let e = usable(&facts(vec![
-            default,
-            Route::local(pfx("0.0.0.0/1"), 1),
-            Route::local(pfx("128.0.0.0/1"), 1),
-        ]))
+        let e = usable(
+            &facts(vec![
+                default,
+                Route::local(pfx("0.0.0.0/1"), 1),
+                Route::local(pfx("128.0.0.0/1"), 1),
+            ]),
+            &offline(),
+        )
         .unwrap_err();
         assert!(
             e.to_string().contains("0.0.0.0/1, 128.0.0.0/1")
@@ -1174,12 +1384,12 @@ mod tests {
         );
         // One half: refused where it holds, and the policy starts.
         let f = facts(vec![default, Route::local(pfx("0.0.0.0/1"), 1)]);
-        assert!(usable(&f).is_ok());
+        assert!(usable(&f, &offline()).is_ok());
         assert!(admit(NetMode::Public, ip("8.8.8.8"), &f, &[]).is_err());
         assert_eq!(admit(NetMode::Public, ip("200.1.1.1"), &f, &[]), Ok(()));
         // A TPROXY catch-all is left alone.
         let f = facts(vec![default, Route::local(pfx("0.0.0.0/0"), 1)]);
-        assert!(usable(&f).is_ok());
+        assert!(usable(&f, &offline()).is_ok());
         assert_eq!(admit(NetMode::Public, ip("8.8.8.8"), &f, &[]), Ok(()));
     }
 

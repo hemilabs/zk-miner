@@ -9,7 +9,7 @@ description = "zkminer's network guard: nothing a requester controls makes the m
 default = ["client"]
 # The guarded DNS resolver and HTTP client (reqwest, tokio). Without it, only the pure parts: the
 # address predicate, host-name hygiene, URL checks, the admission decision and the host's facts.
-client = ["dep:reqwest", "dep:tokio"]
+client = ["dep:reqwest", "dep:tokio", "dep:rustls", "dep:webpki-roots"]
 # Test seams for the tests of crates that depend on this one: a resolver that connects to another
 # address than the one it admitted (so a public-mode fetch can be served by a server on loopback).
 # Only ever enabled from a `[dev-dependencies]` entry; nothing in a release build turns it on.
@@ -25,6 +25,12 @@ tracing = { workspace = true }
 # with the compiled-in webpki roots.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 tokio = { workspace = true, optional = true }
+# The public-address discovery's HTTPS reflector (a blocking-free TLS client of its own; ring, as
+# reqwest's rustls uses) and its compiled-in roots.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+# The near-hop probe's socket (hop limit set before connecting).
+socket2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -171,10 +171,10 @@ impl std::fmt::Debug for Connector {
 impl Connector {
     /// The miner's connector for `cfg` — the broker file **as the miner loaded it**, in the
     /// miner's network mode ([`BrokerConfig::load_for_connector`]) — with the miner's `[egress]`
-    /// `deny_cidrs` and facts options. The floor's facts are gathered with the stricter of the
-    /// miner's and the file's `[egress]` options (the shorter IPv6 site, discovery if either asks)
-    /// and re-read as netguard does. The DNS servers are `[dns] servers`, else
-    /// `/etc/resolv.conf`'s, read now.
+    /// `deny_cidrs` and options (its IPv4 site, stated public addresses, internal ranges and
+    /// near-hop limit). The floor's facts are gathered with the stricter of the miner's and the
+    /// file's `[egress]` options (the shorter IPv6 site, discovery if either asks) and re-read as
+    /// netguard does. The DNS servers are `[dns] servers`, else `/etc/resolv.conf`'s, read now.
     pub fn for_miner(
         cfg: &BrokerConfig,
         miner_deny: &[Prefix],
@@ -184,6 +184,7 @@ impl Connector {
         let options = zkminer_netguard::FactsOptions {
             ipv6_site_prefix_len: miner_facts.ipv6_site_prefix_len.min(cfg.facts_options.ipv6_site_prefix_len),
             discover_public_addresses: miner_facts.discover_public_addresses || cfg.facts_options.discover_public_addresses,
+            ..miner_facts
         };
         let floor = NetPolicy::with_options(NetMode::Public, Self::deny_for(cfg, miner_deny, &dns_servers), options)?;
         Self::with_floor(cfg, dns_servers, floor)

@@ -585,36 +585,110 @@ fn covered(p: Prefix, set: &[Prefix]) -> bool {
     covered(Prefix::new(p.addr, p.len + 1), set) && covered(Prefix::new(upper, p.len + 1), set)
 }
 
+/// What the kernel answers for a connection to one destination ([`RouteOracle::route_to`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelAnswer {
+    /// No route (unreachable, prohibited, blackholed).
+    NoRoute,
+    /// The routing entry the connection is sent by: one [`Route`] per nexthop, all with the
+    /// entry's prefix, table and type.
+    Entry(Vec<Route>),
+    /// The connection's route lookups disagree: its first lookup (before the kernel chose its
+    /// source address) matched in table `first_table`, the lookup with that source address
+    /// matched `entry`, in another table. A rule that selects by source (`from`) sends the
+    /// connection somewhere its first lookup did not.
+    Split { first_table: u32, entry: Vec<Route> },
+}
+
+impl From<Option<Vec<Route>>> for KernelAnswer {
+    fn from(entry: Option<Vec<Route>>) -> Self {
+        match entry {
+            Some(e) if !e.is_empty() => KernelAnswer::Entry(e),
+            _ => KernelAnswer::NoRoute,
+        }
+    }
+}
+
 /// Where [`crate::admit`] learns how the kernel routes one destination (see
-/// [`RouteTable::judge`]): the kernel itself ([`KernelRoutes`]) for facts read from this host, a
-/// fake in tests.
+/// [`RouteTable::judge_answer`]): the kernel itself ([`KernelRoutes`]) for facts read from this
+/// host, a fake in tests.
 pub trait RouteOracle: Send + Sync + std::fmt::Debug {
-    /// The routing entry the kernel would use for a connection from this process to `dst` —
-    /// one [`Route`] per nexthop, all with the entry's prefix, table and type — or `Ok(None)`
-    /// when it has no route.
-    fn route_to(&self, dst: IpAddr) -> std::io::Result<Option<Vec<Route>>>;
+    /// How the kernel would route a TCP connection from this process to `dst` (and, when given,
+    /// destination port `dport`).
+    fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer>;
 }
 
 /// The kernel, asked over netlink per destination (Linux; elsewhere every query fails, and a
 /// policy over gathered facts refuses everything: routes are only read on Linux anyway).
 ///
-/// One `RTM_GETROUTE` per destination, non-dump, with the destination, this process's uid and
-/// TCP, and `RTM_F_FIB_MATCH`: the kernel runs its policy rules and answers with the routing
-/// entry it matched (prefix, table, type, every nexthop). No privileges needed. It is what a
-/// connection's first route lookup sees: the firewall mark is 0, the source not yet chosen, the
-/// ports not given.
+/// Non-dump `RTM_GETROUTE`s, unprivileged, each with the destination, the destination port when
+/// known (`RTA_DPORT`), this process's uid and TCP, and `RTM_F_LOOKUP_TABLE` (without it an IPv4
+/// answer names the `main` table whatever table matched). They follow what a TCP `connect` does:
+///
+/// - **IPv4** (`ip_route_connect`, include/net/route.h): the kernel looks the route up once
+///   without a source address to choose one, then again with that source. So the first query
+///   (no `RTM_F_FIB_MATCH`) reads the source the kernel chose (`RTA_PREFSRC`) and the table that
+///   matched; the second, with `RTA_SRC` set to that source and `RTM_F_FIB_MATCH`, answers with
+///   the routing entry the connection is sent by. When the two matched in different tables (a
+///   `from` rule) the answer is [`KernelAnswer::Split`].
+/// - **IPv6** (`ip6_dst_lookup_flow`): one lookup, without a source address; a rule with a source
+///   prefix is matched inside it against the source the route would choose
+///   (`FIB_RULE_FIND_SADDR`). So one query, as a `connect` makes it, with `RTM_F_FIB_MATCH`.
+///
+/// The firewall mark is 0 and the source port unknown (it is chosen after these lookups, and a
+/// lookup with it only follows when a rule selects by source port): see SECURITY.md's known
+/// limits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KernelRoutes;
 
 impl RouteOracle for KernelRoutes {
-    fn route_to(&self, dst: IpAddr) -> std::io::Result<Option<Vec<Route>>> {
-        sys::query(dst)
+    fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer> {
+        sys::query(dst, dport)
     }
 }
 
 impl RouteTable {
-    /// Judges the kernel's answer for one destination ([`RouteOracle::route_to`]; an empty
-    /// answer is no route): admitted only for a unicast route whose every nexthop is an uplink
+    /// Judges the kernel's answer for one destination: [`KernelAnswer::NoRoute`] and
+    /// [`KernelAnswer::Split`] are refused ([`RouteKind::NoRoute`], [`RouteKind::PolicyRule`]),
+    /// an entry is judged by [`Self::judge`].
+    pub fn judge_answer(&self, answer: &KernelAnswer) -> Result<(), RouteRefusal> {
+        match answer {
+            KernelAnswer::NoRoute => self.judge(&[]),
+            KernelAnswer::Entry(entry) => self.judge(entry),
+            KernelAnswer::Split { entry, .. } => Err(RouteRefusal {
+                prefix: entry.first().map_or(
+                    Prefix::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
+                    |r| r.prefix,
+                ),
+                kind: RouteKind::PolicyRule,
+            }),
+        }
+    }
+
+    /// Whether the host has a default route of the family (`/0` or a split default) in an
+    /// ordinary table: whether connections of that family go anywhere at all.
+    pub fn routes_family(&self, v6: bool) -> bool {
+        self.routes
+            .iter()
+            .any(|r| r.prefix.addr.is_ipv6() == v6 && r.is_default_like())
+    }
+
+    /// The interfaces of the default routes of ordinary tables (0 for a route through a nexthop
+    /// object, whose interface the dump does not show).
+    pub fn default_interfaces(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .routes
+            .iter()
+            .filter(|r| r.is_default_like())
+            .map(|r| r.ifindex)
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Judges the kernel's routing entry for one destination (an empty entry is no route):
+    /// admitted only for a unicast route whose every nexthop is an uplink
     /// (the gateway and interface of an ordinary table's default route), or that is itself a
     /// default-like route of an ordinary table. Anything else is refused: a route that delivers
     /// to this host, no route, a default-like route of a table only a rule's selector reaches
@@ -666,6 +740,72 @@ pub(crate) fn read_routing(loopback: &[u32]) -> std::io::Result<(Vec<Route>, Vec
     Ok((routes, rules))
 }
 
+/// One network interface: its index, name, and kind (`IFLA_INFO_KIND`: `wireguard`, `tun`,
+/// `bridge`, …; `None` for a physical device).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Link {
+    pub index: u32,
+    pub name: String,
+    pub kind: Option<String>,
+}
+
+/// The interface kinds that are tunnels: traffic sent into one comes out on another network (a
+/// VPN's, a company's), whose own hosts are then a few hops away and look like the internet. A
+/// `ppp` interface (a PPPoE uplink) is not one.
+pub const TUNNEL_KINDS: &[&str] = &[
+    "wireguard",
+    "tun",
+    "tap",
+    "ipip",
+    "gre",
+    "gretap",
+    "ip6tnl",
+    "ip6gre",
+    "ip6gretap",
+    "sit",
+    "vti",
+    "vti6",
+    "xfrm",
+    "erspan",
+    "ip6erspan",
+    "geneve",
+    "vxlan",
+    "l2tpeth",
+    "gtp",
+];
+
+impl Link {
+    /// Whether the interface is a tunnel ([`TUNNEL_KINDS`]).
+    pub fn is_tunnel(&self) -> bool {
+        self.kind
+            .as_deref()
+            .is_some_and(|k| TUNNEL_KINDS.contains(&k))
+    }
+}
+
+/// Every network interface, with its kind (Linux; elsewhere none).
+pub(crate) fn read_links() -> std::io::Result<Vec<Link>> {
+    sys::links()
+}
+
+/// The interfaces the kernel sends this host's internet traffic out of: its answer for a
+/// connection to a fixed public address of each family (Cloudflare's resolver; nothing is sent).
+/// A family without a route has none.
+pub(crate) fn internet_interfaces() -> Vec<u32> {
+    let mut v: Vec<u32> = [
+        IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111,
+        )),
+    ]
+    .into_iter()
+    .filter_map(|dst| sys::output_interface(dst).ok().flatten())
+    .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {
     //! Netlink `RTM_GETROUTE` and `RTM_GETRULE` dumps, per family. Unprivileged; every table.
@@ -674,7 +814,7 @@ mod sys {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use super::{Hop, Route, RouteType, Rule, RuleAction, RuleMatch};
+    use super::{Hop, KernelAnswer, Link, Route, RouteType, Rule, RuleAction, RuleMatch};
     use crate::ip::Prefix;
 
     const NLMSG_HDRLEN: usize = 16;
@@ -691,15 +831,25 @@ mod sys {
     const RTN_ANYCAST: u8 = 4;
     const RTM_F_CLONED: u32 = 0x200;
     const RTA_DST: u16 = 1;
+    const RTA_SRC: u16 = 2;
     const RTA_OIF: u16 = 4;
+    const RTA_PREFSRC: u16 = 7;
     const RTA_GATEWAY: u16 = 5;
     const RTA_MULTIPATH: u16 = 9;
     const RTA_VIA: u16 = 18;
     const RTA_TABLE: u16 = 15;
     const RTA_UID: u16 = 25;
     const RTA_IP_PROTO: u16 = 27;
+    const RTA_DPORT: u16 = 29;
     const RTA_NH_ID: u16 = 30;
+    const RTM_F_LOOKUP_TABLE: u32 = 0x1000;
     const RTM_F_FIB_MATCH: u32 = 0x2000;
+    const RTM_NEWLINK: u16 = 16;
+    const RTM_GETLINK: u16 = 18;
+    const IFINFOMSG_LEN: usize = 16;
+    const IFLA_IFNAME: u16 = 3;
+    const IFLA_LINKINFO: u16 = 18;
+    const IFLA_INFO_KIND: u16 = 1;
     const RTM_NEWRULE: u16 = 32;
     const RTM_GETRULE: u16 = 34;
     const FR_ACT_TO_TBL: u8 = 1;
@@ -804,9 +954,22 @@ mod sys {
         family: u8,
         parse: impl Fn(&[u8], &mut Vec<T>) -> io::Result<()>,
     ) -> io::Result<Vec<T>> {
+        // `struct rtmsg` and `struct fib_rule_hdr` are both 12 bytes, family first.
+        let mut hdr = [0u8; RTMSG_LEN];
+        hdr[0] = family;
+        dump_consistent_with(request, reply, &hdr, parse)
+    }
+
+    /// [`dump_consistent`] with the request's header given (`struct ifinfomsg` for links).
+    fn dump_consistent_with<T>(
+        request: u16,
+        reply: u16,
+        hdr: &[u8],
+        parse: impl Fn(&[u8], &mut Vec<T>) -> io::Result<()>,
+    ) -> io::Result<Vec<T>> {
         for _ in 0..DUMP_ATTEMPTS {
             let mut out = Vec::new();
-            match dump_family(request, reply, family, &parse, &mut out) {
+            match dump_family(request, reply, hdr, &parse, &mut out) {
                 Ok(()) => return Ok(out),
                 Err(e) if is_interrupted(&e) => continue,
                 Err(e) => return Err(e),
@@ -928,18 +1091,15 @@ mod sys {
     fn dump_family<T>(
         request: u16,
         reply: u16,
-        family: u8,
+        hdr: &[u8],
         parse: &impl Fn(&[u8], &mut Vec<T>) -> io::Result<()>,
         out: &mut Vec<T>,
     ) -> io::Result<()> {
         let sock = socket()?;
         let seq: u32 = 1;
-        // `struct rtmsg` and `struct fib_rule_hdr` are both 12 bytes, family first.
-        let mut hdr = [0u8; RTMSG_LEN];
-        hdr[0] = family;
         send(
             &sock,
-            &message(request, NLM_F_REQUEST | NLM_F_DUMP, seq, &hdr),
+            &message(request, NLM_F_REQUEST | NLM_F_DUMP, seq, hdr),
         )?;
         let mut buf = vec![0u8; RECV_BUF];
         loop {
@@ -1196,12 +1356,63 @@ mod sys {
     /// How long the kernel may take to answer one route query.
     const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-    /// The route the kernel would take for a connection from this process to `dst`: a
-    /// non-dump `RTM_GETROUTE` with `RTA_DST`, `RTA_UID` (this process's uid) and `RTA_IP_PROTO`
-    /// (TCP), and `RTM_F_FIB_MATCH`, so the answer is the matching routing entry itself — its
-    /// prefix, table, type and every nexthop — as the rules (`ip rule`) select it. Unprivileged.
-    /// `Ok(None)` when the kernel has no route (unreachable, prohibited).
-    pub(super) fn query(dst: IpAddr) -> io::Result<Option<Vec<Route>>> {
+    /// What an answer says besides its routes: the table that matched (`RTA_TABLE`), the source
+    /// address the kernel chose (`RTA_PREFSRC`) and the output interface (`RTA_OIF`).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(super) struct AnswerMeta {
+        pub table: u32,
+        pub prefsrc: Option<IpAddr>,
+        pub oif: u32,
+    }
+
+    /// How the kernel would route a TCP connection from this process to `dst` (see
+    /// [`super::KernelRoutes`] for the queries and why IPv4 asks twice).
+    pub(super) fn query(dst: IpAddr, dport: Option<u16>) -> io::Result<KernelAnswer> {
+        if dst.is_ipv6() {
+            return Ok(ask(dst, None, dport, true)?.map(|(e, _)| e).into());
+        }
+        // The connect's first lookup: no source yet. Its answer names the source the kernel
+        // chose and the table it matched in.
+        let Some((_, first)) = ask(dst, None, dport, false)? else {
+            return Ok(KernelAnswer::NoRoute);
+        };
+        // The second, with that source: the route the connection is sent by.
+        let Some((entry, second)) = ask(dst, first.prefsrc, dport, true)? else {
+            return Ok(KernelAnswer::NoRoute);
+        };
+        if entry.is_empty() {
+            return Ok(KernelAnswer::NoRoute);
+        }
+        if first.table != second.table {
+            return Ok(KernelAnswer::Split {
+                first_table: first.table,
+                entry,
+            });
+        }
+        Ok(KernelAnswer::Entry(entry))
+    }
+
+    /// The interface the kernel would send a connection to `dst` out of (`RTA_OIF` of a plain
+    /// route query), `None` without a route.
+    pub(super) fn output_interface(dst: IpAddr) -> io::Result<Option<u32>> {
+        Ok(ask(dst, None, None, false)?
+            .map(|(_, m)| m.oif)
+            .filter(|i| *i != 0))
+    }
+
+    /// One non-dump `RTM_GETROUTE` for a TCP connection from this process to `dst`: with
+    /// `RTA_SRC` when `src` is given, `RTA_DPORT` when `dport` is, this process's uid
+    /// (`RTA_UID`), TCP (`RTA_IP_PROTO`), and `RTM_F_LOOKUP_TABLE` (the table that matched, not
+    /// `main` regardless); with `RTM_F_FIB_MATCH` (`fib_match`) the answer is the matching routing
+    /// entry itself — its prefix, table, type and every nexthop — else the route the kernel
+    /// resolved (with the source it chose). Unprivileged. `Ok(None)` when the kernel has no
+    /// route (unreachable, prohibited).
+    fn ask(
+        dst: IpAddr,
+        src: Option<IpAddr>,
+        dport: Option<u16>,
+        fib_match: bool,
+    ) -> io::Result<Option<(Vec<Route>, AnswerMeta)>> {
         let sock = socket()?;
         let tv = libc::timeval {
             tv_sec: QUERY_TIMEOUT.as_secs() as libc::time_t,
@@ -1220,26 +1431,7 @@ mod sys {
         {
             return Err(io::Error::last_os_error());
         }
-        let (family, width, octets): (u8, u8, Vec<u8>) = match dst {
-            IpAddr::V4(a) => (libc::AF_INET as u8, 32, a.octets().to_vec()),
-            IpAddr::V6(a) => (libc::AF_INET6 as u8, 128, a.octets().to_vec()),
-        };
-        let mut body = vec![0u8; RTMSG_LEN];
-        body[0] = family;
-        body[1] = width;
-        body[8..12].copy_from_slice(&RTM_F_FIB_MATCH.to_ne_bytes());
-        // SAFETY: getuid cannot fail.
-        let uid = unsafe { libc::getuid() };
-        for (ty, data) in [
-            (RTA_DST, octets),
-            (RTA_UID, uid.to_ne_bytes().to_vec()),
-            (RTA_IP_PROTO, vec![libc::IPPROTO_TCP as u8]),
-        ] {
-            body.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
-            body.extend_from_slice(&ty.to_ne_bytes());
-            body.extend_from_slice(&data);
-            body.resize(align4(body.len()), 0);
-        }
+        let body = request_body(dst, src, dport, fib_match);
         let seq = 1;
         send(&sock, &message(RTM_GETROUTE, NLM_F_REQUEST, seq, &body))?;
         let mut buf = vec![0u8; RECV_BUF];
@@ -1251,9 +1443,59 @@ mod sys {
         }
     }
 
-    /// The answer to [`query`] in one datagram: `Some(Some(routes))` for a route,
-    /// `Some(None)` for none, `None` when the datagram does not answer it.
-    pub(super) fn parse_answer(mut b: &[u8], seq: u32) -> io::Result<Option<Option<Vec<Route>>>> {
+    /// The `struct rtmsg` and attributes of [`ask`]'s request.
+    pub(super) fn request_body(
+        dst: IpAddr,
+        src: Option<IpAddr>,
+        dport: Option<u16>,
+        fib_match: bool,
+    ) -> Vec<u8> {
+        let octets = |a: IpAddr| match a {
+            IpAddr::V4(a) => a.octets().to_vec(),
+            IpAddr::V6(a) => a.octets().to_vec(),
+        };
+        let (family, width) = match dst {
+            IpAddr::V4(_) => (libc::AF_INET as u8, 32),
+            IpAddr::V6(_) => (libc::AF_INET6 as u8, 128),
+        };
+        let src = src.filter(|s| s.is_ipv4() == dst.is_ipv4());
+        let mut body = vec![0u8; RTMSG_LEN];
+        body[0] = family;
+        body[1] = width;
+        if src.is_some() {
+            body[2] = width;
+        }
+        let flags = RTM_F_LOOKUP_TABLE | if fib_match { RTM_F_FIB_MATCH } else { 0 };
+        body[8..12].copy_from_slice(&flags.to_ne_bytes());
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        let mut attrs = vec![(RTA_DST, octets(dst))];
+        if let Some(src) = src {
+            attrs.push((RTA_SRC, octets(src)));
+        }
+        attrs.push((RTA_UID, uid.to_ne_bytes().to_vec()));
+        attrs.push((RTA_IP_PROTO, vec![libc::IPPROTO_TCP as u8]));
+        if let Some(port) = dport {
+            // `__be16`, in network byte order.
+            attrs.push((RTA_DPORT, port.to_be_bytes().to_vec()));
+        }
+        for (ty, data) in attrs {
+            body.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            body.extend_from_slice(&ty.to_ne_bytes());
+            body.extend_from_slice(&data);
+            body.resize(align4(body.len()), 0);
+        }
+        body
+    }
+
+    /// The answer to [`ask`] in one datagram: `Some(Some((routes, meta)))` for a route (`routes`
+    /// empty for a type that reaches nothing), `Some(None)` for none, `None` when the datagram
+    /// does not answer it.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn parse_answer(
+        mut b: &[u8],
+        seq: u32,
+    ) -> io::Result<Option<Option<(Vec<Route>, AnswerMeta)>>> {
         while b.len() >= NLMSG_HDRLEN {
             let len = u32_at(b, 0).ok_or_else(malformed)? as usize;
             let ty = u16_at(b, 4).ok_or_else(malformed)?;
@@ -1275,7 +1517,8 @@ mod sys {
                     RTM_NEWROUTE => {
                         let mut out = Vec::new();
                         parse_route_entry(payload, &mut out)?;
-                        return Ok(Some((!out.is_empty()).then_some(out)));
+                        let meta = answer_meta(payload)?;
+                        return Ok(Some(Some((out, meta))));
                     }
                     _ => {}
                 }
@@ -1283,6 +1526,63 @@ mod sys {
             b = &b[align4(len).min(b.len())..];
         }
         Ok(None)
+    }
+
+    /// The table, chosen source and output interface of one `RTM_NEWROUTE` answer.
+    fn answer_meta(p: &[u8]) -> io::Result<AnswerMeta> {
+        if p.len() < RTMSG_LEN {
+            return Err(malformed());
+        }
+        let family = p[0];
+        let mut meta = AnswerMeta {
+            table: u32::from(p[4]),
+            ..AnswerMeta::default()
+        };
+        for (ty, data) in attrs(&p[RTMSG_LEN..])? {
+            match ty {
+                RTA_TABLE => meta.table = u32_at(data, 0).ok_or_else(malformed)?,
+                RTA_PREFSRC => meta.prefsrc = addr(family, data),
+                RTA_OIF => meta.oif = u32_at(data, 0).unwrap_or(0),
+                _ => {}
+            }
+        }
+        Ok(meta)
+    }
+
+    /// Every network interface and its kind: an `RTM_GETLINK` dump (unprivileged).
+    pub(super) fn links() -> io::Result<Vec<Link>> {
+        // `struct ifinfomsg`: family (AF_UNSPEC), pad, type, index, flags, change.
+        let hdr = [0u8; IFINFOMSG_LEN];
+        dump_consistent_with(RTM_GETLINK, RTM_NEWLINK, &hdr, parse_link)
+    }
+
+    /// One `RTM_NEWLINK`: its index, `IFLA_IFNAME`, and `IFLA_INFO_KIND` inside `IFLA_LINKINFO`.
+    pub(super) fn parse_link(p: &[u8], out: &mut Vec<Link>) -> io::Result<()> {
+        if p.len() < IFINFOMSG_LEN {
+            return Err(malformed());
+        }
+        let index = u32_at(p, 4).ok_or_else(malformed)?;
+        let mut name = String::new();
+        let mut kind = None;
+        for (ty, data) in attrs(&p[IFINFOMSG_LEN..])? {
+            match ty {
+                IFLA_IFNAME => {
+                    let raw = data.split(|b| *b == 0).next().unwrap_or_default();
+                    name = String::from_utf8_lossy(raw).into_owned();
+                }
+                IFLA_LINKINFO => {
+                    for (t, d) in attrs(data)? {
+                        if t == IFLA_INFO_KIND {
+                            let raw = d.split(|b| *b == 0).next().unwrap_or_default();
+                            kind = Some(String::from_utf8_lossy(raw).into_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push(Link { index, name, kind });
+        Ok(())
     }
 
     /// One `RTM_NEWROUTE` of a dump into `out` (routes the kernel cached, `RTM_F_CLONED`, and
@@ -1760,6 +2060,7 @@ mod sys {
                 },
                 &FactsOptions {
                     discover_public_addresses: false,
+                    public_addresses: vec![ip("198.51.99.7"), ip("2a02:db8:99::7")],
                     ..FactsOptions::default()
                 },
             );
@@ -2170,13 +2471,18 @@ mod sys {
                 } else {
                     ip("8.8.8.8")
                 };
-                let answer = query(public).expect("route query");
+                let answer = query(public, Some(443)).expect("route query");
                 if has_default {
-                    let a = answer.expect("a route to the internet");
-                    assert_eq!(t.judge(&a), Ok(()), "{public}: {a:?}");
+                    assert!(
+                        matches!(answer, KernelAnswer::Entry(_)),
+                        "a route to the internet: {answer:?}"
+                    );
+                    assert_eq!(t.judge_answer(&answer), Ok(()), "{public}: {answer:?}");
+                    // Without a port, as before.
+                    assert_eq!(t.judge_answer(&query(public, None).unwrap()), Ok(()));
                     checked += 1;
                 } else {
-                    assert!(t.judge(answer.as_deref().unwrap_or_default()).is_err());
+                    assert!(t.judge_answer(&answer).is_err());
                 }
             }
             // This host's own addresses: delivered locally (link-local ones need a scope).
@@ -2187,9 +2493,9 @@ mod sys {
                 {
                     continue;
                 }
-                let answer = query(a).unwrap().expect("a local route");
+                let answer = query(a, Some(80)).unwrap();
                 assert_eq!(
-                    t.judge(&answer).map_err(|r| r.kind),
+                    t.judge_answer(&answer).map_err(|r| r.kind),
                     Err(RouteKind::Local),
                     "{a}: {answer:?}"
                 );
@@ -2210,8 +2516,9 @@ mod sys {
                 if t.local_routes().iter().any(|r| r.holds(n)) {
                     continue;
                 }
-                let answer = query(n).unwrap().expect("an on-link route");
-                let kernel = t.judge(&answer).map_err(|r| r.kind);
+                let answer = query(n, Some(80)).unwrap();
+                assert!(matches!(answer, KernelAnswer::Entry(_)), "{n}: {answer:?}");
+                let kernel = t.judge_answer(&answer).map_err(|r| r.kind);
                 assert_eq!(kernel, Err(RouteKind::OnLink), "{n}: {answer:?}");
                 if stock {
                     assert_eq!(
@@ -2240,19 +2547,29 @@ mod sys {
                 ],
             );
             entry[8..12].copy_from_slice(&RTM_F_CLONED.to_ne_bytes()); // kept in an answer
+            entry.extend(attr(RTA_PREFSRC, &[10, 8, 0, 6]));
+            entry.extend(attr(RTA_TABLE, &100u32.to_ne_bytes()));
             let got = parse_answer(&msg(RTM_NEWROUTE, 1, &entry), 1).unwrap();
-            let routes = got.unwrap().unwrap();
+            let (routes, meta) = got.unwrap().unwrap();
             assert_eq!(routes.len(), 1);
             assert_eq!(routes[0].prefix, "0.0.0.0/1".parse().unwrap());
+            assert_eq!(
+                meta,
+                AnswerMeta {
+                    table: 100,
+                    prefsrc: Some("10.8.0.6".parse().unwrap()),
+                    oif: 7
+                }
+            );
             assert_eq!(
                 parse_answer(&msg(NLMSG_ERROR, 1, &(-libc::ENETUNREACH).to_ne_bytes()), 1).unwrap(),
                 Some(None)
             );
             let blackhole = rt(v4, 8, 6, &[attr(RTA_DST, &[10, 0, 0, 0])]);
-            assert_eq!(
+            assert!(matches!(
                 parse_answer(&msg(RTM_NEWROUTE, 1, &blackhole), 1).unwrap(),
-                Some(None)
-            );
+                Some(Some((r, _))) if r.is_empty()
+            ));
             assert_eq!(
                 parse_answer(&msg(RTM_NEWROUTE, 2, &entry), 1).unwrap(),
                 None
@@ -2260,6 +2577,105 @@ mod sys {
             let e =
                 parse_answer(&msg(NLMSG_ERROR, 1, &(-libc::ENOBUFS).to_ne_bytes()), 1).unwrap_err();
             assert_eq!(e.raw_os_error(), Some(libc::ENOBUFS));
+        }
+
+        /// The request carries the destination port in network byte order (`RTA_DPORT`), the
+        /// chosen source (`RTA_SRC`, with `rtm_src_len`) when given, and asks for the table that
+        /// matched (`RTM_F_LOOKUP_TABLE`) whether or not it asks for the routing entry.
+        #[test]
+        fn route_requests_carry_the_port_the_source_and_the_table_flag() {
+            let dst: IpAddr = "8.8.8.8".parse().unwrap();
+            let src: IpAddr = "192.168.1.33".parse().unwrap();
+            let body = request_body(dst, Some(src), Some(443), true);
+            assert_eq!(body[0], libc::AF_INET as u8);
+            assert_eq!((body[1], body[2]), (32, 32));
+            let flags = u32::from_ne_bytes(body[8..12].try_into().unwrap());
+            assert_eq!(flags, RTM_F_LOOKUP_TABLE | RTM_F_FIB_MATCH);
+            let a = attrs(&body[RTMSG_LEN..]).unwrap();
+            let get = |t: u16| a.iter().find(|(ty, _)| *ty == t).map(|(_, d)| d.to_vec());
+            assert_eq!(get(RTA_DST), Some(vec![8, 8, 8, 8]));
+            assert_eq!(get(RTA_SRC), Some(vec![192, 168, 1, 33]));
+            assert_eq!(get(RTA_DPORT), Some(vec![0x01, 0xbb]));
+            assert_eq!(get(RTA_IP_PROTO), Some(vec![libc::IPPROTO_TCP as u8]));
+            let plain = request_body(dst, None, None, false);
+            assert_eq!(plain[2], 0);
+            assert_eq!(
+                u32::from_ne_bytes(plain[8..12].try_into().unwrap()),
+                RTM_F_LOOKUP_TABLE
+            );
+            let a = attrs(&plain[RTMSG_LEN..]).unwrap();
+            assert!(!a.iter().any(|(t, _)| *t == RTA_SRC || *t == RTA_DPORT));
+            // A source of the other family is never sent.
+            let v6 = request_body("2606:4700::1".parse().unwrap(), Some(src), Some(80), true);
+            assert_eq!(v6[2], 0);
+        }
+
+        /// Link messages parse to their index, name and kind (inside `IFLA_LINKINFO`).
+        #[test]
+        fn link_messages_parse() {
+            let mut p = vec![0u8; IFINFOMSG_LEN];
+            p[4..8].copy_from_slice(&7u32.to_ne_bytes());
+            p.extend(attr(IFLA_IFNAME, b"wg0\0"));
+            let kind = attr(IFLA_INFO_KIND, b"wireguard\0");
+            p.extend(attr(IFLA_LINKINFO | 0x8000, &kind));
+            let mut out = Vec::new();
+            parse_link(&p, &mut out).unwrap();
+            assert_eq!(
+                out,
+                vec![Link {
+                    index: 7,
+                    name: "wg0".into(),
+                    kind: Some("wireguard".into())
+                }]
+            );
+            assert!(out[0].is_tunnel());
+            let mut eth = vec![0u8; IFINFOMSG_LEN];
+            eth[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            eth.extend(attr(IFLA_IFNAME, b"ens18\0"));
+            parse_link(&eth, &mut out).unwrap();
+            assert_eq!(out[1].kind, None);
+            assert!(!out[1].is_tunnel());
+            let ppp = Link {
+                index: 3,
+                name: "ppp0".into(),
+                kind: Some("ppp".into()),
+            };
+            assert!(!ppp.is_tunnel(), "a PPPoE uplink is no tunnel");
+            assert!(parse_link(&[0u8; 4], &mut out).is_err());
+        }
+
+        /// This host's interfaces read (loopback among them, with no kind; `lo` is index 1), and
+        /// the kernel names an interface for internet traffic of every family it routes.
+        #[test]
+        fn this_hosts_links_read() {
+            let links = links().expect("an RTM_GETLINK dump");
+            let lo = links.iter().find(|l| l.index == 1).expect("loopback");
+            assert_eq!(lo.name, "lo");
+            assert!(!lo.is_tunnel());
+            for i in super::super::internet_interfaces() {
+                assert!(links.iter().any(|l| l.index == i), "{i} in {links:?}");
+            }
+            eprintln!("{links:?}");
+        }
+
+        /// IPv4 asks twice (without a source, then with the one the kernel chose): on this host,
+        /// whose rules are the stock ones, both lookups match in the same table, and the port
+        /// changes nothing.
+        #[test]
+        fn this_hosts_two_ipv4_lookups_agree() {
+            let dst: IpAddr = "8.8.8.8".parse().unwrap();
+            let Some((_, first)) = ask(dst, None, Some(443), false).unwrap() else {
+                eprintln!("SKIPPED: no IPv4 route here");
+                return;
+            };
+            let src = first.prefsrc.expect("the kernel chose a source");
+            let (entry, second) = ask(dst, Some(src), Some(443), true).unwrap().unwrap();
+            assert!(!entry.is_empty());
+            assert_eq!(first.table, second.table);
+            assert!(matches!(
+                query(dst, Some(443)).unwrap(),
+                KernelAnswer::Entry(_)
+            ));
         }
 
         /// This host's own tables and rules read, and have what every running Linux host has:
@@ -2289,8 +2705,19 @@ mod sys {
         Ok((Vec::new(), Vec::new()))
     }
 
-    pub(super) fn query(_: std::net::IpAddr) -> std::io::Result<Option<Vec<super::Route>>> {
+    pub(super) fn query(
+        _: std::net::IpAddr,
+        _: Option<u16>,
+    ) -> std::io::Result<super::KernelAnswer> {
         Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn output_interface(_: std::net::IpAddr) -> std::io::Result<Option<u32>> {
+        Ok(None)
+    }
+
+    pub(super) fn links() -> std::io::Result<Vec<super::Link>> {
+        Ok(Vec::new())
     }
 }
 

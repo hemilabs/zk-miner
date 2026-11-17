@@ -1,5 +1,8 @@
-//! The guarded resolver: reqwest's DNS hook, so every connection to a name goes only to addresses
-//! the policy admitted, from one resolution, with nothing left for reqwest to resolve again.
+//! The guarded resolver: every connection to a name goes only to addresses the policy admitted,
+//! from one resolution, with nothing left for the HTTP client to resolve again. (The guarded
+//! client asks it itself, once per hop, and pins the hop to what it answers; it also implements
+//! reqwest's DNS hook.) In public mode its lookup is netguard's DNS-over-HTTPS
+//! ([`crate::doh::DohLookup`]), never the system resolver.
 //!
 //! For each connection reqwest asks [`GuardedResolver`] for the name's addresses (an IP-literal host
 //! never reaches a resolver, which is why [`crate::check_url`] judges literals itself). The resolver
@@ -197,13 +200,19 @@ impl GuardedResolver {
         Ok(admitted)
     }
 
-    fn connect_addr(&self, ip: IpAddr) -> SocketAddr {
+    /// The address connected to for the admitted `ip`: `ip` itself (in test builds, what the
+    /// connect map says).
+    pub(crate) fn connect_ip(&self, ip: IpAddr) -> IpAddr {
         #[cfg(any(test, feature = "test-util"))]
         let ip = match &self.connect_map {
             Some(map) => map(ip),
             None => ip,
         };
-        SocketAddr::new(ip, 0)
+        ip
+    }
+
+    fn connect_addr(&self, ip: IpAddr) -> SocketAddr {
+        SocketAddr::new(self.connect_ip(ip), 0)
     }
 }
 
