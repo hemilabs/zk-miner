@@ -10586,17 +10586,22 @@ dependencies = [
 name = "zkminer-cli"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "alloy",
  "alloy-primitives",
  "alloy-signer-local",
  "anyhow",
  "chrono",
  "clap",
+ "ctr",
  "dirs 6.0.0",
  "hex",
+ "hmac",
  "libc",
+ "pbkdf2",
  "rand 0.8.6",
  "risc0-binfmt",
+ "scrypt",
  "serde",
  "serde_json",
  "sha2",

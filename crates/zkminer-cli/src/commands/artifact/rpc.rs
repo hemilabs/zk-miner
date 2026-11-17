@@ -3,6 +3,11 @@
 //! no proxy, no redirect), paced by a limiter of its own (§13.5 "uses its own limiter"), each
 //! response read under a cap. The URL (which may carry a provider key) is never logged or put in an
 //! error: errors name the host only.
+//!
+//! The publisher trusts this RPC: the pacing gate's readings (heads, safe head, backlog, pause) and
+//! the key checks (stake, operator logs, pending nonces) are its answers. So outside developer mode
+//! it must be `https://` (nobody on the path can answer for it), sends are also paced by the local
+//! clock, and `--verify-rpc-url` checks each deployment against a second provider.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -41,9 +46,16 @@ impl std::fmt::Debug for Rpc {
 
 impl Rpc {
     /// A client for `url` under `policy`, at most `max_requests_per_sec` requests a second. The URL
-    /// is checked by the guard now, so a refused one fails before anything else.
+    /// is checked by the guard now, so a refused one fails before anything else; outside developer
+    /// mode it must be `https://`.
     pub fn new(policy: &NetPolicy, url: &str, max_requests_per_sec: u32) -> Result<Self> {
-        let parsed = policy.check_url(url).map_err(|d| anyhow::anyhow!("--rpc-url is refused by the network guard: {d}"))?;
+        let parsed = policy.check_url(url).map_err(|d| anyhow::anyhow!("the RPC URL is refused by the network guard: {d}"))?;
+        if policy.mode() != zkminer_netguard::NetMode::DevPrivate && parsed.scheme() != "https" {
+            bail!(
+                "the RPC URL must be https:// (the publisher trusts its RPC for pacing and the key checks, \
+                 so nobody on the path may answer for it); plain http is for a local node in developer mode"
+            );
+        }
         let host = parsed.host_str().unwrap_or("").to_string();
         let client = zkminer_netguard::guarded_client(policy).context("building the guarded HTTP client")?;
         Ok(Rpc {
@@ -189,5 +201,16 @@ mod tests {
         }
         let dev = NetPolicy::with_facts(zkminer_netguard::NetMode::DevPrivate, zkminer_netguard::HostFacts::empty(), Vec::new());
         assert_eq!(Rpc::new(&dev, "http://127.0.0.1:8545", 4).unwrap().host(), "127.0.0.1");
+    }
+
+    #[test]
+    fn a_public_rpc_must_be_https_outside_developer_mode() {
+        let public = NetPolicy::with_facts(zkminer_netguard::NetMode::Public, zkminer_netguard::HostFacts::empty(), Vec::new());
+        let e = Rpc::new(&public, "http://rpc.example.com/v1/s3cr3t", 4).unwrap_err().to_string();
+        assert!(e.contains("https://"), "{e}");
+        assert!(!e.contains("s3cr3t"), "the URL is not in the error: {e}");
+        assert_eq!(Rpc::new(&public, "https://rpc.example.com/v1/s3cr3t", 4).unwrap().host(), "rpc.example.com");
+        let dev = NetPolicy::with_facts(zkminer_netguard::NetMode::DevPrivate, zkminer_netguard::HostFacts::empty(), Vec::new());
+        assert!(Rpc::new(&dev, "http://rpc.example.com", 4).is_ok(), "developer mode allows a plain local node");
     }
 }

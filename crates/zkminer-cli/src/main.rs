@@ -283,29 +283,47 @@ enum ArtifactCommand {
     /// Publish FILE in the hemi-code format: chunks of at most 24,575 bytes deployed as `0x00`-
     /// prefixed data contracts, then a manifest; prints the locator only after every deployment is
     /// at or below the safe head and the artifact was read back there with the miner's checks.
-    /// Paced: one chunk in flight, and only while the DA backlog is under 250 KB, the safe-head lag
-    /// at most 300 s, the router not paused and the head fresh. About twenty minutes per MiB.
+    /// Paced: one chunk in flight, at most one send per block and per block time of wall clock, and
+    /// only while the DA backlog is under 250 KB, the safe-head lag at most 300 s, the router not
+    /// paused and the head fresh. About twenty minutes per MiB.
     ///
     /// The key is an encrypted keystore of its own (never the miner's): refused when it is staked
     /// as a prover, authorized as an operator, the configured prover, or has pending transactions
     /// it did not send. Every request goes through the network guard: a node on loopback or the LAN
-    /// is reachable only with `[dev] private_network` for this chain in the configuration.
+    /// is reachable only with `[dev] private_network` for this chain in the configuration. The RPC
+    /// is trusted for the pacing readings and the key checks (hence https://, and --verify-rpc-url
+    /// to check it against a second provider).
     Publish {
         /// The artifact: a WASM builder or a risc0 guest ELF.
         file: std::path::PathBuf,
         /// What FILE is; it must parse as one (publication is permanent).
         #[arg(long, value_parser = ["builder", "elf"])]
         kind: String,
-        /// The HemiProve chain's RPC (never the miner's [chain] rpc_url while it runs).
+        /// The HemiProve chain's RPC (never the miner's [chain] rpc_url while it runs): https:// unless
+        /// the configuration's developer mode is for this chain. The publisher trusts it for the
+        /// pacing gate's readings and the key checks. A URL carrying a provider key is better given
+        /// by --rpc-url-file or ZKMINER_PUBLISH_RPC_URL (argv is visible to every local user).
+        #[arg(long, conflicts_with = "rpc_url_file")]
+        rpc_url: Option<String>,
+        /// Read the RPC URL from this file (its first line).
         #[arg(long)]
-        rpc_url: String,
+        rpc_url_file: Option<std::path::PathBuf>,
+        /// A second RPC of the same chain, from another provider: each deployment's receipt must show
+        /// the same block there before the next chunk is signed, and the read-back is repeated
+        /// there, so one lying or intercepted RPC cannot collect the chunks unsent.
+        #[arg(long, conflicts_with = "verify_rpc_url_file")]
+        verify_rpc_url: Option<String>,
+        /// Read the second RPC's URL from this file (its first line).
+        #[arg(long)]
+        verify_rpc_url_file: Option<std::path::PathBuf>,
         /// The HemiProve chain id the RPC must serve.
         #[arg(long)]
         chain_id: u64,
         /// The publisher's encrypted keystore (Web3 Secret Storage JSON).
         #[arg(long)]
         keystore: std::path::PathBuf,
-        /// Read the keystore password from this file descriptor (3 or above) instead of the terminal.
+        /// Read the keystore password from this file descriptor instead of the terminal: 3 or above,
+        /// a pipe or a regular file the caller opened for this command (`3<file`, or a pipe).
         #[arg(long)]
         password_fd: Option<i32>,
         /// The HemiProve router (default: the known deployment's on --chain-id).
@@ -320,6 +338,17 @@ enum ArtifactCommand {
         /// This command's own request rate limit.
         #[arg(long, default_value_t = 4)]
         max_requests_per_sec: u32,
+        /// The least wall-clock time between two sends, in milliseconds (default: the chain's block
+        /// time: 12 s on Hemi, else measured over the last 64 blocks; at least 1 s outside
+        /// developer mode, and never below a known chain's block time). Paces the publisher
+        /// whatever the RPC reports.
+        #[arg(long)]
+        block_time_ms: Option<u64>,
+        /// Record each mined deployment in this file, and on a later run of the same file to the
+        /// same chain reuse the chunks it lists (their code checked on chain) instead of sending
+        /// them again.
+        #[arg(long)]
+        progress: Option<std::path::PathBuf>,
         /// Send after the cost preview without asking.
         #[arg(long)]
         yes: bool,
@@ -433,8 +462,15 @@ enum BindingCommand {
     },
 }
 
-#[tokio::main(worker_threads = 4)]
-async fn main() -> Result<()> {
+/// What `main` takes from the process before the async runtime starts.
+#[derive(Default)]
+struct Early {
+    /// `artifact publish --password-fd N`, checked and owned.
+    #[cfg(target_os = "linux")]
+    password_fd: Option<std::os::fd::OwnedFd>,
+}
+
+fn main() -> Result<()> {
     // The miner holds the operator's signing key. Non-dumpable, its `/proc/<pid>` entries belong to
     // root, so no other process of this uid can read its memory or environment (`mem`, `environ`,
     // `maps`, `fd`), whatever the host's `ptrace_scope`, and it leaves no core dump. Its own reads of
@@ -446,7 +482,31 @@ async fn main() -> Result<()> {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
     let cli = Cli::parse();
+    // `--password-fd N` is taken now, while every open descriptor above 2 is one the caller passed:
+    // once the runtime, the network guard or a connection has opened its own, a number the caller
+    // did not open could name one of them (and reading it to the end would close it).
+    #[allow(unused_mut)]
+    let mut early = Early::default();
+    #[cfg(target_os = "linux")]
+    if let Commands::Artifact {
+        command:
+            ArtifactCommand::Publish {
+                password_fd: Some(fd),
+                ..
+            },
+    } = &cli.command
+    {
+        early.password_fd = Some(commands::artifact::keys::take_password_fd(*fd)?);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?
+        .block_on(run(cli, early))
+}
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+async fn run(cli: Cli, early: Early) -> Result<()> {
     // Only setup stderr tracing for headless/CLI modes.
     // In TUI mode, any stderr output (from any thread) corrupts the alternate screen.
     let is_tui = matches!(&cli.command,
@@ -639,32 +699,46 @@ async fn main() -> Result<()> {
                     file,
                     kind,
                     rpc_url,
+                    rpc_url_file,
+                    verify_rpc_url,
+                    verify_rpc_url_file,
                     chain_id,
                     keystore,
-                    password_fd,
+                    password_fd: _,
                     router,
                     from_block,
                     tip_wei,
                     max_requests_per_sec,
+                    block_time_ms,
+                    progress,
                     yes,
                     json,
                 },
         } => {
-            use commands::artifact::{plan::Kind, PublishOptions};
+            use commands::artifact::{plan::Kind, rpc_url_from, PublishOptions, RPC_URL_ENV};
             let kind = if kind == "elf" { Kind::Elf } else { Kind::Builder };
+            let rpc_url = rpc_url_from(rpc_url, rpc_url_file.as_deref(), Some(RPC_URL_ENV))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("name the RPC with --rpc-url, --rpc-url-file or {RPC_URL_ENV}")
+                })?;
+            let verify_rpc_url =
+                rpc_url_from(verify_rpc_url, verify_rpc_url_file.as_deref(), None)?;
             commands::artifact::publish(
                 config_path,
                 PublishOptions {
                     file,
                     kind,
                     rpc_url,
+                    verify_rpc_url,
                     chain_id,
                     keystore,
-                    password_fd,
+                    password_fd: early.password_fd,
                     router,
                     from_block,
                     tip_wei,
                     max_requests_per_sec,
+                    block_time_ms,
+                    progress,
                     yes,
                     json,
                 },
