@@ -16,9 +16,10 @@
 
 use std::ffi::c_void;
 
-/// The setting's DRS id, from the driver's own settings table in `nvapi64.dll` (driver 621.24),
-/// where it is listed as "CUDA Sysmem Fallback Policy" with the values 0, 1 and 2. NVAPI's public
-/// headers do not carry it.
+/// The setting's DRS id, as listed in the driver's own settings table (in `nvapi64_impl.dll`,
+/// beside `nvapi64.dll`) under "CUDA Sysmem Fallback Policy" with the values 0, 1 and 2. NVAPI's
+/// public headers do not carry it, and no value set for it has been read back yet: a driver that
+/// keeps the setting under another id reads as not set.
 const CUDA_SYSMEM_FALLBACK_POLICY_ID: u32 = 0x10EC_ECC9;
 
 /// A value of CUDA - Sysmem Fallback Policy.
@@ -60,9 +61,10 @@ impl SysmemFallback {
 impl std::fmt::Display for SysmemFallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotSet => {
-                f.write_str("not set in any profile read here (the driver default falls back)")
-            }
+            Self::NotSet => f.write_str(
+                "not set in any profile read here (the driver default falls back; a driver \
+                     that keeps the setting under another id also reads this way)",
+            ),
             Self::DriverDefault => f.write_str("Driver Default (falls back)"),
             Self::PreferNoFallback => f.write_str("Prefer No Sysmem Fallback"),
             Self::PreferFallback => f.write_str("Prefer Sysmem Fallback"),

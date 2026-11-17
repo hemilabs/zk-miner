@@ -496,7 +496,8 @@ fn sysmem_fallback_check(report: &mut Report) {
              moves into system memory and runs several times slower: it may still finish, or miss \
              its deadline. \"Prefer No Sysmem Fallback\" (NVIDIA Control Panel → Manage 3D \
              settings → CUDA - Sysmem Fallback Policy, globally or for {}) makes it fail at once, \
-             and the job is retried or released",
+             and the job is retried or released (a release costs 5% of its collateral): which is \
+             better depends on how much slack your jobs' deadlines leave",
             PROGRAMS.join(", ")
         )
     } else {

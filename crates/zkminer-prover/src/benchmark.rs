@@ -461,15 +461,17 @@ pub fn metal_job_po2(vram_bytes: Option<u64>) -> u8 {
 }
 
 /// The largest job size whose peak (`risc0_gpu_peak`: measured to 20, extrapolated above) plus
-/// [`RISC0_JOB_VRAM_MARGIN`] fits a CUDA card of `vram` bytes, or `None` when that is unknown (VRAM
-/// not read, or another vendor's card, whose peaks nothing has measured). For pricing a size above
-/// it (`risc0_job_throughput`), never for choosing one: above 20 the figures are an extrapolation.
+/// [`RISC0_JOB_VRAM_MARGIN`] fits a CUDA card of `vram` bytes (0 on one too small for any), or
+/// `None` when that is unknown (VRAM not read, or another vendor's card, whose peaks nothing has
+/// measured). For pricing a size above it (`risc0_job_throughput`), never for choosing one: above
+/// 20 the figures are an extrapolation.
 pub fn risc0_largest_fitting_po2(vram: Option<u64>, gpu_tag: &str) -> Option<u8> {
     use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let vram = vram.filter(|_| gpu_tag == "cuda")?;
-    (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX)
+    let fits = (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX)
         .rev()
-        .find(|p| risc0_gpu_peak(*p).saturating_add(RISC0_JOB_VRAM_MARGIN) <= vram)
+        .find(|p| risc0_gpu_peak(*p).saturating_add(RISC0_JOB_VRAM_MARGIN) <= vram);
+    Some(fits.unwrap_or(0))
 }
 
 /// Throughput factor per segment-size step below the smallest size a row was measured at.
@@ -5358,6 +5360,13 @@ mod tests {
         assert_eq!(fit(24_564), Some(21));
         assert_eq!(fit(32_607), Some(21));
         assert_eq!(fit(12_282), Some(19));
+        // A card too small for any holds none, which is not "unknown": a 6 GB card benchmarked at
+        // 20 by an earlier version and set to 21 is charged above 20.
+        assert_eq!(fit(6_144), Some(0));
+        assert_eq!(
+            risc0_job_throughput(&uncalibrated, 21, fit(6_144)),
+            2_000_000.0 * 0.25
+        );
         assert_eq!(risc0_largest_fitting_po2(Some(16_303 * MIB), "rocm"), None);
         assert_eq!(risc0_largest_fitting_po2(None, "cuda"), None);
         assert_eq!(
