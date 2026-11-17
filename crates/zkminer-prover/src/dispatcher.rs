@@ -1915,8 +1915,14 @@ fn vram_tier_shrank(
 /// server keeps the memory a CUDA one drops (an A770 peaks around 14 GB at 134M), and nothing has
 /// measured a HIP one. With no total, those cards are sized as the larger card's table says and the
 /// server's tier is not assumed — the room predicted is never smaller than the worker's.
+///
+/// Nor when the miner's environment switches off one of the server's small-card memory savers
+/// (`sp1_small_card_savers_off`): the worker and its server inherit it, and the 16 GB table assumes
+/// them on.
 fn sizing_total(key: &str, total: u64) -> Option<u64> {
-    (key.split(':').nth(1) == Some("cuda")).then_some(total)
+    let savers_off =
+        zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
+    (key.split(':').nth(1) == Some("cuda") && !savers_off).then_some(total)
 }
 
 /// What one card's VRAM looks like to ONE slot at a moment in time.

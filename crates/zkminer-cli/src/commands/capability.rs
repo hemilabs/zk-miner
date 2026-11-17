@@ -137,7 +137,12 @@ fn running_verdict(
         }
         BACKEND_SP1 => {
             // The tables are CUDA measurements; another vendor's card is held to the larger one's.
-            let total = slot.vram_bytes.filter(|_| slot.gpu_tag == "cuda");
+            let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| {
+                std::env::var(v).ok()
+            });
+            let total = slot
+                .vram_bytes
+                .filter(|_| slot.gpu_tag == "cuda" && !savers_off);
             let floor =
                 zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1, total);
             // What SP1's smallest measured configuration needs free, whatever the override.

@@ -117,6 +117,14 @@ pub struct DeviceBenchmark {
     /// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
     #[serde(default)]
     pub benchmark_po2: Option<u8>,
+    /// The largest segment size a risc0 calibration proved on this card, which its kept samples
+    /// (all at or below `max_feasible_po2`) may not show: a sweep that saw a larger size fail keeps
+    /// none above its ceiling. `None` on a row calibrated before this was recorded, or never
+    /// calibrated.
+    ///
+    /// `#[serde(default)]` for the reason given on `pci_bus_id`.
+    #[serde(default)]
+    pub highest_proved_po2: Option<u8>,
 }
 
 fn default_po2() -> u8 {
@@ -354,10 +362,16 @@ pub fn risc0_job_po2(
     if let Some(p) = override_po2 {
         return Some(in_range(p));
     }
+    // A card whose VRAM could not be read this time proves at the size its benchmark ran at, which
+    // was its default when it was read: its rate is that size's, and 20 may not fit it.
+    let benchmarked = row
+        .filter(|db| db.prover_backend == "risc0")
+        .and_then(|db| db.benchmark_po2);
     let default = match vram_bytes {
         Some(v) if gpu_tag == "cuda" => risc0_default_job_po2_for_vram(v),
         Some(v) if v < RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED => None,
-        _ => Some(RISC0_DEFAULT_JOB_PO2),
+        Some(_) => Some(RISC0_DEFAULT_JOB_PO2),
+        None => Some(benchmarked.map_or(RISC0_DEFAULT_JOB_PO2, in_range)),
     };
     match row.filter(|db| db.prover_backend == "risc0" && !db.po2_samples.is_empty()) {
         Some(db) => {
@@ -366,7 +380,14 @@ pub fn risc0_job_po2(
             // is a step below the highest size that proved when a larger one failed, so one at or
             // above the default less one. A lower ceiling means the default size failed there (a
             // display holding VRAM, or a card whose VRAM read failed), and the calibration stands.
-            let proved_default = default.filter(|d| db.max_feasible_po2.saturating_add(1) >= *d);
+            //
+            // A ceiling the card's free VRAM set is the highest size that proved, not one below it,
+            // so the default proved only if `highest_proved_po2` reaches it; a row calibrated
+            // before that was recorded keeps the ceiling rule.
+            let proved_default = default.filter(|d| match db.highest_proved_po2 {
+                Some(highest) => highest >= *d,
+                None => db.max_feasible_po2.saturating_add(1) >= *d,
+            });
             Some(proved_default.map_or(calibrated, |d| calibrated.max(d)))
         }
         None => default,
@@ -381,27 +402,49 @@ pub fn risc0_job_po2(
 /// a bound, however far down.
 pub const RISC0_PO2_STEP_DOWN_FACTOR: f64 = 0.5;
 
+/// Throughput factor per segment-size step above the largest size a row was measured at, when that
+/// size is below [`RISC0_DEFAULT_JOB_PO2`]: a card benchmarked or calibrated below it is one its
+/// measured peaks say the next size does not fit (`risc0_benchmark_po2`), so a size set above that
+/// spills into system memory under Windows, or fails. On the 12 GB RTX 4070, measured at 19, the
+/// suite took ~14 minutes at 20 against 4 at 19, and po2 21 ran at 0.24M c/s against 1.22M: a
+/// quarter per step.
+///
+/// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+pub const RISC0_PO2_STEP_UP_UNFIT_FACTOR: f64 = 0.25;
+
 /// The throughput (cycles/s) to plan a risc0 job on this card at `po2`, the card's job size.
 ///
 /// The row's throughput was measured at its `benchmark_po2` ([`RISC0_DEFAULT_JOB_PO2`] on a row
 /// without one). A calibrated card is held to the lower of that and its measured rate at `po2`
 /// (which includes the Groth16 wrap). Below the smallest size either was measured at, each step
-/// down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]; above it, nothing is credited.
+/// down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]. Above the largest, nothing is credited, and on a
+/// card measured only below [`RISC0_DEFAULT_JOB_PO2`] (one too small for it) each step up is
+/// charged [`RISC0_PO2_STEP_UP_UNFIT_FACTOR`]: an operator's size, or the default on a card whose
+/// VRAM could not be read, may not fit it.
 ///
 /// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
 pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
-    let (rate, lowest) = match Po2Profile::from_device_benchmark(row) {
+    let benchmarked = row
+        .benchmark_po2
+        .unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2);
+    let (rate, lowest, highest) = match Po2Profile::from_device_benchmark(row) {
         Some(profile) => {
             let lowest = profile.samples.iter().map(|s| s.po2).min().unwrap_or(po2);
-            (row.throughput.min(profile.throughput_at_po2(po2)), lowest)
+            let highest = profile.samples.iter().map(|s| s.po2).max().unwrap_or(po2);
+            (
+                row.throughput.min(profile.throughput_at_po2(po2)),
+                lowest,
+                highest.max(benchmarked),
+            )
         }
-        None => (
-            row.throughput,
-            row.benchmark_po2
-                .unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2),
-        ),
+        None => (row.throughput, benchmarked, benchmarked),
     };
-    rate * RISC0_PO2_STEP_DOWN_FACTOR.powi(i32::from(lowest.saturating_sub(po2)))
+    let up = if highest < zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2 {
+        RISC0_PO2_STEP_UP_UNFIT_FACTOR.powi(i32::from(po2.saturating_sub(highest)))
+    } else {
+        1.0
+    };
+    rate * up * RISC0_PO2_STEP_DOWN_FACTOR.powi(i32::from(lowest.saturating_sub(po2)))
 }
 
 impl DeviceBenchmark {
@@ -872,6 +915,7 @@ pub fn add_gpu_device_benchmarks(suite: &mut BenchmarkSuite, gpus: &[GpuDesc]) {
                 // An ESTIMATED row (no worker ran), so there is nothing measured to record.
                 host_peak_bytes: None,
                 benchmark_po2: None,
+                highest_proved_po2: None,
             });
         }
     }
@@ -1980,6 +2024,7 @@ fn build_gpu_device_benchmarks_from_workers(
             // Measured by the dispatcher while this worker was still alive.
             host_peak_bytes: r.host_peak_bytes,
             benchmark_po2: r.benchmark_po2,
+            highest_proved_po2: None,
         });
     }
 
@@ -2113,7 +2158,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         }
         let start = PO2_MIN.min(max_po2);
         tracing::info!("{key}: calibrating po2 from {start}, up to {max_po2}");
-        let (samples, ceiling) = sweep_po2(start, max_po2, |po2| {
+        let (samples, ceiling, highest) = sweep_po2(start, max_po2, |po2| {
             // Retry once on failure. A worker can be SIGKILLed out from under us
             // between `ensure_alive`'s liveness check and the response — the worker
             // inherits PR_SET_PDEATHSIG, which is THREAD-scoped, so a retired tokio
@@ -2176,6 +2221,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             );
             db.max_feasible_po2 = ceiling;
         }
+        db.highest_proved_po2 = highest;
         // The MEASURED fastest size within it is the card's job size (see `risc0_job_po2`, which
         // never lets it lower a default size the calibration proved) and what the TUI shows — when
         // the samples can say which is fastest (`calibration_is_usable`). One sample, or samples that
@@ -2233,12 +2279,13 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
 /// card's limit at, does. When no sample lies at or below the ceiling, the ceiling itself is proved
 /// too.
 ///
-/// `prove(p)` proves the calibration workload at `p` and returns its sample.
+/// `prove(p)` proves the calibration workload at `p` and returns its sample. Also returns the
+/// highest size that proved, which the kept samples may not include.
 fn sweep_po2(
     start: u8,
     top: u8,
     mut prove: impl FnMut(u8) -> Option<Po2Sample>,
-) -> (Vec<Po2Sample>, Option<u8>) {
+) -> (Vec<Po2Sample>, Option<u8>, Option<u8>) {
     use zkminer_prover_protocol::RISC0_JOB_PO2_MIN;
     fn keep(samples: &mut Vec<Po2Sample>, s: Po2Sample) {
         if !samples.iter().any(|k| k.po2 == s.po2) {
@@ -2271,7 +2318,7 @@ fn sweep_po2(
         }
     }
     let Some(highest) = samples.iter().map(|s| s.po2).max() else {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     };
     // Reaching the job range's top proves nothing about headroom: the prover refuses anything larger,
     // so no failure above it could be seen. A top set by the card's memory is a MEASURED size that fit
@@ -2282,16 +2329,16 @@ fn sweep_po2(
         highest
     };
     if ceiling < RISC0_JOB_PO2_MIN {
-        return (Vec::new(), None);
+        return (Vec::new(), None, Some(highest));
     }
     if !samples.iter().any(|s| s.po2 <= ceiling) {
         match prove(ceiling) {
             Some(s) if s.po2 <= ceiling => keep(&mut samples, s),
-            _ => return (Vec::new(), None),
+            _ => return (Vec::new(), None, Some(highest)),
         }
     }
     samples.retain(|s| s.po2 <= ceiling);
-    (samples, Some(ceiling))
+    (samples, Some(ceiling), Some(highest))
 }
 
 /// Run simulated benchmarks for all canonical programs.
@@ -3179,6 +3226,7 @@ mod tests {
             po2_samples: Vec::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         };
         let target = |device: &str, backend: &str| (device.to_string(), backend.to_string());
         let targets = [
@@ -3650,6 +3698,7 @@ mod tests {
             po2_samples: Vec::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         };
         assert_eq!(db.throughput_cov(), 0.0);
     }
@@ -3675,6 +3724,7 @@ mod tests {
             po2_samples: Vec::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         };
         assert_eq!(db.throughput_cov(), 0.0);
     }
@@ -3700,6 +3750,7 @@ mod tests {
             po2_samples: Vec::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         };
         let cov = db.throughput_cov();
         assert!((cov - 0.333).abs() < 0.01, "expected ~0.333, got {cov}");
@@ -4462,6 +4513,7 @@ mod tests {
             po2_samples: samples,
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         };
 
         let profile = Po2Profile::from_device_benchmark(&db).expect("profile from samples");
@@ -4492,6 +4544,7 @@ mod tests {
             po2_samples: samples,
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 
@@ -4561,6 +4614,31 @@ mod tests {
             Some(18)
         );
         assert_eq!(cuda_job_po2(None, Some(&calibrated(18)), None), Some(18));
+        // A sweep capped at 19 by a 16 GB card's free VRAM proved 19 and never tried 20: it stands.
+        let capped = DeviceBenchmark {
+            highest_proved_po2: Some(19),
+            ..calibrated(19)
+        };
+        assert_eq!(cuda_job_po2(None, Some(&capped), Some(16 * GIB)), Some(19));
+        // One that proved 20 and saw 21 fail (ceiling 19) is raised to its default 20.
+        let proved_20 = DeviceBenchmark {
+            highest_proved_po2: Some(20),
+            ..calibrated(19)
+        };
+        assert_eq!(
+            cuda_job_po2(None, Some(&proved_20), Some(16 * GIB)),
+            Some(20)
+        );
+        // A card whose VRAM could not be read proves at the size it was benchmarked at.
+        let benchmarked_19 = DeviceBenchmark {
+            benchmark_po2: Some(19),
+            ..risc0_row(Vec::new(), 19, 19)
+        };
+        assert_eq!(cuda_job_po2(None, Some(&benchmarked_19), None), Some(19));
+        assert_eq!(
+            cuda_job_po2(None, Some(&benchmarked_19), Some(12 * GIB)),
+            Some(19)
+        );
         // Never above its ceiling, and within the job range (a cache from before the range).
         let mut over = calibrated(19);
         over.optimal_po2 = 21;
@@ -4612,11 +4690,24 @@ mod tests {
         // credited above it and the same charge per step below.
         let at_19 = DeviceBenchmark {
             benchmark_po2: Some(19),
+            highest_proved_po2: None,
             ..risc0_row(Vec::new(), 19, 19)
         };
         assert_eq!(risc0_job_throughput(&at_19, 19), 2_000_000.0);
-        assert_eq!(risc0_job_throughput(&at_19, 20), 2_000_000.0);
         assert_eq!(risc0_job_throughput(&at_19, 18), 2_000_000.0 * 0.5);
+        // Above it is a size its measurements say does not fit (an operator's 20, or 20 when its
+        // VRAM could not be read): charged a quarter per step, not credited the rate of the size
+        // that fits.
+        assert_eq!(risc0_job_throughput(&at_19, 20), 2_000_000.0 * 0.25);
+        assert_eq!(risc0_job_throughput(&at_19, 21), 2_000_000.0 * 0.25 * 0.25);
+        // Calibrated only up to 19 (its free VRAM capped the sweep): the same.
+        let capped = DeviceBenchmark {
+            benchmark_po2: Some(19),
+            ..risc0_row(vec![sample(18, 32, 1.0e6), sample(19, 16, 1.5e6)], 19, 19)
+        };
+        assert_eq!(risc0_job_throughput(&capped, 20), 1_500_000.0 * 0.25);
+        // A card measured at 20 is not charged above it, as before.
+        assert_eq!(risc0_job_throughput(&uncalibrated, 22), 2_000_000.0);
     }
 
     #[test]
@@ -4647,7 +4738,7 @@ mod tests {
     /// it asked for.
     fn sweep(start: u8, top: u8, fits: Option<u8>) -> (Vec<u8>, Option<u8>, Vec<u8>) {
         let mut asked = Vec::new();
-        let (samples, ceiling) = sweep_po2(start, top, |p| {
+        let (samples, ceiling, _) = sweep_po2(start, top, |p| {
             asked.push(p);
             fits.filter(|f| p <= *f).map(|_| sample(p, 4, 1e6))
         });
@@ -4691,15 +4782,31 @@ mod tests {
         );
         // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure.
         let mut asked = Vec::new();
-        let (samples, ceiling) = sweep_po2(18, 22, |p| {
+        let (samples, ceiling, highest) = sweep_po2(18, 22, |p| {
             asked.push(p);
             Some(sample(p.min(19), 4, 1e6))
         });
+        assert_eq!(highest, Some(19));
         assert_eq!(
             samples.iter().map(|s| s.po2).collect::<Vec<_>>(),
             vec![18, 19]
         );
         assert_eq!((ceiling, asked), (Some(19), vec![18, 19, 20]));
+    }
+
+    #[test]
+    fn a_sweep_reports_the_highest_size_that_proved() {
+        let highest = |start, top, fits: Option<u8>| {
+            sweep_po2(start, top, |p| {
+                fits.filter(|f| p <= *f).map(|_| sample(p, 4, 1e6))
+            })
+            .2
+        };
+        // 20 proved and 21 failed: the ceiling is 19, but 20 proved.
+        assert_eq!(highest(18, 22, Some(20)), Some(20));
+        // Capped at 19 by free VRAM: 19 is the highest, and 20 never ran.
+        assert_eq!(highest(18, 19, Some(22)), Some(19));
+        assert_eq!(highest(18, 22, None), None);
     }
 
     #[test]
@@ -4739,6 +4846,7 @@ mod cache_power_tests {
             po2_samples: Vec::new(),
             host_peak_bytes: None,
             benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 
@@ -4879,6 +4987,7 @@ mod host_peak_tests {
             po2_samples: Vec::new(),
             host_peak_bytes: peak,
             benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 

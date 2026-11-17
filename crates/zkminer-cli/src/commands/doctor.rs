@@ -446,7 +446,8 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             Level::Info,
             "benchmark",
             "no saved benchmark for this hardware: `zkminer run` measures the cards first (or run \
-             `zkminer benchmark` beforehand)",
+             `zkminer benchmark --calibrate` beforehand; a plain `zkminer benchmark` saves \
+             nothing)",
         );
     }
 }

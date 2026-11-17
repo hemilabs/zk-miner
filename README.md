@@ -355,7 +355,9 @@ Worth knowing:
   shard size when about 11.6 GiB of the card is free, which an idle 12 GB card has, and at the
   smaller one (about 20% slower) from 9 GiB, so a card driving a display steps down by itself.
   On NVIDIA cards above 16 GiB, and on AMD and Intel cards of any size (not yet measured), SP1
-  needs 15.2 GiB free; `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, untested: a larger job can
+  needs 15.2 GiB free, as do 12–16 GB NVIDIA cards when `SP1_GPU_DROP_LDES` or
+  `SP1_GPU_RECOMPUTE_FIRST_LAYER` is set to `0` (the server's memory savers the figures above
+  assume); `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that, untested: a larger job can
   run out part-way and lose its lock. RISC Zero proves at po2 19 on a 12 GB card, 20 from 14
   GiB, and benchmarks at that size. A 12 GB card benchmarked by an earlier version (at 20, which
   doesn't fit) has saved rates far too low: re-benchmark it with `b` on the Benchmark screen, or

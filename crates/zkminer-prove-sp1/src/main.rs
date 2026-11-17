@@ -1499,12 +1499,15 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             .map(|b| format!("{:.1} GB", b as f64 / 1e9))
             .unwrap_or_else(|| "unknown".into()),
     );
-    // The measured tables are CUDA measurements, so another vendor's server is sized by the larger
+    // The measured tables are CUDA measurements, taken with the server's small-card memory savers
+    // on, so another vendor's server, or one with a saver switched off, is sized by the larger
     // card's table, as the dispatcher sizes it (`sizing_total`).
+    let savers_off =
+        zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
     apply_sp1_worker_tuning(
         sp1_scale,
         available_vram,
-        vram_bytes.filter(|_| warmup::drives_cuda()),
+        vram_bytes.filter(|_| warmup::drives_cuda() && !savers_off),
     );
     #[cfg(windows)]
     windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
