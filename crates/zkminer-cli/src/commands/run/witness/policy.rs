@@ -34,6 +34,21 @@ pub(crate) const UNSERVED_SET_ASIDE: Duration = Duration::from_secs(600);
 /// allowlisted caller's job is looked at again soon after serving comes back.
 pub(crate) const SERVING_OFF_SET_ASIDE: Duration = Duration::from_secs(60);
 
+/// Why no new witness work may start now, though nothing is wrong with any job: the miner drives
+/// held locks only, the operator paused claiming, or switched risc0 off. Routing sets a witness job
+/// aside for as long as serving is off then; a task already running re-checks before each step.
+pub(crate) fn claims_held_reason(held_locks_only: bool, paused: bool, risc0_off: bool) -> Option<&'static str> {
+    if held_locks_only {
+        Some("the miner drives held locks only")
+    } else if paused {
+        Some("claiming is paused")
+    } else if risc0_off {
+        Some("risc0 is switched off")
+    } else {
+        None
+    }
+}
+
 /// The set-aside for a job whose verdict holds until `until` (unix seconds) at `now`: the rest of
 /// the verdict.
 pub(crate) fn verdict_set_aside(until: u64, now: u64) -> Duration {
@@ -822,6 +837,14 @@ mod tests {
         assert!(!card_room(1, 1, 2));
         assert!(!card_room(3, 0, 2), "a look-ahead queue of inline work");
         assert!(card_room(0, 0, 0), "a cap of 0 counts as 1");
+    }
+
+    #[test]
+    fn new_witness_work_waits_for_the_operator() {
+        assert_eq!(claims_held_reason(false, false, false), None);
+        assert_eq!(claims_held_reason(false, false, true), Some("risc0 is switched off"));
+        assert_eq!(claims_held_reason(false, true, true), Some("claiming is paused"));
+        assert_eq!(claims_held_reason(true, false, false), Some("the miner drives held locks only"));
     }
 
     #[test]

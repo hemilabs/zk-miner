@@ -95,7 +95,7 @@ use zkminer_witness_store::{
 
 use super::super as run;
 use super::policy::{
-    caller_admitted, caller_tally_key, card_room, deadline_fits, device_tally_key, divergence_reusable,
+    caller_admitted, caller_tally_key, card_room, claims_held_reason, deadline_fits, device_tally_key, divergence_reusable,
     estimate_prove_secs, fixed_allowance_secs, fulfils_besides, funds_cover, gate_refusal_reason, host_max_guest_cycles,
     is_witness_input, not_claimable_reason, parse_session_cap, pin_lock_gone, proving_cutoff, rate_secs_left,
     reservation_wei, segment_need, segments_fit, session_cap_admits, short, tally_count, verdict_plan,
@@ -918,7 +918,9 @@ impl WitnessRuntime {
             }
             return unserved(UNSERVED_SET_ASIDE);
         }
-        if !self.serving_enabled() {
+        // Not served while the operator holds new work back (risc0 switched off): set aside like a job
+        // with serving off, instead of starting a task that only finds this out.
+        if !self.serving_enabled() || self.claims_held_now().is_some() {
             return unserved(SERVING_OFF_SET_ASIDE);
         }
         if shutting_down() {
@@ -1384,17 +1386,23 @@ impl WitnessRuntime {
     /// Why new witness work must not start now, though nothing is wrong with any job: the operator
     /// paused claiming (or the miner drives held locks only), or switched risc0 off.
     async fn claims_held(&self) -> Option<&'static str> {
-        if run::held_locks_only() {
-            return Some("the miner drives held locks only");
-        }
         let st = self.state.read().await;
-        if st.paused {
-            return Some("claiming is paused");
-        }
-        if st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0) {
-            return Some("risc0 is switched off");
-        }
-        None
+        claims_held_reason(
+            run::held_locks_only(),
+            st.paused,
+            st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
+        )
+    }
+
+    /// [`Self::claims_held`] for the brain's routing, without waiting on the state: `None` while it
+    /// is being written just now (the task's own check then decides).
+    fn claims_held_now(&self) -> Option<&'static str> {
+        let st = self.state.try_read().ok()?;
+        claims_held_reason(
+            run::held_locks_only(),
+            st.paused,
+            st.runtime_settings.disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
+        )
     }
 
     /// Everything before a witness lock (§5.2 steps 0–9). `None` when the job is not locked now.
