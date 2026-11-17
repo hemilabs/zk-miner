@@ -3,6 +3,11 @@ pub mod init;
 pub mod mock;
 pub mod run;
 pub mod simulate;
+#[cfg(target_os = "linux")]
+pub mod simulate_witness;
+#[cfg(not(target_os = "linux"))]
+#[path = "simulate_witness_stub.rs"]
+pub mod simulate_witness;
 #[cfg(feature = "sp1-demo")]
 pub mod sp1_demo;
 pub mod stake;

@@ -98,19 +98,69 @@ enum Commands {
     },
     /// Measure jobs as the miner sizes them before a claim, whatever their state, and print one JSON
     /// line per job: cycles, or why not. Signs and sends nothing; starts measure workers only.
+    ///
+    /// With --descriptor, simulate a witness-construction job that is not on chain through the
+    /// miner's own pre-claim pipeline (sandboxed builder and execute, binding check) and print one
+    /// JSON report; --adversarial then attacks its witness and host inputs. Needs a delegated cgroup:
+    /// run it under `systemd-run --user --scope -p Delegate=yes`.
     Simulate {
         /// A job to measure (repeatable).
         #[arg(long = "job", value_name = "JOB_ID")]
         jobs: Vec<alloy::primitives::B256>,
+        /// A witness-job descriptor file (JSON, or TOML by its extension), as `zkminer witness
+        /// envelope encode --descriptor-out` writes it.
+        #[arg(long, conflicts_with_all = ["jobs", "stdin"])]
+        descriptor: Option<std::path::PathBuf>,
+        /// The builder artifact (WASM) instead of fetching it by the envelope's builderURIs; it must
+        /// hash to the builderId.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        builder: Option<std::path::PathBuf>,
+        /// The guest ELF instead of reading it from the ProgramRegistry; its image id must be the
+        /// programId.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        elf: Option<std::path::PathBuf>,
+        /// The prover address in the journal prefix (default: [witness] prover_address, else zero). A
+        /// prefix job is reproduced exactly only with the real jobId and prover.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        prover: Option<alloy::primitives::Address>,
+        /// The risc0 keccak po2 (`RISC0_KECCAK_PO2` of the provers).
+        #[arg(long, default_value_t = 17, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        keccak_po2: u8,
+        /// The broker's configuration: the requester's own endpoints (default: [broker] config).
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        broker_config: Option<std::path::PathBuf>,
+        /// Write the witness report here instead of stdout.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        out: Option<std::path::PathBuf>,
+        /// Attack the witness: structured mutations of W, re-execution under two sys_rand keys, two
+        /// po2s and two keccak po2s, and a differential run against two evm-rpc providers. Exits
+        /// non-zero unless the verdict is `pass`.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        adversarial: bool,
+        /// The adversarial run's bound, in seconds.
+        #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_ADVERSARIAL_SECS, requires = "adversarial")]
+        adversarial_secs: u64,
+        /// Byte flips at sampled offsets of W.
+        #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_FLIPS, requires = "adversarial")]
+        flips: usize,
+        /// The scheme id whose structured mutations apply (default: the journal header's first word).
+        #[arg(long, requires = "adversarial")]
+        scheme: Option<u64>,
+        /// The two `[[evm_rpc]]` aliases of the broker configuration for the differential run
+        /// (default: the first two serving the job's chain).
+        #[arg(long, value_delimiter = ',', requires = "adversarial")]
+        providers: Option<Vec<String>>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
         /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
         /// descriptor's log scan; the fulfil's public values let the report say whether the measured
         /// journal is the proven one).
         #[arg(long)]
         stdin: bool,
-        /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).
-        #[arg(long, default_value_t = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)]
-        po2: u8,
+        /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment). With
+        /// --descriptor, the sizes to execute at, as one (`20`), a range (`16..22`) or a list
+        /// (`16,20`); default every job size, 16..=22.
+        #[arg(long)]
+        po2: Option<String>,
         /// Bound on one execution, in seconds: at least 60 (a lower value is raised to it), at most
         /// 86400. An SP1 worker's one-time setup is not part of it.
         #[arg(long, default_value_t = 600)]
@@ -129,7 +179,8 @@ enum Commands {
         /// again; 0 = never remembered.
         #[arg(long, default_value_t = commands::simulate::DEFAULT_PROGRAM_FAILURE_TTL_SECS)]
         program_failure_ttl_secs: u64,
-        /// The risc0 worker binary (e.g. zkminer-prove-risc0-cpu); overrides the config.
+        /// The risc0 worker binary (e.g. zkminer-prove-risc0-cpu); overrides the config. With
+        /// --descriptor, the execute worker (default: [witness] execute_binary).
         #[arg(long)]
         risc0_worker: Option<std::path::PathBuf>,
         /// The SP1 worker binary (zkminer-prove-sp1); overrides the config.
@@ -406,6 +457,48 @@ async fn main() -> Result<()> {
             commands::run::run(config_path, headless || watch_only, watch).await
         }
         Commands::Simulate {
+            descriptor: Some(descriptor),
+            builder,
+            elf,
+            prover,
+            keccak_po2,
+            broker_config,
+            out,
+            adversarial,
+            adversarial_secs,
+            flips,
+            scheme,
+            providers,
+            po2,
+            execute_timeout_secs,
+            risc0_worker,
+            cache_dir,
+            ..
+        } => {
+            let po2s = commands::simulate::parse_po2_set(po2.as_deref().unwrap_or("16..=22"))?;
+            anyhow::ensure!((14..=18).contains(&keccak_po2), "--keccak-po2 must be within 14..=18");
+            let opts = commands::simulate_witness::WitnessSimOptions {
+                descriptor,
+                builder,
+                elf,
+                prover,
+                po2s,
+                keccak_po2,
+                broker_config,
+                execute_worker: risc0_worker,
+                cache_dir,
+                execute_timeout: simulate_bound("--execute-timeout-secs", execute_timeout_secs),
+                out,
+                adversarial: adversarial.then(|| commands::simulate_witness::AdversarialOptions {
+                    budget: std::time::Duration::from_secs(adversarial_secs),
+                    flips,
+                    scheme,
+                    providers,
+                }),
+            };
+            commands::simulate_witness::run(config_path, opts).await
+        }
+        Commands::Simulate {
             jobs,
             stdin,
             po2,
@@ -416,7 +509,15 @@ async fn main() -> Result<()> {
             risc0_worker,
             sp1_worker,
             cache_dir,
+            ..
         } => {
+            let po2 = match po2.as_deref() {
+                None => zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2,
+                Some(s) => match commands::simulate::parse_po2_set(s)?.as_slice() {
+                    [one] => *one,
+                    _ => anyhow::bail!("--po2 takes one size for on-chain jobs"),
+                },
+            };
             commands::simulate::run(
                 config_path,
                 commands::simulate::SimulateOptions {
@@ -660,7 +761,7 @@ mod tests {
                     ]
                 );
                 assert!(stdin);
-                assert_eq!(po2, 21);
+                assert_eq!(po2.as_deref(), Some("21"));
                 assert_eq!(execute_timeout_secs, 600);
                 assert_eq!(max_cycles, 1_000_000_000);
                 assert_eq!(program_failure_ttl_secs, 6 * 3600);
@@ -689,5 +790,28 @@ mod tests {
             _ => panic!("not a simulate command"),
         }
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--job", "0x12"]).is_err());
+        // Descriptor mode and its flags.
+        let cli = Cli::try_parse_from([
+            "zkminer", "simulate", "--descriptor", "d.json", "--builder", "b.wasm", "--po2", "16..18", "--adversarial",
+            "--adversarial-secs", "60", "--providers", "a,b", "--scheme", "1",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Simulate { descriptor, builder, po2, adversarial, adversarial_secs, providers, scheme, flips, .. } => {
+                assert_eq!(descriptor, Some("d.json".into()));
+                assert_eq!(builder, Some("b.wasm".into()));
+                assert_eq!(po2.as_deref(), Some("16..18"));
+                assert!(adversarial);
+                assert_eq!(adversarial_secs, 60);
+                assert_eq!(providers, Some(vec!["a".to_string(), "b".to_string()]));
+                assert_eq!(scheme, Some(1));
+                assert_eq!(flips, commands::simulate_witness::DEFAULT_FLIPS);
+            }
+            _ => panic!("not a simulate command"),
+        }
+        // Descriptor mode excludes the on-chain modes; its flags need it.
+        assert!(Cli::try_parse_from(["zkminer", "simulate", "--descriptor", "d.json", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "simulate", "--stdin", "--builder", "b.wasm"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "simulate", "--descriptor", "d", "--flips", "3"]).is_err());
     }
 }

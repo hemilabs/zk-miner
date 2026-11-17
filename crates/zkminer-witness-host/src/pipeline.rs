@@ -86,6 +86,34 @@ pub type EvictionValueFn = Arc<dyn Fn(&BundleMeta) -> u64 + Send + Sync>;
 /// A hook's answer.
 pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// The largest builder artifact a host reads by default (the broker's default `[artifacts]
+/// max_builder_bytes`; the broker also enforces its own).
+pub const DEFAULT_MAX_ARTIFACT_BYTES: u64 = 4 << 20;
+/// Wall clock of one sandboxed execute (every po2 of the host's set).
+pub const DEFAULT_EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
+/// The most `maxGuestCycles` a host admits when its configuration names no maximum and nothing
+/// lower is derived from its cards (the miner's own derivation is capped here too).
+pub const MAX_HOST_GUEST_CYCLES: u64 = 1 << 34;
+
+/// The host maxima and builder clamps of `[witness]` (plan §7.1, §19), with `max_guest_cycles` as
+/// the caller derived it: the miner from its cards and proving timeout when the configuration
+/// names none. One function for the miner and `zkminer simulate`, so a simulation is judged by the
+/// limits a miner with the same configuration applies.
+pub fn host_maxima(w: &zkminer_config::witness::WitnessConfig, max_guest_cycles: u64) -> HostMaxima {
+    let c = &w.builder_clamps;
+    HostMaxima {
+        max_witness_bytes: w.max_witness_bytes,
+        max_guest_cycles,
+        max_fetches: c.fetches,
+        max_fetch_bytes: c.fetch_bytes,
+        max_request_bytes: c.request_bytes,
+        max_response_bytes: c.response_bytes,
+        max_builder_fuel: c.fuel,
+        max_builder_memory_bytes: c.memory_bytes,
+        max_builder_seconds: c.seconds,
+    }
+}
+
 /// The `pids.max` of an execute cgroup: the worker runs in two tasks (its main thread and the
 /// executor's segment thread); the rest is slack.
 pub const EXECUTE_PIDS_MAX: u32 = 4;
@@ -164,6 +192,11 @@ pub struct JobInput<'a> {
     /// The guest ELF, with its image id checked against `programId`; `None` to have
     /// [`PipelineHooks::guest_elf`] fetch it once the static gates have passed.
     pub elf: Option<&'a [u8]>,
+    /// The builder artifact from the caller instead of the broker (`zkminer simulate --builder`, a
+    /// requester trying a builder before publishing it): held to the same checks the broker applies
+    /// to a fetched one (its sha256 is `builderId`, its length within the host's cap). The miner
+    /// passes `None`: its artifacts come only through the broker.
+    pub artifact: Option<&'a [u8]>,
     /// The current block number (the bundle's `created_at_block`).
     pub current_block: u64,
 }
@@ -257,6 +290,8 @@ impl std::fmt::Display for Skip {
 pub enum ArtifactOrigin {
     Mirror,
     HemiCode { manifest: Address },
+    /// The caller's own bytes ([`JobInput::artifact`]).
+    Local,
 }
 
 /// What the builder run cost.
@@ -274,6 +309,8 @@ pub struct BuilderStats {
     pub run_ms: Option<u32>,
     /// The run's wall time as the miner saw it (job registration to `EndJob`).
     pub wall: Duration,
+    /// The runner cgroup's peak memory, when the kernel reports it.
+    pub memory_peak: Option<u64>,
 }
 
 /// Wall time per step.
@@ -624,6 +661,29 @@ async fn obtain_artifact(
     Err(Skip::new(reason, S, format!("no source yielded the artifact (mirror {mirror:?}, hemi-code {outcomes:?})")))
 }
 
+/// The caller's artifact ([`JobInput::artifact`]), held to what [`verify_artifact`] holds a fetched
+/// one to: within the host's cap, and hashing to `builderId`. A wrong one is the job's, as a manifest
+/// for another artifact is.
+fn local_artifact(ctx: &HostContext, bytes: &[u8], builder_id: B256) -> Result<Artifact, Skip> {
+    const S: Step = Step::Artifact;
+    if bytes.len() as u64 > ctx.max_artifact_bytes {
+        return Err(Skip::new(
+            SkipReason::LimitsAboveHostMaxima,
+            S,
+            format!("the builder artifact is {} bytes, above the {}-byte cap", bytes.len(), ctx.max_artifact_bytes),
+        ));
+    }
+    let sha = B256::from(<[u8; 32]>::from(Sha256::digest(bytes)));
+    if sha != builder_id {
+        return Err(Skip::new(
+            SkipReason::ArtifactAllSourcesBad,
+            S,
+            format!("the builder artifact's sha256 is {sha}, not the envelope's builderId {builder_id}"),
+        ));
+    }
+    Ok(Artifact { bytes: bytes.to_vec(), cached: false, origin: ArtifactOrigin::Local })
+}
+
 /// Reads the broker's sealed memfd and re-hashes it: the bytes the runner gets are `builderId`'s.
 fn verify_artifact(
     ctx: &HostContext,
@@ -685,7 +745,7 @@ impl Read for Tee {
 /// Checks an execute response against the job (§5.2 steps 6–7): the image id is `programId`; every
 /// po2 of the request halted with 0; one journal at every po2; cycles within `maxGuestCycles`; the
 /// journal within the 32,768-byte cap. Returns the journal.
-fn check_execution(
+pub fn check_execution(
     resp: &WitnessExecuteResponse,
     po2s: &[u8],
     program_id: B256,
@@ -817,6 +877,72 @@ async fn execute(
     result.map_err(|e| Skip::new(execute_reason(&e), S, execute_detail(&e)))
 }
 
+/// `bytes` in a write-sealed memfd, as the execute worker takes `W` (fd 3: a read-only regular file
+/// or a sealed memfd, read with `pread`).
+pub fn sealed_memfd(name: &str, bytes: &[u8]) -> io::Result<File> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let cname = std::ffi::CString::new(name).map_err(|_| io::Error::other("memfd name"))?;
+    // SAFETY: a plain syscall with a valid NUL-terminated name.
+    let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just created and is owned by nothing else.
+    let mut f = unsafe { File::from_raw_fd(fd) };
+    f.write_all(bytes)?;
+    let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl on an fd we own.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
+/// One execution of bytes the caller holds, outside a pipeline run: `zkminer simulate --adversarial`
+/// re-executes a mutated `W`, or the same `W` under another seed key, po2 or keccak po2, through the
+/// sandboxed worker, request and seed derivation [`simulate_witness_job`] uses.
+pub struct ExecuteOnce<'a> {
+    pub elf: &'a [u8],
+    pub program_id: B256,
+    /// The journal prefix ([`guest_input_prefix`]), when the job carries the marker.
+    pub prefix: Option<[u8; PREFIX_BYTES]>,
+    pub po2s: &'a [u8],
+    pub keccak_po2: u8,
+    /// The key the `sys_rand` seed is derived from, as the miner derives it
+    /// (`sys_rand::risc0_seed(key, image id, sha256(prefix ‖ W))`).
+    pub sys_rand_key: [u8; 32],
+    pub max_cycles: u64,
+}
+
+/// Runs [`ExecuteOnce`] on `w` (sealed in a memfd) and returns the worker's response unjudged; the
+/// caller applies [`check_execution`] and the binding as it needs. `Err` is the verdict the pipeline
+/// would give an execute that produced no response.
+pub async fn execute_once(
+    ctx: &HostContext,
+    token: &AbortToken,
+    w: &[u8],
+    spec: &ExecuteOnce<'_>,
+) -> Result<WitnessExecuteResponse, Skip> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    const S: Step = Step::Execute;
+    let (input, w_len) = input_sha256(spec.prefix.as_ref(), w)
+        .map_err(|e| Skip::new(SkipReason::HostInternal, S, format!("hashing W: {e}")))?;
+    let file = sealed_memfd("zkminer-w", w).map_err(|e| Skip::new(SkipReason::HostInternal, S, format!("sealing W: {e}")))?;
+    let req = WitnessExecuteRequest {
+        elf: spec.elf.to_vec(),
+        prefix: spec.prefix.map(|p| p.to_vec()).unwrap_or_default(),
+        w_len,
+        input_sha256: input.0,
+        sys_rand_seed: sys_rand::risc0_seed(&spec.sys_rand_key, &spec.program_id.0, &input.0),
+        po2s: spec.po2s.to_vec(),
+        keccak_po2: spec.keccak_po2,
+        max_cycles: Some(spec.max_cycles),
+    };
+    let name = format!("wexec-once-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+    execute(ctx, token, req, file, name).await
+}
+
 // ---------------------------------------------------------------------------------------------
 // The pipeline.
 
@@ -853,7 +979,10 @@ pub async fn simulate_witness_job(
     // 2. The builder artifact.
     check_abort(token, Step::Artifact)?;
     let t = Instant::now();
-    let artifact = obtain_artifact(ctx, job, &envelope, job_key, hooks).await?;
+    let artifact = match job.artifact {
+        Some(bytes) => local_artifact(ctx, bytes, envelope.job.builderId)?,
+        None => obtain_artifact(ctx, job, &envelope, job_key, hooks).await?,
+    };
     timings.artifact = t.elapsed();
 
     // 3. The builder, W into a new bundle version.
@@ -929,6 +1058,7 @@ pub async fn simulate_witness_job(
         compile_ms: summary.map(|s| s.compile_ms),
         run_ms: summary.map(|s| s.run_ms),
         wall: result.elapsed,
+        memory_peak: result.memory_peak,
     };
     drop(artifact);
     timings.builder = t.elapsed();

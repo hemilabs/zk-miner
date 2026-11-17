@@ -79,7 +79,6 @@ use zkminer_prover::engine::ProofOutput;
 use zkminer_prover_protocol::{WitnessProve, GUEST_EXIT_HALTED};
 use zkminer_tui::state::{LogLevel, MinerJobStatus, SharedState, TrackedJob};
 use zkminer_witness::bundle::{BundleV1, GuestExit, PinRecord, Po2Result};
-use zkminer_witness::envelope::HostMaxima;
 use zkminer_witness::verdict::{PostLockFailureClass, SkipReason, VerdictRecord};
 use zkminer_witness_broker::client::{ArtifactCharge, BrokerClient};
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
@@ -110,11 +109,10 @@ use super::policy::{
 use super::{known_class, note_class, Class, Route};
 use crate::journal::WitnessBundleRef;
 
-/// The largest builder artifact this host reads (the broker's default `[artifacts]
-/// max_builder_bytes`; the broker also enforces its own).
-const MAX_ARTIFACT_BYTES: u64 = 4 << 20;
+/// The largest builder artifact this host reads (the broker also enforces its own).
+const MAX_ARTIFACT_BYTES: u64 = zkminer_witness_host::pipeline::DEFAULT_MAX_ARTIFACT_BYTES;
 /// Wall clock of one sandboxed execute (every po2 of the host's set).
-const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
+const EXECUTE_TIMEOUT: Duration = zkminer_witness_host::pipeline::DEFAULT_EXECUTE_TIMEOUT;
 /// Wall clock of the execute worker's build handshake (it loads its binary and answers).
 const EXECUTE_BUILD_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often the sandbox and broker self-tests run again (and a serving start that failed is tried
@@ -1507,7 +1505,6 @@ impl WitnessRuntime {
         execute_build: String,
     ) -> HostContext {
         let w = &self.witness;
-        let c = &w.builder_clamps;
         HostContext {
             spawner: serving.spawner.clone(),
             broker: serving.broker_client.clone(),
@@ -1515,19 +1512,10 @@ impl WitnessRuntime {
             cgroup_root: serving.cgroup_root.clone(),
             builder_binary: serving.builder_binary.clone(),
             execute_binary: serving.execute_binary.clone(),
-            host_maxima: HostMaxima {
-                max_witness_bytes: w.max_witness_bytes,
-                max_guest_cycles: w
-                    .max_guest_cycles
-                    .unwrap_or_else(|| host_max_guest_cycles(plan, self.proving_timeout.as_secs())),
-                max_fetches: c.fetches,
-                max_fetch_bytes: c.fetch_bytes,
-                max_request_bytes: c.request_bytes,
-                max_response_bytes: c.response_bytes,
-                max_builder_fuel: c.fuel,
-                max_builder_memory_bytes: c.memory_bytes,
-                max_builder_seconds: c.seconds,
-            },
+            host_maxima: zkminer_witness_host::pipeline::host_maxima(
+                w,
+                w.max_guest_cycles.unwrap_or_else(|| host_max_guest_cycles(plan, self.proving_timeout.as_secs())),
+            ),
             po2s,
             keccak_po2: self.keccak_po2,
             sys_rand_key: self.sys_rand_key,
@@ -1895,6 +1883,7 @@ impl WitnessRuntime {
                     router: self.client.hemi_prove,
                     // Fetched by the hook once the static gates have passed (§5.2 step 3).
                     elf: None,
+                    artifact: None,
                     current_block,
                 };
                 tracing::info!("witness job {}: simulating (po2 {po2s:?})", short(jid));

@@ -75,12 +75,16 @@ pub struct BuilderRunResult {
     pub aborted: bool,
     pub log: String,
     pub elapsed: Duration,
+    /// The runner cgroup's `memory.peak` (module, compiled code and runner together), when the
+    /// kernel reports it.
+    pub memory_peak: Option<u64>,
 }
 
 struct Raw {
     exit: Option<i32>,
     signal: Option<i32>,
     oom_killed: bool,
+    memory_peak: Option<u64>,
     wall_clock_hit: bool,
     aborted: bool,
     summary_bytes: Vec<u8>,
@@ -174,6 +178,7 @@ fn run_blocking<S: WitnessSink>(
         exit: None,
         signal: None,
         oom_killed: false,
+        memory_peak: None,
         wall_clock_hit: false,
         aborted: false,
         summary_bytes: Vec::new(),
@@ -310,6 +315,7 @@ fn run_blocking<S: WitnessSink>(
     raw.summary_bytes = summary_t.join().unwrap_or_default();
     raw.log = log_t.join().unwrap_or_default();
     raw.oom_killed = cgroup.oom_killed();
+    raw.memory_peak = cgroup.memory_peak();
     let _ = cgroup.remove();
     (raw, sink)
 }
@@ -400,6 +406,7 @@ pub async fn run_builder_abortable<S: WitnessSink>(
             aborted: raw.aborted,
             log,
             elapsed: started.elapsed(),
+            memory_peak: raw.memory_peak,
         },
         sink,
     ))

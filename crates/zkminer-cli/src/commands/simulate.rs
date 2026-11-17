@@ -662,6 +662,37 @@ fn guest_input(
     Ok(input)
 }
 
+/// `--po2`: one size (`20`), an inclusive range (`16..22` or `16..=22`), or a list (`16,18,20`), each a
+/// job po2 the risc0 worker accepts; sorted and unique.
+pub fn parse_po2_set(s: &str) -> Result<Vec<u8>> {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let one = |t: &str| -> Result<u8> { t.trim().parse::<u8>().with_context(|| format!("--po2: {t:?} is not a po2")) };
+    let mut v: Vec<u8> = if let Some((a, b)) = s.split_once("..") {
+        let (a, b) = (one(a)?, one(b.strip_prefix('=').unwrap_or(b))?);
+        anyhow::ensure!(a <= b, "--po2 {s}: an empty range");
+        (a..=b).collect()
+    } else {
+        s.split(',').map(one).collect::<Result<_>>()?
+    };
+    v.sort_unstable();
+    v.dedup();
+    anyhow::ensure!(!v.is_empty(), "--po2 names no size");
+    if let Some(p) = v.iter().find(|p| !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(p)) {
+        anyhow::bail!("--po2 {p} is outside {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}");
+    }
+    Ok(v)
+}
+
+/// Why an on-chain witness-construction job is not measured here: its proven input is `prefix ‖ W`,
+/// which its builder made on the prover's host, never the envelope in `inputData`.
+fn witness_job_reason(input_data: &[u8]) -> Option<&'static str> {
+    zkminer_witness::classify(input_data).map(|_| {
+        "a witness-construction job (its inputData is a witness envelope): its proven input is the builder's \
+         W, which measuring inputData cannot reproduce; run it through the miner's pipeline with \
+         `zkminer simulate --descriptor`"
+    })
+}
+
 /// Why a measured count is not reported as one: above `max`.
 fn over_cycle_cap(cycles: u64, max: u64) -> Option<String> {
     (cycles > max).then(|| {
@@ -1075,6 +1106,9 @@ impl Simulator {
 
         if program_id == B256::ZERO {
             return r.end(Outcome::ProgramMismatch, "its programId is zero");
+        }
+        if let Some(why) = witness_job_reason(&d.inputData) {
+            return r.end(Outcome::NotServed, why);
         }
         // Decided before the ELF: a job whose proven run cannot be reproduced here costs no download.
         let input = match guest_input(&d, job_id, view.prover, backend) {
@@ -2046,6 +2080,26 @@ mod tests {
         assert_eq!(outcome, Outcome::NotServed);
         assert!(!outcome.retryable());
         assert!(why.contains("journal-prefix"), "{why}");
+    }
+
+    #[test]
+    fn po2_sets_are_sizes_ranges_or_lists() {
+        assert_eq!(parse_po2_set("20").unwrap(), vec![20]);
+        assert_eq!(parse_po2_set("16..22").unwrap(), (16..=22).collect::<Vec<u8>>());
+        assert_eq!(parse_po2_set("16..=18").unwrap(), vec![16, 17, 18]);
+        assert_eq!(parse_po2_set("20,16,20").unwrap(), vec![16, 20]);
+        for bad in ["", "15", "23", "22..16", "16..x", "a"] {
+            assert!(parse_po2_set(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn on_chain_witness_jobs_are_not_measured_as_inline_ones() {
+        let mut input = zkminer_witness::WITNESS_JOB_TAG_V1.to_vec();
+        input.extend_from_slice(&[0u8; 64]);
+        assert!(witness_job_reason(&input).is_some());
+        assert!(witness_job_reason(&10u32.to_le_bytes()).is_none());
+        assert!(witness_job_reason(&input[..31]).is_none());
     }
 
     #[test]

@@ -554,6 +554,7 @@ impl Env {
             chain_id: ANVIL_CHAIN,
             router: self.router,
             elf: Some(&fibonacci().0),
+            artifact: None,
             current_block: block,
         };
         let r = simulate_witness_job(&self.ctx, &job, hooks).await;

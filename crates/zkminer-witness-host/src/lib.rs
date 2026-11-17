@@ -3,6 +3,7 @@
 //! builder run and the pre-claim pipeline. `zkminer-cli` drives these; nothing here signs or sends.
 
 pub mod abort;
+pub mod adversarial;
 pub mod broker_proc;
 pub mod builder_run;
 pub mod paths;
