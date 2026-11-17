@@ -10595,6 +10595,7 @@ dependencies = [
  "hex",
  "libc",
  "rand 0.8.6",
+ "risc0-binfmt",
  "serde",
  "serde_json",
  "sha2",

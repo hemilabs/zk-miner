@@ -22,6 +22,35 @@ pub const MANIFEST_FIXED_BYTES: usize = 1 + 32 + 8 + 32 + 4;
 /// The most addresses that fit in one manifest contract.
 pub const MAX_MANIFEST_CHUNKS: u32 = ((MAX_CODE_BYTES - MANIFEST_FIXED_BYTES) / 20) as u32;
 
+/// The smallest chunk body `zkminer artifact publish` plans (every chunk but the last; plan §13.5):
+/// it starts at 23,000 bytes and shrinks a chunk only while the chain's `GasPriceOracle` prices its
+/// creation above 19,500 DA bytes, which no estimate does for a chunk this size (they track the
+/// bytes: Ecotone's is about one DA byte per byte, so a chunk ends near 19,400 at worst). A plan
+/// that would need smaller chunks is refused, so a miner can count chunk reads from it.
+pub const MIN_PLANNED_CHUNK_BODY: usize = 16_384;
+
+/// The per-job budget of a `hemi-code` artifact read (plan §13.4 step 3): its bytes and its chunk
+/// reads, from the largest artifact a host reads. The chunk reads allow every artifact of up to
+/// `max_bytes` a publisher plans ([`MIN_PLANNED_CHUNK_BODY`]), plus one, never more than a
+/// manifest can list. One budget for the miner and `zkminer simulate`, so a simulation is judged by
+/// the budget a miner applies, and for the publisher, which refuses a plan over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactBudget {
+    pub max_bytes: u64,
+    pub max_chunks: u32,
+}
+
+impl ArtifactBudget {
+    pub fn for_max_bytes(max_bytes: u64) -> Self {
+        let chunks = max_bytes.div_ceil(MIN_PLANNED_CHUNK_BODY as u64).saturating_add(1);
+        Self { max_bytes, max_chunks: u32::try_from(chunks).unwrap_or(u32::MAX).min(MAX_MANIFEST_CHUNKS) }
+    }
+
+    pub fn admits(&self, length: u64, chunks: u32) -> bool {
+        length <= self.max_bytes && chunks <= self.max_chunks
+    }
+}
+
 /// A validated manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactManifest {
@@ -278,6 +307,26 @@ mod tests {
         const _: () = assert!(MANIFEST_FIXED_BYTES + 20 * 1_224 <= MAX_CODE_BYTES);
         const _: () = assert!(MANIFEST_FIXED_BYTES + 20 * 1_225 > MAX_CODE_BYTES);
         assert_eq!(u64::from(MAX_MANIFEST_CHUNKS) * MAX_CHUNK_BODY as u64, 30_079_800);
+    }
+
+    #[test]
+    fn the_artifact_budget_admits_every_plan_a_publisher_makes() {
+        let b = ArtifactBudget::for_max_bytes(4 << 20);
+        assert_eq!(b.max_chunks, 257);
+        assert!(b.admits(4 << 20, b.max_chunks));
+        assert!(!b.admits((4 << 20) + 1, 1));
+        assert!(!b.admits(1, b.max_chunks + 1));
+        // The publisher's first try (23,000-byte chunks) and its worst realistic shrink (19,400) for
+        // a builder of every size up to the cap, and the 3,956,001-byte one a reviewer published in
+        // 177 chunks.
+        for len in [1u64, 23_000, 1 << 20, 3_956_001, 4 << 20] {
+            for chunk in [23_000u64, 19_400, MIN_PLANNED_CHUNK_BODY as u64] {
+                assert!(b.admits(len, len.div_ceil(chunk) as u32), "{len} bytes in {chunk}-byte chunks");
+            }
+        }
+        assert!(b.admits(3_956_001, 177));
+        let huge = ArtifactBudget::for_max_bytes(u64::MAX);
+        assert_eq!(huge.max_chunks, MAX_MANIFEST_CHUNKS);
     }
 
     #[test]
