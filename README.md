@@ -276,10 +276,11 @@ that cannot confine itself refuses to run guests. Workers (and the witness sandb
 to run guests while **any network or remote-capable FUSE filesystem, or an automount map, is
 mounted where this user can reach it** (NFS, SMB, 9p and virtiofs shares, sshfs, rclone, a GNOME
 session's gvfs, autofs `/net`, ...): Landlock cannot stop a path lookup, which would query that
-filesystem's server. FUSE filesystems that serve only this host (the document portal, lxcfs,
-ntfs-3g and exfat-fuse on a block device, squashfuse and AppImage mounts) are fine. Unmount the
-others, or run the miner as a dedicated user (another user's FUSE mount without `allow_other` is
-closed to it) or in a container or mount namespace that leaves them out. Confined workers also
+filesystem's server. Of FUSE filesystems only two that root mounts are fine (lxcfs, and ntfs-3g
+or exfat-fuse on a block device); a user's own FUSE mounts (gvfs, the document portal, AppImages,
+rclone, ...) are not, whatever they call themselves. Unmount them, or run the miner as a dedicated
+user (another user's FUSE mount without `allow_other` is closed to it) or in a container or mount
+namespace that leaves them out. Confined workers also
 change no file's mode, owner, attributes or times. The CPU risc0 worker's Docker Groth16 wrap runs in
 a helper process that accepts only a strictly checked prover input, with the image pinned by digest
 and `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
