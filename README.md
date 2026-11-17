@@ -221,14 +221,24 @@ fix `[contracts]` and restart. On 743111 the live deployment is the 2026-11-16 o
 Anyone can register a program and post a job, so the URLs a miner downloads programs from
 are chosen by strangers. zkminer only ever connects to **public internet** addresses on
 their behalf: never loopback, the LAN, link-local or cloud metadata, this host's own
-addresses (its public address behind NAT included, which it learns from two fixed DNS
-reflectors), a neighbour on a network it is connected to or routes to other than through its
-default route (the kernel is asked, per destination, how it would route the connection, policy
-rules included), an address a `local` route delivers to this host, the rest of its IPv6 site,
-the DNS servers it uses, a private address behind NAT64, or a name only a local resolver
-answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label names, …). Anycast
-service addresses (`2001:1::/32`, AMT, AS112) are refused too. See [SECURITY.md](SECURITY.md) for exactly
-what is refused and why.
+addresses (its public address behind NAT included, which it learns from fixed reflectors), a
+neighbour on a network it is connected to or routes to other than through its default route
+(the kernel is asked, per destination and port, how it would route the connection, policy rules
+included), an address a `local` route delivers to this host, the rest of its IPv6 site (a /48)
+or of the IPv4 /16 around a public address on its interfaces, the DNS servers it uses, a
+private address behind NAT64, a destination that answers within 2 hops of this host (its router,
+a neighbour in the same VPC: a hop-limited probe asks right before each connection), or a name
+only a local resolver answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label
+names, …). Requester host names are resolved over DNS-over-HTTPS by public resolvers, never
+through this host's own resolver. Anycast service addresses (`2001:1::/32`, AMT, AS112) are
+refused too. See [SECURITY.md](SECURITY.md) for exactly what is refused and why.
+
+It **fails closed**: while this host's public address of a family it routes is unknown
+(outbound DNS and HTTPS to the reflectors blocked or intercepted), no requester connection goes
+out over that family, and the miner says so at startup, when it changes, and in `zkminer status`;
+`[egress] public_addresses` fixes it. A host with a public IPv4 address on an interface (a campus,
+a data centre) or a default route through a tunnel (a full-tunnel VPN) does not start in public
+mode until `[egress] internal_ranges` lists its own network's ranges (`[]` if there are none).
 
 Run the miner with the host's network (`--network host` in a container): inside a container
 it sees only the container's interfaces and routes, so list the host's networks and addresses
@@ -237,18 +247,24 @@ in `[egress] deny_cidrs` if it cannot.
 **Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
 endpoints for builders, has no network of its own: its sandbox denies every socket call. The
 miner's *connector* makes each connection for it — the broker can only name one of the endpoints
-in its config file, which the miner reads itself — and admits the address with this same guard,
-using the miner's `[egress]` settings (the broker file's `[egress] deny_cidrs` are added to
+in its config file, which the miner reads itself — and admits the address with this same guard
+(the near-hop probe right before connecting included), using the miner's `[egress]` settings (the broker file's `[egress] deny_cidrs` are added to
 them) and the miner's `[dev] private_network`. So a broker an attacker took over still reaches
 only your configured endpoints. See SECURITY.md, "Witness jobs: the broker".
 
 | key | default | meaning |
 |---|---|---|
-| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet, on a cloud host your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route), and this host's public address behind NAT if discovering it fails or is off. Host bits must be zero. |
-| `[egress] ipv6_site_prefix_len` | `56` | The site refused around each of this host's global IPv6 addresses: its enclosing /N, 48 to 64. Use 48 if your site was delegated a /48. |
-| `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes by asking `ns1.google.com` and `1.1.1.1` which address a DNS query came from, and refuse every address either reports (only one both report alike also refuses its IPv6 site). Off: list them in `deny_cidrs`. |
+| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet and, on a cloud host, your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route). Host bits must be zero. |
+| `[egress] internal_ranges` | unset | The ranges of your own network this host reaches by the same route as the internet: a campus's or data centre's public ranges, your VPC's, what a full-tunnel VPN leads to. Refused like `deny_cidrs`. **Required** (`internal_ranges = []` states there are none) on a host with a global IPv4 address on an interface or a default route out of a tunnel interface (WireGuard, OpenVPN/Tailscale `tun`, GRE, IPsec `xfrm`, …; not PPPoE): in public mode the miner refuses to start without it, naming the reason. |
+| `[egress] ipv6_site_prefix_len` | `48` | The site refused around each of this host's global IPv6 addresses: its enclosing /N, 32 to 64. Set it shorter if your organisation's site is larger (a campus `/32`). |
+| `[egress] ipv4_site_prefix_len` | `16` | The site refused around each global IPv4 address on this host's interfaces: its enclosing /N, 8 to 32. |
+| `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes from fixed reflectors — `ns1.google.com` and `1.1.1.1` over DNS, and Cloudflare's `https://1.1.1.1/cdn-cgi/trace` over HTTPS (also over IPv6, and on an IPv6-only host through its NAT64 prefix) — and refuse every address any reports. A family counts as known only when the HTTPS reflector or both DNS reflectors confirm it; while a family this host routes is unknown, requester connections over it are refused. Off: `public_addresses` must name an address of every family this host routes, or the miner does not start. |
+| `[egress] public_addresses` | `[]` | This host's public addresses as you know them (behind NAT, your router's; on an IPv6-only host, the NAT64 translator's IPv4 address). Refused as its own, and a family named here counts as known: set it where outbound DNS or HTTPS to the reflectors is filtered or intercepted. |
+| `[egress] near_hop_limit` | `2` | Right before every requester-caused connection, a probe whose packets may cross at most this many hops connects to the destination: one that answers (accepts, or refuses with a reset) is this host's own network and is refused. 2 to 16. |
+| `[egress] doh_resolvers` | Cloudflare, Google, Quad9 | The DNS-over-HTTPS resolvers requester host names are resolved with (never this host's resolver, `/etc/hosts` or a local stub): `https://` URLs whose host is a public IP literal, e.g. `["https://9.9.9.9/dns-query"]`. |
 | `[egress] nat64_prefixes` | `[]` | NAT64 prefixes this host's translator uses besides the well-known `64:ff9b::/96` (RFC 6052: a `/32`, `/40`, `/48`, `/56`, `/64` or `/96`, e.g. `"2001:db8:64::/96"`). An address under one is judged by the IPv4 address it carries, so `<prefix>::10.0.0.1` is refused. The prefix a DNS64 resolver uses is learned at startup from this host's DNS servers (`ipv4only.arpa`, RFC 7050); name it here when it cannot be. |
-| `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine. The only way to turn the guard off (there is no environment variable or flag). Refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
+| `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine (names then resolve through the system resolver, and no near-hop probe is sent). The only way to turn the guard off (there is no environment variable or flag). Needs `[dev] chain_id`; refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
+| `[dev] chain_id` | unset | The test network `private_network` is meant for: it must equal `[chain] chain_id` (which the RPC confirms at startup), or the miner refuses the config. A config copied to another network does not open the guard there. |
 
 The prover workers that run requesters' guests are confined before the first one runs: no
 sockets of any kind, the filesystem limited by Landlock to what proving needs (nothing of your
@@ -261,7 +277,8 @@ wrap runs in a helper process with `--network none`. See [SECURITY.md](SECURITY.
 
 Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
 instead of being ignored. `ZKMINER_ELF_ALLOW_PRIVATE_URLS`, which older builds read, is no
-longer read: move a test setup that used it to `[dev] private_network = true`.
+longer read: move a test setup that used it to `[dev] private_network = true` with `[dev]
+chain_id` set to the test network's chain id.
 
 ## Run
 
@@ -577,8 +594,8 @@ Some jobs are submitted before the miner starts and some after, so both the star
 and the live monitor are covered; the backfill starts at the first job's block, so one that
 starts a block late loses it. Nothing touches the real chain, and no key of yours is involved;
 each miner runs with its own HOME and a cleaned environment. The programs are served from
-127.0.0.1, so each miner's config sets `[dev] private_network = true` (the fork is 743111,
-where developer mode is allowed).
+127.0.0.1, so each miner's config sets `[dev] private_network = true` and `[dev] chain_id =
+743111` (the fork's chain id, where developer mode is allowed).
 
 ```bash
 env NVCC=/usr/local/cuda/bin/nvcc HIPCC=off \

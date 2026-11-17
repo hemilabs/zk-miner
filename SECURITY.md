@@ -26,8 +26,10 @@ Every connection a requester can cause goes through one guard
   `2001::/23`**, IANA's globally reachable assignments in it included: the PCP, TURN and
   DNS-SD SRP anycast addresses in `2001:1::/32`, AMT's relay anycast `2001:3::/32` and
   AS112-v6 `2001:4:112::/48` (the nearest instance of an anycast service may be a box on your
-  own network), and the ORCHIDv2 and DRIP identifier prefixes (`2001:20::/28`,
-  `2001:30::/28`), which are not locators. An
+  own network), the Direct Delegation AS112 block `2620:4f:8000::/48` (the twin of
+  `192.175.48.0/24`), and the ORCHIDv2 and DRIP identifier prefixes (`2001:20::/28`,
+  `2001:30::/28`), which are not locators. Every entry of IANA's two special-purpose address
+  registries is refused (a unit test walks them). An
   IPv6 address that carries an IPv4 one (mapped, SIIT, the well-known NAT64 prefix, and a
   **network-specific NAT64 prefix** — RFC 6052, any /32 to /96 a network picks for its
   translator) is judged by that IPv4 address, which the translator would connect to from its
@@ -39,16 +41,33 @@ Every connection a requester can cause goes through one guard
   holds as written).
 - **Not this host, not its neighbours, not its site.** Refused, whatever the spelling:
   - the host's own addresses, **including its public address behind NAT**: at startup and
-    every 5 minutes the miner asks two fixed DNS reflectors which address its query came from
-    (`o-o.myaddr.l.google.com` TXT, asked of Google's authoritative `ns1.google.com`, and
-    `whoami.cloudflare` CH TXT, asked of `1.1.1.1`), each over IPv4 and over IPv6, and refuses
-    every address either reports (a warning says when they disagree). The names and servers are
-    compiled in: nothing a requester sends chooses them, and an answer can only add an address
-    to refuse; only an address both reflectors report alike also gives its IPv6 site (below),
-    so one forged answer cannot refuse someone else's whole /48. Facts read while the first
-    discovery runs wait for it. If no reflector answers, a loud warning says so and the miner
-    carries on: list the public address in `[egress] deny_cidrs` then (or always).
-    `[egress] discover_public_addresses = false` turns the queries off;
+    every 5 minutes the miner asks fixed reflectors which address its query came from
+    (`o-o.myaddr.l.google.com` TXT, asked of Google's authoritative `ns1.google.com`;
+    `whoami.cloudflare` CH TXT, asked of `1.1.1.1`; and Cloudflare's `/cdn-cgi/trace` over
+    HTTPS at `1.1.1.1`, an IP literal whose certificate is verified for that address), each over
+    IPv4 and over IPv6, and refuses every address any reports (a warning says when they
+    disagree). The names and servers are compiled in: nothing a requester sends chooses them,
+    and an answer can only add an address to refuse. An address is **confirmed** when the HTTPS
+    reflector reports it (a box that intercepts DNS cannot forge that answer) or both DNS
+    reflectors report it alike (a DNS answer that is one of the host's own DNS servers — an
+    intercepting resolver reporting itself — confirms nothing); only a confirmed address gives
+    its IPv6 site (below), so one forged answer cannot refuse someone else's whole /48. Facts
+    read while the first discovery runs wait for it. `[egress] public_addresses` states the
+    public addresses instead (or as well); `[egress] discover_public_addresses = false` turns the
+    queries off, and then `public_addresses` must name an address of every family the host
+    routes or the miner does not start;
+  - **fail closed:** for every address family the host routes (has a default route for), a
+    public address must be **known** — confirmed by discovery, or stated in `[egress]
+    public_addresses` — or **no requester connection goes out over that family**: behind NAT,
+    a destination at the unknown address would reach this host or its router by hairpin. The
+    miner warns at startup and whenever it changes, `zkminer status` says so, and both name the
+    line to add; discovery is retried every 15 seconds meanwhile. On an **IPv6-only host behind
+    NAT64**, the IPv4 reflectors are asked at their addresses under the NAT64 prefix in force
+    (configured, or learned from the host's DNS64), which reports the translator's own IPv4
+    address: refused as the host's own, and until it is known (or an IPv4 address is stated)
+    every address under that prefix is refused. A host with IPv4 of its own never connects to an
+    IPv6 address that carries an IPv4 one (NAT64, SIIT): there is no translator it needs, and
+    one it reached could hairpin;
   - **every address a `local`, `broadcast` or `anycast` route delivers to the host itself**, in
     any routing table: an AnyIP range (`ip route add local 185.199.108.0/24 dev lo`, as
     freebind, anycast and IPv6-proxy hosts install) is this host though no interface carries it.
@@ -76,14 +95,30 @@ Every connection a requester can cause goes through one guard
     it, and so does a destination rule (`ip rule add to 52.95.0.0/16 lookup 100`) into a table
     that is not ordinary, for its whole prefix. On top of that, **the kernel itself is asked**,
     for every address a connection would go to: one unprivileged `RTM_GETROUTE` per
-    destination (with the miner's uid, TCP, and the "which routing entry matched" flag), which
-    applies every rule exactly; only a unicast route through a default route's gateway, or a
-    default route of an ordinary table, is admitted (a local route, no route, a default route
-    a selector picks, an on-link route or another gateway is refused). Answers are reused for
-    the life of one facts snapshot (about a second). Linux only;
-  - **the site around each of the host's global IPv6 addresses**: its enclosing `/56`
-    (`[egress] ipv6_site_prefix_len`, 48 to 64), the usual delegation to a home or office,
-    whose other /64s hold your other machines;
+    destination (with the miner's uid, TCP, the connection's destination port, and the "which
+    routing entry matched" and "which table matched" flags), which applies every rule exactly,
+    port rules included; only a unicast route through a default route's gateway, or a default
+    route of an ordinary table, is admitted (a local route, no route, a default route a
+    selector picks, an on-link route or another gateway is refused). For IPv4 it is asked twice,
+    as a `connect` does (`ip_route_connect`): once without a source address, which tells the
+    source the kernel picks, then with that source; a `from` rule that sends the connection to
+    another table than the first lookup used is refused. (IPv6 looks the route up once, matching
+    source rules inside that lookup, and is asked once.) Answers are reused for the life of one
+    facts snapshot (about a second). Linux only;
+  - **the site around each of the host's global IPv6 addresses**: its enclosing `/48`
+    (`[egress] ipv6_site_prefix_len`, 32 to 64), the most a home, office or small site is
+    usually delegated, whose other /64s hold your other machines; and **the site around each
+    global IPv4 address on its interfaces**: its enclosing `/16` (`[egress]
+    ipv4_site_prefix_len`, 8 to 32), since a host numbered from public IPv4 space sits in a
+    network (a campus, a data centre) whose other subnets the default gateway reaches;
+  - **your own network's ranges, where the host cannot see them** (`[egress]
+    internal_ranges`, refused like `deny_cidrs`). A host with a global IPv4 address on an
+    interface, or whose default route goes out of a tunnel interface (WireGuard, `tun`/`tap`,
+    `ipip`, `gre`/`gretap`, `ip6tnl`, `ip6gre`, `sit`, `vti`/`vti6`, `xfrm`, …; not `ppp`, an
+    ordinary PPPoE uplink), reaches other hosts of its own organisation by the same route as
+    the internet: in public mode such a host **refuses to start** until `internal_ranges` lists
+    them (`internal_ranges = []` is the statement that there are none), and the error names
+    which of the two applies;
   - **the DNS servers the host uses**: the `nameserver`s of `/etc/resolv.conf` and of
     systemd-resolved's `/run/systemd/resolve/resolv.conf` (the upstream servers behind its
     `127.0.0.53` stub), which may answer only their own customers.
@@ -92,6 +127,19 @@ Every connection a requester can cause goes through one guard
   rests on them. **Run the miner on the host's network:** a containerized miner sees only the
   container's interfaces and routes, so use host networking (`--network host`), or list the
   host's networks and addresses in `[egress] deny_cidrs`.
+- **Nothing within two hops.** Right before every connection (each hop of the ELF fetch, and
+  each connection the witness connector makes), a **probe** asks whether the destination is
+  near: a fresh TCP socket whose packets may cross at most `[egress] near_hop_limit` hops
+  (`IP_TTL` / `IPV6_UNICAST_HOPS`, default 2: the first-hop router and what sits directly
+  behind it) connects to the exact address and port, for at most 1.5 s, and is closed without
+  sending data. If something answers — the connection is accepted, refused or reset — the
+  destination is this host's own network (the home router's own global address on its WAN
+  side, which many routers serve their admin page, DNS and UPnP on; a NAT router or NAT64
+  translator hairpinning its own public address; a neighbour in the same cloud VPC; the far
+  side of a tunnel) and is refused. If the probe runs out of hops (Linux reports the router's
+  "time exceeded" as host unreachable) or nothing answers in time, the destination is farther
+  and the real connection is made, on a new socket with the usual hop limit. Any other probe
+  error (a local firewall's) refuses. Unprivileged; developer mode sends no probe.
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
   (`home.arpa`), `corp`, `intranet`, `private`, `localdomain`, `svc`, `consul`, `test`,
@@ -99,17 +147,31 @@ Every connection a requester can cause goes through one guard
   `metadata.goog` are refused, as are trailing dots, non-ASCII names (write them in their
   `xn--` form), and IP addresses written other than as four decimal octets (`2130706433`,
   `0x7f.1`, `0177.0.0.1`, `127.1`). The full list is `INTERNAL_SUFFIXES` in
-  `crates/zkminer-netguard/src/host.rs`. Names are then looked up **absolute** (with a
-  trailing dot added), so the resolver's `search` domains and `ndots` never turn a requester's
-  `secrets.corp` into `secrets.corp.<your search domain>`.
+  `crates/zkminer-netguard/src/host.rs`.
+- **Requester names never reach this host's resolver.** The system resolver answers from
+  `/etc/hosts`, NSS modules and the local stub, which forwards to the LAN's, the company's or
+  the ISP's resolver, whose split-horizon zones answer internal names. So every name a requester
+  chooses — a storage URI's host, a redirect's, and the fixed IPFS and Arweave gateways' — is
+  resolved by netguard's own **DNS-over-HTTPS** client (rustls, compiled-in roots) at public
+  resolvers addressed by IP literal: Cloudflare (`1.1.1.1`, `2606:4700:4700::1111`, `1.0.0.1`),
+  Google (`8.8.8.8`, `2001:4860:4860::8888`, `8.8.4.4`) and Quad9 (`9.9.9.9`, `2620:fe::fe`),
+  tried in turn, or the operator's `[egress] doh_resolvers` (https URLs whose host is a public
+  IP literal). Each query asks the resolver not to pass on this host's subnet (EDNS Client
+  Subnet, source prefix 0); only the name's own records and its `CNAME` chain are read. On an
+  IPv6-only host with a NAT64 prefix, a name with only `A` records gets the addresses a DNS64
+  resolver would synthesize. A resolver the floor refuses (the host's own network) is skipped.
+  Developer mode uses the system resolver, with names looked up absolute (a trailing dot added,
+  so `search` domains and `ndots` never apply).
 - **URL hygiene:** `http` and `https` only; no user information; nothing but printable ASCII
   (no whitespace or backslashes, which the URL standard would quietly rewrite); no IPv6 zone
   ids; and the URL must read the same — scheme, host and port — to a strict parser and to the
   standard parser the HTTP client connects with.
-- **One lookup, then that address:** each connection resolves its name once, every answer
-  passes the checks above, and the HTTP client is handed only the admitted addresses, so a
-  name that answers differently a moment later (DNS rebinding) cannot move the connection.
-  An IP-literal URL is checked directly.
+- **One lookup, then that address:** each hop resolves its name once, every answer passes
+  the checks above, each admitted address is checked again right before the connection (the
+  kernel asked with the port, the near-hop probe), and the hop's HTTP client is pinned to
+  exactly the addresses that passed (it resolves nothing itself), so a name that answers
+  differently a moment later (DNS rebinding) cannot move the connection. An IP-literal URL is
+  checked the same way.
 - **No proxies, no automatic redirects:** proxy settings are ignored (a proxy would resolve
   the name itself). Redirects are followed by hand, at most 5, each target checked like the
   first URL before anything connects to it, within one time budget.
@@ -129,17 +191,24 @@ and only for them:
 ```toml
 [dev]
 private_network = true
+chain_id = 743111   # the test network's chain id: must equal [chain] chain_id
 ```
 
 It admits every destination for requester-caused connections (scheme and URL syntax checks
-still apply). It is gated as follows:
+still apply), resolves names through the system resolver, and sends no near-hop probe. It is
+gated as follows:
 
 - **The config file is the only switch.** There is no environment variable or command-line
   flag; `ZKMINER_ELF_ALLOW_PRIVATE_URLS`, which older builds read, is gone. `[dev]` refuses
   unknown keys, so a typo is an error, not a silent no-op.
-- **Refused on Hemi mainnet (43111).** `zkminer` stops with an error on a config that sets it
-  there, before connecting anywhere, and the mode stays public on mainnet even on a code path
-  that skipped validation. The chain id is the one the RPC confirms at startup.
+- **It names the network it is for.** `[dev] chain_id` must be set and equal `[chain]
+  chain_id`, which the RPC must confirm at startup (`eth_chainId`); otherwise `zkminer` stops
+  with an error and the mode stays public even on a code path that skipped validation. A
+  developer config copied to another network — a production deployment under a chain id
+  zkminer does not list as one included — does not open the guard there.
+- **Refused on Hemi mainnet (43111)** whatever `[dev] chain_id` says: `zkminer` stops with an
+  error on a config that sets it there, before connecting anywhere, and the mode stays public
+  on mainnet even on a code path that skipped validation.
 - **Announced every time:** every start logs
   `DEV MODE: private network access enabled — never run on a public market`, `zkminer status`
   prints it, and the TUI's status bar shows a red `DEV MODE: PRIVATE NETWORK` badge on every
@@ -163,7 +232,9 @@ job there could then reach this host's private network.
 | Witness `blob/v1` fetches | the operator's `[[blob_mirror]]` templates; the hash from **the builder** | the connector; the URL is built by the broker |
 | `hemi-code` artifact reads | the operator's `[artifacts]` endpoint and mirror; the address from **the job** | the connector |
 | The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
-| Public-address discovery (miner and broker, at startup and every 5 minutes) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53 | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
+| Public-address discovery (miner and broker, at startup and every 5 minutes; every 15 seconds while a family is unknown) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53; `https://1.1.1.1/cdn-cgi/trace` and its IPv6 twin (the miner); on an IPv6-only host, the same IPv4 reflectors through the NAT64 prefix | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
+| DNS-over-HTTPS resolution of requester names (public mode) | fixed in the build (Cloudflare, Google, Quad9 by IP literal), or the operator's `[egress] doh_resolvers`; the **name** from the requester | the resolver's address must pass the floor (being one of the host's DNS servers is allowed); certificate verified for the IP literal |
+| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | a SYN with no data, closed without data |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
 | The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up); Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
@@ -261,11 +332,16 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   reading the provider keys), never anything the broker says; the broker can name an endpoint,
   never a host, an address or a port of its own;
 - resolves the endpoint's host name itself (the broker resolves nothing), with the operator's DNS
-  servers, and keeps only the answers its role entry admits;
+  servers (operator endpoint names only; requester names never go there), and keeps only the
+  answers its role entry admits;
 - admits each address with netguard's floor over **the miner's** host facts (gathered with the
   stricter of the miner's and the broker file's `[egress]` options), the miner's `[egress]
-  deny_cidrs`, the broker file's deny CIDRs and the DNS servers; developer mode only from the
-  miner's own `[dev] private_network`;
+  deny_cidrs` and `internal_ranges`, the broker file's deny CIDRs and the DNS servers; developer
+  mode only from the miner's own `[dev] private_network`;
+- right before each connection the floor applies to (public mode, or a DNS-named endpoint),
+  checks the exact address and port again: the kernel's route with the port, and the near-hop
+  probe; an address that answers within `near_hop_limit` hops (an operator node in the same VPC
+  by its public address) is refused and never connected to;
 - connects with the configured connect timeout, and paces attempts (64 at once, 16 a second: a
   hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
   `max_concurrency` in flight);
@@ -330,40 +406,59 @@ no second one):
 
 ## Known limits
 
-- **DNS lookups leak.** Resolving a requester's name tells that name's DNS server that this
-  host (or its resolver) asked, and when. Hygiene keeps local names away from the resolver,
-  but a public name always reaches the system resolver.
+- **DNS lookups leak, to public resolvers.** Resolving a requester's name tells the
+  DNS-over-HTTPS resolver the name, and the name's own DNS servers that the resolver asked, and
+  when (not this host's subnet: Client Subnet is asked off). Where the compiled-in resolvers are
+  blocked (a network that filters DNS-over-HTTPS), requester names do not resolve until
+  `[egress] doh_resolvers` names one that is reachable.
 - **The miner is a timing oracle for public hosts.** Whether and how fast a public address
   answers is observable to the requester; the guard bounds where connections go, not what can
   be inferred from public ones.
-- **Global addresses inside your own network, reached through the default route.** The guard
-  sees the host's interfaces, routes, IPv6 site and public address. Other subnets of the same
-  cloud VPC, a data centre's other public ranges, or a site delegated more than the configured
-  `ipv6_site_prefix_len` are reached through the default gateway like the internet, so the
-  guard cannot tell them from it. Put your VPC's IPv6 range (and any public IPv4 range your
-  network uses internally) in `[egress] deny_cidrs`. On a cloud host, also block the metadata
-  service inside the instance (IMDSv2 required, hop limit 1, or the endpoint off) as defense in
-  depth.
-- **What the routing checks cannot see.** The kernel is asked as for a connection's first
-  route lookup: no source address yet, no ports, firewall mark 0. So a rule that selects by
-  source (`from`), by port (`dport`/`sport`) or by a mark that a firewall (nftables/iptables
-  `OUTPUT` mangle) sets on the miner's packets, a VRF the miner is run inside (`ip vrf
-  exec`), and eBPF or netfilter rerouting are not followed for that connection; the prefix
-  model still refuses every specific route of every table that is not the default path, and
-  every destination rule's prefix, but a default route that only such a rule selects is
-  treated as an internet path. If you route the miner's own traffic by source, port, mark or
-  cgroup, list what those paths reach in `[egress] deny_cidrs`. A destination rule into a table
-  that routes it out the same uplink is refused all the same (refusing too much). Routes and
-  rules are read on Linux only.
-- **Public-address discovery depends on two outside services.** If neither answers (a firewall
-  blocking outbound DNS to them, an outage), the NAT public address is unknown until one does:
-  list it in `[egress] deny_cidrs`. A host whose public address changes is caught at the next
-  discovery, at most 5 minutes later.
+- **Global addresses inside your own network, farther than two hops.** The guard sees the
+  host's interfaces, routes, sites and public addresses, refuses the IPv6 /48 and the IPv4 /16
+  around them, makes a host with a public IPv4 interface address or a tunnel uplink list its
+  `internal_ranges` before it starts, and refuses whatever answers within `near_hop_limit` hops.
+  What remains is your organisation's own space beyond all of that: a VPC neighbour or campus
+  subnet more than two hops away and outside the sites and the ranges you listed, an IPv6 site
+  larger than `ipv6_site_prefix_len` on a host without a public IPv4 address, or a service
+  that trusts this host's public address by allowlist. List such ranges in `[egress]
+  internal_ranges` or `deny_cidrs` (and raise `near_hop_limit` where your network is deeper).
+  On a cloud host, also block the metadata service inside the instance (IMDSv2 required, hop
+  limit 1, or the endpoint off) as defense in depth.
+- **The near-hop probe's own limits.** The probe is a SYN with no data, but a near host does
+  receive it (and, if it accepts, a connection that is reset at once) before the connection is
+  refused. A near host that silently drops the probe reads as far, and the real connection,
+  which differs only in its hop limit, then reaches it if it answers that one: a firewall that
+  filters by hop count could tell them apart. A transparent proxy within the limit answers for
+  every destination, so every connection through it is refused. A router that does not
+  decrement the hop count is invisible to the probe, and a far destination whose path drops
+  ICMP costs the probe's 1.5 seconds per address. The probe and the connection are two
+  connects a moment apart; a route that changes in between is not followed.
+- **What the routing checks cannot see.** The kernel is asked as a connection's route
+  lookups are made: with the destination port and (IPv4) the source address the kernel picks,
+  firewall mark 0, and no source port (one is chosen after these lookups; a rule that selects by
+  source port is followed by the kernel's third lookup only). So a source-port rule (`sport`), a
+  mark that a firewall (nftables/iptables `OUTPUT` mangle) sets on the miner's packets, a VRF
+  the miner is run inside (`ip vrf exec`), and eBPF or netfilter rerouting are not followed for
+  that connection; the prefix model still refuses every specific route of every table that is
+  not the default path, and every destination rule's prefix. If you route the miner's own
+  traffic by source port, mark or cgroup, list what those paths reach in `[egress] deny_cidrs`.
+  A destination rule into a table that routes it out the same uplink is refused all the same
+  (refusing too much). Routes and rules are read on Linux only.
+- **Public-address discovery depends on outside services.** If the reflectors cannot confirm
+  a family's address (a firewall blocking outbound DNS and HTTPS to them, an outage), no
+  requester connection goes out over that family until they can or `[egress]
+  public_addresses` names it: the miner stays safe and stops fetching. A box that intercepts
+  DNS **and** HTTPS to `1.1.1.1` (with a certificate this host trusts) could still answer for
+  both DNS reflectors alike. A host whose public address changes is caught at the next
+  discovery, at most 5 minutes later (the last confirmed address stays in force meanwhile).
 - **The facts can be a second stale.** A host that just joined a network is judged on facts at
   most a second old (a refusal re-reads them at once).
 - **NAT64 prefixes the host cannot learn.** A network-specific NAT64 prefix is learned from
   the host's DNS servers (RFC 7050); a translator reached without DNS64 (a static route to a
-  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. The
+  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On an
+  IPv6-only host, addresses under a prefix are refused until the translator's IPv4 address is
+  learned through it (or stated in `public_addresses`). The
   witness broker learns the prefix itself at startup and also gets, from the miner, the
   refusals it implies as prefixes; under a prefix shorter than `/64` that is the whole prefix
   (its "u" octet sits inside the embedded address), so the broker reaches no IPv4-only
