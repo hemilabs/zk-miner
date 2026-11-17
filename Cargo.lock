@@ -10559,6 +10559,8 @@ dependencies = [
  "serde",
  "sha2",
  "sp1-build",
+ "sp1-core-executor",
+ "sp1-core-executor-runner",
  "sp1-cuda",
  "sp1-primitives",
  "sp1-prover",

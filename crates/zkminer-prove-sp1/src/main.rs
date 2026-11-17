@@ -634,19 +634,29 @@ fn confine_worker(keep_server: bool) -> Result<(), String> {
 
 /// The SDK's executor runs every guest in a runner it unpacks into `TMPDIR` on first use and makes
 /// executable with a `chmod`, which a confined worker may not make (no metadata writes:
-/// `zkminer_witness_sandbox::netdeny`). So, before the confinement, the worker executes its own
-/// embedded fibonacci guest once on a CPU prover, which unpacks the runner; the SDK reuses it for
-/// the rest of the process. No requester's bytes are involved. A failure is only logged: the first
+/// `zkminer_witness_sandbox::netdeny`). So, before the confinement, the worker runs that executor
+/// once on its own embedded fibonacci guest, which unpacks the runner; the SDK reuses it for the
+/// rest of the process. No requester's bytes are involved. A failure is only logged: the first
 /// guest's execution then reports it. (The server's executor unpacks its own runner, which its
 /// supervisor makes executable: `zkminer_witness_sandbox::supervise`.)
+#[cfg(target_os = "linux")]
 fn unpack_executor_runner() {
     if FIBONACCI_SP1_GUEST_ELF.is_empty() {
         return;
     }
     let started = Instant::now();
-    let outcome = std::panic::catch_unwind(|| {
-        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
-        run_execute_sp1(&cpu, FIBONACCI_SP1_GUEST_ELF, &10u32.to_le_bytes()).map(|_| ())
+    let outcome = std::panic::catch_unwind(|| -> anyhow::Result<()> {
+        let program = sp1_core_executor::Program::from(FIBONACCI_SP1_GUEST_ELF)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut runner =
+            sp1_core_executor_runner::MinimalExecutorRunner::simple(std::sync::Arc::new(program));
+        runner.with_input(&10u32.to_le_bytes());
+        while runner
+            .try_execute_chunk()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?
+            .is_some()
+        {}
+        Ok(())
     });
     match outcome {
         Ok(Ok(())) => tracing::info!(
@@ -661,6 +671,9 @@ fn unpack_executor_runner() {
         }
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn unpack_executor_runner() {}
 
 /// Whether this worker has confined itself ([`confine_worker`]), and so has no network.
 pub(crate) fn network_denied() -> bool {
