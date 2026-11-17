@@ -18,8 +18,11 @@ test-util = ["client"]
 [dependencies]
 url = "2"
 tracing = { workspace = true }
-# No default features: no system proxy, no decompression, no HTTP/2; TLS is rustls with the
-# compiled-in webpki roots.
+# No default features asked for here, but Cargo unifies features across a build: what other crates
+# ask of reqwest (zkminer-chain: system-proxy and HTTP/2) is turned on in this same reqwest. So the
+# guarded client switches off what must stay off itself, explicitly: `no_proxy()`,
+# `http1_only()`, and `no_gzip()` / `no_brotli()` / `no_deflate()` / `no_zstd()`. TLS is rustls
+# with the compiled-in webpki roots.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 tokio = { workspace = true, optional = true }
 
