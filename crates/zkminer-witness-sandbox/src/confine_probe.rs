@@ -133,6 +133,233 @@ fn run(path: &Path) -> Result<(i32, String), i32> {
     Ok((code, String::new()))
 }
 
+/// A raw syscall: its return value and errno.
+fn sys(f: impl FnOnce() -> libc::c_long) -> (libc::c_long, i32) {
+    let r = f();
+    (r, if r < 0 { errno() } else { 0 })
+}
+
+/// Whether a call failed with exactly `want`, and how it went.
+fn refused_with(r: libc::c_long, e: i32, want: i32) -> (bool, String) {
+    (
+        r < 0 && e == want,
+        if r < 0 {
+            format!("errno {e}")
+        } else {
+            format!("SUCCEEDED ({r})")
+        },
+    )
+}
+
+/// Namespaces, mounts and the rest of the kernel surface the filters take away: each call's
+/// arguments would make it fail with another errno, or succeed harmlessly, without the filter
+/// (`fsopen`, `fsmount`, `fspick` and `move_mount` check the capability first, so for them the
+/// kernel's own answer is `EPERM` too). Then that threads and `posix_spawn` still work, through
+/// libc's fallback from `clone3` to `clone`.
+fn kernel_surface_checks(exec: Option<&Path>, mut report: impl FnMut(&str, bool, String)) {
+    let m1 = -1 as libc::c_long;
+    let null = std::ptr::null::<libc::c_char>();
+    // SAFETY (every call below): arguments that make the call fail without side effects, or (for
+    // the ones that would succeed unfiltered) a no-op unshare, an fd that is closed, a child that
+    // exits at once.
+    let calls: Vec<(&str, libc::c_long, i32)> = vec![
+        {
+            let (r, e) = sys(|| unsafe { libc::unshare(0) } as libc::c_long);
+            ("unshare_none", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::unshare(libc::CLONE_NEWUSER) } as libc::c_long);
+            ("unshare_newuser", r, e)
+        },
+        {
+            let (r, e) = sys(|| {
+                (unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) }) as libc::c_long
+            });
+            ("unshare_newnet", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::setns(-1, 0) } as libc::c_long);
+            ("setns", r, e)
+        },
+        {
+            let (r, e) =
+                sys(|| unsafe { libc::syscall(libc::SYS_mount, null, null, null, 0usize, null) });
+            ("mount", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::umount2(c"/".as_ptr(), -1) } as libc::c_long);
+            ("umount2", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_pivot_root, null, null) });
+            ("pivot_root", r, e)
+        },
+        {
+            let (r, e) = sys(
+                || unsafe { libc::chroot(c"/nonexistent-zkminer-probe".as_ptr()) } as libc::c_long,
+            );
+            ("chroot", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fsopen, null, m1) });
+            ("fsopen", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fsconfig, m1, 0, null, null, 0) });
+            ("fsconfig", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fsmount, m1, 0, 0) });
+            ("fsmount", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_fspick, m1, null, 0) });
+            ("fspick", r, e)
+        },
+        {
+            let (r, e) =
+                sys(|| unsafe { libc::syscall(libc::SYS_move_mount, m1, null, m1, null, m1) });
+            ("move_mount", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_open_tree, m1, null, m1) });
+            ("open_tree", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(crate::restrict::SYS_OPEN_TREE_ATTR, m1, null, m1, null, 0)
+            });
+            ("open_tree_attr", r, e)
+        },
+        {
+            let (r, e) =
+                sys(|| unsafe { libc::syscall(libc::SYS_mount_setattr, m1, null, m1, null, 0) });
+            ("mount_setattr", r, e)
+        },
+        {
+            // UFFD_USER_MODE_ONLY: what an unprivileged process may create.
+            let (r, e) =
+                sys(|| unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | 1) });
+            if r >= 0 {
+                unsafe { libc::close(r as libc::c_int) };
+            }
+            ("userfaultfd", r, e)
+        },
+        {
+            let (r, e) =
+                sys(|| unsafe { libc::syscall(libc::SYS_perf_event_open, null, 0, m1, m1, 0) });
+            ("perf_event_open", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(libc::SYS_name_to_handle_at, m1, null, null, null, 0)
+            });
+            ("name_to_handle_at", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_open_by_handle_at, m1, null, 0) });
+            ("open_by_handle_at", r, e)
+        },
+    ];
+    for (name, r, e) in calls {
+        let (ok, detail) = refused_with(r, e, libc::EPERM);
+        report(name, ok, detail);
+    }
+    for (name, flag) in crate::netdeny::CLONE_NEW_FLAGS {
+        let flags = (flag | libc::SIGCHLD) as libc::c_ulong;
+        // SAFETY: a fork-like clone (no CLONE_VM, no new stack); a child, if the filter let one
+        // through, exits at once.
+        let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_clone, flags, 0usize, 0, 0, 0) });
+        if r == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        if r > 0 {
+            let mut st = 0;
+            unsafe { libc::waitpid(r as libc::pid_t, &mut st, 0) };
+        }
+        let (ok, detail) = refused_with(r, e, libc::EPERM);
+        report(
+            &format!(
+                "clone_{}",
+                name.trim_start_matches("CLONE_").to_ascii_lowercase()
+            ),
+            ok,
+            detail,
+        );
+    }
+    // SAFETY: clone3 with no arguments (EINVAL without the filter).
+    let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_clone3, null, 0usize) });
+    let (ok, detail) = refused_with(r, e, libc::ENOSYS);
+    report("clone3_enosys", ok, detail);
+    // What the GPU stack does keep: threads and posix_spawn, through libc's fallback to clone.
+    let t = std::thread::spawn(|| 7).join();
+    report(
+        "thread_after_confinement",
+        t.as_ref().is_ok_and(|v| *v == 7),
+        format!("{t:?}"),
+    );
+    if let Some(exec) = exec {
+        let r = std::process::Command::new(exec)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        report(
+            "spawn_after_confinement",
+            r.as_ref().is_ok_and(|s| s.success()),
+            format!("{r:?}"),
+        );
+    }
+}
+
+/// Every way to signal `pid` besides `kill` (which the callers check): a thread of it
+/// (`tgkill`), a queued signal (`rt_sigqueueinfo`, `rt_tgsigqueueinfo`), and through a pidfd
+/// (`pidfd_send_signal`). Signal 0 throughout: nothing is sent even if one were allowed.
+fn signal_checks(pid: libc::pid_t, who: &str, mut report: impl FnMut(&str, bool, String)) {
+    // SAFETY: a zeroed siginfo with si_code SI_QUEUE, as sigqueue makes it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    info.si_code = -1; // SI_QUEUE
+    let info_ptr = &info as *const libc::siginfo_t;
+    // SAFETY: signal 0 to `pid`, with a valid siginfo.
+    let calls = [
+        (
+            "tgkill",
+            sys(|| unsafe { libc::syscall(libc::SYS_tgkill, pid, pid, 0) }),
+        ),
+        (
+            "rt_sigqueueinfo",
+            sys(|| unsafe { libc::syscall(libc::SYS_rt_sigqueueinfo, pid, 0, info_ptr) }),
+        ),
+        (
+            "rt_tgsigqueueinfo",
+            sys(|| unsafe { libc::syscall(libc::SYS_rt_tgsigqueueinfo, pid, pid, 0, info_ptr) }),
+        ),
+    ];
+    for (name, (r, e)) in calls {
+        let (ok, detail) = refused_with(r, e, libc::EPERM);
+        report(&format!("{name}_{who}"), ok, detail);
+    }
+    // A pidfd of the process is not refused (it is inert); a signal through it is.
+    // SAFETY: pidfd_open takes no pointers; the fd is closed.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let (ok, detail) = if fd < 0 {
+        (false, format!("pidfd_open errno {}", errno()))
+    } else {
+        // SAFETY: signal 0 through the pidfd just opened, no siginfo.
+        let (r, e) = sys(|| unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        });
+        unsafe { libc::close(fd as libc::c_int) };
+        refused_with(r, e, libc::EPERM)
+    };
+    report(&format!("pidfd_send_signal_{who}"), ok, detail);
+}
+
 static GOT_SIGUSR1: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigusr1(_: libc::c_int) {
@@ -470,10 +697,12 @@ pub fn run_confined(args: &[OsString]) -> i32 {
         rc != 0 && e == libc::EPERM,
         format!("errno {e}"),
     );
+    signal_checks(parent, "parent", |n, ok, d| check(n, ok, d));
     // SAFETY: an io_uring setup with no params; refused by the filter.
     let rc = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, std::ptr::null_mut::<u8>()) };
     let e = errno();
     check("io_uring", rc < 0 && e == libc::EPERM, format!("errno {e}"));
+    kernel_surface_checks(a.exec.as_deref(), |n, ok, d| check(n, ok, d));
 
     // The thread from before.
     go_tx.send(home.clone()).unwrap();
@@ -741,12 +970,14 @@ pub fn run_supervised_child(args: &[OsString]) -> i32 {
         rc != 0 && e == libc::EPERM,
         format!("errno {e}"),
     );
+    signal_checks(sup, "supervisor", &mut report);
     let r = try_open(Path::new(&format!("/proc/{sup}/environ")), libc::O_RDONLY);
     report(
         "proc_supervisor_environ",
         r == Err(libc::EACCES),
         format!("{r:?}"),
     );
+    kernel_surface_checks(None, &mut report);
     let r = try_open(
         &home.join(".config/autostart/zk.desktop"),
         libc::O_WRONLY | libc::O_CREAT,
