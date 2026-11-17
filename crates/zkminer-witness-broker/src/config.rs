@@ -1692,10 +1692,10 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         let d = dir.path();
         let c = dev_toml(&minimal(""), d).unwrap();
         assert_eq!(c.facts_options, zkminer_netguard::FactsOptions::default());
-        let c = dev_toml(&minimal("[egress]\nipv6_site_prefix_len = 48\ndiscover_public_addresses = false"), d).unwrap();
-        assert_eq!(c.facts_options.ipv6_site_prefix_len, 48);
+        let c = dev_toml(&minimal("[egress]\nipv6_site_prefix_len = 56\ndiscover_public_addresses = false"), d).unwrap();
+        assert_eq!(c.facts_options.ipv6_site_prefix_len, 56);
         assert!(!c.facts_options.discover_public_addresses);
-        for bad in ["47", "65", "0"] {
+        for bad in ["31", "65", "0"] {
             let e = err(&minimal(&format!("[egress]\nipv6_site_prefix_len = {bad}")), d);
             assert!(e.contains("ipv6_site_prefix_len"), "{e}");
         }
