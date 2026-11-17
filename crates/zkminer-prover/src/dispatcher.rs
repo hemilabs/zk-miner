@@ -1831,9 +1831,10 @@ const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 /// Groth16 component 2.3 GB.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// `~/.zkminer/locks`: on disk, owned by the miner, and the same for every worker it starts.
+/// `~/.zkminer/locks` (`sp1_groth16_queue_dir`): on disk, owned by the miner, and the same for
+/// every worker it starts.
 fn sp1_queue_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".zkminer").join("locks"))
+    dirs::home_dir().map(|home| zkminer_prover_protocol::types::sp1_groth16_queue_dir(&home))
 }
 
 /// Pool of worker processes, keyed by compound slot key.
@@ -2165,8 +2166,9 @@ impl WorkerPool {
                         // One host-wide queue for every SP1 server's final wrap (hemilabs `sp1`
                         // from v6.8.1), in a directory that is the same for all of them. Its own
                         // default is chosen per process, and lives in `/dev/shm` where `/run/lock`
-                        // is not writable, which logind empties at logout. Ignored by older servers;
-                        // an operator's own setting, inherited from this process, wins.
+                        // is not writable, which logind empties at logout and which a confined
+                        // server cannot reach. Ignored by older servers; an operator's own setting,
+                        // inherited from this process, wins.
                         if std::env::var_os(SP1_QUEUE_DIR_ENV).is_none() {
                             if let Some(dir) = sp1_queue_dir() {
                                 env.insert(SP1_QUEUE_DIR_ENV.into(), dir.display().to_string());

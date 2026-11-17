@@ -774,6 +774,14 @@ pub const WITNESS_READ_DIR_ENV: &str = "ZKMINER_WITNESS_READ_DIR";
 /// (`WitnessProve::segment_dir` is below it), which its confinement lets it write.
 pub const WITNESS_SEGMENT_DIR_ENV: &str = "ZKMINER_WITNESS_SEGMENT_DIR";
 
+/// Where SP1's servers take turns for their final wraps (`SP1_GROTH16_QUEUE_DIR`, lock files, one
+/// per slot) unless the operator says otherwise: `<home>/.zkminer/locks`. On disk, owned by the
+/// miner, the same for every worker it starts and for a worker started on its own, so every server
+/// on the host shares one queue; never `/dev/shm`, which a confined SP1 process cannot reach.
+pub fn sp1_groth16_queue_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".zkminer").join("locks")
+}
+
 /// Set to `0` to stop the SP1 worker installing the `sp1-gpu-server` shipped beside it over
 /// `~/.sp1/bin/sp1-gpu-server`. Shared because the dispatcher has to know which of the two servers
 /// a worker will run, to check that the card can run its GPU code.

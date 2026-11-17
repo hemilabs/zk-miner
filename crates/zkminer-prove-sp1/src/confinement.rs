@@ -9,9 +9,12 @@
 //! keeps no socket. A proving worker first starts its server and connects to it (`build_prover`),
 //! then confines itself keeping that one connection and nothing else. Files: read the system's, this binary's directory,
 //! `LD_LIBRARY_PATH` and `~/.sp1`; write only its private temporary directory (`TMPDIR`, made at
-//! startup by [`prepare`], where the SDK's executor puts its runner, which it may also execute) and
-//! `/dev/shm` (the executor's memory images and trace rings). No signal to, and no `/proc` access
-//! to, the miner or another worker.
+//! startup by [`prepare`], where the SDK's executor puts its runner, which it may also execute).
+//! Nothing in `/dev/shm`: SP1's executor shares the guest's memory and trace ring with its runner
+//! through file descriptors (memfds), which no path reaches, and what SP1's final-wrap provers would
+//! put in `/dev/shm` goes to the private directory too (`SP1_SHM_DIR`). No signal to the miner or
+//! another worker; `/proc` is readable (the executor's memory monitor reads its runner child's
+//! entries), but not another process's memory or environment.
 //!
 //! **The server.** The SDK starts the server as `~/.sp1/bin/<SP1_GPU_SERVER_NAME>`. A proving worker
 //! points that name at [`SHIM_PREFIX`]`<the real name>`, a link to this binary, and the real
@@ -19,8 +22,10 @@
 //! this binary is the shim ([`run_if_shim`]): it runs the real server confined, under a supervisor
 //! (`zkminer_witness_sandbox::supervise`): its own listener and the CUDA driver's until it accepts
 //! its first connection, no socket, `bind` or `listen` after, never `connect`; Landlock as for the
-//! worker, plus executing itself (its Groth16 CPU helper) and creating its socket under `/tmp`;
-//! `/dev/null` for stdin. The server's socket is therefore `/tmp/zkminer-confined-<name>-<id>.sock`.
+//! worker, plus executing itself (its Groth16 CPU helper), the host-wide Groth16 queue's lock files
+//! (`SP1_GROTH16_QUEUE_DIR`, `~/.zkminer/locks` unless the operator put it elsewhere) and creating
+//! its socket under `/tmp`; `/dev/null` for stdin. The server's socket is therefore
+//! `/tmp/zkminer-confined-<name>-<id>.sock`.
 //! The server ends when the worker does.
 //!
 //! Neither may change a file's mode. The SDK's executor unpacks its runner into `TMPDIR` and makes
@@ -99,6 +104,15 @@ pub(crate) fn route_server_through_shim() -> Result<(), String> {
     let shim_name = format!("{SHIM_PREFIX}{real_name}");
     let dir = sp1_bin_dir().ok_or("$HOME is not set")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // The servers' host-wide Groth16 queue (lock files): the miner's (as the dispatcher sets it),
+    // never `/dev/shm`, which a confined server cannot reach. It must exist before the server is
+    // confined to it; where it cannot be made, SP1 proves without the queue, and says so.
+    let queue = std::env::var_os("SP1_GROTH16_QUEUE_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| zkminer_prover_protocol::types::sp1_groth16_queue_dir(&h)))
+        .ok_or("$HOME is not set")?;
+    let _ = std::fs::create_dir_all(&queue);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let link = dir.join(&shim_name);
     let current = std::fs::read_link(&link).ok();
@@ -113,13 +127,17 @@ pub(crate) fn route_server_through_shim() -> Result<(), String> {
     unsafe {
         std::env::set_var(REAL_SERVER_ENV, &real);
         std::env::set_var("SP1_GPU_SERVER_NAME", &shim_name);
-        // The servers' host-wide Groth16 queue (lock files): in `/dev/shm`, which a confined server
-        // writes anyway, rather than `/run/lock`, which it may not.
-        if std::env::var_os("SP1_GROTH16_QUEUE_DIR").is_none() {
-            std::env::set_var("SP1_GROTH16_QUEUE_DIR", "/dev/shm");
-        }
+        std::env::set_var("SP1_GROTH16_QUEUE_DIR", &queue);
     }
     server_routed_through_shim()
+}
+
+/// `$HOME`, if set.
+#[cfg(target_os = "linux")]
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 #[cfg(target_os = "linux")]
@@ -130,17 +148,22 @@ mod imp {
 
     use zkminer_witness_sandbox::confine::{self, Confinement, Rights, Sockets};
 
+    use super::home;
+
     /// The private temporary directory [`prepare`] made.
     static TMPDIR: OnceLock<PathBuf> = OnceLock::new();
 
     /// At startup, while the process has one thread: a private temporary directory, which `TMPDIR`
     /// then names for everything in this process and its server (the SDK's executor runner, gnark's
-    /// files).
+    /// files), and `SP1_SHM_DIR` for whatever SP1's final-wrap provers would put in `/dev/shm`.
     pub fn prepare() {
         match confine::private_tmpdir("sp1") {
             Ok(dir) => {
                 // SAFETY: called from `main` before any thread exists.
-                unsafe { std::env::set_var("TMPDIR", &dir) };
+                unsafe {
+                    std::env::set_var("TMPDIR", &dir);
+                    std::env::set_var("SP1_SHM_DIR", &dir);
+                }
                 let _ = TMPDIR.set(dir);
             }
             Err(e) => eprintln!(
@@ -165,6 +188,14 @@ mod imp {
         let tmp = TMPDIR
             .get()
             .ok_or("no private temporary directory to confine this worker to")?;
+        let c = worker_policy(tmp, keep_server);
+        let report = confine::confine_all_threads(&c).map_err(|e| e.to_string())?;
+        tracing::info!("worker confined: {report}");
+        Ok(())
+    }
+
+    /// The worker's confinement: see the module docs.
+    fn worker_policy(tmp: &Path, keep_server: bool) -> Confinement {
         let mut c = Confinement::with_system(Sockets::KeepConnected);
         common_rules(&mut c, tmp);
         if keep_server {
@@ -174,15 +205,7 @@ mod imp {
                 c.allow(server, Rights::EXEC);
             }
         }
-        let report = confine::confine_all_threads(&c).map_err(|e| e.to_string())?;
-        tracing::info!("worker confined: {report}");
-        Ok(())
-    }
-
-    fn home() -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(PathBuf::from)
+        c
     }
 
     /// What the worker and its server both need.
@@ -196,14 +219,13 @@ mod imp {
         for dir in confine::library_path_dirs() {
             c.allow(dir, Rights::READ);
         }
-        // The SDK's executor extracts its runner here and runs it.
+        // The SDK's executor extracts its runner here and runs it. (It shares the guest's memory
+        // image and trace ring with the runner through file descriptors, which need no path.)
         c.allow(tmp, Rights::WRITE | Rights::EXEC);
         // All of `/proc`, not only this process's: the executor's memory monitor (`sysinfo`) reads
         // its runner child's `/proc/<pid>/{stat,statm,io,exe}`, and the worker its server's
         // `/proc/<pid>/stat`, at pids no rule can name in advance.
         c.allow("/proc", Rights::READ);
-        // ...and keeps the guest's memory image and trace ring in shared memory.
-        c.allow("/dev/shm", Rights::WRITE);
         if let Some(h) = home() {
             c.allow(h.join(".sp1"), Rights::READ);
         }
@@ -222,7 +244,7 @@ mod imp {
         c.allow("/tmp", Rights::MAKE_SOCK);
         // Its Groth16 CPU helper is itself, started again.
         c.allow(real, Rights::EXEC);
-        // The host-wide Groth16 queue, where the operator put it elsewhere than `/dev/shm`.
+        // The host-wide Groth16 queue (`route_server_through_shim` names it).
         if let Some(dir) = std::env::var_os("SP1_GROTH16_QUEUE_DIR").filter(|d| !d.is_empty()) {
             c.allow(PathBuf::from(dir), Rights::WRITE);
         }
@@ -298,6 +320,46 @@ mod imp {
                 eprintln!("zkminer: cannot run sp1-gpu-server confined: {e}");
                 1
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Whether a rule on `path` reaches `/dev/shm`: names it, a directory above it, or
+        /// anything in it (through a symlink too, such as `/run/shm`).
+        fn reaches_dev_shm(path: &Path) -> bool {
+            let shm = Path::new("/dev/shm");
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            shm.starts_with(&path) || path.starts_with(shm)
+        }
+
+        /// Neither the worker (measuring or proving) nor its server may open, create or remove
+        /// anything in `/dev/shm`. The one rule above it is the system's listing of `/dev`, which
+        /// opens no file.
+        #[test]
+        fn no_confinement_reaches_dev_shm() {
+            let tmp =
+                std::env::temp_dir().join(format!("zkminer-sp1-policy-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let server = std::env::current_exe().unwrap();
+            for (what, c) in [
+                ("measuring worker", worker_policy(&tmp, false)),
+                ("proving worker", worker_policy(&tmp, true)),
+                ("server", server_policy(&server, &tmp)),
+            ] {
+                for (path, rights) in c.rules() {
+                    if reaches_dev_shm(path) {
+                        assert!(
+                            *rights == Rights::LIST && path == Path::new("/dev"),
+                            "the {what}'s rule on {} ({rights:?}) reaches /dev/shm",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
         }
     }
 }

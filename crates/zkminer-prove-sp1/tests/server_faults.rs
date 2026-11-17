@@ -102,6 +102,10 @@ impl Rig {
         ));
         let bin = dir.join(".sp1/bin");
         std::fs::create_dir_all(&bin).unwrap();
+        // The host-wide Groth16 queue's directory: where the server, which runs confined
+        // (Landlock), may write.
+        let queue = dir.join("queue");
+        std::fs::create_dir_all(&queue).unwrap();
         // A link keeps this quick: what runs is named by its path, and that is what its `comm` is.
         std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bin.join(server)).unwrap();
         let mut env = vec![
@@ -114,8 +118,14 @@ impl Rig {
             ("ZKMINER_CUDA_DEVICE_ID".to_string(), DEVICE.to_string()),
             ("ZKMINER_SP1_SERVER_INSTALL".to_string(), "0".to_string()),
             ("FAKE_SERVER_MODE".to_string(), mode.to_string()),
-            // Where the server, which runs confined (Landlock), may write: /dev/shm.
-            ("FAKE_SERVER_LOG".to_string(), Self::reached_marker(name)),
+            (
+                "SP1_GROTH16_QUEUE_DIR".to_string(),
+                queue.display().to_string(),
+            ),
+            (
+                "FAKE_SERVER_LOG".to_string(),
+                queue.join("reached").display().to_string(),
+            ),
         ];
         if server != CUDA_SERVER {
             env.push(("SP1_GPU_SERVER_NAME".to_string(), server.to_string()));
@@ -189,22 +199,11 @@ impl Rig {
             .find(|(k, _)| k == "FAKE_SERVER_LOG")
             .is_some_and(|(_, v)| Path::new(v).exists())
     }
-
-    /// The marker the stand-in server writes when a worker reaches it.
-    fn reached_marker(name: &str) -> String {
-        format!(
-            "/dev/shm/zkminer-server-faults-{}-{name}-reached",
-            std::process::id()
-        )
-    }
 }
 
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
-        if let Some((_, marker)) = self.env.iter().find(|(k, _)| k == "FAKE_SERVER_LOG") {
-            let _ = std::fs::remove_file(marker);
-        }
         // A killed server leaves its socket, as a real one does.
         for socket in [
             format!("/tmp/sp1-cuda-{DEVICE}.sock"),

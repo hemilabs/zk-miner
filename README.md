@@ -551,7 +551,7 @@ Reading the counts:
   default, 1e9, is ten times the largest proof seen on this market.
 
 **Never run `simulate` on a host that runs a miner.** The miner's host-RAM and `/dev/shm` ledgers are
-per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` and may hold up to
+per process: a simulate measurement (an SP1 one stages gigabytes of shared memory and may hold up to
 24 GiB) is invisible to a miner beside it, and the two can together OOM or SIGBUS its proofs.
 
 ## Witness jobs: requester tools
