@@ -9,6 +9,10 @@
 //! parent stands in for it), and the kernel surface the filters take away: namespaces (`unshare`,
 //! `setns`, `clone` with a `CLONE_NEW*` flag; `clone3` is unimplemented), mounts and the new mount
 //! API, `userfaultfd`, `perf_event_open` and file handles; threads and `posix_spawn` still work.
+//! Metadata writes (mode, owner, extended attributes, times; by path and through an fd) are
+//! refused, but for the supervised server's runner, which its supervisor makes executable; links,
+//! renames, removals, directories, symlinks and truncation outside the writable path are refused
+//! by Landlock.
 //!
 //! Needs Landlock ABI >= 6 (else SKIPPED, or a failure with `ZKMINER_SANDBOX_TESTS_REQUIRED=1`); no
 //! cgroup, no GPU.
@@ -125,6 +129,48 @@ const KERNEL_SURFACE: &[&str] = &[
     "clone3_enosys",
     "thread_after_confinement",
 ];
+
+/// Metadata writes (`metadata_checks`), each refused, on a file both probes may write; and the
+/// namespace changes outside the writable path that Landlock refuses (`namespace_checks`).
+fn metadata_and_namespace_checks() -> Vec<String> {
+    let mut v: Vec<&str> = vec![
+        "fchmodat",
+        "fchmodat2",
+        "fchownat",
+        "setxattr",
+        "lsetxattr",
+        "setxattrat",
+        "removexattr",
+        "lremovexattr",
+        "removexattrat",
+        "utimensat_path",
+        "fchmod",
+        "fchown",
+        "fsetxattr",
+        "fremovexattr",
+        "futimens",
+        "chmod_key",
+    ];
+    if cfg!(target_arch = "x86_64") {
+        v.extend(["chmod", "chown", "lchown", "utime", "utimes", "futimesat"]);
+    }
+    let mut names: Vec<String> = v.iter().map(|n| format!("meta_{n}")).collect();
+    names.push("metadata_unchanged".into());
+    for n in [
+        "link_into_home",
+        "link_out_of_home",
+        "symlink_into_home",
+        "rename_into_home",
+        "rename_out_of_home",
+        "unlink_home",
+        "rmdir_home",
+        "mkdir_home",
+        "truncate_home",
+    ] {
+        names.push(format!("ns_{n}"));
+    }
+    names
+}
 
 /// Signals by every syscall but `kill` (`signal_checks`), to `who`.
 fn signal_checks(who: &str) -> Vec<String> {
@@ -257,6 +303,10 @@ fn a_confined_worker_reaches_no_socket_no_home_and_not_the_miner() {
     for name in signal_checks("parent") {
         assert!(checked(&log, &name), "{name} not checked:\n{log}");
     }
+    for name in metadata_and_namespace_checks() {
+        assert!(checked(&log, &name), "{name} not checked:\n{log}");
+    }
+    assert!(checked(&log, "runner_chmod_refused"), "{log}");
     // Nothing was written where it was refused.
     assert!(!home.path().join(".config/autostart/zk.desktop").exists());
     assert!(!home.path().join(".config/thread-was-here").exists());
@@ -264,6 +314,9 @@ fn a_confined_worker_reaches_no_socket_no_home_and_not_the_miner() {
         std::fs::read_to_string(home.path().join(".bashrc")).unwrap(),
         "# the operator's\n"
     );
+    assert!(home.path().join(".config/systemd/user").is_dir());
+    assert!(!home.path().join(".config/new-dir").exists());
+    assert!(!home.path().join(".config/moved").exists());
     // The pivots this host has were really reachable before: the refusals are the confinement's.
     for l in log.lines().filter(|l| l.starts_with("NOTE before_")) {
         say(l);
@@ -340,6 +393,12 @@ fn supervised(
 ) {
     let home = fake_home();
     let write = tempfile::tempdir().unwrap();
+    // Private, as the worker's temporary directory is (the supervisor makes runner files
+    // executable only in such a directory).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(write.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let sock_dir = tempfile::tempdir().unwrap();
     let socket = sock_dir.path().join("server.sock");
     let mut cmd = if linger {
@@ -418,6 +477,16 @@ fn a_supervised_server_listens_until_its_first_connection_and_never_after() {
     }
     for name in signal_checks("supervisor") {
         assert!(checked(&log, &name), "{name} not checked:\n{log}");
+    }
+    for name in metadata_and_namespace_checks() {
+        assert!(checked(&log, &name), "{name} not checked:\n{log}");
+    }
+    for name in [
+        "runner_made_executable_by_supervisor",
+        "other_file_not_made_executable",
+        "runner_other_mode_refused",
+    ] {
+        assert!(checked(&log, name), "{name} not checked:\n{log}");
     }
     for pivot in ["session_bus", "docker", "resolved_varlink"] {
         if log.contains(&format!("pre_accept_connect_{pivot}")) {

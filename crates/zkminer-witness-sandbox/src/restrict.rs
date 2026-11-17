@@ -438,13 +438,13 @@ const fn d(name: &'static str, nr: i64) -> Denied {
 }
 
 // Not in libc 0.2.191; new syscalls share one number on every architecture since Linux 5.1.
-const SYS_SETXATTRAT: i64 = 463;
+pub(crate) const SYS_SETXATTRAT: i64 = 463;
 const SYS_GETXATTRAT: i64 = 464;
 const SYS_LISTXATTRAT: i64 = 465;
-const SYS_REMOVEXATTRAT: i64 = 466;
+pub(crate) const SYS_REMOVEXATTRAT: i64 = 466;
 pub(crate) const SYS_OPEN_TREE_ATTR: i64 = 467;
 const SYS_FILE_GETATTR: i64 = 468;
-const SYS_FILE_SETATTR: i64 = 469;
+pub(crate) const SYS_FILE_SETATTR: i64 = 469;
 const SYS_STATMOUNT: i64 = 457;
 const SYS_LISTMOUNT: i64 = 458;
 const SYS_LSM_GET_SELF_ATTR: i64 = 459;

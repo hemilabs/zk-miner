@@ -16,13 +16,18 @@
 //!   (mounted over it, or over one of its parent directories) cannot be reached by any path and is
 //!   left out; an automount point never is (its mount expires and it is reachable again). The
 //!   filesystem type must be one known to be local ([`LOCAL_TYPES`]: disk, memory and kernel
-//!   filesystems); anything else is refused, unknown types included. Two exceptions, both because
-//!   the kernel itself keeps the process out: a FUSE mount without `allow_other` that belongs to
-//!   another user (the kernel refuses this user's lookups before the daemon sees them, which a
-//!   `statx` of its root confirms), and a *direct* automount point (one fixed mount, such as
-//!   systemd's for `binfmt_misc` or the EFI system partition) whose target is a local filesystem;
-//!   an idle one is triggered once to see what it mounts. An indirect automount map (a lookup names
-//!   what it mounts) is refused.
+//!   filesystems); anything else is refused, unknown types included. Exceptions: a FUSE mount
+//!   without `allow_other` that belongs to another user (the kernel refuses this user's lookups
+//!   before the daemon sees them, which a `statx` of its root confirms); the FUSE filesystems that
+//!   serve only what is on this host by construction, recognised by subtype, source and owner
+//!   ([`local_fuse`]: the document portal, lxcfs, a FUSE driver of a block device, squashfuse and
+//!   AppImage mounts), while every FUSE filesystem that can stand for a remote (gvfs, sshfs,
+//!   rclone, s3fs, davfs, smbnetfs, curlftpfs, an encrypted overlay such as gocryptfs or encfs over
+//!   a directory that may itself be remote) and every unknown subtype is refused; and a *direct*
+//!   automount point (one fixed mount, such as systemd's for `binfmt_misc` or the EFI system
+//!   partition) whose target is a local filesystem; an idle one is triggered once to see what it
+//!   mounts. An indirect automount map (a lookup names what it mounts) is refused, and so is 9p
+//!   (a VM host's or WSL's file shares: a transport to another machine's files).
 //! - **every path the process is granted**: `statfs` must report a local filesystem
 //!   ([`LOCAL_MAGICS`]);
 //! - **its working directory and every regular file, directory or link it holds open**: on a
@@ -206,7 +211,11 @@ enum Kind {
 fn kind_of(fstype: &str) -> Kind {
     if LOCAL_TYPES.contains(&fstype) {
         Kind::Local
-    } else if fstype == "fuse" || fstype == "fuseblk" || fstype.starts_with("fuse.") {
+    } else if fstype == "fuse"
+        || fstype == "fuseblk"
+        || fstype.starts_with("fuse.")
+        || fstype.starts_with("fuseblk.")
+    {
         Kind::Fuse
     } else if fstype == "autofs" {
         Kind::Automount
@@ -216,6 +225,86 @@ fn kind_of(fstype: &str) -> Kind {
 }
 
 /// Why a filesystem of `fstype` is refused.
+/// What [`judge`] asks of the host about a mount's source.
+pub(crate) trait SourceFacts {
+    /// Whether `path` is a block device.
+    fn is_block_device(&self, path: &Path) -> bool;
+}
+
+/// The host as it is.
+struct Host;
+
+impl SourceFacts for Host {
+    fn is_block_device(&self, path: &Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        path.is_absolute() && std::fs::metadata(path).is_ok_and(|m| m.file_type().is_block_device())
+    }
+}
+
+/// Whether `name` is an AppImage's file name, as its runtime names the mount (`fuse.<name>`, with
+/// `<name>` as the source too).
+fn is_appimage_name(name: &[u8]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.len() > ".appimage".len() && lower.ends_with(b".appimage") && !name.contains(&b'/')
+}
+
+/// The FUSE filesystems whose daemon serves only what is on this host, by construction: the reason,
+/// or `None` (refused). Each is recognised by its subtype together with what pins it: the user that
+/// mounted it (only root, or this user, can mount one so: another user's carries that user's id)
+/// and the source the table shows.
+///
+/// - `fuse.portal`, this user's at `/run/user/<uid>/doc`: xdg-document-portal, which gives
+///   sandboxed apps the documents the user handed them, by document id. A name it does not know it
+///   answers itself, touching no filesystem; the documents it knows are the user's own files, on
+///   filesystems of the mount table, which are judged in their own right (a remote one is refused
+///   there).
+/// - `fuse.lxcfs`, root's: LXD's and Incus's daemon for containers' views of `/proc` and `/sys`,
+///   which it computes from this kernel's cgroup and process data.
+/// - `fuseblk` (`fuseblk.<subtype>`) with a block device as source: a disk filesystem driver in user
+///   space (ntfs-3g, exfat-fuse) reading that device; only root can mount one, and the kernel opens
+///   the device for it. A device that is itself remote (iSCSI, NBD) is as invisible here as under
+///   any local filesystem.
+/// - `fuse.squashfuse`, `fuse.squashfuse_ll`, this user's or root's: a read-only squashfs image
+///   file; every lookup is answered from the image.
+/// - An AppImage this user runs: its runtime (squashfuse) mounts the image embedded in the AppImage
+///   file as `fuse.<file name>`, source `<file name>`, at `<temporary directory>/.mount_<...>`.
+fn local_fuse(m: &Mount, euid: u32, facts: &dyn SourceFacts) -> Option<&'static str> {
+    let owner = m
+        .super_option("user_id")
+        .and_then(|u| u.parse::<u32>().ok());
+    let source = unescape(&m.source);
+    let point = m.mount_point();
+    let t = m.fstype.as_str();
+    if t == "fuse.portal"
+        && source == b"portal"
+        && owner == Some(euid)
+        && point == Path::new(&format!("/run/user/{euid}/doc"))
+    {
+        Some("xdg-document-portal")
+    } else if t == "fuse.lxcfs" && source == b"lxcfs" && owner == Some(0) {
+        Some("lxcfs")
+    } else if (t == "fuseblk" || t.starts_with("fuseblk."))
+        && facts.is_block_device(Path::new(std::ffi::OsStr::from_bytes(&source)))
+    {
+        Some("a FUSE driver of a block device")
+    } else if (t == "fuse.squashfuse" || t == "fuse.squashfuse_ll")
+        && (owner == Some(euid) || owner == Some(0))
+    {
+        Some("squashfuse")
+    } else if t
+        .strip_prefix("fuse.")
+        .is_some_and(|sub| sub.as_bytes() == source.as_slice() && is_appimage_name(&source))
+        && owner == Some(euid)
+        && point
+            .file_name()
+            .is_some_and(|n| n.as_bytes().starts_with(b".mount_"))
+    {
+        Some("an AppImage")
+    } else {
+        None
+    }
+}
+
 fn why_not_local(fstype: &str) -> &'static str {
     const NETWORK: &[&str] = &[
         "nfs",
@@ -243,6 +332,9 @@ fn why_not_local(fstype: &str) -> &'static str {
         Kind::Local => "local",
         Kind::Fuse => "a FUSE filesystem, served by a user-space daemon",
         Kind::Automount => "an automount point",
+        Kind::Other if fstype == "9p" || fstype == "virtiofs" => {
+            "a share of another machine's files (a VM host's, or WSL's drives)"
+        }
         Kind::Other if NETWORK.contains(&fstype) => "a network filesystem",
         Kind::Other if fstype == "ocfs2" || fstype == "gfs2" => "a cluster filesystem",
         Kind::Other => "a filesystem type not known to be local",
@@ -429,7 +521,12 @@ fn fuse_of_another_user(m: &Mount, euid: u32) -> bool {
 
 /// The reachable mounts of `mounts` that are not local, each with why (see the module docs), for a
 /// process whose root is the mount `root_id` and whose effective uid is `euid`.
-pub(crate) fn judge(mounts: &[Mount], root_id: u32, euid: u32) -> Vec<String> {
+pub(crate) fn judge(
+    mounts: &[Mount],
+    root_id: u32,
+    euid: u32,
+    facts: &dyn SourceFacts,
+) -> Vec<String> {
     let reach = reachable(mounts, root_id);
     let mut problems = Vec::new();
     for (m, _) in mounts.iter().zip(&reach).filter(|(_, r)| **r) {
@@ -437,6 +534,8 @@ pub(crate) fn judge(mounts: &[Mount], root_id: u32, euid: u32) -> Vec<String> {
             Kind::Local => {}
             // The kernel refuses this user's lookups before its daemon sees them.
             Kind::Fuse if fuse_of_another_user(m, euid) => {}
+            // Served from this host only (see `local_fuse`).
+            Kind::Fuse if local_fuse(m, euid, facts).is_some() => {}
             Kind::Automount => {
                 let target = mounts
                     .iter()
@@ -587,7 +686,7 @@ pub fn check_local_filesystems(granted: &[PathBuf]) -> Result<LocalFsReport, San
     }
     // SAFETY: geteuid has no arguments.
     let euid = unsafe { libc::geteuid() };
-    let mut problems = judge(&mounts, root, euid);
+    let mut problems = judge(&mounts, root, euid, &Host);
     // Another user's FUSE mount that `judge` let pass: the kernel must refuse this process's
     // `statx` of its root (from cached attributes, so its daemon is not asked either way).
     let reach = reachable(&mounts, root);
@@ -721,9 +820,19 @@ mod tests {
 51 25 0:40 / /var/lib/docker/rootfs/overlayfs/d7e1f228 rw,relatime shared:27 - overlay overlay rw,lowerdir=/var/lib/docker/a:/var/lib/docker/b,upperdir=/var/lib/docker/c,workdir=/var/lib/docker/d
 ";
 
+    /// A host whose block devices are `/dev/sd*` and `/dev/nvme*`.
+    struct Fake;
+
+    impl SourceFacts for Fake {
+        fn is_block_device(&self, path: &Path) -> bool {
+            let p = path.to_string_lossy();
+            p.starts_with("/dev/sd") || p.starts_with("/dev/nvme")
+        }
+    }
+
     fn judged(extra: &str) -> Vec<String> {
         let mounts = parse_mountinfo(&format!("{HOST}{extra}")).unwrap();
-        judge(&mounts, 25, 1000)
+        judge(&mounts, 25, 1000, &Fake)
     }
 
     #[test]
@@ -782,7 +891,8 @@ mod tests {
         for line in [
             "60 25 0:51 / /mnt/remote rw - fuse.sshfs me@host:/ rw,user_id=1000,group_id=1000",
             "60 25 0:51 / /mnt/remote rw - fuse.rclone remote: rw,user_id=1000,group_id=1000",
-            "60 25 0:51 / /mnt/win rw - fuseblk /dev/sdb1 rw,user_id=0,group_id=0,allow_other",
+            // A block-device FUSE driver whose source is not a block device.
+            "60 25 0:51 / /mnt/win rw - fuseblk /srv/disk.img rw,user_id=0,group_id=0,allow_other",
             // Another user's, but open to every user.
             "60 25 0:51 / /mnt/x rw - fuse.sshfs h:/ rw,user_id=1001,group_id=1001,allow_other",
             "60 25 0:51 / /mnt/x rw - fuse src rw",
@@ -799,7 +909,70 @@ mod tests {
             "{HOST}60 25 0:51 / /home/other/remote rw - fuse.sshfs h:/ rw,user_id=1001,group_id=1001\n"
         ))
         .unwrap();
-        assert_eq!(judge(&mounts, 25, 0).len(), 1);
+        assert_eq!(judge(&mounts, 25, 0, &Fake).len(), 1);
+    }
+
+    /// FUSE filesystems served from this host by construction pass; every one that can stand for a
+    /// remote, and every unknown subtype, is refused (see `local_fuse`).
+    #[test]
+    fn fuse_served_locally_by_construction_and_nothing_else() {
+        let allowed = [
+            // GNOME's and KDE's document portal, this user's, where it always is.
+            "60 49 0:52 / /run/user/1000/doc rw,nosuid,nodev,relatime - fuse.portal portal rw,user_id=1000,group_id=1000",
+            // LXD's lxcfs (deb and snap locations).
+            "60 25 0:53 / /var/lib/lxcfs rw,nosuid,nodev,relatime - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other",
+            "60 25 0:53 / /var/snap/lxd/common/var/lib/lxcfs rw - fuse.lxcfs lxcfs rw,user_id=0,group_id=0,allow_other",
+            // ntfs-3g and exfat-fuse mounted by udisks.
+            "60 25 0:54 / /media/me/Windows rw,nosuid,nodev,relatime - fuseblk /dev/sdb1 rw,user_id=0,group_id=0,default_permissions,allow_other,blksize=4096",
+            "60 25 0:54 / /media/me/CARD rw - fuseblk.exfat /dev/nvme1n1p1 rw,user_id=0,group_id=0,allow_other",
+            // squashfuse, by this user or root.
+            "60 25 0:55 / /mnt/img rw - fuse.squashfuse squashfuse rw,user_id=1000,group_id=1000",
+            "60 25 0:55 / /opt/tool rw - fuse.squashfuse_ll /srv/tool.sqfs rw,user_id=0,group_id=0,allow_other",
+            // An AppImage this user runs.
+            "60 44 0:56 / /tmp/.mount_ObsidiAbC123 ro,nosuid,nodev,relatime - fuse.Obsidian-1.4.16.AppImage Obsidian-1.4.16.AppImage ro,user_id=1000,group_id=1000",
+        ];
+        for line in allowed {
+            assert_eq!(judged(&format!("{line}\n")), Vec::<String>::new(), "{line}");
+        }
+        let refused = [
+            // Remote-capable daemons.
+            "60 49 0:51 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse.sshfs me@host:/ rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse.rclone s3:bucket rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse.s3fs s3fs rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse https://dav.example.com/ rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse.smbnetfs smbnetfs rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse.curlftpfs curlftpfs#ftp://h/ rw,user_id=1000,group_id=1000",
+            // Encrypted views of a directory that may itself be remote.
+            "60 25 0:51 / /mnt/r rw - fuse.gocryptfs /home/me/cipher rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse.encfs encfs rw,user_id=1000,group_id=1000",
+            // Unknown subtypes and plain FUSE.
+            "60 25 0:51 / /mnt/r rw - fuse.mything src rw,user_id=1000,group_id=1000",
+            "60 25 0:51 / /mnt/r rw - fuse src rw,user_id=1000,group_id=1000",
+            // A known subtype that does not match what pins it: elsewhere, another source, another
+            // owner, an AppImage name at another mount point or with another source.
+            "60 25 0:52 / /mnt/doc rw - fuse.portal portal rw,user_id=1000,group_id=1000",
+            "60 49 0:52 / /run/user/1000/doc rw - fuse.portal sshfs rw,user_id=1000,group_id=1000",
+            "60 28 0:52 / /run/user/1001/doc rw - fuse.portal portal rw,user_id=1001,group_id=1001,allow_other",
+            "60 25 0:53 / /var/lib/lxcfs rw - fuse.lxcfs lxcfs rw,user_id=1001,group_id=1001,allow_other",
+            "60 25 0:53 / /var/lib/lxcfs rw - fuse.lxcfs me@host:/ rw,user_id=0,group_id=0,allow_other",
+            "60 25 0:55 / /mnt/img rw - fuse.squashfuse squashfuse rw,user_id=1001,group_id=1001,allow_other",
+            "60 44 0:56 / /tmp/notmount rw - fuse.X.AppImage X.AppImage rw,user_id=1000,group_id=1000",
+            "60 44 0:56 / /tmp/.mount_XabcDE rw - fuse.X.AppImage me@host:/ rw,user_id=1000,group_id=1000",
+            "60 44 0:56 / /tmp/.mount_XabcDE rw - fuse.sshfs X.AppImage rw,user_id=1000,group_id=1000",
+            "60 25 0:54 / /mnt/w rw - fuseblk /srv/disk.img rw,user_id=0,group_id=0,allow_other",
+            // 9p and virtiofs: a VM host's (or WSL's) shares.
+            "60 25 0:57 / /mnt/c rw - 9p drvfs rw,aname=drvfs;path=C:\\",
+            "60 25 0:57 / /mnt/host rw - 9p hostshare rw,trans=virtio",
+            "60 25 0:57 / /mnt/host rw - virtiofs myfs rw",
+        ];
+        for line in refused {
+            assert_eq!(judged(&format!("{line}\n")).len(), 1, "{line}");
+        }
+        assert!(
+            judged("60 25 0:57 / /mnt/host rw - 9p hostshare rw,trans=virtio\n")[0]
+                .contains("another machine's files")
+        );
     }
 
     #[test]
@@ -810,7 +983,7 @@ mod tests {
             "48 37 0:38 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:24 - binfmt_misc binfmt_misc rw\n",
             "",
         );
-        let p = judge(&parse_mountinfo(&idle).unwrap(), 25, 1000);
+        let p = judge(&parse_mountinfo(&idle).unwrap(), 25, 1000, &Fake);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("could not be seen"), "{p:?}");
         // A direct automount of the EFI partition, mounted: fine.

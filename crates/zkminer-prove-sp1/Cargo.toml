@@ -34,6 +34,11 @@ sp1-primitives = "6.0"
 # Denies the worker the network before it runs a requester's guest (`deny_network`).
 [target.'cfg(target_os = "linux")'.dependencies]
 zkminer-witness-sandbox = { workspace = true }
+# `unpack_executor_runner`: the SDK's executor runner, run once on an embedded guest before the worker
+# confines itself, which unpacks the runner binary. sp1-sdk depends on both already (the same commit
+# as the [patch] in the workspace's Cargo.toml).
+sp1-core-executor = "6.0"
+sp1-core-executor-runner = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
 
 [build-dependencies]
 sp1-build = "6.0"
