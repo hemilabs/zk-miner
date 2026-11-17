@@ -14,10 +14,12 @@
 #                      of any other family keeps compiling at first start. Default: applegpu_g17s.
 #
 # Only this Mac's architecture is copied (~170 MB of the 1.7 GB set). Every file is checked against
-# SHA256SUMS. The new set replaces the old one in one rename, so a running worker never sees a
+# SHA256SUMS, and its metallib digest against the worker's embedded metallibs (P31-M9b; a set built
+# for another worker is refused). The new set replaces the old one in one rename, so a running worker never sees a
 # half-copied directory. Exit 0 also when nothing is installed (another arch, no archives); a
 # previous install's set is then removed, since it was built for another worker.
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
 src=${1:?usage: install-metal-aot.sh <archive set dir> <installed worker> [validated arch ...]}
 worker=${2:?usage: install-metal-aot.sh <archive set dir> <installed worker> [validated arch ...]}
 shift 2
@@ -55,6 +57,24 @@ if [ ${#files[@]} = 0 ]; then
   echo "install-metal-aot: $src has no archives for $arch: none installed"
   remove_stale
   exit 0
+fi
+
+# P31-M9b: every archive must be of a metallib this worker embeds (the digest field of its name,
+# `<unit>-<digest24>-<arch>-...`). A set built for another worker (any risc0 kernel change) is refused:
+# its files would only be clean misses, so installing it would hide that the first start compiles.
+# AOT_SKIP_DIGEST_CHECK=1 skips this (tests with a fake worker).
+if [ "${AOT_SKIP_DIGEST_CHECK:-0}" != 1 ]; then
+  digests=$("$here/build-metal-aot.sh" --worker-digests "$worker") \
+    || { echo "install-metal-aot: cannot read the metallib digests of $worker" >&2; exit 1; }
+  stale=()
+  for f in "${files[@]}"; do
+    d=$(echo "$f" | cut -d- -f2)
+    grep -qx "$d" <<<"$digests" || stale+=("$f")
+  done
+  if [ ${#stale[@]} -gt 0 ]; then
+    echo "install-metal-aot: refused: ${#stale[@]} of ${#files[@]} archives in $src were built for metallibs $worker does not embed (digest mismatch; first: ${stale[0]}); rebuild the set for this worker (make -f Makefile.mac mac-build-aot)" >&2
+    exit 1
+  fi
 fi
 
 tmp="$dest_dir/.metal-aot.tmp.$$"

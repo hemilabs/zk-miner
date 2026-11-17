@@ -8,7 +8,9 @@
 #   mac-test-miner      zk-miner's macOS tests: the Metal worker's unit tests, discovery/dispatcher,
 #                       and one Warmup + Prove of the real worker over its IPC protocol
 #   mac-build-worker    Build zkminer-prove-risc0-metal and the zkminer CLI (release)
-#   mac-install-worker  Install the worker into $(PROVERS_DIR) and warm its GPU pipelines once
+#   mac-build-aot       Build this Mac's offline (AOT) Metal archive set for the built worker
+#   mac-install-worker  Install the worker and its offline Metal archives into $(PROVERS_DIR), and warm
+#                       its GPU pipelines once
 #   mac-bench           Run the worker's own benchmark (BENCH_ONLY=fibonacci for one program)
 #
 # Every target sources $(ENV_SH) (Metal compiler on PATH, the RISC Zero C++ guest archiver), sets
@@ -37,10 +39,22 @@ CLI_BIN    := $(MAKEFILE_DIR)/target/release/zkminer
 
 # Warm the installed worker's pipelines at install (1) or not (0); see mac-install-worker.
 WARM ?= 1
-# W7-M11: a risc0 offline (AOT) Metal archive set (tools/metal_aot/build_all.py output, risc0 W7-Z1)
-# to install beside the worker, and the GPU families validated on hardware. Empty: none installed.
-AOT_SRC    ?=
-AOT_ARCHES ?= applegpu_g17s
+# Offline (AOT) Metal archives (risc0 W7-Z1 tools/metal_aot; W7-M11, P31-M9b). mac-install-worker
+# builds this Mac's set for the built worker (mac-build-aot, into AOT_OUT; reused while the worker is
+# unchanged) and installs it beside the worker, so the first start loads its GPU pipelines instead of
+# compiling them (~95 s -> a few s on an M5 Max).
+#   AOT=0          build and install none (the first start compiles; a previous install's set is removed)
+#   AOT_SRC=<set>  install that prebuilt set instead (tools/metal_aot/build_all.py output)
+#   AOT_ARCHES     the GPU families mac-build-aot builds (default: this Mac's)
+#   AOT_VALIDATED  the families whose archives were validated on hardware (risc0 tools/metal_aot
+#                  README); another Mac installs none and compiles at first start, as before
+#   AOT_JOBS       archive units built at once (default 3; ~2.2 GB of RAM for the rv32im one)
+AOT           ?= 1
+AOT_SRC       ?=
+AOT_ARCHES    ?=
+AOT_VALIDATED ?= applegpu_g17s
+AOT_OUT       ?= $(MAKEFILE_DIR)/target/metal-aot
+AOT_JOBS      ?= 3
 # Run the real worker over IPC in mac-test-miner (1) or skip it (0).
 MINER_IPC ?= 1
 
@@ -56,7 +70,7 @@ FORK  = cd "$(RISC0_DIR)" &&
 
 .PHONY: help mac-check mac-prereqs mac-test-risc0 mac-test-risc0-zkp mac-test-risc0-rv32im \
 	mac-test-risc0-recursion mac-test-risc0-keccak mac-test-risc0-groth16 mac-test-miner \
-	mac-build-worker mac-install-worker mac-bench
+	mac-build-worker mac-build-aot mac-install-worker mac-bench
 
 help:
 	@echo "Apple Silicon (Metal) targets (make -f Makefile.mac <target>):"
@@ -64,8 +78,10 @@ help:
 	@echo "  mac-test-risc0      - the risc0 fork's Metal suites (also mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16})"
 	@echo "  mac-test-miner      - zk-miner macOS tests (worker unit tests, discovery/dispatcher, IPC prove; MINER_IPC=0 skips the last)"
 	@echo "  mac-build-worker    - release build of $(WORKER) and zkminer"
-	@echo "  mac-install-worker  - install $(WORKER) into $(PROVERS_DIR) and warm its pipelines (WARM=0 skips;"
-	@echo "                        AOT_SRC=<archive set> also installs this Mac's offline Metal archives)"
+	@echo "  mac-build-aot       - this Mac's offline Metal archive set for the built worker, into $(AOT_OUT)"
+	@echo "                        (AOT_ARCHES=<family ...> builds others)"
+	@echo "  mac-install-worker  - install $(WORKER) and its offline Metal archives into $(PROVERS_DIR), and warm"
+	@echo "                        its pipelines (WARM=0 skips; AOT=0 installs no archives; AOT_SRC=<set> installs that set)"
 	@echo "  mac-bench           - the worker's own benchmark (BENCH_ONLY=fibonacci for one program)"
 	@echo ""
 	@echo "Settings: ENV_SH=$(ENV_SH)"
@@ -152,12 +168,21 @@ mac-build-worker:
 	$(CARGO) build --locked --release -j $(JOBS) -p zkminer-cli && \
 	ls -l "$(WORKER_BIN)" "$(CLI_BIN)"
 
+# P31-M9b: the offline archive set of the built worker (scripts/mac/build-metal-aot.sh): metallibs
+# extracted from the worker binary, kernel names from risc0's dump tests (built once per risc0 kernel
+# set under target/aot-dump, never in $(RISC0_DIR)'s target), archives built with metal-tt (the Metal
+# toolchain from env.sh; minutes and ~170 MB per family). Reused while the worker is unchanged.
+mac-build-aot: mac-build-worker
+	@$(CARGO_ENV) export RISC0_DIR="$(RISC0_DIR)" AOT_JOBS=$(AOT_JOBS); \
+	"$(MAKEFILE_DIR)/scripts/mac/build-metal-aot.sh" "$(WORKER_BIN)" "$(AOT_OUT)" $(AOT_ARCHES)
+
 # Copy, then rename over the old binary: a running worker keeps its (now unlinked) file, and
 # macOS never sees a signed binary modified in place (which gets the process killed).
-# With AOT_SRC set (W7-M11), this Mac's offline Metal archives from that set go to
-# $(PROVERS_DIR)/metal-aot (scripts/mac/install-metal-aot.sh; only the AOT_ARCHES families), and the
-# worker points RISC0_METAL_AOT_DIR at them, so the first start loads its pipelines instead of
-# compiling them (~80 s -> ~2 s for fibonacci on an M5 Max; ZKMINER_METAL_AOT=0 turns it off).
+# Then (P31-M9b, by default) this Mac's offline Metal archives, mac-build-aot's set or AOT_SRC's, go to
+# $(PROVERS_DIR)/metal-aot (scripts/mac/install-metal-aot.sh: only this Mac's family, only an
+# AOT_VALIDATED one, every file checksummed and of a metallib the worker embeds), and the worker
+# points RISC0_METAL_AOT_DIR at them, so the first start loads its pipelines instead of compiling
+# them (~95 s -> a few s on an M5 Max; ZKMINER_METAL_AOT=0 turns it off at run time).
 # With WARM=1 the installed worker then proves fibonacci once (`--benchmark`, which first builds
 # every circuit's GPU pipelines): minutes on a cold machine, seconds once the OS shader cache
 # and the keccak binary archive hold them, so the first real job does not pay for it.
@@ -166,12 +191,24 @@ mac-install-worker: mac-build-worker
 	tmp="$(PROVERS_DIR)/.$(WORKER).tmp.$$$$"; \
 	cp "$(WORKER_BIN)" "$$tmp" && chmod 755 "$$tmp" && mv -f "$$tmp" "$(PROVERS_DIR)/$(WORKER)"; \
 	echo "installed $(PROVERS_DIR)/$(WORKER)"
-	@if [ -n "$(AOT_SRC)" ]; then \
-	  "$(MAKEFILE_DIR)/scripts/mac/install-metal-aot.sh" "$(AOT_SRC)" "$(PROVERS_DIR)/$(WORKER)" $(AOT_ARCHES); \
-	elif [ -d "$(PROVERS_DIR)/metal-aot" ]; then \
-	  rm -rf "$(PROVERS_DIR)/metal-aot"; \
-	  echo "AOT_SRC unset: removed the offline Metal archives of the previous install (they were built for another worker; the first start compiles the pipelines)"; \
-	else echo "AOT_SRC unset: no offline Metal archives installed (the first start compiles the pipelines)"; fi
+	@set -eo pipefail; inst="$(PROVERS_DIR)/$(WORKER)"; \
+	drop() { if [ -d "$(PROVERS_DIR)/metal-aot" ]; then rm -rf "$(PROVERS_DIR)/metal-aot"; \
+	  echo "$$1: removed the offline Metal archives of the previous install (built for another worker)"; fi; \
+	  echo "$$1: no offline Metal archives installed (the first start compiles the GPU pipelines, ~1.5 min on an M5 Max)"; }; \
+	if [ "$(AOT)" = 0 ]; then drop "AOT=0"; \
+	elif [ -n "$(AOT_SRC)" ]; then \
+	  "$(MAKEFILE_DIR)/scripts/mac/install-metal-aot.sh" "$(AOT_SRC)" "$$inst" $(AOT_VALIDATED); \
+	else \
+	  arch=$$("$$inst" --metal-arch) || { echo "mac-install-worker: $$inst --metal-arch failed" >&2; exit 1; }; \
+	  case " $(AOT_VALIDATED) " in \
+	  *" $$arch "*) \
+	    ( $(CARGO_ENV) export RISC0_DIR="$(RISC0_DIR)" AOT_JOBS=$(AOT_JOBS); \
+	      "$(MAKEFILE_DIR)/scripts/mac/build-metal-aot.sh" "$(WORKER_BIN)" "$(AOT_OUT)" $(AOT_ARCHES) ) \
+	      || { echo "mac-install-worker: building the offline Metal archives failed (AOT=0 installs without them)" >&2; exit 1; }; \
+	    "$(MAKEFILE_DIR)/scripts/mac/install-metal-aot.sh" "$(AOT_OUT)" "$$inst" $(AOT_VALIDATED);; \
+	  *) drop "this Mac's GPU is $$arch, offline archives are validated on hardware only for $(AOT_VALIDATED) (risc0 tools/metal_aot README; AOT_VALIDATED=$$arch builds them anyway)";; \
+	  esac; \
+	fi
 	@if [ "$(WARM)" = 1 ]; then \
 	  $(CARGO_ENV) echo "warming the GPU pipelines (BENCH_ONLY=fibonacci $(PROVERS_DIR)/$(WORKER) --benchmark)"; \
 	  t0=$$(date +%s); BENCH_ONLY=fibonacci "$(PROVERS_DIR)/$(WORKER)" --benchmark; \
