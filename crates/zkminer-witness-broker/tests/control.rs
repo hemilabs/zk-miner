@@ -302,5 +302,6 @@ fn in_process_only(c: &SelfTestCheck) -> bool {
             | SelfTestCheck::GpuNodeUnopenable
             | SelfTestCheck::InetSocketDenied
             | SelfTestCheck::ConnectDenied
+            | SelfTestCheck::SocketOptionsDenied
     )
 }

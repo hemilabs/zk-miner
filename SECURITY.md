@@ -235,8 +235,8 @@ job there could then reach this host's private network.
 | Public-address discovery (miner and broker, at startup and every 5 minutes; every 15 seconds while a family is unknown) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53; `https://1.1.1.1/cdn-cgi/trace` and its IPv6 twin (the miner); on an IPv6-only host, the same IPv4 reflectors through the NAT64 prefix | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | DNS-over-HTTPS resolution of requester names (public mode) | fixed in the build (Cloudflare, Google, Quad9 by IP literal), or the operator's `[egress] doh_resolvers`; the **name** from the requester | the resolver's address must pass the floor (being one of the host's DNS servers is allowed); certificate verified for the IP literal |
 | The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | a SYN with no data, closed without data |
-| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair` and `connect` |
-| The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up); Landlock grants no TCP port |
+| The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect`, and every `setsockopt` but the socket timeouts |
+| The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
 | The miner's witness host (pipeline, builder runs, store) | none | talks to the broker over a Unix socket pair only |
 
@@ -320,7 +320,17 @@ process an attacker may get code execution in, and **it has no network of its ow
 filter denies `socket`, `connect`, `bind`, `listen` and `accept*`, Landlock grants it no TCP port,
 and once its runtime is up even `socketpair` is denied. Without `connect` it cannot disconnect a
 socket it holds (`connect(AF_UNSPEC)`) and aim it elsewhere, and TCP Fast Open to another address
-fails on a connected socket.
+fails on a connected socket. Nor can it re-route one at the IP layer: its only socket option is
+`setsockopt(IPPROTO_TCP, TCP_NODELAY)`, and any other level or option fails with `EPERM` (an IPv6
+routing header, which unprivileged would send later segments to the address it names; IPv4 source
+routing; `SO_BINDTODEVICE`/`SO_BINDTOIFINDEX`, `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, `IPV6_NEXTHOP`,
+`IP_TRANSPARENT`, `SO_MARK`, the TTLs, `TCP_ULP`, …). Ancillary data on `sendmsg` is no way
+around it: TCP ignores `IPPROTO_IP` and `IPPROTO_IPV6` control messages (routing headers,
+`PKTINFO` interfaces, next hops, IP options), and the one `SOL_SOCKET` message that selects a
+route, a per-packet `SO_MARK`, needs `CAP_NET_ADMIN`; every sandbox drops all capabilities when it
+starts, whoever runs the miner. The builder runner and the execute worker may set only the socket
+timeouts (`SO_RCVTIMEO`/`SO_SNDTIMEO`, which the runner uses on its job socket), so a socket that
+reached one of them (passed over the runner's job socket) cannot be re-routed there either.
 
 Every connection the broker uses is made by the **connector**, in the miner
 (`crates/zkminer-witness-broker/src/connector`, run by `zkminer-witness-host`): the broker sends a
@@ -346,10 +356,21 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
   `max_concurrency` in flight);
 - treats the broker as hostile: strict fixed-size decoding, and a malformed frame, a file
-  descriptor sent to it, more than 64 requests in flight, a request id reused while in flight, or
-  more than 8 requests in a minute for an endpoint that does not exist **cut the broker off** —
-  the socket is closed, the miner pages `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and
-  stops witness serving.
+  descriptor sent to it, more than 64 requests in flight, a request id reused while in flight,
+  more than 8 requests in a minute for an endpoint that does not exist (counted before the refusal
+  is answered), an answer left unread for longer than a request's budget (the connect timeout plus
+  12 seconds), or an answer that cannot be written while the broker keeps sending (it shut the
+  reading side of its socket) **cut the broker off** — the socket is closed, the requests still
+  being served are aborted (nothing more is connected for it), the miner pages
+  `WITNESS-BROKER-CUT-OFF`, kills the broker's cgroup and stops witness serving. So does a broker
+  that closes its connector socket and is still running 5 seconds later (an honest broker closes
+  it only by exiting). However the session ends, every builder runner registered with the broker
+  is killed with it, and one registered afterwards at once: the broker can pass a runner any
+  descriptor it holds over the runner's job socket, a TCP socket from the connector included, and
+  such a socket must not outlive the broker in the runner;
+- holds at most 64 sockets for a broker that stops reading: a request counts as in flight until
+  its answer is handed to the socket, and the socket's send buffer is the kernel's minimum (about
+  six written answers the broker has not read).
 
 So a broker an attacker controls can reach only the operator's configured endpoints, at addresses
 the miner's floor admits — the same set an honest broker reaches. The broker still checks every
@@ -381,7 +402,9 @@ no second one):
   route whole — at least what the miner's prefix model refuses.
 - **The self-test** (at startup and hourly) also checks, from inside the sandboxed broker, that
   `socket(AF_INET/AF_INET6)` fails and `connect`, `bind`, `listen` and `accept4` fail with the
-  filter's `EPERM`, and that the connector refuses an index past the configuration; and, in the
+  filter's `EPERM`, that every re-routing socket option fails with `EPERM` on fd -1 and on a
+  socket the connector hands it for its first endpoint while `TCP_NODELAY` works, and that the
+  connector refuses an index past the configuration; and, in the
   miner, that the connector refuses an address outside every role entry, a private address (public
   mode) and a malformed request.
 - **Keys** (`key_file`) travel only over `https` in public mode. In developer mode they may also
@@ -514,4 +537,7 @@ no second one):
   is reachable by a broker compromise; keep endpoint nodes minimal (§11.1 of the design: `eth`,
   `net`, `web3` only) and keys scoped. It can lie to the miner about fetch results (the guest
   re-checks everything it uses) and read its spool directory. It cannot reach any other host,
-  port, or address, private or public, nor resolve a name.
+  port, or address, private or public, nor resolve a name: every socket it holds was connected
+  by the miner to an admitted address, and it can neither reconnect one (no `connect`) nor
+  re-route one (no socket option but `TCP_NODELAY`, IP-level control messages ignored by TCP, no
+  capability). Bytes it writes go to the peer the connector chose and nowhere else.

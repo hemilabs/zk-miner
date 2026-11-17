@@ -17,7 +17,7 @@ use zkminer_witness::abi::{LOG_CAP_BYTES, W_CHUNK_BYTES};
 use zkminer_witness::envelope::Limits;
 use zkminer_witness::ipc::{decode_summary_pipe, BuilderSummary, SUMMARY_PIPE_MAX_BYTES};
 use zkminer_witness::verdict::{builder_verdict, BuilderOutcome, SkipReason};
-use zkminer_witness_broker::client::{job_socketpair, BrokerClient, JobRegistration, JobStats};
+use zkminer_witness_broker::client::{job_socketpair, BrokerClient, JobRegistration, JobStats, RunnerCgroups};
 use zkminer_witness_broker::egress::sanitize_log;
 use zkminer_witness_sandbox::{prepare_command, Cgroup, CgroupSpec};
 
@@ -89,6 +89,8 @@ struct Raw {
     w_overflow: bool,
     sink_error: Option<String>,
     spawn_error: Option<String>,
+    /// The broker's session ended while the runner ran, and the runner was killed with it.
+    broker_gone: bool,
 }
 
 fn pipe() -> io::Result<(File, OwnedFd)> {
@@ -152,7 +154,8 @@ pub fn runner_args(limits: &Limits) -> Vec<String> {
 }
 
 /// The blocking core: spawn, stream, wait, kill on the outer deadline. `broker_fd` is the runner's end
-/// of the job socket (already registered with the broker).
+/// of the job socket (already registered with the broker); the runner's cgroup is registered in
+/// `runners` while it runs, so the end of the broker's session kills it.
 #[allow(clippy::too_many_arguments)]
 fn run_blocking<S: WitnessSink>(
     spawner: &Spawner,
@@ -165,6 +168,7 @@ fn run_blocking<S: WitnessSink>(
     limits: Limits,
     mut sink: S,
     abort: AbortToken,
+    runners: &RunnerCgroups,
 ) -> (Raw, S) {
     let mut raw = Raw {
         exit: None,
@@ -178,6 +182,7 @@ fn run_blocking<S: WitnessSink>(
         w_overflow: false,
         sink_error: None,
         spawn_error: None,
+        broker_gone: false,
     };
     let name = format!("builder-{}-{}", hex_prefix(job_key), RUN_SEQ.fetch_add(1, Ordering::Relaxed));
     let cgroup = match Cgroup::create(
@@ -237,6 +242,10 @@ fn run_blocking<S: WitnessSink>(
             return (raw, sink);
         }
     };
+    // The runner is in its cgroup now (spawn returns after the exec), with the job socket: from
+    // here until it is reaped, the end of the broker's session kills it (at once, if it ended
+    // already: the broker may have queued a socket on the job socket before it went).
+    let registered = runners.add(cgroup.path());
     let start = Instant::now();
     let deadline = start + Duration::from_secs(u64::from(limits.maxBuilderSeconds)) + OUTER_DEADLINE_GRACE;
     let summary_t = thread::spawn(move || read_capped(sum_read, SUMMARY_PIPE_MAX_BYTES));
@@ -289,6 +298,11 @@ fn run_blocking<S: WitnessSink>(
     }
     drop(w_read);
     let (status, killed) = waiter.join().expect("waiter thread");
+    match registered {
+        Some(id) => runners.remove(id),
+        None => raw.broker_gone = true,
+    }
+    raw.broker_gone |= runners.closed();
     raw.wall_clock_hit = killed == Killed::Deadline;
     raw.aborted = killed == Killed::Aborted;
     raw.exit = status.code();
@@ -342,17 +356,18 @@ pub async fn run_builder_abortable<S: WitnessSink>(
     let spawner = spawner.clone();
     // Absolute: the sandbox launcher starts the runner in `/`.
     let binary = std::path::absolute(run.binary).unwrap_or_else(|_| run.binary.to_path_buf());
-    let (binary, root, key, limits, abort) =
-        (binary, run.cgroup_root.to_path_buf(), run.job_key, run.limits.clone(), abort.clone());
+    let (binary, root, key, limits, abort, runners) =
+        (binary, run.cgroup_root.to_path_buf(), run.job_key, run.limits.clone(), abort.clone(), broker.runners().clone());
     let joined = tokio::task::spawn_blocking(move || {
-        run_blocking(&spawner, binary, root, key, module, context, OwnedFd::from(runner_end), limits, sink, abort)
+        run_blocking(&spawner, binary, root, key, module, context, OwnedFd::from(runner_end), limits, sink, abort, &runners)
     })
     .await;
     let (raw, sink) = joined.map_err(|e| anyhow::anyhow!("builder run thread: {e}"))?;
     let stats = broker.end_job(run.job_key).await.ok();
     let (module_started, summary) = decode_summary_pipe(&raw.summary_bytes);
-    // An abort kill is the miner's doing, never the module's.
-    let miner_side_failure = raw.sink_error.is_some() || raw.spawn_error.is_some() || stats.is_none() || raw.aborted;
+    // An abort kill is the miner's doing, never the module's; so is a kill with the broker.
+    let miner_side_failure =
+        raw.sink_error.is_some() || raw.spawn_error.is_some() || stats.is_none() || raw.aborted || raw.broker_gone;
     let outcome = BuilderOutcome {
         exit: raw.exit,
         oom_killed: raw.oom_killed,

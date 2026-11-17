@@ -36,17 +36,32 @@
 //!
 //! Host-name resolution lives here, not in the broker: the broker never resolves anything, so it
 //! needs no DNS server as a destination either. The connector can only ever produce a connection
-//! to a configured endpoint's admitted address.
+//! to a configured endpoint's admitted address, and the broker cannot point a socket it was handed
+//! anywhere else: its sandbox denies `connect` (no `connect(AF_UNSPEC)` and reconnect; TCP Fast
+//! Open to another address fails on a connected socket) and every `setsockopt` but
+//! `IPPROTO_TCP`/`TCP_NODELAY` (no IPv6 routing header, IPv4 source route, interface binding, next
+//! hop or mark), TCP ignores IP-level control messages on `sendmsg`, and the sandbox holds no
+//! capability (a per-packet `SO_MARK` needs `CAP_NET_ADMIN`).
 //!
 //! # Limits and cut-off
 //!
 //! The broker is hostile input. Frames are decoded strictly (magic, version, operation, role, every
 //! reserved byte zero); a frame that fails, an fd sent *to* the connector, more than
-//! [`MAX_INFLIGHT`] requests in flight, a request id already in flight, or more than
+//! [`MAX_INFLIGHT`] requests in flight, a request id already in flight, more than
 //! [`MAX_MISUSE`] requests naming an index or role/port that does not exist within
-//! [`MISUSE_WINDOW`] **cuts the broker off**: the connector closes the socket, the miner pages and
-//! kills the broker. An honest broker can produce none of these (its client keeps the same
-//! in-flight bound). Connection attempts are paced by a token bucket ([`RATE_BURST`] at once,
+//! [`MISUSE_WINDOW`] (checked before the refusal is answered), an answer the broker leaves unread
+//! for longer than [`request_budget`], or a failed answer write while the broker keeps sending (it
+//! shut its reading side) **cuts the broker off**: the connector closes the socket and aborts the
+//! requests it is still serving, the miner pages and kills the broker and the builder runners
+//! registered with it (`zkminer-witness-host`). An honest broker can produce none of these (its client keeps the same
+//! in-flight bound and reads every answer). A request stays in flight until its answer is handed
+//! to the socket, so a broker that stops reading cannot make the miner hold more than
+//! [`MAX_INFLIGHT`] connected sockets (and the one being written); the socket's send buffer is the
+//! kernel's minimum, so the kernel holds only a few written answers it has not read either. After a
+//! failed answer write the broker's requests are still judged by every rule above but nothing is
+//! connected or answered: a broker that exited reaches end-of-file within a second and its session
+//! ends closed; one that keeps its end open is cut off. Requests still being served when a session
+//! ends are aborted. Connection attempts are paced by a token bucket ([`RATE_BURST`] at once,
 //! [`RATE_PER_SEC`] a second — a hard budget of `RATE_BURST + RATE_PER_SEC × t` attempts in any
 //! interval `t`) and at most the endpoint's `max_concurrency` are in flight per endpoint; past them
 //! a request waits, and is answered [`Status::RateLimited`] when its time runs out. A request is

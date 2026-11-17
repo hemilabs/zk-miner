@@ -13,7 +13,11 @@
 //! name an endpoint index; the connector resolves, admits (netguard's floor with the miner's facts)
 //! and connects, and hands back the connected socket. A broker that breaks the protocol is cut off:
 //! the socket is closed, the miner pages (`WITNESS-BROKER-CUT-OFF`) and kills the broker's cgroup,
-//! and the next self-test disables witness serving.
+//! and witness serving stops. So is a broker that closes its connector socket and is still running
+//! [`BROKER_EXIT_GRACE`] later (an honest one closes it only by exiting). When the session ends,
+//! for any reason, the builder runners registered with the broker
+//! ([`zkminer_witness_broker::client::RunnerCgroups`]) are killed too: a socket the broker passed
+//! one over its job socket would outlive the broker in it.
 //!
 //! The broker runs in the miner's network mode and no other: [`BrokerProcess::start`] takes the
 //! miner's config and passes `--dev-private-network` exactly when its
@@ -143,17 +147,32 @@ impl BrokerProcess {
         }
         let client = Arc::new(BrokerClient::new(miner_end).context("broker client")?);
         connector.warm_up();
-        let kill = cgroup.path().join("cgroup.kill");
+        let cgroup_dir = cgroup.path().to_path_buf();
         let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let session = tokio::spawn({
-            let (connector, cut) = (connector.clone(), cut.clone());
+            let (connector, cut, runners) = (connector.clone(), cut.clone(), client.runners().clone());
             async move {
                 let end = connector.serve(connector_end).await;
-                if let SessionEnd::CutOff(why) = &end {
+                let why = match &end {
+                    SessionEnd::CutOff(why) => Some(why.to_string()),
+                    // An honest broker closes its connector socket only by exiting.
+                    SessionEnd::Closed if still_running(&cgroup_dir, BROKER_EXIT_GRACE).await => {
+                        Some(format!("it closed its connector socket and was still running {BROKER_EXIT_GRACE:?} later"))
+                    }
+                    SessionEnd::Closed => None,
+                };
+                if let Some(why) = &why {
                     cut.store(true, Ordering::SeqCst);
                     // The broker broke the connector's protocol: treat it as compromised.
-                    let killed = std::fs::write(&kill, "1");
+                    let killed = std::fs::write(cgroup_dir.join("cgroup.kill"), "1");
                     tracing::error!("PAGE: WITNESS-BROKER-CUT-OFF: the broker was killed ({why}; cgroup.kill: {killed:?})");
+                }
+                // A socket the broker passed over a job socket lives on in the runner that got
+                // it: the runners registered with this broker end with its session, and any
+                // registered later is killed at once.
+                let runners_killed = runners.close_and_kill();
+                if runners_killed > 0 {
+                    tracing::warn!(runners_killed, cut_off = why.is_some(), "the builder runners of the broker's session were killed with it");
                 }
                 end
             }
@@ -175,6 +194,26 @@ impl BrokerProcess {
     /// Whether the broker has exited.
     pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().ok().flatten()
+    }
+}
+
+/// How long a broker whose connector session closed may take to exit before it counts as cut off
+/// (an honest broker closes its connector socket only by exiting).
+pub const BROKER_EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether the cgroup at `dir` still holds a process after `grace` (`cgroup.events` `populated`;
+/// a process that exited no longer counts, reaped or not).
+async fn still_running(dir: &Path, grace: Duration) -> bool {
+    let until = tokio::time::Instant::now() + grace;
+    loop {
+        let events = tokio::fs::read_to_string(dir.join("cgroup.events")).await.unwrap_or_default();
+        if !events.lines().any(|l| l.trim() == "populated 1") {
+            return false;
+        }
+        if tokio::time::Instant::now() >= until {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

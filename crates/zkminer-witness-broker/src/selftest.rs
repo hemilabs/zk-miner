@@ -16,15 +16,19 @@
 //! These are checks of the broker's own, second-layer floor. Its first layer is that it has no
 //! network (review r2 F5): [`SelfTestCheck::InetSocketDenied`] and [`SelfTestCheck::ConnectDenied`]
 //! check, from inside the sandbox, that it can make no socket and call no `connect`, `bind`,
-//! `listen` or `accept4`; [`SelfTestCheck::ConnectorRefusesBadIndex`] that the miner's connector
+//! `listen` or `accept4`; [`SelfTestCheck::SocketOptionsDenied`] that it can set no socket option
+//! but `TCP_NODELAY`, on fd -1 and on a socket the connector hands it for its first endpoint (so a
+//! handed socket cannot be re-routed); [`SelfTestCheck::ConnectorRefusesBadIndex`] that the miner's connector
 //! refuses an endpoint index past the configuration. The connector's own checks run in the miner
 //! ([`crate::connector::Connector::self_test`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicU64;
 
 use zkminer_witness::ipc::{ControlResponse, SelfTestCheck};
+use zkminer_witness_sandbox::{set_socket_option, BROKER_SOCKET_OPTION, REFUSED_SOCKET_OPTIONS};
 
 use crate::broker::Broker;
 use crate::config::mask;
@@ -107,6 +111,19 @@ pub(crate) async fn run(b: &Broker) -> ControlResponse {
     // probe-based self-test for the broker profile, which the miner runs at startup and hourly.
     checks.extend(in_process_sandbox_checks());
     checks.extend(no_network_checks());
+    // A socket handed for the first endpoint (closed unused), to try the options on.
+    let handed = match b.cfg.endpoints().next() {
+        Some(e) => match b.connector.connect(0, e.role, e.port).await {
+            Ok((stream, _)) => Some(stream),
+            Err(err) => {
+                tracing::warn!(endpoint = %e.alias, error = %err, "self-test: no socket from the connector to try socket options on");
+                None
+            }
+        },
+        None => None,
+    };
+    checks.push((SelfTestCheck::SocketOptionsDenied, socket_options_denied(handed.as_ref().map(|s| s.as_raw_fd()))));
+    drop(handed);
     let bad = b.connector.connect(u32::MAX, crate::egress::Role::EvmRpc, 443).await;
     checks.push((
         SelfTestCheck::ConnectorRefusesBadIndex,
@@ -175,6 +192,34 @@ fn no_network_checks() -> Vec<(SelfTestCheck, bool)> {
     vec![(SelfTestCheck::InetSocketDenied, socket_denied), (SelfTestCheck::ConnectDenied, connect_denied)]
 }
 
+/// The broker's socket options: every [`REFUSED_SOCKET_OPTIONS`] entry fails with the filter's
+/// `EPERM` on fd -1 (a missing filter says `EBADF`) and on `handed`, a socket the connector
+/// handed over; `TCP_NODELAY` reaches the kernel on fd -1 (`EBADF`) and works on `handed`.
+fn socket_options_denied(handed: Option<RawFd>) -> bool {
+    let mut wrong = Vec::new();
+    for o in REFUSED_SOCKET_OPTIONS {
+        for fd in std::iter::once(-1).chain(handed) {
+            let r = set_socket_option(fd, o);
+            if r != Err(libc::EPERM) {
+                wrong.push(format!("{} on fd {fd}: {r:?}", o.name));
+            }
+        }
+    }
+    let r = set_socket_option(-1, &BROKER_SOCKET_OPTION);
+    if r != Err(libc::EBADF) {
+        wrong.push(format!("TCP_NODELAY on fd -1: {r:?}"));
+    }
+    if let Some(fd) = handed {
+        if let Err(e) = set_socket_option(fd, &BROKER_SOCKET_OPTION) {
+            wrong.push(format!("TCP_NODELAY on fd {fd}: errno {e}"));
+        }
+    }
+    if !wrong.is_empty() {
+        tracing::error!("PAGE: self-test: socket options the broker may not set: {}", wrong.join("; "));
+    }
+    wrong.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +280,11 @@ mod tests {
         for (c, passed) in no_network_checks() {
             assert!(!passed, "{c:?} passed outside the sandbox");
         }
+    }
+
+    #[test]
+    fn socket_options_check_fails_outside_the_sandbox() {
+        assert!(!socket_options_denied(None));
     }
 
     #[test]
