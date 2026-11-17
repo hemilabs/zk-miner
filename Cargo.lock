@@ -3711,6 +3711,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hemiprove-proxy-slots-methods"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "hemiprove-eth-prelude",
+ "hemiprove-proxy-slots",
+ "hex",
+ "risc0-binfmt",
+ "risc0-build",
+ "risc0-zkvm",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zkminer-config",
+ "zkminer-netguard",
+ "zkminer-witness",
+ "zkminer-witness-broker",
+ "zkminer-witness-host",
+ "zkminer-witness-sandbox",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
