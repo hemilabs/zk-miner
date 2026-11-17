@@ -32,8 +32,9 @@
 //!   count, a read at or after the lock block showing another prover, or a claim that never landed:
 //!   a read from a block mined past the claim-intent age since the pin), deletes bundles of terminal
 //!   jobs, and, once a full pass has completed and the
-//!   brain's first complete recovery pass has handed every witness lock over and each is pinned,
-//!   enables eviction. A lock with no readable pin is found by the brain's chain scan and re-pinned
+//!   brain's first recovery pass with a complete chain scan has handed over every witness lock it
+//!   decided and each is pinned, enables eviction (sparing the bundles of the jobs that pass left
+//!   undecided). A lock with no readable pin is found by the brain's chain scan and re-pinned
 //!   from the store's latest version for it.
 //! - **Post-lock failures** (§16): a lock released after it failed records a final verdict for its
 //!   job, a tally for its caller (admission stops at a limit) and one for the device and failure
@@ -475,10 +476,13 @@ pub(crate) struct WitnessRuntime {
     execute_build: Mutex<Option<String>>,
     /// The brain's view of the cards, each tick: inline jobs still needing a card, and the cap.
     cards: Mutex<Option<(usize, usize)>>,
-    /// The brain's first complete recovery pass has handed over every witness lock it found.
+    /// A brain recovery pass with a complete chain scan has handed over every witness lock it decided.
     brain_recovered: AtomicBool,
     /// Witness locks recovery handed over whose bundle is not pinned yet: eviction waits for them.
     unpinned_recoveries: Mutex<HashSet<B256>>,
+    /// Jobs the brain's latest complete recovery pass left undecided: their bundles are spared from
+    /// eviction (re-applied to a store opened later).
+    undecided: Mutex<HashSet<B256>>,
     /// Image-id derivations that could not run (no measure worker free within the bound).
     image_id_unavailable: Arc<AtomicU64>,
     /// Callers' post-lock failure counts as last read or written here, with when they expire.
@@ -633,6 +637,7 @@ impl WitnessRuntime {
             cards: Mutex::new(None),
             brain_recovered: AtomicBool::new(false),
             unpinned_recoveries: Mutex::new(HashSet::new()),
+            undecided: Mutex::new(HashSet::new()),
             image_id_unavailable: Arc::new(AtomicU64::new(0)),
             post_lock_callers: Mutex::new(HashMap::new()),
             tallies: Mutex::new(HashMap::new()),
@@ -654,6 +659,7 @@ impl WitnessRuntime {
                     s.identity().store_uuid,
                     report.tmp_entries_removed
                 );
+                s.spare_jobs(lock(&self.undecided).iter().copied());
                 *lock(&self.store) = Some(Arc::new(s));
             }
             Ok(Err(e)) => tracing::error!(
@@ -918,12 +924,23 @@ impl WitnessRuntime {
         give_back_card(&mut lock(&self.tasks), jid);
     }
 
-    /// The brain finished a recovery pass (`deferred`: cut short). After its first complete one,
-    /// every witness lock it found has been handed to [`Self::drive_recovered`]; eviction then waits
-    /// only for those to be pinned (§15.2: nothing is evicted before one full recovery scan).
-    pub(crate) fn note_recovery_pass(&self, deferred: bool) {
-        if !deferred && !self.brain_recovered.swap(true, Ordering::SeqCst) {
-            tracing::info!("witness: the brain's recovery pass handed over every witness lock it found");
+    /// The brain finished a recovery pass. `scan_complete`: its chain scan covered the whole lookback
+    /// window, so every lock of ours was either decided by it (each witness lock handed to
+    /// [`Self::drive_recovered`]) or is among `undecided` (unreadable just now, a claim that may still
+    /// be pending, the pass cut short). After the first such pass eviction waits only for the
+    /// handed-over locks to be pinned (§15.2: nothing is evicted before one full recovery scan), and
+    /// it spares the bundles of the undecided jobs until a later pass decides them: a pass deferred
+    /// over one unreadable job no longer holds eviction back for every other bundle.
+    pub(crate) fn note_recovery_pass(&self, scan_complete: bool, undecided: Vec<B256>) {
+        if !scan_complete {
+            return;
+        }
+        if let Some(store) = self.store() {
+            store.spare_jobs(undecided.iter().copied());
+        }
+        *lock(&self.undecided) = undecided.into_iter().collect();
+        if !self.brain_recovered.swap(true, Ordering::SeqCst) {
+            tracing::info!("witness: the brain's recovery pass handed over every witness lock it decided");
         }
     }
 
@@ -3414,8 +3431,9 @@ impl WitnessRuntime {
             }
         }
         // Eviction (§15.2: "nothing is evicted until this process has completed one full recovery
-        // scan"): this pass read every pin, the brain's recovery has handed over every witness lock
-        // it found on chain or in the journal, and each of those is pinned.
+        // scan"): this pass read every pin, a brain recovery pass with a complete chain scan has
+        // handed over every witness lock it decided (the jobs it left undecided are spared in the
+        // store), and each of those is pinned.
         let handed = self.brain_recovered.load(Ordering::SeqCst);
         let waiting = lock(&self.unpinned_recoveries).len();
         if complete && handed && waiting == 0 && !self.scan_complete.swap(true, Ordering::SeqCst) {
@@ -3781,6 +3799,23 @@ mod tests {
         rt.note_release(third, "released at shutdown").await;
         rt.note_release(third, "released at shutdown").await;
         assert_eq!(s.as_ref().unwrap().store.verdict(third).unwrap().unwrap().attempts, 1);
+    }
+
+    /// A brain pass that stayed deferred over one unreadable job (or a claim that might still be
+    /// pending) never enabled eviction, so the store filled. A pass whose chain scan was complete now
+    /// enables it, sparing only the bundles of the jobs it left undecided; a pass whose scan failed
+    /// still does not (a lock of ours could be anywhere).
+    #[tokio::test]
+    async fn an_undecided_job_no_longer_holds_eviction_back() {
+        let (rt, _s) = test_runtime(true).await;
+        rt.note_recovery_pass(false, vec![]);
+        assert!(!rt.brain_recovered.load(Ordering::SeqCst), "a failed chain scan hands over nothing");
+        let undecided = B256::repeat_byte(0x81);
+        rt.note_recovery_pass(true, vec![undecided]);
+        assert!(rt.brain_recovered.load(Ordering::SeqCst));
+        assert!(lock(&rt.undecided).contains(&undecided));
+        rt.note_recovery_pass(true, vec![]);
+        assert!(lock(&rt.undecided).is_empty(), "decided by a later pass");
     }
 
     /// A store pass running as shutdown began re-drove held locks beside the drain's releases. Once

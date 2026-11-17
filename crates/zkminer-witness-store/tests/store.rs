@@ -800,6 +800,23 @@ fn post_lock_records_are_written_on_a_full_store() {
     assert_accounting(&s);
 }
 
+/// Jobs the miner's recovery could not decide about yet (a lock of ours whose state it could not
+/// read) are spared by eviction, pinned or not, until it says otherwise; a scan keeps the set.
+#[test]
+fn eviction_spares_the_jobs_recovery_has_not_decided() {
+    let d = tmpdir();
+    let s = open(d.path());
+    let a = put_and_publish(&s, &Spec::new(job(0x71)), &witness(1, 4000));
+    let b = put_and_publish(&s, &Spec::new(job(0x72)), &witness(2, 4000));
+    s.mark_recovery_scan_complete();
+    s.spare_jobs([a.job_id]);
+    s.scan().unwrap();
+    let rep = s.evict_to(u64::MAX, &|_| 0).unwrap();
+    assert_eq!(rep.evicted, vec![b], "the undecided job's bundle stays");
+    s.spare_jobs([]);
+    assert_eq!(s.evict_to(u64::MAX, &|_| 0).unwrap().evicted, vec![a]);
+}
+
 #[test]
 fn scan_reports_layout_anomalies_pins_and_callers() {
     let d = tmpdir();

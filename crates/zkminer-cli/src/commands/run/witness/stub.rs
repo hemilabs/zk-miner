@@ -82,7 +82,7 @@ impl WitnessRuntime {
 
     pub(crate) fn note_cards(&self, _inline_needing: usize, _max_concurrent: usize) {}
 
-    pub(crate) fn note_recovery_pass(&self, _deferred: bool) {}
+    pub(crate) fn note_recovery_pass(&self, _scan_complete: bool, _undecided: Vec<B256>) {}
 
     pub(crate) fn claim_release(self: &Arc<Self>, _job_id: B256) -> ReleaseClaim {
         ReleaseClaim::NotWitness

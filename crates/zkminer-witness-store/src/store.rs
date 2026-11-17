@@ -1,7 +1,7 @@
 //! The store: init and open (filesystem, mount, lock, identity, `tmp/` cleanup, usage), the
 //! in-memory index, quota admission, poisoning, bundle reads and the recovery scan.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
@@ -337,6 +337,8 @@ pub(crate) struct State {
     pub next_version: u32,
     pub scan_complete: bool,
     pub anomalies: Vec<Anomaly>,
+    /// Jobs whose versions eviction leaves alone, whatever their pins ([`Store::spare_jobs`]).
+    pub spared: HashSet<B256>,
 }
 
 impl State {

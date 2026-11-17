@@ -4945,6 +4945,8 @@ async fn miner_brain(
         tracing::info!("watch-only: lock recovery and the nonce watchdog are off");
         RecoveryPass {
             deferred: false,
+            scan_ok: true,
+            undecided: Vec::new(),
             actions: Vec::new(),
             scan: None,
         }
@@ -4966,7 +4968,7 @@ async fn miner_brain(
     let mut recovery_scan = startup_pass.scan;
     spawn_recovery_actions(
         startup_pass.actions,
-        startup_pass.deferred,
+        (startup_pass.scan_ok, startup_pass.undecided),
         &mut in_flight,
         &client,
         &state,
@@ -5583,7 +5585,7 @@ async fn miner_brain(
                     }
                     spawn_recovery_actions(
                         pass.actions,
-                        pass.deferred,
+                        (pass.scan_ok, pass.undecided),
                         &mut in_flight,
                         &client,
                         &state,
@@ -5607,6 +5609,10 @@ async fn miner_brain(
                 recovery_deferred = false;
                 consecutive_defers = 0;
                 last_recovery_at = std::time::Instant::now();
+                // No lock of ours on chain: none of the witness runtime's to hand over or spare.
+                if let Some(w) = &witness_rt {
+                    w.note_recovery_pass(true, Vec::new());
+                }
             }
         }
 
@@ -12323,6 +12329,12 @@ struct RecoveryPass {
     /// The pass was cut short (a rate-limit storm, a failed chain scan, a transient descriptor
     /// failure): retry SOONER than the periodic cadence.
     deferred: bool,
+    /// The on-chain locked-job scan covered the whole lookback window by this pass: every lock of
+    /// ours is among the ids the pass considered (decided, or in `undecided`).
+    scan_ok: bool,
+    /// Ids the pass considered but left without a decision (unreadable, a claim that may still be
+    /// pending, cut short): a later pass decides them.
+    undecided: Vec<B256>,
     actions: Vec<(B256, RecoveryAction)>,
     /// The incremental locked-job scan state to hand to the next pass.
     scan: Option<RecoveryScan>,
@@ -12460,6 +12472,8 @@ async fn recover_claimed_jobs(
     let mut settled: Vec<B256> = Vec::new();
     // A live lifecycle task owns these: it is the only writer of their breadcrumbs.
     job_ids.retain(|jid| !skip.contains(jid));
+    // Every id this pass is about: whatever it neither settles nor acts on is left undecided.
+    let considered: Vec<B256> = job_ids.clone();
     if !job_ids.is_empty() {
         tracing::info!(
             "recover: reconciling {} claimed/locked job(s)",
@@ -12896,8 +12910,12 @@ async fn recover_claimed_jobs(
             sc.known.remove(jid);
         }
     }
+    let decided: std::collections::HashSet<B256> =
+        settled.iter().copied().chain(actions.iter().map(|(j, _)| *j)).collect();
     RecoveryPass {
         deferred: deferred || scan_failed || open_intent,
+        scan_ok: !scan_failed && next_scan.is_some(),
+        undecided: considered.into_iter().filter(|j| !decided.contains(j)).collect(),
         actions,
         scan: next_scan,
     }
@@ -12906,10 +12924,12 @@ async fn recover_claimed_jobs(
 /// Execute a recovery pass's actions as spawned tasks, each holding an `in_flight` slot (no
 /// collateral: the lock is already reflected in the on-chain stake figures). Shutdown can begin
 /// between the pass and here; a lock left undriven keeps its breadcrumb for the abandon path.
+/// `handover`: whether the pass's chain scan was complete, and the ids it left undecided (the
+/// witness runtime spares their bundles from eviction until a later pass decides them).
 #[allow(clippy::too_many_arguments)]
 fn spawn_recovery_actions(
     pass_actions: Vec<(B256, RecoveryAction)>,
-    deferred: bool,
+    handover: (bool, Vec<B256>),
     in_flight: &mut HashMap<B256, u128>,
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
@@ -12980,10 +13000,11 @@ fn spawn_recovery_actions(
             RecoveryAction::Witness(_) => unreachable!("handled above"),
         }
     }
-    // After the handover: the witness runtime enables eviction only once a complete pass has handed
-    // it every witness lock (and it has pinned each).
+    // After the handover: the witness runtime enables eviction once a pass whose chain scan was
+    // complete has handed it every witness lock it decided (and it has pinned each), sparing the
+    // bundles of the ids the pass left undecided.
     if let Some(w) = witness_rt {
-        w.note_recovery_pass(deferred);
+        w.note_recovery_pass(handover.0, handover.1);
     }
 }
 
