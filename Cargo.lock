@@ -3768,6 +3768,7 @@ name = "hemiprove-proxy-slots-methods"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
  "hemiprove-eth-prelude",
  "hemiprove-proxy-slots",
  "hex",
