@@ -879,10 +879,17 @@ pub fn terminate_if_our_worker(pid: u32, expected_starttime: Option<u64>) -> boo
 /// what Linux finds by process group, which Windows does not have. A process counts as a child only
 /// if it started after its recorded parent (a recorded parent pid may since belong to another
 /// process), and one whose creation time cannot be read is left out, with what it started.
+///
+/// `root_started` is the root's own start time, when known: a live process with another start time
+/// is a stranger given the number, and yields nothing. A root that has already exited is still the
+/// parent its children recorded, so they are found from that start time.
 #[cfg(windows)]
-pub fn process_tree(root: u32) -> Vec<(u32, u64)> {
-    let Some(root_started) = pid_starttime(root) else {
-        return Vec::new();
+pub fn process_tree(root: u32, root_started: Option<u64>) -> Vec<(u32, u64)> {
+    let root_started = match (pid_starttime(root), root_started) {
+        (Some(now), Some(expected)) if now != expected => return Vec::new(),
+        (Some(now), _) => now,
+        (None, Some(expected)) => expected,
+        (None, None) => return Vec::new(),
     };
     let parents = win32::recorded_parents();
     let mut tree = vec![(root, root_started)];

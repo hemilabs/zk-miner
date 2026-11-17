@@ -1008,19 +1008,19 @@ pub const SP1_TIER_STEP_RATE_FACTOR: f64 = 0.79;
 /// [`SP1_TIER_STEP_RATE_FACTOR`] per tier above `cap` that the uncapped worker could have run at,
 /// up to the server's own tier for a card of `total` bytes (`None`: the fork's default).
 pub fn sp1_rate_factor_for_cap(cap: u64, total: Option<u64>) -> f64 {
+    // The worker is sized from its free VRAM (every GPU slot is told it), so it never ran above the
+    // largest measured tier, nor above the server's own.
     let server = total.map_or(
         SP1_FORK_DEFAULT_THRESHOLD,
         sp1_fork_threshold_for_total_vram,
     );
-    let mut above: Vec<u64> = sp1_measured_tiers(total)
+    let tiers = sp1_measured_tiers(total);
+    let ceiling = tiers.first().map_or(server, |(t, _)| (*t).min(server));
+    let above = tiers
         .iter()
-        .map(|(t, _)| *t)
-        .chain([server])
-        .filter(|t| *t > cap && *t <= server)
-        .collect();
-    above.sort_unstable();
-    above.dedup();
-    SP1_TIER_STEP_RATE_FACTOR.powi(above.len() as i32)
+        .filter(|(t, _)| *t > cap && *t <= ceiling)
+        .count();
+    SP1_TIER_STEP_RATE_FACTOR.powi(above as i32)
 }
 
 /// Set to disable the SP1 worker's host-memory tuning, for bisecting a proving failure against stock
@@ -1975,10 +1975,13 @@ mod tests {
         // A 12 GB card ran at 268M, the server's own tier: one step.
         assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4070), f);
         assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4070), 1.0);
-        // A 24 GB card's server runs 402M: capped at 268M is one step, at 134M two.
+        // A 24 GB card's worker runs at most the largest measured tier, 268M (its server would run
+        // 402M, but the worker is sized from its free VRAM): capped at 134M is one step, at 268M
+        // none.
         let rtx4090 = Some(24_564 * MIB);
-        assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4090), f);
-        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4090), f * f);
+        assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4090), 1.0);
+        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4090), f);
+        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, None), f);
         // A recorded cap is never below the smallest measured tier, and garbage is no cap.
         assert_eq!(super::sp1_card_cap(Some("0")), Some(134_217_728));
         assert_eq!(super::sp1_card_cap(Some("268435456")), Some(268_435_456));

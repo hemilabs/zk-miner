@@ -7845,11 +7845,13 @@ async fn miner_brain(
             &disabled_slots_by_backend,
             disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
         );
-        // Not a card another program's memory is keeping risc0 proofs off right now: a job claimed
-        // for it would wait there and be released (see `WorkerPool::risc0_card_short`).
+        // Not a card whose last risc0 proof found too little VRAM free and still does: a job
+        // claimed for it would wait there and be released (see `WorkerPool::risc0_card_short`).
+        let risc0_cards_before = risc0_cards.len();
         if let Some(pool) = zkminer_prover::engine::worker_pool() {
             risc0_cards.retain(|card| !pool.risc0_card_short(&card.slot));
         }
+        let risc0_cards_short = risc0_cards_before - risc0_cards.len();
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
 
         let device_backend_throughputs: Vec<(String, String, f64)> = {
@@ -8425,20 +8427,38 @@ async fn miner_brain(
                             .is_none_or(|t| now.duration_since(t) >= COLLATERAL_WARN_EVERY)
                         {
                             last_no_risc0_card_warn = Some(now);
-                            let detail = "Not claiming risc0 jobs: no enabled card here has a risc0 \
+                            if risc0_cards_short > 0 {
+                                let detail = "Not claiming risc0 jobs: too little VRAM is free on \
+                                              every risc0 card here (another program holds it); \
+                                              each card is checked again every 5 minutes.";
+                                tracing::warn!("{detail}");
+                                state
+                                    .write()
+                                    .await
+                                    .add_log(LogLevel::Warn, detail.to_string());
+                            } else {
+                                let detail = "Not claiming risc0 jobs: no enabled card here has a risc0 \
                                           job size. A card with under 6.5 GiB of VRAM (14 GiB on \
                                           AMD and Intel) needs one: a \
                                           po2 under Settings → Advanced for this session, or \
                                           `prover.risc0_job_po2` in the config or, on an NVIDIA \
                                           card, `zkminer benchmark --calibrate`, each read when the \
                                           miner starts.";
-                            tracing::warn!("{detail}");
-                            state
-                                .write()
-                                .await
-                                .add_log(LogLevel::Warn, detail.to_string());
+                                tracing::warn!("{detail}");
+                                state
+                                    .write()
+                                    .await
+                                    .add_log(LogLevel::Warn, detail.to_string());
+                            }
                         }
-                        declines.note(jid, "no card has a risc0 job size");
+                        declines.note(
+                            jid,
+                            if risc0_cards_short > 0 {
+                                "every risc0 card is short of free VRAM"
+                            } else {
+                                "no card has a risc0 job size"
+                            },
+                        );
                         continue;
                     }
                     if !sim_mode {
@@ -11367,7 +11387,7 @@ async fn process_job_lifecycle(
     // The card an SP1 retry belongs on: the one whose shard size was just lowered after this job
     // ran out of GPU memory there (`WorkerPool::take_sp1_retry_card`), preferred for the next
     // attempt.
-    let mut retry_card: Option<String> = None;
+    let mut retry_card: Option<(String, String)> = None;
 
     // Scale the proving-watchdog deadline to the job so a wedged GPU is
     // caught in minutes, not the full (large) configured timeout. Committed-cycle
@@ -11581,10 +11601,13 @@ async fn process_job_lifecycle(
             // The cards this job was admitted on (a hard filter) and the order to try them in: the card
             // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
             // host-memory refusal of a card, that card leaves the order (see `refused_admission`). An
-            // SP1 job whose card's shard size an out-of-memory lowered goes back there first.
+            // SP1 job whose card's shard size an out-of-memory lowered goes back there first, kept
+            // until an attempt actually runs there: one refused before it starts (memory short a
+            // moment) must not send the next to a card still at the size that ran out.
             let eligible_for_prove = snapshot.eligible_devices.clone();
             let planned = retry_card
-                .take()
+                .clone()
+                .map(|(_, card)| card)
                 .or_else(|| snapshot.preferred_device.clone());
             let order_for_prove =
                 job_card_order(planned.as_ref(), &eligible_for_prove, &refused_admission);
@@ -11678,6 +11701,13 @@ async fn process_job_lifecycle(
                 Err(e) => return Err(anyhow::anyhow!("prove task panicked: {e}")),
             };
 
+            // The retry ran where it was pinned: the pin has done its work.
+            if retry_card
+                .as_ref()
+                .is_some_and(|(slot, _)| used_slot.as_deref() == Some(slot.as_str()))
+            {
+                retry_card = None;
+            }
             match proof_result {
                 Ok(p) => {
                     proved_on = used_slot;
@@ -11997,7 +12027,7 @@ async fn process_job_lifecycle(
                         // Excluding cannot strand a job: `prove_min_vram` restores the
                         // full set when pruning empties it.
                         if let Some(card) = sp1_smaller_here.clone() {
-                            retry_card = Some(card);
+                            retry_card = used_slot.clone().map(|slot| (slot, card));
                         } else if !invalid {
                             if let Some(k) = used_slot.clone() {
                                 if !excluded.contains(&k) {
