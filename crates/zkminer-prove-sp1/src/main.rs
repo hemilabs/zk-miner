@@ -1138,6 +1138,10 @@ const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
 /// from unlinking another uid's file) and independent of whether we can read that uid's `/proc/*/maps`.
 ///
 /// Mirrors `reap_orphaned_gpu_servers`: same /proc-walk, same "only touch what is provably orphaned".
+///
+/// TO REMOVE a release after the SP1 pin whose executor shares memory through descriptors (memfds):
+/// that executor leaves nothing in `/dev/shm`, so this only still sweeps what an older worker on the
+/// same host left there. It runs unconfined, at startup, before the worker confines itself.
 #[cfg(target_os = "linux")]
 fn reap_orphaned_sp1_shm() {
     let Ok(dir) = std::fs::read_dir("/dev/shm") else {

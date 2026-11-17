@@ -1179,11 +1179,11 @@ impl std::fmt::Display for MeasureWallClockTimeout {
 impl std::error::Error for MeasureWallClockTimeout {}
 
 /// A committed (claimed) proof reclaimed this in-flight pre-claim MEASUREMENT's resources by killing
-/// its throwaway measure worker (dispatcher `preempt_measures_for_host` / `preempt_measures_for_shm`).
+/// its throwaway measure worker (dispatcher `preempt_measures_for_host`).
 ///
 /// Typed, and TRANSIENT, for the same reason as `MeasureSlotsBusy`: nothing about the (program, input)
 /// failed — the measurement was healthy and simply YIELDED to a bonded job on the marginal box where a
-/// ~12 GiB measure and an ~18 GiB prove cannot co-fit (host-RAM and, on x86_64, `/dev/shm`). A
+/// ~12 GiB measure and an ~18 GiB prove cannot co-fit in host RAM. A
 /// measurement is speculative work with no collateral; a claimed proof is bonded and on a deadline, so
 /// giving the proof priority is the correct resolution of that contention (finding RH-round3 residual
 /// A — the "give the committed prove priority over the speculative measure" proper fix). The caller

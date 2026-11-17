@@ -429,10 +429,9 @@ impl WorkerBuild {
 
 /// A pre-claim cycle MEASUREMENT currently in flight, recorded so a committed (claimed) proof that
 /// cannot otherwise fit can PREEMPT it — kill its throwaway measure worker to reclaim the host RAM
-/// and/or `/dev/shm` it is holding. A measurement is speculative work with no collateral; a claimed
-/// proof is bonded and on a deadline, so on the marginal box where the two cannot co-fit the proof
-/// wins (finding RH-round3 residual A). See `preempt_measures_for_host` / `preempt_measures_for_shm`
-/// and `WorkerPool::inflight_measures`.
+/// it is holding. A measurement is speculative work with no collateral; a claimed proof is bonded
+/// and on a deadline, so on the marginal box where the two cannot co-fit the proof wins (finding
+/// RH-round3 residual A). See `preempt_measures_for_host` and `WorkerPool::inflight_measures`.
 #[derive(Clone)]
 struct InflightMeasure {
     /// The measure worker's pid Arc (shared with its `WorkerEntry`), re-read at kill time.
@@ -465,8 +464,6 @@ struct InflightMeasure {
     preempt: Arc<AtomicBool>,
     /// Host-RAM bytes this measurement reserved against the ledger (0 if it reserved none).
     host_bytes: u64,
-    /// `/dev/shm` bytes this measurement reserved against `shm_ledger` (0 off x86-64 / non-SP1).
-    shm_bytes: u64,
 }
 
 /// Source of the monotonic `InflightMeasure::generation`. A free-running counter is enough: a
@@ -1890,25 +1887,12 @@ pub struct WorkerPool {
     /// not each evict, and a measurement flood cannot thrash the warm prover with re-warm churn. See
     /// `MEASURE_EVICT_COOLDOWN`.
     last_measure_eviction: Mutex<Option<Instant>>,
-    /// Aggregate `/dev/shm` bytes reserved by in-flight SP1 native-executor stagings (finding RH1,
-    /// balloon Mode B). The native executor (x86-64 Linux ONLY) stages the guest memory IMAGE + trace
-    /// ring in `/dev/shm`; the per-execute `sp1_measure_cap_bytes` clamp bounds ONE image below the
-    /// tmpfs, but the x86_64 clamp does NOT bound the AGGREGATE of several concurrent stagings (a
-    /// measure-pool slot + a prove's execute phase, or two proves on two cards), whose sum can exceed
-    /// the shared tmpfs and SIGBUS synchronously — beating the 100 ms `MEMORY_LIMIT` poll and killing
-    /// whichever process touches the tipping page (possibly a claimed prove → slash). This ledger
-    /// admits exactly as many concurrent SP1 native executes as the tmpfs can physically back: each
-    /// staging reserves `sp1_measure_cap_bytes` against a capacity of `dev_shm − poll_margin`, held
-    /// across the execute/prove and released on drop. Inert off x86-64-Linux (portable in-process
-    /// executor, no `/dev/shm`) and when the tmpfs is unreadable (fails open, like the RAM ledger).
-    shm_ledger: crate::memory::MemoryLedger,
     /// In-flight pre-claim cycle MEASUREMENTS, keyed by measure-slot key (`sp1:measure:0`, …).
     /// Populated by `execute_cycles` for the duration of the Execute (RAII-removed on return) so a
-    /// committed proof that cannot fit can PREEMPT one — reclaim the host RAM / `/dev/shm` it holds by
-    /// killing its throwaway worker — rather than be forced into a penalized release (finding
-    /// RH-round3 residual A). A measurement is speculative and uncollateralized; a claimed proof is
-    /// bonded and on a deadline, so the proof wins. See `preempt_measures_for_host` /
-    /// `preempt_measures_for_shm` and `InflightMeasure`.
+    /// committed proof that cannot fit can PREEMPT one — reclaim the host RAM it holds by killing its
+    /// throwaway worker — rather than be forced into a penalized release (finding RH-round3 residual
+    /// A). A measurement is speculative and uncollateralized; a claimed proof is bonded and on a
+    /// deadline, so the proof wins. See `preempt_measures_for_host` and `InflightMeasure`.
     inflight_measures: Mutex<HashMap<String, InflightMeasure>>,
     /// When set, `discover_and_spawn` starts workers for these backends only (see
     /// [`Self::only_backends`]).
@@ -1967,7 +1951,6 @@ impl WorkerPool {
             gpu_locks: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
-            shm_ledger: crate::memory::MemoryLedger::default(),
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
             progress: None,
@@ -2096,10 +2079,10 @@ impl WorkerPool {
                 // the device-index pin. These MUST equal the measure worker's values, or a guest that
                 // declines at measure would succeed at prove — finding F, and worse as claim-then-fail
                 // (collateral already bonded). `MEMORY_LIMIT` bounds the prove-phase execute CHILD's RSS
-                // exactly as on the measure worker; `TRACE_CHUNK_SLOTS=2` makes the prove /dev/shm trace
-                // ring the SAME ~4 GiB as measure, so equal `MEMORY_LIMIT` leaves equal guest-IMAGE
-                // headroom (asymmetric rings would otherwise pass a mid-size guest at measure and SIGKILL
-                // it at prove) and keeps the prove ring inside a modest /dev/shm. A worker pinned to an
+                // exactly as on the measure worker; `TRACE_CHUNK_SLOTS=2` makes the prove trace ring
+                // the SAME ~4 GiB as measure, so equal `MEMORY_LIMIT` leaves equal guest-IMAGE headroom
+                // (asymmetric rings would otherwise pass a mid-size guest at measure and SIGKILL it at
+                // prove) and keeps the prove ring's shared memory modest. A worker pinned to an
                 // explicit `-cuda` binary has `device_index=None` but still proves on device 0, so this
                 // cannot live inside the `device_index` pin block below. SP1-only (`drives_cuda_…`), so
                 // risc0 and other cuda backends are untouched. A claimed job was measured under this
@@ -2608,15 +2591,10 @@ impl WorkerPool {
         // built to end. Routing risc0 `Execute` to this dedicated pool means the self-guard kills only a
         // THROWAWAY measure worker (respawned cheaply, no CUDA was ever initialised — `default_prover()`
         // is touched only by `Prove`, which a measure-only worker never receives), while the prove
-        // worker stays warm and keeps proving already-claimed jobs. No `/dev/shm` guard or `MEMORY_LIMIT`
-        // (those bound SP1's native executor); risc0's bound is its own RSS self-guard, set explicitly to
-        // the ledger charge below so enforcement == charge. openvm is NOT pooled here (its binary/guard
-        // are unverified); it keeps the in-process fallback in `execute_cycles`.
-        //
-        // Provisioned BEFORE the SP1 block on purpose (finding RH-round2/1): the SP1 block early-returns
-        // when /dev/shm is too small for SP1's native executor, and risc0 — which never touches
-        // /dev/shm — must NOT be collateral-skipped by that, or risc0 would silently fall back to the
-        // measure-kills-warm-prover in-process path on small-/dev/shm hosts.
+        // worker stays warm and keeps proving already-claimed jobs. No `MEMORY_LIMIT` (that bounds
+        // SP1's native executor); risc0's bound is its own RSS self-guard, set explicitly to the ledger
+        // charge below so enforcement == charge. openvm is NOT pooled here (its binary/guard are
+        // unverified); it keeps the in-process fallback in `execute_cycles`.
         if let Some(path) = risc0_measure_path {
             self.report_progress("Starting the risc0 cycle-measuring workers".to_string());
             let backend = zkminer_prover_protocol::BACKEND_RISC0.to_string();
@@ -2710,68 +2688,12 @@ impl WorkerPool {
         // host-RAM admission on the measure path (added separately) bounds the aggregate.
         if let Some(path) = sp1_measure_path {
             self.report_progress("Starting the sp1 cycle-measuring workers".to_string());
-            // Layer-B /dev/shm guard (locked #3). The SP1 native executor stages its trace ring and
-            // memory image in /dev/shm; a tmpfs too small to hold even the (now 2-slot, ~4 GiB) ring
-            // makes every measure SIGBUS the instant it is touched — the 64 MiB Docker default being
-            // the usual culprit. On too-small /dev/shm, register an EMPTY measure pool (below) instead
-            // of spawning workers that only SIGBUS-loop: that blocks SP1 claiming cleanly while leaving
-            // the already-registered prove workers up for jobs that were claimed before this point.
-            // Gated to x86-64 Linux, where the native executor exists; the portable executor elsewhere
-            // runs in-process and never touches /dev/shm. An unreadable probe (`None`) does NOT disable
-            // SP1 — spawn and let a real failure speak.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            let shm_ok = {
-                // ~4 GiB ring (TRACE_CHUNK_SLOTS=2 × 2 GiB) plus a little image headroom. Below this
-                // the ring cannot even be created and the first execute SIGBUSes.
-                // A measure execute and a concurrent prove execute each stage their own ~5 GiB,
-                // 2-slot trace ring in this SAME tmpfs, so the floor is TWO rings (~10 GiB), not one:
-                // sizing for one ring lets a measure and a prove coexist and overflow /dev/shm →
-                // SIGBUS. (This static floor does NOT cover a misconfigured container that gives a
-                // large `--memory` but a modest `--shm-size`, where the RAM ledger can admit several
-                // concurrent MEASURES the tmpfs still cannot back; a /dev/shm-sized execute semaphore
-                // is the complete fix and is tracked separately.) The ~5 GiB-per-ring figure is
-                // `TRACE_CHUNK_SLOTS=2 × ~2.4 GiB`, both workers pinned to 2 slots.
-                // Floor below which /dev/shm is too small to stage even the executor's irreducible
-                // working set (anon floor + a 2-slot trace ring), so the H3 cap clamp would drive
-                // `MEMORY_LIMIT` below what any measure needs and every measure would fail. Above this,
-                // the clamp (`sp1_measure_cap_bytes`) keeps the image from overflowing the tmpfs, so a
-                // too-small-but-usable /dev/shm LOWERS the cap rather than SIGBUS-ing — it does not
-                // need to hold the full 24 GiB default.
-                const MIN_DEV_SHM_FOR_MEASURE: u64 = 10 * 1024 * 1024 * 1024;
-                match crate::memory::dev_shm_capacity_bytes() {
-                    Some(cap) if cap < MIN_DEV_SHM_FOR_MEASURE => {
-                        tracing::error!(
-                            "SP1 measuring DISABLED (claims blocked): /dev/shm is {} MiB, below the \
-                             {} MiB the SP1 native executor needs for its working set — mount a larger \
-                             /dev/shm to enable SP1 (the execute cap is clamped to roughly /dev/shm \
-                             size, so size it for the jobs you want to claim, e.g. `--shm-size=24g` \
-                             for the full 24 GiB default). Prove workers stay up for already-claimed \
-                             jobs; the miner continues for other backends.",
-                            cap / (1024 * 1024),
-                            MIN_DEV_SHM_FOR_MEASURE / (1024 * 1024),
-                        );
-                        false
-                    }
-                    _ => true,
-                }
-            };
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let shm_ok = true;
-
+            // No `/dev/shm` floor: SP1's executor shares the guest's memory and trace ring with its
+            // runner through memfds, which are host RAM (charged to the host ledger and bounded by the
+            // measure worker's `MEMORY_LIMIT` below and its cgroup), so a small `/dev/shm`, such as a
+            // container's 64 MiB default, no longer stops SP1 from measuring. The worker's executor
+            // canary declines its slot if it cannot share memory at all.
             let backend = zkminer_prover_protocol::BACKEND_SP1.to_string();
-            if !shm_ok {
-                // Register an EMPTY measure pool, NOT nothing. `execute_cycles` and
-                // `has_idle_or_revivable_worker` treat a backend with NO `measure_workers` entry as
-                // "measure on the prove pool" (their `None` arm) — which for SP1 is exactly the
-                // server-teardown DoS the dedicated measure pool exists to prevent. `Some([])` instead
-                // makes `execute_cycles` bail ("no worker registered") and `has_idle_or_revivable_worker`
-                // return false, so SP1 measuring is genuinely off and no job is ever sized on a prove
-                // worker. The risc0 measure pool is provisioned ABOVE this block (it never touches
-                // /dev/shm), so this early return skips ONLY the SP1 spawn — risc0 is unaffected.
-                self.measure_workers.insert(backend, Vec::new());
-                return connected;
-            }
-
             let pool_size = std::env::var("ZKMINER_SP1_MEASURE_WORKERS")
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
@@ -2793,12 +2715,11 @@ impl WorkerPool {
                     zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV.to_string(),
                     "1".to_string(),
                 );
-                // Layer-B ring cap (locked #3). Pin the native executor's /dev/shm trace ring to 2
-                // slots (~4 GiB) on the measure worker instead of SP1's default 5 (~10 GiB), which
-                // alone nearly fills a typical half-of-RAM tmpfs and leaves a hostile guest little
-                // room to drive the image balloon into a SIGBUS. Applied last by `WorkerHandle::spawn`
-                // (overrides any inherited value) and carried in `spawn_env` across respawns. Inert on
-                // the portable executor.
+                // Layer-B ring cap (locked #3). Pin the native executor's trace ring to 2 slots
+                // (~4 GiB of shared memory) on the measure worker instead of SP1's default 5
+                // (~10 GiB), which the host would hold for every measurement. Applied last by
+                // `WorkerHandle::spawn` (overrides any inherited value) and carried in `spawn_env`
+                // across respawns. Inert on the portable executor.
                 menv.insert("TRACE_CHUNK_SLOTS".to_string(), "2".to_string());
                 // Layer-A enforced cap (locked #1/#2). SP1 reads `MEMORY_LIMIT` (bytes) and SIGKILLs the
                 // guest at that RSS via a 100 ms monitor, surfacing an in-band `TooMuchMemory` — the
@@ -3764,32 +3685,7 @@ impl WorkerPool {
                     ));
                 }
             };
-            // RH1 / Mode B: an SP1 benchmark runs the native executor and stages its image + trace ring
-            // in /dev/shm exactly as a measure or a prove does, so it must take the SAME aggregate shm
-            // reservation (held for the whole benchmark) — otherwise its staging is invisible to the
-            // shm_ledger and could sum images past the shared tmpfs with a concurrent measure/prove and
-            // SIGBUS. Inert off x86-64-Linux and for non-SP1 slots (no native executor staged there).
-            let shm = if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 {
-                match self.reserve_sp1_shm() {
-                    Some(r) => Some(r),
-                    None => {
-                        return Err(anyhow::Error::new(
-                            zkminer_prover_protocol::types::HostMemoryShortage {
-                                attempted: false,
-                                slot_key: key.to_string(),
-                                needed: crate::memory::sp1_measure_cap_bytes(
-                                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                                ),
-                                reserved: self.shm_ledger.reserved_bytes(),
-                                available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                            },
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            (host, shm)
+            host
         };
 
         self.ensure_alive(&mut slot, entry)?;
@@ -4166,32 +4062,7 @@ impl WorkerPool {
                     ));
                 }
             };
-            // RH1 / Mode B: an SP1 benchmark runs the native executor and stages its image + trace ring
-            // in /dev/shm exactly as a measure or a prove does, so it must take the SAME aggregate shm
-            // reservation (held for the whole benchmark) — otherwise its staging is invisible to the
-            // shm_ledger and could sum images past the shared tmpfs with a concurrent measure/prove and
-            // SIGBUS. Inert off x86-64-Linux and for non-SP1 slots (no native executor staged there).
-            let shm = if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 {
-                match self.reserve_sp1_shm() {
-                    Some(r) => Some(r),
-                    None => {
-                        return Err(anyhow::Error::new(
-                            zkminer_prover_protocol::types::HostMemoryShortage {
-                                attempted: false,
-                                slot_key: key.to_string(),
-                                needed: crate::memory::sp1_measure_cap_bytes(
-                                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                                ),
-                                reserved: self.shm_ledger.reserved_bytes(),
-                                available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                            },
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            (host, shm)
+            host
         };
 
         self.ensure_alive(&mut slot, entry)?;
@@ -4752,36 +4623,8 @@ impl WorkerPool {
         // sp1-gpu-server. On shortage, refuse now (nothing ran); the caller (`measure_cycles`) treats a
         // HostMemoryShortage as transient — no strike, no breaker. risc0 measures on its prove worker,
         // whose proofs the ledger already tracks, so it is exempt. Held across the Execute below.
-        // /dev/shm aggregate gate for the SP1 native executor (finding RH1, balloon Mode B). Acquired
-        // FIRST — before the host-RAM reservation below, which for a measure may evict a warm idle
-        // server via `make_measure_room` — so a /dev/shm shortage refuses CHEAPLY, without wasting a
-        // teardown and its cooldown on a measurement that could not stage anyway (finding RH-round2/6).
-        // Held across the Execute so this measure's image staging cannot sum past the shared tmpfs with
-        // a concurrent staging (another measure, or a prove's execute phase, which also takes an
-        // `shm_ledger` reservation) and SIGBUS. Only SP1 stages in /dev/shm; risc0/openvm executes are
-        // in-process. Inert off x86-64-Linux and on an unreadable tmpfs (both reserve 0 ⇒ always
-        // granted). A refusal is the SAME typed transient as a host-RAM shortage: not struck.
-        let _measure_shm = if backend == zkminer_prover_protocol::BACKEND_SP1 {
-            match self.reserve_sp1_shm() {
-                Some(r) => Some(r),
-                None => {
-                    return Err(anyhow::Error::new(
-                        zkminer_prover_protocol::types::HostMemoryShortage {
-                            attempted: false,
-                            slot_key: key.to_string(),
-                            needed: crate::memory::sp1_measure_cap_bytes(
-                                crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                            ),
-                            reserved: self.shm_ledger.reserved_bytes(),
-                            available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                        },
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
+        // (SP1's executor shares the guest's memory with its runner through memfds, which are host
+        // RAM, charged here; `/dev/shm` is no longer involved and is not budgeted.)
         let _measure_mem = if self.measure_workers.contains_key(backend) {
             let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
             // Charge the measurement's worst-case host RSS, PER BACKEND (charge == the enforced ceiling
@@ -4862,12 +4705,12 @@ impl WorkerPool {
 
         // Register this measurement as PREEMPTIBLE for exactly the duration of the Execute below. A
         // committed (claimed) proof that cannot otherwise fit may kill this throwaway worker to
-        // reclaim the host RAM / `/dev/shm` it holds (finding RH-round3 residual A): a measurement is
+        // reclaim the host RAM it holds (finding RH-round3 residual A): a measurement is
         // speculative work with no collateral, a claimed proof is bonded and on a deadline, so on the
         // marginal box where the two cannot co-fit the proof wins. `preempt` is read in the recv-fail
         // handler below so the kill is reported as a TYPED transient (`MeasurePreempted`) — never
-        // misread as a wall-clock timeout or a slot crash. The charges recorded here are the ACTUAL
-        // bytes each ledger reservation holds, so the preemptor's victim selection frees the right
+        // misread as a wall-clock timeout or a slot crash. The charge recorded here is the ACTUAL
+        // bytes the ledger reservation holds, so the preemptor's victim selection frees the right
         // amount; the guard removes the registration on return (success/error/panic), bounding the
         // preemptible window to the recv so a just-finished measurement is (almost) never targeted.
         let preempt = Arc::new(AtomicBool::new(false));
@@ -4880,7 +4723,6 @@ impl WorkerPool {
                 generation: INFLIGHT_MEASURE_GENERATION.fetch_add(1, Ordering::Relaxed),
                 preempt: preempt.clone(),
                 host_bytes: _measure_mem.as_ref().map(|r| r.bytes()).unwrap_or(0),
-                shm_bytes: _measure_shm.as_ref().map(|r| r.bytes()).unwrap_or(0),
             };
             self.inflight_measures
                 .lock()
@@ -4964,7 +4806,7 @@ impl WorkerPool {
             Err(e) => {
                 if preempt.load(Ordering::Acquire) {
                     // A committed (claimed) proof reclaimed this measurement's resources by killing
-                    // its worker (`preempt_measures_for_host` / `preempt_measures_for_shm`). Checked
+                    // its worker (`preempt_measures_for_host`). Checked
                     // FIRST, before the wall-clock-timeout branch: the preemptor's kill and a
                     // watchdog timeout can race, and this is neither a timeout nor a crash — the
                     // measurement was healthy and simply yielded to a bonded job. `mark_slot_dead`
@@ -5090,8 +4932,8 @@ impl WorkerPool {
     ///
     /// Runs on the same slots as [`Self::execute_cycles`] and is bounded by `timeout` the same way (a
     /// watchdog SIGKILL comes back as the typed `MeasureWallClockTimeout`). On a dedicated measure
-    /// worker it is charged to the host-RAM ledger as a measurement of the backend is, but it takes no
-    /// `/dev/shm` reservation, as an SP1 `Execute` does. When the backend has NO measure
+    /// worker it is charged to the host-RAM ledger as a measurement of the backend is. When the
+    /// backend has NO measure
     /// pool and the request falls back to a prove worker, nothing is charged at all, and a watchdog
     /// kill would group-kill that prove worker (an SP1 one with its `sp1-gpu-server`): a miner must not
     /// call it then. Not registered as preemptible: only a process that proves nothing calls it
@@ -5879,75 +5721,18 @@ impl WorkerPool {
         self.memory_ledger.reserved_bytes()
     }
 
-    /// Reserve the `/dev/shm` an SP1 native-executor staging needs, or `None` if the tmpfs cannot back
-    /// it alongside what is already staging (finding RH1, balloon Mode B). The per-execute charge is
-    /// the enforced execute cap (`sp1_measure_cap_bytes` = what one image can stage), reserved against
-    /// a capacity of `dev_shm − poll_margin`, so the `shm_ledger` admits exactly as many concurrent SP1
-    /// native executes as the tmpfs can physically hold — closing the aggregate-SIGBUS the per-execute
-    /// x86_64 clamp leaves open. Held across the execute/prove by the caller and released on drop.
-    ///
-    /// Gating is x86-64-Linux ONLY: that is the sole target that compiles SP1's native executor and
-    /// therefore stages in `/dev/shm`. Elsewhere the portable in-process executor runs (no `/dev/shm`),
-    /// and an unreadable tmpfs fails OPEN — both reserve 0 bytes against an unbounded capacity, which
-    /// `try_reserve` always grants, so the gate is inert exactly where there is nothing to bound.
-    /// Matches the x86_64 gating of `sp1_measure_cap_bytes`'s own `/dev/shm` clamp and the measure
-    /// pool's sufficiency guard.
-    fn reserve_sp1_shm(&self) -> Option<crate::memory::MemoryReservation<'_>> {
-        let (want, capacity) = if cfg!(target_arch = "x86_64") {
-            match crate::memory::dev_shm_capacity_bytes() {
-                Some(shm) => {
-                    let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
-                    (
-                        crate::memory::sp1_measure_cap_bytes(total),
-                        shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES),
-                    )
-                }
-                // Unreadable tmpfs: fail OPEN, exactly as `reserve_host_memory` does for an unreadable
-                // `/proc/meminfo`. The measure pool's own sufficiency guard still refused to stand up
-                // on a too-small `/dev/shm`, and the per-execute clamp still bounds a single image.
-                None => (0, u64::MAX),
-            }
-        } else {
-            // Portable in-process executor: nothing stages in `/dev/shm`, so there is nothing to bound.
-            (0, u64::MAX)
-        };
-        // 0 bytes against `u64::MAX` is always granted (`can_admit(0, ..)` holds), so the inert paths
-        // return a live-but-empty reservation rather than a spurious `None`. `resident`/`reserve` are 0
-        // and `available == total == capacity`: pure ledger-bounded concurrency, independent of live
-        // tmpfs occupancy. Our own files stay out of the way because a kill of ours unlinks them
-        // (`unlink_group_sp1_shm`), and the worker's startup sweep takes those of a death we did not
-        // cause, such as the kernel's OOM killer, after its 30 s age floor.
-        self.shm_ledger.try_reserve(want, 0, capacity, capacity, 0)
-    }
-
-    /// How many SP1 proofs this host can stage at once: the smaller of what `/dev/shm` holds of the
-    /// images `reserve_sp1_shm` charges (x86-64) and what host RAM holds of SP1's expected peak,
-    /// counting the reserve. `None` when neither can be read. Claim admission keeps the SP1 jobs
+    /// How many SP1 proofs this host can stage at once: what host RAM holds of SP1's expected peak,
+    /// counting the reserve. `None` when it cannot be read. Claim admission keeps the SP1 jobs
     /// waiting for a card to this many (plus one queued), so claimed jobs do not sit in the
-    /// memory-wait loop holding collateral and a concurrency slot: on a 92 GB host with a 46 GiB
-    /// `/dev/shm` it is 1, and SP1 jobs claimed beyond it waited a median 41 s.
+    /// memory-wait loop holding collateral and a concurrency slot. (SP1's executor shares its
+    /// memory through memfds, which are host RAM: the size of `/dev/shm` no longer bounds it.)
     pub fn sp1_concurrent_capacity(&self) -> Option<usize> {
-        let total = crate::memory::mem_total_bytes();
-        let shm = if cfg!(target_arch = "x86_64") {
-            crate::memory::dev_shm_capacity_bytes().map(|shm| {
-                staging_capacity(
-                    shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES),
-                    crate::memory::sp1_measure_cap_bytes(total.unwrap_or(u64::MAX)),
-                )
-            })
-        } else {
-            None
-        };
-        let host = total.map(|t| {
+        crate::memory::mem_total_bytes().map(|t| {
             staging_capacity(
                 t.saturating_sub(crate::memory::DEFAULT_HOST_RESERVE_BYTES),
                 self.expected_host_peak(zkminer_prover_protocol::BACKEND_SP1),
             )
-        });
-        match (shm, host) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        })
     }
 
     /// The host memory `key`'s next proof is charged: its backend's expected peak at the proof's
@@ -5976,11 +5761,10 @@ impl WorkerPool {
     /// anything; `None` whenever its admission might still succeed.
     ///
     /// Certain means: what is already reserved, less what a committed proof may preempt (pre-claim
-    /// measurements' charges), plus this proof, exceeds the whole host (`can_admit`'s committed term)
-    /// or, for SP1, the `/dev/shm` the staging ledger allows (`reserve_sp1_shm`). Recycling an idle
-    /// worker changes neither figure, so nothing `make_host_room` or the VRAM budget could do would
-    /// help: only another proof finishing will. The live term (`MemAvailable`) is left out on
-    /// purpose, since recycling can fix it.
+    /// measurements' charges), plus this proof, exceeds the whole host (`can_admit`'s committed
+    /// term). Recycling an idle worker does not change that figure, so nothing `make_host_room` or
+    /// the VRAM budget could do would help: only another proof finishing will. The live term
+    /// (`MemAvailable`) is left out on purpose, since recycling can fix it.
     fn host_side_refusal(
         &self,
         key: &str,
@@ -6006,17 +5790,6 @@ impl WorkerPool {
             })
         };
         let total = crate::memory::mem_total_bytes();
-        let backend = key.split(':').next().unwrap_or(key);
-        if backend == zkminer_prover_protocol::BACKEND_SP1 && cfg!(target_arch = "x86_64") {
-            if let Some(shm) = crate::memory::dev_shm_capacity_bytes() {
-                let need = crate::memory::sp1_measure_cap_bytes(total.unwrap_or(u64::MAX));
-                let capacity = shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES);
-                let held = self.shm_ledger.reserved_bytes();
-                if beyond_committed_room(held, preemptable(|m| m.shm_bytes), need, 0, capacity) {
-                    return refusal(need, held, shm);
-                }
-            }
-        }
         let held = self.reserved_host_memory();
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         if beyond_committed_room(held, preemptable(|m| m.host_bytes), want, reserve, total?) {
@@ -6210,79 +5983,6 @@ impl WorkerPool {
             wait_for_reclaim(key, reclaim_wait_budget(abort_at));
         }
         self.reserve_host_memory(want, key)
-    }
-
-    /// Preempt in-flight measurements to free the `/dev/shm` a COMMITTED SP1 proof on `key` needs to
-    /// stage its execute phase, then reserve it. The `/dev/shm` arm of the residual-A fix. Only an SP1
-    /// native-executor measurement reserves `shm_ledger`, so those are the only victims; inert off
-    /// x86-64-Linux / unreadable tmpfs (`reserve_sp1_shm` reserves 0 there, so the caller never
-    /// refuses and never reaches here).
-    ///
-    /// `None` when preempting every shm-holding measurement still would not admit the staging — then
-    /// another SP1 PROVE's staging holds the tmpfs. On a single-`/dev/shm` box the two serialize, and a
-    /// bonded prove is never preempted; size `/dev/shm` for N_gpu to run them concurrently. The caller
-    /// refuses with the typed shortage, as before.
-    ///
-    /// An SP1 measurement holds BOTH ledgers, so when we actually kill one to free `/dev/shm` we also
-    /// wait HERE for its host RAM to be reclaimed before returning. The host-RAM arm in `prove_on_slot`
-    /// runs immediately after this one; by then our victim is deregistered, so that arm's snapshot is
-    /// empty and it can neither preempt nor wait. Without this wait the committed proof would refuse
-    /// host RAM even though this kill just freed exactly what it needs (finding RH-round4, the
-    /// cross-arm reclaim gap). `key` is the proof's slot, used only as the reclaim-wait log label.
-    fn preempt_measures_for_shm(
-        &self,
-        key: &str,
-        abort_at: Option<Instant>,
-    ) -> Option<crate::memory::MemoryReservation<'_>> {
-        if self.closing.load(Ordering::Acquire) {
-            return None;
-        }
-        if abort_at
-            .is_some_and(|a| too_late_to_make_room(a.saturating_duration_since(Instant::now())))
-        {
-            return None;
-        }
-        let mut victims: Vec<(String, InflightMeasure)> = self
-            .inflight_measures_snapshot()
-            .into_iter()
-            .filter(|(_, m)| m.shm_bytes > 0)
-            .collect();
-        if victims.is_empty() {
-            // Nothing of ours holds `/dev/shm` — the blocker is a bonded prove's staging. Retry once
-            // in case room appeared, else None.
-            return self.reserve_sp1_shm();
-        }
-        victims.sort_by_key(|(_, m)| std::cmp::Reverse(m.shm_bytes));
-        // Kill the largest first and re-test after each, so the minimal set is preempted. Unlike host
-        // RAM there is nothing to wait on after the charge: `preempt_one_measure` unlinks what the
-        // measurement staged, so its pages go when it does. So poll the real `reserve_sp1_shm`.
-        for (k, m) in &victims {
-            let killed = self.preempt_one_measure(k, m);
-            // Same start-floor-respecting bound as the host arm (see `reclaim_wait_budget`): a full
-            // poll must not run past `abort_at - MIN_ABORT_START_BUDGET`.
-            let deadline = Instant::now() + reclaim_wait_budget(abort_at);
-            loop {
-                if let Some(r) = self.reserve_sp1_shm() {
-                    // Got the staging. If we actually KILLED a victim that also held host RAM, its
-                    // host ledger charge has already dropped (it unwinds before the shm charge), but
-                    // the kernel has not returned its anon pages yet — wait for that here so the
-                    // host-RAM arm can admit the proof (see the fn doc). Gated on `killed` so a shm
-                    // reservation that merely became free on its own does not block the full budget.
-                    if killed && m.host_bytes > 0 {
-                        // Start-floor-respecting bound again: this recomputes from `now`, so the poll
-                        // above plus this host wait together still stop at `abort_at -
-                        // MIN_ABORT_START_BUDGET` and never eat the proof's start budget.
-                        wait_for_reclaim(key, reclaim_wait_budget(abort_at));
-                    }
-                    return Some(r);
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-        None
     }
 
     /// Has the operator switched off every device this backend could run on?
@@ -7705,11 +7405,11 @@ impl WorkerPool {
         let gpu_lock = self.gpu_lock_for(key);
         let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, timeout)?;
 
-        // Host memory and `/dev/shm` are reserved further down, after the slot mutex (see there), but
+        // Host memory is reserved further down, after the slot mutex (see there), but
         // the VRAM budget just below may recycle a warm same-card sibling to make room. If the proofs
         // already in flight leave this one no host-side room that anything below could make, it would
         // be refused there anyway, after the sibling was destroyed for nothing, and again on every
-        // retry. Seen on localnet: an SP1 proof waiting for `/dev/shm` behind another card's SP1 proof
+        // retry. Seen on localnet: an SP1 proof waiting for room behind another card's SP1 proof
         // recycled the idle risc0 worker on its own card seven times in four minutes. So it is refused
         // here first, with the same typed shortage.
         if let Some(shortage) = self.host_side_refusal(
@@ -7844,75 +7544,26 @@ impl WorkerPool {
         // free slots — the ledger's figure stopped meaning "in flight".
         //
         // Held for the rest of the proof; released on drop, including on every error path.
-        let backend_of_slot = key.split(':').next().unwrap_or(key);
         // Read again now, after any recycle above, which changes what the SP1 server holds.
         let want = self.host_want(key, po2, execute_peak_bytes);
-        // RH1 / Mode B: reserve the `/dev/shm` this SP1 proof's execute phase will stage, held for the
-        // whole proof so a concurrent measure or a prove on another card cannot sum images past the
-        // shared tmpfs and SIGBUS (which, hitting a claimed prove, is a slash). On shortage, refuse as
-        // a typed `HostMemoryShortage` — the retry loop re-dispatches once the other staging frees the
-        // tmpfs, exactly as for a host-RAM shortage. Inert off x86-64-Linux and for non-SP1 backends.
-        //
-        // DESIGN (findings RH-round2/3 and RH-round3 residual A): the reservation is held for the
-        // WHOLE proof, though only the brief execute phase actually stages in /dev/shm — the
-        // dispatcher cannot see when the worker's internal execute finishes without a protocol phase
-        // signal, and the trace ring's /dev/shm lifetime across GPU proving is not guaranteed, so
-        // releasing early could re-admit a colliding staging. When the /dev/shm clamp binds (tmpfs
-        // fits only one cap-sized image) this would SERIALIZE, for the whole proof, both:
-        //   * two SP1 proves on DIFFERENT cards (multi-GPU only); and
-        //   * an SP1 prove vs. a concurrent pre-claim SP1 MEASUREMENT — on the SUPPORTED SINGLE-GPU
-        //     box too. And the host-RAM ledger serializes measure-vs-prove independently of /dev/shm
-        //     (a ~12 GiB measure + an ~18 GiB prove exceed a 28 GiB box — the host-RAM half, from the
-        //     C3 measure charge, is the DOMINANT cause, not /dev/shm).
-        // RESOLVED for the committed proof (the only case that can be slashed): a bonded claim now
-        // PREEMPTS the speculative measurement on BOTH ledgers — host RAM via `preempt_measures_for_
-        // host`, /dev/shm via `preempt_measures_for_shm`, wired into the two reservations just below,
-        // gated on `committed` (= `abort_at.is_some()`). A measurement is uncollateralized pre-claim
-        // work; a claim is bonded and on a deadline, so the proof reclaims the measurement's charge
-        // (killing its throwaway worker, which re-measures next tick as a transient `MeasurePreempted`)
-        // rather than being forced into a penalized RELEASE. A bonded proof is NEVER preempted (both
-        // committed), so the only remaining serialization is prove-vs-prove, which is NOT a slash
-        // vector and is self-healing (re-dispatch once the other frees). To run concurrent multi-GPU
-        // SP1, additionally size /dev/shm for N_gpu cap-sized images so the ledger admits N concurrent
-        // stagings (a throughput choice, not a safety one).
+        // A bonded claim may PREEMPT a speculative pre-claim measurement's host-RAM charge (RH-round3
+        // residual A, in `preempt_measures_for_host` below): a measurement is uncollateralized; a
+        // claim is bonded and on a deadline, so the proof reclaims the measurement's charge (killing
+        // its throwaway worker, which re-measures next tick as a transient `MeasurePreempted`) rather
+        // than being forced into a penalized RELEASE. A bonded proof is NEVER preempted.
         // Committed == has a lock deadline: a claimed proof sets `abort_at`; the benchmark/calibration
         // paths (which reach `prove_on_slot` only via `prove_min_vram`) do not, so this never runs for
-        // speculative work (which would be sizing-vs-sizing, no priority to justify a kill).
+        // speculative work (which would be sizing-vs-sizing, no priority to justify a kill). SP1's
+        // executor shares its memory through memfds, host RAM charged here, so `/dev/shm` takes no
+        // reservation.
         let committed = abort_at.is_some();
-        let _prove_shm = if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 {
-            match self.reserve_sp1_shm().or_else(|| {
-                // `/dev/shm` is short. If a pre-claim SP1 measurement is holding it, preempt it so
-                // this bonded proof can stage (RH-round3 residual A, shm arm). None (not committed,
-                // or a bonded prove's staging is the blocker) falls through to the typed shortage.
-                committed
-                    .then(|| self.preempt_measures_for_shm(key, abort_at))
-                    .flatten()
-            }) {
-                Some(r) => Some(r),
-                None => {
-                    return Err(anyhow::Error::new(
-                        zkminer_prover_protocol::types::HostMemoryShortage {
-                            attempted: false,
-                            slot_key: key.to_string(),
-                            needed: crate::memory::sp1_measure_cap_bytes(
-                                crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                            ),
-                            reserved: self.shm_ledger.reserved_bytes(),
-                            available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                        },
-                    ));
-                }
-            }
-        } else {
-            None
-        };
         let _memory_reservation = match self
             .reserve_host_memory(want, key)
             .or_else(|| self.make_host_room(key, want, abort_at))
             .or_else(|| {
                 // Host RAM is still short after recycling idle workers. If a pre-claim measurement is
                 // holding it, preempt it so this bonded proof can run (RH-round3 residual A, host-RAM
-                // arm — the DOMINANT half on the single-GPU box, independent of `/dev/shm`). None
+                // arm — the DOMINANT half on the single-GPU box). None
                 // (not committed, or a bonded proof is the blocker) falls through to the existing
                 // credit-unreadable recycle and then the typed shortage.
                 committed
@@ -8980,48 +8631,6 @@ mod tests {
         assert_eq!(whole_journal(Some(vec![]), 3), None);
         assert_eq!(whole_journal(Some(vec![1, 2]), 3), None);
         assert_eq!(whole_journal(Some(vec![0; CAP + 1]), CAP as u64 + 1), None);
-    }
-
-    // Finding RH1 / Mode B: the `/dev/shm` ledger admits only as many concurrent SP1 native stagings
-    // as the tmpfs can physically back, and releases on drop.
-    #[test]
-    fn sp1_shm_reservations_are_capacity_bounded_and_release() {
-        use super::WorkerPool;
-        let pool = WorkerPool::new(std::collections::HashMap::new(), Vec::new(), None);
-
-        // The FIRST staging is always admissible: the per-execute cap is clamped `<= capacity` by
-        // construction (and off x86-64-Linux / on an unreadable tmpfs the gate is inert → always Some).
-        let first = pool.reserve_sp1_shm();
-        assert!(
-            first.is_some(),
-            "a single SP1 shm staging must always be admissible"
-        );
-
-        // Where the gate is ACTIVE and the tmpfs is too small to back two cap-sized images at once, a
-        // second concurrent staging is refused while the first is held.
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            if let Some(shm) = crate::memory::dev_shm_capacity_bytes() {
-                let capacity =
-                    shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES);
-                let cap = crate::memory::sp1_measure_cap_bytes(
-                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                );
-                if cap > 0 && capacity < cap.saturating_mul(2) {
-                    assert!(
-                        pool.reserve_sp1_shm().is_none(),
-                        "a second cap-sized staging must not fit a tmpfs that holds only one"
-                    );
-                }
-            }
-        }
-
-        drop(first);
-        // Released on drop: a staging is admissible again.
-        assert!(
-            pool.reserve_sp1_shm().is_some(),
-            "a dropped shm reservation must free its bytes"
-        );
     }
 
     #[test]
@@ -10686,18 +10295,16 @@ mod tests {
         assert!(
             guard < refusal && refusal < budget,
             "host_side_refusal must come after the per-card guard and before check_vram_budget: \
-             otherwise an SP1 proof waiting for another card's `/dev/shm` staging recycles the idle \
-             risc0 worker on its own card on every retry, for nothing"
+             otherwise an SP1 proof waiting for host room behind another card's proof recycles the \
+             idle risc0 worker on its own card on every retry, for nothing"
         );
     }
 
-    /// This host: a 46 GiB `/dev/shm` (less the poll margin) holds one 24 GiB SP1 image, and 92 GiB
-    /// of RAM three of SP1's 24 GiB unmeasured peak.
+    /// This host: 92 GiB of RAM holds three of SP1's 24 GiB unmeasured peak.
     #[test]
     fn sp1_staging_capacity_counts_whole_images() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        let shm = 46 * GIB - crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES;
-        assert_eq!(staging_capacity(shm, 24 * GIB), 1);
+        assert_eq!(staging_capacity(46 * GIB, 24 * GIB), 1);
         assert_eq!(
             staging_capacity(
                 92 * GIB - crate::memory::DEFAULT_HOST_RESERVE_BYTES,
@@ -10713,14 +10320,20 @@ mod tests {
     #[test]
     fn the_committed_room_is_net_of_what_a_claim_may_preempt() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        // `/dev/shm` of 46 GiB (half of 92) less the 2 GiB poll margin, one SP1 staging of 24 GiB
-        // in flight: a second one cannot fit, whatever is recycled.
-        let shm = 46 * GIB - crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES;
-        assert!(beyond_committed_room(24 * GIB, 0, 24 * GIB, 0, shm));
+        // A room of 44 GiB with one 24 GiB SP1 charge in flight: a second one cannot fit, whatever
+        // is recycled.
+        let room = 44 * GIB;
+        assert!(beyond_committed_room(24 * GIB, 0, 24 * GIB, 0, room));
         // ... unless the 24 GiB in flight is a pre-claim measurement a claimed proof may preempt.
-        assert!(!beyond_committed_room(24 * GIB, 24 * GIB, 24 * GIB, 0, shm));
-        // Nothing in flight: one staging fits.
-        assert!(!beyond_committed_room(0, 0, 24 * GIB, 0, shm));
+        assert!(!beyond_committed_room(
+            24 * GIB,
+            24 * GIB,
+            24 * GIB,
+            0,
+            room
+        ));
+        // Nothing in flight: one fits.
+        assert!(!beyond_committed_room(0, 0, 24 * GIB, 0, room));
         // Host RAM of 92 GiB with the 3 GiB reserve: an SP1 proof (24) beside two risc0 ones fits.
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         assert!(!beyond_committed_room(
@@ -11659,7 +11272,7 @@ mod preemption_tests {
         WorkerPool::new(HashMap::new(), Vec::new(), None)
     }
 
-    fn fake_measure(host_bytes: u64, shm_bytes: u64) -> (InflightMeasure, Arc<AtomicBool>) {
+    fn fake_measure(host_bytes: u64) -> (InflightMeasure, Arc<AtomicBool>) {
         let preempt = Arc::new(AtomicBool::new(false));
         (
             InflightMeasure {
@@ -11672,7 +11285,6 @@ mod preemption_tests {
                 generation: INFLIGHT_MEASURE_GENERATION.fetch_add(1, Ordering::Relaxed),
                 preempt: preempt.clone(),
                 host_bytes,
-                shm_bytes,
             },
             preempt,
         )
@@ -11683,7 +11295,7 @@ mod preemption_tests {
     #[test]
     fn inflight_measure_guard_removes_on_drop() {
         let pool = empty_pool();
-        let (m, _p) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m, _p) = fake_measure(8 * 1024 * 1024 * 1024);
         {
             pool.inflight_measures
                 .lock()
@@ -11729,7 +11341,7 @@ mod preemption_tests {
             !pool.backend_fits_for_claim(peak, "sp1", 0, 1),
             "held by proofs: nothing can be preempted"
         );
-        let (m, _flag) = fake_measure(held, 0);
+        let (m, _flag) = fake_measure(held);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -11785,7 +11397,7 @@ mod preemption_tests {
     #[test]
     fn preempt_one_measure_sets_the_flag_on_the_live_registration() {
         let pool = empty_pool();
-        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -11806,7 +11418,7 @@ mod preemption_tests {
     #[test]
     fn preempt_one_measure_skips_a_vanished_registration() {
         let pool = empty_pool();
-        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024);
         // Not inserted: the registry is empty, as if the measurement already returned.
         let killed = pool.preempt_one_measure("sp1:measure:0", &m);
         assert!(!killed);
@@ -11822,10 +11434,10 @@ mod preemption_tests {
     #[test]
     fn preempt_one_measure_skips_a_changed_registration() {
         let pool = empty_pool();
-        let (stale, _stale_flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (stale, _stale_flag) = fake_measure(8 * 1024 * 1024 * 1024);
         // A later measurement M2 on the SAME slot: fake_measure draws a fresh generation, so even
         // with identical pid/start-time (0/0) it is a distinct registration.
-        let (m2, m2_flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m2, m2_flag) = fake_measure(8 * 1024 * 1024 * 1024);
         assert_ne!(stale.generation, m2.generation);
         pool.inflight_measures
             .lock()
@@ -11845,7 +11457,7 @@ mod preemption_tests {
     fn preemption_is_refused_while_closing() {
         let pool = empty_pool();
         pool.closing.store(true, Ordering::Release);
-        let (m, _p) = fake_measure(12 * 1024 * 1024 * 1024, 0);
+        let (m, _p) = fake_measure(12 * 1024 * 1024 * 1024);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -11853,7 +11465,6 @@ mod preemption_tests {
         assert!(pool
             .preempt_measures_for_host("sp1:cuda:0", 18 * 1024 * 1024 * 1024, None)
             .is_none());
-        assert!(pool.preempt_measures_for_shm("sp1:cuda:0", None).is_none());
         // And nothing was preempted.
         assert_eq!(pool.test_inflight_measure_count(), 1);
     }
@@ -11863,7 +11474,7 @@ mod preemption_tests {
     #[test]
     fn preemption_is_refused_when_the_deadline_is_too_close() {
         let pool = empty_pool();
-        let (m, flag) = fake_measure(12 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024);
+        let (m, flag) = fake_measure(12 * 1024 * 1024 * 1024);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -11873,7 +11484,6 @@ mod preemption_tests {
         assert!(pool
             .preempt_measures_for_host("sp1:cuda:0", 18 * 1024 * 1024 * 1024, soon)
             .is_none());
-        assert!(pool.preempt_measures_for_shm("sp1:cuda:0", soon).is_none());
         assert!(
             !flag.load(Ordering::Acquire),
             "no measurement should be preempted when the deadline is too close"

@@ -219,6 +219,10 @@ const GROUP_SHM_SCAN_WAIT: Duration = Duration::from_millis(250);
 /// Unlink the SP1 `/dev/shm` segments a worker's process group maps. Call just before killing it.
 /// `key` is its backend or slot key: nothing else stages there, so nothing else is looked at.
 ///
+/// TO REMOVE a release after the SP1 pin whose executor shares memory through descriptors: that
+/// executor names nothing in `/dev/shm`, so there is nothing for this to find. Harmless meanwhile
+/// (a scan of the group's maps that matches nothing).
+///
 /// sp1-jit removes these when an execution ends, in a `Drop` that a signal never reaches, so otherwise
 /// they stay until a worker starting 30 s or more later sweeps them up (`reap_orphaned_sp1_shm`). The
 /// ledger gives their room away the moment the killed execution's charge drops, so the next execution
