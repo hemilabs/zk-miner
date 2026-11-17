@@ -481,26 +481,36 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
-                tracing::info!("Running benchmarks...");
-                if let Err(refused) = guest_may_run(0) {
-                    write_message(&mut stdout, &refused)?;
-                    continue;
-                }
-                let results = if let Some(refusal) = gpu_refusal() {
-                    tracing::error!("not benchmarking: {refusal}");
-                    Vec::new()
-                } else {
-                    #[cfg(feature = "metal")]
-                    {
-                        metal_start::log_power_state("benchmark");
-                        metal_start::prewarm_before_benchmark(default_job_po2());
+            WorkerCommand::Benchmark { programs, po2 } => match job_segment_po2(po2) {
+                Ok(po2) => {
+                    tracing::info!("Running benchmarks at po2 {po2}...");
+                    if let Err(refused) = guest_may_run(0) {
+                        write_message(&mut stdout, &refused)?;
+                        continue;
                     }
-                    run_benchmarks_streaming(&mut stdout, &programs)?
-                };
-                let resp = WorkerResponse::BenchmarkResult { results };
-                write_message(&mut stdout, &resp)?;
-            }
+                    let results = if let Some(refusal) = gpu_refusal() {
+                        tracing::error!("not benchmarking: {refusal}");
+                        Vec::new()
+                    } else {
+                        #[cfg(feature = "metal")]
+                        {
+                            metal_start::log_power_state("benchmark");
+                            metal_start::prewarm_before_benchmark(po2);
+                        }
+                        run_benchmarks_streaming(&mut stdout, &programs, po2)?
+                    };
+                    let resp = WorkerResponse::BenchmarkResult { results };
+                    write_message(&mut stdout, &resp)?;
+                }
+                Err(e) => {
+                    let resp = WorkerResponse::Error {
+                        request_id: 0,
+                        message: format!("{e:#}"),
+                        kind: ErrorKind::InvalidInput,
+                    };
+                    write_message(&mut stdout, &resp)?;
+                }
+            },
 
             // A witness-construction job (plan §15.3): its input read from the bundle and checked,
             // executed once, and proven only if it reproduces the bundle's journal.
@@ -2151,16 +2161,17 @@ fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
     (!elf.is_empty()).then_some(elf)
 }
 
-/// Prove each of `programs`, sending a `BenchmarkProgress` after each one that proved. The suite is
-/// the host's; see `zkminer_prover_protocol::suite`.
+/// Prove each of `programs` at segment size `po2`, sending a `BenchmarkProgress` after each one
+/// that proved. The suite is the host's; see `zkminer_prover_protocol::suite`.
 fn run_benchmarks_streaming<W: std::io::Write>(
     stdout: &mut W,
     programs: &[BenchmarkProgramSpec],
+    po2: u8,
 ) -> anyhow::Result<Vec<BenchmarkEntry>> {
     let mut results = Vec::new();
     let total = programs.len() as u32;
     for (idx, spec) in programs.iter().enumerate() {
-        if let Some(entry) = benchmark_spec(spec) {
+        if let Some(entry) = benchmark_spec(spec, po2) {
             let progress = WorkerResponse::BenchmarkProgress {
                 entry: entry.clone(),
                 program_index: idx as u32 + 1,
@@ -2193,13 +2204,17 @@ fn forced_failure_in(knob: Option<&str>, what: &str) -> Option<String> {
         .then(|| format!("forced failure (ZKMINER_TEST_FORCE_FAIL={what})"))
 }
 
-/// Prove one requested program, if this build has its guest.
-fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
-    benchmark_spec_with(spec, force_fail_knob().as_deref())
+/// Prove one requested program at segment size `po2`, if this build has its guest.
+fn benchmark_spec(spec: &BenchmarkProgramSpec, po2: u8) -> Option<BenchmarkEntry> {
+    benchmark_spec_with(spec, po2, force_fail_knob().as_deref())
 }
 
 /// `benchmark_spec` with the `ZKMINER_TEST_FORCE_FAIL` value passed in.
-fn benchmark_spec_with(spec: &BenchmarkProgramSpec, knob: Option<&str>) -> Option<BenchmarkEntry> {
+fn benchmark_spec_with(
+    spec: &BenchmarkProgramSpec,
+    po2: u8,
+    knob: Option<&str>,
+) -> Option<BenchmarkEntry> {
     if let Some(forced) = forced_failure_in(knob, &spec.name) {
         tracing::error!("{}: {forced}", spec.name);
         return None;
@@ -2215,6 +2230,7 @@ fn benchmark_spec_with(spec: &BenchmarkProgramSpec, knob: Option<&str>) -> Optio
         spec.weight,
         spec.precompile,
         spec.measure_wrap,
+        po2,
     )
 }
 
@@ -2254,6 +2270,8 @@ fn run_benchmarks_with(
     use zkminer_prover_protocol::{
         benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
     };
+    // At the size a host sends a card it knows nothing about (on a Mac, the Metal table's).
+    let po2 = default_job_po2();
     let mut failed = Vec::new();
     // Discarded, as under a host: see `warmup_spec`. Its failure still fails the run.
     let warmup = warmup_spec(BACKEND_RISC0);
@@ -2262,7 +2280,7 @@ fn run_benchmarks_with(
             tracing::error!("warm-up: {forced}");
             false
         }
-        None => benchmark_spec_with(&warmup, knob).is_some(),
+        None => benchmark_spec_with(&warmup, po2, knob).is_some(),
     };
     if !warmed {
         failed.push(format!("{} (warm-up)", warmup.name));
@@ -2273,13 +2291,15 @@ fn run_benchmarks_with(
         .iter()
         .filter(|spec| wanted(&spec.name))
     {
-        match benchmark_spec_with(spec, knob) {
+        match benchmark_spec_with(spec, po2, knob) {
             Some(entry) => results.push(entry),
             None => failed.push(spec.name.clone()),
         }
     }
     if wanted(BENCH_ZKOP_MIX) {
-        match measure_zkop_mix(|iterations| benchmark_spec_with(&zkop_mix_spec(iterations), knob)) {
+        match measure_zkop_mix(|iterations| {
+            benchmark_spec_with(&zkop_mix_spec(iterations), po2, knob)
+        }) {
             Some(entry) => results.push(entry),
             None => {
                 tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score");
@@ -2299,13 +2319,13 @@ fn benchmark_stages(
     weight: f64,
     precompile: bool,
     measure_wrap: bool,
+    po2: u8,
 ) -> Option<BenchmarkEntry> {
-    // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
-    // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
-    // only says what the executor default already was.)
+    // At the size the host names: the one this card proves jobs at before any calibration, so its
+    // throughput and host peak describe them. On a 12 GB card that is 19; at 20 its proofs spill
+    // into shared memory and run several times slower than any job it proves.
     let mut env = risc0_zkvm::ExecutorEnv::builder();
-    env.write_slice(input)
-        .segment_limit_po2(default_job_po2() as u32);
+    env.write_slice(input).segment_limit_po2(po2 as u32);
     let _segments = segments::spill_here(&mut env);
     let env = env.build().ok()?;
 
@@ -2320,7 +2340,7 @@ fn benchmark_stages(
     // P31-M9b: wait for the in-flight specialized eval pipeline when this program's segments are
     // its size, outside the stopwatch.
     #[cfg(feature = "metal")]
-    metal_start::before_benchmark_program(name, default_job_po2(), elf, input);
+    metal_start::before_benchmark_program(name, po2, elf, input);
     let prover = local_prover();
     // W7-M11: the power state the program is measured under, read before and after it.
     let power_before = bench_power_state();
@@ -2381,7 +2401,7 @@ fn benchmark_stages(
             sampler.held("held after release");
             tracing::info!(
                 "{name}: Metal peak GPU memory at po2 {}: {}",
-                default_job_po2(),
+                po2,
                 sampler.summary()
             );
         }
@@ -2390,7 +2410,7 @@ fn benchmark_stages(
             footprint.phase("held after release");
             tracing::info!(
                 "{name}: peak process footprint (host + GPU) at po2 {}: {}",
-                default_job_po2(),
+                po2,
                 footprint.summary()
             );
         }
@@ -2439,7 +2459,7 @@ fn benchmark_stages(
         sampler.held("held after release");
         tracing::info!(
             "{name}: Metal peak GPU memory at po2 {}: {}",
-            default_job_po2(),
+            po2,
             sampler.summary()
         );
     }
@@ -2448,7 +2468,7 @@ fn benchmark_stages(
         footprint.phase("held after release");
         tracing::info!(
             "{name}: peak process footprint (host + GPU) at po2 {}: {}",
-            default_job_po2(),
+            po2,
             footprint.summary()
         );
     }

@@ -118,6 +118,15 @@ pub struct DeviceBenchmark {
     /// estimate rather than treating an unmeasured backend as free.
     #[serde(default)]
     pub host_peak_bytes: Option<u64>,
+    /// The segment size (po2) a risc0 row's suite was proved at (`risc0_benchmark_po2`), which
+    /// `throughput` is the rate at. `None` on other backends, and on a row written before the size
+    /// was the card's own: those were all proved at [`RISC0_DEFAULT_JOB_PO2`].
+    ///
+    /// `#[serde(default)]` for the reason given on `pci_bus_id`.
+    ///
+    /// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+    #[serde(default)]
+    pub benchmark_po2: Option<u8>,
 }
 
 fn default_po2() -> u8 {
@@ -306,6 +315,25 @@ pub fn risc0_default_job_po2_for_vram(vram: u64) -> Option<u8> {
         .map(|(po2, _)| *po2)
 }
 
+/// The segment size (po2) a risc0 card's benchmark proves the suite at: the size it proves jobs at
+/// before any calibration or operator's size, so the rate it records is the one its jobs run at.
+///
+/// On a CUDA card of known VRAM, the largest measured size that fits
+/// (`risc0_default_job_po2_for_vram`) or, on a card too small for any, the smallest measured one:
+/// its rate still says what the card would do. Anywhere else [`RISC0_DEFAULT_JOB_PO2`], which every
+/// card was benchmarked at before: no AMD or Intel card has been measured per size, and a 12 GB Arc
+/// B580 proves 20.
+///
+/// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+pub fn risc0_benchmark_po2(vram_bytes: Option<u64>, gpu_tag: &str) -> u8 {
+    match vram_bytes {
+        Some(v) if gpu_tag == "cuda" => {
+            risc0_default_job_po2_for_vram(v).unwrap_or(RISC0_GPU_MEASURED_PEAK_MIB[0].0)
+        }
+        _ => zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2,
+    }
+}
+
 /// The segment size (po2) a risc0 card measures and proves jobs at, or `None` for a card that proves
 /// none.
 ///
@@ -421,10 +449,10 @@ pub const RISC0_PO2_STEP_DOWN_FACTOR: f64 = 0.5;
 
 /// The throughput (cycles/s) to plan a risc0 job on this card at `po2`, the card's job size.
 ///
-/// The row's throughput was measured at [`RISC0_DEFAULT_JOB_PO2`]. A calibrated card is held to the
-/// lower of that and its measured rate at `po2` (which includes the Groth16 wrap). Below the smallest
-/// size either was measured at, each step down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]; above it,
-/// nothing is credited.
+/// The row's throughput was measured at its `benchmark_po2` ([`RISC0_DEFAULT_JOB_PO2`] on a row
+/// without one). A calibrated card is held to the lower of that and its measured rate at `po2`
+/// (which includes the Groth16 wrap). Below the smallest size either was measured at, each step
+/// down is charged [`RISC0_PO2_STEP_DOWN_FACTOR`]; above it, nothing is credited.
 ///
 /// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
 pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
@@ -435,7 +463,8 @@ pub fn risc0_job_throughput(row: &DeviceBenchmark, po2: u8) -> f64 {
         }
         None => (
             row.throughput,
-            zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2,
+            row.benchmark_po2
+                .unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2),
         ),
     };
     rate * RISC0_PO2_STEP_DOWN_FACTOR.powi(i32::from(lowest.saturating_sub(po2)))
@@ -961,6 +990,7 @@ pub fn add_gpu_device_benchmarks(suite: &mut BenchmarkSuite, gpus: &[GpuDesc]) {
                 po2_samples: Vec::new(),
                 // An ESTIMATED row (no worker ran), so there is nothing measured to record.
                 host_peak_bytes: None,
+                benchmark_po2: None,
             });
         }
     }
@@ -2351,6 +2381,7 @@ fn build_gpu_device_benchmarks_with(
             pci_bus_id,
             // Measured by the dispatcher while this worker was still alive.
             host_peak_bytes: r.host_peak_bytes,
+            benchmark_po2: r.benchmark_po2,
         });
     }
 
@@ -3563,6 +3594,7 @@ mod zkop_score_tests {
             entries,
             vram_bytes: None,
             host_peak_bytes: None,
+            benchmark_po2: None,
         }
     }
 
@@ -3663,6 +3695,7 @@ mod tests {
             pci_bus_id: String::new(),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         };
         let target = |device: &str, backend: &str| (device.to_string(), backend.to_string());
         let targets = [
@@ -4133,6 +4166,7 @@ mod tests {
             pci_bus_id: String::new(),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         };
         assert_eq!(db.throughput_cov(), 0.0);
     }
@@ -4157,6 +4191,7 @@ mod tests {
             pci_bus_id: String::new(),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         };
         assert_eq!(db.throughput_cov(), 0.0);
     }
@@ -4181,6 +4216,7 @@ mod tests {
             pci_bus_id: String::new(),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         };
         let cov = db.throughput_cov();
         assert!((cov - 0.333).abs() < 0.01, "expected ~0.333, got {cov}");
@@ -4602,6 +4638,7 @@ mod tests {
             }],
             vram_bytes,
             host_peak_bytes: None,
+            benchmark_po2: None,
         }
     }
 
@@ -4945,6 +4982,7 @@ mod tests {
             pci_bus_id: String::new(),
             po2_samples: samples,
             host_peak_bytes: None,
+            benchmark_po2: None,
         };
 
         let profile = Po2Profile::from_device_benchmark(&db).expect("profile from samples");
@@ -4974,6 +5012,7 @@ mod tests {
             pci_bus_id: String::new(),
             po2_samples: samples,
             host_peak_bytes: None,
+            benchmark_po2: None,
         }
     }
 
@@ -5187,6 +5226,39 @@ mod tests {
         let a770 = risc0_row(samples, 19, 19);
         assert_eq!(risc0_job_throughput(&a770, 20), 116_003.0);
         assert_eq!(risc0_job_throughput(&a770, 19), 77_113.0);
+        // A 12 GB card benchmarked at its own 19: that rate is its jobs' rate, with nothing
+        // credited above it and the same charge per step below.
+        let at_19 = DeviceBenchmark {
+            benchmark_po2: Some(19),
+            ..risc0_row(Vec::new(), 19, 19)
+        };
+        assert_eq!(risc0_job_throughput(&at_19, 19), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&at_19, 20), 2_000_000.0);
+        assert_eq!(risc0_job_throughput(&at_19, 18), 2_000_000.0 * 0.5);
+    }
+
+    #[test]
+    fn a_card_is_benchmarked_at_its_own_default_size() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // The 4070's 12 GB: 19, where a 20 proof spills. 16 GB and up: 20, as before.
+        assert_eq!(risc0_benchmark_po2(Some(12 * GIB), "cuda"), 19);
+        assert_eq!(risc0_benchmark_po2(Some(16 * GIB), "cuda"), 20);
+        assert_eq!(risc0_benchmark_po2(Some(32 * GIB), "cuda"), 20);
+        assert_eq!(risc0_benchmark_po2(Some(8 * GIB), "cuda"), 18);
+        // Too small to prove jobs by default: still the smallest measured size, not an unmeasured
+        // one.
+        assert_eq!(risc0_benchmark_po2(Some(4 * GIB), "cuda"), 18);
+        // Unknown VRAM, or AMD and Intel: 20, as every card was benchmarked before.
+        assert_eq!(risc0_benchmark_po2(None, "cuda"), 20);
+        assert_eq!(risc0_benchmark_po2(Some(12 * GIB), "intel"), 20);
+        assert_eq!(risc0_benchmark_po2(Some(16 * GIB), "rocm"), 20);
+        // A card is benchmarked at the size it proves jobs at by default.
+        for gib in [6, 8, 12, 16, 24, 32] {
+            let v = Some(gib * GIB);
+            if let Some(job) = risc0_job_po2(None, None, v, "cuda") {
+                assert_eq!(risc0_benchmark_po2(v, "cuda"), job, "{gib} GiB");
+            }
+        }
     }
 
     /// A sweep proving at each size per `fits` (the largest that fits; None fails all), recording what
@@ -5285,6 +5357,7 @@ mod cache_power_tests {
             pci_bus_id: String::new(),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         }
     }
 
@@ -5424,6 +5497,7 @@ mod host_peak_tests {
             pci_bus_id: String::new(),
             po2_samples: Vec::new(),
             host_peak_bytes: peak,
+            benchmark_po2: None,
         }
     }
 

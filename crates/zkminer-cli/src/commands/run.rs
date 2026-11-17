@@ -5562,6 +5562,7 @@ fn synthetic_conservative_benchmark(
                 // Unmeasured by construction: nothing has been benchmarked. Admission control treats
                 // that as "assume a conservative cost", not as "assume it is free".
                 host_peak_bytes: None,
+                benchmark_po2: None,
             },
         )
         .collect();
@@ -17343,6 +17344,7 @@ mod r2_sizing_tests {
             program_stages: Vec::new(),
             pci_bus_id: String::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
         }
     }
 

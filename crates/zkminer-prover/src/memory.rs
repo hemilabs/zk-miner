@@ -1275,7 +1275,8 @@ pub fn unmeasured_peak_for(backend: &str) -> u64 {
 ///   wrap. `zkminer-prove-risc0`'s own calibration comment says it plainly: *"It also under-reports
 ///   MEMORY pressure: po2=21 completes composite-only but OOMs on the real groth16 path, so a
 ///   composite-derived max_feasible_po2 is too optimistic."*
-/// * **Segment size.** The benchmark runs at `BASELINE_PO2`; a card proves jobs at its own po2, and
+/// * **Segment size.** A figure is held at `BASELINE_PO2` (one measured at a card's smaller
+///   benchmark size is scaled up to it, `peak_at_baseline`); a card proves jobs at its own po2, and
 ///   this project's own model has memory DOUBLING per po2 step.
 ///
 /// So a measured figure is a lower bound, and using it raw is worse than using no measurement at
@@ -1327,12 +1328,25 @@ pub fn max_admissible_budget(total: u64) -> u64 {
     bound.max(MIN_TRUSTED_PEAK_BYTES)
 }
 
-/// Baseline po2 that `unmeasured_peak_for` and a benchmark measurement are taken at.
+/// Baseline po2 that `unmeasured_peak_for` and every recorded benchmark measurement are held at.
 ///
-/// `RISC0_DEFAULT_JOB_PO2`, which `benchmark_program` proves at (and always did: its composite first
-/// stage never let the SDK pick 21). A card proves jobs at its own po2, so any budget compared against
-/// a different po2 has to be scaled from here; below it nothing is credited.
+/// `RISC0_DEFAULT_JOB_PO2`, which a benchmark proves at on every card of 14 GiB or more. A smaller
+/// CUDA card's benchmark proves at its own smaller size (`benchmark::risc0_benchmark_po2`), and its
+/// figure is scaled up to this one when recorded (`peak_at_baseline`). A card proves jobs at its
+/// own po2, so any budget compared against a different po2 has to be scaled from here; below it
+/// nothing is credited.
 pub const BASELINE_PO2: u8 = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2;
+
+/// A host-memory figure measured at `measured_po2` (`None` = `BASELINE_PO2`), held at
+/// `BASELINE_PO2`: doubled per step below it, as `peak_for_po2` doubles per step above. Never
+/// lowered: a figure measured above the baseline stays as measured.
+pub fn peak_at_baseline(peak: u64, measured_po2: Option<u8>) -> u64 {
+    let steps = BASELINE_PO2.saturating_sub(measured_po2.unwrap_or(BASELINE_PO2));
+    peak.saturating_mul(
+        1u64.checked_shl(u32::from(steps.min(16)))
+            .unwrap_or(u64::MAX),
+    )
+}
 
 /// Scale a host-memory figure measured at `BASELINE_PO2` to the cost at `po2`.
 ///

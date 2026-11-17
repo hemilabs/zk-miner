@@ -2123,7 +2123,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
+            WorkerCommand::Benchmark { programs, .. } => {
                 tracing::info!("Running benchmarks...");
                 if sp1_measure_only() {
                     // Benchmarking builds the CudaProver (forks sp1-gpu-server) — exactly what a

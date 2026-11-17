@@ -79,7 +79,11 @@ use serde::{Deserialize, Serialize};
 /// selector of the risc0 it was proven with. Bincode is positional: a v16 worker's entry is one
 /// field short, and a beta worker of its v14 lacks every 14-16 field, so the handshake refuses both
 /// instead of a decoder failing mid-benchmark or mid-job.
-pub const PROTOCOL_VERSION: u32 = 17;
+/// 18: the macOS beta's 17 with max/usability's `Benchmark.po2`: the segment size a risc0 worker
+/// proves the suite at, the card's own job size, so its rate describes the jobs it proves (a 12 GB
+/// card benchmarked at 20 spills into shared memory and records a rate several times too low). A
+/// v17 worker would prove the suite at 20.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// The risc0-zkvm `major.minor` a risc0 worker must report (`HelloAck.sdk_version`, "risc0-zkvm
 /// X.Y.Z") for this host: the risc0 whose Groth16 verifier parameters give the host's seal selector.
@@ -233,7 +237,13 @@ pub enum WorkerCommand {
     /// Prove each of `programs`, in order, sending a `BenchmarkProgress` after each and then one
     /// `BenchmarkResult` with a row per program that proved. A program this worker has no guest for
     /// is skipped with a warning.
-    Benchmark { programs: Vec<BenchmarkProgramSpec> },
+    Benchmark {
+        programs: Vec<BenchmarkProgramSpec>,
+        /// The segment size (po2) to prove at: risc0 only, other backends ignore it. `None` =
+        /// [`RISC0_DEFAULT_JOB_PO2`]. Within [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`].
+        #[serde(default)]
+        po2: Option<u8>,
+    },
     /// Generate a proof for the given ELF and input data.
     Prove {
         request_id: u64,

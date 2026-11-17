@@ -38,8 +38,12 @@ pub struct SlotBenchmarkResult {
     /// the miner legitimately learns what a proof on this backend costs in RAM, and it must be read
     /// while the worker is still alive (its cgroup counter dies with it). `None` when the host
     /// cannot report it, in which case admission falls back to a conservative default rather than
-    /// assuming the proof is free.
+    /// assuming the proof is free. Held at `memory::BASELINE_PO2`: a risc0 card benchmarked at a
+    /// smaller size has its figure scaled up (`memory::peak_at_baseline`).
     pub host_peak_bytes: Option<u64>,
+    /// The segment size a risc0 slot's suite was proved at (`benchmark::risc0_benchmark_po2`);
+    /// `None` on other backends.
+    pub benchmark_po2: Option<u8>,
 }
 
 /// The failure of a slot that answered its benchmark but proved none of the programs.
@@ -5117,6 +5121,7 @@ impl WorkerPool {
     fn run_benchmark_requests(
         handle: &mut WorkerHandle,
         key: &str,
+        po2: Option<u8>,
         on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
         on_warmed: &dyn Fn(),
         // Called as each step completes (the warm-up, each program, each scoring proof): the
@@ -5130,7 +5135,8 @@ impl WorkerPool {
         let backend = handle.backend.clone();
         // The worker's one-off first-proof costs land here, not on the first program's row. A
         // warm-up that fails costs only that; the suite still runs.
-        let warmup = Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {});
+        let warmup =
+            Self::benchmark_request(handle, vec![warmup_spec(&backend)], po2, &|_, _, _| {});
         progress();
         match warmup {
             Err(e) => {
@@ -5145,7 +5151,7 @@ impl WorkerPool {
         on_warmed();
         let programs = benchmark_suite(&backend);
         let total = programs.len() as u32 + 1;
-        let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
+        let mut results = match Self::benchmark_request(handle, programs, po2, &|row, index, _| {
             progress();
             on_done(row, index, total)
         }) {
@@ -5175,7 +5181,7 @@ impl WorkerPool {
         let mut lost: Option<anyhow::Error> = None;
         let scored = measure_zkop_mix(|iterations| {
             let rows = vec![zkop_mix_spec(iterations)];
-            let answer = Self::benchmark_request(handle, rows, &|_, _, _| {});
+            let answer = Self::benchmark_request(handle, rows, po2, &|_, _, _| {});
             progress();
             match answer {
                 Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
@@ -5215,19 +5221,34 @@ impl WorkerPool {
         }
     }
 
-    /// Sends one `Benchmark` request and waits for its answer: `Err` when the worker stopped
-    /// answering, `Ok(Err)` with its message when it answered with an error.
+    /// Sends one `Benchmark` request, proving at `po2` (risc0), and waits for its answer: `Err`
+    /// when the worker stopped answering, `Ok(Err)` with its message when it answered with an
+    /// error.
     fn benchmark_request(
         handle: &mut WorkerHandle,
         programs: Vec<zkminer_prover_protocol::BenchmarkProgramSpec>,
+        po2: Option<u8>,
         on_progress: &dyn Fn(&BenchmarkEntry, u32, u32),
     ) -> Result<std::result::Result<Vec<BenchmarkEntry>, String>> {
-        handle.send(&WorkerCommand::Benchmark { programs })?;
+        handle.send(&WorkerCommand::Benchmark { programs, po2 })?;
         Ok(match handle.recv_benchmark(on_progress)? {
             WorkerResponse::BenchmarkResult { results } => Ok(results),
             WorkerResponse::Error { message, .. } => Err(message),
             other => Err(format!("unexpected response {other:?}")),
         })
+    }
+
+    /// The segment size a risc0 slot's benchmark proves at: its card's own job size
+    /// (`benchmark::risc0_benchmark_po2`), so the rate it records is the one its jobs run at.
+    /// `None` for other backends, which have no such size.
+    fn benchmark_po2(&self, key: &str) -> Option<u8> {
+        let mut parts = key.split(':');
+        if parts.next() != Some(zkminer_prover_protocol::BACKEND_RISC0) {
+            return None;
+        }
+        let gpu_tag = parts.next().unwrap_or("");
+        let vram = self.workers.get(key).and_then(|e| e.vram_bytes);
+        Some(crate::benchmark::risc0_benchmark_po2(vram, gpu_tag))
     }
 
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
@@ -5346,8 +5367,11 @@ impl WorkerPool {
             )
         });
 
+        let po2 = self.benchmark_po2(key);
         let requests =
-            Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {}, &|| clock.touch());
+            Self::run_benchmark_requests(handle, key, po2, &|_, _, _| {}, &|| {}, &|| {
+                clock.touch()
+            });
         slot.note_used(UseKind::Other);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
@@ -5485,7 +5509,10 @@ impl WorkerPool {
             } else {
                 outcome
             };
-            let host_peak_bytes = self.host_peak_for_slot(&key);
+            let benchmark_po2 = self.benchmark_po2(&key);
+            let host_peak_bytes = self
+                .host_peak_for_slot(&key)
+                .map(|p| crate::memory::peak_at_baseline(p, benchmark_po2));
             run.record(
                 &key,
                 &backend,
@@ -5500,6 +5527,7 @@ impl WorkerPool {
                     entries,
                     vram_bytes,
                     host_peak_bytes,
+                    benchmark_po2,
                 },
                 gpu_name.clone(),
                 &gpu_tag,
@@ -5777,7 +5805,9 @@ impl WorkerPool {
         };
         let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
-        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed, &|| clock.touch());
+        let po2 = self.benchmark_po2(key);
+        let requests =
+            Self::run_benchmark_requests(handle, key, po2, &cb, &warmed, &|| clock.touch());
         slot.note_used(UseKind::Other);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
@@ -5942,7 +5972,10 @@ impl WorkerPool {
             } else {
                 outcome
             };
-            let host_peak_bytes = self.host_peak_for_slot(&key);
+            let benchmark_po2 = self.benchmark_po2(&key);
+            let host_peak_bytes = self
+                .host_peak_for_slot(&key)
+                .map(|p| crate::memory::peak_at_baseline(p, benchmark_po2));
             run.record(
                 &key,
                 &backend,
@@ -5957,6 +5990,7 @@ impl WorkerPool {
                     entries,
                     vram_bytes,
                     host_peak_bytes,
+                    benchmark_po2,
                 },
                 gpu_name.clone(),
                 &gpu_tag,

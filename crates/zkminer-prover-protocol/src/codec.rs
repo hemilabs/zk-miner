@@ -331,11 +331,12 @@ mod tests {
     /// the macOS beta's v13 (`BenchmarkEntry.power_state`, risc0 3.1) are two different wires. A
     /// worker of either still answers a decodable `HelloAck`, and the exact version check refuses it.
     /// v17 (W11-ON37): the same for the beta's own 14 (no witness fields) and main's 14-16 (no
-    /// `power_state`): every one of them is a different wire from 17.
+    /// `power_state`): every one of them is a different wire from 17. v18: the beta's 17 and
+    /// max/usability's 17 (`Benchmark.po2`, `ProveStage`) are two different wires from 18.
     #[test]
     fn a_worker_of_either_v13_is_refused() {
-        assert_eq!(PROTOCOL_VERSION, 17);
-        for version in [13, 14, 15, 16] {
+        assert_eq!(PROTOCOL_VERSION, 18);
+        for version in [13, 14, 15, 16, 17] {
             let hello = bincode::serialize(&WorkerResponse::HelloAck {
                 protocol_version: version,
                 backend: "risc0".to_string(),
