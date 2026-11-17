@@ -512,6 +512,7 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
         tracing::error!("cannot confine this worker, so it proves nothing: {e}");
         return 1;
     }
+    canary_or_decline(&*prover);
     // Discarded, as under a host: see `warmup_spec`.
     let warmup = [zkminer_prover_protocol::warmup_spec(BACKEND_SP1)];
     run_benchmarks(prover, &mut held.benchmark_keys, &warmup, &mut |_, _, _| {});
@@ -660,6 +661,132 @@ fn guest_may_run(request_id: u64, keep_server: bool) -> std::result::Result<(), 
             ),
         }
     })
+}
+
+/// The executor canary's input: fibonacci(300), a few thousand cycles.
+const CANARY_FIB_N: u32 = 300;
+
+/// What the fibonacci guest commits for `n`: fibonacci(n) as it computes it (wrapping `u64`), in the
+/// encoding `sp1_zkvm::io::commit` writes (bincode: eight bytes, little-endian).
+fn canary_public_values(n: u32) -> Vec<u8> {
+    let (mut a, mut b) = (0u64, 1u64);
+    for _ in 0..n {
+        (a, b) = (b, a.wrapping_add(b));
+    }
+    a.to_le_bytes().to_vec()
+}
+
+/// The text of a caught panic.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic with no message".to_string())
+}
+
+/// Runs the embedded fibonacci guest (fibonacci(300)) through `prover`'s executor, the path every
+/// requester's guest takes in this worker: the executor's runner process, and the memory it shares
+/// with it. `Ok` if it ran and committed what fibonacci(300) is.
+fn run_executor_canary<P: sp1_sdk::blocking::Prover>(prover: &P) -> Result<(), String> {
+    use sp1_sdk::blocking::{Elf, SP1Stdin};
+    if FIBONACCI_SP1_GUEST_ELF.is_empty() {
+        // A build with its guests stubbed (`SP1_SKIP_PROGRAM_BUILD`) has nothing to run.
+        return Ok(());
+    }
+    let mut stdin = SP1Stdin::new();
+    stdin.write_slice(&CANARY_FIB_N.to_le_bytes());
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prover
+            .execute(Elf::from(FIBONACCI_SP1_GUEST_ELF), stdin)
+            .run()
+    }));
+    match run {
+        Ok(Ok((public_values, _)))
+            if public_values.to_vec() == canary_public_values(CANARY_FIB_N) =>
+        {
+            Ok(())
+        }
+        Ok(Ok((public_values, _))) => Err(format!(
+            "it committed {} bytes that are not fibonacci({CANARY_FIB_N})",
+            public_values.to_vec().len()
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(panic) => Err(format!("the executor panicked: {}", panic_text(&*panic))),
+    }
+}
+
+/// The executor canary's verdict, once per worker: [`run_executor_canary`] the first time a guest
+/// command reaches the point where its guest would run, once the worker is confined
+/// ([`confine_worker`]), with that command's prover. A worker that cannot run it cannot run any
+/// requester's guest either, and says so ([`decline_executor`]) before it runs one.
+fn executor_canary<P: sp1_sdk::blocking::Prover>(prover: &P) -> Result<(), String> {
+    static VERDICT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    VERDICT
+        .get_or_init(|| {
+            let started = Instant::now();
+            let verdict = run_executor_canary(prover);
+            match &verdict {
+                Ok(()) => tracing::info!(
+                    "executor canary: fibonacci({CANARY_FIB_N}) ran confined in {:.2}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => tracing::error!("executor canary failed: {e}"),
+            }
+            verdict
+        })
+        .clone()
+}
+
+/// The canary before a requester's guest runs: [`executor_canary`], and [`decline_executor`] if it
+/// failed. Returns only if it ran.
+fn canary_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P) {
+    if let Err(reason) = executor_canary(prover) {
+        decline_executor(&reason);
+    }
+}
+
+/// Whether an SP1 execution failed setting up its executor's shared memory or handing it to the
+/// runner process: before any guest instruction ran, so this host's fault, not the program's. Matched
+/// on the messages of hemilabs/sp1's `sp1-core-executor-runner` (`native.rs`), which no guest
+/// writes; a match only makes the worker run its canary again ([`environment_fault_or_decline`]).
+fn is_executor_environment_fault(text: &str) -> bool {
+    const SETUP: [&str; 4] = [
+        "create shm file for",
+        "failed to create the child's stdin",
+        "failed to spawn child process",
+        "the executor runner exited before reading its input",
+    ];
+    SETUP.iter().any(|m| text.contains(m))
+}
+
+/// After an execution failed setting up its executor ([`is_executor_environment_fault`]): the canary
+/// again, now. If that fails too, this host cannot run guests any more ([`decline_executor`]);
+/// otherwise the failure was passing, and is reported as the worker's (`Internal`), never the job's.
+fn environment_fault_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P, failure: &str) {
+    if let Err(reason) = run_executor_canary(prover) {
+        decline_executor(&format!("{failure}; and the canary again: {reason}"));
+    }
+    tracing::warn!(
+        "an SP1 execution could not set up its executor ({failure}), though the canary runs again: \
+         reporting it as this worker's fault, not the job's"
+    );
+}
+
+/// Ends a worker whose executor cannot run guests here: no answer to the command that found it,
+/// and the exit code [`WORKER_EXIT_DECLINED`], on which the dispatcher declines this slot as it does
+/// a worker that declines its handshake. An environment fault (the executor cannot share memory with
+/// its runner under the confinement, say), so neither the job nor its program is blamed.
+///
+/// [`WORKER_EXIT_DECLINED`]: zkminer_prover_protocol::types::WORKER_EXIT_DECLINED
+fn decline_executor(reason: &str) -> ! {
+    tracing::error!(
+        "{}: SP1's executor cannot run guests in this worker ({reason}); exiting with code {}, \
+         which declines SP1 on this slot",
+        zkminer_prover_protocol::types::WORKER_DECLINED,
+        zkminer_prover_protocol::types::WORKER_EXIT_DECLINED,
+    );
+    std::process::exit(zkminer_prover_protocol::types::WORKER_EXIT_DECLINED)
 }
 
 /// Refuses, before the SDK would try, a server the SDK would download first: none at its path, or
@@ -1988,6 +2115,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             write_message(&mut stdout, &refused)?;
                             continue;
                         }
+                        canary_or_decline(&*p);
                         let run = run_benchmarks(
                             p,
                             &mut held.benchmark_keys,
@@ -2095,6 +2223,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &refused)?;
                     continue;
                 }
+                canary_or_decline(&*prover_for_proof);
                 // Announce proof START so the miner can move the job from Queued to Proving.
                 // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
                 let started = WorkerResponse::Progress {
@@ -2131,12 +2260,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_panic) => {
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "SP1 prover panicked on this ELF (malformed or hostile program)"
-                                .to_string(),
+                    Err(panic) => {
+                        let text = panic_text(&*panic);
+                        let resp = if is_executor_environment_fault(&text) {
+                            environment_fault_or_decline(&*prover_for_proof, &text);
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message: format!(
+                                    "SP1's executor could not be set up for this proof: {text}"
+                                ),
+                            }
+                        } else {
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::InvalidInput,
+                                message: "SP1 prover panicked on this ELF (malformed or hostile \
+                                          program)"
+                                    .to_string(),
+                            }
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2156,7 +2298,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
                         // permanent program-level mismatch is reported as such and never misread as a
                         // transient GPU OOM.
-                        let kind = if msg.contains("does not match job programId")
+                        let kind = if is_executor_environment_fault(&msg) {
+                            // Its executor could not be set up: this worker's fault, not the job's.
+                            environment_fault_or_decline(&*prover_for_proof, &msg);
+                            ErrorKind::Internal
+                        } else if msg.contains("does not match job programId")
                             || msg.contains("could not parse SP1 vkey hash")
                         {
                             // The served ELF's verifying key cannot match this job's programId. No job
@@ -2246,6 +2392,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 };
+                canary_or_decline(cpu);
                 // The ELF bytes are fully attacker-controlled, and SP1's parser/executor
                 // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
                 // rather than returning Err. A panic unwinding out of the loop would have the
@@ -2285,23 +2432,43 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // (canonicalized to "exceeded cycle limit …", which the host classifies as
                         // too-heavy), fail the vkey bind, or simply error on this input. All are
                         // properties of the job, not of this worker, so report InvalidInput and keep
-                        // the healthy worker alive.
+                        // the healthy worker alive. Unless the executor itself could not be set up,
+                        // before the guest ran: that is this worker's.
+                        let kind = if is_executor_environment_fault(&msg) {
+                            environment_fault_or_decline(cpu, &msg);
+                            ErrorKind::Internal
+                        } else {
+                            ErrorKind::InvalidInput
+                        };
                         let resp = WorkerResponse::Error {
                             request_id,
-                            kind: ErrorKind::InvalidInput,
+                            kind,
                             message: msg,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_) => {
+                    Err(panic) => {
                         // A panic in the attacker-data path: same InvalidInput classification, worker
-                        // stays alive (the loop continues; the slot is not scored failed).
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "SP1 executor panicked while sizing this ELF (malformed or \
-                                      hostile program)"
-                                .to_string(),
+                        // stays alive (the loop continues; the slot is not scored failed). Unless the
+                        // executor itself could not be set up, as above.
+                        let text = panic_text(&*panic);
+                        let resp = if is_executor_environment_fault(&text) {
+                            environment_fault_or_decline(cpu, &text);
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message: format!(
+                                    "SP1's executor could not be set up for sizing: {text}"
+                                ),
+                            }
+                        } else {
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::InvalidInput,
+                                message: "SP1 executor panicked while sizing this ELF (malformed \
+                                          or hostile program)"
+                                    .to_string(),
+                            }
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2346,6 +2513,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 };
+                canary_or_decline(cpu);
                 let started = Instant::now();
                 // Submitter-controlled bytes reach `setup`, which can panic on a malformed ELF: a
                 // caught panic is a property of the ELF (InvalidInput), as on the Execute arm.

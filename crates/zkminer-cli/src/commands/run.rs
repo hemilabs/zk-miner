@@ -9508,6 +9508,10 @@ async fn process_job_lifecycle(
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
+        // Set once an attempt's worker declined (`WorkerDeclined`): it found, before running this
+        // job's guest, that its backend cannot run on this host. An environment fault, so if every
+        // attempt then fails the program and submitter are not marked divergent.
+        let mut env_declined = false;
         let mut attempt = 0u32;
         // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
         // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
@@ -9884,6 +9888,31 @@ async fn process_job_lifecycle(
                             "proving failed after {attempt} attempt(s): {msg}"
                         ));
                     }
+                    // The worker declined before it ran the guest: this card cannot run the backend
+                    // here at all (the dispatcher no longer uses it). Not the job's fault, so it
+                    // must not count toward marking the program or submitter below; another card
+                    // may still prove it. Typed, as every arm here: a guest cannot produce it.
+                    if e.downcast_ref::<zkminer_prover_protocol::types::WorkerDeclined>()
+                        .is_some()
+                    {
+                        env_declined = true;
+                        if let Some(k) = used_slot.clone() {
+                            if !excluded.contains(&k) {
+                                excluded.push(k);
+                            }
+                        }
+                        tracing::error!(
+                            "{} could not be proved on {}: {msg}",
+                            short_id(job_id),
+                            used_slot.as_deref().unwrap_or("a card")
+                        );
+                        if attempt < MAX_PROVE_ATTEMPTS {
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!(
+                            "proving failed after {attempt} attempt(s): {msg}"
+                        ));
+                    }
                     // A HOST memory shortage is not this worker's fault and not this job's
                     // fault: the box is momentarily short of RAM. Classifying it as ill-health
                     // was a money-losing bug. The ledger is process-wide, so "retry on a
@@ -10089,7 +10118,7 @@ async fn process_job_lifecycle(
                     }
                     // Every attempt failed on a job that measured clean. Class-agnostic on purpose: the
                     // worker's kind can follow guest-chosen text (see `note_post_claim_divergence`).
-                    if rode_measurement {
+                    if rode_measurement && !env_declined {
                         note_post_claim_divergence(program_id, backend, submitter, "all prove attempts failed");
                     }
                     return Err(anyhow::anyhow!(
@@ -11513,6 +11542,15 @@ async fn measure_cycles(
                 // strike, no negative-cache, no TTL — re-measure next tick once the proof has freed the
                 // resources. A hostile guest cannot reach this branch: only the dispatcher's preemption
                 // path constructs `MeasurePreempted`, never a worker error carrying guest text.
+                // The measure worker declined before it ran the guest: it cannot run this backend
+                // here (the dispatcher no longer uses it). Nothing about the (program, input) is
+                // known, so no strike. Typed; only the dispatcher constructs it, from an exit code.
+                if e.downcast_ref::<zkminer_prover_protocol::types::WorkerDeclined>()
+                    .is_some()
+                {
+                    tracing::warn!("measure {}: {e:#}", short_id(program_id));
+                    continue;
+                }
                 if is_measure_preempted(&e) {
                     tracing::debug!(
                         "measure {}: preempted by a claimed proof, not sizing now (transient)",

@@ -341,6 +341,18 @@ fn exit_can_be_a_host_oom(exit: &ExitProbe) -> bool {
     )
 }
 
+/// Whether a worker's exit is its decline: see `WorkerHandle::exited_declined`.
+#[cfg(unix)]
+fn exit_is_a_decline(exit: &ExitProbe) -> bool {
+    matches!(
+        exit,
+        ExitProbe::Exited {
+            signal: None,
+            code: Some(zkminer_prover_protocol::types::WORKER_EXIT_DECLINED),
+        }
+    )
+}
+
 /// Observe a child's exit WITHOUT reaping it.
 ///
 /// `try_wait`/`wait` reap, which frees the pid — and with it the process-GROUP number,
@@ -1426,6 +1438,22 @@ impl WorkerHandle {
         Some(exit_can_be_a_host_oom(&probe_exit_nowait(self.child.id())) && now > before)
     }
 
+    /// Whether the worker exited [`WORKER_EXIT_DECLINED`]: it found, after its handshake, that its
+    /// backend cannot run on this host. Only meaningful once it is dead; read without reaping, as
+    /// `exit_reason` does. `false` once reaped, when the pid no longer identifies it.
+    ///
+    /// [`WORKER_EXIT_DECLINED`]: zkminer_prover_protocol::types::WORKER_EXIT_DECLINED
+    pub fn exited_declined(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            !self.reaped && exit_is_a_decline(&probe_exit_nowait(self.child.id()))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// After EOF on the worker's pipe, wait up to `budget` for its exit to be visible, for a question
     /// about how it died (`died_of_host_oom`) to have an answer.
     ///
@@ -1927,8 +1955,39 @@ mod group_shm_tests {
 
 #[cfg(all(test, unix))]
 mod exit_classification_tests {
-    use super::{await_exit_visible_of, exit_can_be_a_host_oom, probe_exit_nowait, ExitProbe};
-    use zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+    use super::{
+        await_exit_visible_of, exit_can_be_a_host_oom, exit_is_a_decline, probe_exit_nowait,
+        ExitProbe,
+    };
+    use zkminer_prover_protocol::types::{WORKER_EXIT_DECLINED, WORKER_EXIT_SERVER_LOST};
+
+    /// A worker that declines after its handshake says so by its exit code alone, read off a real
+    /// child's exit; no other exit is a decline, nor is a decline a host OOM.
+    #[test]
+    fn a_decline_is_its_exit_code_and_nothing_else() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {WORKER_EXIT_DECLINED}"))
+            .spawn()
+            .unwrap();
+        await_exit_visible_of(child.id(), std::time::Duration::from_secs(5));
+        let probe = probe_exit_nowait(child.id());
+        assert!(exit_is_a_decline(&probe), "{probe:?}");
+        assert!(!exit_can_be_a_host_oom(&probe));
+        child.wait().unwrap();
+        let exited = |signal, code| ExitProbe::Exited { signal, code };
+        assert!(!exit_is_a_decline(&exited(None, Some(0))));
+        assert!(!exit_is_a_decline(&exited(
+            None,
+            Some(WORKER_EXIT_SERVER_LOST)
+        )));
+        assert!(!exit_is_a_decline(&exited(
+            Some(WORKER_EXIT_DECLINED),
+            None
+        )));
+        assert!(!exit_is_a_decline(&ExitProbe::Running));
+        assert!(!exit_is_a_decline(&ExitProbe::Gone));
+    }
 
     /// An SP1 server is what the kernel kills when the host runs out of memory, and its worker then
     /// exits with this code. Read as an ordinary failure, that would exclude a healthy card and spend

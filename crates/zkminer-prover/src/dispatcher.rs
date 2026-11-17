@@ -4905,7 +4905,15 @@ impl WorkerPool {
             // `handle.is_none()`, so a dead-but-Some handle would be re-selected every dispatch and
             // never respawned — wedging the backend's measuring until process restart. Clear the slot
             // so the next dispatch revives it either way. (A bare `?` here previously leaked the dead
-            // handle.)
+            // handle.) Unless it exited declined: then nothing revives it.
+            if slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+                Self::decline_slot(&mut slot, entry, key);
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerDeclined {
+                        slot_key: key.to_string(),
+                    },
+                ));
+            }
             Self::mark_slot_dead(&mut slot, entry);
             // DISTINGUISH the cause, exactly as the recv-failure handler and the recv-Ok arm do: a
             // COMMITTED proof can preempt this measurement in the narrow window between registering it
@@ -4991,6 +4999,22 @@ impl WorkerPool {
                         },
                     ));
                 } else {
+                    // A worker that exited declined found, before it ran this guest, that it cannot
+                    // run here: its slot is declined, and the (program, input) is not at fault.
+                    #[cfg(unix)]
+                    if e.downcast_ref::<WorkerDied>().is_some() {
+                        if let Some(h) = slot.handle.as_mut() {
+                            h.await_exit_visible(Duration::from_secs(1));
+                        }
+                    }
+                    if slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+                        Self::decline_slot(&mut slot, entry, key);
+                        return Err(anyhow::Error::new(
+                            zkminer_prover_protocol::types::WorkerDeclined {
+                                slot_key: key.to_string(),
+                            },
+                        ));
+                    }
                     // A raw EOF here is a non-intentional crash. Treated as a slot failure (counts
                     // toward respawn backoff / retire), identical to HEAD.
                     //
@@ -8097,6 +8121,17 @@ impl WorkerPool {
                     h.await_exit_visible(Duration::from_secs(1));
                 }
             }
+            // A worker that exited declined (`WORKER_EXIT_DECLINED`) found it cannot run its backend
+            // on this host, before it ran this job's guest: the slot is declined, and the job is not
+            // at fault.
+            if is_eof && slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+                Self::decline_slot(&mut slot, entry, key);
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerDeclined {
+                        slot_key: key.to_string(),
+                    },
+                ));
+            }
             #[cfg(unix)]
             let host_oom = !entry.intentional_kill.load(Ordering::Acquire)
                 && slot
@@ -8333,6 +8368,24 @@ impl WorkerPool {
         slot.handle = None;
     }
 
+    /// Records that the slot's worker exited declined (`WorkerHandle::exited_declined`): it cannot
+    /// run its backend on this host, as a worker that declines its handshake cannot, so the slot is
+    /// never dispatched to or respawned again (`slot_eligible`), and clears it.
+    fn decline_slot(slot: &mut WorkerSlot, pid: &impl PidSlot, key: &str) {
+        let msg = format!(
+            "{} Worker {key} found after its handshake that it cannot run {} here (exit code {}; \
+             its log says why)",
+            zkminer_prover_protocol::types::WORKER_DECLINED,
+            slot.backend,
+            zkminer_prover_protocol::types::WORKER_EXIT_DECLINED,
+        );
+        if slot.declined.is_none() {
+            tracing::error!("Worker {key} DECLINED and will no longer be used: {msg}");
+            slot.declined = Some(msg);
+        }
+        Self::mark_slot_dead(slot, pid);
+    }
+
     /// True if a slot may be dispatched to: healthy, or retired-but-cooled-down so a
     /// transient failure burst doesn't sideline a GPU until process restart.
     fn slot_eligible(slot: &WorkerSlot) -> bool {
@@ -8487,6 +8540,13 @@ impl WorkerPool {
 
         let needs_respawn = if is_alive {
             false
+        } else if slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+            // It found, after its handshake, that it cannot run here: no respawn will either.
+            let key = format!("{}:{}", slot.backend, slot.gpu_tag);
+            Self::decline_slot(slot, pid, &key);
+            return Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::WorkerDeclined { slot_key: key },
+            ));
         } else if slot.handle.is_some() {
             let reason = slot
                 .handle

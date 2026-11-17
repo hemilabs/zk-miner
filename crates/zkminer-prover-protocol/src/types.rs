@@ -674,6 +674,36 @@ pub enum ErrorKind {
 /// `WorkerHandle::died_of_host_oom`). 75 is `EX_TEMPFAIL`: another worker may well succeed.
 pub const WORKER_EXIT_SERVER_LOST: i32 = 75;
 
+/// The exit code of a worker that found, after its handshake, that it cannot run its backend on this
+/// host: an SP1 worker whose executor could not run its own small guest once confined (it cannot
+/// share memory with its runner process there, say). It answers nothing and exits; the dispatcher
+/// then declines the slot as it does a worker that declines its handshake (`WORKER_DECLINED`) and
+/// reports [`WorkerDeclined`]. An exit code, not a message, because no guest's text can produce it:
+/// the worker checks before it runs any requester's guest. 78 is `EX_CONFIG`.
+pub const WORKER_EXIT_DECLINED: i32 = 78;
+
+/// A worker exited [`WORKER_EXIT_DECLINED`] in the middle of a request: its backend cannot run on
+/// this host, its slot is declined for the rest of the process, and nothing about the job or program
+/// it was given is known. Only the dispatcher constructs it, from the worker's exit code.
+#[derive(Debug, Clone)]
+pub struct WorkerDeclined {
+    /// The declined slot, e.g. `sp1:cuda:0` or `sp1:measure:1`.
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for WorkerDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{WORKER_DECLINED}: worker {} found it cannot run its backend here (an environment \
+             fault, not the job's; see the worker's log) and is declined",
+            self.slot_key
+        )
+    }
+}
+
+impl std::error::Error for WorkerDeclined {}
+
 /// Bytes of HOST memory a worker is allowed to use, as the dispatcher sees it.
 ///
 /// A worker cannot work this out for itself: the ceiling is the host's RAM minus the slice reserved
