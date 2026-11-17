@@ -430,6 +430,24 @@ impl Connector {
             }
             let share = (connect_until - now) / (n - i as u32);
             let addr = SocketAddr::new(ip, st.ep.port);
+            // Right before connecting, wherever the floor applies: the kernel's route with the
+            // port, and the near-hop probe (a destination within a few hops is this host's own
+            // network).
+            if self.mode == NetMode::Public || st.ep.dns_derived() {
+                let floor = self.floor.clone();
+                match tokio::time::timeout(share, tokio::task::spawn_blocking(move || floor.vet_connection(addr))).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(d))) => {
+                        tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
+                        continue;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: the check before connecting did not finish");
+                        continue;
+                    }
+                }
+            }
+            let share = share.saturating_sub(now.elapsed());
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             match tokio::time::timeout(share, connect_tcp(addr)).await {
                 Ok(Ok(fd)) => return (Response { id, status: Status::Connected, peer: Some(addr) }, Some(fd)),

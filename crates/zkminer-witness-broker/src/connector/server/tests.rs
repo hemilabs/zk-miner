@@ -302,3 +302,36 @@ async fn fuzz_the_reader() {
         }
     }
 }
+
+/// Public mode: right before connecting, the connector asks the near-hop probe about the exact
+/// address and port; a destination that answers within the hop limit (here a staged probe, so
+/// nothing leaves the host) is refused and never connected to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_near_destination_is_refused_before_connecting() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://93.184.216.34:8545", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    let deny = Connector::deny_for(&cfg, &[], &[]);
+    for (outcome, refused) in [
+        (zkminer_netguard::ProbeOutcome::Refused, true),
+        (zkminer_netguard::ProbeOutcome::Connected, true),
+        (zkminer_netguard::ProbeOutcome::Failed("Operation not permitted".into()), true),
+    ] {
+        let probe = zkminer_netguard::FixedProbe::answering(outcome.clone());
+        let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny.clone()).with_near_probe(probe.clone());
+        let c = Connector::with_floor(&cfg, vec![], floor).unwrap();
+        let (b, s) = session(&c);
+        let (resp, fd) = blocking(move || {
+            let r = request_blocking(&b, &req(1, 0, 8545)).unwrap();
+            drop(b);
+            r
+        })
+        .await;
+        assert_eq!(resp.status == Status::Connected, !refused, "{outcome:?}: {resp:?}");
+        assert!(fd.is_none());
+        let addr: SocketAddr = "93.184.216.34:8545".parse().unwrap();
+        assert_eq!(*probe.asked.lock().unwrap(), vec![(addr, 2)], "{outcome:?}");
+        assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 0, "{outcome:?}: no connection was attempted");
+        assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+    }
+}
