@@ -45,6 +45,16 @@ GPU cores is slower.
 
 ## Install
 
+This beta has no signature. Download it only from the hemilabs/zk-miner release page on GitHub,
+over HTTPS, and compare the tarball's SHA-256 with the release's `SHA256SUMS` before you unpack it:
+
+```sh
+shasum -a 256 zkminer-<version>-macos-arm64.tar.gz   # must equal the line in the release's SHA256SUMS
+```
+
+The `SHA256SUMS` inside the kit, which `install.sh` checks, catches a damaged file but says nothing
+about who made the kit.
+
 ```sh
 tar -xzf zkminer-<version>-macos-arm64.tar.gz
 cd zkminer-<version>-macos-arm64
@@ -75,9 +85,15 @@ zkminer benchmark                       # measures this Mac the way the miner do
 zkminer run
 ```
 
-`zkminer init` is needed once after every install, `--with-groth16` or not. Neither `zkminer` nor
-the worker has a `--version` flag: the kit's version, commit and risc0 revision are in its
-`BUILDINFO` file, and `zkminer help` lists the commands.
+Run `zkminer init` once, on the first install (with or without `--with-groth16`). It leaves an
+existing `~/.zkminer/config.toml` alone, so an update needs no `init`. Do not run
+`zkminer init --force` after an update: it overwrites your config.
+
+Neither `zkminer` nor the worker has a `--version` flag: the kit's version, commit and risc0
+revision are in its `BUILDINFO` file, and `zkminer help` lists the commands.
+
+`~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark` exits with status 0 even when a program
+fails. Judge it by its `... verified` lines, or run `tools/macos-smoke.sh`, which checks the proof.
 
 ### First start
 
@@ -107,6 +123,11 @@ Either way, the archive's SHA-256 is checked against the value pinned in the pro
 `BUILDINFO`) before anything is unpacked. A copy that does not match is deleted.
 `RISC0_GROTH16_DIR=<dir>` points the prover at a copy you already have. Running
 `zkminer-prove-risc0-metal --benchmark` by hand does not download the component: install it first.
+If the prover says "missing the `risc0-groth16` component ... install it with rzup install
+risc0-groth16", run `./install.sh --with-groth16` from the kit instead (the kit does not need rzup).
+
+The download prints one line when it starts and nothing more until it is done: 82 s were measured
+on a fast link, and a slow link takes minutes. Let it run.
 
 ## Gatekeeper (unsigned beta)
 

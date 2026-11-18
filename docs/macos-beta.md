@@ -263,6 +263,25 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
   & Security → Open Anyway.
 - **Signing.** No Developer ID signing or notarization in the beta. The binaries carry the linker's
   ad hoc signature, which arm64 macOS requires, and the check script verifies it.
+- **Who made the kit.** The kit's `SHA256SUMS` travels inside the tarball, so it catches damage and
+  nothing more. The READMEs tell users to download from the GitHub release over HTTPS and compare
+  the tarball's SHA-256 with the release's `SHA256SUMS` before unpacking.
+
+## Debug-only environment variables
+
+These work in release builds, zk-miner never sets them, and an operator should not set them on a
+mining Mac. None of them can make the stock verifier accept a bad proof; they affect the operator's
+own data or local checks only.
+
+- `RISC0_METAL_REC_CAPTURE=<dir>` writes every recursion proof's inputs and preflight trace to disk
+  (a validation aid). The files hold the recursion witness: treat them as secret and delete them.
+- `RISC0_SKIP_VERIFY=1` (stock risc0) skips the local receipt check. The worker's own verification
+  of every job receipt before it returns it (`zkminer-prove-risc0` main.rs) is unaffected.
+- `RISC0_METAL_REC_SEAL_CHECK=1` re-proves every recursion proof on the CPU with the same noise and
+  requires identical seals (a validation aid, slow). The noise is keyed from a 256-bit OS seed
+  (B9-SEC), so ZK holds.
+- `RISC0_METAL=0`, `RISC0_METAL_SKIP=groth16` and `RISC0_GROTH16_METAL_PROVER=docker` fall back to the
+  stock CPU or Docker paths (slow; Docker is not part of the beta).
 
 ## CI
 

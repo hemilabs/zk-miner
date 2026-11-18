@@ -228,6 +228,7 @@ README. It has no offline GPU pipeline archives (its `metal-aot/` is empty). The
 0.2 GB; the Groth16 component adds 5.4 GB (about 7.8 GB free while it downloads and unpacks).
 
 ```sh
+shasum -a 256 zkminer-<version>-macos-arm64.tar.gz   # compare with the release's SHA256SUMS first
 tar -xzf zkminer-<version>-macos-arm64.tar.gz
 cd zkminer-<version>-macos-arm64
 ./install.sh                    # ~/.zkminer/zkminer and ~/.zkminer/provers/; --help for options
@@ -235,10 +236,13 @@ export PATH="$HOME/.zkminer:$PATH"
 zkminer init && zkminer benchmark
 ```
 
-`zkminer init` is needed with `./install.sh --with-groth16` too. There is no `zkminer --version`:
+`zkminer init` is needed once, on the first install (`--with-groth16` or not); it leaves an existing
+config alone, so an update needs none. There is no `zkminer --version`:
 the kit's `BUILDINFO` names its version and commit, and `zkminer help` lists the commands.
 
-- **Unsigned.** The kit has no Developer ID and is not notarized. `install.sh` checks the kit's
+- **Unsigned.** The kit has no Developer ID and is not notarized. Download it only from the GitHub
+  release over HTTPS and check its SHA-256 against the release's `SHA256SUMS` before unpacking: the
+  kit's own `SHA256SUMS` only catches damage. `install.sh` checks the kit's
   `SHA256SUMS` and removes `com.apple.quarantine` from the files it installs. To run a binary from the
   kit directly, use `xattr -d com.apple.quarantine <file>`, or System Settings → Privacy & Security →
   Open Anyway.
