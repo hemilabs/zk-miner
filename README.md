@@ -477,7 +477,7 @@ A `measured` report also says whether its count is evidence of the proven run:
 
 A count is evidence when `proven` is `matches`, `binding` is not `fails`, `hostInputReads` is
 present and `sizeCheck` is not `differs`. risc0 guests' `sys_rand` is seeded by a public rule (`SYS_RAND_RULE`) that zkminer's proofs
-use from protocol 12: a function of the image id and every byte the guest reads, so a guest's random
+use from protocol 13: a function of the image id and every byte the guest reads, so a guest's random
 bytes, and the path it takes on them, are the same here as in a proof zkminer makes under that rule.
 The figure is the cost of that run at the size the report names (a miner proves at its own card's).
 
