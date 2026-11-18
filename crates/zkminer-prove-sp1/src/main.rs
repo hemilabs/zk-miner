@@ -4448,9 +4448,9 @@ mod threshold_tests {
         // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind. On v6.1.0
         // 11 GiB is in the 134M band [10,012, 12,512) — a 16 GiB card now fits 268M.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
-        assert_eq!(from_vram(16 * GIB, RTX4090), Some(SMALL));
+        assert_eq!(from_vram(18 * GIB, RTX4090), Some(SMALL));
         // Through the function the worker actually calls, not a re-implementation of it.
-        let combined = cap(1.0, Some(16 * GIB), RTX4090);
+        let combined = cap(1.0, Some(18 * GIB), RTX4090);
         assert_eq!(
             combined,
             Some(SMALL),
@@ -4628,13 +4628,12 @@ mod threshold_tests {
 
 #[cfg(test)]
 mod pin_tests {
-    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the fork's shard tiers and its
-    /// 402,653,184-element default) was re-measured against the pinned hemilabs `sp1`, whose circuit
-    /// is v6.1.0: 134M peaks at ~9 GiB and 268M at ~11.5 GiB, both far below the v6.0.0 figures (v6.1.0
-    /// is much more memory-efficient). Moving the pin again must revisit it: re-measure the tiers and
-    /// update SP1_MEASURED_TIERS, then update this version. (v6.1.0's own default for a 24 GB card is
-    /// 285,212,672 elements rather than 402,653,184, but neither binds here — the measured tiers cap
-    /// SP1_GPU_ELEMENT_THRESHOLD at 268M, below both.)
+    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the server's shard tiers, the
+    /// cards it refuses, where it runs its memory savers, and the measured VRAM tables) was checked
+    /// against the pinned hemilabs `sp1` 6.8.1, whose circuit is v6.1.0, and both tables measured
+    /// under its server (2026-11-16 on an RTX 4070, 2026-11-17 on an RTX 5090). Moving the pin must
+    /// revisit them: the v6.0.0 server ran its savers on 24 GB cards too, and the larger card's
+    /// table it left was ~5 GiB short at 268M under this one.
     #[test]
     fn the_sizing_mirror_was_measured_for_the_pinned_sp1() {
         assert_eq!(

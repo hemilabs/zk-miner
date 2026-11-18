@@ -2246,14 +2246,15 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// inside SP1 can notice, because the sizing happens before its first allocation.
 ///
 /// Why this, rather than a flat allowance for foreign VRAM, which is what this replaced: a flat
-/// allowance refuses work the card could actually do. Measured on this box on 2026-10-05, SP1 peaks at
-/// 15,092 MiB on the 134M-element tier and 17,766 MiB on the 268M tier. A 24,564 MiB 4090 with 6 GiB
-/// held by a display still has 18 GiB free — plenty for the lower tier — and a 512 MiB allowance
-/// refused it outright. Requiring the FLOOR to be free instead admits that card and leaves the sizing
-/// to [`sp1_element_threshold_for_available_vram`], which steps the tier down to match. The floor
-/// itself is the smaller tier's measured peak plus margin — 15,604 MiB on a card above 16 GiB, 9,167
-/// MiB on one of 16 GiB or less, whose server runs leaner — so a card that clears the floor has room
-/// for the configuration it will actually be given.
+/// allowance refuses work the card could actually do. Measured under the pinned server on a CUDA card
+/// above 16 GiB, SP1 peaks at 17,041 MiB on the 134M-element tier and 22,944 MiB on the 268M tier. A
+/// 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free — enough for the lower tier —
+/// and a 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead admits that
+/// card and leaves the sizing to [`sp1_element_threshold_for_available_vram`], which steps the tier
+/// down to match. The floor itself is the smaller tier's measured peak plus margin — 17,553 MiB on a
+/// CUDA card above 16 GiB, 9,167 MiB on one of 16 GiB or less, whose server runs leaner, 15,604 MiB
+/// on an AMD or Intel card — so a card that clears the floor has room for the configuration it will
+/// actually be given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
 /// (`benchmark::risc0_job_po2`), and one too small for any proves none. A risc0 PROOF has one of

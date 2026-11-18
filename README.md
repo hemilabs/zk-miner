@@ -829,9 +829,11 @@ Worth knowing:
 - **12 GB NVIDIA cards prove both zkVMs** (measured on an RTX 4070). SP1 runs at its larger
   shard size when about 11.6 GiB of the card is free, which an idle 12 GB card has, and at the
   smaller one (about 20% slower) from 9 GiB, so a card driving a display steps down by itself.
-  On NVIDIA cards above 16 GiB, and on AMD and Intel cards of any size (not yet measured), SP1
-  needs 15.2 GiB free, so a smaller one gets no SP1 jobs; `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers
-  that, untested: a larger job can run out part-way and lose its lock. A 12–16 GB NVIDIA card
+  On NVIDIA cards above 16 GiB, SP1 needs 17.1 GiB free for the smaller shard size and 22.9 GiB
+  for the larger one (measured on an RTX 5090), so an idle 24 GB card runs the larger. AMD and
+  Intel cards of any size (not yet measured) need 15.2 GiB free, so a smaller one gets no SP1
+  jobs. `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that floor, untested: a larger job can run out
+  part-way and lose its lock. A 12–16 GB NVIDIA card
   gets none either while `SP1_GPU_DROP_LDES` or `SP1_GPU_RECOMPUTE_FIRST_LAYER` is set to `0`:
   that switches off the server memory savers the figures above were measured with. An SP1 proof
   that runs out of GPU memory is retried on the same card one shard size smaller, and when it

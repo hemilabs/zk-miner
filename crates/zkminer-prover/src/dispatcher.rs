@@ -1957,8 +1957,8 @@ fn spawn_refusal(
     }
 
     // A 12-16 GB NVIDIA card with the SP1 server's memory savers switched off: nothing has measured
-    // what it then takes (the 16 GB figures have them on, the larger card's run on a card with room
-    // to spare), so no floor bounds it.
+    // what it then takes at 268M (the 16 GB figures have them on, the larger card's run on a card
+    // with room to spare), so no floor bounds it.
     if let Some(have) = vram_bytes {
         let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(crate::env::var);
         if backend == zkminer_prover_protocol::BACKEND_SP1
@@ -1978,7 +1978,7 @@ fn spawn_refusal(
     // A card whose whole VRAM is under the free VRAM its backend needs before every proof
     // (`check_vram_budget`) would be advertised, take claims, and refuse each one: SP1 on a 12 GB
     // AMD or Intel card, or on a 12 GB NVIDIA one with the server's memory savers switched off,
-    // where only the larger card's figures apply. The same floor and total as that check.
+    // where only `SP1_OTHER_SERVER_TIERS` applies. The same floor and total as that check.
     if let Some(have) = vram_bytes {
         if let Some(need) = crate::discovery::min_available_vram_bytes_for_backend(
             backend,
@@ -3120,7 +3120,7 @@ enum RoomNeeded {
 /// A configuration nothing has measured — an operator's value off the table, or a card with no known
 /// total and nothing bounding the worker — has no requirement to aim at, so all the room is made
 /// (`Unknown`), not merely the floor's worth: an operator's 402M on a 4090 needs more than even the
-/// 268M tier's 17,766 MiB.
+/// 268M tier's 22,944 MiB.
 fn room_needed(
     cap: SizingCap,
     backend: &str,
@@ -3329,12 +3329,13 @@ fn vram_tier_shrank(
 ///
 /// SP1's measured tables and the server-tier mirror are CUDA measurements: on a 16 GB SYCL card the
 /// server keeps the memory a CUDA one drops (an A770 peaks around 14 GB at 134M), and nothing has
-/// measured a HIP one. With no total, those cards are sized as the larger card's table says and the
+/// measured a HIP one. With no total, those cards are sized by `SP1_OTHER_SERVER_TIERS` and the
 /// server's tier is not assumed — the room predicted is never smaller than the worker's.
 ///
-/// Nor when the miner's environment switches off one of the server's small-card memory savers
-/// (`sp1_small_card_savers_off`): the worker and its server inherit it, and the 16 GB table assumes
-/// them on.
+/// Nor a CUDA card of 16 GiB or less when the miner's environment switches off one of the server's
+/// small-card memory savers (`sp1_small_card_savers_off`): the worker and its server inherit it,
+/// and the 16 GB table assumes them on. A larger card keeps its total: its server runs without
+/// them anyway, which its table measures.
 fn sizing_total(key: &str, total: u64) -> Option<u64> {
     sizing_total_for_tag(key.split(':').nth(1).unwrap_or(""), total)
 }
@@ -3342,7 +3343,8 @@ fn sizing_total(key: &str, total: u64) -> Option<u64> {
 /// `sizing_total` for a card of vendor `gpu_tag`.
 fn sizing_total_for_tag(gpu_tag: &str, total: u64) -> Option<u64> {
     let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(crate::env::var);
-    (gpu_tag == "cuda" && !savers_off).then_some(total)
+    let savers_assumed = zkminer_prover_protocol::types::sp1_savers_are_the_default(total);
+    (gpu_tag == "cuda" && !(savers_off && savers_assumed)).then_some(total)
 }
 
 /// What one card's VRAM looks like to ONE slot at a moment in time.
@@ -10392,8 +10394,8 @@ impl WorkerPool {
         };
         // A live worker is sized from the figure it was SPAWNED with, so a display attached since
         // then leaves it committed to more VRAM than is free. The floor check below cannot see this:
-        // on a 24 GiB card, 8 GiB taken still clears a 16 GB floor while a worker sized for the empty
-        // card needs ~17.8 GiB. Re-sizing is the repair, not refusing — that is the whole point of
+        // on a 24 GiB card, 6 GiB taken still clears the 17.1 GiB floor while a worker sized for the
+        // empty card needs ~22.9 GiB. Re-sizing is the repair, not refusing — that is the whole point of
         // measuring instead of gating. After the room-making above, so a worker is never shrunk to
         // fit beside a sibling that was, or could have been, recycled.
         self.resize_worker_if_vram_shrank(
@@ -13580,7 +13582,8 @@ mod tests {
         let refuse = |tag: &str, vram: u64| spawn_refusal("sp1", tag, None, None, path, Some(vram));
         // A 12 GB NVIDIA card runs SP1 (its server's small-card tiers).
         assert_eq!(refuse("cuda", 12 * GIB), None);
-        // A 12 GB AMD or Intel card is held to the larger card's 15.2 GiB, which it never has.
+        // A 12 GB AMD or Intel card is held to `SP1_OTHER_SERVER_TIERS`'s 15.2 GiB, which it never
+        // has.
         // (A 12-16 GB NVIDIA card with the server's savers off is refused too; not set here, as the
         // environment is the process's.)
         let why = refuse("intel", 12 * GIB).expect("refused");
@@ -14368,18 +14371,17 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let (rtx4090, rtx5080) = (Some(24_564 * MIB), Some(16_303 * MIB));
         let roomy = SizingCap::Host(None);
-        let floor = Some(10_012 * MIB); // v6.1.0: 134M's 9,500 + 512
+        let floor = Some(17_553 * MIB);
         let shrank =
             |cap, assumed, now, total| vram_tier_shrank(cap, "sp1", assumed, now, total, floor);
 
-        // Spawned with the whole 4090 free (268M), now 20 GiB free — still 268M: left alone.
-        assert!(!shrank(roomy, Some(24 * GIB), 20 * GIB, rtx4090));
-        // Now 11 GiB free — in the 134M band [10,012, 12,512) on v6.1.0: the live 268M worker is sized
-        // for more than it has.
-        assert!(shrank(roomy, Some(24 * GIB), 11 * GIB, rtx4090));
+        // Spawned with the whole 4090 free (268M), now 23 GiB free — still 268M: left alone.
+        assert!(!shrank(roomy, Some(24 * GIB), 23 * GIB, rtx4090));
+        // Now 18 GiB free, which is the 134M tier: the live worker is sized for more than it has.
+        assert!(shrank(roomy, Some(24 * GIB), 18 * GIB, rtx4090));
         // The other direction must never trigger a recycle: VRAM being FREED is good news, and the
         // worker is merely conservative. Growing back costs a respawn for no correctness gain.
-        assert!(!shrank(roomy, Some(16 * GIB), 24 * GIB, rtx4090));
+        assert!(!shrank(roomy, Some(18 * GIB), 24 * GIB, rtx4090));
         // Spawned with too little free for any tier: it took the SMALLEST, so there is nothing to
         // shrink to — and it is not grown back either.
         assert!(!shrank(roomy, Some(8 * GIB), 24 * GIB, rtx4090));
@@ -14427,17 +14429,17 @@ mod tests {
         ));
         // A host-capped worker is already at its host tier, whatever the card had.
         let host_134 = SizingCap::Host(Some(134_217_728));
-        assert!(!shrank(host_134, Some(24 * GIB), 16 * GIB, rtx4090));
+        assert!(!shrank(host_134, Some(24 * GIB), 18 * GIB, rtx4090));
         // Without a recorded figure the worker had only its host cap and the server's own tier from
-        // the card's total: on a 4090 that is 402M, so 16 GiB free means it must come down.
-        assert!(shrank(roomy, None, 16 * GIB, rtx4090));
+        // the card's total: on a 4090 that is 402M, so 18 GiB free means it must come down.
+        assert!(shrank(roomy, None, 18 * GIB, rtx4090));
         // ...but a card whose total is also unknown leaves nothing to compare.
-        assert!(!shrank(roomy, None, 16 * GIB, None));
+        assert!(!shrank(roomy, None, 18 * GIB, None));
         // The operator fixed the knob: the worker ignores our figure, so re-sizing changes nothing.
         assert!(!shrank(
             SizingCap::Operator(Some(268_435_456)),
             Some(24 * GIB),
-            16 * GIB,
+            18 * GIB,
             rtx4090
         ));
         // risc0 clamps its segment per run and has no spawn-time tier to go stale.
@@ -14465,7 +14467,8 @@ mod tests {
                 let cap = SizingCap::Host(t::sp1_element_threshold_for_host_scale(scale));
                 for avail_mib in (0..=total_mib)
                     .step_by(97)
-                    .chain([9_166, 9_167, 11_888, 11_889, 15_603, 15_604, 18_277, 18_278])
+                    .chain([9_166, 9_167, 11_888, 11_889, 15_603, 15_604, 17_552, 17_553])
+                    .chain([18_277, 18_278, 23_455, 23_456])
                 {
                     let available = Some(avail_mib * MIB);
                     let worker = t::sp1_element_threshold_cap(scale, available, Some(total));
@@ -14735,7 +14738,7 @@ mod tests {
         const LARGE: u64 = 268_435_456;
         let (rtx5080, rtx4090) = (Some(16_303 * MIB), Some(24_564 * MIB));
         // The default floors: a card above 16 GiB, and a 16 GB card, whose server runs leaner.
-        let floor = Some(15_604 * MIB);
+        let floor = Some(17_553 * MIB);
         let floor_16gb = Some(9_167 * MIB);
         assert_eq!(
             floor,
@@ -14767,37 +14770,37 @@ mod tests {
             ),
             Bytes(9_167 * MIB)
         );
-        // 4090, emptied: 268M, now 11,542 + 512 = 12,512 on v6.1.0.
+        // 4090, emptied (24,564 less 455 and 2): 268M, 22,944 + 512.
         assert_eq!(
             room(roomy, 24_107, None, floor, rtx4090),
-            Bytes(12_512 * MIB)
+            Bytes(23_456 * MIB)
         );
         assert_eq!(
             room(this_box, 24_107, None, floor, rtx4090),
-            Bytes(12_512 * MIB)
+            Bytes(23_456 * MIB)
         );
         assert_eq!(
             room(roomy, 24_107, Some(Some(LARGE)), floor, rtx4090),
-            Bytes(12_512 * MIB)
+            Bytes(23_456 * MIB)
         );
         // A live worker at the small tier never grows; making 268M of room would recycle a sibling
         // for nothing.
         assert_eq!(
             room(roomy, 24_107, Some(Some(SMALL)), floor, rtx4090),
-            Bytes(10_012 * MIB)
+            Bytes(17_553 * MIB)
         );
         // A live 268M worker on a 4090 whose ceiling is 15,878: 268M now fits (12,512), so it stays —
         // no resize down, and the room is 268M's.
         assert_eq!(
-            room(roomy, 15_878, Some(Some(LARGE)), floor, rtx4090),
-            Bytes(12_512 * MIB)
+            room(roomy, 20_000, Some(Some(LARGE)), floor, rtx4090),
+            Bytes(17_553 * MIB)
         );
         // A host that caps SP1 at 134M: the 4090 needs only the small tier's room. Targeting 268M
         // would evict risc0 on every alternation for a configuration the worker never uses.
         let host_134 = SizingCap::Host(Some(SMALL));
         assert_eq!(
             room(host_134, 24_107, None, floor, rtx4090),
-            Bytes(10_012 * MIB)
+            Bytes(17_553 * MIB)
         );
         // A 12,288 MiB ceiling now fits 134M (10,012) on v6.1.0, where on v6.0.0 nothing fit.
         assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Bytes(10_012 * MIB));
@@ -14817,10 +14820,10 @@ mod tests {
         let op_large = SizingCap::Operator(Some(LARGE));
         assert_eq!(
             room(op_large, 24_107, None, floor, rtx4090),
-            Bytes(12_512 * MIB)
+            Bytes(23_456 * MIB)
         );
-        // An operator value nothing has measured — 402M on a 4090 — has no requirement to aim at, so
-        // ALL the room is made, not the floor's worth.
+        // An operator value nothing has measured — 402M on a 4090 needs more than even 268M's
+        // 22,944 — has no requirement to aim at, so ALL the room is made, not the floor's worth.
         let op_402 = SizingCap::Operator(Some(402_653_184));
         assert_eq!(room(op_402, 24_107, None, floor, rtx4090), Unknown);
         assert_eq!(
@@ -14850,8 +14853,8 @@ mod tests {
         assert_eq!(room(this_box, 15_178, None, floor, rtx5080), Hopeless);
         // Raised above the tier: room up to the floor, or the gate refuses what recycling allows.
         assert_eq!(
-            room(roomy, 24_107, None, Some(20_000 * MIB), rtx4090),
-            Bytes(20_000 * MIB)
+            room(roomy, 24_107, None, Some(24_000 * MIB), rtx4090),
+            Bytes(24_000 * MIB)
         );
         // ...unless even the emptied card cannot reach it.
         assert_eq!(
@@ -14901,13 +14904,16 @@ mod tests {
         let (room, evict) = sp1_room(10_204, &sib("risc0:cuda:0", 1_806), 12_282);
         assert_eq!(room, RoomNeeded::Bytes(11_889 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:0".to_string()]);
-        // SP1 after risc0 on the 4090 (268M, 12,512): 10,000 MiB free is short, and evicting the
-        // risc0 worker holding its Groth16 cache (7,134 MiB) clears it. It goes.
-        let (room, evict) = sp1_room(10_000, &sib("risc0:cuda:1", 7_134), 24_564);
-        assert_eq!(room, RoomNeeded::Bytes(12_512 * MIB));
+        // SP1 after risc0 on the 4090, whose risc0 worker keeps its Groth16 cache (7,134 MiB): the
+        // 268M tier's 23,456 does not fit in 16,973. It goes.
+        let (room, evict) = sp1_room(16_973, &sib("risc0:cuda:1", 7_134), 24_564);
+        assert_eq!(room, RoomNeeded::Bytes(23_456 * MIB));
         assert_eq!(evict, vec!["risc0:cuda:1".to_string()]);
-        // Plenty free on the 4090: 268M fits without touching the sibling, so it stays.
+        // So does one holding ~2.4 GiB: 21,657 is short of it too.
         let (_, evict) = sp1_room(21_657, &sib("risc0:cuda:1", 2_450), 24_564);
+        assert_eq!(evict, vec!["risc0:cuda:1".to_string()]);
+        // A sibling that leaves room for 268M stays.
+        let (_, evict) = sp1_room(23_456, &sib("risc0:cuda:1", 651), 24_564);
         assert!(evict.is_empty());
 
         // risc0 after SP1 on the 5080: the idle SP1 worker keeps 15,124 MiB. It goes.
@@ -17548,8 +17554,16 @@ mod spill_and_cap_tests {
             let _env = Hermetic::new(&[(saver, "0")]);
             let why = refuse("cuda", 12_282).expect("unmeasured without the savers");
             assert!(why.contains("memory savers"), "{why}");
-            // A larger card's figures were measured with them off.
+            // A larger card's figures were measured with them off, its server's default.
             assert_eq!(refuse("cuda", 24_564), None);
+            // So a larger card keeps its total, and its own table, with them off; a 12-16 GB one
+            // loses it.
+            assert_eq!(
+                sizing_total_for_tag("cuda", 24_564 << 20),
+                Some(24_564 << 20)
+            );
+            assert_eq!(sizing_total_for_tag("cuda", 12_282 << 20), None);
+            assert_eq!(sizing_total_for_tag("rocm", 24_564 << 20), None);
         }
         let _env = Hermetic::new(&[(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV, "0")]);
         assert_eq!(refuse("intel", 12 * 1024), None);

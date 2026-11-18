@@ -862,16 +862,25 @@ pub const CUDA_VRAM_AVAILABLE_BYTES_ENV: &str = "ZKMINER_CUDA_VRAM_AVAILABLE_BYT
 /// MiB, as `nvidia-smi` reports it.
 const MIB: u64 = 1024 * 1024;
 
-/// Measured `(element threshold, peak VRAM)` for SP1 on a card of MORE than 16 GiB, largest first,
-/// and the table for any card whose total is not given: an AMD or Intel card, or an unknown total.
+/// Measured `(element threshold, peak VRAM)` for SP1 on a CUDA card of MORE than 16 GiB, largest
+/// first. A card whose total is not given has its own table, [`SP1_OTHER_SERVER_TIERS`].
 ///
-/// Both figures measured on this box with a 1,912,954,963-cycle `sha256-chain` proof
-/// through to a compact Groth16 seal: 17,766 MiB of a 24,564 MiB RTX 4090 at the 268M threshold, and
-/// 15,092 MiB of a 16,303 MiB RTX 5080 at 134M. The 5080's figure predates the current server and
-/// was taken on a 16 GB card, which the server now runs differently (see
-/// [`SP1_MEASURED_TIERS_16GB`]); nothing has measured 134M on a larger card under it, where the
-/// server keeps the memory the small-card table's savers drop, so it stays as this table's smaller
-/// tier rather than a smaller guess.
+/// Measured 2026-11-17 on a 32,607 MiB RTX 5090 under Windows with the pinned server (circuit
+/// v6.1.0) and the SP1 benchmark suite through to Groth16 seals, every program verified:
+/// 22,944 MiB at 268M and 17,041 MiB at 134M (`nvidia-smi`'s figure less the 1.7 GiB the card
+/// held before the worker started). The server reaches that level on the first large proof and
+/// holds it in its memory pool for the rest of the process, so it is also what nothing else on the
+/// card can use.
+///
+/// The figures this replaced (17,766 MiB at 268M on a 4090, 15,092 at 134M on a 5080, now
+/// [`SP1_OTHER_SERVER_TIERS`]) were taken under the v6.0.0 server, which dropped the LDEs and
+/// recomputed the first GKR layer on 24 GB cards too. The pinned server does both only on a CUDA
+/// card of 16 GiB or less (ceil(GiB) + 4 <= 20), so above that they were ~5 GiB short at 268M.
+///
+/// A card above 16 GiB but under 24 GiB (a 24,564 MiB RTX 4090 among them) needs less than the
+/// 5090 did: its server keeps no wrap or shrink proving key between proofs, and runs its Groth16
+/// on the GPU only when its own check finds the memory free. The table is an upper bound there,
+/// which errs toward the smaller tier, never toward a spill. An emptied 4090 still clears 268M.
 ///
 /// `402_653_184` — the fork's own default — is deliberately ABSENT. Nothing here has measured its peak
 /// VRAM, and this table is used to decide what will fit. Its omission makes a roomy card slightly
@@ -879,17 +888,32 @@ const MIB: u64 = 1024 * 1024;
 /// trade `sp1_element_threshold_for_host_scale` already makes for host memory: only ever a value
 /// measured to complete a proof.
 const SP1_MEASURED_TIERS: &[(u64, u64)] =
-    &[(268_435_456, 12_000 * MIB), (134_217_728, 9_500 * MIB)];
+    &[(268_435_456, 22_944 * MIB), (134_217_728, 17_041 * MIB)];
+
+/// `(element threshold, peak VRAM)` for an SP1 card whose total is not given: an AMD or Intel card,
+/// a CUDA card of 16 GiB or less with its server's memory savers switched off
+/// ([`sp1_small_card_savers_off`]), or one whose total could not be read.
+///
+/// These are the CUDA figures of the v6.0.0 server (17,766 MiB of a 4090 at 268M, 15,092 MiB of a
+/// 5080 at 134M), kept as they were. Nothing has measured the pinned server on these cards, and the
+/// CUDA card's table above does not describe them: a HIP server picks a smaller tier on a 16 GB
+/// card when Windows grants it too little, and a SYCL server's caching allocator fills the card
+/// whatever the tier, so neither peaks where a CUDA one does. Held to [`SP1_MEASURED_TIERS`] they
+/// would lose SP1 on every 16 GB card (an RX 9070 XT, an Arc A770), which prove it here. A 12-16
+/// GiB CUDA card with its savers off still needs less than these at 134M (11,023 MiB measured on
+/// an RTX 4070 under the pinned server, 2026-11-17).
+const SP1_OTHER_SERVER_TIERS: &[(u64, u64)] =
+    &[(268_435_456, 17_766 * MIB), (134_217_728, 15_092 * MIB)];
 
 /// Measured `(element threshold, peak VRAM)` for SP1 on a CUDA card of 16 GiB or less, largest
-/// first. Callers give an AMD or Intel card no total, so it is sized by the larger table: a SYCL
-/// server keeps its LDEs on a 13-16 GiB card (an A770 peaks around 14 GB at 134M), and nothing has
-/// measured a HIP one.
+/// first. Callers give an AMD or Intel card no total, so it is sized by [`SP1_OTHER_SERVER_TIERS`]: a
+/// SYCL server keeps its LDEs on a 13-16 GiB card (an A770 peaks around 14 GB at 134M), and nothing
+/// has measured a HIP one.
 ///
 /// The server sizes itself from the card's total (`local_gpu_opts`, `ceil(total GiB) + 4 <= 20`) and
 /// on these cards drops its LDE codewords after committing, recomputes the first GKR layer, keeps no
 /// wrap or shrink key between proofs, and caches no preprocessed data — so the same threshold needs
-/// far less than on a 24 GB card, and the larger table above would refuse a 12 GB card outright.
+/// far less than on a 24 GB card, and the larger tables above would refuse a 12 GB card outright.
 ///
 /// Measured 2026-11-16 on a 12,282 MiB RTX 4070 under Windows, driving no display, with the SP1
 /// benchmark suite through to Groth16 seals (`nvidia-smi`'s figure, every program verified):
@@ -926,18 +950,19 @@ pub fn sp1_small_card_savers_off(get: impl Fn(&str) -> Option<String>) -> bool {
 
 /// Whether `sp1-gpu-server` runs its small-card memory savers by default on a CUDA card of `total`
 /// bytes: on one it accepts of 16 GiB or less (`ceil(GiB) + 4 <= 20`). Larger cards run without
-/// them, which the larger card's table measures.
+/// them, which [`SP1_MEASURED_TIERS`] measures.
 pub fn sp1_savers_are_the_default(total: u64) -> bool {
     total > SP1_UNSUPPORTED_CARD_MAX_TOTAL && total <= SP1_16GB_CARD_MAX_TOTAL
 }
 
 /// The measured tiers for a card of `total` bytes, largest first: none for a card the server refuses,
-/// and the larger card's table when the total is unknown, whose figures are the higher.
+/// and [`SP1_OTHER_SERVER_TIERS`] when no total is given.
 fn sp1_measured_tiers(total: Option<u64>) -> &'static [(u64, u64)] {
     match total {
+        None => SP1_OTHER_SERVER_TIERS,
         Some(t) if t <= SP1_UNSUPPORTED_CARD_MAX_TOTAL => &[],
         Some(t) if t <= SP1_16GB_CARD_MAX_TOTAL => SP1_MEASURED_TIERS_16GB,
-        _ => SP1_MEASURED_TIERS,
+        Some(_) => SP1_MEASURED_TIERS,
     }
 }
 
@@ -955,9 +980,9 @@ const SP1_VRAM_MARGIN: u64 = 512 * MIB;
 /// Why not SP1's own tier arithmetic, which is what this first did: `local_gpu_opts` computes
 /// `gpu_memory_gb = ceil(total / 1 GiB) + 4` and takes the larger tier above 20. That formula carries
 /// 4 GiB of implicit slack that only holds for a card whose capacity it is given. Fed an AVAILABLE
-/// figure it selects the 268M tier from 16.4 GiB upward, while that tier's measured peak is 17.4 GiB —
-/// so between roughly 16.4 and 17.8 GiB free it would choose a configuration that does not fit and
-/// fail part-way through a claimed job. The same latent gap exists in the fork for a real 17 GiB card;
+/// figure it selects the large tier from 16.4 GiB upward, while 268M's measured peak on such a card
+/// is 22.4 GiB — so between roughly 16.4 and 22.9 GiB free it would choose a configuration that does
+/// not fit and fail (or spill) part-way through a claimed job. The same latent gap exists in the fork for a real 17 GiB card;
 /// it has never shown because the cards that exist are 16 and 24.
 ///
 /// So: pick the largest configuration whose MEASURED peak fits, with margin. The result is only ever
@@ -1152,7 +1177,7 @@ pub fn sp1_element_threshold_cap(
     [from_host, from_vram].into_iter().flatten().min()
 }
 
-/// The smallest SP1 element threshold with a measured VRAM peak. The same in both tables.
+/// The smallest SP1 element threshold with a measured VRAM peak. The same in every table.
 pub fn sp1_smallest_measured_threshold() -> u64 {
     SP1_MEASURED_TIERS
         .last()
@@ -2054,28 +2079,32 @@ mod tests {
         const GIB: u64 = 1024 * 1024 * 1024;
         const FULL_DEFAULT: u64 = 402_653_184;
 
-        // An empty 4090 has room for the 268M configuration (17,766 MiB + margin).
+        // An empty 4090 has room for the 268M configuration (22,944 MiB + margin).
         assert_eq!(tier(24 * GIB, RTX4090), Some(268_435_456));
-        // 16 GiB free steps down to 134M, whose 15,092 MiB peak fits.
-        assert_eq!(tier(16 * GIB, RTX4090), Some(134_217_728));
+        // 18 GiB free steps down to 134M, whose 17,041 MiB peak fits; 17 GiB fits neither.
+        assert_eq!(tier(18 * GIB, RTX4090), Some(134_217_728));
+        assert_eq!(tier(17 * GIB, RTX4090), None);
+        assert_eq!(tier(17_552 * MIB, RTX4090), None);
+        assert_eq!(tier(17_553 * MIB, RTX4090), Some(134_217_728));
 
-        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the 268M tier from
-        // 16.4 GiB upward, but that tier peaks at 17,766 MiB. Everything in that band must step down,
-        // or we commit to a configuration that cannot fit and fail part-way through a claimed job.
-        for mib in [16_500u64, 17_000, 17_500, 18_000, 18_277] {
+        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the large tier
+        // from 16.4 GiB upward, but 268M peaks at 22,944 MiB. Everything in that band must step
+        // down, or we commit to a configuration that cannot fit and fail (or, on Windows, spill)
+        // part-way through a claimed job.
+        for mib in [17_553u64, 18_000, 20_000, 22_000, 23_000, 23_455] {
             assert_eq!(
                 tier(mib * MIB, RTX4090),
                 Some(134_217_728),
-                "{mib} MiB free must take the 134M tier: 268M needs 12,512 MiB and will not fit"
+                "{mib} MiB free must take the 134M tier: 268M peaks at 22,944 MiB and will not fit"
             );
         }
         // Just above the 268M peak plus margin, it may step back up.
-        assert_eq!(tier(18_278 * MIB, RTX4090), Some(268_435_456));
+        assert_eq!(tier(23_456 * MIB, RTX4090), Some(268_435_456));
 
         // Below the smallest measured configuration there is nothing to offer.
         assert_eq!(tier(8 * GIB, RTX4090), None);
         assert_eq!(tier(0, RTX4090), None);
-        // An unknown card is sized by the larger card's table, whose figures are the higher.
+        // A card with no total (AMD, Intel) keeps the v6.0.0 figures: 16 GiB takes 134M.
         assert_eq!(tier(16 * GIB, None), Some(134_217_728));
         assert_eq!(tier(12 * GIB, None), None);
 
