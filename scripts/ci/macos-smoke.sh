@@ -43,13 +43,18 @@
 #      downloaded with a browser; macOS kills such an unsigned binary): nothing was launched. Run the
 #      kit's ./install.sh (it clears the flag on the installed copies) and run this script again, or
 #      pass --worker/--cli. Not a launch failure of this macOS release.
+#   9  run from inside a kit, the binary picked in place of the kit's own (the installed copy in
+#      --prefix, or target/release) is another build than this kit's: nothing was launched, so no
+#      other build's result is reported as this kit's. Run this kit's ./install.sh first, or pass
+#      --worker/--cli to test that build on purpose.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 worker= cli= receipts= try_pv=0 proof=1 prefix=$HOME/.zkminer
+worker_given=0 cli_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --worker) worker=${2:?}; shift ;;
-    --cli) cli=${2:?}; shift ;;
+    --worker) worker=${2:?}; worker_given=1; shift ;;
+    --cli) cli=${2:?}; cli_given=1; shift ;;
     --prefix) prefix=${2:?}; shift ;;
     --receipt-dir) receipts=${2:?}; shift ;;
     --try-paravirtual) try_pv=1 ;;
@@ -106,13 +111,22 @@ if [ -n "$q" ]; then
   say "RESULT: quarantined binaries, nothing launched (exit 8; not a launch failure of this macOS)"
   exit 8
 fi
-# Installed copies used in place of this kit's own: say when they are from another build.
-for pair in "$worker:$kit_worker" "$cli:$kit_cli"; do
-  a=${pair%%:*} b=${pair#*:}
-  if [ -n "$b" ] && [ "$a" != "$b" ] && [ -f "$b" ] && ! cmp -s "$a" "$b"; then
-    say "   NOTE: $a is not this kit's $(basename "$b") (another build is installed): rerun this kit's ./install.sh"
-  fi
-done
+# Run from inside a kit, a binary picked in place of the kit's own (the installed copy, or
+# target/release) must be this kit's build: otherwise another build's verdict would be reported as
+# this kit's (e.g. an older beta still installed when the new kit's smoke script runs before its
+# install.sh). Nothing is launched (exit 9). --worker/--cli test another build on purpose.
+other=
+[ "$worker_given" = 1 ] || { [ -n "$kit_worker" ] && [ "$worker" != "$kit_worker" ] && ! cmp -s "$worker" "$kit_worker" && other="$other worker:$worker"; }
+[ "$cli_given" = 1 ] || { [ -n "$kit_cli" ] && [ -f "$kit_cli" ] && [ "$cli" != "$kit_cli" ] && ! cmp -s "$cli" "$kit_cli" && other="$other cli:$cli"; }
+if [ -n "$other" ]; then
+  say "== not this kit's build (nothing was launched):"
+  for f in $other; do say "   ${f%%:*} ${f#*:} differs from this kit's $(basename "${f#*:}")"; done
+  say "   this kit's own binaries are quarantined or missing, and the copies found instead are another build:"
+  say "   run this kit's ./install.sh --with-groth16, then $0 again; or pass --worker/--cli to test that build."
+  rm -rf "$log"
+  say "RESULT: installed copies are another build than this kit's, nothing launched (exit 9)"
+  exit 9
+fi
 
 # --- 1. launch ----------------------------------------------------------------------------------
 launch_fail=0 killed=0

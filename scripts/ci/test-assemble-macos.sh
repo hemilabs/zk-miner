@@ -467,6 +467,13 @@ if [ -n "$kit_tarball" ] && [ "${TEST_ASSEMBLE_GPU:-1}" = 1 ]; then
     [ "$rc" = 8 ] && grep -q 'quarantined' "$d/smoke.log" && ! grep -q 'FAILED (exit' "$d/smoke.log" \
       && ok "12: before install.sh: the kit's smoke script reports the quarantine (exit 8), launches nothing" \
       || no "12: before install.sh: rc $rc: $(grep -E 'RESULT|FAILED' "$d/smoke.log" | head -3 | tr '\n' ' ')"
+    mkdir -p "$d/home/.zkminer/provers"; cp "$sdk_cli" "$d/home/.zkminer/zkminer"
+    cp "$sdk_worker" "$d/home/.zkminer/provers/zkminer-prove-risc0-metal"
+    rc=$(smoke)
+    [ "$rc" = 9 ] && grep -q 'another build' "$d/smoke.log" && ! grep -q 'launch:' "$d/smoke.log" \
+      && ok "12: before install.sh, an older build installed: exit 9, nothing launched" \
+      || no "12: stale install before install.sh: rc $rc: $(grep -E 'cli |RESULT|launch' "$d/smoke.log" | head -3 | tr '\n' ' ')"
+    rm -rf "$d/home/.zkminer"
     HOME=$d/home "$k/install.sh" --no-aot > "$d/inst.log" 2>&1 || no "12: install.sh failed: $(tail -2 "$d/inst.log")"
     rc=$(smoke)
     { [ "$rc" = 0 ] || [ "$rc" = 4 ]; } && grep -q "worker $d/home/.zkminer/provers/zkminer-prove-risc0-metal" "$d/smoke.log" \
@@ -478,9 +485,12 @@ if [ -n "$kit_tarball" ] && [ "${TEST_ASSEMBLE_GPU:-1}" = 1 ]; then
       || no "12: --worker quarantined: rc $rc: $(grep RESULT "$d/smoke.log")"
     cp "$sdk_cli" "$d/home/.zkminer/zkminer"
     rc=$(smoke)
-    { [ "$rc" = 0 ] || [ "$rc" = 4 ]; } && grep -q "not this kit's" "$d/smoke.log" \
-      && ok "12: an installed CLI from another build is named (exit $rc)" \
-      || no "12: installed CLI from another build: rc $rc: $(grep -E 'cli |NOTE|RESULT' "$d/smoke.log" | head -3 | tr '\n' ' ')"
+    [ "$rc" = 9 ] && grep -q 'another build' "$d/smoke.log" && ! grep -q 'launch:' "$d/smoke.log" \
+      && ok "12: an installed CLI from another build: exit 9, nothing launched" \
+      || no "12: installed CLI from another build: rc $rc: $(grep -E 'cli |RESULT|launch' "$d/smoke.log" | head -3 | tr '\n' ' ')"
+    rc=$(smoke --cli "$d/home/.zkminer/zkminer")
+    { [ "$rc" = 0 ] || [ "$rc" = 4 ]; } && ok "12: --cli of another build tests it on purpose (exit $rc)" \
+      || no "12: --cli of another build: rc $rc: $(grep RESULT "$d/smoke.log")"
   fi
   rm -rf "$d"
 fi

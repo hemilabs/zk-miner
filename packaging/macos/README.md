@@ -151,6 +151,6 @@ Groth16 component (`~/.risc0`) and the compiled-pipeline cache
 | `zkminer` | the CLI |
 | `provers/zkminer-prove-risc0-metal` | the Metal prover |
 | `metal-aot/` | offline GPU pipeline archives (`manifest.jsonl`, `SHA256SUMS`) |
-| `install.sh`, `tools/` | the installer, its archive helper, and `macos-smoke.sh` (checks that the prover starts, shows your GPU, and makes and verifies one small proof; run it from the kit folder **after** `./install.sh --with-groth16`: `tools/macos-smoke.sh`. It uses the installed copies, because the kit's own files keep the browser's quarantine flag; before installing it stops with exit 8 "quarantined" and launches nothing) |
+| `install.sh`, `tools/` | the installer, its archive helper, and `macos-smoke.sh` (checks that the prover starts, shows your GPU, and makes and verifies one small proof; run it from the kit folder **after** `./install.sh --with-groth16`: `tools/macos-smoke.sh`. It uses the installed copies, because the kit's own files keep the browser's quarantine flag; before installing it stops with exit 8 "quarantined", or exit 9 if an older build is still installed, and launches nothing) |
 | `BUILDINFO` | version, commit, risc0 revision, minimum macOS, Metal compiler, archive families, the Groth16 pin |
 | `SHA256SUMS` | checksums of every file in the kit |
