@@ -1136,6 +1136,11 @@ pub struct GpuMemoryShortage {
     pub ours_in_the_way: bool,
     /// Total VRAM of the card, in bytes, for the operator's benefit in the log line.
     pub total_bytes: u64,
+    /// Not an admission refusal: the proof was STOPPED part-way, because Windows was moving this
+    /// much of its memory off the card (bytes) to make room for another program's, which slows a
+    /// proof many times over. 0 for a refusal before the proof started. Either way the card is
+    /// short of memory now, and the job is better tried where it fits.
+    pub evicted_bytes: u64,
 }
 
 /// Foreign VRAM below this is driver bookkeeping, not an occupant: an idle card with nothing running
@@ -1156,6 +1161,28 @@ impl std::fmt::Display for GpuMemoryShortage {
             .saturating_sub(self.available_bytes)
             .saturating_sub(self.foreign_bytes)
             .saturating_sub(self.sibling_bytes);
+        if self.evicted_bytes > 0 {
+            write!(
+                f,
+                "{} was stopped part-way: Windows was moving {} MiB of its proof's memory off the \
+                 card to make room for another program's",
+                self.slot_key,
+                mib(self.evicted_bytes),
+            )?;
+            if foreign {
+                write!(
+                    f,
+                    " ({} MiB of the card's {} MiB is held by other processes)",
+                    mib(self.foreign_bytes),
+                    mib(self.total_bytes),
+                )?;
+            }
+            return write!(
+                f,
+                ", which slows a proof many times over. The job runs again where it fits. Close \
+                 whatever is using the card, or drive the display from another GPU."
+            );
+        }
         let mut held = Vec::new();
         if foreign {
             held.push(format!(
@@ -1775,6 +1802,7 @@ mod tests {
                 needed_bytes: needed.map(|n| n * MIB),
                 ours_in_the_way: ours,
                 total_bytes: total * MIB,
+                evicted_bytes: 0,
             }
             .to_string()
         };
@@ -1799,6 +1827,32 @@ mod tests {
             .to_string(),
         ];
         let has = |i: usize, what: &str| msgs[i].contains(what);
+        // A proof stopped part-way because Windows was paging it off the card: said as such, with
+        // what was off the card and what another program held, and none of a refusal's wording.
+        let stopped = super::GpuMemoryShortage {
+            slot_key: "sp1:cuda:1".to_string(),
+            foreign_bytes: 2_185 * MIB,
+            sibling_bytes: 0,
+            available_bytes: 9_825 * MIB,
+            needed_bytes: None,
+            ours_in_the_way: false,
+            total_bytes: 12_282 * MIB,
+            evicted_bytes: 9_866 * MIB,
+        }
+        .to_string();
+        assert!(
+            stopped.starts_with(
+                "sp1:cuda:1 was stopped part-way: Windows was moving 9866 MiB of its proof's memory"
+            ),
+            "{stopped}"
+        );
+        assert!(
+            stopped.contains("(2185 MiB of the card's 12282 MiB is held by other processes)"),
+            "{stopped}"
+        );
+        assert!(stopped.contains("runs again where it fits"), "{stopped}");
+        assert!(!stopped.contains("needs that memory freed"), "{stopped}");
+        assert!(!stopped.contains("  "), "{stopped}");
         // A foreign occupant is named, with the advice to remove it; nothing of ours is invented.
         assert!(has(0, "2444 MiB is held by another process"), "{}", msgs[0]);
         assert!(has(0, "Close whatever"), "{}", msgs[0]);

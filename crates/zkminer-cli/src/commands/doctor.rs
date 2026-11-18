@@ -505,11 +505,13 @@ fn sysmem_fallback_check(report: &mut Report) {
 
 #[cfg(windows)]
 const SYSMEM_BEHAVIOUR: &str = "not readable here (the NVIDIA driver hides its CUDA - Sysmem \
-     Fallback Policy). At the default, an SP1 proof that outgrows its card moves into system memory \
-     and runs many times slower (408 s instead of 33 on an RTX 4070), which can cost a lock; with \
-     \"Prefer No Sysmem Fallback\" (NVIDIA Control Panel → Manage 3D settings, globally or for \
-     sp1-gpu-server.exe) it fails at once and is retried one shard size smaller. Memory another \
-     program takes while a proof runs only slows it, whatever the setting";
+     Fallback Policy). At the default, a proof that outgrows its card moves into system memory and \
+     runs many times slower, which can cost a lock. The SP1 server refuses that memory itself, so \
+     an SP1 proof fails at once and is retried one shard size smaller whatever the setting; for \
+     RISC Zero, \"Prefer No Sysmem Fallback\" (NVIDIA Control Panel → Manage 3D settings, globally \
+     or for zkminer-prove-risc0-cuda.exe) does that. Memory another program takes while a proof \
+     runs is paged by Windows either way: the miner sees it, shows it on the dashboard, and runs \
+     the proof again where it fits";
 
 pub async fn run(config_path: Option<&Path>) -> Result<()> {
     let mut report = Report::default();

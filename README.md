@@ -365,20 +365,26 @@ Worth knowing:
   proves there the card keeps that size in later runs too (`~/.zkminer/sp1_shard_caps.json`;
   `zkminer doctor` lists it; stop the miner and remove the card's entry to lift it). Until it is
   re-benchmarked, such a card's SP1 jobs are planned about 20% slower per size step. Under
-  Windows this needs "Prefer No Sysmem Fallback" (below): by default such a proof spills into
-  system memory and runs many times slower rather than running out. RISC Zero
+  Windows too, whatever the driver's settings (below). RISC Zero
   proves at po2 19 on a 12 GB card, 20 from 14 GiB, and benchmarks at that size. A 12 GB card
   benchmarked by an earlier version (at 20, which doesn't fit) has saved rates far too low:
   re-benchmark it with `b` on the Benchmark screen, or `zkminer benchmark --calibrate` with the
-  miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, by default, a proof
-  that outgrows its card doesn't fail: the driver moves part of it into system memory and it runs
-  many times slower (an SP1 proof on an RTX 4070: 408 s instead of 33), which can cost a lock.
-  "Prefer No Sysmem Fallback" (NVIDIA Control Panel → Manage 3D settings → CUDA - Sysmem Fallback
-  Policy, globally or for `sp1-gpu-server.exe`) makes an SP1 proof that needs more than the card
-  fail at once instead, and it is retried one shard size smaller. `zkminer doctor` can't read the
-  setting: the driver hides it. Memory another program takes while a proof runs only slows the
-  proof, whatever the setting (Windows pages one program's memory out for the other's), so leave
-  the card the room these figures say. The miner helps:
+  miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, at the NVIDIA driver's
+  default CUDA - Sysmem Fallback Policy, a proof that outgrows its card isn't refused memory: the
+  driver puts part of it in system memory and it runs many times slower (an SP1 proof on an RTX
+  4070: 408 s instead of 33), which can cost a lock. The SP1 server refuses that memory itself, so
+  an SP1 proof fails at once and is retried one shard size smaller (60 s, the same proof), with no
+  setting changed. For RISC Zero, which has no such check, "Prefer No Sysmem Fallback" (NVIDIA
+  Control Panel → Manage 3D settings, globally or for `zkminer-prove-risc0-cuda.exe`) makes the
+  driver refuse it instead (not measured for RISC Zero). `zkminer doctor` can't read the setting:
+  the driver hides it. Memory another program takes while a proof runs doesn't fail the
+  proof under either setting: Windows pages the two programs' memory in turns, and the proof runs
+  8–12 times slower. The miner watches for that (Windows' per-process GPU memory counters): the
+  dashboard's GPU row shows "⚠ … GiB paged to RAM", and once it has gone on for a few seconds the
+  proof is stopped and run again where it fits, on another card or on this one at a size that
+  fits beside the other program (on an RTX 4070: stopped 6 s after a 2 GB program started, then
+  proved in 62 s, against 242 s left to page). Still, leave the card the room these figures say.
+  The miner helps:
   a RISC Zero proof on an NVIDIA card starts only when its segment size's measured peak fits in
   what is free (else it waits, or goes to another card, and no RISC Zero job is claimed for that
   card until a check every 5 minutes finds the room; a job that waits about 2 minutes without room

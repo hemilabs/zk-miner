@@ -764,6 +764,51 @@ pub(crate) async fn apply_stop_request(
     }
 }
 
+/// Publish, every 2 s for the life of the process, which cards' running proofs Windows is moving off
+/// the card for another program's memory (`WorkerPool::gpu_spills`), by the bus id the dashboard's
+/// GPU rows use. Nothing to publish elsewhere: a card that runs out there fails the allocation.
+fn spawn_spill_publisher(state: zkminer_tui::state::SharedState) {
+    if !cfg!(windows) {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            let Some(pool) = zkminer_prover::engine::worker_pool() else {
+                continue;
+            };
+            let spills = spills_by_card(&pool.gpu_spills(), |key| pool.bus_id_for_slot(key));
+            if state.read().await.gpu_spills != spills {
+                state.write().await.gpu_spills = spills;
+            }
+        }
+    });
+}
+
+/// Each slot's spill (`WorkerPool::gpu_spills`) under its card's bus id (`bus_of`). Both of a
+/// card's slots can report one; the card shows the one being stopped, else the larger.
+fn spills_by_card(
+    spills: &[(String, zkminer_prover::dispatcher::GpuSpill)],
+    bus_of: impl Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, zkminer_prover::dispatcher::GpuSpill> {
+    let mut by_card = std::collections::HashMap::new();
+    for (key, spill) in spills {
+        let Some(bus) = bus_of(key) else {
+            continue;
+        };
+        by_card
+            .entry(bus)
+            .and_modify(|shown: &mut zkminer_prover::dispatcher::GpuSpill| {
+                if (spill.stopping, spill.evicted_mib) > (shown.stopping, shown.evicted_mib) {
+                    *shown = *spill;
+                }
+            })
+            .or_insert(*spill);
+    }
+    by_card
+}
+
 /// Poll for stops asked for at the dashboard (`stop_request`) or by `zkminer stop` (the request
 /// file), once a second, for the life of the process.
 fn spawn_stop_watcher(
@@ -4141,6 +4186,7 @@ pub async fn run(
     if !watch_only() {
         spawn_stop_watcher(sig_tx.clone(), state.clone());
     }
+    spawn_spill_publisher(state.clone());
 
     // The dashboard, when there is one. It stays open through the shutdown below and closes when
     // the miner is about to exit.
@@ -14552,6 +14598,7 @@ mod tests {
             needed_bytes: None,
             ours_in_the_way: true,
             total_bytes: 0,
+            evicted_bytes: 0,
         });
         assert!(refused_before_start(&gpu));
         assert!(!refused_before_start(&anyhow::anyhow!("GpuMemoryShortage")));
@@ -14572,6 +14619,7 @@ mod tests {
                 needed_bytes: Some(1 << 33),
                 ours_in_the_way,
                 total_bytes: 12 << 30,
+                evicted_bytes: 0,
             })
         };
         let host = |attempted| {
@@ -14702,6 +14750,43 @@ mod tests {
 
     /// A card short of VRAM for its risc0 size claims no risc0 job, by slot AND size, and is counted
     /// for the claim side's message; the rest are claimable.
+    /// Each slot's spill goes to its card; a card's two slots show the one being stopped, else the
+    /// larger; a slot whose card is unknown shows nowhere.
+    #[test]
+    fn spills_are_shown_by_card() {
+        use zkminer_prover::dispatcher::GpuSpill;
+        let spill = |evicted_mib, stopping| GpuSpill {
+            evicted_mib,
+            stopping,
+        };
+        let bus = |key: &str| match key {
+            "risc0:cuda:1" | "sp1:cuda:1" => Some("0000:03:00.0".to_string()),
+            "sp1:cuda:0" => Some("0000:01:00.0".to_string()),
+            _ => None,
+        };
+        let shown = spills_by_card(
+            &[
+                ("risc0:cuda:1".to_string(), spill(9_000, false)),
+                ("sp1:cuda:1".to_string(), spill(500, true)),
+                ("sp1:cuda:0".to_string(), spill(700, false)),
+                ("sp1:rocm:9".to_string(), spill(800, false)),
+            ],
+            bus,
+        );
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown["0000:03:00.0"], spill(500, true));
+        assert_eq!(shown["0000:01:00.0"], spill(700, false));
+        let shown = spills_by_card(
+            &[
+                ("sp1:cuda:1".to_string(), spill(500, false)),
+                ("risc0:cuda:1".to_string(), spill(9_000, false)),
+            ],
+            bus,
+        );
+        assert_eq!(shown["0000:03:00.0"], spill(9_000, false));
+        assert!(spills_by_card(&[], bus).is_empty());
+    }
+
     #[test]
     fn a_risc0_card_short_at_its_size_is_not_claimable() {
         let card = |slot: &str, device: &str, po2| Risc0Card {
@@ -14951,6 +15036,7 @@ mod tests {
             needed_bytes: Some(16_000_000_000),
             ours_in_the_way: false,
             total_bytes: 16 << 30,
+            evicted_bytes: 0,
         });
         assert!(real.downcast_ref::<GpuMemoryShortage>().is_some());
 
