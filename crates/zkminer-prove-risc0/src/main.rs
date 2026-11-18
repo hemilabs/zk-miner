@@ -9,6 +9,7 @@ use std::time::Instant;
 mod confinement;
 mod groth16_component;
 mod groth16_wrap;
+mod segments;
 mod witness;
 
 use anyhow::{Context, Result};
@@ -88,8 +89,10 @@ fn main() {
     use_shipped_level_zero_driver();
 
     // A private temporary directory, named by TMPDIR from here on, while the process has one thread:
-    // the confinement lets the worker write there and almost nowhere else (confinement.rs).
+    // the confinement lets the worker write there and almost nowhere else (confinement.rs). And the
+    // directory its proofs write their segments to, on disk (segments.rs), which it may write too.
     confinement::prepare();
+    segments::prepare();
 
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
@@ -1585,6 +1588,7 @@ fn run_proof_once(
         tracing::info!("Setting session_limit = {limit} cycles (operator override)");
         env_builder.session_limit(Some(limit));
     }
+    let _segments = segments::spill_here(&mut env_builder);
     let env = env_builder.build()?;
 
     // Use Groth16 receipt kind for on-chain verifiable proofs.
@@ -1752,11 +1756,11 @@ fn benchmark_stages(
     // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
     // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
     // only says what the executor default already was.)
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .write_slice(input)
-        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
-        .build()
-        .ok()?;
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(input)
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build().ok()?;
 
     // ONE proof, staged, so each stage is timed exactly rather than inferred from two runs.
     //
@@ -1930,10 +1934,11 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
         None,
     );
     let start = Instant::now();
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .write_slice(&1000u32.to_le_bytes())
-        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
-        .build()?;
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(&1000u32.to_le_bytes())
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build()?;
     let proved = groth16_wrap::prove(&local_prover(), env, FIBONACCI_ELF);
     release_groth16_cache_if_tight();
     proved?
@@ -1955,10 +1960,10 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     let input = CALIBRATION_ITERS.to_le_bytes();
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .write_slice(&input)
-        .segment_limit_po2(po2 as u32)
-        .build()?;
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(&input).segment_limit_po2(po2 as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build()?;
 
     let start = std::time::Instant::now();
     let prover = local_prover();
