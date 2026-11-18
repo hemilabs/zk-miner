@@ -840,15 +840,20 @@ Worth knowing:
   proves there the card keeps that size in later runs too (`~/.zkminer/sp1_shard_caps.json`;
   `zkminer doctor` lists it; stop the miner and remove the card's entry to lift it). Until it is
   re-benchmarked, such a card's SP1 jobs are planned about 20% slower per size step. Under
-  Windows this needs "Prefer No Sysmem Fallback" (below): by default the proof spills into
-  system memory and slows down rather than running out. RISC Zero
+  Windows this needs "Prefer No Sysmem Fallback" (below): by default such a proof spills into
+  system memory and runs many times slower rather than running out. RISC Zero
   proves at po2 19 on a 12 GB card, 20 from 14 GiB, and benchmarks at that size. A 12 GB card
   benchmarked by an earlier version (at 20, which doesn't fit) has saved rates far too low:
   re-benchmark it with `b` on the Benchmark screen, or `zkminer benchmark --calibrate` with the
-  miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, by default (the
-  driver's CUDA - Sysmem Fallback Policy, which `zkminer doctor` shows), a proof that outgrows the
-  card doesn't fail: the driver moves part of it into system memory and it runs several times
-  slower, which can cost a lock, so leave the card the room these figures say. The miner helps:
+  miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, by default, a proof
+  that outgrows its card doesn't fail: the driver moves part of it into system memory and it runs
+  many times slower (an SP1 proof on an RTX 4070: 408 s instead of 33), which can cost a lock.
+  "Prefer No Sysmem Fallback" (NVIDIA Control Panel → Manage 3D settings → CUDA - Sysmem Fallback
+  Policy, globally or for `sp1-gpu-server.exe`) makes an SP1 proof that needs more than the card
+  fail at once instead, and it is retried one shard size smaller. `zkminer doctor` can't read the
+  setting: the driver hides it. Memory another program takes while a proof runs only slows the
+  proof, whatever the setting (Windows pages one program's memory out for the other's), so leave
+  the card the room these figures say. The miner helps:
   a RISC Zero proof on an NVIDIA card starts only when its segment size's measured peak fits in
   what is free (else it waits, or goes to another card, and no RISC Zero job is claimed for that
   card until a check every 5 minutes finds the room; a job that waits about 2 minutes without room

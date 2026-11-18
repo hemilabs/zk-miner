@@ -4596,9 +4596,18 @@ mod threshold_tests {
             "allocation failed on evaluated: 1728053248 bytes",
             "Proving failed: out of GPU memory",
             "cudaMallocAsync failed: out of memory",
+            // The server's own report of a proof whose device allocation failed (hemilabs/sp1
+            // zkminer/sp1-oom-cause), as the SDK hands it on.
+            "CudaClientError: The server returned an internal error \n controller task failed: \
+             out of GPU memory (a device allocation failed)",
         ] {
             assert!(matches!(kind(oom), ErrorKind::ResourceExhausted), "{oom}");
         }
+        // Without it, a failed proof says nothing of why: not an out-of-memory.
+        assert!(matches!(
+            kind("CudaClientError: The server returned an internal error \n controller task failed"),
+            ErrorKind::ProofFailed
+        ));
         assert!(matches!(
             kind("vkey hash does not match job programId (out of memory)"),
             ErrorKind::ProgramMismatch

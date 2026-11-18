@@ -3048,6 +3048,11 @@ fn unix_now() -> u64 {
 /// running out, means the growth may be what ran out.
 const FOREIGN_GROWTH_TOLERANCE: u64 = 256 * 1024 * 1024;
 
+/// SP1 proofs in a row that may fail on a slot (`WorkerPool::sp1_prove_errors`) before its worker,
+/// and so its GPU server, is restarted. Two: one bad program costs no restart, and a server that
+/// can no longer prove costs two jobs rather than every job until the miner restarts.
+const SP1_PROVE_ERRORS_BEFORE_RECYCLE: u32 = 2;
+
 /// Whether an SP1 out-of-memory may be recorded as the card's (`PendingSp1Cap::record`): only when
 /// what another program held is known both when the proof was admitted and when it ran out, and did
 /// not grow by more than [`FOREIGN_GROWTH_TOLERANCE`]. A card that could not be read either time,
@@ -3538,6 +3543,12 @@ pub struct WorkerPool {
     /// Each SP1 slot's shard-size cap, for the planner (`sp1_rate_factor`): a copy of what its
     /// spawn environment carries, kept here because a proof holds the slot for its whole length.
     sp1_slot_caps: Mutex<HashMap<String, SlotSp1Cap>>,
+    /// SP1 proofs in a row that failed on each slot, other than for its memory or its program
+    /// (`note_sp1_prove_error`). A proof's failure reaches the worker as its server's bare
+    /// "controller task failed", whatever went wrong inside, so a server left unable to prove (an
+    /// out-of-memory its fork did not report, say) failed every proof it was given while the
+    /// worker, which answered, was kept.
+    sp1_prove_errors: Mutex<HashMap<String, u32>>,
     /// What another program held on each risc0/SP1 slot's card when its proof was admitted
     /// (`check_vram_budget`), to tell an out-of-memory the size caused from one another program's
     /// growth caused (`lower_sp1_shard_cap`).
@@ -3667,6 +3678,7 @@ impl WorkerPool {
             sp1_caps_pending: Mutex::new(HashMap::new()),
             risc0_short: Mutex::new(HashMap::new()),
             sp1_slot_caps: Mutex::new(HashMap::new()),
+            sp1_prove_errors: Mutex::new(HashMap::new()),
             admitted_foreign: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             test_cards: Mutex::new(HashMap::new()),
@@ -11073,6 +11085,10 @@ impl WorkerPool {
                 );
                 if slot.backend == zkminer_prover_protocol::BACKEND_SP1 {
                     self.confirm_sp1_shard_cap(key, &slot, entry.vram_bytes, program_hash(elf));
+                    self.sp1_prove_errors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(key);
                 }
                 if let Some((tier, _)) = ran_tier {
                     let i = usize::from(tier == crate::metal_sizing::OwnerTier::Active);
@@ -11158,6 +11174,21 @@ impl WorkerPool {
                     } else {
                         Self::mark_slot_failed(&mut slot, entry);
                     }
+                } else if slot.backend == zkminer_prover_protocol::BACKEND_SP1
+                    && !matches!(kind, ErrorKind::InvalidInput | ErrorKind::ProgramMismatch)
+                    && self.note_sp1_prove_error(key)
+                {
+                    // A fresh worker brings a fresh server. Not counted as a failure: a program
+                    // that cannot be proved fails the same way on a healthy server.
+                    tracing::warn!(
+                        "Worker {key}: {SP1_PROVE_ERRORS_BEFORE_RECYCLE} SP1 proofs in a row failed; \
+                         restarting it and its GPU server"
+                    );
+                    entry.clear_pid();
+                    if let Some(h) = slot.handle.as_mut() {
+                        h.kill();
+                    }
+                    Self::mark_slot_dead(&mut slot, entry);
                 }
                 Err(anyhow::Error::new(typed))
             }
@@ -11223,6 +11254,23 @@ impl WorkerPool {
             }
         }
         Ok(())
+    }
+
+    /// Counts a failed SP1 proof on `key` (see `sp1_prove_errors`): true, and the count starts
+    /// over, at the [`SP1_PROVE_ERRORS_BEFORE_RECYCLE`]th in a row, when its worker is to be
+    /// restarted.
+    fn note_sp1_prove_error(&self, key: &str) -> bool {
+        let mut errors = self
+            .sp1_prove_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = errors.entry(key.to_string()).or_insert(0);
+        *n += 1;
+        if *n >= SP1_PROVE_ERRORS_BEFORE_RECYCLE {
+            errors.remove(key);
+            return true;
+        }
+        false
     }
 
     /// Mark a worker slot as failed: clear handle, zero PID, increment failure counter.
@@ -13566,6 +13614,39 @@ mod tests {
         let pool = pool_with_keys(&["risc0x:cuda:0", "risc0:cuda:0"]);
         let keys = pool.keys_for_prefix("risc0");
         assert_eq!(keys, vec!["risc0:cuda:0"]);
+    }
+
+    /// The second SP1 proof in a row to fail restarts its worker, and the count starts over; a
+    /// proof that succeeds clears it.
+    #[test]
+    fn a_second_sp1_prove_error_in_a_row_restarts_the_worker() {
+        let pool = pool_with_keys(&["sp1:cuda:0", "sp1:cuda:1"]);
+        assert!(!pool.note_sp1_prove_error("sp1:cuda:0"));
+        assert!(!pool.note_sp1_prove_error("sp1:cuda:1"), "per slot");
+        assert!(pool.note_sp1_prove_error("sp1:cuda:0"));
+        assert!(
+            !pool.note_sp1_prove_error("sp1:cuda:0"),
+            "the count started over"
+        );
+        // A proved SP1 proof clears its slot's count, where it confirms the slot's cap.
+        let production = include_str!("dispatcher.rs")
+            .split_once(
+                "
+#[cfg(test)]",
+            )
+            .unwrap()
+            .0;
+        let success = production
+            .split_once(
+                "self.confirm_sp1_shard_cap(key, &slot, entry.vram_bytes, program_hash(elf));",
+            )
+            .expect("the success path")
+            .1;
+        assert!(
+            success[..200].contains(".sp1_prove_errors") && success[..300].contains(".remove(key)"),
+            "{}",
+            &success[..300]
+        );
     }
 
     #[test]
