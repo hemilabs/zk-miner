@@ -303,8 +303,8 @@ mod tests {
         }
     }
 
-    /// v13 appended `witness` to `Prove`: it round-trips both ways, the fields before it keep their
-    /// places (a `None` frame is a v12 frame plus one byte), and a v12 frame no longer decodes, which
+    /// v14 appended `witness` to `Prove`: it round-trips both ways, the fields before it keep their
+    /// places (a `None` frame is a v13 frame plus one byte), and a v13 frame no longer decodes, which
     /// is why the version moved.
     #[test]
     fn a_witness_prove_round_trips_and_appends_last() {
@@ -344,7 +344,7 @@ mod tests {
         }
 
         #[derive(serde::Serialize)]
-        enum V12Command {
+        enum V13Command {
             _Hello,
             _Capabilities,
             _Benchmark,
@@ -356,7 +356,7 @@ mod tests {
                 program_id: Option<[u8; 32]>,
             },
         }
-        let v12 = bincode::serialize(&V12Command::Prove {
+        let v13 = bincode::serialize(&V13Command::Prove {
             request_id: 5,
             elf: vec![1],
             input_data: vec![2],
@@ -364,7 +364,7 @@ mod tests {
             program_id: None,
         })
         .unwrap();
-        let v13 = bincode::serialize(&WorkerCommand::Prove {
+        let v14 = bincode::serialize(&WorkerCommand::Prove {
             request_id: 5,
             elf: vec![1],
             input_data: vec![2],
@@ -374,27 +374,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            &v13[..v12.len()],
-            &v12[..],
+            &v14[..v13.len()],
+            &v13[..],
             "every earlier field keeps its place"
         );
         assert_eq!(
-            &v13[v12.len()..],
+            &v14[v13.len()..],
             &[0u8],
             "and `witness: None` is one trailing byte"
         );
         assert!(
-            bincode::deserialize::<WorkerCommand>(&v12).is_err(),
-            "a v12 Prove must not decode as v13"
+            bincode::deserialize::<WorkerCommand>(&v13).is_err(),
+            "a v13 Prove must not decode as v14"
         );
         // The struct round-trips on its own too (the dispatcher clones it into the frame).
         let w: WitnessProve =
             bincode::deserialize(&bincode::serialize(&witness()).unwrap()).unwrap();
         assert_eq!(w, witness());
-        const _: () = assert!(PROTOCOL_VERSION >= 13);
+        const _: () = assert!(PROTOCOL_VERSION >= 14);
     }
 
-    /// v13's `JournalDiverged` is appended after `SetupProgress`, and `InputMismatch` after
+    /// v14's `JournalDiverged` is appended after `SetupProgress`, and `InputMismatch` after
     /// `Internal`: no older index moved.
     #[test]
     fn journal_diverged_and_input_mismatch_are_appended() {

@@ -191,7 +191,7 @@ pub enum WorkerCommand {
         /// the pre-existing behaviour (benchmark/calibration paths, mock worker).
         #[serde(default)]
         program_id: Option<[u8; 32]>,
-        /// A witness-construction job's input, by path (protocol v13): `None` for every other
+        /// A witness-construction job's input, by path (protocol v14): `None` for every other
         /// proof. When set, `input_data` must be empty: the worker reads `prefix ‖ W` itself, refuses
         /// it on a length or hash mismatch ([`ErrorKind::InputMismatch`]), and proves only if the
         /// execution's journal hashes to `expect_journal_sha256` (else `JournalDiverged`). risc0
@@ -404,7 +404,7 @@ pub enum WorkerResponse {
     /// it did not halt with exit code 0, or its journal does not hash to `expect_journal_sha256`.
     /// Nothing was proven. Typed so the host never classifies a divergence from text: it re-runs the
     /// binding and the claim-gate limits on this journal and either re-dispatches a new bundle
-    /// version, hands the job back, or releases it (plan §15.3). Appended last (v13), so every
+    /// version, hands the job back, or releases it (plan §15.3). Appended last (v14), so every
     /// earlier variant keeps its bincode index.
     JournalDiverged {
         request_id: u64,
@@ -425,7 +425,7 @@ pub enum WorkerResponse {
     },
 }
 
-/// The input of a witness-construction job's proof (`WorkerCommand::Prove::witness`, protocol v13).
+/// The input of a witness-construction job's proof (`WorkerCommand::Prove::witness`, protocol v14).
 ///
 /// The prove workers are trusted processes of the miner's own uid, so the input travels as a path:
 /// host RAM is not charged for a copy in the frame, and the worker hashes what it actually reads.
@@ -709,7 +709,7 @@ pub enum ErrorKind {
     /// A witness `Prove`'s input, read in full, does not have the bundle's length or
     /// `sha256(prefix ‖ W)`: the retained `W` is corrupt (plan §15.2), not the job or the worker. An
     /// input the worker could not open or read is `Internal` instead (the store may be unavailable).
-    /// Appended last (v13).
+    /// Appended last (v14).
     InputMismatch,
 }
 /// The exit code of a worker whose proving server is gone, or whose connection to it is unusable.

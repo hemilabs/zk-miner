@@ -1,4 +1,4 @@
-//! The CPU worker's witness prove path over its IPC protocol (protocol v13): a `Prove` whose input is
+//! The CPU worker's witness prove path over its IPC protocol (protocol v14): a `Prove` whose input is
 //! a bundle's `prefix ‖ W` file, executed once into the slot's segment directory, compared with the
 //! bundle's journal hash, and proven only on a match.
 //!
@@ -86,7 +86,7 @@ impl Worker {
         match w.recv() {
             WorkerResponse::HelloAck {
                 protocol_version, ..
-            } => assert_eq!(protocol_version, 13),
+            } => assert_eq!(protocol_version, 14),
             other => panic!("{other:?}"),
         }
         w
