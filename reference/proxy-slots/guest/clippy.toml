@@ -1,9 +1,10 @@
 # Host inputs a guest must never let reach its journal or a selection (plan §8.2, §21.1 item 4):
 # randomness (sys_rand, getrandom, and the standard hash maps it seeds), cycle counts, the
 # environment and arguments, early exits, the raw syscall entry points that reach all of these
-# around their wrappers, other file descriptors, the raw keccak permutation's status, and the
-# interior-mutable cells a function the guards accept could read (`static` itself has no clippy
-# lint: the source scan refuses it). `../check-guest-lints.sh` runs clippy with them denied
+# around their wrappers, other file descriptors, the raw keccak permutation's status, and every
+# interior-mutable type (cells, once-cells, lazies, locks, atomics): one in a `static` is what a
+# function the guards accept could read, and the guard types refuse to hold one (`static` itself
+# has no clippy lint: the source scan refuses it). `../check-guest-lints.sh` runs clippy with them denied
 # (for the zkVM target, with the risc0 toolchain); `methods/tests/guest_lints.rs` checks the sources
 # of everything the guest links from this repository and the call graph of the built ELF as well.
 disallowed-types = [
@@ -14,6 +15,24 @@ disallowed-types = [
     { path = "core::cell::Cell", reason = "a derivation that captures nothing could read it" },
     { path = "core::cell::RefCell", reason = "a derivation that captures nothing could read it" },
     { path = "core::cell::UnsafeCell", reason = "a derivation that captures nothing could read it" },
+    { path = "core::cell::OnceCell", reason = "a derivation that captures nothing could read it" },
+    { path = "core::cell::LazyCell", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::OnceLock", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::LazyLock", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::Mutex", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::RwLock", reason = "a derivation that captures nothing could read it" },
+    { path = "core::sync::atomic::AtomicBool", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI8", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU8", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI16", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU16", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI32", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU32", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI64", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU64", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicIsize", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicUsize", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicPtr", reason = "a derivation that captures nothing could read it", allow-invalid = true },
 ]
 disallowed-macros = [
     { path = "std::thread_local", reason = "a derivation that captures nothing could read it" },

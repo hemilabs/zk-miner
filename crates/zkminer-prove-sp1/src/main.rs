@@ -2316,29 +2316,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
                         // permanent program-level mismatch is reported as such and never misread as a
                         // transient GPU OOM.
-                        let kind = if is_executor_environment_fault(&msg) {
+                        if is_executor_environment_fault(&msg) {
                             // Its executor could not be set up: this worker's fault, not the job's.
                             environment_fault_or_decline(&*prover_for_proof, &msg);
-                            ErrorKind::Internal
-                        } else if msg.contains("does not match job programId")
-                            || msg.contains("could not parse SP1 vkey hash")
-                            || msg.starts_with(NOT_SHA256_COMMITTED)
-                        {
-                            // The served ELF's verifying key cannot match this job's programId, or its
-                            // proof commits its public values under a digest the chain does not
-                            // accept. No job for this program can be fulfilled, so report it as
-                            // ProgramMismatch: the host negative-caches the program and stops claiming
-                            // its jobs, instead of re-proving it and eating a release penalty per job.
-                            ErrorKind::ProgramMismatch
-                        } else if is_gpu_oom(&msg) {
-                            // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
-                            // respawns this worker (and its gpu-server) with clean VRAM.
-                            ErrorKind::ResourceExhausted
-                        } else if msg.contains("serialize") || msg.contains("bincode") {
-                            ErrorKind::Internal
-                        } else {
-                            ErrorKind::ProofFailed
-                        };
+                        }
+                        let kind = prove_error_kind(&msg);
                         let resp = WorkerResponse::Error {
                             request_id,
                             kind,
@@ -2949,7 +2931,7 @@ fn run_execute_sp1(
 fn refuse_unprovable_exit(exit_code: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         exit_code == 0,
-        "the guest halted with exit code {exit_code}: no proof of it verifies"
+        "{UNPROVABLE_EXIT} {exit_code}: no proof of it verifies"
     );
     Ok(())
 }
@@ -2965,8 +2947,7 @@ fn refuse_non_sha256_commitment(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         public_values.hash() == committed_digest,
-        "the guest commits its public values under a digest other than SHA-256, which the on-chain \
-         verifier does not accept"
+        "{NOT_SHA256_DIGEST}, which the on-chain verifier does not accept"
     );
     Ok(())
 }
@@ -2988,8 +2969,48 @@ fn proof_commits_sha256(proof: &sp1_sdk::SP1ProofWithPublicValues) -> bool {
 }
 
 /// The phrase of `run_proof`'s refusal of a proof whose public values are not committed under
-/// SHA-256; the prove path reports it as [`ErrorKind::ProgramMismatch`].
+/// SHA-256; the prove path reports it as [`ErrorKind::InvalidInput`] (see [`prove_error_kind`]).
 const NOT_SHA256_COMMITTED: &str = "SP1 proof's public values are not committed under SHA-256";
+
+/// The start of [`refuse_unprovable_exit`]'s refusal.
+const UNPROVABLE_EXIT: &str = "the guest halted with exit code";
+
+/// The start of [`refuse_non_sha256_commitment`]'s refusal.
+const NOT_SHA256_DIGEST: &str =
+    "the guest commits its public values under a digest other than SHA-256";
+
+/// How the prove path reports a failure of `run_proof` (its message, `msg`), from this binary's own
+/// phrases, never a guest's (the executor's errors are a typed enum with no free-form guest field):
+/// - this worker's executor could not be set up: [`ErrorKind::Internal`];
+/// - the served ELF's verifying key is not the job's programId: [`ErrorKind::ProgramMismatch`],
+///   which the host records against the program (no job of it can be fulfilled);
+/// - the job's own execution is unprovable (a non-zero exit, found by the execute before the proof),
+///   or commits its public values under a digest the chain does not accept (Blake3, found before or
+///   after the proof): [`ErrorKind::InvalidInput`]. That is this job's input, not its program: the
+///   same program may commit under SHA-256 for another input, and its verifying key is the job's;
+/// - a GPU out of memory: [`ErrorKind::ResourceExhausted`]; else [`ErrorKind::ProofFailed`].
+fn prove_error_kind(msg: &str) -> ErrorKind {
+    if is_executor_environment_fault(msg) {
+        ErrorKind::Internal
+    } else if msg.contains("does not match job programId")
+        || msg.contains("could not parse SP1 vkey hash")
+    {
+        ErrorKind::ProgramMismatch
+    } else if msg.starts_with(NOT_SHA256_COMMITTED)
+        || msg.starts_with(UNPROVABLE_EXIT)
+        || msg.starts_with(NOT_SHA256_DIGEST)
+    {
+        ErrorKind::InvalidInput
+    } else if is_gpu_oom(msg) {
+        // GPU OOM: tag as ResourceExhausted so the dispatcher kills + respawns this worker (and its
+        // gpu-server) with clean VRAM.
+        ErrorKind::ResourceExhausted
+    } else if msg.contains("serialize") || msg.contains("bincode") {
+        ErrorKind::Internal
+    } else {
+        ErrorKind::ProofFailed
+    }
+}
 
 /// The runtime the measurement's execution runs on (`run_execute_sp1`), made on first use: the SDK's
 /// blocking calls run on a runtime of their own, which is not reachable from here.
@@ -3029,6 +3050,29 @@ fn canonicalize_sp1_execute_error(raw: &str) -> anyhow::Error {
     }
 }
 
+/// The execution before a proof, checked as the measurement checks it: capped at the measurement's
+/// cycle limit, and refused when no proof of it can be accepted (a non-zero exit, or public values
+/// committed under a digest other than SHA-256), before a Groth16 proof is spent on it. A lock taken
+/// on a measurement that did not check these (an older worker's, recovered across an upgrade) fails
+/// here, in an execute's time.
+fn execute_before_proof<P: sp1_sdk::blocking::Prover>(
+    prover: &P,
+    elf: &[u8],
+    stdin: &sp1_sdk::SP1Stdin,
+) -> Result<(sp1_sdk::SP1PublicValues, sp1_sdk::ExecutionReport)> {
+    let mut context = sp1_sdk::SP1ContextBuilder::new();
+    if let Some(limit) = sp1_execute_cycle_limit() {
+        context.max_cycles(limit);
+    }
+    let context = context.build();
+    let (public_values, committed_digest, report) = sizing_runtime()?
+        .block_on(prover.inner().execute(elf, stdin.clone(), context))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    refuse_unprovable_exit(report.exit_code)?;
+    refuse_non_sha256_commitment(&public_values, &committed_digest)?;
+    Ok((public_values, report))
+}
+
 fn run_proof(
     prover: &sp1_sdk::blocking::CudaProver,
     pk_cache: &mut PkCache,
@@ -3052,11 +3096,7 @@ fn run_proof(
     // so a claimed-but-hostile guest could spin the executor far past the measured budget on the
     // prove worker (where it stacks on the warm sp1-gpu-server). The same ELF+input measured feasible,
     // so the cap never trips a legitimate claimed job.
-    let mut exec = prover.execute(Elf::from(elf), stdin.clone());
-    if let Some(limit) = sp1_execute_cycle_limit() {
-        exec = exec.cycle_limit(limit);
-    }
-    let (public_values, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (public_values, report) = execute_before_proof(prover, elf, &stdin)?;
     let cycles = sp1_proving_cost(&report);
 
     // Get-or-create the proving key for this ELF. The key depends only on the
@@ -4747,6 +4787,84 @@ mod pk_cache_tests {
             "refused for another reason: {err:#}"
         );
         assert!(super::refuse_unprovable_exit(0).is_ok());
+    }
+
+    /// The execute before a proof refuses what the measurement refuses, so a lock measured without
+    /// those checks (by an older worker, recovered across an upgrade) fails in an execute's time,
+    /// before a Groth16 proof, and as the job's input, not as a mismatch of its program.
+    #[test]
+    fn the_execute_before_a_proof_refuses_a_non_zero_exit() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let stdin = |input: &[u8]| {
+            let mut s = sp1_sdk::SP1Stdin::new();
+            s.write_slice(input);
+            s
+        };
+        let err = super::execute_before_proof(
+            test_cpu_prover(),
+            super::FIBONACCI_SP1_GUEST_ELF,
+            &stdin(&[]),
+        )
+        .expect_err("a guest that panicked passed the execute before its proof");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with(super::UNPROVABLE_EXIT), "{msg}");
+        assert!(matches!(
+            super::prove_error_kind(&msg),
+            zkminer_prover_protocol::ErrorKind::InvalidInput
+        ));
+        // A guest that halts with 0 passes, with the public values its proof will carry.
+        let (pv, report) = super::execute_before_proof(
+            test_cpu_prover(),
+            super::FIBONACCI_SP1_GUEST_ELF,
+            &stdin(&10u32.to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(report.exit_code, 0);
+        assert!(!pv.to_vec().is_empty());
+    }
+
+    /// A proof found committing its public values under Blake3 is reported as the job's (its input
+    /// commits so), never as a mismatch of its program's verifying key, which the host would hold
+    /// against every job of the program.
+    #[test]
+    fn a_proof_failure_is_reported_as_what_it_is() {
+        use zkminer_prover_protocol::ErrorKind;
+        let kind = super::prove_error_kind;
+        let blake3 = format!(
+            "{}: the on-chain verifier would reject it",
+            super::NOT_SHA256_COMMITTED
+        );
+        assert!(
+            matches!(kind(&blake3), ErrorKind::InvalidInput),
+            "{:?}",
+            kind(&blake3)
+        );
+        let refused =
+            super::refuse_non_sha256_commitment(&sp1_sdk::SP1PublicValues::from(b"x"), &[0; 32])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            matches!(kind(&refused), ErrorKind::InvalidInput),
+            "{refused}"
+        );
+        let exit = super::refuse_unprovable_exit(1).unwrap_err().to_string();
+        assert!(matches!(kind(&exit), ErrorKind::InvalidInput), "{exit}");
+        assert!(matches!(
+            kind("ELF vkey hash does not match job programId (served ELF is not the registered program) — refusing to prove"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("could not parse SP1 vkey hash for programId binding — refusing to prove"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("cudaErrorMemoryAllocation: out of memory"),
+            ErrorKind::ResourceExhausted
+        ));
+        assert!(matches!(kind("something else"), ErrorKind::ProofFailed));
     }
 }
 

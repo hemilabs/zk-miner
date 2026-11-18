@@ -64,6 +64,8 @@ pub struct Account {
     pub code_hash: [u8; 32],
 }
 
+crate::guard::plain_data!(struct Account { nonce, balance, storage_root, code_hash });
+
 impl Account {
     /// What an absent account reads as.
     pub const ABSENT: Self = Self { nonce: 0, balance: [0; 32], storage_root: EMPTY_ROOT, code_hash: KECCAK_EMPTY };

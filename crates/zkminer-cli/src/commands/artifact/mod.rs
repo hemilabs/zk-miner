@@ -29,16 +29,20 @@
 //!   explicit, the tip the inclusion floor measured from recent blocks; a chunk unmined for
 //!   [`STUCK_BLOCKS`] blocks while the gate is open is replaced at its nonce with bumped fees (at most
 //!   [`MAX_REPLACEMENTS`] times, the tip and the max fee capped), and only an above-threshold backlog
-//!   means waiting instead.
+//!   means waiting instead. Past the count or the caps it waits, while the pool holds the
+//!   transaction: one the pool dropped is sent again as it was (at most [`MAX_RESENDS`] times), and
+//!   the publish stops with an error when that is refused.
 //! - **Deploy and verify:** chunks first, the manifest last, addresses from receipts; every
 //!   receipt's status checked, a failed creation (out of gas) redeployed at a new nonce; then the
 //!   wait until every deploying block is at or below `safe` with its hash unchanged, the §13.4 fetch
 //!   of the locator at the safe head (pinned by hash, with the miner's own manifest, chunk and
 //!   assembly checks), and only then the result.
-//! - **Resume:** with `--progress FILE` each mined deployment is recorded, and a later run of the
-//!   same artifact to the same chain reuses the recorded chunks whose code is on chain, sending only
-//!   the rest. Without it, a run that stopped part-way is simply run again: it sends every chunk
-//!   anew (paced the same, paid again), and the chunks of the first run stay on chain unused.
+//! - **Resume:** with `--progress FILE` each mined deployment is recorded, and so is each
+//!   transaction before it is sent (synced to disk); a later run of the same artifact to the same
+//!   chain reuses the recorded chunks whose code is on chain, and the transaction sent before the
+//!   stop when it created the next deployment, sending only the rest (one still pending stops it
+//!   until it settles). Without it, a run that stopped part-way is simply run again: it sends every
+//!   chunk anew (paced the same, paid again), and the chunks of the first run stay on chain unused.
 
 pub mod keys;
 pub mod plan;
@@ -93,6 +97,8 @@ const MIN_TIP_CAP_WEI: u128 = 1_000_000_000;
 const BASE_FEE_CAP_MULTIPLE: u128 = 8;
 /// Replacements sent (or refused) at one nonce, at most; then the publisher only waits.
 pub const MAX_REPLACEMENTS: u32 = 16;
+/// How many times a transaction the pool dropped, past the replacements, is sent again as it was.
+pub const MAX_RESENDS: u32 = 3;
 /// Hemi's block time (mainnet and testnet): the least time between two sends there.
 const HEMI_BLOCK_TIME: Duration = Duration::from_secs(12);
 /// The least time between two sends outside developer mode on any chain.
@@ -238,6 +244,13 @@ pub struct Faults {
     pub stop_after: Option<usize>,
     /// How long `--verify-rpc-url` may take (default [`VERIFY_TIMEOUT`]).
     pub verify_timeout: Option<Duration>,
+    /// The run's tip and fee caps are its first send's: no replacement can raise them.
+    pub no_fee_room: bool,
+    /// This many sends again of a dropped transaction are themselves dropped from the pool.
+    pub drop_resends: u32,
+    /// The run stops (an error) right after its first send, before the receipt: a run killed with a
+    /// transaction in flight.
+    pub stop_after_send: bool,
 }
 
 /// A block header as the publisher reads it.
@@ -636,8 +649,19 @@ impl Publisher {
         Ok(v.as_str().context("no tx hash")?.parse()?)
     }
 
-    /// Deploys `runtime` verbatim (one chunk or the manifest), sizing nothing: the caller sized it.
-    async fn deploy(&mut self, runtime: &[u8], label: &str) -> Result<Deployed> {
+    /// Records in `--progress`, before it is sent, a transaction at `nonce` for `target` (a chunk's
+    /// range, or the manifest).
+    fn note_send(&mut self, target: &Option<std::ops::Range<usize>>, nonce: u64, hash: B256) -> Result<()> {
+        if let Some(p) = &mut self.progress {
+            p.note_send(target.clone(), nonce, self.signer.address().create(nonce), hash);
+            p.save()?;
+        }
+        Ok(())
+    }
+
+    /// Deploys `runtime` verbatim (one chunk, `target` its range, or the manifest), sizing nothing:
+    /// the caller sized it.
+    async fn deploy(&mut self, runtime: &[u8], label: &str, target: Option<std::ops::Range<usize>>) -> Result<Deployed> {
         #[cfg(test)]
         if self.faults.stop_after.is_some_and(|n| self.mined >= n) {
             bail!("stopped by the test after {} deployment(s)", self.mined);
@@ -664,14 +688,22 @@ impl Publisher {
             let mut replacements = 0u32;
             let mut attempts = 0u32;
             let (hash, raw) = self.sign(plan::unsigned_creation(self.chain.chain_id, nonce, gas, max_fee, tip, input.clone()))?;
+            self.note_send(&target, nonce, hash)?;
             self.last_send_at = Some(Instant::now());
             self.send_raw(&raw).await.with_context(|| format!("sending {label}"))?;
             hashes.push(hash);
+            // What the pool holds at this nonce: sent again as it is if the pool drops it.
+            let mut pooled_raw = raw;
+            let mut resends = 0u32;
             self.last_send_head = Some(head.number);
             self.say(format!("{label}: sent {hash} at nonce {nonce} (gas {gas}, tip {tip} wei, max fee {max_fee} wei)"));
             #[cfg(test)]
             if std::mem::take(&mut self.faults.drop_first_send) {
                 let _ = self.chain.rpc.call("anvil_dropTransaction", json!([format!("{hash:#x}")])).await;
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut self.faults.stop_after_send) {
+                bail!("stopped by the test after sending {hash}");
             }
             // The receipt of any transaction sent at this nonce; a replacement while the gate is open.
             let mut sent_at = head.number;
@@ -702,7 +734,42 @@ impl Publisher {
                             bail!("{label}: nonce {nonce} was used by a transaction this publisher did not send");
                         }
                     } else if attempts >= MAX_REPLACEMENTS || !raises_both(tip, max_fee, next_tip, next_max) {
-                        if capped_said.elapsed() >= Duration::from_secs(60) {
+                        // Only waiting is left, while the pool holds the transaction. One it dropped
+                        // (nothing pending at this nonce) is sent again as it was, a few times;
+                        // refused, the publish stops rather than wait for what is not coming.
+                        if self.chain.nonce(self.signer.address(), "pending").await? <= nonce {
+                            resends += 1;
+                            if resends > MAX_RESENDS {
+                                bail!(
+                                    "{label}: the pool dropped the transaction at nonce {nonce} again after {MAX_RESENDS} \
+                                     sends of it (tip {tip} wei, max fee {max_fee} wei, at this run's caps or after \
+                                     {attempts} replacement(s)); nothing more is sent: publish again later (with \
+                                     --progress, what is mined is kept)"
+                                );
+                            }
+                            match self.send_raw(&pooled_raw).await {
+                                Ok(_) => {}
+                                Err(e) if already_pooled(&e) => {}
+                                Err(e) => bail!(
+                                    "{label}: the pool dropped the transaction at nonce {nonce} (tip {tip} wei, max fee \
+                                     {max_fee} wei, at this run's caps or after {attempts} replacement(s)) and refused it \
+                                     again ({e:#}); nothing more is sent: publish again later (with --progress, what is \
+                                     mined is kept)"
+                                ),
+                            }
+                            self.last_send_at = Some(Instant::now());
+                            self.last_send_head = Some(now.number);
+                            self.say(format!(
+                                "{label}: the pool dropped its transaction at nonce {nonce}; sent it again ({resends}/{MAX_RESENDS})"
+                            ));
+                            #[cfg(test)]
+                            if self.faults.drop_resends > 0 {
+                                self.faults.drop_resends -= 1;
+                                for h in &hashes {
+                                    let _ = self.chain.rpc.call("anvil_dropTransaction", json!([format!("{h:#x}")])).await;
+                                }
+                            }
+                        } else if capped_said.elapsed() >= Duration::from_secs(60) {
                             self.say(format!(
                                 "{label}: unmined after {attempts} replacement(s), at the caps (tip {} wei, max fee {} wei) or the \
                                  count ({MAX_REPLACEMENTS}); waiting (stop with Ctrl-C and publish again)",
@@ -714,13 +781,14 @@ impl Publisher {
                     } else {
                         let (h2, raw2) =
                             self.sign(plan::unsigned_creation(self.chain.chain_id, nonce, gas, next_max, next_tip, input.clone()))?;
+                        self.note_send(&target, nonce, h2)?;
                         self.last_send_at = Some(Instant::now());
                         attempts += 1;
                         // Watched for a receipt either way: a send whose answer was lost may be pooled.
                         hashes.push(h2);
                         match self.send_raw(&raw2).await {
-                            Ok(_) => {}
-                            Err(e) if already_pooled(&e) => {}
+                            Ok(_) => pooled_raw = raw2,
+                            Err(e) if already_pooled(&e) => pooled_raw = raw2,
                             Err(e) => {
                                 self.say(format!(
                                     "{label}: a replacement was refused ({e:#}); the pool keeps tip {tip} wei, max fee {max_fee} wei"
@@ -1042,25 +1110,40 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
     )?;
     let me = signer.address();
     check_key(&chain, router, from_block, me).await?;
-    let latest = chain.nonce(me, "latest").await?;
-    let pending = chain.nonce(me, "pending").await?;
-    if pending != latest {
-        bail!("{me} has {} pending transaction(s) it did not send here: let them settle, or use a key of its own (§13.5)", pending - latest);
-    }
-
     // 4. What an earlier run left (`--progress`), the plan and the cost preview.
     let mut progress = match &opts.progress {
         Some(path) => Some(Progress::open(path, opts.chain_id, B256::from(sha256), bytes.len())?),
         None => None,
     };
+    let latest = chain.nonce(me, "latest").await?;
+    let pending = chain.nonce(me, "pending").await?;
+    if pending != latest {
+        // The transaction an earlier run sent before it stopped, still in the pool: checked once it
+        // settles, never sent around.
+        if let Some((nonce, hashes)) =
+            progress.as_ref().and_then(|p| p.pending_send()).filter(|(n, _)| (latest..pending).contains(n))
+        {
+            let hashes: Vec<String> = hashes.iter().map(|h| format!("{h:#x}")).collect();
+            bail!(
+                "the transaction the stopped run sent at nonce {nonce} ({}) is still pending: let it mine or drop, then \
+                 publish again (it is checked before anything is sent)",
+                hashes.join(", ")
+            );
+        }
+        bail!(
+            "{me} has {} pending transaction(s) it did not send here: let them settle, or use a key of its own (§13.5)",
+            pending - latest
+        );
+    }
     let (mut deployed, reused_manifest) = match &progress {
         Some(p) => p.reusable(&chain, &bytes).await?,
         None => (Vec::new(), None),
     };
     let reused_to = deployed.last().map_or(0, |d: &(std::ops::Range<usize>, Deployed)| d.0.end);
     if let Some(p) = &mut progress {
-        // Only what was found on chain stays recorded: the rest is sent again.
-        p.keep(deployed.len(), reused_manifest.is_some());
+        // Only what was found on chain stays recorded (a transaction left pending included, when
+        // it created what it was for): the rest is sent again.
+        p.keep(&deployed, reused_manifest.as_ref());
         p.save()?;
     }
     if !deployed.is_empty() {
@@ -1089,9 +1172,15 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
             None => qty(&chain.rpc.call("eth_maxPriorityFeePerGas", json!([])).await?)?.max(1),
         },
     };
-    let tip_cap = tip.saturating_mul(TIP_CAP_MULTIPLE).max(MIN_TIP_CAP_WEI);
-    let fee_cap = head.base_fee.saturating_mul(BASE_FEE_CAP_MULTIPLE).saturating_add(tip_cap);
+    #[allow(unused_mut)]
+    let mut tip_cap = tip.saturating_mul(TIP_CAP_MULTIPLE).max(MIN_TIP_CAP_WEI);
+    #[allow(unused_mut)]
+    let mut fee_cap = head.base_fee.saturating_mul(BASE_FEE_CAP_MULTIPLE).saturating_add(tip_cap);
     let (_, max_fee) = plan::fees(head.base_fee, tip);
+    #[cfg(test)]
+    if faults.no_fee_room {
+        (tip_cap, fee_cap) = (tip, max_fee);
+    }
     let largest = chunks.iter().map(|c| c.len()).max().unwrap_or(0);
     let gas_largest = match chunks.iter().find(|c| c.len() == largest) {
         Some(c) => chain.estimate_gas(me, &plan::chunk_creation(&bytes[c.clone()])).await?,
@@ -1176,7 +1265,7 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
     };
     for c in &chunks {
         let runtime = zkminer_witness::manifest::chunk_runtime_code(&bytes[c.clone()]);
-        let d = p.deploy(&runtime, &format!("chunk {}/{}", deployed.len() + 1, all_chunks)).await?;
+        let d = p.deploy(&runtime, &format!("chunk {}/{}", deployed.len() + 1, all_chunks), Some(c.clone())).await?;
         p.record(&d, Some(c.clone()))?;
         deployed.push((c.clone(), d));
     }
@@ -1186,7 +1275,7 @@ pub async fn publish_with(config: &ZkMinerConfig, mut opts: PublishOptions, faul
     let manifest = match reused_manifest {
         Some(m) => m,
         None => {
-            let m = p.deploy(&manifest_runtime, "manifest").await?;
+            let m = p.deploy(&manifest_runtime, "manifest", None).await?;
             p.record(&m, None)?;
             m
         }

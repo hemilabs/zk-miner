@@ -3,13 +3,15 @@
 //! arguments, an early exit; and the same host inputs reached around the names the lints used to
 //! ban: the raw syscall entry points (`syscall_*_nr` with `nr::SYS_RANDOM`, `SYS_CYCLE_COUNT`,
 //! `SYS_GETENV`), another file descriptor (`sys_read` of fd 3, `FdReader`), the raw keccak
-//! permutation's status (which shows the host's keccak po2), and a `static` that a non-capturing
-//! function reads into an output. The lint tests check that the built ELF carries the syscalls
-//! these reach and that the source scan flags them. Never deployed.
+//! permutation's status (which shows the host's keccak po2), a `static` atomic that a
+//! non-capturing function reads into an output, and a `OnceCell` set from the input (the
+//! interior-mutable types a guest could otherwise fill from `W`). The lint tests check that the
+//! built ELF carries the syscalls these reach and that the source scan and clippy flag them. Never
+//! deployed.
 
 #![no_main]
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -87,6 +89,12 @@ fn main() {
         SMUGGLED.store(n, Ordering::Relaxed);
         let c = Cell::new(read_smuggled(&0));
         out += c.get();
+    }
+    if n & 4096 != 0 {
+        // A cell set once from the input.
+        let c = OnceCell::new();
+        let _ = c.set(u64::from(n));
+        out += c.get().copied().unwrap_or(0);
     }
     env::commit(&out);
 }

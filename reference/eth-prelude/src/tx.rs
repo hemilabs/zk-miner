@@ -72,6 +72,8 @@ pub struct Signature {
     pub s: [u8; 32],
 }
 
+crate::guard::plain_data!(struct Signature { y_parity, r, s });
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub tx_type: u8,
@@ -95,6 +97,10 @@ pub struct Transaction {
     /// Deposits only.
     pub is_system_tx: Option<bool>,
 }
+
+crate::guard::plain_data!(struct Transaction {
+    tx_type, chain_id, nonce, gas_limit, to, value, input, signature, deposit_from, source_hash, mint, is_system_tx,
+});
 
 fn chain_id(item: &Item<'_>) -> Result<u64, TxError> {
     let b = item.uint_bytes(32)?;
@@ -266,6 +272,8 @@ pub struct HashedTransaction {
     /// `keccak256` of the EIP-2718 encoding.
     pub hash: [u8; 32],
 }
+
+crate::guard::plain_data!(struct HashedTransaction { tx, hash });
 
 /// The transaction hash: `keccak256` of the EIP-2718 encoding.
 pub fn tx_hash(encoded: &[u8]) -> [u8; 32] {

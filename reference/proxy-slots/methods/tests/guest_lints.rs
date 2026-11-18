@@ -6,7 +6,7 @@
 //!
 //! Two checks here, each shown to catch every violation of the lint control guest, which commits
 //! all of them (including the ways around the names: the raw `syscall_*_nr` entry points, fd 3,
-//! `FdReader`, a `static` read by a function that captures nothing):
+//! `FdReader`, a `static` atomic read by a function that captures nothing, a `OnceCell`):
 //!
 //! 1. **The built ELF** (`llvm-objdump`), which covers every crate the guest links:
 //!    - an `ecall` only inside the platform's syscall wrappers (`sys_*`, `syscall_*`) and risc0's
@@ -22,8 +22,10 @@
 //! 2. **The sources** of everything the guest links from this repository (the guest, the
 //!    statement, the prelude): no banned name outside comments, strings and test modules, among
 //!    them `syscall_*`, `SYS_*`, `asm!`, `send_recv`, `FdReader`, `sys_keccak`, a `sys_read` of any
-//!    fd but `fileno::STDIN`, and `static`, `thread_local`, `Cell`, `RefCell` (a function the guards
-//!    accept as a derivation captures nothing, but could read one of those). This covers what the
+//!    fd but `fileno::STDIN`, and `static`, `thread_local` and every interior-mutable type (`Cell`,
+//!    `RefCell`, `UnsafeCell`, `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`, `RwLock`,
+//!    `Atomic*`): a function the guards accept as a derivation captures nothing, but could read one
+//!    kept in a `static`, and the guard types refuse to hold one. This covers what the
 //!    ELF cannot show: an early `env::exit(0)`, which halts like a return from `main`, and the fd a
 //!    read names.
 //!
@@ -303,9 +305,16 @@ const BANNED_NAMES: &[&str] = &[
     "Cell",
     "RefCell",
     "UnsafeCell",
+    "OnceCell",
+    "OnceLock",
+    "LazyCell",
+    "LazyLock",
+    "Mutex",
+    "RwLock",
 ];
-/// Identifier prefixes no guest source may use: the raw syscall entry points and the syscall names.
-const BANNED_PREFIXES: &[&str] = &["syscall_", "SYS_"];
+/// Identifier prefixes no guest source may use: the raw syscall entry points, the syscall names and
+/// the atomics (`AtomicU64`, `AtomicBool`, …), interior-mutable like the cells above.
+const BANNED_PREFIXES: &[&str] = &["syscall_", "SYS_", "Atomic"];
 /// A read of this fd only (`sys_read(fileno::STDIN, …)`): any other fd is a channel the prover's host
 /// fills.
 const STDIN: &str = "fileno::STDIN";
@@ -488,12 +497,15 @@ fn the_source_scan_catches_the_control_and_ignores_comments() {
         "FdReader",
         "static",
         "Cell",
+        "OnceCell",
+        "Atomic…",
     ] {
         assert!(found.contains(expected), "{expected} not found: {found:?}");
     }
     let quiet = "// HashMap\n/* env::exit /* nested sys_rand */ */\nlet s = \"std::env\"; let r = r#\"cycle_count\"#;\n\
                  let c = '\"'; fn f<'a>(x: &'a u8) {}\nstruct MyHashMapLike; fn my_cycle_count_x() {}\n\
                  fn w() -> Witness<'static> {} struct OnceCellLike; fn my_syscall_x() {} fn MY_SYS_X() {}\n\
+                 struct MyMutexLike; fn rw_lock_free() {} struct NotAtomic; fn lazy_lock_x() {}\n\
                  let n = unsafe { sys_read(fileno::STDIN, p, 4) };\n";
     assert_eq!(banned_names(quiet), BTreeSet::new());
     let one = |s: &str| banned_names(s).into_iter().collect::<Vec<_>>();
@@ -503,9 +515,19 @@ fn the_source_scan_catches_the_control_and_ignores_comments() {
     assert_eq!(one("unsafe { syscall_0_nr(11, nr::SYS_RANDOM, p, 8) }"), ["SYS_…", "syscall_…"]);
     assert_eq!(one("let n = unsafe { sys_read(3, p, 16) };"), ["sys_read(fd)"]);
     assert_eq!(one("unsafe { core::arch::asm!(\"ecall\") }"), ["asm"]);
-    assert_eq!(one("static HINT: AtomicU64 = AtomicU64::new(0);"), ["static"]);
+    assert_eq!(one("static HINT: AtomicU64 = AtomicU64::new(0);"), ["Atomic…", "static"]);
     assert_eq!(one("thread_local! { static X: u8 = 0 }"), ["static", "thread_local"]);
     assert_eq!(one("let c = std::cell::RefCell::new(0);"), ["RefCell"]);
     assert_eq!(one("let r = env::FdReader::new(3);"), ["FdReader"]);
     assert_eq!(one("let a = hdr.derive(|_| SMUGGLED.load(Ordering::Relaxed)); static SMUGGLED: u8 = 0;"), ["static"]);
+    // Every interior-mutable type, whichever the guard types would refuse to hold: a derivation
+    // that captures nothing could still read one a guest keeps in a static.
+    assert_eq!(one("let c = core::cell::OnceCell::<u64>::new();"), ["OnceCell"]);
+    assert_eq!(one("let c: std::sync::OnceLock<u64> = OnceLock::new();"), ["OnceLock"]);
+    assert_eq!(one("let c = core::cell::LazyCell::new(|| 0u64);"), ["LazyCell"]);
+    assert_eq!(one("let c = std::sync::LazyLock::new(|| 0u64);"), ["LazyLock"]);
+    assert_eq!(one("let m = std::sync::Mutex::new(0u64);"), ["Mutex"]);
+    assert_eq!(one("let m = std::sync::RwLock::new(0u64);"), ["RwLock"]);
+    assert_eq!(one("let a = core::sync::atomic::AtomicBool::new(false);"), ["Atomic…"]);
+    assert_eq!(one("use std::sync::atomic::{AtomicUsize, Ordering};"), ["Atomic…"]);
 }

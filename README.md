@@ -382,20 +382,37 @@ Worth knowing:
   refused at start, and its proof system is not offered on that card. Workers in
   `~/.zkminer/provers` are found before the ones shipped beside the miner: replace them too, or
   remove them, when you upgrade.
-- **One job locks at most half the stake.** A submitter chooses a job's collateral rate (up to
-  500%) and its minimum collateral, and a forced release burns a share of what is locked. So a job
-  whose collateral at its maximum price is over `ZKMINER_MAX_JOB_COLLATERAL_FRACTION` (default
-  `0.5`) of the total stake is set aside, not claimed; `0` turns the cap off. (Witness jobs, which
-  come only from the callers `[witness] callers` lists, are not capped.)
+- **One job locks at most half the stake, and so do one program's and one submitter's jobs
+  together.** A submitter chooses a job's collateral rate (up to 500%) and its maximum price, and a
+  forced release burns a share of what is locked. The cap is `ZKMINER_MAX_JOB_COLLATERAL_FRACTION`
+  (default `0.5`; `0` turns it off) of the total stake, but never less than the deployment's
+  per-job floor (`MIN_COLLATERAL_AMOUNT`, 100 HEMI on 743111), so a stake of 100–199 HEMI can still
+  claim one job (the miner says so once at startup). A job whose collateral at its maximum price is
+  over the cap is set aside, not claimed; one that would take the jobs of its program, or of its
+  submitter, that this miner holds and has not proven yet over the cap waits until they are proven.
+  Witness jobs are held to the same cap, inline and witness locks counting together, and
+  `run --watch-only` reports a job over it. A value that is not a number from 0 up is warned
+  about and the default used.
 - **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
   sha, bigint) by what they cost to prove, where the instruction count counted each as one.
   Benchmarks saved by an older miner count SP1 instructions per second, which is close for code
   without precompiles; run `zkminer benchmark` (again with `--calibrate` if you calibrated) to
   record SP1 in gas.
-- **risc0 proofs write their segments to disk**, under `~/.zkminer/risc0-segments/<pid>` (mode
-  0700), not to the temporary directory: a long proof stages gigabytes there, which on a tmpfs
-  would be RAM the miner does not count. Keep room on the home filesystem. Each proof empties the
-  directory, and a worker that was killed has its directory removed when the next one starts.
+- **risc0 proofs write their segments to disk**, not to the temporary directory: a long proof
+  stages gigabytes there, which on a tmpfs would be RAM the miner does not count. Each worker has
+  a directory of its own (mode 0700): `<segment_dir>/inline/<pid>-<start>` when `[retention]` is
+  configured, beside the witness proofs', else `~/.zkminer/risc0-segments/<pid>-<start>`
+  (`~/.zkminer` may be a link of yours to a directory of yours, on another disk). Keep room there:
+  an inline risc0 job is claimed only while its segments (estimated at 4 bytes per sized cycle)
+  fit beside those of every proof planned or running, witness ones included, with 1 GiB to spare,
+  and a worker does not start a proof with under 1 GiB free. A proof that fails while the disk
+  has no room for its segments (a full disk or quota) is this host's failure: it is not held
+  against the job's program or submitter. Each proof empties its directory, and a worker that was
+  killed has its directory removed when the next one starts. That sweep tells a live worker by
+  its pid and start time in `/proc`. On another OS it cannot, and keeps every directory: remove a
+  killed worker's by hand. Workers that share one home from different pid namespaces (containers)
+  cannot see each other and would remove each other's: give each its own home, or its own
+  `[retention] segment_dir`.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
@@ -811,15 +828,20 @@ public. The rules it follows are the format's own (§13.5 of the design):
   transaction estimates at most 19,500 DA bytes. A chunk unmined for 3 blocks with the gate open is
   replaced at its nonce with both fee fields raised, at most 16 times, the tip never past 64 times
   the measured tip floor and the max fee never past 8 times the starting base fee plus that; a
-  refused replacement leaves the pooled fees as they were; a failed creation is redeployed at a new
-  nonce;
+  refused replacement leaves the pooled fees as they were. Past the replacements or the caps it
+  waits while the pool holds the chunk; one the pool dropped is sent again as it was, at most 3
+  times, and the publish stops with an error if the pool refuses it or keeps dropping it. A failed
+  creation is redeployed at a new nonce;
 - it waits until every deploying block is at or below the safe head with its hash unchanged, reads
   the artifact back there with the miner's manifest, chunk and assembly checks, and only then
   prints the locator, sha256, length, addresses, total cost, and the `builderId` (or, for an ELF,
   the `addStorageURI` arguments). Submit the job only after that. `--json` prints it as JSON;
-- `--progress FILE` records each mined deployment; run the same command again after a failure
-  and it reuses the recorded chunks whose code is on chain, sending only the rest. Without it, a
-  run that stopped part-way is run again from the start: every chunk is sent (and paid) again.
+- `--progress FILE` records each mined deployment, and each transaction before it is sent (synced
+  to disk); run the same command again after a failure and it reuses the recorded chunks whose code
+  is on chain, and the transaction a killed run left in flight when it created the next one, sending
+  only the rest (while that transaction is still pending, the run refuses to start: let it settle).
+  Without it, a run that stopped part-way is run again from the start: every chunk is sent (and
+  paid) again.
 
 The router is the known deployment's on the chain, else `--router`. A configuration's `[dev]
 da_backlog_bytes` stands in for the backlog reading only in developer mode, and on Hemi testnet's

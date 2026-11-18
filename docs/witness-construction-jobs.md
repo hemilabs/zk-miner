@@ -145,7 +145,7 @@ the witness is obtained.
 | 4 | Obtain the builder artifact: local cache → operator mirror → `hemi-code` (§13); verify its content id | artifact endpoint | per §16 |
 | 5 | Run the builder in its sandbox (§10); `W` streams to the retention store | broker | per §16 |
 | 6 | Execute the guest in the execute sandbox (§10.1) on `prefix ‖ W` at every po2 this host may prove at | none | per §16 |
-| 7 | **Claim gate:** `J` ≤ 32,768 bytes; binding satisfied at every po2 with identical journals; fulfil DA size (§5.5); gas by the guide's formula; price ≥ reservation (§17.2); prove time leaves a margin before `D`, and each proof attempt fits the per-attempt proving timeout ((sized cycles at the slowest eligible card's benchmarked rate, else a floor for its kind, plus the card's measured Groth16 wrap, else an allowance for its kind — minutes on a CPU) × `deadline_safety_margin`, plus three times the measured execute); prove resources fit (host RAM for `W`, segment disk, VRAM, operator session cap — §15.3); the adapter's `SELECTOR()` matches this toolchain | chain reads | skip |
+| 7 | **Claim gate:** `J` ≤ 32,768 bytes; binding satisfied at every po2 with identical journals; fulfil DA size (§5.5); gas by the guide's formula; price ≥ reservation (§17.2); prove time leaves a margin before `D`, and each proof attempt fits the per-attempt proving timeout ((sized cycles at the slowest eligible card's benchmarked rate, else a floor for its kind, plus the card's measured Groth16 wrap, else an allowance for its kind — minutes on a CPU) × `deadline_safety_margin`, plus three times the measured execute); the collateral cap, as inline jobs have it (the job's collateral at its maximum price within `max(fraction × stake, MIN_COLLATERAL_AMOUNT)`, and with the unproven jobs of its program and of its caller held here, inline or witness, within it too: over by its own terms is this host's limit, over a share is deferred; taken again with the count right before the lock); prove resources fit (host RAM for `W`, segment disk, VRAM, operator session cap — §15.3); the adapter's `SELECTOR()` matches this toolchain | chain reads | skip |
 | 8 | Publish the bundle and its pin (§15) | none | skip |
 | 9 | Revalidate the bundle against the host as it is now (§15.2); re-run the claimability `eth_call` (§5.3); send the lock transaction | chain | — |
 | 10 | Prove the bundle: execute, compare, prove (§15.3) | none | the miner's own failure |
@@ -582,11 +582,15 @@ validation is where soundness bugs hide.
 - **Commit what you checked.** The reference library enforces it with types: a `Pinned<T>` built
   only from `W`'s header words and committed exactly once, in header order; an `Authenticated<T>`
   produced only by verifiers, from pinned values, from guest constants (`constant!`: an associated
-  `const` of a sealed plain-data type, byte arrays, integers, `bool` or the prelude's own types), or
-  by `fn`-pointer derivations of those; outputs only of the sealed `ToWord` types; trie keys taken
-  only as `Authenticated` values; and a `finish()` that returns the journal only when every header
-  word was committed and every item of `W` read. A `fn` pointer captures nothing but can still read
-  a `static`, `thread_local!` or `Cell`: the guest lints refuse those in a guest's sources.
+  `const`), or by `fn`-pointer derivations of those; both holding only the sealed `PlainData` types
+  (integers, `bool`, byte arrays, `Vec`s, `Option`s, arrays and tuples of those, the prelude's own
+  types), so no derivation can put a cell, lock, atomic, reference or guest-defined type inside one
+  and set it through `get`; outputs only of the sealed `ToWord` types; trie keys taken only as
+  `Authenticated` values; and a `finish()` that returns the journal only when every header word was
+  committed and every item of `W` read. A `fn` pointer captures nothing but can still read a
+  `static` or `thread_local!`: the guest lints refuse those, and every interior-mutable type, in a
+  guest's sources. Left to an audit: `unsafe` code, and a branch on an unverified value that chooses
+  which derivation runs.
 
 ### 8.4 EVM state, receipts and transactions
 
@@ -918,7 +922,8 @@ Each property has a mechanism; none is assumed.
       since the executor's memory monitor reads its runner child's entries), the worker's own
       directory and SDK files, and the retention store;
     - write: a private `TMPDIR`, the segment directories (a witness proof's slot directory; for the
-      risc0 worker's other proofs, its own `~/.zkminer/risc0-segments/<pid>`), the GPU kernel caches,
+      risc0 worker's other proofs, its own `<segment_dir>/inline/<pid>-<start>`, or
+      `~/.zkminer/risc0-segments/<pid>-<start>` without `[retention]`), the GPU kernel caches,
       and, for an SP1 server, the user's Groth16 queue (`~/.zkminer/locks`, never in `/dev/shm`);
     - execute: only the loader and what the worker starts;
     - devices: the GPU nodes;
@@ -1385,7 +1390,9 @@ transactions.
   refused: miners count chunk reads from 16,384-byte chunks, `⌈max_builder_bytes / 16,384⌉ + 1` (257
   for 4 MiB), and a manifest over it is `NotAdmitted`, deferred for ever. At most 16 replacements
   per nonce, the max fee never above 8× the starting base fee plus the tip cap (above that the
-  publisher waits). A refused replacement leaves the pooled fees as they were.
+  publisher waits). A refused replacement leaves the pooled fees as they were. Waiting at the caps
+  lasts while the pool holds the transaction: one the pool dropped (nothing pending at its nonce) is
+  sent again as it was, at most 3 times; refused, or dropped again, the publish fails with an error.
 - **Deploy and verify:** chunks first, the manifest last; addresses from receipts, never precomputed;
   every receipt's status checked (an out-of-gas creation spends the nonce and leaves the address
   empty: redeploy at a new nonce); with a CREATE2 factory, identical code already present is success.
@@ -1402,9 +1409,13 @@ transactions.
   `chunk_body`, `Assembler`), run inside the publisher (the broker needs the miner's sandbox and the
   operator's endpoint). The assembled bytes must equal the file. For an ELF it prints
   `addStorageURI(<programId>, 3, locator, keccak256(elf))`. With `--progress FILE` every mined
-  deployment is recorded. A later run of the same artifact to the same chain reuses recorded chunks
-  from the start, while their receipt and code at that block match, plus the manifest when every
-  chunk was reused, and sends only the rest. Without it, a re-run sends every chunk again.
+  deployment is recorded, and every transaction before it is sent (its nonce, the address its
+  creation makes, each hash at that nonce), each record synced to disk. A later run of the same
+  artifact to the same chain reuses recorded chunks from the start, while their receipt and code at
+  that block match, then the transaction a killed run left in flight when one of its hashes created
+  the next deployment as recorded, plus the manifest when every chunk was reused, and sends only the
+  rest; while that transaction is still pending it refuses to start. Without it, a re-run sends every
+  chunk again.
 
 The full cost arithmetic is in Appendix B: about 231M gas per MiB; at a tip near the inclusion floor
 the L1 data fee dominates — about 0.0009 ETH per MiB at a 0.062 gwei L1 base fee, about 0.4 ETH at
@@ -2132,7 +2143,9 @@ provider units, retention bytes.
    `Pinned` / `Authenticated` types of §8.3, plus lints banning default-seeded `HashMap`/`HashSet`,
    `env::exit`/`pause`, `env::var`/`args`, `cycle_count`, `sys_rand`, raw `sys_keccak`, the raw
    syscall entry points (`syscall_*`, `SYS_*` names, `asm!`, `send_recv`), fds other than stdin
-   (`FdReader`, `sys_read` of another fd), and `static`/`thread_local!`/`Cell`/`RefCell` in guests.
+   (`FdReader`, `sys_read` of another fd), and `static`/`thread_local!` and every interior-mutable
+   type (`Cell`, `RefCell`, `UnsafeCell`, `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`,
+   `RwLock`, `Atomic*`) in guests.
    Three layers: clippy, the built ELF (the `ecall`, caller and name-string rules), and a source
    scan. Every risc0 guest's runtime draws memory-image entropy through `sys_rand` in `env::init`,
    which never reaches the journal; the check allows that one caller and no other. **No mainnet

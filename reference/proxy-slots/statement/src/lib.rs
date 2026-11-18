@@ -339,7 +339,9 @@ pub fn run(input: &[u8]) -> Result<Vec<u8>, Error> {
     journal.commit_pinned(&block_hash)?;
     let proxy = r.pin_address()?;
     journal.commit_pinned(&proxy)?;
-    let rule = r.pin_word()?.try_map(Rule::decode)?;
+    // The rule stays its pinned word (the guards hold only the prelude's plain data, never a type of
+    // this crate's own); it is checked here and decoded again where the slots are derived.
+    let rule = r.pin_word()?.try_map(|w| Rule::decode(w).map(|rule| rule.word()))?;
     journal.commit_pinned(&rule)?;
     let k = r.pin_u64(MAX_SLOTS)?;
     journal.commit_pinned(&k)?;
@@ -363,7 +365,11 @@ pub fn run(input: &[u8]) -> Result<Vec<u8>, Error> {
 
     // The slot set, from the pinned rule and count and the proven implementation; then each slot
     // of C, in rule order.
-    let slots = rule.authenticated().zip(implementation).zip(k.authenticated()).map(|((rule, i), k)| rule.slots(&i, k));
+    let slots = rule
+        .authenticated()
+        .zip(implementation)
+        .zip(k.authenticated())
+        .try_map(|((rule, i), k)| Rule::decode(rule).map(|rule| rule.slots(&i, k)))?;
     for slot in slots.into_items() {
         let value = r.storage(&proxy_account, &slot)?;
         journal.output(&slot)?;

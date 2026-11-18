@@ -105,8 +105,12 @@ No host input may reach the journal or a selection: no default-seeded `HashMap`/
 (`sys_rand` seeds them), `env::exit`/`pause`, environment, arguments, cycle count, `sys_rand`, the
 raw keccak permutation's status (it shows the host's keccak po2), a file descriptor other than
 stdin, or any syscall made around the platform's wrappers (the raw `syscall_*_nr` entry points,
-`asm!`). And no `static`, `thread_local!`, `Cell` or `RefCell`: a derivation the guards accept
-captures nothing, but could read one of those.
+`asm!`). And no `static`, `thread_local!` or interior-mutable type (`Cell`, `RefCell`,
+`UnsafeCell`, `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`, `RwLock`, `Atomic*`): a
+derivation the guards accept captures nothing, but could read one kept in a `static`. (The guard
+types themselves refuse to hold an interior-mutable value, a reference or a type of the guest's
+own: see the prelude's README.) The statement keeps its rule as the pinned word for that reason,
+and decodes it where it derives the slots.
 
 - `guest/clippy.toml` denies what clippy can see; `./check-guest-lints.sh` runs clippy for the zkVM
   target with the risc0 toolchain, and checks that the lint control's violations are reported.
@@ -118,8 +122,9 @@ captures nothing, but could read one of those.
   `env::exit` or `env::pause`; the syscall name strings (`nr::SYS_*`) referenced only by their
   wrappers, and `SYS_GETENV`, `SYS_ARGV`, `SYS_ARGC`, `SYS_CYCLE_COUNT` by nothing; no hash-map seed
   linked. It also scans the sources of the guest, the statement and the prelude for the banned names,
-  the `syscall_`/`SYS_` prefixes, `asm!`, `send_recv`, `FdReader`, `static`, `thread_local`, `Cell`,
-  `RefCell` and a `sys_read` of any fd but `fileno::STDIN`. Both are shown to catch the lint control,
+  the `syscall_`/`SYS_`/`Atomic` prefixes, `asm!`, `send_recv`, `FdReader`, `static`,
+  `thread_local`, `Cell`, `RefCell`, `UnsafeCell`, `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`,
+  `Mutex`, `RwLock` and a `sys_read` of any fd but `fileno::STDIN`. Both are shown to catch the lint control,
   which also reaches every host input around the names (a reviewer's bypass guest, folded in).
 - What no lint sees: a host input the guest reads by an `ecall` inside one of the platform's own
   wrappers it is allowed to call, if the platform changed what that wrapper does. Pin the platform

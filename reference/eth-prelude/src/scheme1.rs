@@ -72,6 +72,13 @@ pub enum ProofKind {
     Exclusion = 1,
 }
 
+crate::guard::plain_data!(
+    enum ProofKind {
+        Inclusion,
+        Exclusion,
+    }
+);
+
 impl ProofKind {
     pub fn flipped(self) -> Self {
         match self {
@@ -417,6 +424,8 @@ pub struct ProvenAccount {
     pub address: [u8; 20],
     pub account: Option<Account>,
 }
+
+crate::guard::plain_data!(struct ProvenAccount { index, address, account });
 
 impl ProvenAccount {
     /// [`EMPTY_ROOT`](crate::keccak::EMPTY_ROOT) for an absent account.

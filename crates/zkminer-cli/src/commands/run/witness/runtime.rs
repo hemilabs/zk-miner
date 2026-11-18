@@ -66,7 +66,7 @@ use zkminer_chain::da::{
 use zkminer_chain::descriptor::{compute_descriptor_hash, fetch_job_descriptor_checked_with_form, FetchedDescriptor, SubmissionForm};
 use zkminer_chain::governance::{AbortReason as GovAbort, GovernanceConfig, GovernanceView, GovernanceWatcher};
 use zkminer_chain::jobs::{
-    fulfill_gas_formula, ClaimOutcome, ClaimQuote, FulfilDa, HashedFulfil, JOB_STATUS_FULFILLED, JOB_STATUS_LOCKED,
+    fulfill_gas_formula, ClaimOutcome, ClaimQuote, FulfilDa, HashedFulfil, JobInfo, JOB_STATUS_FULFILLED, JOB_STATUS_LOCKED,
     JOB_STATUS_OPEN, MAX_JOURNAL_BYTES, MAX_REOPEN_COUNT,
 };
 use zkminer_chain::rpc_meter::{with_lane, Lane};
@@ -101,7 +101,7 @@ use super::policy::{
     device_tally_key, divergence_reusable, elf_image_id_outcome, estimate_prove_secs, fixed_allowance_secs,
     fulfils_besides, funds_cover, gate_refusal_reason, held_lock_prove_sizes, host_max_guest_cycles,
     is_witness_input, lasts_until_terminal, not_claimable_reason, parse_session_cap, pin_lock_gone,
-    pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, segments_fit, session_cap_admits, short,
+    pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, session_cap_admits, short,
     tally_count, verdict_expires_at, verdict_plan, verdict_set_aside, watchdog_admits, ArtifactBudget, Blame,
     PinFacts, PinRead, ProvePlan, ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES,
     POST_LOCK_DEVICE_LIMIT, POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE,
@@ -366,6 +366,8 @@ struct GateOk {
     window: u64,
     /// The fulfil's gas limit the gate funded.
     fulfil_gas: u64,
+    /// What the claim may lock, and whose job it is, for the collateral cap (`run::collateral`).
+    exposure: run::collateral::Exposure,
 }
 
 /// A held witness lock, as the prove and fulfil steps need it.
@@ -461,8 +463,6 @@ pub(crate) struct WitnessRuntime {
     verdict_until: Mutex<HashMap<B256, u64>>,
     blame: Mutex<Blame>,
     image_ids: Arc<Mutex<HashMap<B256, B256>>>,
-    /// Segment bytes reserved per witness proof planned or running.
-    segment_reserved: Mutex<HashMap<B256, u64>>,
     brain: Mutex<Option<BrainLink>>,
     sim_slots: Arc<tokio::sync::Semaphore>,
     classify_slots: Arc<tokio::sync::Semaphore>,
@@ -627,7 +627,6 @@ impl WitnessRuntime {
             verdict_until: Mutex::new(HashMap::new()),
             blame: Mutex::new(Blame::default()),
             image_ids: Arc::new(Mutex::new(HashMap::new())),
-            segment_reserved: Mutex::new(HashMap::new()),
             brain: Mutex::new(None),
             sim_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS)),
             classify_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLASSIFICATIONS)),
@@ -1306,9 +1305,7 @@ impl WitnessRuntime {
             match locked {
                 Some(l) => rt.run_locked(l).await,
                 // Not locked: whatever the gate reserved for the proof goes.
-                None => {
-                    lock(&rt.segment_reserved).remove(&jid);
-                }
+                None => run::segment_disk::release(jid),
             }
         });
         Route::Witness
@@ -1899,7 +1896,7 @@ impl WitnessRuntime {
         if token.is_aborted() || shutting_down() {
             return None;
         }
-        let gate = match self.claim_gate(jid, &d, &rec, &candidate, &plan, quote.price_floor).await {
+        let gate = match self.claim_gate(&job.info, &d, &rec, &candidate, &plan, quote.price_floor).await {
             Ok(g) => g,
             Err((reason, detail)) => {
                 self.record_verdict(jid, caller, reason, &format!("claim gate: {detail}")).await;
@@ -1913,16 +1910,25 @@ impl WitnessRuntime {
 
     async fn claim_gate(
         &self,
-        jid: B256,
+        info: &JobInfo,
         d: &JobDescriptor,
         rec: &JobRecord,
         c: &Candidate,
         plan: &ProvePlan,
         price: u128,
     ) -> Result<GateOk, (SkipReason, String)> {
+        let jid = info.job_id;
         with_lane(Lane::PreClaim, async {
             if c.journal.len() > MAX_JOURNAL_BYTES {
                 return Err((SkipReason::JournalTooLarge, format!("{} bytes", c.journal.len())));
+            }
+            // The collateral cap, as the inline gate applies it (`run::collateral`): what this job
+            // alone may lock at its maximum price (its terms are fixed while it is Open: this host's
+            // limit, looked at again when the host changes), and with its program's and caller's
+            // unproven jobs here (not now).
+            let exposure = self.collateral_exposure(info, price).await?;
+            if let Some(refusal) = cap_refusal(run::collateral::check(jid, &exposure, self.collateral_cap().await)) {
+                return Err(refusal);
             }
             if !run::risc0_claimable() {
                 return Err((SkipReason::VerifierSelectorMismatch, "the risc0 adapter is not verified claimable".into()));
@@ -1974,23 +1980,11 @@ impl WitnessRuntime {
                 ));
             }
             // Prove resources: segment disk (reserved now, for this job, against every other proof
-            // planned or running), then host RAM through the dispatcher's ledger.
+            // planned or running, inline ones included: `run::segment_disk`), then host RAM through
+            // the dispatcher's ledger.
             let need = segment_need(c.per_po2.iter().map(|p| p.2));
             if let Some(dir) = self.retention.as_ref().map(|r| r.segment_dir.clone()) {
-                let mut reserved = lock(&self.segment_reserved);
-                let others: u64 = reserved.iter().filter(|(j, _)| **j != jid).map(|(_, b)| *b).sum();
-                match free_bytes(&dir) {
-                    Ok(free) if segments_fit(need, others, free) => {
-                        reserved.insert(jid, need);
-                    }
-                    Ok(free) => {
-                        return Err((
-                            SkipReason::ProveResources,
-                            format!("segments need {need} bytes beside {others} reserved; {free} free under {}", dir.display()),
-                        ))
-                    }
-                    Err(e) => return Err((SkipReason::ProveResources, format!("segment directory {}: {e}", dir.display()))),
-                }
+                run::segment_disk::try_reserve(jid, need, &dir).map_err(|e| (SkipReason::ProveResources, e))?;
             }
             if let (Some(pool), Some(available), Some(total)) = (
                 zkminer_prover::engine::worker_pool(),
@@ -2032,7 +2026,7 @@ impl WitnessRuntime {
                 plan.fixed_secs,
                 plan.margin
             );
-            Ok(GateOk { reservation, window: rec.fulfillment_timeout, fulfil_gas })
+            Ok(GateOk { reservation, window: rec.fulfillment_timeout, fulfil_gas, exposure })
         })
         .await
     }
@@ -2044,13 +2038,30 @@ impl WitnessRuntime {
         fulfils_besides(lock(&self.journal).entries.keys().copied(), jid)
     }
 
+    /// What a claim of `info`'s job may lock: its collateral at its maximum price (or the quoted
+    /// `price`, if higher) under its own snapshotted terms, as the inline gate sizes it.
+    async fn collateral_exposure(&self, info: &JobInfo, price: u128) -> Result<run::collateral::Exposure, (SkipReason, String)> {
+        run::prefetch_job_collateral_terms(&self.client, &[info.job_id]).await;
+        let Some(terms) = run::job_collateral_terms(info.job_id) else {
+            return Err((SkipReason::OperatorEndpoint, "its collateral terms (getJobSnapshots) are unreadable".into()));
+        };
+        Ok(run::claim_exposure(info, price, terms))
+    }
+
+    /// The collateral cap at the stake last read (`None`: off, or the stake not known yet).
+    async fn collateral_cap(&self) -> Option<u128> {
+        let total = self.state.read().await.stake_info.as_ref().map_or(0, |s| s.total_staked);
+        run::collateral::policy().cap(total)
+    }
+
     // ── the lock (§5.2 step 9) ────────────────────────────────────────────────
 
     /// Drops what a claim that provably did not land left: the claim intent and the pin. When an
     /// earlier claim of ours is unresolved (`prior`), both stay: that claim may have landed, and its
     /// lock would then be proven from this pin (recovery decides from the chain).
     async fn abandon_intent(&self, jid: B256, bundle: BundleRef, prior: bool) {
-        lock(&self.segment_reserved).remove(&jid);
+        run::segment_disk::release(jid);
+        run::collateral::forget(jid);
         if prior {
             return;
         }
@@ -2235,6 +2246,14 @@ impl WitnessRuntime {
             self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
             return None;
         }
+        // The collateral cap once more, deciding and counting the claim in one step: an inline claim
+        // may have taken its program's or caller's share since the gate.
+        if let Some((reason, why)) = cap_refusal(run::collateral::admit(jid, gate.exposure, self.collateral_cap().await)) {
+            self.abandon_intent(jid, c.bundle, prior).await;
+            tracing::info!("witness job {}: not locked now — {why}", short(jid));
+            self.record_verdict(jid, caller, reason, &why).await;
+            return None;
+        }
         // From here the task holds (or may hold) a lock: no abort reaches it, and it counts against
         // the cards.
         if let Some(t) = lock(&self.tasks).get_mut(&jid) {
@@ -2369,13 +2388,23 @@ impl WitnessRuntime {
     async fn run_locked(self: &Arc<Self>, mut l: LockCtx) {
         let jid = l.job_id;
         let caller = l.caller;
+        // A lock held and not proven yet counts against its program's and caller's share of the stake
+        // (a recovered one too), at what it locked.
+        run::collateral::record(
+            jid,
+            run::collateral::Exposure {
+                program: l.descriptor.programId,
+                submitter: caller,
+                collateral: l.locked_collateral.max(run::collateral::floor().unwrap_or(0)),
+            },
+        );
         let link = lock(&self.brain).clone();
         let _slot = link.map(|b| {
             let _ = b.held.send((jid, l.locked_collateral, l.cycles));
             run::SlotGuard(jid, b.done)
         });
         let result = with_lane(Lane::HeldLock, self.prove_and_fulfil(&mut l)).await;
-        lock(&self.segment_reserved).remove(&jid);
+        run::segment_disk::release(jid);
         let bundle = l.bundle;
         match result {
             Ok(()) => {}
@@ -2708,7 +2737,7 @@ impl WitnessRuntime {
                 expect_journal_sha256: first.journal_sha256.0,
                 segment_dir: segment_dir.to_string_lossy().into_owned(),
             };
-            lock(&self.segment_reserved).insert(jid, segment_need(l.record.po2_results.iter().map(|r| r.segment_bytes)));
+            run::segment_disk::reserve(jid, segment_need(l.record.po2_results.iter().map(|r| r.segment_bytes)));
             // The configured cap (`prover.proving_timeout_secs`), not the inline path's tightened
             // estimate: a watchdog kill costs a witness lock its proof. The claim gate admitted the
             // lock only if its realistic estimate (the CPU wrap included) fits this cap; the deadline
@@ -3745,16 +3774,15 @@ fn terminal_state(rec: &JobRecord) -> Option<TerminalState> {
     }
 }
 
-/// Bytes available to this user on the filesystem holding `dir`.
-fn free_bytes(dir: &Path) -> std::io::Result<u64> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| std::io::Error::other("path contains NUL"))?;
-    // SAFETY: statvfs fills a plain struct.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+/// The witness verdict for a collateral-cap refusal (`run::collateral`), `None` when admitted: a job
+/// whose terms alone ask for more than one job may lock is over this host's limit (looked at again
+/// when the host changes: a larger stake, another fraction); one over its program's or caller's share
+/// is not admitted now (deferred: their jobs here are proven soon). Neither is the caller's doing.
+fn cap_refusal(v: run::collateral::CapVerdict) -> Option<(SkipReason, String)> {
+    let why = v.describe()?;
+    Some((if v.is_final() { SkipReason::LimitsAboveHostMaxima } else { SkipReason::NotAdmitted }, why))
 }
+
 
 /// What one [`WitnessRuntime::self_test_round`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3915,6 +3943,30 @@ mod tests {
     }
 
     /// A runtime as `start` builds it (no serving, no tasks), with `store` open.
+    /// The collateral cap's refusals as witness verdicts: a job over the cap by its own terms is over
+    /// this host's limit, one over its program's or caller's share is deferred; neither is the
+    /// caller's.
+    #[test]
+    fn a_collateral_cap_refusal_is_the_hosts_limit_or_deferred() {
+        use run::collateral::CapVerdict;
+        assert_eq!(cap_refusal(CapVerdict::Admit), None);
+        let (reason, why) = cap_refusal(CapVerdict::OverJob { required: 600, cap: 500 }).unwrap();
+        assert_eq!(reason, SkipReason::LimitsAboveHostMaxima);
+        assert!(why.contains("one job may lock"), "{why}");
+        for v in [
+            CapVerdict::OverProgram { held: 400, required: 200, cap: 500 },
+            CapVerdict::OverSubmitter { held: 400, required: 200, cap: 500 },
+        ] {
+            assert_eq!(cap_refusal(v).unwrap().0, SkipReason::NotAdmitted);
+        }
+        for (r, _) in [CapVerdict::OverJob { required: 2, cap: 1 }, CapVerdict::OverProgram { held: 1, required: 1, cap: 1 }]
+            .into_iter()
+            .filter_map(cap_refusal)
+        {
+            assert!(!r.verdict().blames_caller);
+        }
+    }
+
     async fn test_runtime(store: bool) -> (Arc<WitnessRuntime>, Option<TestStore>) {
         let client = chainless_client().await;
         let gov = GovernanceWatcher::new(client.clone(), GovernanceConfig::new(client.address, vec![])).view();

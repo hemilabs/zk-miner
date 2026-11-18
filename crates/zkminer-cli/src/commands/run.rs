@@ -27,6 +27,12 @@ use zkminer_chain::adapter::AdapterInfo;
 /// Witness-construction jobs: routing, the witness runtime and its pure policy (see its docs).
 mod witness;
 
+/// The collateral cap: what one job, and the unproven jobs of one program or submitter, may lock.
+mod collateral;
+
+/// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
+mod segment_disk;
+
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
@@ -1643,6 +1649,26 @@ fn job_collateral_terms(job_id: B256) -> Option<(u128, u128)> {
         .and_then(|m| m.get(&job_id).copied())
 }
 
+/// What a claim of `info`'s job may lock at most, and whose job it is, for the collateral cap: its
+/// collateral at its maximum price (or `price`, if higher: the price ramps up until the claim mines)
+/// under its own snapshotted `terms`, `(minCollateral, collateralBps)`, as the claim computes it.
+fn claim_exposure(
+    info: &zkminer_chain::jobs::JobInfo,
+    price: u128,
+    terms: (u128, u128),
+) -> collateral::Exposure {
+    let (min_collateral, bps) = terms;
+    collateral::Exposure {
+        program: info.program_id,
+        submitter: info.caller,
+        collateral: zkminer_chain::auction::compute_collateral(
+            info.max_price.max(price),
+            u64::try_from(bps).unwrap_or(u64::MAX),
+            min_collateral,
+        ),
+    }
+}
+
 /// PAGE lines waiting for the dashboard (see `PageToDashboard` in main.rs). Bounded: the oldest go.
 static PAGES: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -2405,35 +2431,6 @@ fn fmt_hemi(wei: u128) -> String {
     format!("{whole}.{cents:02}")
 }
 
-/// The variable naming the share of total stake one job's collateral may lock.
-const MAX_JOB_COLLATERAL_FRACTION_ENV: &str = "ZKMINER_MAX_JOB_COLLATERAL_FRACTION";
-
-/// What [`MAX_JOB_COLLATERAL_FRACTION_ENV`] is when unset or unreadable.
-///
-/// The cap is checked against a job's collateral at its maximum price, the most its claim could
-/// lock, so it must clear an honest job on a rig staked for only a couple of concurrent ones, and
-/// still stop one job (whose `collateralBps`, up to 500%, and `minCollateral` its submitter chose)
-/// from locking most of the stake, where a forced release then burns a share of all of it.
-const DEFAULT_MAX_JOB_COLLATERAL_FRACTION: f64 = 0.5;
-
-/// The share of total stake one job's collateral may lock: `raw` (the variable's value) when it is a
-/// finite number from 0 up, else the default. `0` turns the cap off.
-fn max_job_collateral_fraction(raw: Option<&str>) -> f64 {
-    raw.and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|f| f.is_finite() && *f >= 0.0)
-        .unwrap_or(DEFAULT_MAX_JOB_COLLATERAL_FRACTION)
-}
-
-/// The most collateral one job may lock, in wei: `fraction` of `total_staked`. `None` when the cap is
-/// off (`fraction` 0) or the stake is not known (0). A threshold, so f64 rounding at wei magnitudes
-/// does not matter.
-fn max_job_collateral(total_staked: u128, fraction: f64) -> Option<u128> {
-    if fraction <= 0.0 || total_staked == 0 {
-        return None;
-    }
-    Some(((total_staked as f64) * fraction) as u128)
-}
-
 /// Build the collateral-starvation warning.
 ///
 /// A FUNCTION, not two inline format! calls, because there are two output channels (the
@@ -2624,6 +2621,9 @@ pub async fn run(
     if let Some(r) = &config.retention {
         zkminer_prover::worker::set_risc0_witness_dirs(r.dir.clone(), r.segment_dir.clone());
     }
+    // And there its inline proofs' segments go too (else under `~/.zkminer`): where the claim gate
+    // reserves their disk.
+    segment_disk::set_inline_root(config.retention.as_ref().map(|r| r.segment_dir.as_path()));
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -5026,6 +5026,8 @@ async fn miner_brain(
     // rarely, so a best-effort cache that never expires is acceptable. Repopulate
     // on miner restart.
     let mut adapter_cache: HashMap<alloy::primitives::B256, AdapterInfo> = HashMap::new();
+    // When the deployment's per-job collateral floor was last asked for, until it is known.
+    let mut last_floor_read: Option<std::time::Instant> = None;
     // Throttle for the "skipping all jobs — insufficient collateral" warning:
     // the brain re-evaluates every 5s, so warn at most once per COLLATERAL_WARN_EVERY.
     let mut last_collateral_warn: Option<std::time::Instant> = None;
@@ -5301,6 +5303,8 @@ async fn miner_brain(
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
+            collateral::forget(jid);
+            segment_disk::release(jid);
             proved.remove(&jid);
             inflight_work.remove(&jid);
             queue_model.settle(&jid.0);
@@ -5310,12 +5314,22 @@ async fn miner_brain(
             if in_flight.contains_key(&jid) && proved.insert(jid) {
                 queue_model.settle(&jid.0);
             }
+            // Proven (or never going to be): no longer counted against its program's and
+            // submitter's share of the stake, and its segments are gone.
+            collateral::forget(jid);
+            segment_disk::release(jid);
         }
         // Only jobs still held. Every path that reaps one removes it here too, but an entry left
         // behind would read as one card fewer needed for as long as the miner ran: it did, from a
         // recovery pass's own reap, and the planner's model then never matched again.
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
+        // Held and unproven, or a witness task's (claiming, or holding a lock the brain has not been
+        // told of yet): anything else left the count (a claim that did not land, a task that ended).
+        collateral::retain(|j| {
+            (in_flight.contains_key(j) && !proved.contains(j))
+                || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
+        });
         prune_lock_blocks(&in_flight);
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
@@ -6319,16 +6333,22 @@ async fn miner_brain(
         // a stranded lock is in `on_chain_locked` but not in `in_flight`, so max() dropped it.)
         let stake_read_block = stake_info.as_ref().and_then(|si| si.read_block);
         let lock_blocks = lock_blocks();
-        // The most one job may lock (`max_job_collateral`): a share of the total stake.
-        let job_collateral_fraction = max_job_collateral_fraction(
-            std::env::var(MAX_JOB_COLLATERAL_FRACTION_ENV)
-                .ok()
-                .as_deref(),
-        );
-        let job_collateral_cap = max_job_collateral(
-            stake_info.as_ref().map_or(0, |si| si.total_staked),
-            job_collateral_fraction,
-        );
+        // The most one job, and the unproven jobs of one program or submitter, may lock
+        // (`collateral`): a share of the total stake, at least the deployment's per-job floor.
+        if collateral::floor().is_none()
+            && last_floor_read.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+        {
+            last_floor_read = Some(std::time::Instant::now());
+            match client.get_min_collateral_amount().await {
+                Ok(wei) => collateral::set_floor(wei),
+                Err(e) => tracing::debug!(
+                    "MIN_COLLATERAL_AMOUNT unreadable ({e:#}): the collateral cap has no floor yet"
+                ),
+            }
+        }
+        let total_staked = stake_info.as_ref().map_or(0, |si| si.total_staked);
+        collateral::note_stake(total_staked);
+        let job_collateral_cap = collateral::policy().cap(total_staked);
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
@@ -7160,23 +7180,25 @@ async fn miner_brain(
             // genuinely tight — which is the correct, safe behaviour: you cannot prove what
             // you cannot collateralize. The real remedy for tight collateral is to stake
             // more or free stale locked collateral, not to over-commit.)
-            let required_collateral = zkminer_chain::auction::compute_collateral(
-                job.info.max_price.max(snapshot.current_price),
-                effective_bps,
-                job_min_collateral, // the job's snapshotted floor, not adapter.min_stake
+            // (The job's snapshotted floor, not adapter.min_stake.)
+            let exposure = claim_exposure(
+                &job.info,
+                snapshot.current_price,
+                (job_min_collateral, u128::from(effective_bps)),
             );
-            // No job may lock more than its share of the stake (`max_job_collateral`): one whose
-            // terms ask for more is set aside, not claimed. Its terms are fixed while it is Open.
-            if let Some(cap) = job_collateral_cap.filter(|cap| required_collateral > *cap) {
-                tracing::warn!(
-                    "job {} would lock up to {} HEMI of collateral, over the {} HEMI one job may \
-                     lock ({:.0}% of the stake; {MAX_JOB_COLLATERAL_FRACTION_ENV}) — setting it aside",
-                    short_id(jid),
-                    fmt_hemi(required_collateral),
-                    fmt_hemi(cap),
-                    job_collateral_fraction * 100.0,
-                );
-                set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+            let required_collateral = exposure.collateral;
+            // No job may lock more than its share of the stake, nor the unproven jobs of its program
+            // or submitter held here with it (`collateral`). One whose terms alone ask for more is
+            // set aside: they are fixed while it is Open. One over a program's or submitter's share
+            // waits for their jobs to be proven.
+            let cap_verdict = collateral::check(jid, &exposure, job_collateral_cap);
+            if let Some(why) = cap_verdict.describe() {
+                if cap_verdict.is_final() {
+                    tracing::warn!("job {}: {why} — setting it aside", short_id(jid));
+                    set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                } else {
+                    tracing::debug!("job {}: {why} — not now", short_id(jid));
+                }
                 continue;
             }
 
@@ -7620,6 +7642,33 @@ async fn miner_brain(
                     min_profit_threshold,
                     deadline_safety_margin,
                 );
+            }
+            // A risc0 proof writes all its segments to disk first: claimed only while they fit beside
+            // every proof planned or running here, witness ones included (`segment_disk`). Reserved
+            // until its card is released.
+            if would_commit
+                && matches!(eval.recommendation, Recommendation::Claim)
+                && risc0_job
+                && !watch_only()
+            {
+                if let Err(why) = segment_disk::try_reserve_inline(jid, params.estimated_cycles) {
+                    tracing::debug!("job {}: its segments do not fit now ({why})", short_id(jid));
+                    continue;
+                }
+            }
+            // The cap again, deciding and recording in one step: a witness claim may have taken the
+            // program's or submitter's room since the check above.
+            if would_commit
+                && matches!(eval.recommendation, Recommendation::Claim)
+                && collateral::admit(jid, exposure, job_collateral_cap)
+                    != collateral::CapVerdict::Admit
+            {
+                segment_disk::release(jid);
+                tracing::debug!(
+                    "job {}: its program's or submitter's share of the stake is taken — not now",
+                    short_id(jid)
+                );
+                continue;
             }
             if would_commit && matches!(eval.recommendation, Recommendation::Claim) {
                 claimed_this_tick = true;
@@ -8623,6 +8672,27 @@ async fn watch_inspect(
             }
         }
     };
+    // The collateral cap, as the brain applies it to this job alone (`collateral`): one whose terms
+    // ask for more than one job may lock at the watched address's stake is set aside, not claimed.
+    prefetch_job_collateral_terms(client, &[job_id]).await;
+    let Some((min_collateral, bps)) = job_collateral_terms(job_id) else {
+        return Inspected::Retry("collateral terms (getJobSnapshots) unreadable".into());
+    };
+    let exposure = claim_exposure(&job.info, 0, (min_collateral, bps));
+    let total_staked = state
+        .read()
+        .await
+        .stake_info
+        .as_ref()
+        .map_or(0, |s| s.total_staked);
+    let cap = collateral::policy().cap(total_staked);
+    let verdict = collateral::decide(job_id, &exposure, cap, &HashMap::new());
+    if let (true, Some(why)) = (verdict.is_final(), verdict.describe()) {
+        return Inspected::Done(
+            "over the collateral cap",
+            format!("{head}: {measured}, {bound}; {why}: set aside, not claimed"),
+        );
+    }
     match client.preview_claim(job_id).await {
         Ok(ClaimPreview::Claimable(q)) => Inspected::Done(
             "claim quote ok",
@@ -9583,6 +9653,9 @@ async fn process_job_lifecycle(
         // job's guest, that its backend cannot run on this host. An environment fault, so if every
         // attempt then fails the program and submitter are not marked divergent.
         let mut env_declined = false;
+        // A risc0 attempt failed while this host's segment disk could not hold the job's segments
+        // (`segment_disk::inline_short`, read here, not from the worker): this host's failure.
+        let mut disk_short = false;
         let mut attempt = 0u32;
         // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
         // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
@@ -10124,6 +10197,20 @@ async fn process_job_lifecycle(
                         None => zkminer_prover_protocol::types::is_gpu_oom(&msg),
                     };
                     let health_fail = !invalid && !real_oom;
+                    // This host's segment disk, read now: a full disk (ENOSPC or a quota) is the
+                    // host's, whatever the worker said, and is not held against the job's program or
+                    // submitter below. The proof's own segments are gone by now, so only a disk short
+                    // without them reads so.
+                    if backend == zkminer_prover_protocol::BACKEND_RISC0
+                        && segment_disk::inline_short(job_id, sizing_cycles)
+                    {
+                        disk_short = true;
+                        tracing::warn!(
+                            "{}: this host's segment disk has too little room for the job's segments \
+                             (see README, risc0 segments): {msg}",
+                            short_id(job_id),
+                        );
+                    }
                     if attempt < MAX_PROVE_ATTEMPTS {
                         // BOTH non-invalid classes steer OFF the card that just failed.
                         //
@@ -10189,7 +10276,7 @@ async fn process_job_lifecycle(
                     }
                     // Every attempt failed on a job that measured clean. Class-agnostic on purpose: the
                     // worker's kind can follow guest-chosen text (see `note_post_claim_divergence`).
-                    if rode_measurement && !env_declined {
+                    if rode_measurement && !env_declined && !disk_short {
                         note_post_claim_divergence(program_id, backend, submitter, "all prove attempts failed");
                     }
                     return Err(anyhow::anyhow!(
@@ -13081,6 +13168,30 @@ fn spawn_recovery_actions(
             _ => None,
         };
         in_flight.insert(jid, 0);
+        if let RecoveryAction::Drive {
+            job, descriptor, ..
+        } = &action
+        {
+            // A lock held and not proven yet counts against its program's and submitter's share of
+            // the stake: at what its settled price locks under its terms when they are known, and at
+            // least the deployment's floor, which every lock locks.
+            let floor = collateral::floor().unwrap_or(0);
+            let locked = job_collateral_terms(jid).map_or(floor, |(min, bps)| {
+                zkminer_chain::auction::compute_collateral(
+                    job.info.settled_price,
+                    u64::try_from(bps).unwrap_or(u64::MAX),
+                    min,
+                )
+            });
+            collateral::record(
+                jid,
+                collateral::Exposure {
+                    program: descriptor.programId,
+                    submitter: job.info.caller,
+                    collateral: locked.max(job.info.locked_collateral).max(floor),
+                },
+            );
+        }
         match action {
             RecoveryAction::Drive {
                 job,
@@ -13665,48 +13776,6 @@ mod collateral_warning_tests {
                 "printed {printed} is short of {shortfall} wei"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod job_collateral_cap_tests {
-    use super::{max_job_collateral, max_job_collateral_fraction, ONE_HEMI_WEI};
-    use zkminer_chain::auction::compute_collateral;
-
-    #[test]
-    fn the_fraction_is_read_from_the_variable_or_defaults_to_half() {
-        assert_eq!(max_job_collateral_fraction(None), 0.5);
-        assert_eq!(max_job_collateral_fraction(Some("0.25")), 0.25);
-        assert_eq!(max_job_collateral_fraction(Some(" 1 ")), 1.0);
-        assert_eq!(max_job_collateral_fraction(Some("0")), 0.0);
-        for bad in ["", "half", "-0.5", "NaN", "inf"] {
-            assert_eq!(max_job_collateral_fraction(Some(bad)), 0.5, "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn no_cap_without_a_stake_or_with_the_cap_off() {
-        assert_eq!(max_job_collateral(0, 0.5), None);
-        assert_eq!(max_job_collateral(1_000 * ONE_HEMI_WEI, 0.0), None);
-        assert_eq!(
-            max_job_collateral(1_000 * ONE_HEMI_WEI, 0.5),
-            Some(500 * ONE_HEMI_WEI)
-        );
-    }
-
-    /// The case the cap is for: a job whose terms its submitter chose (500% collateral at a high
-    /// maximum price) fits in the free stake, so the stake check alone would claim it and a forced
-    /// release would then burn a share of most of the stake. An honest job (the deployment's 100 HEMI
-    /// floor, a few HEMI of price at 150%) is far under the cap.
-    #[test]
-    fn a_job_asking_for_most_of_the_stake_is_over_the_cap_and_an_honest_one_is_not() {
-        let stake = 3_000 * ONE_HEMI_WEI;
-        let cap = max_job_collateral(stake, max_job_collateral_fraction(None)).unwrap();
-        let decoy = compute_collateral(500 * ONE_HEMI_WEI, 50_000, 100 * ONE_HEMI_WEI);
-        assert!(decoy <= stake, "the stake check alone would admit it");
-        assert!(decoy > cap);
-        let honest = compute_collateral(5 * ONE_HEMI_WEI, 15_000, 100 * ONE_HEMI_WEI);
-        assert!(honest <= cap);
     }
 }
 
