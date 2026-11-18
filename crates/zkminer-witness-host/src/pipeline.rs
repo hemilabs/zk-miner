@@ -368,6 +368,9 @@ pub struct ExecutedPo2 {
     pub segment_bytes: u64,
     /// The execute worker's peak resident set after this po2 (a process-wide high-water mark).
     pub peak_host_bytes: u64,
+    /// The guest's `sys_rand` calls past its runtime's own draw (`Some(0)` in a published bundle:
+    /// any other count is refused), `None` when no call was seen at all.
+    pub sys_rand_draws: Option<u64>,
 }
 
 /// A published, unpinned bundle whose journals satisfy the binding at every po2 of the host's set.
@@ -778,8 +781,9 @@ impl Read for Tee {
 // Steps 4–5: execute and check.
 
 /// Checks an execute response against the job (§5.2 steps 6–7): the image id is `programId`; every
-/// po2 of the request halted with 0; one journal at every po2; cycles within `maxGuestCycles`; the
-/// journal within the 32,768-byte cap. Returns the journal.
+/// po2 of the request halted with 0; no po2 drew `sys_rand` past the guest runtime's own draw; one
+/// journal at every po2; cycles within `maxGuestCycles`; the journal within the 32,768-byte cap.
+/// Returns the journal.
 pub fn check_execution(
     resp: &WitnessExecuteResponse,
     po2s: &[u8],
@@ -800,6 +804,22 @@ pub fn check_execution(
     let got: Vec<u8> = resp.results.iter().map(|r| r.po2).collect();
     if got != po2s {
         return Err((SkipReason::HostInternal, format!("executed po2s {got:?}, requested {po2s:?}")));
+    }
+    // The proof binds no seed: whatever the guest draws, a prover may choose. A journal that does not
+    // follow the seed shows nothing (a randomized check of `W` passes an honest `W` under any seed),
+    // so the calls themselves are refused.
+    if let Some((po2, n)) = resp
+        .results
+        .iter()
+        .find_map(|r| r.sys_rand_draws.filter(|&n| n > 0).map(|n| (r.po2, n)))
+    {
+        return Err((
+            SkipReason::GuestUsesSysRand,
+            format!(
+                "po2 {po2}: the guest called sys_rand {n} time(s) past its runtime's own draw; no proof binds the seed, \
+                 so a prover chooses what it draws"
+            ),
+        ));
     }
     let first = &resp.results[0];
     if let Some(r) = resp.results.iter().find(|r| (r.journal_len, r.journal_sha256) != (first.journal_len, first.journal_sha256)) {
@@ -1326,6 +1346,7 @@ pub async fn simulate_witness_job(
             cycles: r.cycles,
             segment_bytes: r.segment_bytes,
             peak_host_bytes: r.peak_host_bytes,
+            sys_rand_draws: r.sys_rand_draws,
         })
         .collect();
     let journal_hex = hex::encode(&journal);
@@ -1474,6 +1495,7 @@ mod tests {
             exit_code: 0,
             segment_bytes: 1,
             peak_host_bytes: 1,
+            sys_rand_draws: Some(0),
         }
     }
 
@@ -1498,6 +1520,40 @@ mod tests {
         let mut big = po2(16, b"", 1);
         big.journal_len = MAX_JOURNAL_BYTES as u32 + 1;
         assert_eq!(check_execution(&resp(vec![big]), &[16], id, 10).unwrap_err().0, SkipReason::JournalTooLarge);
+        // A guest that draws from sys_rand at any po2, past its runtime's own draw, is refused,
+        // whatever its journals: the same journal under every seed shows nothing (a spot check of
+        // W at a drawn index passes an honest W under any seed, and a forged one under the seed a
+        // prover picks). No draw seen at all is not a draw.
+        let mut draws = po2(18, b"j", 120);
+        draws.sys_rand_draws = Some(1);
+        let (reason, detail) = check_execution(
+            &resp(vec![po2(16, b"j", 100), draws]),
+            &[16, 18],
+            id,
+            1 << 30,
+        )
+        .unwrap_err();
+        assert_eq!(reason, SkipReason::GuestUsesSysRand);
+        assert!(
+            detail.starts_with("po2 18: the guest called sys_rand 1 time(s)"),
+            "{detail}"
+        );
+        assert!(
+            reason.verdict().blames_caller
+                && reason.verdict().retry == zkminer_witness::verdict::Retry::Never
+        );
+        let mut unseen = po2(18, b"j", 120);
+        unseen.sys_rand_draws = None;
+        assert_eq!(
+            check_execution(
+                &resp(vec![po2(16, b"j", 100), unseen]),
+                &[16, 18],
+                id,
+                1 << 30
+            )
+            .unwrap(),
+            b"j"
+        );
     }
 
     #[test]

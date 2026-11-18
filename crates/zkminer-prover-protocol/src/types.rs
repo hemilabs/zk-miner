@@ -51,7 +51,12 @@ use serde::{Deserialize, Serialize};
 /// as its instruction count (`zkop-mix`'s scoring rows excepted). A v14 SP1 worker would measure such
 /// guests clean and size a host's jobs in other units, and `~/.zkminer/provers` is searched before
 /// the workers shipped beside the miner, so the handshake refuses it.
-pub const PROTOCOL_VERSION: u32 = 15;
+/// 16: [`WitnessExecutePo2`] gained `sys_rand_draws`, the guest's `sys_rand` calls past its runtime's
+/// own, which the miner's witness gate and `zkminer simulate --adversarial` refuse: no proof binds
+/// the seed, so a prover picks what the guest draws. The one-shot execute is not part of the IPC
+/// stream, but ships with the workers: a v15 binary's response lacks the field and fails to decode
+/// rather than pass for one that drew nothing.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -541,6 +546,13 @@ pub struct WitnessExecutePo2 {
     /// The worker's peak resident set (`getrusage` `ru_maxrss`) after this po2 ran: a high-water mark
     /// of the whole process, so it never decreases across the po2s of one response.
     pub peak_host_bytes: u64,
+    /// The guest's `sys_rand` calls at this po2 past the one its runtime makes before `main` (four
+    /// words of memory-image entropy): `Some(0)` for a guest that drew nothing of its own, `None`
+    /// when no call was seen at all (a guest without risc0's runtime, or a fork whose handler stopped
+    /// logging the call the worker counts). The proof binds no seed, so whatever a guest draws a
+    /// prover may choose; the miner skips a job whose guest draws (`GuestUsesSysRand`). A count of
+    /// calls, not a proof of independence: a guest can read its runtime's own draw from memory.
+    pub sys_rand_draws: Option<u64>,
 }
 
 /// The answer to a [`WitnessExecuteRequest`]: one frame on fd 1.

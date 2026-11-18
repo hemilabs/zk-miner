@@ -199,7 +199,13 @@ identical, and the bundle records each:
   The miner derives it and passes it to the sandboxed execute; a prove worker derives the same from
   the input it reads. The bundle records the rule (`sys_rand_rule`, the SHA-256 of its domain). No
   proof binds the seed — a prover on other software can answer `sys_rand` with anything — so a
-  journal that follows it depends on a prover-controlled input (§21.1).
+  journal that follows it depends on a prover-controlled input (§21.1). Nor does a journal that
+  ignores it show anything: a guest that spot-checks `W` at an index it draws commits the same
+  journal for an honest `W` under every seed, and a prover who picks the seed passes a forged one.
+  So the execute counts the guest's `sys_rand` calls past the one its runtime makes before `main`
+  (`WitnessExecutePo2::sys_rand_draws`, protocol 16), and the miner skips a job whose guest makes any
+  (`GuestUsesSysRand`, §16). The count is of calls: a guest that reads its runtime's own draw from
+  memory, or replaces risc0's runtime, is not caught by it (§8.2 forbids both all the same).
 - **Other host inputs:** empty environment and arguments (the executor answers `getenv`/`argv` only
   from its own empty maps); the keccak po2 (`RISC0_KECCAK_PO2`, guest-visible through
   `keccak_permute`); the executor build of every worker that may prove the job.
@@ -1722,7 +1728,7 @@ Witness serving stays disabled in code until the steps of its phase are in place
 | Static gate | envelope malformed or out of range; unsupported type, adapter or binding; submission form; capability not provisioned; limits above maxima; not claimable; not admitted | skip | none |
 | Artifact or ELF | per §13.4 / today's ELF rules | skip | none |
 | Builder | trap, fuel, memory, wall clock, non-zero return, unknown import, fetch denied or exhausted | skip | none |
-| Guest | fails; cycles above the limit; journals differ across po2 | skip | none |
+| Guest | fails; cycles above the limit; journals differ across po2; draws from `sys_rand` | skip | none |
 | Claim gate | journal cap, binding, DA size, gas, reservation, deadline margin, prove resources | skip | none |
 | After a lock — the job | anything the submitter does through the job | **nothing** (§5.5) | none |
 | After a lock — blockspace | DA stall fill; blockspace bought past the deadline | residual shared with inline jobs | release penalty or slash |
@@ -1741,6 +1747,7 @@ Witness serving stays disabled in code until the steps of its phase are in place
 | Builder source-lagging (a fetch the job's source answered as lacking the block or state, or naming a block above its head, with fewer than two independent endpoints of that chain agreeing and the block within the pruning horizon, §9.2) | retried with backoff (6 attempts, about 16 minutes), then permanent; never counted against the caller |
 | Guest failure or binding mismatch | one jittered rebuild on other endpoints (a stale node can cause it), then permanent |
 | Journals differ across po2 | permanent |
+| The guest calls `sys_rand` past its runtime's own draw (`GuestUsesSysRand`, §5.4) | permanent; counted against the caller |
 | Operator-side (endpoint errors, 429s, operator budget exhaustion, artifact endpoint errors) | never counted against the caller; retried |
 | Post-lock witness failure | the job gets a verdict that lasts until it is terminal; tallies per caller and per (device, failure class) are persisted for 7 days from the latest; a failure counts against the caller only when an attempt of its guest ran on a device not quarantined then; a caller with 3 is not admitted; a device with failures of one class from ≥ 2 distinct callers is quarantined from new witness locks until they age out (`PAGE: WITNESS-DEVICE-QUARANTINED`), while locks already held keep proving, on another card when one can; every release of a witness lock (failure, the recovery room rule, shutdown) records the job's verdict; never feeds zkminer's host-wide stop on new programs; only same-device failures across ≥ 2 callers trigger a host-wide hold |
 | Measure workers busy (the image id cannot be derived now) | deferred; never final; never counted against the caller |
@@ -2097,7 +2104,11 @@ provider units, retention bytes.
    alone in its own broker; different journals that both satisfy the binding are a soundness
    failure. Re-execution runs under two `sys_rand` seeds (the public rule's and a fresh random one), two po2s (each in a request of its own, the
    second from `--po2`, a cycle cap reported as such) and two keccak po2s, and any journal change is
-   reported as a dependence on a prover-controlled host input. All of this runs within a time bound
+   reported as a dependence on a prover-controlled host input. These checks compare journals only,
+   which cannot show a check of `W` that follows the seed while the journal does not (a spot check
+   at a drawn index); that is caught by the execute's count of the guest's `sys_rand` calls (§5.4),
+   which skips such a job before any attack and marks a host-input pair dependent wherever a run
+   draws. All of this runs within a time bound
    and writes a JSON report whose verdict is `pass`, `fail` or `incomplete`. Every execute and
    broker start gets what is left of the time bound and is killed there. A stale-proof swap is not
    made: a scheme-1 `W` names no keys to fetch. The last tool is `zkminer artifact publish`.

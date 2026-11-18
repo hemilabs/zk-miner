@@ -502,9 +502,10 @@ fn a_binding_that_leaves_header_words_free_fails() {
     );
 }
 
-/// The hostdep guest's journal follows the `sys_rand` seed (W = 0xA1) and the keccak po2 (W = 0xA4,
-/// the raw permutation's batch status): the reruns under a random seed beside the rule's and under
-/// another keccak po2 catch each, and nothing else is reported dependent.
+/// The hostdep guest's journal follows the keccak po2 (W = 0xA4, the raw permutation's batch
+/// status): the reruns under another keccak po2 catch it, and nothing else is reported dependent.
+/// One that follows the `sys_rand` seed (W = 0xA1) is refused before any attack: it draws from
+/// `sys_rand` (see `a_guest_that_draws_from_sys_rand_is_refused`).
 #[test]
 fn host_inputs_a_prover_controls_are_caught() {
     let _g = serial();
@@ -514,28 +515,147 @@ fn host_inputs_a_prover_controls_are_caught() {
     let anvil = Anvil::start();
     let w = World::new(zkminer(), &anvil, &anvil);
     let echo = sdk_wasm("params-echo", "params_echo.wasm");
-    for (mode, input) in [(0xa1u8, "sys_rand_seed"), (0xa4, "keccak_po2")] {
-        w.job(HOSTDEP_ELF, &echo, "prefix = false\nheader = [\"uint256:0x77\"]", &[mode]);
-        let (out, report) = w.attack(&["--flips", "1", "--max-mutations", "1", "--header-bytes", "32"]);
-        assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
-        let a = &report["adversarial"];
-        let hosts = a["hostInputs"].as_array().unwrap();
-        for h in hosts {
-            assert_eq!(h["dependent"], h["input"] == input, "mode {mode:#x}: {h:#}");
-        }
-        assert!(
-            a["soundnessFailures"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().starts_with(&format!(
-                "host input {}",
-                match input {
-                    "sys_rand_seed" => "SysRandSeed",
-                    _ => "KeccakPo2",
-                }
-            ))),
-            "{a:#}"
-        );
-        assert_eq!(a["verdict"], "fail");
-        assert!(!out.status.success());
+    w.job(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x77\"]",
+        &[0xa4],
+    );
+    let (out, report) = w.attack(&[
+        "--flips",
+        "1",
+        "--max-mutations",
+        "1",
+        "--header-bytes",
+        "32",
+    ]);
+    assert_eq!(
+        report["outcome"],
+        "simulated",
+        "{}\n{report:#}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let a = &report["adversarial"];
+    let hosts = a["hostInputs"].as_array().unwrap();
+    for h in hosts {
+        assert_eq!(h["dependent"], h["input"] == "keccak_po2", "{h:#}");
     }
+    assert!(
+        a["soundnessFailures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().starts_with("host input KeccakPo2")),
+        "{a:#}"
+    );
+    assert_eq!(a["verdict"], "fail");
+    assert!(!out.status.success());
+
+    w.job(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x77\"]",
+        &[0xa1],
+    );
+    let (out, report) = w.attack(&[
+        "--flips",
+        "1",
+        "--max-mutations",
+        "1",
+        "--header-bytes",
+        "32",
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(report["outcome"], "skipped", "{report:#}");
+    assert_eq!(
+        report["verdict"]["reason"], "GuestUsesSysRand",
+        "{report:#}"
+    );
+}
+
+/// A guest whose honest journal ignores the `sys_rand` seed while its check of `W` follows it
+/// (hostdep 0xA5: one of k items checked, at an index drawn from `sys_rand`). Its journals agree
+/// under every seed, so comparing journals passes it, while a prover who picks the seed proves a
+/// forged `W` (shown with the CPU executor). The execute counts the guest's own `sys_rand` call, and
+/// simulate refuses the job as a miner does: `GuestUsesSysRand` at the execute step, the caller's,
+/// never retried, with and without `--adversarial` (a job the miner skips is not attacked).
+#[test]
+fn a_guest_that_draws_from_sys_rand_is_refused() {
+    let _g = serial();
+    if !delegated("a_guest_that_draws_from_sys_rand_is_refused") {
+        return;
+    }
+    let anvil = Anvil::start();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    let echo = sdk_wasm("params-echo", "params_echo.wasm");
+    let k = 16u8;
+    let v = 1000u64.to_le_bytes();
+    let mut honest = vec![0xa5];
+    honest.extend_from_slice(&v);
+    honest.push(k);
+    for _ in 0..k {
+        honest.extend_from_slice(&v);
+    }
+    w.job(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x78\"]",
+        &honest,
+    );
+    for (name, (out, report)) in [
+        ("simulate", w.simulate()),
+        ("--adversarial", w.attack(&["--header-bytes", "32"])),
+    ] {
+        assert!(
+            !out.status.success(),
+            "{name}: a skipped job exits non-zero"
+        );
+        assert_eq!(report["outcome"], "skipped", "{name}: {report:#}");
+        let v = &report["verdict"];
+        assert_eq!(v["reason"], "GuestUsesSysRand", "{name}: {v:#}");
+        assert_eq!(v["step"], "execute");
+        assert_eq!(
+            (v["blamesCaller"].as_bool(), v["retry"].as_str()),
+            (Some(true), Some("never")),
+            "{v:#}"
+        );
+        assert!(
+            v["detail"]
+                .as_str()
+                .unwrap()
+                .contains("called sys_rand 1 time(s) past its runtime's own draw"),
+            "{v:#}"
+        );
+        assert!(report["adversarial"].is_null(), "{name}: not attacked");
+    }
+
+    // Why: W* claims v' with v' at one index only, and passes under a seed the prover picks.
+    let forged_v = 1_000_000u64.to_le_bytes();
+    let mut forged = vec![0xa5];
+    forged.extend_from_slice(&forged_v);
+    forged.push(k);
+    for i in 0..k {
+        forged.extend_from_slice(if i == 5 { &forged_v } else { &v });
+    }
+    let run = |seed: [u8; 32]| {
+        let mut b = risc0_zkvm::ExecutorEnv::builder();
+        b.write_slice(&forged);
+        b.random_seed(seed);
+        risc0_zkvm::default_executor()
+            .execute(b.build().unwrap(), HOSTDEP_ELF)
+            .ok()
+            .map(|s| s.journal.bytes)
+    };
+    let journal = (0u8..=255)
+        .find_map(|s| run([s; 32]))
+        .expect("a seed the spot check misses");
+    let mut header = [0u8; 32];
+    header[31] = 0x78;
+    assert_eq!(
+        (&journal[..32], &journal[32..]),
+        (&header[..], &forged_v[..]),
+        "the forged statement"
+    );
 }
 
 /// Two providers at different heads: the latest-block builder makes a different W from each, and the

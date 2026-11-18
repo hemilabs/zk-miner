@@ -677,6 +677,18 @@ pub fn classify(
         return (MutationOutcome::RejectedInGuest { why: "the guest did not halt with 0".into() }, None);
     }
     let cycles = resp.results.iter().map(|r| r.cycles).max();
+    // A W under which the guest draws from sys_rand is judged on this seed's journal, but one seed
+    // decides only a soundness failure: another seed may give another journal.
+    let draws = resp
+        .results
+        .iter()
+        .filter_map(|r| r.sys_rand_draws)
+        .max()
+        .filter(|&n| n > 0);
+    let mut resp = resp;
+    for r in &mut resp.results {
+        r.sys_rand_draws = None;
+    }
     let journal = match check_execution(&resp, po2s, judge.descriptor.programId, limits.host) {
         Ok(j) => j,
         Err((SkipReason::GuestCyclesAboveLimit, _)) => {
@@ -697,6 +709,15 @@ pub fn classify(
             first_difference: first_difference(&journal, judge.baseline_journal),
         },
         Verdict::Rejected => MutationOutcome::RejectedInGuest { why: "no journal".into() },
+    };
+    let outcome = match (outcome, draws) {
+        (o @ MutationOutcome::SoundnessFailure { .. }, _) | (o, None) => o,
+        (_, Some(n)) => MutationOutcome::Inconclusive {
+            why: format!(
+                "the guest called sys_rand {n} time(s) past its runtime's own draw under this W: another seed may give \
+                 another journal"
+            ),
+        },
     };
     (outcome, cycles)
 }
@@ -894,14 +915,15 @@ enum NoJournal {
     Host(String),
 }
 
-/// One value's journal and its largest sized cycle count.
-type Ran = Result<(B256, Vec<u8>, u64), NoJournal>;
+/// One value's journal, its largest sized cycle count, and the guest's `sys_rand` calls past its
+/// runtime's own draw.
+type Ran = Result<(B256, Vec<u8>, u64, Option<u64>), NoJournal>;
 
 fn journal_of(resp: &Result<WitnessExecuteResponse, Skip>, i: usize) -> Ran {
     match resp {
         Ok(r) => match r.results.get(i) {
             Some(p) if p.exit_kind == GUEST_EXIT_HALTED && p.exit_code == 0 => {
-                Ok((sha(&p.journal), p.journal.clone(), p.cycles))
+                Ok((sha(&p.journal), p.journal.clone(), p.cycles, p.sys_rand_draws))
             }
             Some(p) => Err(NoJournal::Guest(format!("po2 {}: exit kind {} code {}", p.po2, p.exit_kind, p.exit_code))),
             None => Err(NoJournal::Host("no result".into())),
@@ -917,9 +939,22 @@ fn journal_of(resp: &Result<WitnessExecuteResponse, Skip>, i: usize) -> Ran {
 fn pair_result(input: HostInput, values: [String; 2], a: Ran, b: Ran, limits: CycleLimits) -> HostInputResult {
     let (ja, jb) = (a.as_ref().ok().map(|x| x.0), b.as_ref().ok().map(|x| x.0));
     let mut notes = Vec::new();
+    // A guest that draws from sys_rand depends on the seed whatever its journals say: a randomized
+    // check of W passes the honest W under every seed, and a forged one under the seed its prover
+    // picks. Journals alone cannot show that.
+    let mut drew = false;
     for (v, r) in values.iter().zip([&a, &b]) {
+        if let Ok((_, _, _, Some(n))) = r {
+            if *n > 0 {
+                drew = true;
+                notes.push(format!(
+                    "{v}: the guest called sys_rand {n} time(s) past its runtime's own draw (no proof binds the seed; \
+                     a miner skips the job)"
+                ));
+            }
+        }
         match r {
-            Ok((_, _, c)) if *c > limits.job => notes.push(format!(
+            Ok((_, _, c, _)) if *c > limits.job => notes.push(format!(
                 "{v}: {c} sized cycles, past the job's maxGuestCycles {} (a miner executing at it skips the job)",
                 limits.job
             )),
@@ -931,7 +966,7 @@ fn pair_result(input: HostInput, values: [String; 2], a: Ran, b: Ran, limits: Cy
         }
     }
     let (dependent, ran) = match (&a, &b) {
-        (Ok(x), Ok(y)) => (x.1 != y.1, true),
+        (Ok(x), Ok(y)) => (x.1 != y.1 || drew, true),
         (Err(NoJournal::Guest(e)), Ok(_)) => {
             notes.push(format!("only {} ran: {e}", values[1]));
             (true, true)
@@ -944,7 +979,8 @@ fn pair_result(input: HostInput, values: [String; 2], a: Ran, b: Ran, limits: Cy
             notes.push(format!("neither ran: {e}"));
             (false, false)
         }
-        _ => (false, false),
+        // One value did not run here: a draw under the other is still a dependence.
+        _ => (drew, drew),
     };
     let note = (!notes.is_empty()).then(|| notes.join("; "));
     HostInputResult { input, values, journal_sha256: [ja, jb], dependent, note, ran }
@@ -1161,6 +1197,7 @@ mod tests {
                 exit_code,
                 segment_bytes: 1,
                 peak_host_bytes: 1,
+                sys_rand_draws: Some(0),
             }],
             sdk_version: "s".into(),
             worker_version: "w".into(),
@@ -1209,6 +1246,24 @@ mod tests {
         let mut hdr = journal.clone();
         hdr[70] ^= 1;
         assert!(matches!(run(&hdr, 0, 1 << 20).0, MutationOutcome::BindingRejects { .. }));
+        // A W under which the guest draws from sys_rand: this seed's journal decides a failure, and
+        // nothing else (another seed may give another journal).
+        let drawing = |j: &[u8]| {
+            let mut r = resp(j, 0, pid, 1 << 20);
+            r.results[0].sys_rand_draws = Some(2);
+            classify(&judge, Ok(r), &[20], limits).0
+        };
+        assert!(
+            matches!(drawing(&journal), MutationOutcome::Inconclusive { ref why } if why.contains("sys_rand 2 time(s)"))
+        );
+        assert!(matches!(
+            drawing(&hdr),
+            MutationOutcome::Inconclusive { .. }
+        ));
+        assert!(matches!(
+            drawing(&out2),
+            MutationOutcome::SoundnessFailure { .. }
+        ));
         // Past the host's own maximum there is no journal to judge: inconclusive, never a rejection.
         assert!(matches!(run(&out2, 0, (1 << 30) + 1).0, MutationOutcome::Inconclusive { .. }));
         let skip = |r| Err(Skip::Verdict { reason: r, step: crate::pipeline::Step::Execute, detail: "d".into() });
@@ -1239,7 +1294,7 @@ mod tests {
         assert_eq!(other_keccak_po2(17), 16);
         assert_eq!(other_keccak_po2(14), 15);
         let limits = CycleLimits { host: 1 << 30, job: 1 << 20 };
-        let ok = |j: &[u8]| -> Ran { Ok((sha(j), j.to_vec(), 1000)) };
+        let ok = |j: &[u8]| -> Ran { Ok((sha(j), j.to_vec(), 1000, Some(0))) };
         let v = || ["a".to_string(), "b".to_string()];
         assert!(!pair_result(HostInput::Po2, v(), ok(b"x"), ok(b"x"), limits).dependent);
         assert!(pair_result(HostInput::Po2, v(), ok(b"x"), ok(b"y"), limits).dependent);
@@ -1259,12 +1314,38 @@ mod tests {
         assert!(!cap.dependent && !cap.ran);
         assert!(cap.note.unwrap().contains("past this host's cycle maximum"));
         // Past the job's cap at one po2, the journals still compare, with a note.
-        let over: Ran = Ok((sha(b"x"), b"x".to_vec(), 1 << 21));
+        let over: Ran = Ok((sha(b"x"), b"x".to_vec(), 1 << 21, Some(0)));
         let r = pair_result(HostInput::Po2, v(), ok(b"x"), over, limits);
         assert!(r.ran && !r.dependent);
         assert!(r.note.unwrap().contains("past the job's maxGuestCycles"));
         // Host trouble is not a dependence.
         let host = pair_result(HostInput::KeccakPo2, v(), ok(b"x"), Err(NoJournal::Host("timeout".into())), limits);
         assert!(!host.dependent && !host.ran);
+        // The same journal under both seeds, but the guest drew from sys_rand (a spot check of W at
+        // a drawn index): dependent, whatever the journals say. Only the count shows it.
+        let drew: Ran = Ok((sha(b"x"), b"x".to_vec(), 1000, Some(1)));
+        let spot = pair_result(
+            HostInput::SysRandSeed,
+            v(),
+            drew.clone(),
+            drew.clone(),
+            limits,
+        );
+        assert!(spot.dependent && spot.ran, "{spot:?}");
+        assert!(spot.note.unwrap().contains("called sys_rand 1 time(s)"));
+        // Under one po2 only (the other not run here): still a dependence.
+        let one = pair_result(
+            HostInput::Po2,
+            v(),
+            drew,
+            Err(NoJournal::Host("timeout".into())),
+            limits,
+        );
+        assert!(one.dependent);
+        // No call seen at all is no evidence either way.
+        let unseen: Ran = Ok((sha(b"x"), b"x".to_vec(), 1000, None));
+        assert!(
+            !pair_result(HostInput::SysRandSeed, v(), unseen.clone(), unseen, limits).dependent
+        );
     }
 }

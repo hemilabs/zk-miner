@@ -204,6 +204,9 @@ pub struct Po2Report {
     pub cycles: String,
     pub segment_bytes: u64,
     pub peak_host_bytes: u64,
+    /// The guest's `sys_rand` calls past its runtime's own draw (any is refused: no proof binds the
+    /// seed); `null` when no call was seen at all.
+    pub sys_rand_draws: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1045,7 +1048,13 @@ fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, f: Succ
     r.per_po2 = s
         .per_po2
         .iter()
-        .map(|p| Po2Report { po2: p.po2, cycles: p.cycles.to_string(), segment_bytes: p.segment_bytes, peak_host_bytes: p.peak_host_bytes })
+        .map(|p| Po2Report {
+            po2: p.po2,
+            cycles: p.cycles.to_string(),
+            segment_bytes: p.segment_bytes,
+            peak_host_bytes: p.peak_host_bytes,
+            sys_rand_draws: p.sys_rand_draws,
+        })
         .collect();
     r.cycles = Some(CyclesReport {
         declared_max_guest_cycles: declared.maxGuestCycles.to_string(),

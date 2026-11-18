@@ -105,6 +105,11 @@ pub enum SkipReason {
     GuestCyclesAboveLimit,
     BindingMismatch,
     JournalsDifferAcrossPo2,
+    /// The guest called `sys_rand` past its runtime's own draw (`WitnessExecutePo2::sys_rand_draws`).
+    /// No proof binds the seed, so a prover picks what the guest draws: a randomized check of `W` is
+    /// one the prover passes with a seed of its choosing, whatever the journal. The guest's design,
+    /// the same for every `W`: permanent, the caller's.
+    GuestUsesSysRand,
     // Claim gate.
     JournalTooLarge,
     FulfilDaTooLarge,
@@ -133,7 +138,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    pub const ALL: [SkipReason; 46] = {
+    pub const ALL: [SkipReason; 47] = {
         use SkipReason::*;
         [
             EnvelopeMalformed, EnvelopeOutOfRange, UnsupportedBuilderType, UnsupportedProofSystem,
@@ -143,7 +148,7 @@ impl SkipReason {
             BuilderUnknownImport, BuilderTrap, BuilderFuelExhausted, BuilderMemoryExhausted,
             BuilderNonZeroReturn, BuilderWitnessTooLarge, BuilderTransient, BuilderSourceLagging, BuilderWallClock,
             BuilderClampedByProbation, RunnerInternal, BuilderCrashed, RunnerCrashed, GuestFailed, GuestCyclesAboveLimit,
-            BindingMismatch, JournalsDifferAcrossPo2, JournalTooLarge, FulfilDaTooLarge,
+            BindingMismatch, JournalsDifferAcrossPo2, GuestUsesSysRand, JournalTooLarge, FulfilDaTooLarge,
             BelowReservation, DeadlineMargin, ProveResources, VerifierSelectorMismatch,
             OperatorEndpoint, OperatorBudget, RetentionFull, HostInternal, HostBusy, PostLockFailure,
         ]
@@ -158,7 +163,7 @@ impl SkipReason {
             | BuilderInvalidModule | BuilderUnknownImport | BuilderTrap | BuilderFuelExhausted
             | BuilderMemoryExhausted | BuilderNonZeroReturn | BuilderWitnessTooLarge | BuilderWallClock
             | BuilderCrashed
-            | GuestCyclesAboveLimit | JournalsDifferAcrossPo2 | JournalTooLarge => (Never, true),
+            | GuestCyclesAboveLimit | JournalsDifferAcrossPo2 | GuestUsesSysRand | JournalTooLarge => (Never, true),
             // A stale node can cause these: one rebuild on other endpoints, then the caller's.
             GuestFailed | BindingMismatch => (OnceJittered, true),
             // Only operator-side failures (§11.2), so never the caller's.
@@ -327,7 +332,7 @@ mod tests {
         let v = |r: SkipReason| r.verdict();
         // Permanent for the job, the caller's.
         for r in [EnvelopeMalformed, EnvelopeOutOfRange, BuilderUnknownImport, BuilderTrap, BuilderFuelExhausted,
-            BuilderMemoryExhausted, BuilderNonZeroReturn, BuilderWallClock, JournalsDifferAcrossPo2]
+            BuilderMemoryExhausted, BuilderNonZeroReturn, BuilderWallClock, JournalsDifferAcrossPo2, GuestUsesSysRand]
         {
             assert_eq!(v(r), Verdict { retry: Retry::Never, blames_caller: true }, "{r:?}");
         }

@@ -509,10 +509,16 @@ mod tests {
             exit_code: 0,
             segment_bytes: 4096,
             peak_host_bytes: 1 << 28,
+            sys_rand_draws: Some(u64::from(p) - 16),
+        };
+        // `None` (no draw seen) round-trips apart from `Some(0)` (only the runtime's).
+        let unknown = WitnessExecutePo2 {
+            sys_rand_draws: None,
+            ..po2(22)
         };
         let resp = WitnessExecuteResponse {
             image_id: [3; 32],
-            results: vec![po2(16), po2(20)],
+            results: vec![po2(16), po2(20), unknown],
             sdk_version: "risc0-zkvm 3.1.0".to_string(),
             worker_version: "0.1.0".to_string(),
         };
@@ -520,6 +526,51 @@ mod tests {
         write_message(&mut buf, &resp).unwrap();
         let got: WitnessExecuteResponse = read_message(&mut Cursor::new(buf)).unwrap();
         assert_eq!(got, resp);
+
+        // v16 appended `sys_rand_draws` to each po2: a v15 worker's response (the same fields
+        // without it) does not decode, rather than read as a guest that drew nothing.
+        #[derive(serde::Serialize)]
+        struct V15Po2 {
+            po2: u8,
+            cycles: u64,
+            journal: Vec<u8>,
+            journal_len: u32,
+            journal_sha256: [u8; 32],
+            exit_kind: u8,
+            exit_code: u32,
+            segment_bytes: u64,
+            peak_host_bytes: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct V15Response {
+            image_id: [u8; 32],
+            results: Vec<V15Po2>,
+            sdk_version: String,
+            worker_version: String,
+        }
+        let v15 = V15Response {
+            image_id: [3; 32],
+            results: vec![V15Po2 {
+                po2: 20,
+                cycles: 1 << 20,
+                journal: vec![1; 8],
+                journal_len: 8,
+                journal_sha256: [4; 32],
+                exit_kind: GUEST_EXIT_HALTED,
+                exit_code: 0,
+                segment_bytes: 4096,
+                peak_host_bytes: 1 << 28,
+            }],
+            sdk_version: "risc0-zkvm 3.1.0".to_string(),
+            worker_version: "0.1.0".to_string(),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &v15).unwrap();
+        assert!(
+            read_message::<_, WitnessExecuteResponse>(&mut Cursor::new(buf)).is_err(),
+            "a v15 response must not decode as v16"
+        );
+        const _: () = assert!(PROTOCOL_VERSION >= 16);
     }
 
     #[test]

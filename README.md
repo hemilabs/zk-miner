@@ -732,7 +732,13 @@ chain is reported `not_served`: its proven input is the builder's `W`, not its `
   binds no seed, so a prover on other software can answer with anything), two po2s (the first
   `--po2` and the one farthest from it, else the far end of 16..22; one request each) and two keccak
   po2s; any journal change is a dependence on an input the prover controls (a run past the cycle
-  maximum is reported as such, not as a dependence);
+  maximum is reported as such, not as a dependence). These compare journals only, and a guest can
+  check `W` by the seed while its journal ignores it (a spot check at a drawn index passes an honest
+  `W` under every seed, and a forged one under the seed its prover picks). So every execute counts
+  the guest's own `sys_rand` calls (`perPo2[].sysRandDraws`, past the one its runtime makes before
+  `main`): a job whose guest makes any is skipped before any attack (`GuestUsesSysRand`, the
+  caller's, as a miner skips it), and a pair whose run draws is dependent. The count is of calls; a
+  guest that reads its runtime's own draw from memory is not caught by it;
 - **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
   (`--providers a,b`, default the first two serving the job's chain), each alone; different
   journals that both satisfy the binding are a soundness failure.
