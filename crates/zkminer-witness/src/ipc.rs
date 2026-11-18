@@ -350,13 +350,18 @@ pub enum ControlResponse {
     Registered { job_key: B256 },
     /// The broker's account of a job, sent in answer to `EndJob`.
     ///
-    /// A status-2 fetch sets at most one of two flags:
+    /// A status-2 fetch sets at most one of three flags:
     /// - `operator_failure`: it failed for an operator-side reason — a transport error or connect
     ///   timeout, a non-2xx other than 404, a malformed answer, an operator budget or the spool
     ///   quota exhausted, the fetch deadline hitting a lane, pacer or concurrency wait;
     /// - `unanswerable`: every endpoint it was allowed to try answered that it lacks the block or
-    ///   state (lagging or `null`), or every mirror answered 404 — a builder can ask for that on
-    ///   demand, so it is not the operator's failure.
+    ///   state (lagging or `null`) and at least two independent endpoints (distinct host and port)
+    ///   said so, or the block is older than the source's pruning horizon; or every mirror answered
+    ///   404 — a builder can ask for that on demand, so it is not the operator's failure;
+    /// - `lagging_unconfirmed`: the endpoints tried answered that they lack the block or state (or
+    ///   the block is above every head they report), but fewer than two independent ones did and the
+    ///   block is within the pruning horizon — a node behind the chain answers exactly so, so the
+    ///   requester is not blamed and the job is retried.
     ///
     /// A status-2 fetch with neither flag failed on its own cost (a timeout once the request was
     /// sent, or the fetch deadline while an endpoint worked on it). `fetch_in_flight_at_end` = a
@@ -371,6 +376,8 @@ pub enum ControlResponse {
         fetch_bytes: u64,
         operator_failure: bool,
         unanswerable: bool,
+        #[serde(default)]
+        lagging_unconfirmed: bool,
         fetch_in_flight_at_end: bool,
         in_flight_operator_wait: bool,
         denied: u32,

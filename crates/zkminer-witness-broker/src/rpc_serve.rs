@@ -7,8 +7,10 @@
 //! 4. Resolve symbolic tags by asking an endpoint, once per fetch: every call of the fetch sees the
 //!    same numbers. A request that names an explicit block number also resolves `latest`; a
 //!    number above the head (the highest `latest` of at most [`MAX_LAGGING_ATTEMPTS`] endpoints)
-//!    is refused, status 1, with no failover. A refusal after resolution costs the one unit of a
-//!    refused request, not one per call.
+//!    is refused, status 1, with no failover, once two independent endpoints (distinct host and
+//!    port) report heads below it; with fewer it is status 2 [`Failure::LaggingUnconfirmed`] (one
+//!    node behind the chain reports the same head). A refusal after resolution costs the one unit
+//!    of a refused request, not one per call.
 //! 5. Answer calls pinned to a block hash from the cache, charging the operator budget for them as
 //!    if they missed (status 2 when no endpoint can spend them, as for a miss). Send the rest (a
 //!    subset with the broker's own ids) through the endpoints in order:
@@ -18,8 +20,12 @@
 //!    - a lagging answer (the lagging heuristics, `null` where an answer must exist, or a suspect
 //!      error on a pinned call that the endpoint's head or `eth_getBlockByHash` shows it lacks)
 //!      moves on too, but at most [`MAX_LAGGING_ATTEMPTS`] endpoints are asked per request: if they
-//!      all lag the fetch is status 2 [`Failure::Unanswerable`] (a builder can ask for an unknown
-//!      hash on demand; that must not buy a blameless retry or cost every endpoint);
+//!      all lag the fetch is status 2 [`Failure::Unanswerable`] when two independent endpoints
+//!      (distinct host and port) lagged, or the request's oldest explicit block is deeper than the
+//!      source's pruning horizon ([`crate::broker::pruning_horizon`]) below the head (a builder can
+//!      ask for an unknown hash on demand; that must not buy a blameless retry or cost every
+//!      endpoint); with fewer it is [`Failure::LaggingUnconfirmed`], since one node behind the chain
+//!      answers a valid request exactly so;
 //!    - a timeout once the request was sent is the request's own ([`Failure::Own`]).
 //!
 //!    Every attempt, tag queries and head checks included, is charged to that endpoint's operator
@@ -87,6 +93,8 @@ pub(crate) async fn failover<T>(
     mut accept: impl FnMut(&[u8]) -> Attempt<T>,
 ) -> Result<(T, usize), Outcome> {
     let (mut lagging, mut operator, mut own) = (0usize, false, false);
+    // The endpoints that answered that they lack the block or state, by host and port.
+    let mut lagged: Vec<(&str, u16)> = Vec::new();
     let fault = |what: &str, ep: &Endpoint| {
         job.note_operator_fault();
         tracing::warn!(job = %job.tag(), endpoint = %ep.alias(), "{what}");
@@ -108,6 +116,7 @@ pub(crate) async fn failover<T>(
                     Ok(false) => return Ok((t, i)),
                     Ok(true) => {
                         lagging += 1;
+                        lagged.push((&ep.spec.host, ep.spec.port));
                         tracing::info!(job = %job.tag(), endpoint = %ep.alias(), "the node lacks a block the request is pinned to");
                     }
                     Err(e) => {
@@ -117,6 +126,7 @@ pub(crate) async fn failover<T>(
                 },
                 Attempt::Lagging => {
                     lagging += 1;
+                    lagged.push((&ep.spec.host, ep.spec.port));
                     tracing::info!(job = %job.tag(), endpoint = %ep.alias(), "the node lags or lacks the state");
                 }
                 Attempt::Bad(why) => {
@@ -141,11 +151,24 @@ pub(crate) async fn failover<T>(
     let failure = if operator {
         Failure::Operator
     } else if lagging > 0 && !own {
-        Failure::Unanswerable
+        if independent(&lagged) >= 2 {
+            Failure::Unanswerable
+        } else {
+            Failure::LaggingUnconfirmed
+        }
     } else {
         Failure::Own
     };
     Err(Outcome::failed(failure))
+}
+
+/// How many independent endpoints `seen` names: distinct `(host, port)` (two aliases of one URL are
+/// one node).
+fn independent(seen: &[(&str, u16)]) -> usize {
+    let mut v = seen.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    v.len()
 }
 
 /// Asks `ep` whether it lacks any block in `pins`: its head against the highest number, and
@@ -184,6 +207,23 @@ async fn lacks_a_block(b: &Broker, job: &Job, ep: &Endpoint, pins: &[BlockPin]) 
     Ok(false)
 }
 
+/// Whether `req`'s oldest call pinned to a block number lies more than `horizon` blocks below
+/// `head` (known when the request named an explicit number, which resolves `latest`).
+fn beyond_horizon(
+    head: Option<u64>,
+    req: &dyn RpcReq,
+    resolve: &dyn Fn(BlockTag) -> u64,
+    horizon: u64,
+) -> bool {
+    let oldest = (0..req.len())
+        .filter_map(|i| match req.pin(i, resolve) {
+            Some(BlockPin::Number(n)) => Some(n),
+            _ => None,
+        })
+        .min();
+    matches!((head, oldest), (Some(h), Some(n)) if h.saturating_sub(n) > horizon)
+}
+
 fn response_attempt<T>(e: ResponseError) -> Attempt<T> {
     match e {
         ResponseError::TooLarge => Attempt::Stop(FetchStatus::Exhausted),
@@ -215,6 +255,7 @@ pub(crate) async fn serve(
     chain_id: u64,
     method_set: MethodSet,
     endpoints: &[Arc<Endpoint>],
+    horizon: u64,
     request: &[u8],
 ) -> Outcome {
     let codec = &b.hooks.codec;
@@ -275,18 +316,29 @@ pub(crate) async fn serve(
     }
     if let Some(n) = highest {
         let mut head = tags[&BlockTag::Latest];
+        let first = &endpoints[latest_from].spec;
+        let mut below: Vec<(&str, u16)> = vec![(&first.host, first.port)];
         // The first answer may come from a node behind the others: ask one more before refusing.
         if n > head {
             for (i, ep) in endpoints.iter().enumerate().filter(|(i, _)| *i != latest_from).take(MAX_LAGGING_ATTEMPTS - 1) {
                 if let Some(h) = latest_of(b, job, ep).await {
                     tracing::debug!(job = %job.tag(), endpoint = i, head = h, "second head for an explicit block number");
                     head = head.max(h);
+                    if h < n {
+                        below.push((&ep.spec.host, ep.spec.port));
+                    }
                 }
             }
         }
         if n > head {
-            tracing::debug!(job = %job.tag(), number = n, head, "evm-rpc request names a block above the head");
-            return refuse();
+            // Above the heads of two independent endpoints: a block that does not exist yet. One
+            // node's head alone may be a node behind the chain.
+            if independent(&below) >= 2 {
+                tracing::debug!(job = %job.tag(), number = n, head, "evm-rpc request names a block above the head");
+                return refuse();
+            }
+            tracing::info!(job = %job.tag(), number = n, head, "evm-rpc request names a block above the only head seen: the node may lag");
+            return Outcome::failed(Failure::LaggingUnconfirmed);
         }
     }
     let resolve = |t: BlockTag| tags.get(&t).copied().expect("every tag of the request was resolved");
@@ -342,6 +394,18 @@ pub(crate) async fn serve(
         .await;
         let got = match got {
             Ok((a, _)) => a,
+            // State older than every provisioned endpoint keeps is not a lagging node's: final.
+            Err(o)
+                if o.failure == Some(Failure::LaggingUnconfirmed)
+                    && beyond_horizon(
+                        tags.get(&BlockTag::Latest).copied(),
+                        sub,
+                        &resolve,
+                        horizon,
+                    ) =>
+            {
+                return Outcome::failed(Failure::Unanswerable)
+            }
             Err(o) => return o,
         };
         let mut cache = b.rpc_cache.lock().unwrap_or_else(|p| p.into_inner());

@@ -16,7 +16,8 @@
 //! charged only to operator budgets, so operator exhaustion is status 2.
 //!
 //! A status-2 fetch is classified ([`Failure`]) into `JobStats.operator_failure`,
-//! `JobStats.unanswerable` or neither (the request's own cost); see `zkminer_witness::ipc`.
+//! `JobStats.unanswerable`, `JobStats.lagging_unconfirmed` or none (the request's own cost); see
+//! `zkminer_witness::ipc`.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +44,8 @@ const SPOOL_READ_CHUNK: usize = 256 << 10;
 
 /// Where one of a job's capabilities is served from.
 pub(crate) enum JobSource {
-    EvmRpc { chain_id: u64, method_set: MethodSet, endpoints: Vec<Arc<Endpoint>> },
+    /// `horizon`: [`crate::broker::pruning_horizon`] of `endpoints`.
+    EvmRpc { chain_id: u64, method_set: MethodSet, endpoints: Vec<Arc<Endpoint>>, horizon: u64 },
     Blob { max_bytes: u64 },
 }
 
@@ -53,8 +55,14 @@ pub(crate) enum Failure {
     /// The operator's side: transport, connect timeouts, non-2xx (404 only for RPC endpoints), a
     /// malformed answer, an operator budget or the spool quota, a lane or pacer wait at the deadline.
     Operator,
-    /// Every endpoint tried lacked the block or state, or every mirror lacked the blob.
+    /// Every endpoint tried lacked the block or state, and at least two independent ones (distinct
+    /// host and port) said so, or the block is older than the source's pruning horizon; or every
+    /// mirror lacked the blob.
     Unanswerable,
+    /// Every endpoint tried lacked the block or state (or the block is above every head seen), but
+    /// fewer than two independent endpoints said so and the block is within the pruning horizon: a
+    /// node behind the chain answers exactly so, so it is neither the builder's question nor final.
+    LaggingUnconfirmed,
     /// The request's own cost: a timeout once sent, the deadline while an endpoint worked on it.
     Own,
 }
@@ -65,6 +73,7 @@ struct Account {
     fetch_bytes: u64,
     operator_failure: bool,
     unanswerable: bool,
+    lagging_unconfirmed: bool,
     denied: u32,
     in_flight_at_close: bool,
     operator_wait_at_close: bool,
@@ -268,6 +277,7 @@ pub(crate) async fn end(b: &Arc<Broker>, job_key: B256) -> ControlResponse {
         bytes = a.fetch_bytes,
         operator_failure = a.operator_failure,
         unanswerable = a.unanswerable,
+        lagging_unconfirmed = a.lagging_unconfirmed,
         denied = a.denied,
         frames_after_exhaustion = a.frames_after_exhaustion,
         "job ended"
@@ -278,6 +288,7 @@ pub(crate) async fn end(b: &Arc<Broker>, job_key: B256) -> ControlResponse {
         fetch_bytes: a.fetch_bytes,
         operator_failure: a.operator_failure,
         unanswerable: a.unanswerable,
+        lagging_unconfirmed: a.lagging_unconfirmed,
         fetch_in_flight_at_end: in_flight || a.in_flight_at_close,
         in_flight_operator_wait: operator_wait || a.operator_wait_at_close,
         denied: a.denied,
@@ -442,6 +453,9 @@ async fn run(b: Arc<Broker>, job: Arc<Job>, sock: tokio::net::UnixStream, mut ca
         match (o.status, o.failure) {
             (FetchStatus::Failed, Some(Failure::Operator)) => job.acct().operator_failure = true,
             (FetchStatus::Failed, Some(Failure::Unanswerable)) => job.acct().unanswerable = true,
+            (FetchStatus::Failed, Some(Failure::LaggingUnconfirmed)) => {
+                job.acct().lagging_unconfirmed = true
+            }
             (FetchStatus::Denied, _) => job.acct().denied += 1,
             _ => {}
         }
@@ -473,8 +487,22 @@ async fn serve_fetch(b: &Arc<Broker>, job: &Arc<Job>, payload: &[u8]) -> Outcome
     };
     let fut = async {
         match source {
-            JobSource::EvmRpc { chain_id, method_set, endpoints } => {
-                crate::rpc_serve::serve(b, job, *chain_id, *method_set, endpoints, request).await
+            JobSource::EvmRpc {
+                chain_id,
+                method_set,
+                endpoints,
+                horizon,
+            } => {
+                crate::rpc_serve::serve(
+                    b,
+                    job,
+                    *chain_id,
+                    *method_set,
+                    endpoints,
+                    *horizon,
+                    request,
+                )
+                .await
             }
             JobSource::Blob { max_bytes } => crate::blob::serve(b, job, *max_bytes, request).await,
         }

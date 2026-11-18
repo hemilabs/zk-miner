@@ -23,6 +23,26 @@ pub(crate) struct EvmEndpoint {
     pub ep: Arc<Endpoint>,
 }
 
+/// The fewest blocks of recent state a full node keeps (geth's in-memory window): a non-archive
+/// endpoint's pruning horizon is at least this deep, whatever its `max_proof_age`.
+pub(crate) const RECENT_STATE_BLOCKS: u64 = 128;
+
+/// The deepest `head − block` at which a source's endpoints, `(archive, max_proof_age)` each, still
+/// serve state: unbounded with an archive endpoint, else the largest `max_proof_age`, at least
+/// [`RECENT_STATE_BLOCKS`]. A request for state deeper than this is one no provisioned endpoint was
+/// promised to answer; within it, an endpoint that lacks the state lags (or is broken).
+pub(crate) fn pruning_horizon(endpoints: impl IntoIterator<Item = (bool, u64)>) -> u64 {
+    endpoints
+        .into_iter()
+        .fold(RECENT_STATE_BLOCKS, |h, (archive, age)| {
+            if archive {
+                u64::MAX
+            } else {
+                h.max(age)
+            }
+        })
+}
+
 pub(crate) struct Broker {
     pub cfg: BrokerConfig,
     pub hooks: Hooks,
@@ -122,7 +142,7 @@ impl Broker {
         let cap = Capability { class, config: config.to_vec().into() };
         match decode_capability(&cap).ok()? {
             CapabilityKind::EvmRpcV1 { chain_id, archive, method_set, max_proof_age } => {
-                let endpoints: Vec<_> = self
+                let serving: Vec<_> = self
                     .evm
                     .iter()
                     .filter(|e| {
@@ -131,9 +151,19 @@ impl Broker {
                             && e.info.max_proof_age >= max_proof_age
                             && e.info.method_sets.contains(&method_set)
                     })
-                    .map(|e| e.ep.clone())
                     .collect();
-                (!endpoints.is_empty()).then_some(JobSource::EvmRpc { chain_id, method_set, endpoints })
+                let horizon = pruning_horizon(
+                    serving
+                        .iter()
+                        .map(|e| (e.info.archive, e.info.max_proof_age)),
+                );
+                let endpoints: Vec<_> = serving.iter().map(|e| e.ep.clone()).collect();
+                (!endpoints.is_empty()).then_some(JobSource::EvmRpc {
+                    chain_id,
+                    method_set,
+                    endpoints,
+                    horizon,
+                })
             }
             CapabilityKind::BlobV1 { max_bytes } => (!self.blob_mirrors.is_empty()).then_some(JobSource::Blob { max_bytes }),
         }

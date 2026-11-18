@@ -85,6 +85,11 @@ pub enum SkipReason {
     /// expired while a fetch waited on operator-side capacity. Not: a fetch the builder made
     /// unanswerable (unknown hashes, missing state), nor one in flight on its own cost.
     BuilderTransient,
+    /// A fetch failed because the job's source answered that it lacks the block or state (or the
+    /// block is above its head), while fewer than two independent endpoints for that chain said so
+    /// and the block is within the source's pruning horizon (`JobStats.lagging_unconfirmed`): a
+    /// node behind the chain answers a valid request exactly so. Retried, never the caller's.
+    BuilderSourceLagging,
     /// The wall clock expired with no fetch in flight.
     BuilderWallClock,
     BuilderClampedByProbation,
@@ -128,7 +133,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    pub const ALL: [SkipReason; 45] = {
+    pub const ALL: [SkipReason; 46] = {
         use SkipReason::*;
         [
             EnvelopeMalformed, EnvelopeOutOfRange, UnsupportedBuilderType, UnsupportedProofSystem,
@@ -136,7 +141,7 @@ impl SkipReason {
             LimitsAboveHostMaxima, NotClaimable, NotAdmitted, WitnessDisabled, ElfUnavailable,
             ElfImageIdMismatch, ArtifactAllSourcesBad, ArtifactUnavailable, BuilderInvalidModule,
             BuilderUnknownImport, BuilderTrap, BuilderFuelExhausted, BuilderMemoryExhausted,
-            BuilderNonZeroReturn, BuilderWitnessTooLarge, BuilderTransient, BuilderWallClock,
+            BuilderNonZeroReturn, BuilderWitnessTooLarge, BuilderTransient, BuilderSourceLagging, BuilderWallClock,
             BuilderClampedByProbation, RunnerInternal, BuilderCrashed, RunnerCrashed, GuestFailed, GuestCyclesAboveLimit,
             BindingMismatch, JournalsDifferAcrossPo2, JournalTooLarge, FulfilDaTooLarge,
             BelowReservation, DeadlineMargin, ProveResources, VerifierSelectorMismatch,
@@ -158,6 +163,11 @@ impl SkipReason {
             GuestFailed | BindingMismatch => (OnceJittered, true),
             // Only operator-side failures (§11.2), so never the caller's.
             BuilderTransient => (OnceJittered, false),
+            // A node behind the chain catches up on its own: retried while it may (about 16
+            // minutes), never the caller's. Each retry is a whole simulation a builder can cause
+            // on a host with one endpoint per chain, so the count stays small; with two
+            // independent endpoints the broker's answer is final instead.
+            BuilderSourceLagging => (Backoff { max_attempts: 6 }, false),
             // What this host supports or is configured for: re-evaluated only when that changes.
             UnsupportedBuilderType | UnsupportedProofSystem | UnsupportedBinding | UnsupportedSubmission
             | DeploymentNotVerified | CapabilityNotProvisioned | LimitsAboveHostMaxima
@@ -182,10 +192,11 @@ impl SkipReason {
     }
 }
 
-/// Everything known about how a builder run ended. `operator_failure`, `fetch_in_flight_at_end`
-/// and `in_flight_operator_wait` come from the broker's `JobStats`, never from the sandboxed
-/// runner's own summary. (`JobStats.unanswerable` is deliberately absent: a fetch the builder made
-/// unanswerable never excuses its failure.)
+/// Everything known about how a builder run ended. `operator_failure`, `source_lagging`,
+/// `fetch_in_flight_at_end` and `in_flight_operator_wait` come from the broker's `JobStats`, never
+/// from the sandboxed runner's own summary. (`JobStats.unanswerable` is deliberately absent: a
+/// fetch the builder made unanswerable, as two independent endpoints or the pruning horizon
+/// confirm, never excuses its failure.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BuilderOutcome {
     /// The runner's exit code; `None` when it was killed by a signal.
@@ -196,6 +207,9 @@ pub struct BuilderOutcome {
     pub wall_clock_hit: bool,
     /// Some fetch failed (status 2) for an operator-side reason.
     pub operator_failure: bool,
+    /// Some fetch failed (status 2) because the source lacked the block or state, unconfirmed by a
+    /// second independent endpoint (`JobStats.lagging_unconfirmed`).
+    pub source_lagging: bool,
     /// A fetch was being served when the run ended.
     pub fetch_in_flight_at_end: bool,
     /// ...and it was waiting on operator-side capacity, or had met an operator-side failure.
@@ -225,6 +239,11 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
     let deadline = o.wall_clock_hit || o.exit == Some(exit::WALL_CLOCK);
     if o.operator_failure || (deadline && o.fetch_in_flight_at_end && o.in_flight_operator_wait) {
         return Some(BuilderTransient);
+    }
+    // Like an operator-side failure, a lagging source excuses any exit: the builder never got
+    // what it needed.
+    if o.source_lagging {
+        return Some(BuilderSourceLagging);
     }
     if o.oom_killed {
         return Some(BuilderMemoryExhausted);
@@ -337,6 +356,7 @@ mod tests {
         let o = |exit, operator_failure, fetch_in_flight_at_end, wall_clock_hit, oom_killed| BuilderOutcome {
             exit,
             operator_failure,
+            source_lagging: false,
             fetch_in_flight_at_end,
             in_flight_operator_wait: fetch_in_flight_at_end,
             wall_clock_hit,
@@ -395,6 +415,46 @@ mod tests {
         assert_eq!(builder_verdict(&BuilderOutcome { fetch_in_flight_at_end: true, in_flight_operator_wait: true, ..base }), Some(BuilderTrap));
         // An operator-side failure excuses any exit.
         assert_eq!(builder_verdict(&BuilderOutcome { operator_failure: true, ..base }), Some(BuilderTransient));
+    }
+
+    /// A source that lacked the block or state with no second independent endpoint to confirm it
+    /// may be a node behind the chain: the builder is retried with backoff and never blamed, after
+    /// any exit; an operator-side failure still reads as one.
+    #[test]
+    fn an_unconfirmed_lagging_source_is_retried_and_never_blamed() {
+        let base = BuilderOutcome {
+            exit: Some(exit::NONZERO_RETURN),
+            module_started: true,
+            ..Default::default()
+        };
+        assert_eq!(builder_verdict(&base), Some(BuilderNonZeroReturn));
+        let lagging = BuilderOutcome {
+            source_lagging: true,
+            ..base
+        };
+        assert_eq!(builder_verdict(&lagging), Some(BuilderSourceLagging));
+        assert_eq!(
+            builder_verdict(&BuilderOutcome {
+                exit: Some(exit::FUEL),
+                ..lagging
+            }),
+            Some(BuilderSourceLagging)
+        );
+        assert_eq!(
+            builder_verdict(&BuilderOutcome {
+                operator_failure: true,
+                ..lagging
+            }),
+            Some(BuilderTransient)
+        );
+        assert_eq!(
+            BuilderSourceLagging.verdict(),
+            Verdict {
+                retry: Retry::Backoff { max_attempts: 6 },
+                blames_caller: false
+            }
+        );
+        assert_eq!(BuilderSourceLagging.verdict().retry.as_str(), "backoff");
     }
 
     /// The runner's "module started" marker: its own INTERNAL exit before the marker is the

@@ -65,8 +65,13 @@ pub struct JobStats {
     pub fetch_bytes: u64,
     /// Some fetch failed (status 2) for an operator-side reason.
     pub operator_failure: bool,
-    /// Some fetch failed (status 2) because every endpoint tried lacked what it asked for.
+    /// Some fetch failed (status 2) because every endpoint tried lacked what it asked for, as at
+    /// least two independent endpoints (or the source's pruning horizon) confirm.
     pub unanswerable: bool,
+    /// Some fetch failed (status 2) because the endpoints tried lacked the block or state, but
+    /// fewer than two independent ones said so and it is within the pruning horizon (a lagging
+    /// node looks the same).
+    pub lagging_unconfirmed: bool,
     /// A fetch was being served when the job ended or its socket closed.
     pub fetch_in_flight_at_end: bool,
     /// ...and it was waiting on operator-side capacity or had met an operator-side failure.
@@ -285,6 +290,7 @@ impl BrokerClient {
                     fetch_bytes,
                     operator_failure,
                     unanswerable,
+                    lagging_unconfirmed,
                     fetch_in_flight_at_end,
                     in_flight_operator_wait,
                     denied,
@@ -296,6 +302,7 @@ impl BrokerClient {
                 fetch_bytes,
                 operator_failure,
                 unanswerable,
+                lagging_unconfirmed,
                 fetch_in_flight_at_end,
                 in_flight_operator_wait,
                 denied,

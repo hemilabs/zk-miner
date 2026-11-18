@@ -379,6 +379,7 @@ pub async fn run_builder_abortable<S: WitnessSink>(
         oom_killed: raw.oom_killed,
         wall_clock_hit: raw.wall_clock_hit,
         operator_failure: stats.is_some_and(|s| s.operator_failure),
+        source_lagging: stats.is_some_and(|s| s.lagging_unconfirmed),
         fetch_in_flight_at_end: stats.is_some_and(|s| s.fetch_in_flight_at_end),
         in_flight_operator_wait: stats.is_some_and(|s| s.in_flight_operator_wait),
         module_started,

@@ -172,6 +172,7 @@ async fn a_builder_cannot_make_its_failure_transient() {
         oom_killed: false,
         wall_clock_hit: false,
         operator_failure: stats.operator_failure,
+        source_lagging: stats.lagging_unconfirmed,
         fetch_in_flight_at_end: stats.fetch_in_flight_at_end,
         in_flight_operator_wait: stats.in_flight_operator_wait,
         module_started: true,
@@ -215,6 +216,183 @@ async fn a_lagging_node_fails_over_to_one_that_has_the_block() {
     let stats = client.end_job(B256::repeat_byte(1)).await.unwrap();
     assert_eq!((stats.fetches, stats.denied), (3, 1), "1 + 1 + one unit for the refused batch");
     assert!(!stats.operator_failure && !stats.unanswerable);
+}
+
+/// A node at height `head` that has no state at any block (`missing trie node`) and knows no block
+/// by hash (`null`): what a node far behind the chain, or one asked for what does not exist, says.
+fn stateless_node(head: u64) -> impl Fn(TestRequest) -> TestResponse + Send + Sync + 'static {
+    move |req| {
+        let v: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let one = |c: &Value| match c["method"].as_str().unwrap_or_default() {
+            "eth_getBlockByNumber" => {
+                json!({"jsonrpc":"2.0","id":c["id"].clone(),"result":{"number":format!("{head:#x}")}})
+            }
+            "eth_getBalance" => {
+                json!({"jsonrpc":"2.0","id":c["id"].clone(),"error":{"code":-32000,"message":"missing trie node 5c3a (path )"}})
+            }
+            _ => json!({"jsonrpc":"2.0","id":c["id"].clone(),"result":null}),
+        };
+        let out = match &v {
+            Value::Array(a) => Value::Array(a.iter().map(one).collect()),
+            c => one(c),
+        };
+        TestResponse::ok(serde_json::to_vec(&out).unwrap())
+    }
+}
+
+/// One fetch in a job of its own, so the job's flags are that fetch's.
+async fn fetch_one(
+    client: &zkminer_witness_broker::client::BrokerClient,
+    key: u8,
+    req: String,
+) -> (FetchStatus, zkminer_witness_broker::client::JobStats) {
+    let mut b = register(
+        client,
+        key,
+        vec![anvil_cap()],
+        budget(10, 1 << 20, 1 << 20),
+        false,
+    )
+    .await;
+    let status = b.fetch(0, req.as_bytes()).await.0;
+    (
+        status,
+        client.end_job(B256::repeat_byte(key)).await.unwrap(),
+    )
+}
+
+/// With one endpoint for a chain, "this node lacks the block or state" is what a node behind the
+/// chain answers to a valid request: status 2 `lagging_unconfirmed`, which retries the builder
+/// without blaming its caller. It is final (`unanswerable`, or status 1 for a block above the
+/// heads) once two independent endpoints (distinct host and port) agree, or when the block is
+/// deeper than every endpoint keeps state (the pruning horizon).
+#[tokio::test]
+async fn a_lagging_source_is_final_only_when_confirmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n0, n1) = (
+        TestServer::start(stateless_node(1000)).await,
+        TestServer::start(stateless_node(1000)).await,
+    );
+    let local = "cidrs = [\"127.0.0.1/32\"]";
+    let balance = |id: u32, block: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"eth_getBalance","params":["{DEV}","{block:#x}"]}}"#
+        )
+    };
+    let unknown = format!("0x{}", "00".repeat(31) + "02");
+    let by_hash = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"eth_getBlockByHash","params":["{unknown}",false]}}"#
+    );
+
+    // One non-archive endpoint (horizon: 128 blocks of recent state).
+    let text = config_text(dir.path(), &evm("n0", &n0.url(), ANVIL_CHAIN, local));
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    // State 8 blocks below its head: within the horizon, unconfirmed.
+    let (status, stats) = fetch_one(&client, 1, balance(1, 992)).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.lagging_unconfirmed && !stats.unanswerable && !stats.operator_failure,
+        "{stats:?}"
+    );
+    let outcome = BuilderOutcome {
+        exit: Some(exit::NONZERO_RETURN),
+        operator_failure: stats.operator_failure,
+        source_lagging: stats.lagging_unconfirmed,
+        module_started: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        builder_verdict(&outcome),
+        Some(SkipReason::BuilderSourceLagging)
+    );
+    assert!(!SkipReason::BuilderSourceLagging.verdict().blames_caller);
+    // A block hash it does not know: the same.
+    let (status, stats) = fetch_one(&client, 2, by_hash.clone()).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.lagging_unconfirmed && !stats.unanswerable,
+        "{stats:?}"
+    );
+    // A number above its only head: status 2, not a refusal (it may be the node that is behind).
+    let (status, stats) = fetch_one(&client, 3, balance(3, 2000)).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(stats.lagging_unconfirmed && stats.denied == 0, "{stats:?}");
+    // State 984 blocks deep: beyond what the endpoint keeps, so no node lagging explains it.
+    let (status, stats) = fetch_one(&client, 4, balance(4, 16)).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.unanswerable && !stats.lagging_unconfirmed,
+        "{stats:?}"
+    );
+    assert_eq!(
+        builder_verdict(&BuilderOutcome {
+            source_lagging: false,
+            ..outcome
+        }),
+        Some(SkipReason::BuilderNonZeroReturn)
+    );
+
+    // An archive endpoint keeps every state: no horizon, so even that depth is unconfirmed.
+    let text = config_text(
+        dir.path(),
+        &evm(
+            "n0",
+            &n0.url(),
+            ANVIL_CHAIN,
+            &format!("archive = true\n{local}"),
+        ),
+    );
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let (_, stats) = fetch_one(&client, 5, balance(5, 16)).await;
+    assert!(
+        stats.lagging_unconfirmed && !stats.unanswerable,
+        "{stats:?}"
+    );
+
+    // Two aliases of one URL are one node: still unconfirmed, though both were asked.
+    let before = n0.hits();
+    let text = config_text(
+        dir.path(),
+        &format!(
+            "{}{}",
+            evm("n0", &n0.url(), ANVIL_CHAIN, local),
+            evm("n0-again", &n0.url(), ANVIL_CHAIN, local)
+        ),
+    );
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let (_, stats) = fetch_one(&client, 6, by_hash.clone()).await;
+    assert!(
+        stats.lagging_unconfirmed && !stats.unanswerable,
+        "{stats:?}"
+    );
+    assert_eq!(n0.hits() - before, 2, "both aliases were asked");
+
+    // Two independent endpoints agree: final.
+    let text = config_text(
+        dir.path(),
+        &format!(
+            "{}{}",
+            evm("n0", &n0.url(), ANVIL_CHAIN, local),
+            evm("n1", &n1.url(), ANVIL_CHAIN, local)
+        ),
+    );
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let (status, stats) = fetch_one(&client, 7, by_hash).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.unanswerable && !stats.lagging_unconfirmed,
+        "{stats:?}"
+    );
+    let (status, stats) = fetch_one(&client, 8, balance(8, 992)).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.unanswerable && !stats.lagging_unconfirmed,
+        "{stats:?}"
+    );
+    // ...and a number above both heads is a block that does not exist yet: refused.
+    let (status, stats) = fetch_one(&client, 9, balance(9, 2000)).await;
+    assert_eq!(status, FetchStatus::Denied);
+    assert_eq!(stats.denied, 1);
 }
 
 /// The mock codec's explicit numbers: a head from a lagging first endpoint is not the last word.

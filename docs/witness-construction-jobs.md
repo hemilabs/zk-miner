@@ -777,7 +777,14 @@ struct BuilderContextV1 {        // the input, as abi.encode(ctx) with its 0x20 
   or the wall clock expired while a fetch waited on the operator side. A request every endpoint
   answers as lagging or not found is *unanswerable*, which is the builder's question, not the operator's
   failure: a builder must not be able to buy a free retry by asking for a future block or an unknown
-  hash (§16). The runner writes a marker on its summary pipe once compilation succeeds and before
+  hash (§16) — once **two independent endpoints** (distinct host and port) for that chain answered so,
+  or the block lies deeper below the head than the source's **pruning horizon** (unbounded when an
+  endpoint serving it is `archive`, else the largest `max_proof_age` of its endpoints, at least 128
+  blocks of recent state). With fewer, a node behind the chain answers a valid request exactly so (a
+  block it does not know yet, state it lacks at a recent block), so the run is *source-lagging*: retried
+  with backoff and never counted against the caller (§16). The price is a few retries a builder can
+  cause on a host with one endpoint per chain; a host with two independent endpoints per chain gives it
+  none. The runner writes a marker on its summary pipe once compilation succeeds and before
   instantiation; a runner error reported after that marker is treated as a builder trap, since a
   builder that escaped wasmtime controls the runner process and could otherwise fake an internal
   error for a free retry.
@@ -1067,8 +1074,12 @@ only *for a configuration*: chain id, archive, served proof age, method sets.
   weighted cost units; exhausting an operator budget is status 2, so status 3 always means the job's
   own limits.
 - **Retries:** transport errors and 429 → failover to another endpoint; lagging-node errors ("header
-  not found", "missing trie node") → retry on another endpoint; execution errors (a reverted call) are
-  answers.
+  not found", "missing trie node") → retry on another endpoint, at most two; execution errors (a
+  reverted call) are answers. When every endpoint asked lacks the block or state, the fetch is status 2
+  and final (*unanswerable*) only if two independent endpoints agreed or the block is beyond the
+  pruning horizon; otherwise it is *source-lagging* (§9.2). An explicit block number above the head is
+  refused (status 1) once two independent endpoints report heads below it; above one node's head only,
+  it is status 2, source-lagging.
 - **Keys:** key-bearing endpoints get no redirects, no Referer, no proxy; endpoints are logged by
   operator alias, errors with the URL stripped.
 
@@ -1725,6 +1736,7 @@ Witness serving stays disabled in code until the steps of its phase are in place
 | Builder artifact | per source (§13.4); permanent for the job once every source is bad |
 | Builder deterministic failure (trap, fuel, memory, non-zero return) with no status-2 fetch | permanent for the job |
 | Builder transient (an operator-side fetch failure, or the wall clock expiring while a fetch waited on the operator side; not an unanswerable request) | one jittered retry on other endpoints, then permanent; never counted against the caller |
+| Builder source-lagging (a fetch the job's source answered as lacking the block or state, or naming a block above its head, with fewer than two independent endpoints of that chain agreeing and the block within the pruning horizon, §9.2) | retried with backoff (6 attempts, about 16 minutes), then permanent; never counted against the caller |
 | Guest failure or binding mismatch | one jittered rebuild on other endpoints (a stale node can cause it), then permanent |
 | Journals differ across po2 | permanent |
 | Operator-side (endpoint errors, 429s, operator budget exhaustion, artifact endpoint errors) | never counted against the caller; retried |
