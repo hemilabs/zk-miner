@@ -1253,9 +1253,9 @@ impl ChainClient {
                 Ok(false)
             }
             None => {
-                if let Ok((rec, _)) = self.read_job_record(job_id, None).await {
+                if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
                     if rec.prover != self.address {
-                        self.abort_nonce(nonce);
+                        self.settle_nonce(nonce, Some(at)).await;
                         return Ok(true);
                     }
                 }
@@ -1600,16 +1600,21 @@ impl ChainClient {
                     if is_funds_refusal(&msg) {
                         self.note_funds_short();
                     }
-                    // Send failed and the tx did not land → recycle the nonce as a gap.
-                    self.abort_nonce(nonce);
                     // A preflighting node rejects a reverting claim at SEND with the revert data.
                     // THIS send locked nothing — but if an earlier attempt of ours was broadcast,
                     // its tx may be the very reason the job is no longer open. Decide from a read
                     // at a block that includes it.
                     let Some(bn) = broadcast_nonce else {
+                        // Nothing of ours ever went out → recycle the nonce as a gap.
+                        self.abort_nonce(nonce);
                         return Err(claim_failure_from_call(&e, true, None));
                     };
-                    return match self.read_job_record_after_nonce(job_id, bn).await {
+                    let read = self.read_job_record_after_nonce(job_id, bn).await;
+                    // This send did not land, but an earlier broadcast at this same nonce may have
+                    // mined (and be what locked the job): commit it then, recycle it otherwise.
+                    self.settle_nonce(nonce, read.as_ref().ok().map(|(_, at)| *at))
+                        .await;
+                    return match read {
                         Ok((rec, at)) if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED => {
                             tracing::info!("Job claimed: {job_id} (an earlier broadcast at nonce {bn} mined)");
                             Ok(ClaimReceipt {
@@ -1727,9 +1732,9 @@ impl ChainClient {
                     while std::time::Instant::now() < deadline {
                         if let Ok((rec, at)) = self.read_job_record(job_id, None).await {
                             if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
-                                // SOME claim of ours landed, not necessarily THIS nonce → abort
-                                // (self-heals); commit could advance past an unmined nonce.
-                                self.abort_nonce(nonce);
+                                // SOME claim of ours landed, not necessarily THIS nonce: commit only
+                                // when the mined count is past it, else abort.
+                                self.settle_nonce(nonce, Some(at)).await;
                                 tracing::info!("Job {} claimed (confirmed via poll)", job_id);
                                 return Ok(ClaimReceipt {
                                     block: at,
@@ -1746,7 +1751,7 @@ impl ChainClient {
                                     .await
                                     .is_ok_and(|c| c > broadcast_nonce.unwrap_or(nonce));
                                 if included {
-                                    self.abort_nonce(nonce);
+                                    self.settle_nonce(nonce, Some(at)).await;
                                     return Err(ClaimLostRace(rec.prover).into());
                                 }
                             }
@@ -1765,14 +1770,14 @@ impl ChainClient {
         };
         if let Ok((rec, at)) = read {
             if rec.prover == self.address && rec.status == JOB_STATUS_LOCKED {
-                self.abort_nonce(nonce);
+                self.settle_nonce(nonce, Some(at)).await;
                 return Ok(ClaimReceipt {
                     block: at,
                     settled_price: None,
                 });
             }
             if rec.prover != Address::ZERO && rec.prover != self.address {
-                self.abort_nonce(nonce);
+                self.settle_nonce(nonce, Some(at)).await;
                 return Err(ClaimLostRace(rec.prover).into());
             }
         }
@@ -2218,7 +2223,7 @@ impl ChainClient {
                         ));
                     }
                     DaStep::Fulfilled => {
-                        self.abort_nonce(nonce);
+                        self.settle_nonce(nonce, None).await;
                         tracing::info!("Job {job_id} Fulfilled on-chain");
                         return Ok(());
                     }
@@ -2252,7 +2257,7 @@ impl ChainClient {
                 ));
             }
             // Lock check before publishing: Locked AND ours, at a block >= the claim receipt's.
-            let (rec, _) = match self.read_job_record(job_id, lock_block).await {
+            let (rec, read_at) = match self.read_job_record(job_id, lock_block).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("{what}: lock read for {job_id} failed: {e:#}");
@@ -2262,13 +2267,15 @@ impl ChainClient {
                     continue;
                 }
             };
+            // An earlier publish at this nonce (a previous attempt, or the resumed stash) may be what
+            // settled the job: `settle_nonce` commits the nonce if it mined.
             if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
-                self.abort_nonce(nonce);
+                self.settle_nonce(nonce, Some(read_at)).await;
                 tracing::info!("Job {} already Fulfilled on-chain", job_id);
                 return Ok(());
             }
             if rec.status != JOB_STATUS_LOCKED || rec.prover != self.address {
-                self.abort_nonce(nonce);
+                self.settle_nonce(nonce, Some(read_at)).await;
                 return Err(fail(
                     FulfilClass::Stale,
                     String::new(),
@@ -2429,11 +2436,11 @@ impl ChainClient {
                             if let Some(b) = budget {
                                 poll_end = poll_end.min(started + b);
                             }
-                            if self
+                            if let Some(at) = self
                                 .poll_fulfilled_until(job_id, poll_end, FULFIL_HELD_POLL)
                                 .await
                             {
-                                self.abort_nonce(nonce);
+                                self.settle_nonce(nonce, Some(at)).await;
                                 tracing::info!(
                                     "Job {} Fulfilled (confirmed via state poll)",
                                     job_id
@@ -2492,13 +2499,21 @@ impl ChainClient {
                             // NotJobProver for a lock we hold — the lifecycle would then drop it. Only
                             // a read pinned at or after the lock block may conclude the lock is gone.
                             match self.read_job_record(job_id, lock_block).await {
-                                Ok((rec, _)) if rec.prover == self.address && rec.status == JOB_STATUS_FULFILLED => {
-                                    self.abort_nonce(nonce);
+                                Ok((rec, at))
+                                    if rec.prover == self.address
+                                        && rec.status == JOB_STATUS_FULFILLED =>
+                                {
+                                    // An earlier publish at this nonce may be what settled it.
+                                    self.settle_nonce(nonce, Some(at)).await;
                                     return Ok(());
                                 }
-                                Ok((rec, _)) if rec.prover != self.address || rec.status != JOB_STATUS_LOCKED => {
-                                    // Confirmed gone: nothing to displace, so recycle the nonce.
-                                    self.abort_nonce(nonce);
+                                Ok((rec, at))
+                                    if rec.prover != self.address
+                                        || rec.status != JOB_STATUS_LOCKED =>
+                                {
+                                    // Confirmed gone: nothing to displace, so recycle the nonce —
+                                    // unless an earlier publish at it mined (a revert).
+                                    self.settle_nonce(nonce, Some(at)).await;
                                     return Err(fail(
                                         class,
                                         d.name(),
@@ -2614,11 +2629,14 @@ impl ChainClient {
                     if let Some(b) = budget {
                         poll_end = poll_end.min(started + b);
                     }
-                    if self
+                    if let Some(at) = self
                         .poll_fulfilled_until(job_id, poll_end, Duration::from_secs(5))
                         .await
                     {
-                        self.abort_nonce(nonce);
+                        // Usually our own fulfil at this nonce, mined inside the receipt wait: the
+                        // nonce is spent then, and recycling it would hand the next claim "nonce
+                        // too low".
+                        self.settle_nonce(nonce, Some(at)).await;
                         tracing::info!("Job {} Fulfilled (confirmed via state poll)", job_id);
                         return Ok(());
                     }
@@ -2636,9 +2654,9 @@ impl ChainClient {
                     .and_then(|x| x.ok()),
                 None => self.read_job_record(job_id, None).await.ok(),
             };
-            if let Some((rec, _)) = read {
+            if let Some((rec, at)) = read {
                 if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
-                    self.abort_nonce(nonce);
+                    self.settle_nonce(nonce, Some(at)).await;
                     return Ok(());
                 }
             }
@@ -2697,20 +2715,21 @@ impl ChainClient {
         }
     }
 
-    /// Poll `jobs()` every `every` until `poll_end` for this job Fulfilled by us.
+    /// Poll `jobs()` every `every` until `poll_end` for this job Fulfilled by us; the block the read
+    /// that saw it was taken at.
     async fn poll_fulfilled_until(
         &self,
         job_id: B256,
         poll_end: std::time::Instant,
         every: Duration,
-    ) -> bool {
+    ) -> Option<u64> {
         while std::time::Instant::now() < poll_end {
             let call_budget = poll_end.saturating_duration_since(std::time::Instant::now());
-            if let Ok(Ok((rec, _))) =
+            if let Ok(Ok((rec, at))) =
                 tokio::time::timeout(call_budget, self.read_job_record(job_id, None)).await
             {
                 if rec.status == JOB_STATUS_FULFILLED && rec.prover == self.address {
-                    return true;
+                    return Some(at);
                 }
             }
             tokio::time::sleep(
@@ -2718,7 +2737,7 @@ impl ChainClient {
             )
             .await;
         }
-        false
+        None
     }
 
     /// After a fulfil gives up: if anything was broadcast at `nonce`, STASH it for this job (it may
@@ -2889,8 +2908,9 @@ impl ChainClient {
             if let Ok(view) = self.get_job_status_view(job_id).await {
                 if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
                     // Our lock is gone (release landed, or the fulfill we were displacing
-                    // actually mined) → success. Recycle the nonce; self-heals if consumed.
-                    self.abort_nonce(nonce);
+                    // actually mined) → success. Commit the nonce if one of ours at it mined,
+                    // else recycle it.
+                    self.settle_nonce(nonce, None).await;
                     tracing::info!("Job {} no longer locked by us (released/reopened)", job_id);
                     return Ok(());
                 }
@@ -3157,14 +3177,14 @@ impl ChainClient {
                     while std::time::Instant::now() < deadline {
                         if let Ok(view) = self.get_job_status_view(job_id).await {
                             if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
-                                // ABORT, not commit: "our lock is gone" is NOT uniquely our
-                                // doing — a keeper's slashAndReopen or another prover's
-                                // reclaim clears it too, in which case our releaseJob at
-                                // `nonce` never mined and it's a gap to recycle. If our tx
-                                // DID land, recycling self-heals (a reuser hits "nonce too
-                                // low" → re-syncs). Either way, abort is correct and — unlike
-                                // a blunt invalidate — doesn't discard other gaps.
-                                self.abort_nonce(nonce);
+                                // "Our lock is gone" is NOT uniquely our doing — a keeper's
+                                // slashAndReopen or another prover's reclaim clears it too, in
+                                // which case our releaseJob at `nonce` never mined and it's a gap
+                                // to recycle. So the mined count decides: past `nonce`, our tx
+                                // there mined and the nonce is spent (recycling it would hand the
+                                // next reservation "nonce too low"); otherwise abort — which,
+                                // unlike a blunt invalidate, doesn't discard other gaps.
+                                self.settle_nonce(nonce, None).await;
                                 tracing::info!(
                                     "Job {} released (confirmed via state poll)",
                                     job_id
@@ -3208,7 +3228,7 @@ impl ChainClient {
         // here is UNKNOWN, not success.
         if let Ok(view) = self.get_job_status_view(job_id).await {
             if self.lock_gone_on_evidence(job_id, &view, seen, sent).await {
-                self.abort_nonce(nonce);
+                self.settle_nonce(nonce, None).await;
                 tracing::info!("Job {} released (confirmed on final check)", job_id);
                 return Ok(());
             }

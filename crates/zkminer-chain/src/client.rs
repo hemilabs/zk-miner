@@ -677,8 +677,57 @@ impl ChainClient {
     /// gap detector finds such a hole off the node's pending count — and a stuck fulfill's
     /// nonce is HANDED to `release_job` via the stash rather than recycled, so the release
     /// can displace it at that exact nonce.
+    ///
+    /// Once a state read has shown the operation settled, use [`settle_nonce`](Self::settle_nonce)
+    /// instead: our own transaction at the nonce may be what settled it.
     pub fn abort_nonce(&self, nonce: u64) {
         self.nonce_mgr.abort(nonce);
+    }
+
+    /// Resolve a reserved nonce once a STATE read has shown the operation settled — the job
+    /// fulfilled, locked or released by us, or no longer ours — while the receipt of what we
+    /// sent at `nonce` was never seen. Commits when our mined transaction count is past `nonce`,
+    /// aborts otherwise; returns whether it committed.
+    ///
+    /// The state alone cannot say which of our transactions caused it, so it is no proof that
+    /// `nonce` was consumed; the mined count is: on a single-signer account a count past `nonce`
+    /// means a transaction of ours at `nonce` mined (this one, a same-nonce replacement or a
+    /// filler). Recycling such a nonce hands the next reservation a guaranteed "nonce too low" —
+    /// what a fulfil whose receipt wait ended inside the block that mined it used to do. Below the
+    /// count, nothing at `nonce` has mined (yet), and the gap must be refilled: abort.
+    ///
+    /// `seen_at` is the block the state read was taken at. The count is read there first — the
+    /// same view as the state, so one lagging replica answering "latest" cannot turn a mined nonce
+    /// into a recycled one — then at the latest block. An unreadable count aborts, as before.
+    pub async fn settle_nonce(&self, nonce: u64, seen_at: Option<u64>) -> bool {
+        let at = seen_at
+            .map(alloy::eips::BlockId::number)
+            .into_iter()
+            .chain(std::iter::once(alloy::eips::BlockId::latest()));
+        for block in at {
+            if let Ok(count) = self
+                .provider
+                .get_transaction_count(self.address)
+                .block_id(block)
+                .await
+            {
+                if count > nonce {
+                    self.commit_nonce(nonce);
+                    return true;
+                }
+            }
+        }
+        self.abort_nonce(nonce);
+        false
+    }
+
+    /// Drain the fulfil nonce stashed for `job_id` (if any) on a path where no release will run
+    /// for it — the job settled or the lock is gone — through [`Self::settle_nonce`]: the stashed
+    /// fulfil may be the very transaction that settled it.
+    pub async fn settle_abandoned_nonce(&self, job_id: alloy::primitives::B256) {
+        if let Some(n) = self.take_abandoned_nonce(job_id) {
+            self.settle_nonce(n, None).await;
+        }
     }
 
     /// True if one of our txs is EXECUTABLE at the mined frontier, i.e. `pending > mined`.

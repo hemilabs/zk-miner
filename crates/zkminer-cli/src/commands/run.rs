@@ -8676,9 +8676,7 @@ fn spawn_lifecycle_task(
                 // No breadcrumb → release is skipped. If a fulfill nonetheless
                 // stashed a nonce for this job, it would leak as a permanent nonce gap;
                 // recycle it so the allocator stays gap-free.
-                if let Some(n) = client.take_abandoned_nonce(jid) {
-                    client.abort_nonce(n);
-                }
+                client.settle_abandoned_nonce(jid).await;
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != jid);
             }
@@ -10449,9 +10447,7 @@ async fn process_job_lifecycle(
                 tracing::warn!("LOCK-LOST: {} — {reason}", short_id(job_id));
                 journal_update(journal, |j| j.remove(job_id));
                 // No release will ever run for this job, and release is the stash's only consumer.
-                if let Some(n) = client.take_abandoned_nonce(job_id) {
-                    client.abort_nonce(n);
-                }
+                client.settle_abandoned_nonce(job_id).await;
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != job_id);
                 s.add_log(
@@ -12072,9 +12068,7 @@ async fn release_and_clean_with_nonce(
                 Ok(false) => {}
                 Ok(true) => {
                     journal_update(journal, |j| j.remove(job_id));
-                    if let Some(n) = client.take_abandoned_nonce(job_id) {
-                        client.abort_nonce(n);
-                    }
+                    client.settle_abandoned_nonce(job_id).await;
                     let mut s = state.write().await;
                     s.active_jobs.retain(|j| j.info.job_id != job_id);
                     s.add_log(
@@ -12182,9 +12176,7 @@ async fn release_and_clean_with_nonce(
                 // sibling arms below. A leaked stash nonce carries NO abort record
                 // and is not in `freed`, so it is exactly the hole shape the shutdown gate
                 // refuses to fill — every broadcast release above it then strands.
-                if let Some(n) = client.take_abandoned_nonce(job_id) {
-                    client.abort_nonce(n);
-                }
+                client.settle_abandoned_nonce(job_id).await;
                 // Skipping the release — recycle the caller's pre-reserved nonce so it
                 // cannot become a permanent gap in the signer's sequence.
                 if let Some(n) = pre_nonce {
@@ -12206,13 +12198,9 @@ async fn release_and_clean_with_nonce(
             journal_update(journal, |j| j.remove(job_id));
             // This path SKIPS release_job (the only stash consumer). If a fulfill
             // stashed its nonce for this job, drain it here or it becomes a permanent gap
-            // that wedges the whole signer. The fulfill either mined (abort self-heals via
-            // "nonce too low", or — once `commit`/`resync` has raised the `consumed_below`
-            // watermark — the abort simply no-ops) or never landed (abort correctly recycles
-            // the gap).
-            if let Some(n) = client.take_abandoned_nonce(job_id) {
-                client.abort_nonce(n);
-            }
+            // that wedges the whole signer. The fulfill either mined (the mined count is past
+            // it: committed) or never landed (recycled as a gap).
+            client.settle_abandoned_nonce(job_id).await;
             if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
@@ -12259,11 +12247,9 @@ async fn release_and_clean_with_nonce(
             );
             // Past-deadline SKIPS release_job — drain the fulfill stash so a stashed
             // nonce can't wedge the signer. (The stuck fulfill may still be pending at N;
-            // recycling it lets a reuser evict/replace it, self-healing via "nonce too low"
-            // if it later mines — far better than a permanent gap.)
-            if let Some(n) = client.take_abandoned_nonce(job_id) {
-                client.abort_nonce(n);
-            }
+            // unless it has mined, recycling it lets a reuser evict/replace it — far better
+            // than a permanent gap.)
+            client.settle_abandoned_nonce(job_id).await;
             if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
@@ -12602,6 +12588,8 @@ async fn recover_claimed_jobs(
         }
     }
     let before = job_ids.len();
+    // Stashed fulfil nonces of dropped breadcrumbs, settled after the (synchronous) retain.
+    let mut stash_drains: Vec<B256> = Vec::new();
     let mut open_intent = false;
     job_ids.retain(|jid| match views_map.get(jid) {
         // Ours AND still Locked → re-drive. Persist a breadcrumb NOW for anything
@@ -12664,14 +12652,15 @@ async fn recover_claimed_jobs(
             // Dropping the breadcrumb means no `release_job` will ever run for this job again,
             // and that is the ONLY consumer of the abandoned-nonce stash. Leaking one leaves a
             // hole with no local trace that wedges the whole signer.
-            if let Some(n) = client.take_abandoned_nonce(*jid) {
-                client.abort_nonce(n);
-            }
+            stash_drains.push(*jid);
             false
         }
         // View unreadable (RPC miss / lagging node) → keep and re-read per-job (lag-tolerant).
         None => true,
     });
+    for jid in stash_drains {
+        client.settle_abandoned_nonce(jid).await;
+    }
     if before != job_ids.len() {
         tracing::info!(
             "recover: dropped {} settled/not-ours; {} still Locked to re-drive",
@@ -12770,9 +12759,7 @@ async fn recover_claimed_jobs(
             settled.push(jid);
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
-            if let Some(n) = client.take_abandoned_nonce(jid) {
-                client.abort_nonce(n);
-            }
+            client.settle_abandoned_nonce(jid).await;
             continue;
         }
         // Terminal status check (Open=0, Locked=1, Fulfilled=2, Cancelled=3; a release reopens the job,
@@ -12786,9 +12773,7 @@ async fn recover_claimed_jobs(
             settled.push(jid);
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
-            if let Some(n) = client.take_abandoned_nonce(jid) {
-                client.abort_nonce(n);
-            }
+            client.settle_abandoned_nonce(jid).await;
             continue;
         }
         let lock_deadline = effective_cutoff(&view);

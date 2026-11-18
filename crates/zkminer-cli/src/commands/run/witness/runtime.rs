@@ -3070,9 +3070,7 @@ impl WitnessRuntime {
                 FulfilClass::Stale => {
                     tracing::warn!("LOCK-LOST: witness lock {} — {reason}", short(jid));
                     run::journal_update(&self.journal, |j| j.remove(jid));
-                    if let Some(n) = self.client.take_abandoned_nonce(jid) {
-                        self.client.abort_nonce(n);
-                    }
+                    self.client.settle_abandoned_nonce(jid).await;
                     let mut s = self.state.write().await;
                     s.active_jobs.retain(|j| j.info.job_id != jid);
                     drop(s);
