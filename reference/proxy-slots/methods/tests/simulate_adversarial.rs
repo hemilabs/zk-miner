@@ -503,8 +503,8 @@ fn a_binding_that_leaves_header_words_free_fails() {
 }
 
 /// The hostdep guest's journal follows the `sys_rand` seed (W = 0xA1) and the keccak po2 (W = 0xA4,
-/// the raw permutation's batch status): the reruns under another key and another keccak po2 catch
-/// each, and nothing else is reported dependent.
+/// the raw permutation's batch status): the reruns under a random seed beside the rule's and under
+/// another keccak po2 catch each, and nothing else is reported dependent.
 #[test]
 fn host_inputs_a_prover_controls_are_caught() {
     let _g = serial();

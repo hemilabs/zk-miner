@@ -3,9 +3,9 @@
 //!
 //! - **Startup** ([`WitnessRuntime::start`]): the retention store is opened whenever `[retention]` is
 //!   configured (held witness locks are proven from it even with serving off). Serving needs
-//!   `[witness] enabled`, a configuration that validates now, a usable `sys_rand` key, the delegated
-//!   cgroup, the spawner thread, the sandboxed binaries, a passing sandbox self-test, the broker
-//!   process and its own self-test. Any failure leaves serving off with
+//!   `[witness] enabled`, a configuration that validates now, the delegated cgroup, the spawner
+//!   thread, the sandboxed binaries, a passing sandbox self-test, the broker process and its own
+//!   self-test. Any failure leaves serving off with
 //!   `PAGE: WITNESS-DISABLED <reason>`; inline jobs are unaffected. Serving starts in the background
 //!   (the brain does not wait for it), each self-test is bounded, and they run again hourly and
 //!   switch serving off (aborting running simulations) and back on with their result.
@@ -85,8 +85,9 @@ use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, key_fingerprint, risc0_build_id,
-    simulate_witness_job, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
+    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, risc0_build_id,
+    simulate_witness_job, sys_rand_rule, HookFuture, HostContext, ImageIdFn, JobInput,
+    PipelineHooks, Simulated, Skip,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_host::store_open::open_store;
@@ -466,7 +467,6 @@ pub(crate) struct WitnessRuntime {
     sim_slots: Arc<tokio::sync::Semaphore>,
     classify_slots: Arc<tokio::sync::Semaphore>,
     proving_timeout: Duration,
-    sys_rand_key: [u8; 32],
     keccak_po2: u8,
     scan_complete: AtomicBool,
     /// Jobs a one-off notice was logged for (not admitted, needs claim_predicate_jobs).
@@ -493,8 +493,8 @@ pub(crate) struct WitnessRuntime {
     /// The miner is shutting down ([`Self::shutdown`]): held locks are the drain's, nothing re-drives one.
     stopping: AtomicBool,
     /// What a serving start needs, kept for a retry: the configuration the miner started with (when it
-    /// enables serving) and why its `sys_rand` key is unusable, if it is.
-    serve: Mutex<Option<(Arc<ZkMinerConfig>, Option<String>)>>,
+    /// enables serving).
+    serve: Mutex<Option<Arc<ZkMinerConfig>>>,
     /// A serving start is running.
     starting: AtomicBool,
     /// The configuration file says `[witness] enabled = false` now (the kill switch): serving stays
@@ -530,17 +530,6 @@ impl WitnessRuntime {
         if !w.enabled && config.retention.is_none() {
             return None;
         }
-        // The key every risc0 worker of this miner was handed (run.rs loads it once): the seed the
-        // execute runs under must be the one the prove worker derives. A key for this run only
-        // (the file unusable) refuses serving: a bundle must stay provable after a restart.
-        let (sys_rand_key, key_err) = match zkminer_prover::worker::risc0_sys_rand_key() {
-            Some((key, false)) => (key, None),
-            Some((key, true)) => (
-                key,
-                Some(std::io::Error::other("the workers were given a key for this run only")),
-            ),
-            None => zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref()),
-        };
         let backlog = match config.dev_da_backlog_bytes() {
             Some(b) => {
                 tracing::warn!(
@@ -579,7 +568,6 @@ impl WitnessRuntime {
             backlog,
             da_policy,
             proving_timeout,
-            sys_rand_key,
             keccak_po2,
         ));
         rt.open_store().await;
@@ -589,7 +577,7 @@ impl WitnessRuntime {
             // In the background: the self-tests and the broker start take seconds (minutes, bounded,
             // when something is wedged), and the brain and every inline job go on meanwhile. A start
             // that fails is tried again with the hourly self-tests.
-            *lock(&rt.serve) = Some((Arc::new(config.clone()), key_err.map(|e| e.to_string())));
+            *lock(&rt.serve) = Some(Arc::new(config.clone()));
             let rt2 = rt.clone();
             tokio::spawn(async move { rt2.try_start_serving().await });
         } else {
@@ -616,7 +604,6 @@ impl WitnessRuntime {
         backlog: BacklogSource,
         da_policy: DaCapPolicy,
         proving_timeout: Duration,
-        sys_rand_key: [u8; 32],
         keccak_po2: u8,
     ) -> Self {
         let w = &config.witness;
@@ -645,7 +632,6 @@ impl WitnessRuntime {
             sim_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS)),
             classify_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLASSIFICATIONS)),
             proving_timeout,
-            sys_rand_key,
             keccak_po2,
             scan_complete: AtomicBool::new(false),
             noticed: Mutex::new(HashSet::new()),
@@ -716,16 +702,16 @@ impl WitnessRuntime {
     /// Starts serving from the configuration the miner started with, unless a start is running, the
     /// configuration file switched serving off, or it was never enabled. `true` when it ran.
     async fn try_start_serving(self: &Arc<Self>) -> bool {
-        let Some((config, key_err)) = lock(&self.serve).clone() else { return false };
+        let Some(config) = lock(&self.serve).clone() else { return false };
         if self.switched_off.load(Ordering::SeqCst) || self.starting.swap(true, Ordering::SeqCst) {
             return false;
         }
-        self.start_serving(&config, key_err).await;
+        self.start_serving(&config).await;
         self.starting.store(false, Ordering::SeqCst);
         true
     }
 
-    async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig, key_err: Option<String>) {
+    async fn start_serving(self: &Arc<Self>, config: &ZkMinerConfig) {
         let w = &config.witness;
         if let Err(e) = validate(w, config.retention.as_ref(), config.broker.as_ref(), chrono::Utc::now().timestamp()) {
             return self.disable(e.to_string());
@@ -737,12 +723,6 @@ impl WitnessRuntime {
                  jobs are served only on a verified deployment"
                     .into(),
             );
-        }
-        if let Some(e) = key_err {
-            return self.disable(format!(
-                "the risc0 sys_rand key file is unusable ({e}): a witness bundle must stay provable \
-                 after a restart"
-            ));
         }
         let Some(broker_section) = config.broker.clone() else {
             return self.disable("no [broker] section".into());
@@ -1437,7 +1417,7 @@ impl WitnessRuntime {
     fn host_profile(&self, po2s: &[u8]) -> Option<HostProfile> {
         Some(HostProfile {
             po2s: po2s.iter().map(|p| u32::from(*p)).collect(),
-            sys_rand_key_fingerprint: key_fingerprint(&self.sys_rand_key),
+            sys_rand_rule: sys_rand_rule(),
             keccak_po2: u32::from(self.keccak_po2),
             worker_builds: self.worker_builds()?,
         })
@@ -1518,7 +1498,6 @@ impl WitnessRuntime {
             ),
             po2s,
             keccak_po2: self.keccak_po2,
-            sys_rand_key: self.sys_rand_key,
             worker_builds,
             execute_build,
             execute_memory_bytes: w.execute_memory_bytes,
@@ -3949,7 +3928,6 @@ mod tests {
             BacklogSource::Fixed(BacklogReading::fixed(Backlog::Known(0), Some(0))),
             DaCapPolicy::default(),
             Duration::from_secs(600),
-            [7; 32],
             DEFAULT_KECCAK_PO2,
         );
         let ts = store.then(|| test_store(&client));
@@ -4021,7 +3999,7 @@ mod tests {
     #[tokio::test]
     async fn the_kill_switch_is_hot() {
         let (rt, _s) = test_runtime(false).await;
-        *lock(&rt.serve) = Some((Arc::new(ZkMinerConfig::default()), None));
+        *lock(&rt.serve) = Some(Arc::new(ZkMinerConfig::default()));
         rt.enabled.store(true, Ordering::SeqCst);
         let sim = AbortToken::new();
         lock(&rt.tasks).insert(B256::repeat_byte(0x91), Task { token: sim.clone(), phase: Phase::Simulating });
@@ -4054,7 +4032,7 @@ mod tests {
         let (rt, _s) = test_runtime(false).await;
         assert_eq!(rt.self_test_round().await, SelfTestRound::NotEnabled);
         // A start that fails at once (this configuration does not validate): tried again each round.
-        *lock(&rt.serve) = Some((Arc::new(ZkMinerConfig::default()), None));
+        *lock(&rt.serve) = Some(Arc::new(ZkMinerConfig::default()));
         assert_eq!(rt.self_test_round().await, SelfTestRound::StartRetried);
         assert!(!rt.enabled.load(Ordering::SeqCst));
         assert_eq!(rt.self_test_round().await, SelfTestRound::StartRetried, "and again");

@@ -2,7 +2,7 @@
 //! --adversarial`'s host-input reruns are shown to catch them (methods/tests/simulate_adversarial.rs).
 //! `W`'s first byte picks the mode; the journal is a 32-byte header word (scheme id 0x77), then:
 //!
-//! - `0xA1`: 8 bytes of `sys_rand` (depends on the `sys_rand` seed, so on the prover's key);
+//! - `0xA1`: 8 bytes of `sys_rand` (depends on the `sys_rand` seed, which no proof binds);
 //! - `0xA2`: `n` keccak permutations through risc0's batcher (`n` = `W[1..3]` little-endian, 1000 by
 //!   default), then the user cycle count; at a small keccak po2 this makes two or more batches;
 //! - `0xA4`: permutations through the raw `sys_keccak` until its status says the host's batch is

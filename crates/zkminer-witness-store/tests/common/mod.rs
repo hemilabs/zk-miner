@@ -168,7 +168,7 @@ impl Spec {
             input_sha256: input,
             w_sha256: sha256(w),
             w_len: len,
-            sys_rand_key_fingerprint: B256::repeat_byte(6),
+            sys_rand_rule: B256::repeat_byte(6),
             keccak_po2: 17,
             worker_builds: vec!["cpu-test".into()],
             created_at_block: self.block,

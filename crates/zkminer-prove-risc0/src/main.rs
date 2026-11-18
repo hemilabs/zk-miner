@@ -75,7 +75,7 @@ fn main() {
 
     // `--witness-execute`: the one-shot sandboxed execute of a witness job (witness.rs). FIRST, before
     // anything can start a thread, read a file or set up logging: it restricts itself while the
-    // process still has one thread, and never loads the `sys_rand` key. It does not return.
+    // process still has one thread, and runs the guest with the seed it is handed. No return.
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(
             zkminer_prover_protocol::WITNESS_EXECUTE_ARG,

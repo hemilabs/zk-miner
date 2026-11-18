@@ -3,14 +3,14 @@
 //! - **The prove path** (`WorkerCommand::Prove` with `witness`, [`run_witness_proof`]): the input is
 //!   `prefix ‖ W`, read from the bundle's file through one descriptor and refused unless it has the
 //!   bundle's length and hash. The guest is executed ONCE, with the env an inline job gets (the input,
-//!   the seed derived from this worker's key, the po2) plus the slot's segment directory, and NO
+//!   the public rule's seed for it, the po2) plus the slot's segment directory, and NO
 //!   coprocessor callback: the measure path's keccak audit takes the keccak requests out of the
 //!   session, which would leave it unprovable. The measure checks run on that session, its journal is
 //!   compared with the bundle's, and only then is that same session proven, across the invalid-proof
 //!   retries. A run that does not reproduce the bundle is a typed `JournalDiverged`, never proven.
 //! - **The sandboxed execute** (`--witness-execute`, the CPU worker only, [`execute_main`]): a
 //!   one-shot process that restricts itself before anything else, then executes the guest at each po2
-//!   the miner may prove at, with the seed it is handed (it never sees a key), and reports journals,
+//!   the miner may prove at, with the seed it is handed (it derives none), and reports journals,
 //!   cycles and serialized segment bytes.
 
 use std::fs::File;
@@ -28,8 +28,8 @@ use zkminer_prover_protocol::{
 
 use super::{
     check_claim_output, groth16_proof_output, job_segment_po2, prove_session_cycle_limit,
-    prove_with_retries, release_groth16_cache_if_tight, sys_rand_key, sys_rand_seed,
-    verify_program_id, KECCAK_REQUEST_CYCLES,
+    prove_with_retries, release_groth16_cache_if_tight, sys_rand_seed, verify_program_id,
+    KECCAK_REQUEST_CYCLES,
 };
 
 /// The only non-empty prefix: `abi.encode(jobId, prover)`.
@@ -296,17 +296,6 @@ pub(crate) fn run_witness_proof(
     program_id: Option<[u8; 32]>,
     witness: &WitnessProve,
 ) -> Result<WitnessOutcome> {
-    run_witness_proof_with_key(elf, input_data, po2, program_id, witness, &sys_rand_key())
-}
-
-fn run_witness_proof_with_key(
-    elf: &[u8],
-    input_data: &[u8],
-    po2: Option<u8>,
-    program_id: Option<[u8; 32]>,
-    witness: &WitnessProve,
-    sys_rand_key: &[u8; 32],
-) -> Result<WitnessOutcome> {
     if !input_data.is_empty() {
         return Err(WitnessRefusal::Protocol(format!(
             "{} bytes of inline input beside a witness, whose input is read from its bundle",
@@ -319,9 +308,9 @@ fn run_witness_proof_with_key(
     let po2 = job_segment_po2(po2)?;
     let dir = segment_dir(witness)?;
     let input = read_witness_input(witness)?;
-    // The seed an inline proof of this input would use, from this worker's own key: the same the
-    // miner derived for the sandboxed execute from the bundle's `sha256(prefix ‖ W)`.
-    let seed = sys_rand_seed(sys_rand_key, &image_id, &input);
+    // The seed an inline proof of this input would use, by the public rule: the same the miner
+    // derived for the sandboxed execute from the bundle's `sha256(prefix ‖ W)`.
+    let seed = sys_rand_seed(&image_id, &input);
     prepare_segment_dir(&dir)?;
     // Declared before the session, so it empties the directory after the session is gone.
     let _wipe = WipeOnDrop(&dir);
@@ -524,8 +513,7 @@ pub(crate) use execute::execute_main;
 ///   guest, under the same restriction.
 /// - The first thing the process does is [`zkminer_witness_sandbox::restrict_self`] with
 ///   `Profile::ExecuteWorker`, while it has one thread: from then on it opens no file and keeps only
-///   its inherited fds. It never loads the `sys_rand` key (no environment variable, no file): it uses
-///   the seed in the request.
+///   its inherited fds. It derives no `sys_rand` seed: it uses the one in the request.
 /// - **`RISC0_KECCAK_PO2`.** risc0 reads the keccak po2 from the process environment in
 ///   `ExecutorEnvBuilder::build`, overriding `keccak_max_po2`. The request is the one source: the
 ///   launcher passes an empty environment, and the worker sets the variable from
@@ -948,8 +936,6 @@ mod tests {
     use super::*;
     use crate::FIBONACCI_ELF;
 
-    const KEY: [u8; 32] = [0x5a; 32];
-
     fn sha256(b: &[u8]) -> [u8; 32] {
         Sha256::digest(b).into()
     }
@@ -1119,8 +1105,8 @@ mod tests {
         for input in [&b""[..], b"x", &[9u8; 100_000]] {
             let image = [4u8; 32];
             assert_eq!(
-                sys_rand_seed(&KEY, &image, input),
-                zkminer_prover_protocol::sys_rand::risc0_seed(&KEY, &image, &sha256(input))
+                sys_rand_seed(&image, input),
+                zkminer_prover_protocol::sys_rand::risc0_seed(&image, &sha256(input))
             );
         }
     }
@@ -1145,7 +1131,7 @@ mod tests {
         prepare_segment_dir(&segments).unwrap();
         // ~400k cycles: several segments at po2 16.
         let input = 40_000u32.to_le_bytes();
-        let seed = sys_rand_seed(&KEY, &image, &input);
+        let seed = sys_rand_seed(&image, &input);
         {
             let _wipe = WipeOnDrop(&segments);
             let session =
@@ -1203,8 +1189,7 @@ mod tests {
         std::fs::write(&stale, b"from a crashed proof").unwrap();
         let started = Instant::now();
         let outcome =
-            run_witness_proof_with_key(FIBONACCI_ELF, &[], Some(20), Some(image), &witness, &KEY)
-                .unwrap();
+            run_witness_proof(FIBONACCI_ELF, &[], Some(20), Some(image), &witness).unwrap();
         let WitnessOutcome::Diverged(d) = outcome else {
             panic!("proved a run whose journal is not the bundle's")
         };
@@ -1227,8 +1212,7 @@ mod tests {
         prefix[..4].copy_from_slice(&12u32.to_le_bytes());
         witness = witness_for(dir.path(), b"ignored by fibonacci", &prefix, b"nope");
         let WitnessOutcome::Diverged(d) =
-            run_witness_proof_with_key(FIBONACCI_ELF, &[], Some(18), Some(image), &witness, &KEY)
-                .unwrap()
+            run_witness_proof(FIBONACCI_ELF, &[], Some(18), Some(image), &witness).unwrap()
         else {
             panic!("proved a diverged run")
         };
@@ -1248,10 +1232,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let witness = witness_for(dir.path(), &10u32.to_le_bytes(), &[], &55u64.to_le_bytes());
         std::fs::write(&witness.input_path, 11u32.to_le_bytes()).unwrap();
-        let err =
-            run_witness_proof_with_key(FIBONACCI_ELF, &[], Some(20), Some(image), &witness, &KEY)
-                .err()
-                .expect("refused");
+        let err = run_witness_proof(FIBONACCI_ELF, &[], Some(20), Some(image), &witness)
+            .err()
+            .expect("refused");
         let refusal = err.downcast_ref::<WitnessRefusal>().expect("typed");
         assert!(
             matches!(refusal.kind(), ErrorKind::InputMismatch),
@@ -1262,19 +1245,17 @@ mod tests {
             "nothing executed"
         );
         // Inline input beside a witness is the host's protocol error.
-        let err =
-            run_witness_proof_with_key(FIBONACCI_ELF, &[1], Some(20), Some(image), &witness, &KEY)
-                .err()
-                .expect("refused");
+        let err = run_witness_proof(FIBONACCI_ELF, &[1], Some(20), Some(image), &witness)
+            .err()
+            .expect("refused");
         assert!(matches!(
             err.downcast_ref::<WitnessRefusal>().unwrap().kind(),
             ErrorKind::ProtocolError
         ));
         // And a size outside the job range, as for an inline job.
-        let err =
-            run_witness_proof_with_key(FIBONACCI_ELF, &[], Some(15), Some(image), &witness, &KEY)
-                .err()
-                .expect("refused");
+        let err = run_witness_proof(FIBONACCI_ELF, &[], Some(15), Some(image), &witness)
+            .err()
+            .expect("refused");
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
     }
 

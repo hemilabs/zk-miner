@@ -9,8 +9,8 @@ use zkminer_witness::bundle::{BundleV1, GuestExit};
 pub struct HostProfile {
     /// The po2 set of the enabled cards.
     pub po2s: Vec<u32>,
-    /// Fingerprint of the `sys_rand` host key.
-    pub sys_rand_key_fingerprint: B256,
+    /// The `sys_rand` rule this host seeds risc0 guests by (see [`BundleV1::sys_rand_rule`]).
+    pub sys_rand_rule: B256,
     /// `RISC0_KECCAK_PO2`.
     pub keccak_po2: u32,
     /// Build ids of every worker binary that may prove the job now.
@@ -25,7 +25,8 @@ pub struct Revalidation {
     pub missing_po2s: Vec<u32>,
     /// Requested po2s whose recorded result is not `Halted(0)`: not provable.
     pub unprovable_po2s: Vec<u32>,
-    pub key_fingerprint_matches: bool,
+    /// The bundle was executed under the host's `sys_rand` rule.
+    pub sys_rand_rule_matches: bool,
     pub keccak_po2_matches: bool,
     /// Host worker builds the bundle was not executed under.
     pub unrecorded_worker_builds: Vec<String>,
@@ -40,7 +41,7 @@ impl Revalidation {
     pub fn is_current(&self) -> bool {
         self.missing_po2s.is_empty()
             && self.unprovable_po2s.is_empty()
-            && self.key_fingerprint_matches
+            && self.sys_rand_rule_matches
             && self.keccak_po2_matches
             && self.worker_builds_match()
     }
@@ -64,7 +65,7 @@ pub fn unprovable_po2s(bundle: &BundleV1, requested: &[u32]) -> Vec<u32> {
 }
 
 /// Compares a bundle with the host: missing and unprovable po2s from the host's set, the `sys_rand`
-/// key fingerprint, the keccak po2, and whether every host worker build is one the bundle records.
+/// rule, the keccak po2, and whether every host worker build is one the bundle records.
 pub fn revalidate(bundle: &BundleV1, host: &HostProfile) -> Revalidation {
     let mut unrecorded: Vec<String> =
         host.worker_builds.iter().filter(|b| !bundle.worker_builds.contains(b)).cloned().collect();
@@ -73,7 +74,7 @@ pub fn revalidate(bundle: &BundleV1, host: &HostProfile) -> Revalidation {
     Revalidation {
         missing_po2s: missing_po2s(bundle, &host.po2s),
         unprovable_po2s: unprovable_po2s(bundle, &host.po2s),
-        key_fingerprint_matches: bundle.sys_rand_key_fingerprint == host.sys_rand_key_fingerprint,
+        sys_rand_rule_matches: bundle.sys_rand_rule == host.sys_rand_rule,
         keccak_po2_matches: bundle.keccak_po2 == host.keccak_po2,
         unrecorded_worker_builds: unrecorded,
     }
@@ -108,7 +109,7 @@ mod tests {
             input_sha256: B256::ZERO,
             w_sha256: B256::ZERO,
             w_len: 0,
-            sys_rand_key_fingerprint: B256::repeat_byte(7),
+            sys_rand_rule: B256::repeat_byte(7),
             keccak_po2: 17,
             worker_builds: vec!["cuda-abc".into(), "cpu-def".into()],
             created_at_block: 1,
@@ -124,27 +125,27 @@ mod tests {
         let b = bundle();
         let host = HostProfile {
             po2s: vec![22, 20, 19, 20],
-            sys_rand_key_fingerprint: B256::repeat_byte(7),
+            sys_rand_rule: B256::repeat_byte(7),
             keccak_po2: 17,
             worker_builds: vec!["cuda-abc".into()],
         };
         let r = revalidate(&b, &host);
         assert_eq!(r.missing_po2s, vec![22]);
         assert!(r.unprovable_po2s.is_empty());
-        assert!(r.key_fingerprint_matches && r.keccak_po2_matches && r.worker_builds_match());
+        assert!(r.sys_rand_rule_matches && r.keccak_po2_matches && r.worker_builds_match());
         assert!(!r.is_current());
         assert!(revalidate(&b, &HostProfile { po2s: vec![19, 20], ..host.clone() }).is_current());
 
         let other = HostProfile {
             po2s: vec![21],
-            sys_rand_key_fingerprint: B256::repeat_byte(8),
+            sys_rand_rule: B256::repeat_byte(8),
             keccak_po2: 18,
             worker_builds: vec!["cuda-abc".into(), "rocm-new".into(), "rocm-new".into()],
         };
         let r = revalidate(&b, &other);
         assert!(r.missing_po2s.is_empty());
         assert_eq!(r.unprovable_po2s, vec![21]);
-        assert!(!r.key_fingerprint_matches && !r.keccak_po2_matches);
+        assert!(!r.sys_rand_rule_matches && !r.keccak_po2_matches);
         assert_eq!(r.unrecorded_worker_builds, vec!["rocm-new".to_string()]);
         assert_eq!(missing_po2s(&b, &[]), Vec::<u32>::new());
     }

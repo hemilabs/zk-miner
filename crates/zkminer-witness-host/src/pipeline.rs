@@ -21,8 +21,8 @@
 //!    retention store ([`Store::begin_bundle_evicting`]). Any failure drops the writer, which
 //!    discards the version.
 //! 4. **Execute** (§5.4, §10.1): `W` sealed (read-only, fsynced), `sha256(prefix ‖ W)` streamed from
-//!    the sealed file, the `sys_rand` seed derived (the key never leaves this process), and the
-//!    sandboxed CPU worker run once at every po2 of the host's set, in its own cgroup, with
+//!    the sealed file, the `sys_rand` seed derived by the public rule (`sys_rand::risc0_seed`), and
+//!    the sandboxed CPU worker run once at every po2 of the host's set, in its own cgroup, with
 //!    `maxGuestCycles` as its cycle cap. Every po2 must halt with 0 and commit the same journal of at
 //!    most 32,768 bytes, within `maxGuestCycles`, under an image id equal to `programId`.
 //! 5. **Binding** (§7.2): the router's own check (`zkminer_chain::binding`) at every po2, with the
@@ -128,8 +128,7 @@ pub const MAX_DETAIL_BYTES: usize = 4_096;
 const EXECUTE_KILL_RETRY: Duration = Duration::from_millis(50);
 
 /// Everything the pipeline needs from the host: long-lived processes and handles, and its
-/// configuration. Holds the `sys_rand` key, which is only ever used here to derive seeds: no
-/// sandbox, log or record sees it (the bundle records its fingerprint).
+/// configuration.
 pub struct HostContext {
     pub spawner: Spawner,
     pub broker: Arc<BrokerClient>,
@@ -146,7 +145,6 @@ pub struct HostContext {
     pub po2s: Vec<u8>,
     /// `RISC0_KECCAK_PO2` of the provers (guest-visible, §5.4).
     pub keccak_po2: u8,
-    pub sys_rand_key: [u8; 32],
     /// The build id of every prove worker that may prove a bundle (§15.1), as
     /// [`risc0_build_id`] names it. The bundle records these and [`HostContext::execute_build`].
     pub worker_builds: Vec<String>,
@@ -386,9 +384,10 @@ pub fn descriptor_hash_of_abi(bytes: &[u8]) -> Option<B256> {
     (d.abi_encode() == bytes).then(|| compute_descriptor_hash(&d))
 }
 
-/// The bundle's `sys_rand_key_fingerprint` for `key`.
-pub fn key_fingerprint(key: &[u8; 32]) -> B256 {
-    B256::from(sys_rand::key_fingerprint(key))
+/// The `sys_rand` rule this build seeds risc0 guests by, as a bundle records it
+/// ([`BundleV1::sys_rand_rule`]) and revalidation compares it.
+pub fn sys_rand_rule() -> B256 {
+    B256::from(sys_rand::rule_id())
 }
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -916,8 +915,8 @@ pub fn sealed_memfd(name: &str, bytes: &[u8]) -> io::Result<File> {
 }
 
 /// One execution of bytes the caller holds, outside a pipeline run: `zkminer simulate --adversarial`
-/// re-executes a mutated `W`, or the same `W` under another seed key, po2 or keccak po2, through the
-/// sandboxed worker, request and seed derivation [`simulate_witness_job`] uses.
+/// re-executes a mutated `W`, or the same `W` under another `sys_rand` seed, po2 or keccak po2,
+/// through the sandboxed worker, request and seed derivation [`simulate_witness_job`] uses.
 pub struct ExecuteOnce<'a> {
     pub elf: &'a [u8],
     pub program_id: B256,
@@ -925,9 +924,11 @@ pub struct ExecuteOnce<'a> {
     pub prefix: Option<[u8; PREFIX_BYTES]>,
     pub po2s: &'a [u8],
     pub keccak_po2: u8,
-    /// The key the `sys_rand` seed is derived from, as the miner derives it
-    /// (`sys_rand::risc0_seed(key, image id, sha256(prefix ‖ W))`).
-    pub sys_rand_key: [u8; 32],
+    /// The `sys_rand` seed: `None` for the rule's, as the miner derives it
+    /// (`sys_rand::risc0_seed(image id, sha256(prefix ‖ W))`); `Some` for another, which a
+    /// host-dependence check runs the guest under (the proof binds no seed, so a prover on other
+    /// software can answer `sys_rand` with anything).
+    pub sys_rand_seed: Option<[u8; 32]>,
     pub max_cycles: u64,
     /// A wall clock below [`HostContext::execute_timeout`] (a caller's own time bound): the worker's
     /// cgroup is killed when it passes.
@@ -953,7 +954,9 @@ pub async fn execute_once(
         prefix: spec.prefix.map(|p| p.to_vec()).unwrap_or_default(),
         w_len,
         input_sha256: input.0,
-        sys_rand_seed: sys_rand::risc0_seed(&spec.sys_rand_key, &spec.program_id.0, &input.0),
+        sys_rand_seed: spec
+            .sys_rand_seed
+            .unwrap_or_else(|| sys_rand::risc0_seed(&spec.program_id.0, &input.0)),
         po2s: spec.po2s.to_vec(),
         keccak_po2: spec.keccak_po2,
         max_cycles: Some(spec.max_cycles),
@@ -1101,7 +1104,7 @@ pub async fn simulate_witness_job(
     if w_len != writer.written() {
         return Err(Skip::new(SkipReason::HostInternal, E, "the sealed W is not what was written"));
     }
-    let seed = sys_rand::risc0_seed(&ctx.sys_rand_key, &program_id.0, &input.0);
+    let seed = sys_rand::risc0_seed(&program_id.0, &input.0);
     let req = WitnessExecuteRequest {
         elf: elf.to_vec(),
         prefix: prefix.map(|p| p.to_vec()).unwrap_or_default(),
@@ -1185,7 +1188,7 @@ pub async fn simulate_witness_job(
         input_sha256: input,
         w_sha256,
         w_len,
-        sys_rand_key_fingerprint: key_fingerprint(&ctx.sys_rand_key),
+        sys_rand_rule: sys_rand_rule(),
         keccak_po2: u32::from(ctx.keccak_po2),
         worker_builds,
         created_at_block: job.current_block,

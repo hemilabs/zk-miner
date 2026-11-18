@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use zkminer_prover_protocol::{
-    read_message, sys_rand, write_message, ErrorKind, WitnessProve, WorkerCommand, WorkerResponse,
+    read_message, write_message, ErrorKind, WitnessProve, WorkerCommand, WorkerResponse,
     GUEST_EXIT_HALTED, PROTOCOL_VERSION,
 };
 
@@ -44,11 +44,6 @@ impl Worker {
             .env(
                 zkminer_prover_protocol::types::WITNESS_SEGMENT_DIR_ENV,
                 dir.join("segments"),
-            )
-            // A key of the test's own, so nothing reads or creates ~/.zkminer.
-            .env(
-                sys_rand::SYS_RAND_KEY_ENV,
-                sys_rand::encode_key(&[0x5a; 32]),
             )
             .env("HOME", home.path())
             .env("RUST_LOG", "info")

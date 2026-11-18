@@ -4,7 +4,10 @@
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 
-pub const BUNDLE_FORMAT_VERSION: u32 = 1;
+/// The record format this build writes and reads. 2: `sys_rand_rule` replaced version 1's key
+/// fingerprint when the risc0 `sys_rand` seed became a public rule; a version-1 record does not
+/// load.
+pub const BUNDLE_FORMAT_VERSION: u32 = 2;
 
 /// Per-po2 execution results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +53,10 @@ pub struct BundleV1 {
     /// `sha256(W)`: what reads of `w.bin` are verified against.
     pub w_sha256: B256,
     pub w_len: u64,
-    pub sys_rand_key_fingerprint: B256,
+    /// The `sys_rand` rule the executions were seeded by (`sys_rand::rule_id()` of
+    /// zkminer-prover-protocol, `SHA-256(SYS_RAND_DOMAIN)`): revalidation executes a bundle
+    /// recorded under another rule again rather than prove it as if its journals still held.
+    pub sys_rand_rule: B256,
     pub keccak_po2: u32,
     /// Build ids of every worker binary that may prove this bundle.
     pub worker_builds: Vec<String>,
@@ -166,7 +172,7 @@ mod tests {
             input_sha256: B256::ZERO,
             w_sha256: B256::ZERO,
             w_len: 0,
-            sys_rand_key_fingerprint: B256::ZERO,
+            sys_rand_rule: B256::ZERO,
             keccak_po2: 17,
             worker_builds: Vec::new(),
             created_at_block: 0,

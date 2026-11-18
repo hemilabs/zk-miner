@@ -123,8 +123,8 @@ captures nothing, but could read one of those.
   which also reaches every host input around the names (a reviewer's bypass guest, folded in).
 - What no lint sees: a host input the guest reads by an `ecall` inside one of the platform's own
   wrappers it is allowed to call, if the platform changed what that wrapper does. Pin the platform
-  crate, and `simulate --adversarial` reruns the guest under two `sys_rand` keys, two po2s and two
-  keccak po2s.
+  crate, and `simulate --adversarial` reruns the guest under two `sys_rand` seeds (the rule's and a
+  random one), two po2s and two keccak po2s.
 
 The guest is `no_std`, so the standard hash maps, `std::env` and `std::process::exit` do not exist
 for it at all.

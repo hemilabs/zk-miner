@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use zkminer_prover_protocol::{
-    read_message, sys_rand, write_message, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
+    read_message, write_message, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
 
 const WORKER: &str = env!("CARGO_BIN_EXE_zkminer-prove-risc0-cpu");
@@ -33,11 +33,6 @@ impl Worker {
         let home = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(WORKER);
         cmd.env_clear()
-            // A key of the test's own, so nothing reads or creates ~/.zkminer.
-            .env(
-                sys_rand::SYS_RAND_KEY_ENV,
-                sys_rand::encode_key(&[0x5a; 32]),
-            )
             .env("HOME", home.path())
             // An empty rzup home: no risc0-groth16 component, so a warm-up would have to download it.
             .env("RISC0_HOME", home.path().join("risc0"))

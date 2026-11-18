@@ -683,10 +683,10 @@ configuration's admission parameters, and `notChecked`: what was not checked and
 (claimability, submission form, deployment pins, admission, reservation, the DA backlog, deadline,
 prove resources; the builder's availability through its URIs or a mirror with `--builder`; the
 registry's ELF with `--elf`; a card-derived cycle maximum without `--max-guest-cycles`). The
-`sys_rand` key is the run's own, and a journal-prefix job is reproduced exactly only with the real
-`jobId` (the file's `jobId`) and `--prover`. It exits non-zero when a miner with this configuration
-would skip the job. In `--job`/`--stdin` mode a witness job on chain
-is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
+`sys_rand` seed is the public rule's, as a miner's (`sysRandRule`), and a journal-prefix job is
+reproduced exactly only with the real `jobId` (the file's `jobId`) and `--prover`. It exits non-zero
+when a miner with this configuration would skip the job. In `--job`/`--stdin` mode a witness job on
+chain is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
 
 **`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
 (default 600; every execute and broker start gets what is left of it and is killed there):
@@ -711,10 +711,11 @@ is reported `not_served`: its proven input is the builder's `W`, not its `inputD
   `--max-mutations` run (default 256). Each must fail in the guest, give the same journal byte for
   byte, or change pinned bytes (which the router refuses); a changed journal that still satisfies
   the binding is a **soundness failure**, reported with the mutation that caused it;
-- **host inputs**: the same `W` under two `sys_rand` keys, two po2s (the first `--po2` and the one
-  farthest from it, else the far end of 16..22; one request each) and two keccak po2s; any journal
-  change is a dependence on an input the prover controls (a run past the cycle maximum is reported as
-  such, not as a dependence);
+- **host inputs**: the same `W` under two `sys_rand` seeds (the rule's and a random one: the proof
+  binds no seed, so a prover on other software can answer with anything), two po2s (the first
+  `--po2` and the one farthest from it, else the far end of 16..22; one request each) and two keccak
+  po2s; any journal change is a dependence on an input the prover controls (a run past the cycle
+  maximum is reported as such, not as a dependence);
 - **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
   (`--providers a,b`, default the first two serving the job's chain), each alone; different
   journals that both satisfy the binding are a soundness failure.

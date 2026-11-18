@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use zkminer_prover_protocol::{
-    read_message, sys_rand, write_message, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
+    read_message, write_message, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
 
 struct Worker {
@@ -123,10 +123,6 @@ fn a_confined_gpu_worker_proves() {
 
     let mut child = Command::new(&worker_path)
         .env("HOME", home.path())
-        .env(
-            sys_rand::SYS_RAND_KEY_ENV,
-            sys_rand::encode_key(&[0x5a; 32]),
-        )
         .env(
             "RUST_LOG",
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),

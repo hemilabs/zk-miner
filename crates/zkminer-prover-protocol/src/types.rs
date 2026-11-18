@@ -498,8 +498,9 @@ pub struct WitnessExecuteRequest {
     pub w_len: u64,
     /// `sha256(prefix ‖ W)`: the worker refuses any other input ([`WitnessExecuteFailure::InputMismatch`]).
     pub input_sha256: [u8; 32],
-    /// The guest's `sys_rand` seed, derived by the miner (`crate::sys_rand::risc0_seed`). The
-    /// worker never sees, reads or derives a key in this mode.
+    /// The guest's `sys_rand` seed: the public rule's, as the miner derives it
+    /// (`crate::sys_rand::risc0_seed`), or another that a host-dependence check runs the guest
+    /// under. The worker derives no seed in this mode.
     pub sys_rand_seed: [u8; 32],
     /// The segment sizes to execute at, in order, each within
     /// [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`], without repeats.

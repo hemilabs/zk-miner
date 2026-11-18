@@ -132,9 +132,9 @@ enum Commands {
         /// Write the witness report here instead of stdout.
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         out: Option<std::path::PathBuf>,
-        /// Attack the witness: structured mutations of W, re-execution under two sys_rand keys, two
-        /// po2s and two keccak po2s, and a differential run against two evm-rpc providers. Exits
-        /// non-zero unless the verdict is `pass`.
+        /// Attack the witness: structured mutations of W, re-execution under two sys_rand seeds
+        /// (the public rule's and a random one), two po2s and two keccak po2s, and a differential
+        /// run against two evm-rpc providers. Exits non-zero unless the verdict is `pass`.
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         adversarial: bool,
         /// The adversarial run's bound, in seconds.

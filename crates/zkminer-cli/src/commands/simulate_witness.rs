@@ -18,12 +18,12 @@
 //! the deadline margin, prove resources), what `--builder` and `--elf` replace, and a guest-cycle
 //! maximum a miner derives from its own cards are listed under `notChecked`.
 //!
-//! What differs, deliberately: the `sys_rand` key is this run's own (never `~/.zkminer`'s, §16); the
-//! retention store is a throwaway one under the cache directory (on a real filesystem: the store
-//! refuses tmpfs), removed at the end, and so is the broker's spool (never a running miner's); the
-//! guest ELF's image id is checked by the execute worker (an ELF that is not the job's program skips
-//! at the execute step, `ElfImageIdMismatch`, where the miner's measure worker would skip it before
-//! the builder ran).
+//! What differs, deliberately: the retention store is a throwaway one under the cache directory (on
+//! a real filesystem: the store refuses tmpfs), removed at the end, and so is the broker's spool
+//! (never a running miner's); the guest ELF's image id is checked by the execute worker (an ELF
+//! that is not the job's program skips at the execute step, `ElfImageIdMismatch`, where the miner's
+//! measure worker would skip it before the builder ran). The `sys_rand` seed is the public rule's,
+//! as a miner's.
 //!
 //! **Outputs (§16):** fuel, fetches, bytes, the builder's peak memory, `|W|`, cycles in the
 //! `maxGuestCycles` unit and the journal per po2, the pinned bytes and the binding's mutation check,
@@ -34,9 +34,10 @@
 //! scheme-1 `W`'s word count, or `--header-bytes`), else the verdict is `fail`; then the generic
 //! mutations of `W` and the job's scheme's own (by the scheme id in the journal header, or
 //! `--scheme`), each re-executed under this host's cycle maximum; re-execution under two `sys_rand`
-//! keys, two po2s and two keccak po2s; and a differential run of the whole pipeline against two
-//! `evm-rpc` providers of the broker configuration (`--providers`, default the first two serving the
-//! job's chain), each from a broker configuration holding only that provider. All within
+//! seeds (the public rule's, which every run uses, and a random one), two po2s and two keccak po2s;
+//! and a differential run of the whole pipeline against two `evm-rpc` providers of the broker
+//! configuration (`--providers`, default the first two serving the job's chain), each from a broker
+//! configuration holding only that provider. All within
 //! `--adversarial-secs`, every execute and broker start bounded by what is left of it; anything not
 //! run is reported, and makes the verdict `incomplete`. A `W` above `--adversarial-max-w-bytes` is
 //! refused: the mutations are made one at a time, but this process still holds `W` and a few copies.
@@ -71,7 +72,7 @@ use zkminer_witness_host::adversarial::{
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
-    eviction_by_age, execute_worker_build, host_maxima, key_fingerprint, simulate_witness_job, ArtifactOrigin,
+    eviction_by_age, execute_worker_build, host_maxima, simulate_witness_job, ArtifactOrigin,
     HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
     DEFAULT_MAX_ARTIFACT_BYTES, MAX_HOST_GUEST_CYCLES,
 };
@@ -384,8 +385,9 @@ pub struct WitnessReport {
     pub verdict: Option<VerdictReport>,
     pub po2s: Vec<u8>,
     pub keccak_po2: u8,
-    /// The per-run `sys_rand` key's fingerprint (never a miner's key).
-    pub sys_rand_key_fingerprint: B256,
+    /// The `sys_rand` rule the executions were seeded by, as `zkminer simulate`'s other reports
+    /// name it: a miner's own executions and proofs are seeded alike.
+    pub sys_rand_rule: &'static str,
     pub execute_build: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builder: Option<BuilderReport>,
@@ -621,7 +623,6 @@ impl SimHost {
         config: &ZkMinerConfig,
         po2s: Vec<u8>,
         keccak_po2: u8,
-        sys_rand_key: [u8; 32],
         execute_timeout: Duration,
     ) -> HostContext {
         let w = &config.witness;
@@ -636,7 +637,6 @@ impl SimHost {
             host_maxima: host_maxima(w, self.max_guest_cycles),
             po2s,
             keccak_po2,
-            sys_rand_key,
             worker_builds: vec![self.execute_build.clone()],
             execute_build: self.execute_build.clone(),
             execute_memory_bytes: w.execute_memory_bytes,
@@ -1110,7 +1110,6 @@ fn hooks_and_context(
     token: &AbortToken,
     po2s: Vec<u8>,
     keccak_po2: u8,
-    sys_rand_key: [u8; 32],
     execute_timeout: Duration,
 ) -> (SimHooks, HostContext) {
     let slot = Arc::new(Mutex::new(p.elf.clone()));
@@ -1122,7 +1121,7 @@ fn hooks_and_context(
         program_id: p.descriptor.programId,
         fetched_elf: slot.clone(),
     };
-    let mut ctx = host.context(broker, &p.config, po2s, keccak_po2, sys_rand_key, execute_timeout);
+    let mut ctx = host.context(broker, &p.config, po2s, keccak_po2, execute_timeout);
     let id = p.descriptor.programId;
     ctx.image_id_fn = Arc::new(move |b: &[u8]| {
         slot.lock().unwrap_or_else(|e| e.into_inner()).as_deref().filter(|e| *e == b).map(|_| id)
@@ -1151,7 +1150,6 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
     };
     let host = SimHost::start(&p.config, &p.secret, &opts, p.router, p.prover).await?;
     let broker_toml = read_broker_config(&p.broker_config)?;
-    let sys_rand_key: [u8; 32] = rand::random();
     let token = AbortToken::new();
     {
         let t = token.clone();
@@ -1187,7 +1185,7 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         verdict: None,
         po2s: opts.po2s.clone(),
         keccak_po2: opts.keccak_po2,
-        sys_rand_key_fingerprint: key_fingerprint(&sys_rand_key),
+        sys_rand_rule: zkminer_prover_protocol::sys_rand::SYS_RAND_RULE,
         execute_build: host.execute_build.clone(),
         builder: None,
         witness: None,
@@ -1213,7 +1211,6 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         &token,
         opts.po2s.clone(),
         opts.keccak_po2,
-        sys_rand_key,
         opts.execute_timeout,
     );
     let result = run_pipeline(&p, &ctx, &hooks, current_block).await;
@@ -1271,7 +1268,7 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
                     broker_toml: &broker_toml,
                 };
                 let coverage = coverage(&binding, p.descriptor.expectedJournalHash, header_source);
-                report.adversarial = Some(a.run(adv, s, &elf, sys_rand_key, coverage).await?);
+                report.adversarial = Some(a.run(adv, s, &elf, coverage).await?);
             }
             (None, _) => bail!("the ELF bytes the simulation executed were not kept"),
             (_, None) => bail!("the simulation has no binding report"),
@@ -1340,7 +1337,6 @@ impl Adversary<'_> {
         adv: &AdversarialOptions,
         s: &Simulated,
         elf: &[u8],
-        sys_rand_key: [u8; 32],
         coverage: CoverageReport,
     ) -> Result<AdversarialReport> {
         let started = Instant::now();
@@ -1453,7 +1449,6 @@ impl Adversary<'_> {
             po2: *self.opts.po2s.first().expect("a po2"),
             po2s: &self.opts.po2s,
             keccak_po2: self.opts.keccak_po2,
-            sys_rand_key,
             cycles: CycleLimits { host: self.host.max_guest_cycles, job: s.limits.maxGuestCycles },
             deadline,
         };
@@ -1581,7 +1576,6 @@ impl Adversary<'_> {
                     &token,
                     vec![*self.opts.po2s.first().expect("a po2")],
                     self.opts.keccak_po2,
-                    self.ctx.sys_rand_key,
                     self.opts.execute_timeout.min(remaining),
                 );
                 let r = run_pipeline(p, &ctx, &hooks, self.current_block).await;

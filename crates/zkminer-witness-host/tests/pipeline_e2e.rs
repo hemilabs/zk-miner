@@ -45,7 +45,7 @@ use zkminer_witness_broker::client::ArtifactCharge;
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, key_fingerprint, simulate_witness_job,
+    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, simulate_witness_job, sys_rand_rule,
     ArtifactOrigin, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip, Step,
 };
 use zkminer_witness_host::spawner::Spawner;
@@ -56,7 +56,6 @@ const ANVIL_CHAIN: u64 = 31337;
 /// anvil's first dev account (unlocked: `eth_sendTransaction` signs for it).
 const DEV: &str = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266";
 const PO2S: [u8; 2] = [16, 18];
-const KEY: [u8; 32] = [0x5a; 32];
 
 fn skip(test: &str, reason: &str) {
     if std::env::var_os("ZKMINER_SANDBOX_TESTS_REQUIRED").is_some() {
@@ -436,7 +435,6 @@ impl Env {
             host_maxima: host_maxima(),
             po2s: PO2S.to_vec(),
             keccak_po2: 17,
-            sys_rand_key: KEY,
             worker_builds: vec!["test-worker-build".into()],
             execute_build,
             execute_memory_bytes: 512 << 20,
@@ -625,7 +623,7 @@ fn a_full_binding_job_publishes_a_bundle_the_store_reads_back_verified() {
         assert_eq!(descriptor_hash_of_abi(&hex::decode(&b.descriptor_hex).unwrap()), Some(b.descriptor_hash));
         assert_eq!((b.prover, b.caller, b.builder_id), (env.prover, Address::repeat_byte(0xca), env.echo_id));
         assert_eq!((b.image_id, b.keccak_po2, b.submit_tx_hash), (env.image_id(), 17, B256::repeat_byte(0x7c)));
-        assert_eq!(b.sys_rand_key_fingerprint, key_fingerprint(&KEY));
+        assert_eq!(b.sys_rand_rule, sys_rand_rule());
         // The prove workers' builds and the execute worker's own, as its handshake named it (and its
         // response agreed).
         assert!(sim.execute_build.starts_with("risc0/risc0-zkvm "), "{}", sim.execute_build);

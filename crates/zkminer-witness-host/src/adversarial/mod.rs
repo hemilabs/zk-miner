@@ -19,8 +19,9 @@
 //! - the **classification** of one re-executed `W` ([`classify`]);
 //! - the **drivers**, which execute through [`crate::pipeline::execute_once`], the pipeline's own
 //!   sandboxed worker, request and seed derivation: [`run_mutations`] and [`host_input_checks`]
-//!   (two `sys_rand` seed keys, two po2s, two keccak po2s: any journal change is a dependence on a
-//!   prover-controlled host input). Both stop at a deadline and report what they did not run.
+//!   (the rule's `sys_rand` seed and a random one, two po2s, two keccak po2s: any journal change is
+//!   a dependence on a prover-controlled host input). Both stop at a deadline and report what they
+//!   did not run.
 //!
 //! **Memory.** `W` is the requester's, up to `[witness] max_witness_bytes`, and this runs outside any
 //! sandbox. A [`Mutation`] is a description; its changed `W` is made ([`Mutation::make`]) only just
@@ -726,7 +727,6 @@ pub struct Baseline<'a> {
     /// them when there are two.
     pub po2s: &'a [u8],
     pub keccak_po2: u8,
-    pub sys_rand_key: [u8; 32],
     pub cycles: CycleLimits,
     /// The run's time bound: every execute gets at most what is left of it, and is killed there.
     pub deadline: Instant,
@@ -737,14 +737,21 @@ impl Baseline<'_> {
         Instant::now() >= self.deadline || self.token.reason().is_some()
     }
 
-    async fn execute(&self, w: &[u8], po2s: &[u8], keccak_po2: u8, key: [u8; 32]) -> Result<WitnessExecuteResponse, Skip> {
+    /// One execution of `w`, under the rule's `sys_rand` seed unless `seed` names another.
+    async fn execute(
+        &self,
+        w: &[u8],
+        po2s: &[u8],
+        keccak_po2: u8,
+        seed: Option<[u8; 32]>,
+    ) -> Result<WitnessExecuteResponse, Skip> {
         let spec = ExecuteOnce {
             elf: self.elf,
             program_id: self.judge.descriptor.programId,
             prefix: self.prefix,
             po2s,
             keccak_po2,
-            sys_rand_key: key,
+            sys_rand_seed: seed,
             max_cycles: self.cycles.host,
             timeout: Some(self.deadline.saturating_duration_since(Instant::now())),
         };
@@ -805,7 +812,7 @@ pub async fn run_mutations<'m>(
         if !seen.insert(sha(&bytes)) {
             continue;
         }
-        let r = b.execute(&bytes, &[b.po2], b.keccak_po2, b.sys_rand_key).await;
+        let r = b.execute(&bytes, &[b.po2], b.keccak_po2, None).await;
         // An execute the deadline cut short says nothing.
         let cut =
             Instant::now() >= b.deadline && matches!(&r, Err(Skip::Verdict { reason: SkipReason::ProveResources, .. }));
@@ -821,7 +828,8 @@ pub async fn run_mutations<'m>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostInput {
-    /// The `sys_rand` seed (its key: the prover's own secret).
+    /// The `sys_rand` seed: zkminer seeds by a public rule, but the proof binds no seed, so a
+    /// prover on other software can answer `sys_rand` with anything.
     SysRandSeed,
     /// The segment size.
     Po2,
@@ -834,7 +842,7 @@ pub enum HostInput {
 #[serde(rename_all = "camelCase")]
 pub struct HostInputResult {
     pub input: HostInput,
-    /// The two values, as text (`key A`/`key B` for seeds).
+    /// The two values, as text (`rule`/`random` for seeds).
     pub values: [String; 2],
     /// Each value's journal sha256, when it ran to a journal.
     pub journal_sha256: [Option<B256>; 2],
@@ -942,11 +950,12 @@ fn pair_result(input: HostInput, values: [String; 2], a: Ran, b: Ran, limits: Cy
     HostInputResult { input, values, journal_sha256: [ja, jb], dependent, note, ran }
 }
 
-/// Re-executes the baseline `W` under two `sys_rand` seed keys, two po2s and two keccak po2s
-/// (§21.1), each value in a request of its own, each pair compared by journal, until the deadline.
-/// `other_key` is a key unrelated to the baseline's (the seed a different prover derives). The po2
-/// pair is the baseline's po2 and [`alternative_po2`] of the asked ones.
-pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32]) -> Vec<HostInputResult> {
+/// Re-executes the baseline `W` under two `sys_rand` seeds, two po2s and two keccak po2s (§21.1),
+/// each value in a request of its own, each pair compared by journal, until the deadline. The seed
+/// pair is the rule's (every other run's) and `other_seed`, a fresh random one: what a prover on
+/// other software may answer with. The po2 pair is the baseline's po2 and [`alternative_po2`] of
+/// the asked ones.
+pub async fn host_input_checks(b: &Baseline<'_>, other_seed: [u8; 32]) -> Vec<HostInputResult> {
     let mut out = Vec::new();
     let skipped = |input, values: [String; 2]| HostInputResult {
         input,
@@ -956,16 +965,19 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32]) -> Vec<Hos
         note: Some("not run: the run's time ran out first".into()),
         ran: false,
     };
-    // The baseline's own execution at its po2, keccak po2 and key: the first value of every pair.
+    // The baseline's own execution at its po2, keccak po2 and the rule's seed: the first value of
+    // every pair.
     let base = if b.late() {
         None
     } else {
-        Some(journal_of(&b.execute(b.w, &[b.po2], b.keccak_po2, b.sys_rand_key).await, 0))
+        Some(journal_of(&b.execute(b.w, &[b.po2], b.keccak_po2, None).await, 0))
     };
-    let values = ["key A (this run's)".to_string(), "key B (another prover's)".to_string()];
+    let values = ["rule (zkminer's)".to_string(), "random (another prover's)".to_string()];
     match &base {
         Some(a) if !b.late() => {
-            let c = b.execute(b.w, &[b.po2], b.keccak_po2, other_key).await;
+            let c = b
+                .execute(b.w, &[b.po2], b.keccak_po2, Some(other_seed))
+                .await;
             out.push(pair_result(HostInput::SysRandSeed, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::SysRandSeed, values)),
@@ -974,7 +986,7 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32]) -> Vec<Hos
     let values = [b.po2.to_string(), p2.to_string()];
     match &base {
         Some(a) if !b.late() => {
-            let c = b.execute(b.w, &[p2], b.keccak_po2, b.sys_rand_key).await;
+            let c = b.execute(b.w, &[p2], b.keccak_po2, None).await;
             out.push(pair_result(HostInput::Po2, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::Po2, values)),
@@ -983,7 +995,7 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_key: [u8; 32]) -> Vec<Hos
     let values = [b.keccak_po2.to_string(), k2.to_string()];
     match &base {
         Some(a) if !b.late() => {
-            let c = b.execute(b.w, &[b.po2], k2, b.sys_rand_key).await;
+            let c = b.execute(b.w, &[b.po2], k2, None).await;
             out.push(pair_result(HostInput::KeccakPo2, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::KeccakPo2, values)),

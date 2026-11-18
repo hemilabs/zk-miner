@@ -275,15 +275,16 @@ fn a_wrong_input_is_refused() {
 }
 
 /// The seed is the request's, and the guest's journal does not depend on it when it reads no
-/// randomness. The miner derives it from the bundle's input hash, as a prove worker would from W.
+/// randomness. The miner derives it from the bundle's input hash by the public rule, as a prove
+/// worker would from W; a host-dependence check hands another one.
 #[test]
 fn the_seed_is_the_requests() {
     let test = "the_seed_is_the_requests";
     let Some(root) = delegated(test) else { return };
     let dir = tempfile::tempdir().unwrap();
     let w = 1000u32.to_le_bytes();
-    let seed_a = risc0_seed(&[1; 32], &fibonacci().1, &sha256(&w));
-    let seed_b = risc0_seed(&[2; 32], &fibonacci().1, &sha256(&w));
+    let seed_a = risc0_seed(&fibonacci().1, &sha256(&w));
+    let seed_b = [0xa5; 32];
     assert_ne!(seed_a, seed_b);
     let (f, req_a) = job(dir.path(), &w, &[], &[16, 20], seed_a);
     let a = run(&root, "seed-a", &f, &req_a).unwrap();
@@ -521,11 +522,6 @@ fn the_running_worker_is_restricted_and_never_touches_home() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.code().is_none(), "killed: {:?}", out.status);
     cg.remove().unwrap();
-    let log = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !log.contains("sys_rand key"),
-        "it went looking for the key:\n{log}"
-    );
     assert_eq!(
         std::fs::read_dir(home.path()).unwrap().count(),
         0,

@@ -255,7 +255,7 @@ fn finish_refuses_records_that_do_not_match_what_was_written() {
             b.po2_results[0].journal_sha256 = sha256(&j);
         }), Reject::Record(Defect::JournalTooLarge)),
         ("po2 twice", Box::new(|b| b.po2_results[1].po2 = 19), Reject::Record(Defect::Po2Duplicate)),
-        ("format", Box::new(|b| b.format_version = 2), Reject::Record(Defect::FormatVersion)),
+        ("format", Box::new(|b| b.format_version += 1), Reject::Record(Defect::FormatVersion)),
         ("version", Box::new(|b| b.version += 1), Reject::Record(Defect::VersionMismatch)),
         ("elf", Box::new(|b| b.image_id = B256::repeat_byte(0xee)), Reject::ElfMissing),
     ];
