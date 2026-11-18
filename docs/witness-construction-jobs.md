@@ -784,13 +784,18 @@ struct BuilderContextV1 {        // the input, as abi.encode(ctx) with its 0x20 
   answers as lagging or not found is *unanswerable*, which is the builder's question, not the operator's
   failure: a builder must not be able to buy a free retry by asking for a future block or an unknown
   hash (§16) — once **two independent endpoints** (distinct host and port) for that chain answered so,
-  or the block lies deeper below the head than the source's **pruning horizon** (unbounded when an
-  endpoint serving it is `archive`, else the largest `max_proof_age` of its endpoints, at least 128
-  blocks of recent state). With fewer, a node behind the chain answers a valid request exactly so (a
-  block it does not know yet, state it lacks at a recent block), so the run is *source-lagging*: retried
-  with backoff and never counted against the caller (§16). The price is a few retries a builder can
-  cause on a host with one endpoint per chain; a host with two independent endpoints per chain gives it
-  none. The runner writes a marker on its summary pipe once compilation succeeds and before
+  once every endpoint that answered so has a **fresh head** (its latest block stamped within the
+  source's `head_fresh_secs`, a few block times, of now: a node at the chain's head that lacks a block
+  or state shows the request names something not on the chain), or once the block lies deeper below
+  the head than the source's **pruning horizon** (unbounded when an endpoint serving it is `archive`,
+  else the largest `max_proof_age` of its endpoints, at least 128 blocks of recent state). Otherwise
+  (one node, whose head is stale or could not be read) a node behind the chain answers a valid request
+  exactly so (a block it does not know yet, state it lacks at a recent block), so the run is
+  *source-lagging*: retried with backoff and never counted against the caller (§16), but only when the
+  builder then gave up (a non-zero return) or trapped; running out of fuel, memory or the wall clock
+  is its own whatever its fetches met. The price is a few retries a builder can cause on a host with
+  one endpoint per chain while that node is behind; a host with two independent endpoints per chain
+  gives it none. The runner writes a marker on its summary pipe once compilation succeeds and before
   instantiation; a runner error reported after that marker is treated as a builder trap, since a
   builder that escaped wasmtime controls the runner process and could otherwise fake an internal
   error for a free retry.
@@ -1082,12 +1087,15 @@ only *for a configuration*: chain id, archive, served proof age, method sets.
   weighted cost units; exhausting an operator budget is status 2, so status 3 always means the job's
   own limits.
 - **Retries:** transport errors and 429 → failover to another endpoint; lagging-node errors ("header
-  not found", "missing trie node") → retry on another endpoint, at most two; execution errors (a
-  reverted call) are answers. When every endpoint asked lacks the block or state, the fetch is status 2
-  and final (*unanswerable*) only if two independent endpoints agreed or the block is beyond the
-  pruning horizon; otherwise it is *source-lagging* (§9.2). An explicit block number above the head is
-  refused (status 1) once two independent endpoints report heads below it; above one node's head only,
-  it is status 2, source-lagging.
+  not found", "missing trie node") → retry on another endpoint on another host or port (an alias of a
+  node that lagged is skipped: it would answer the same), at most two; execution errors (a reverted
+  call) are answers. When every endpoint asked lacks the block or state, the fetch is status 2 and
+  final (*unanswerable*) if two independent endpoints agreed, if every one that did has a fresh head
+  (its latest block stamped within `head_fresh_secs` of now; each probe is one operator-budget unit),
+  or if the block is beyond the pruning horizon; otherwise it is *source-lagging* (§9.2). An explicit
+  block number above the head is refused (status 1) once two independent endpoints, or every endpoint
+  asked with a fresh head, report heads below it; above one stale node's head only, it is status 2,
+  source-lagging.
 - **Keys:** key-bearing endpoints get no redirects, no Referer, no proxy; endpoints are logged by
   operator alias, errors with the URL stripped.
 
@@ -1744,7 +1752,7 @@ Witness serving stays disabled in code until the steps of its phase are in place
 | Builder artifact | per source (§13.4); permanent for the job once every source is bad |
 | Builder deterministic failure (trap, fuel, memory, non-zero return) with no status-2 fetch | permanent for the job |
 | Builder transient (an operator-side fetch failure, or the wall clock expiring while a fetch waited on the operator side; not an unanswerable request) | one jittered retry on other endpoints, then permanent; never counted against the caller |
-| Builder source-lagging (a fetch the job's source answered as lacking the block or state, or naming a block above its head, with fewer than two independent endpoints of that chain agreeing and the block within the pruning horizon, §9.2) | retried with backoff (6 attempts, about 16 minutes), then permanent; never counted against the caller |
+| Builder source-lagging (a fetch the job's source answered as lacking the block or state, or naming a block above its head, with fewer than two independent endpoints of that chain agreeing, the one that did behind the chain's head or unreadable, and the block within the pruning horizon, §9.2; then a non-zero return or a trap — never fuel, memory or the wall clock) | retried with backoff (6 attempts, about 16 minutes), then permanent; never counted against the caller |
 | Guest failure or binding mismatch | one jittered rebuild on other endpoints (a stale node can cause it), then permanent |
 | Journals differ across po2 | permanent |
 | The guest calls `sys_rand` past its runtime's own draw (`GuestUsesSysRand`, §5.4) | permanent; counted against the caller |
@@ -2014,7 +2022,7 @@ key. The rows marked *(broker file)* below are keys of that file.
 | `cidrs` per endpoint, `[egress] deny_cidrs`, `[dns] servers` *(broker file)* | `[]` | Explicit operator endpoint ranges (needed for local or LAN nodes); extra denied ranges; the broker's resolvers |
 | `[budget] inflight_bytes`, `held_lock_share` *(broker file)* | 256 MiB, 0.25 | Global in-flight byte budget and the share reserved for held-lock work |
 | `chain_rpc_host` *(broker file)* | required | The host of the miner's `[chain] rpc_url` (§11.1): the broker refuses endpoints on it, and the miner refuses to start a broker whose file names another host (developer mode: a warning) |
-| `[[evm_rpc]]` *(broker file)* | — | Per endpoint: `alias`, `url`, `chain_id`, `archive`, `max_proof_age`, `method_sets`, rates, key file |
+| `[[evm_rpc]]` *(broker file)* | — | Per endpoint: `alias`, `url`, `chain_id`, `archive`, `max_proof_age`, `method_sets`, `head_fresh_secs` (36: a head this recent is the chain's, §11.2), rates, key file |
 | `[[blob_mirror]]` *(broker file)* | — | Mirror URL templates (`{sha256}`) |
 | `[chain] preclaim_read_share` | 0.25 | Share of the chain limiter for pre-claim reads |
 | `[dev] private_network` | `false` | Developer setting: lets job-influenced connections (ELF downloads, builder fetches, artifact reads, operator endpoints) reach non-public addresses. For local test networks only; needs `[dev] chain_id`; refused on Hemi mainnet; the miner passes it to the broker it launches (the broker file has no such key) |

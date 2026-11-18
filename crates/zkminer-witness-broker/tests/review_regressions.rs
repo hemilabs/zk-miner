@@ -220,12 +220,29 @@ async fn a_lagging_node_fails_over_to_one_that_has_the_block() {
 
 /// A node at height `head` that has no state at any block (`missing trie node`) and knows no block
 /// by hash (`null`): what a node far behind the chain, or one asked for what does not exist, says.
+/// Its head has no timestamp, so it can never be shown to be at the chain's head.
 fn stateless_node(head: u64) -> impl Fn(TestRequest) -> TestResponse + Send + Sync + 'static {
+    stateless_node_at(head, None)
+}
+
+/// [`stateless_node`] whose head is stamped `age_secs` before now.
+fn stateless_node_at(
+    head: u64,
+    age_secs: Option<u64>,
+) -> impl Fn(TestRequest) -> TestResponse + Send + Sync + 'static {
     move |req| {
         let v: Value = serde_json::from_slice(&req.body).unwrap_or_default();
         let one = |c: &Value| match c["method"].as_str().unwrap_or_default() {
             "eth_getBlockByNumber" => {
-                json!({"jsonrpc":"2.0","id":c["id"].clone(),"result":{"number":format!("{head:#x}")}})
+                let mut block = json!({"number": format!("{head:#x}")});
+                if let Some(age) = age_secs {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    block["timestamp"] = json!(format!("{:#x}", now - age));
+                }
+                json!({"jsonrpc":"2.0","id":c["id"].clone(),"result":block})
             }
             "eth_getBalance" => {
                 json!({"jsonrpc":"2.0","id":c["id"].clone(),"error":{"code":-32000,"message":"missing trie node 5c3a (path )"}})
@@ -349,7 +366,8 @@ async fn a_lagging_source_is_final_only_when_confirmed() {
         "{stats:?}"
     );
 
-    // Two aliases of one URL are one node: still unconfirmed, though both were asked.
+    // Two aliases of one URL are one node: the second is not asked (it would answer the same), and
+    // the node's head is (it has no timestamp: unconfirmed).
     let before = n0.hits();
     let text = config_text(
         dir.path(),
@@ -365,7 +383,31 @@ async fn a_lagging_source_is_final_only_when_confirmed() {
         stats.lagging_unconfirmed && !stats.unanswerable,
         "{stats:?}"
     );
-    assert_eq!(n0.hits() - before, 2, "both aliases were asked");
+    assert_eq!(n0.hits() - before, 2, "the request once, then its head");
+    // ...nor can the aliases use up the lagging attempts before an independent endpoint is asked:
+    // the third entry is, and two independent nodes agreeing is final.
+    let before = (n0.hits(), n1.hits());
+    let text = config_text(
+        dir.path(),
+        &format!(
+            "{}{}{}",
+            evm("n0", &n0.url(), ANVIL_CHAIN, local),
+            evm("n0-again", &n0.url(), ANVIL_CHAIN, local),
+            evm("n1", &n1.url(), ANVIL_CHAIN, local)
+        ),
+    );
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let (status, stats) = fetch_one(&client, 10, by_hash.clone()).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.unanswerable && !stats.lagging_unconfirmed,
+        "{stats:?}"
+    );
+    assert_eq!(
+        (n0.hits() - before.0, n1.hits() - before.1),
+        (1, 1),
+        "each node once"
+    );
 
     // Two independent endpoints agree: final.
     let text = config_text(
@@ -393,6 +435,138 @@ async fn a_lagging_source_is_final_only_when_confirmed() {
     let (status, stats) = fetch_one(&client, 9, balance(9, 2000)).await;
     assert_eq!(status, FetchStatus::Denied);
     assert_eq!(stats.denied, 1);
+}
+
+/// One endpoint at the chain's head (its latest block stamped seconds ago) that lacks a block or
+/// state: no node behind the chain explains it, so it is final (`unanswerable`, or status 1 for a
+/// number above that head). A head older than the source's `head_fresh_secs` keeps it unconfirmed.
+#[tokio::test]
+async fn a_node_at_the_chains_head_makes_a_missing_block_final() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = "cidrs = [\"127.0.0.1/32\"]";
+    let balance = |id: u32, block: u64| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"eth_getBalance","params":["{DEV}","{block:#x}"]}}"#
+        )
+    };
+    let by_hash = format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"eth_getBlockByHash","params":["0x{}",false]}}"#,
+        "00".repeat(31) + "03"
+    );
+    let fresh = TestServer::start(stateless_node_at(1000, Some(2))).await;
+    let text = config_text(dir.path(), &evm("fresh", &fresh.url(), ANVIL_CHAIN, local));
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    for (key, req) in [(1, by_hash.clone()), (2, balance(2, 992))] {
+        let (status, stats) = fetch_one(&client, key, req).await;
+        assert_eq!(status, FetchStatus::Failed);
+        assert!(
+            stats.unanswerable && !stats.lagging_unconfirmed && !stats.operator_failure,
+            "{key}: {stats:?}"
+        );
+    }
+    let (status, stats) = fetch_one(&client, 3, balance(3, 2000)).await;
+    assert_eq!(
+        (status, stats.denied),
+        (FetchStatus::Denied, 1),
+        "a block above a fresh head does not exist yet"
+    );
+
+    // Stamped a minute ago, past the default of 36 s: a node that may lag.
+    let stale = TestServer::start(stateless_node_at(1000, Some(60))).await;
+    let text = config_text(dir.path(), &evm("stale", &stale.url(), ANVIL_CHAIN, local));
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let (_, stats) = fetch_one(&client, 4, by_hash.clone()).await;
+    assert!(
+        stats.lagging_unconfirmed && !stats.unanswerable,
+        "{stats:?}"
+    );
+    let (status, stats) = fetch_one(&client, 5, balance(5, 2000)).await;
+    assert!(
+        status == FetchStatus::Failed && stats.lagging_unconfirmed && stats.denied == 0,
+        "{stats:?}"
+    );
+    // ...unless the source's own window is wider.
+    let text = config_text(
+        dir.path(),
+        &evm(
+            "stale",
+            &stale.url(),
+            ANVIL_CHAIN,
+            &format!("{local}\nhead_fresh_secs = 120"),
+        ),
+    );
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let (_, stats) = fetch_one(&client, 6, by_hash).await;
+    assert!(
+        stats.unanswerable && !stats.lagging_unconfirmed,
+        "{stats:?}"
+    );
+}
+
+/// The security review's PoC, inverted: a builder asks a healthy node at the chain's head (anvil,
+/// the only endpoint) for state at a block hash no chain has. Its fresh head makes the failure
+/// final, so the builder's exit is its own; and where a stale node leaves a fetch unconfirmed,
+/// only giving up or trapping is excused, never running out of fuel, memory or time.
+#[tokio::test]
+async fn a_random_hash_on_a_healthy_single_endpoint_buys_no_retry() {
+    let anvil = Anvil::start(&[]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let text = config_text(
+        dir.path(),
+        &evm(
+            "anvil",
+            &anvil.url,
+            ANVIL_CHAIN,
+            "cidrs = [\"127.0.0.1/32\"]",
+        ),
+    );
+    let (client, _t) = start(dir.path(), &text, Hooks::real()).await;
+    let random = format!("0x{}", "5a".repeat(32));
+    let req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":["0x0000000000000000000000000000000000000001",{{"blockHash":"{random}"}}]}}"#
+    );
+    let (status, stats) = fetch_one(&client, 0x51, req).await;
+    assert_eq!(status, FetchStatus::Failed);
+    assert!(
+        stats.unanswerable && !stats.lagging_unconfirmed && !stats.operator_failure,
+        "{stats:?}"
+    );
+    for exit_code in [exit::FUEL, exit::NONZERO_RETURN, exit::TRAP] {
+        let o = BuilderOutcome {
+            exit: Some(exit_code),
+            source_lagging: stats.lagging_unconfirmed,
+            module_started: true,
+            ..Default::default()
+        };
+        let v = builder_verdict(&o).unwrap();
+        assert!(
+            v != SkipReason::BuilderSourceLagging && v.verdict().blames_caller,
+            "{exit_code}: {v:?}"
+        );
+    }
+    // Had the node lagged: exhaustion is still the builder's.
+    for (wall, oom) in [(true, false), (false, true)] {
+        let o = BuilderOutcome {
+            exit: None,
+            wall_clock_hit: wall,
+            oom_killed: oom,
+            source_lagging: true,
+            module_started: true,
+            ..Default::default()
+        };
+        let v = builder_verdict(&o).unwrap();
+        assert!(
+            v != SkipReason::BuilderSourceLagging && v.verdict().blames_caller,
+            "{v:?}"
+        );
+    }
+    let o = BuilderOutcome {
+        exit: Some(exit::FUEL),
+        source_lagging: true,
+        module_started: true,
+        ..Default::default()
+    };
+    assert_eq!(builder_verdict(&o), Some(SkipReason::BuilderFuelExhausted));
 }
 
 /// The mock codec's explicit numbers: a head from a lagging first endpoint is not the last word.

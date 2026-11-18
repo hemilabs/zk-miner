@@ -67,6 +67,20 @@ struct BlockResp<'a> {
     error: Option<ErrObj>,
 }
 
+#[derive(Deserialize)]
+struct BlockTimeObj<'a> {
+    #[serde(borrow)]
+    timestamp: &'a str,
+}
+
+#[derive(Deserialize)]
+struct BlockTimeResp<'a> {
+    id: u64,
+    #[serde(borrow)]
+    result: Option<BlockTimeObj<'a>>,
+    error: Option<ErrObj>,
+}
+
 /// A block, by number and hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockRef {
@@ -178,6 +192,30 @@ impl RpcClient<'_> {
                 _ => Err(RpcError::Malformed),
             },
         }
+    }
+
+    /// The timestamp (Unix seconds) of the node's `latest` block; `None` when it has none (a null
+    /// result).
+    pub async fn latest_timestamp(&self) -> Result<Option<u64>, RpcError> {
+        let id = self.next_id(1);
+        let body = serde_json::to_vec(&request(
+            id,
+            "eth_getBlockByNumber",
+            json!(["latest", false]),
+        ))
+        .expect("serializes");
+        let bytes = self.post(body, BLOCK_RESPONSE_CAP).await?;
+        let r: BlockTimeResp<'_> =
+            serde_json::from_slice(&bytes).map_err(|_| RpcError::Malformed)?;
+        if r.id != id {
+            return Err(RpcError::Malformed);
+        }
+        if let Some(e) = r.error {
+            return Err(RpcError::Rpc(e.code));
+        }
+        r.result
+            .map(|b| quantity(b.timestamp).ok_or(RpcError::Malformed))
+            .transpose()
     }
 
     /// The block `tag` (`"safe"`, `"finalized"`, `"latest"`) names; `None` when the node has none

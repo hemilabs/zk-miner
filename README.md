@@ -253,6 +253,13 @@ in its config file, which the miner reads itself — and admits the address with
 them) and the miner's `[dev] private_network`. So a broker an attacker took over still reaches
 only your configured endpoints. See SECURITY.md, "Witness jobs: the broker".
 
+Give each chain two `[[evm_rpc]]` endpoints on independent nodes (distinct host and port) if you
+can. When a builder asks for a block or state an endpoint lacks, two independent endpoints that
+both lack it make the answer final, and so does one whose head is fresh (its latest block stamped
+within `head_fresh_secs`, default 36 s; set a few of the chain's block times): the builder is then
+judged on its own exit. With one endpoint per chain whose head is stale, the lag is unconfirmed and
+the job is retried unblamed (up to 6 times) when its builder gave up or trapped.
+
 | key | default | meaning |
 |---|---|---|
 | `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet and, on a cloud host, your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route). Host bits must be zero. |

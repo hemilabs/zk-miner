@@ -575,6 +575,25 @@ no second one):
 - **Cached RPC answers are per requester.** Answers to pinned queries are cached by the job's
   requester (its trust domain), so one requester's builder cannot tell, from how fast an answer
   comes back, whether another requester asked the same query.
+- **The miner's chain RPC is kept apart by name.** The broker file's `chain_rpc_host` must be the
+  host of the miner's `[chain] rpc_url`, and the broker refuses every endpoint on it. Both checks
+  compare host **names** (normalized, with the port), not resolved addresses: an endpoint under
+  another name that resolves to the same node, or a provider sharing the chain RPC's IP, is not
+  caught. Keep builder endpoints on other providers, accounts and nodes. In public mode a file whose
+  `chain_rpc_host` is not the miner's chain RPC host is refused when the miner starts the broker,
+  which disables witness serving (`PAGE: WITNESS-DISABLED`; inline jobs are unaffected); developer
+  mode only warns.
+- **A builder cannot buy blameless retries from a healthy node.** An unknown block hash, missing
+  state or a block above the head is final (the builder is judged on its own exit) when two
+  independent endpoints (distinct host and port) for the chain answer so, when every one that did
+  has a fresh head (its latest block stamped within `head_fresh_secs` of now, by default 36 s:
+  a node at the chain's head that lacks a block shows it is not on the chain), or when the block is
+  deeper than the source's pruning horizon. Only one node whose head is stale or unreadable leaves
+  it unconfirmed, and then only a builder that gave up or trapped is retried unblamed (at most 6
+  times per job), never one that ran out of fuel, memory or time. Failover skips another alias of a
+  node that lagged, so aliases of one URL cannot use up the two lagging attempts before an
+  independent endpoint is asked. With one endpoint per chain, a lag that endpoint confirms itself
+  (a stale head) is retried; two independent endpoints make every such answer final.
 - **Host names** resolve through the connector's resolver, and only global answers outside the
   deny CIDRs, connected prefixes and own addresses become an endpoint's addresses, in both modes.
 - **DNS servers** are operator infrastructure the connector's resolver dials, so a stub such as
