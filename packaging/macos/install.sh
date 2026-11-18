@@ -219,7 +219,12 @@ fi
 say ""
 say "Done. Next:"
 case ":$PATH:" in *":$prefix:"*) ;; *) say "  add the CLI to your PATH:  echo 'export PATH=\"$prefix:\$PATH\"' >> ~/.zshrc" ;; esac
-say "  $prefix/zkminer init           # writes ~/.zkminer/config.toml"
-say "  $prefix/zkminer benchmark      # first run downloads the risc0-groth16 component unless --with-groth16 did"
+say "  $prefix/zkminer init           # writes ~/.zkminer/config.toml (needed once, whatever the options)"
+if [ $groth16 = 1 ]; then
+  say "  $prefix/zkminer benchmark      # the risc0-groth16 component is already installed"
+else
+  say "  $prefix/zkminer benchmark      # its first run downloads the risc0-groth16 component (2.4 GB)"
+fi
 say "  $prefix/zkminer run"
+say "Neither binary has --version: this kit's version and commit are in $kit/BUILDINFO."
 say "See README.md in this kit (memory tiers, first start, Gatekeeper, uninstall)."

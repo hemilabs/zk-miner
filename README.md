@@ -235,6 +235,9 @@ export PATH="$HOME/.zkminer:$PATH"
 zkminer init && zkminer benchmark
 ```
 
+`zkminer init` is needed with `./install.sh --with-groth16` too. There is no `zkminer --version`:
+the kit's `BUILDINFO` names its version and commit, and `zkminer help` lists the commands.
+
 - **Unsigned.** The kit has no Developer ID and is not notarized. `install.sh` checks the kit's
   `SHA256SUMS` and removes `com.apple.quarantine` from the files it installs. To run a binary from the
   kit directly, use `xattr -d com.apple.quarantine <file>`, or System Settings → Privacy & Security →

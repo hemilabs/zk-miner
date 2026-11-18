@@ -74,6 +74,10 @@ zkminer benchmark                       # measures this Mac the way the miner do
 zkminer run
 ```
 
+`zkminer init` is needed once after every install, `--with-groth16` or not. Neither `zkminer` nor
+the worker has a `--version` flag: the kit's version, commit and risc0 revision are in its
+`BUILDINFO` file, and `zkminer help` lists the commands.
+
 ### First start and the offline archives
 
 Metal compiles every GPU kernel the first time a process uses it. For this prover's circuits that
