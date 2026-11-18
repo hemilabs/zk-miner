@@ -38,7 +38,7 @@ risc0-zkvm = { version = "3.1", default-features = false, features = ["std"] }
 zkminer-witness = { workspace = true }
 # Only needed by the optional `sp1-demo` command; made optional so the `zkminer`
 # binary (and the RISC0 prover path) builds without the SP1 native toolchain.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10", default-features = false, features = ["blocking"], optional = true }
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a", default-features = false, features = ["blocking"], optional = true }
 
 # Serving witness-construction jobs needs the rootless sandbox (Landlock, seccomp, cgroup v2) and the
 # retention store's `*at` syscalls: Linux only. Elsewhere `[witness] enabled` is refused at startup.
