@@ -355,7 +355,7 @@ make -f Makefile.mac mac-bench BENCH_ONLY=fibonacci
 | `mac-install-worker` | copies the worker into `PROVERS_DIR` (default `~/.zkminer/provers`; copy then rename, so a running worker is never modified in place), then proves fibonacci once with it to warm the pipelines (`WARM=0` skips) | ~1 min warm; add the cold warm-up below on a new machine |
 | `mac-test-miner` | the worker's unit tests, `zkminer-prover` `discovery::`/`dispatcher::`, and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
 | `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal`, `risc0-circuit-rv32im` `prove::`, `risc0-circuit-recursion`, `risc0-circuit-keccak`, `risc0-groth16-sys` and `risc0-groth16`; each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
-| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (all six programs, about 3 min at po2 20; `BENCH_ONLY=<program>` for one) | ~1 min for fibonacci |
+| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (the miner's suite: a discarded fibonacci warm-up, the five programs, then the zkOP/s scoring proofs; about 4.5 min at po2 20; `BENCH_ONLY=<program>` runs the warm-up and that program) | ~1 min for fibonacci (the warm-up alone) |
 
 Every target sources `env.sh`, sets `NVCC=off HIPCC=off`, passes `--locked` (never `cargo update`,
 see [Layout](#layout)), and builds with `-j` = `CARGO_BUILD_JOBS` if set, else the number of

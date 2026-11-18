@@ -341,7 +341,9 @@ mac-install-worker: mac-build-worker
 	  echo "warm-up done in $$(( $$(date +%s) - t0 )) s"; \
 	else echo "WARM=0: pipelines not warmed (the first Warmup or job builds them)"; fi
 
-# The worker's own benchmark (six programs, ~20 min at po2 20 on an M5 Max; BENCH_ONLY=<name> for one).
+# The worker's own benchmark: the suite the miner sends (a discarded fibonacci warm-up, then five programs)
+# and the zkOP/s scoring proofs, ~4.5 min at po2 20 on an M5 Max. BENCH_ONLY=<name> runs the warm-up and
+# that one program (BENCH_ONLY=fibonacci: the warm-up alone, still wrapped and verified).
 mac-bench: mac-build-worker
 	@$(CARGO_ENV) \
 	$(if $(BENCH_ONLY),export BENCH_ONLY="$(BENCH_ONLY)";) \

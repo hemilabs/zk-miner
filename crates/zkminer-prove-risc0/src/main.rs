@@ -2002,6 +2002,32 @@ fn benchmark_stages(
     footprint.phase("recursion");
 
     if !measure_wrap {
+        // W10-INT: the release the wrapped path makes after its wrap, here after the STARK. Without
+        // it a scoring proof (zkop-mix) kept this thread's cached provers, and the next proof ran on
+        // top of them: the process peak of a full `--benchmark` rose by ~1.5 GB, at the 8 GiB tier
+        // too. Metal only (elsewhere nothing was wrapped, so there is nothing to release); revert
+        // with ZKMINER_METAL_NOWRAP_RELEASE=0.
+        #[cfg(feature = "metal")]
+        {
+            if metal_host::nowrap_release_enabled() {
+                metal_host::release_after_proof();
+            }
+            sampler.held("held after release");
+            tracing::info!(
+                "{name}: Metal peak GPU memory at po2 {}: {}",
+                default_job_po2(),
+                sampler.summary()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            footprint.phase("held after release");
+            tracing::info!(
+                "{name}: peak process footprint (host + GPU) at po2 {}: {}",
+                default_job_po2(),
+                footprint.summary()
+            );
+        }
         let image_id = match risc0_zkvm::compute_image_id(elf) {
             Ok(id) => id,
             Err(e) => {
