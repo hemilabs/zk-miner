@@ -851,8 +851,9 @@ Worth knowing:
   what is free (else it waits, or goes to another card, and no RISC Zero job is claimed for that
   card until a check every 5 minutes finds the room; a job that waits about 2 minutes without room
   is released), and under Windows an NVIDIA card that another program also uses (a display) is
-  sized 1 GiB smaller, for that program to grow into. `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns all
-  of this off.
+  sized 1 GiB smaller, for that program to grow into (on a 12 GB card that means SP1's smaller
+  shard size: re-benchmark such a card after upgrading, as its saved SP1 rate was measured at the
+  larger one). `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns all of this off.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for

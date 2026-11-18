@@ -472,9 +472,10 @@ fn sp1_shard_caps_check(report: &mut Report, path: std::path::PathBuf) {
             Level::Info,
             "SP1 shard size",
             format!(
-                "{} ({}) is capped at {} elements: an SP1 job ran out of GPU memory at a larger \
-                 size there and proved at this one, so every run since sizes it no larger. To lift \
-                 it, stop the miner and remove the card's entry from {} (or the file)",
+                "{} ({}), if it is still this card, is capped at {} elements: an SP1 job ran \
+                 out of GPU memory at a larger size there and proved at this one, so every run \
+                 since sizes it no larger. To lift it, stop the miner and remove the card's entry \
+                 from {} (or the file)",
                 card.gpu_name,
                 card.pci_bus_id,
                 card.max_element_threshold,

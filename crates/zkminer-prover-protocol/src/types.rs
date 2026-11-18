@@ -79,10 +79,14 @@ use serde::{Deserialize, Serialize};
 /// selector of the risc0 it was proven with. Bincode is positional: a v16 worker's entry is one
 /// field short, and a beta worker of its v14 lacks every 14-16 field, so the handshake refuses both
 /// instead of a decoder failing mid-benchmark or mid-job.
-/// 18: the macOS beta's 17 with max/usability's `Benchmark.po2`: the segment size a risc0 worker
-/// proves the suite at, the card's own job size, so its rate describes the jobs it proves (a 12 GB
-/// card benchmarked at 20 spills into shared memory and records a rate several times too low). A
-/// v17 worker would prove the suite at 20.
+/// 18: the two 17s together (the macOS beta merged with max/usability). The macOS beta's 17 is
+/// above. max/usability's 17: `Benchmark` gained `po2`, the segment size a risc0 worker proves the
+/// suite at: the card's own job size, so its rate describes the jobs it proves (a 12 GB card
+/// benchmarked at 20 spills into shared memory and records a rate several times too low). An SP1
+/// worker applies the card's shard-size cap (`SP1_ELEMENT_THRESHOLD_CAP_ENV`) and reports sp1-gpu's
+/// own out-of-memory wordings as `ResourceExhausted`. A v16 worker would prove the suite at 20 and
+/// run larger than the dispatcher plans for. Either 17 is a different wire from 18: the beta's lacks
+/// `Benchmark.po2`, max/usability's lacks `BenchmarkEntry.power_state`.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// The risc0-zkvm `major.minor` a risc0 worker must report (`HelloAck.sdk_version`, "risc0-zkvm
