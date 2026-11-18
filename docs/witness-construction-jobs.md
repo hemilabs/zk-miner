@@ -2109,7 +2109,9 @@ provider units, retention bytes.
    `Pinned` / `Authenticated` types of §8.3, plus lints banning default-seeded `HashMap`/`HashSet`,
    `env::exit`/`pause`, `env::var`/`args`, `cycle_count`, `sys_rand`, raw `sys_keccak`, the raw
    syscall entry points (`syscall_*`, `SYS_*` names, `asm!`, `send_recv`), fds other than stdin
-   (`FdReader`, `sys_read` of another fd), and `static`/`thread_local!`/`Cell`/`RefCell` in guests.
+   (`FdReader`, `sys_read` of another fd), and `static`/`thread_local!` and every interior-mutable
+   type (`Cell`, `RefCell`, `UnsafeCell`, `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`,
+   `RwLock`, `Atomic*`) in guests.
    Three layers: clippy, the built ELF (the `ecall`, caller and name-string rules), and a source
    scan. Every risc0 guest's runtime draws memory-image entropy through `sys_rand` in `env::init`,
    which never reaches the journal; the check allows that one caller and no other. **No mainnet
