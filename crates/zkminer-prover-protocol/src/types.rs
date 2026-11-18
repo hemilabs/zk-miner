@@ -33,7 +33,11 @@ use serde::{Deserialize, Serialize};
 /// 13: `Benchmark` gained `po2`, the segment size a risc0 worker proves the suite at: the card's
 /// own job size, so its rate describes the jobs it proves (a 12 GB card benchmarked at 20 spills
 /// into shared memory and records a rate several times too low). A v12 worker would prove at 20.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// 14: no new field, a new meaning: an SP1 worker applies the card's shard-size cap
+/// (`SP1_ELEMENT_THRESHOLD_CAP_ENV`) and reports sp1-gpu's own out-of-memory wordings as
+/// `ResourceExhausted`. A v13 worker would run larger than the dispatcher plans for, and a cap
+/// recorded after it proved would be one that was never in force.
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///

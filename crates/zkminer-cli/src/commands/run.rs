@@ -3248,7 +3248,8 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
-    // Each card's SP1 shard-size cap, recorded when a proof there ran out of GPU memory.
+    // Each card's SP1 shard-size cap, recorded when a job that ran out of GPU memory there
+    // proved at a smaller size.
     pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
     // One `sys_rand` key for every risc0 worker this miner spawns, loaded once: a measured journal is
     // only worth checking a binding against if the proof that follows, on whichever worker, seeds the
@@ -5865,6 +5866,30 @@ fn risc0_slot_sizes(
         .collect()
 }
 
+/// The SP1 retry pin (slot, device) after an attempt that dispatched to `used_slot`: dropped once
+/// an attempt has run there, kept when that attempt was refused before it started
+/// (`refused_before_start`), so the next goes back to the card holding the smaller size and not to
+/// one still at the size that ran out.
+fn retry_pin_after(
+    pin: Option<(String, String)>,
+    used_slot: Option<&str>,
+    refused_before_start: bool,
+) -> Option<(String, String)> {
+    match pin {
+        Some((slot, _)) if !refused_before_start && used_slot == Some(slot.as_str()) => None,
+        pin => pin,
+    }
+}
+
+/// Whether a prove error is a refusal before the proof started on its card: short of GPU or host
+/// memory at admission. Matched on the type, never the text.
+fn refused_before_start(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
+        .is_some()
+        || e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .is_some_and(|h| !h.attempted)
+}
+
 /// The risc0 cards that prove jobs: each slot with a size, unless the operator switched it (or risc0)
 /// off.
 fn risc0_job_cards(
@@ -7502,6 +7527,10 @@ async fn miner_brain(
         // claimed for it would wait there and be released (see `WorkerPool::risc0_card_short`).
         let risc0_cards_before = risc0_cards.len();
         if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            // Reading a card can take seconds (nvidia-smi), which this loop must not wait on.
+            for key in pool.risc0_short_due() {
+                tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));
+            }
             risc0_cards.retain(|card| !pool.risc0_card_short(&card.slot));
         }
         let risc0_cards_short = risc0_cards_before - risc0_cards.len();
@@ -8050,7 +8079,7 @@ async fn miner_brain(
                             last_no_risc0_card_warn = Some(now);
                             if risc0_cards_short > 0 {
                                 let detail = "Not claiming risc0 jobs: too little VRAM is free on \
-                                              every risc0 card here (another program holds it); \
+                                              every risc0 card here for its proof's segment size; \
                                               each card is checked again every 5 minutes.";
                                 tracing::warn!("{detail}");
                                 state
@@ -11171,13 +11200,14 @@ async fn process_job_lifecycle(
                 Err(e) => return Err(anyhow::anyhow!("prove task panicked: {e}")),
             };
 
-            // The retry ran where it was pinned: the pin has done its work.
-            if retry_card
-                .as_ref()
-                .is_some_and(|(slot, _)| used_slot.as_deref() == Some(slot.as_str()))
-            {
-                retry_card = None;
-            }
+            retry_card = retry_pin_after(
+                retry_card,
+                used_slot.as_deref(),
+                proof_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(refused_before_start),
+            );
             match proof_result {
                 Ok(p) => {
                     proved_on = used_slot;
@@ -11251,8 +11281,13 @@ async fn process_job_lifecycle(
                     if let Some(shortage) =
                         e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
                     {
+                        // Not the card an SP1 retry is pinned to: it holds the smaller size the
+                        // job needs, and its own memory coming back is what it waits for.
+                        let pinned = retry_card
+                            .as_ref()
+                            .is_some_and(|(slot, _)| used_slot.as_deref() == Some(slot.as_str()));
                         if let Some(k) = used_slot.clone() {
-                            if !shortage.ours_in_the_way && !excluded.contains(&k) {
+                            if !shortage.ours_in_the_way && !pinned && !excluded.contains(&k) {
                                 excluded.push(k);
                             }
                         }
@@ -14423,6 +14458,30 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    #[test]
+    fn an_sp1_retry_pin_holds_until_an_attempt_runs_on_its_card() {
+        let pin = || Some(("sp1:cuda:1".to_string(), "gpu1".to_string()));
+        // Ran there: done.
+        assert_eq!(retry_pin_after(pin(), Some("sp1:cuda:1"), false), None);
+        // Refused there before it started (memory short a moment): kept for the next attempt.
+        assert_eq!(retry_pin_after(pin(), Some("sp1:cuda:1"), true), pin());
+        // Ran elsewhere (the card was busy): kept.
+        assert_eq!(retry_pin_after(pin(), Some("sp1:cuda:0"), false), pin());
+        assert_eq!(retry_pin_after(None, Some("sp1:cuda:1"), false), None);
+        // Which errors are refusals before a start: typed, and only those.
+        let gpu = anyhow::Error::new(zkminer_prover_protocol::types::GpuMemoryShortage {
+            slot_key: "sp1:cuda:1".into(),
+            foreign_bytes: 0,
+            sibling_bytes: 0,
+            available_bytes: 0,
+            needed_bytes: None,
+            ours_in_the_way: true,
+            total_bytes: 0,
+        });
+        assert!(refused_before_start(&gpu));
+        assert!(!refused_before_start(&anyhow::anyhow!("GpuMemoryShortage")));
+    }
 
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.
     ///

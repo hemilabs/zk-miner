@@ -1511,10 +1511,10 @@ const WINDOWS_SHARED_CARD_MARGIN: u64 = 1024 * 1024 * 1024;
 #[cfg(windows)]
 const WINDOWS_SHARED_CARD_THRESHOLD: u64 = 64 * 1024 * 1024;
 
-///
-/// Not on a reading that has memory of ours on its way in or out (`draining`, `unattributed`): the
-/// separate queries a reading is made of can then put some of ours under "foreign" for a moment,
-/// and a worker sized on that moment would stay smaller until its next recycle. Nor with the
+/// Applies the margin to a card seen shared within [`WINDOWS_SHARED_CARD_HOLD`]. A card is SEEN
+/// shared only on a reading with no memory of ours on its way in or out (`draining`,
+/// `unattributed`): the separate queries a reading is made of can then put some of ours under
+/// "foreign" for a moment, and the hold would make that moment last minutes. Nothing with the
 /// free-VRAM checks off (`discovery::free_vram_checks_off`).
 #[cfg(windows)]
 fn with_windows_growth_margin(mut card: CardOccupancy, device_index: u32) -> CardOccupancy {
@@ -1524,7 +1524,10 @@ fn with_windows_growth_margin(mut card: CardOccupancy, device_index: u32) -> Car
     let mut seen = WINDOWS_SHARED_SEEN
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD {
+    if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD
+        && card.draining == 0
+        && card.unattributed == 0
+    {
         seen.insert(device_index, Instant::now());
     }
     if seen
@@ -1851,9 +1854,29 @@ fn unix_now() -> u64 {
 /// running out, means the growth may be what ran out.
 const FOREIGN_GROWTH_TOLERANCE: u64 = 256 * 1024 * 1024;
 
-/// How long a card another program's memory kept a risc0 proof off claims no risc0 job
-/// (`WorkerPool::risc0_card_short`). The next proof there re-checks, and clears it if it fits.
+/// Whether an SP1 out-of-memory may be recorded as the card's (`PendingSp1Cap::record`): only when
+/// what another program held is known both when the proof was admitted and when it ran out, and did
+/// not grow by more than [`FOREIGN_GROWTH_TOLERANCE`]. A card that could not be read either time,
+/// as one that has just run out may not be, says nothing either way, so nothing is recorded.
+fn oom_may_be_recorded(admitted_foreign: Option<u64>, foreign_now: Option<u64>) -> bool {
+    match (admitted_foreign, foreign_now) {
+        (Some(before), Some(now)) => now <= before.saturating_add(FOREIGN_GROWTH_TOLERANCE),
+        _ => false,
+    }
+}
+
+/// How long a card with too little VRAM free for a risc0 proof claims no risc0 job before it is
+/// read again (`WorkerPool::risc0_short_due`, `recheck_risc0_short`); a proof admitted there clears
+/// it at once.
 pub const RISC0_SHORT_FOR: Duration = Duration::from_secs(300);
+
+/// A risc0 slot short of VRAM: until when, what its proof needs, and whether a check is reading it.
+#[derive(Debug, Clone, Copy)]
+struct Risc0Short {
+    until: Instant,
+    need: u64,
+    checking: bool,
+}
 
 /// A program's identity for `PendingSp1Cap`: a hash of its ELF.
 fn program_hash(elf: &[u8]) -> u64 {
@@ -2260,9 +2283,9 @@ pub struct WorkerPool {
     /// SP1 slots lowered a tier this run, by slot key, until the program that ran out proves at the
     /// lower tier there (`confirm_sp1_shard_cap`), which is when the cap is recorded.
     sp1_caps_pending: Mutex<HashMap<String, PendingSp1Cap>>,
-    /// risc0 slots whose card another program's memory kept a proof off, until when: the claim side
-    /// claims no risc0 job for them meanwhile (`risc0_card_short`).
-    risc0_short: Mutex<HashMap<String, (Instant, u64)>>,
+    /// risc0 slots whose card had too little VRAM free for a proof (`risc0_card_short`): the claim
+    /// side claims no risc0 job for them until a check finds the room.
+    risc0_short: Mutex<HashMap<String, Risc0Short>>,
     /// Each SP1 slot's shard-size cap, for the planner (`sp1_rate_factor`): a copy of what its
     /// spawn environment carries, kept here because a proof holds the slot for its whole length.
     sp1_slot_caps: Mutex<HashMap<String, SlotSp1Cap>>,
@@ -2381,8 +2404,8 @@ impl WorkerPool {
     }
 
     /// Keep per-card SP1 shard-size caps in `path` (`sp1_shard_caps`): applied to every SP1 worker
-    /// spawned after this, and lowered when one runs out of GPU memory. Call before
-    /// `discover_and_spawn`.
+    /// spawned after this, and lowered there once a job that ran out of GPU memory proves at a
+    /// smaller size (`confirm_sp1_shard_cap`). Call before `discover_and_spawn`.
     pub fn use_sp1_shard_caps(&mut self, path: PathBuf) {
         let store = crate::sp1_shard_caps::Store::load(path);
         *self
@@ -2458,7 +2481,7 @@ impl WorkerPool {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(key);
-            self.set_slot_sp1_cap(key, slot, p.previous_cap);
+            self.set_slot_sp1_cap(key, p.previous_cap);
             tracing::warn!(
                 "{key}: the job ran out of GPU memory again at {}, so the smaller shard size did not \
                  help; undone",
@@ -2499,7 +2522,6 @@ impl WorkerPool {
             );
         self.set_slot_sp1_cap(
             key,
-            slot,
             Some(SlotSp1Cap {
                 cap: lower,
                 since_unix_secs: unix_now(),
@@ -2521,7 +2543,7 @@ impl WorkerPool {
 
     /// Keep the planner's copy of a slot's SP1 cap (`sp1_slot_caps`), which it reads without the
     /// slot lock a proof holds for its whole length.
-    fn set_slot_sp1_cap(&self, key: &str, _slot: &WorkerSlot, cap: Option<SlotSp1Cap>) {
+    fn set_slot_sp1_cap(&self, key: &str, cap: Option<SlotSp1Cap>) {
         let mut caps = self.sp1_slot_caps.lock().unwrap_or_else(|e| e.into_inner());
         match cap {
             Some(c) => caps.insert(key.to_string(), c),
@@ -2637,28 +2659,60 @@ impl WorkerPool {
         1.0
     }
 
-    /// Whether risc0 jobs should not be claimed for `key`'s card for now: a proof there was refused
-    /// for want of VRAM within [`RISC0_SHORT_FOR`]. Each job claimed meanwhile would wait for that
-    /// memory and, on a single card, be released. When the window ends the card is read again here
-    /// (`risc0_card_fits`) rather than with a real job: still short, and the window starts over.
+    /// Whether risc0 jobs should not be claimed for `key`'s card for now: a proof there found too
+    /// little VRAM free, and no check since (`recheck_risc0_short`) has found the room. Each job
+    /// claimed meanwhile would wait for that memory and, on a single card, be released. A map
+    /// lookup: the claim side calls it every tick.
     pub fn risc0_card_short(&self, key: &str) -> bool {
-        let need = {
-            let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
-            match short.get(key) {
-                Some((until, _)) if Instant::now() < *until => return true,
-                Some((_, need)) => {
-                    let need = *need;
-                    short.remove(key);
-                    need
-                }
-                None => return false,
-            }
+        self.risc0_short
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
+    }
+
+    /// The short risc0 slots whose [`RISC0_SHORT_FOR`] has run out and that no check is reading
+    /// yet, marked as being read: the caller runs `recheck_risc0_short` for each, off its own
+    /// thread (the check reads the card, which can take seconds).
+    pub fn risc0_short_due(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
+        short
+            .iter_mut()
+            .filter(|(_, s)| !s.checking && now >= s.until)
+            .map(|(key, s)| {
+                s.checking = true;
+                key.clone()
+            })
+            .collect()
+    }
+
+    /// Read `key`'s card again (`risc0_card_fits`): still short, and its window starts over; room
+    /// enough, or a card that cannot be read, and risc0 jobs are claimed for it again.
+    pub fn recheck_risc0_short(&self, key: &str) {
+        let Some(need) = self
+            .risc0_short
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|s| s.need)
+        else {
+            return;
         };
-        if self.risc0_card_fits(key, need) == Some(false) {
-            self.note_risc0_card_short(key, need);
-            return true;
+        let fits = self.risc0_card_fits(key, need);
+        let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
+        match fits {
+            Some(false) => {
+                if let Some(s) = short.get_mut(key) {
+                    s.until = Instant::now() + RISC0_SHORT_FOR;
+                    s.checking = false;
+                }
+            }
+            _ => {
+                short.remove(key);
+                drop(short);
+                tracing::info!("{key}: room for a risc0 proof again; claiming risc0 jobs for it");
+            }
         }
-        false
     }
 
     /// Whether `need` bytes would be free to `key`'s risc0 proof if every sibling of ours the
@@ -2691,11 +2745,18 @@ impl WorkerPool {
             .risc0_short
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.to_string(), (Instant::now() + RISC0_SHORT_FOR, need));
+            .insert(
+                key.to_string(),
+                Risc0Short {
+                    until: Instant::now() + RISC0_SHORT_FOR,
+                    need,
+                    checking: false,
+                },
+            );
         if was.is_none() {
             tracing::warn!(
                 "{key}: not enough VRAM free for a risc0 proof here ({:.1} GiB needed); claiming no \
-                 risc0 job for this card for {} minutes, then checking again",
+                 risc0 job for this card until a check every {} minutes finds the room",
                 need as f64 / (1u64 << 30) as f64,
                 RISC0_SHORT_FOR.as_secs() / 60
             );
@@ -7995,11 +8056,16 @@ impl WorkerPool {
         key: &str,
         abort_at: Option<Instant>,
         // The segment size of the risc0 proof about to run here, for its free-VRAM floor
-        // (`min_available_vram_bytes_for_risc0_proof`). `None`: no floor (a benchmark or
+        // (`discovery::risc0_proof_vram_bytes`). `None`: no floor (a benchmark or
         // calibration, which pick their own sizes, or another backend).
         risc0_po2: Option<u8>,
     ) -> Result<Option<VramBudget>> {
         let backend = key.split(':').next().unwrap_or(key);
+        // A reading from an earlier proof must not stand in for this one's (`oom_may_be_recorded`).
+        self.admitted_foreign
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
         let Some(mut card) = self.read_card(key) else {
             return Ok(None);
         };
@@ -8810,18 +8876,13 @@ impl WorkerPool {
                             .unwrap_or_else(|e| e.into_inner())
                             .get(key)
                             .copied();
-                        let grew = match (admitted, self.read_card(key)) {
-                            (Some(before), Some(now)) => {
-                                now.foreign() > before.saturating_add(FOREIGN_GROWTH_TOLERANCE)
-                            }
-                            _ => false,
-                        };
+                        let now = self.read_card(key).map(|card| card.foreign());
                         self.lower_sp1_shard_cap(
                             key,
                             &mut slot,
                             entry.vram_bytes,
                             program_hash(elf),
-                            !grew,
+                            oom_may_be_recorded(admitted, now),
                         )
                     };
                     // PID first: `kill()` reaps, after which the number may be reused.
@@ -9794,20 +9855,35 @@ mod tests {
 
     #[test]
     fn a_card_short_for_risc0_claims_none_until_a_check_finds_room() {
-        // A slot whose card cannot be read here (no CUDA index, no bus id): the check at the end of
-        // the window has no reading, and does not hold the card short on none.
+        // A slot whose card cannot be read here (no CUDA index, no bus id): the check has no
+        // reading, and does not hold the card short on none.
         let key = "risc0:rocm:7";
         let pool = pool_with_keys(&[key]);
         assert!(!pool.risc0_card_short(key));
         pool.note_risc0_card_short(key, 8 << 30);
         assert!(pool.risc0_card_short(key));
         assert!(!pool.risc0_card_short("risc0:rocm:6"));
-        pool.risc0_short.lock().unwrap().insert(
-            key.into(),
-            (Instant::now() - Duration::from_secs(1), 8 << 30),
-        );
+        // Not due within its window.
+        assert!(pool.risc0_short_due().is_empty());
+        pool.risc0_short.lock().unwrap().get_mut(key).unwrap().until =
+            Instant::now() - Duration::from_secs(1);
+        // Due once, and short until the check has read the card (the claim side never reads it).
+        assert_eq!(pool.risc0_short_due(), vec![key.to_string()]);
+        assert!(pool.risc0_short_due().is_empty());
+        assert!(pool.risc0_card_short(key));
+        pool.recheck_risc0_short(key);
         assert!(!pool.risc0_card_short(key));
-        assert!(pool.risc0_short.lock().unwrap().get(key).is_none());
+    }
+
+    #[test]
+    fn an_sp1_oom_is_recorded_only_when_nothing_else_grew_and_both_readings_are_known() {
+        const MIB: u64 = 1 << 20;
+        assert!(oom_may_be_recorded(Some(300 * MIB), Some(300 * MIB)));
+        assert!(oom_may_be_recorded(Some(300 * MIB), Some(500 * MIB)));
+        assert!(!oom_may_be_recorded(Some(300 * MIB), Some(600 * MIB)));
+        // A card unreadable at admission or at the out-of-memory says nothing: not recorded.
+        assert!(!oom_may_be_recorded(None, Some(0)));
+        assert!(!oom_may_be_recorded(Some(0), None));
     }
 
     #[cfg(windows)]
