@@ -618,10 +618,21 @@ impl SimHost {
     /// `broker_config` as this run's own, written into the work directory: `spool_dir` moved there
     /// (a simulation never shares a running miner's spool, its quota or its held-lock reserve), and
     /// with `alias` only that `[[evm_rpc]]` entry (a differential run's provider).
-    fn own_broker_config(&self, broker_config: &toml::Value, name: &str, alias: Option<&str>) -> Result<PathBuf> {
+    fn own_broker_config(
+        &self,
+        broker_config: &BrokerToml,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<PathBuf> {
         let dir = self.work.join(name);
-        std::fs::create_dir_all(dir.join("spool")).with_context(|| format!("creating {}", dir.display()))?;
-        let text = broker_config_for(broker_config, alias, &dir.join("spool"))?;
+        std::fs::create_dir_all(dir.join("spool"))
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let text = broker_config_for(
+            &broker_config.value,
+            &broker_config.dir,
+            alias,
+            &dir.join("spool"),
+        )?;
         let path = dir.join("broker.toml");
         write_private(&path, &text)?;
         Ok(path)
@@ -779,10 +790,39 @@ fn pick_providers(broker_config: &toml::Value, chain: Option<u64>, asked: Option
 }
 
 /// `broker_config` with a spool directory of its own and, given `alias`, only that `[[evm_rpc]]`
-/// entry.
-fn broker_config_for(broker_config: &toml::Value, alias: Option<&str>, spool: &Path) -> Result<String> {
+/// entry. The copy is written elsewhere, so every relative `key_file` (which the broker reads from
+/// the configuration's own directory) is made absolute against `dir`, the original's directory.
+fn broker_config_for(
+    broker_config: &toml::Value,
+    dir: &Path,
+    alias: Option<&str>,
+    spool: &Path,
+) -> Result<String> {
     let mut v = broker_config.clone();
     let t = v.as_table_mut().context("the broker configuration is not a table")?;
+    let absolute = |entry: &mut toml::Value| {
+        if let Some(k) = entry.get_mut("key_file") {
+            if let Some(p) = k.as_str().map(Path::new).filter(|p| p.is_relative()) {
+                *k = toml::Value::String(dir.join(p).display().to_string());
+            }
+        }
+    };
+    for table in ["evm_rpc", "blob_mirror"] {
+        for entry in t
+            .get_mut(table)
+            .and_then(|e| e.as_array_mut())
+            .into_iter()
+            .flatten()
+        {
+            absolute(entry);
+        }
+    }
+    if let Some(artifacts) = t.get_mut("artifacts") {
+        absolute(artifacts);
+        if let Some(mirror) = artifacts.get_mut("mirror") {
+            absolute(mirror);
+        }
+    }
     if let Some(alias) = alias {
         let kept: Vec<toml::Value> = t
             .get("evm_rpc")
@@ -809,10 +849,22 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
     f.write_all(text.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
+/// The broker configuration file, parsed, and the directory its relative `key_file`s are read from.
+struct BrokerToml {
+    value: toml::Value,
+    /// The file's directory, absolute.
+    dir: PathBuf,
+}
+
 /// The broker configuration file, parsed.
-fn read_broker_config(path: &Path) -> Result<toml::Value> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("{} is not a broker configuration", path.display()))
+fn read_broker_config(path: &Path) -> Result<BrokerToml> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value = toml::from_str(&text)
+        .with_context(|| format!("{} is not a broker configuration", path.display()))?;
+    let file = std::path::absolute(path).with_context(|| format!("{}", path.display()))?;
+    let dir = file.parent().unwrap_or(Path::new("/")).to_path_buf();
+    Ok(BrokerToml { value, dir })
 }
 
 /// This run's `maxGuestCycles` maximum and where it came from.
@@ -1615,7 +1667,7 @@ struct Adversary<'a> {
     client: Option<&'a ChainClient>,
     current_block: u64,
     /// The broker configuration, parsed: each provider run writes its own from it.
-    broker_toml: &'a toml::Value,
+    broker_toml: &'a BrokerToml,
 }
 
 /// A token that fires when `main` does or at `deadline`, whichever is first; the task watching for
@@ -1846,7 +1898,7 @@ impl Adversary<'_> {
                 _ => None,
             })
         });
-        let providers = match pick_providers(self.broker_toml, chain, adv.providers.as_deref()) {
+        let providers = match pick_providers(&self.broker_toml.value, chain, adv.providers.as_deref()) {
             Ok(v) => v,
             Err(e) => {
                 report.note = Some(format!("not run: {e}"));
@@ -2214,12 +2266,28 @@ mod tests {
              [[evm_rpc]]\nalias = \"b\"\nurl = \"https://b.example\"\n",
         )
         .unwrap();
-        let main: toml::Value =
-            toml::from_str(&broker_config_for(&cfg, None, Path::new("/work/main/spool")).unwrap()).unwrap();
+        let main: toml::Value = toml::from_str(
+            &broker_config_for(
+                &cfg,
+                Path::new("/etc/b"),
+                None,
+                Path::new("/work/main/spool"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(main["spool_dir"].as_str(), Some("/work/main/spool"));
         assert_eq!(main["evm_rpc"].as_array().unwrap().len(), 2);
-        let one: toml::Value =
-            toml::from_str(&broker_config_for(&cfg, Some("b"), Path::new("/work/p1/spool")).unwrap()).unwrap();
+        let one: toml::Value = toml::from_str(
+            &broker_config_for(
+                &cfg,
+                Path::new("/etc/b"),
+                Some("b"),
+                Path::new("/work/p1/spool"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(one["spool_dir"].as_str(), Some("/work/p1/spool"));
         assert_eq!(one["evm_rpc"].as_array().unwrap().len(), 1);
         assert_eq!(one["evm_rpc"][0]["alias"].as_str(), Some("b"));
@@ -2230,6 +2298,55 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(write_private(&path, "y").is_err());
+    }
+
+    /// A broker configuration whose `key_file`s are relative to its own directory (as the broker
+    /// reads them) loads where it is, and still does once copied into a run's work directory: every
+    /// relative `key_file` of the copy is the original's, made absolute.
+    #[test]
+    fn a_relative_key_file_survives_the_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        use zkminer_witness_broker::config::BrokerConfig;
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for (name, key) in [("base.key", "secret-key"), ("art.key", "art-key")] {
+            let path = a.path().join(name);
+            std::fs::write(&path, format!("{key}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let text = format!(
+            "chain_rpc_host = \"rpc.example.org\"\nspool_dir = \"{}\"\n[[evm_rpc]]\nalias = \"base-own\"\n\
+             url = \"https://base.example.net/v2/{{key}}\"\nchain_id = 8453\narchive = true\nmax_proof_age = 100000\n\
+             method_sets = [\"state-read\"]\nkey_file = \"base.key\"\n[[evm_rpc]]\nalias = \"absolute\"\n\
+             url = \"https://abs.example.net/v2/{{key}}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\n\
+             key_file = \"{}\"\n[artifacts]\nalias = \"hemi\"\nurl = \"https://hemi.example.net/\"\nchain_id = 743111\n\
+             key_file = \"./art.key\"\nkey_header = \"x-api-key\"\n",
+            a.path().join("spool").display(),
+            a.path().join("base.key").display(),
+        );
+        let original = a.path().join("broker.toml");
+        std::fs::write(&original, &text).unwrap();
+        let mode = zkminer_netguard::NetMode::Public;
+        BrokerConfig::load(&original, mode).expect("the operator's own file loads");
+        let parsed = read_broker_config(&original).unwrap();
+        assert_eq!(parsed.dir, a.path());
+        let copied = b.path().join("broker.toml");
+        write_private(
+            &copied,
+            &broker_config_for(&parsed.value, &parsed.dir, None, &b.path().join("spool")).unwrap(),
+        )
+        .unwrap();
+        let again = BrokerConfig::load(&copied, mode).map_err(|e| e.to_string());
+        assert!(again.is_ok(), "the copy loads too: {again:?}");
+        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&copied).unwrap()).unwrap();
+        let base = a.path().join("base.key").display().to_string();
+        assert_eq!(v["evm_rpc"][0]["key_file"].as_str(), Some(base.as_str()));
+        assert_eq!(
+            v["evm_rpc"][1]["key_file"].as_str(),
+            Some(base.as_str()),
+            "an absolute one is kept"
+        );
+        let art = a.path().join("./art.key").display().to_string();
+        assert_eq!(v["artifacts"]["key_file"].as_str(), Some(art.as_str()));
     }
 
     #[test]
