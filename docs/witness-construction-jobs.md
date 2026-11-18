@@ -906,15 +906,17 @@ Each property has a mechanism; none is assumed.
       `sys/vm/mmap_min_addr`, `sys/vm/overcommit_memory`; the SP1 worker and server all of `/proc`,
       since the executor's memory monitor reads its runner child's entries), the worker's own
       directory and SDK files, and the retention store;
-    - write: a private `TMPDIR`, the segment directories, the GPU kernel caches, and, for an SP1
-      server, the user's Groth16 queue (`~/.zkminer/locks`, never in `/dev/shm`);
+    - write: a private `TMPDIR`, the segment directories (a witness proof's slot directory; for the
+      risc0 worker's other proofs, its own `~/.zkminer/risc0-segments/<pid>`), the GPU kernel caches,
+      and, for an SP1 server, the user's Groth16 queue (`~/.zkminer/locks`, never in `/dev/shm`);
     - execute: only the loader and what the worker starts;
     - devices: the GPU nodes;
     - scoped signals (`kill`, `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
       `pidfd_send_signal` alike) and abstract Unix sockets.
 
-    `~/.zkminer`, `~/.ssh`, `~/.config` and the rest of the home directory are out of reach, and so
-    are the miner's and other workers' `/proc` entries (for SP1, their memory and environment).
+    `~/.zkminer` (but a risc0 worker's own segment directory there), `~/.ssh`, `~/.config` and the
+    rest of the home directory are out of reach, and so are the miner's and other workers' `/proc`
+    entries (for SP1, their memory and environment).
     Links, renames, removals, new directories
     and symlinks, and truncation outside the writable paths are refused (the probes check each).
   - `sp1-gpu-server` runs every SP1 proof's guest, so it is confined from its first instruction. It
