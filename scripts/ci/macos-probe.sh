@@ -21,7 +21,7 @@
 # Exit: 0 when nothing points at a kit defect (smoke exit 0, 3 no Metal device, 4 paravirtual,
 # 5 the worker refuses this runner, or the proof skipped for disk); the smoke script's code for a
 # real failure (1 proof failed, 6 a binary did not launch, 7 no Groth16 component, 8 quarantined,
-# 2 usage). Writes a summary to GITHUB_STEP_SUMMARY when set.
+# 9 another build installed, 2 usage). Writes a summary to GITHUB_STEP_SUMMARY when set.
 set -uo pipefail
 tarball=${1:?usage: $0 <kit tarball> <work dir>}
 work=${2:?usage: $0 <kit tarball> <work dir>}
@@ -42,6 +42,7 @@ meaning() {
     6) echo "a binary did not launch on this macOS" ;;
     7) echo "the risc0-groth16 component is missing" ;;
     8) echo "a quarantined binary was chosen (nothing launched)" ;;
+    9) echo "the installed copies are another build than this kit's (nothing launched)" ;;
     *) echo "unexpected exit $1" ;;
   esac
 }
