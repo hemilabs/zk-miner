@@ -1032,8 +1032,10 @@ only *for a configuration*: chain id, archive, served proof age, method sets.
   provider account or key as `chain.rpc_url`, never the same provider from the same egress IP, and
   never the same node process, database or host. zkminer refuses an endpoint whose host equals
   `chain.rpc_url`'s: the broker file's `chain_rpc_host` names that host, the broker refuses every
-  endpoint on it, and the miner refuses to start a broker whose file names another host (developer
-  mode only warns: a local test network runs its chain and endpoints on one host). Different
+  endpoint on it, and the miner refuses to start a broker whose file names another host, which
+  disables witness serving (`PAGE: WITNESS-DISABLED`; developer mode only warns: a local test network
+  runs its chain and endpoints on one host). Both checks compare host names, not the addresses they
+  resolve to: an endpoint under another name for the same node is not caught. Different
   providers may share the host's IP. If the miner's own Hemi node is its
   only Hemi node, a Hemi-chain class is not provisioned.
 - **Operator nodes reachable by the broker** must have globally routable addresses (a node on
