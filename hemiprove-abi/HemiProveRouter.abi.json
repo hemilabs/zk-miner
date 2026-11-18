@@ -680,25 +680,6 @@
   },
   {
     "type": "function",
-    "name": "jobLaxCallbackMode",
-    "inputs": [
-      {
-        "name": "",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ],
-    "outputs": [
-      {
-        "name": "",
-        "type": "bool",
-        "internalType": "bool"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "jobProofSystems",
     "inputs": [
       {
@@ -7871,19 +7852,6 @@
   },
   {
     "type": "function",
-    "name": "markFormerBurnDestination",
-    "inputs": [
-      {
-        "name": "addr",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "pendingBatchCycleCommittee",
     "inputs": [],
     "outputs": [
@@ -8462,6 +8430,22 @@
         "name": "sampleCount",
         "type": "uint24",
         "internalType": "uint24"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ZeroEwmaKey",
+    "inputs": [
+      {
+        "name": "proofSystemId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
       }
     ]
   }

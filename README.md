@@ -43,17 +43,24 @@ same files. risc0 3.1 refuses the 3.0 component (`v0.1.0-risc0-groth16`), which 
 
 ### risc0 3.1 and the on-chain verifier
 
-zk-miner builds against risc0 **3.1** (the GHSA-g6qg-9j8p-7j87 circuit and verifier fixes). Its
-Groth16 seals carry the selector `0xe71e6620`, and only a risc0-ethereum 3.1
-`RiscZeroGroth16Verifier` accepts them; 3.0 receipts (selector `0x73c457ba`) are not compatible in
-either direction. As of 2026-11-17 no 3.1 verifier is deployed on Hemi testnet (743111), so:
+zk-miner builds against risc0 **3.1** (risc0-zkvm 3.1.0, risc0-groth16 3.0.6,
+risc0-circuit-recursion 4.1.0; the GHSA-g6qg-9j8p-7j87 circuit and verifier fixes). Its Groth16
+seals carry the selector `0xe71e6620` and go on chain as risc0-ethereum-contracts 3.1.0's
+`encode_seal` makes them: 260 bytes, the selector then the 256-byte proof. The HemiProve deployment
+of 2026-11-16 on Hemi testnet (743111) verifies exactly these: its `risczero.groth16.v1` adapter wraps
+a risc0-ethereum v3.1.0 `RiscZeroGroth16Verifier` (`SELECTOR()` `0xe71e6620`). risc0 3.0 receipts
+(selector `0x73c457ba`) are refused there, and zkminer refuses to claim risc0 jobs with a 3.0
+selector (`prover.risc0_groth16_selector` left over in an old config: remove it).
 
-- the miner logs `PAGE: risczero.groth16.v1 cannot be served yet — ...` at startup, naming what is
-  missing, and claims no risc0 job (locks it already holds are still driven; SP1 is unaffected);
-- the audited pin for the 3.1 verifier, `RISC0_V3_1_GROTH16_VERIFIER` in
-  `crates/zkminer-chain/src/deployment.rs`, is empty (`None`). Once the verifier is deployed and
-  routed by the `risczero.groth16.v1` adapter, fill it with the verifier's runtime keccak from the
-  audited deployment's `VerifierPins.sol` and rebuild. Never fill it from anything else.
+On macOS the Groth16 wrap runs natively on the Metal GPU (no Docker, no x86 host). risc0 falls back
+to its Docker prover only if Metal is unavailable or one of `RISC0_METAL=0`,
+`RISC0_METAL_SKIP=groth16` or `RISC0_GROTH16_METAL_PROVER=docker` is set: do not set them.
+
+Before claiming any risc0 job, `zkminer run` checks the chain end to end: the adapter and verifier
+code against their pins, `SELECTOR()` against the build's selector, and an `eth_call` of
+`Registry.verifyProof` with a known-good risc0 3.1 receipt from the Metal worker
+(`zkminer_chain::deployment::risc0_preflight`; `ZKMINER_SKIP_RISC0_RECEIPT_PREFLIGHT=1` skips that
+call).
 
 Workers and the CLI must come from the same tree: the CLI refuses a worker with another protocol
 version or another risc0 (`risc0-zkvm 3.0.x`) at the handshake.
@@ -389,12 +396,12 @@ Copy or write `~/.zkminer/config.toml`:
 rpc_url  = "https://testnet.rpc.hemi.network/rpc"
 chain_id = 743111                   # Hemi testnet (43111 is mainnet)
 
-[contracts]
-hemi_prove          = "0x..."       # router (diamond proxy)
-hemi_prove_staking  = "0x..."
-hemi_prove_registry = "0x..."
-hemi_token          = "0x..."
-program_registry    = "0x..."       # where programs' ELF sources are read; defaults to the known deployment's
+[contracts]                         # Hemi testnet, HemiProve deployment of 2026-11-16
+hemi_prove          = "0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58"   # router (diamond proxy)
+hemi_prove_staking  = "0xF3498fCF729Eb7d4E0323880e4E6aD1EB6da2e2D"
+hemi_prove_registry = "0xA80D9172931521f9bce0491C6374A5f28e79f10F"
+hemi_token          = "0x46955EdCF61b23a8c0b0d71428A9F1C07Bbf36cc"   # tHEMI (owner-minted)
+program_registry    = "0xeBB9Fb9B82f80518f74725eFc2f3FD24ded7695D"   # where programs' ELF sources are read
 
 [wallet]
 key_source  = "env"                 # reads $ZKMINER_PRIVATE_KEY
@@ -405,12 +412,22 @@ max_concurrent_proofs = 0           # 0 = one proof per detected GPU
 skip_benchmark_gate   = true
 ```
 
-`zkminer init` will scaffold a config, but **verify the contract addresses it writes
-against the deployment you intend to use** before running against a live market. On a
-chain zkminer knows (743111), `run` checks the addresses, their wiring and their code
-against the live deployment; a mismatch starts the miner without claiming anything (it
-still drives locks it already holds) and logs a `PAGE:` line naming the difference, so
-fix `[contracts]` and restart.
+`zkminer init --network testnet` writes these addresses. On a chain zkminer knows (743111),
+`run` checks the addresses, their wiring and their code against the live deployment; a mismatch
+starts the miner without claiming anything (it still drives locks it already holds) and logs a
+`PAGE:` line naming the difference, so fix `[contracts]` and restart. Log scans start at block
+7226094, the deployment's first block (`chain.scan_from_block`).
+
+Every older 743111 stack is abandoned. A config that still names the 2026-10-29 stack (router
+`0xE1a492Dc6D57fCC2B6deb5B64087E69666cA470e`) or the old free-mint tHEMI
+`0x60525eEBB1BD630Fb093d433675E28221DE1E698` is refused as abandoned, even with
+`ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1`: rewrite it with `zkminer init --network testnet --force`.
+
+The code pins (`crates/zkminer-chain/src/deployment.rs`) were computed from the live
+deployment's code on 2026-11-17, because the contracts repo's pin files could not be read when
+they were added; `ZKMINER_CONTRACTS_REPO=<checkout at 8e1808b> cargo test -p zkminer-chain --lib
+the_pins_match_the_contracts_repo` checks them against `script/lib/ReleaseCorePins.sol` and
+`VerifierPins.sol`.
 
 ## Run
 
@@ -733,13 +750,17 @@ cargo build -p zkminer-prover --features testing --bin mock-worker
 cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-threads=1
 ```
 
+On a Mac, build the Metal worker (`--features metal --bin zkminer-prove-risc0-metal`) and point
+`ZKMINER_LOCALNET_RISC0_WORKER` at `target/release/zkminer-prove-risc0-metal`. Foundry 1.5.1
+(`anvil`) is the version the HemiProve reference daemons support.
+
 - **`watch_only_reports_every_job`** (CPU only) runs `zkminer run --watch-only`, as the staked
   prover and then as an unstaked address, with an unknown `RISC0_EXECUTOR` that the worker must
   ignore. It checks every job's verdict, that exactly the claimable jobs would be claimed, that
   every measured cycle count is a power of two, and that nothing was sent.
-- **`fulfils_with_a_replayed_receipt`** (CPU only) mines for real on the contract suite's RISC
-  Zero receipt fixture, which the deployed verifier accepts: the mock worker replays the receipt
-  instead of proving. It requires exactly the claimable jobs to be claimed and then fulfilled in a
+- **`fulfils_with_a_replayed_receipt`** (CPU only) mines for real on a risc0 3.1 Groth16 receipt
+  that the Metal worker made (the fibonacci guest), which the deployed v3.1.0 verifier accepts: the
+  mock worker replays the receipt instead of proving. It requires exactly the claimable jobs to be claimed and then fulfilled in a
   later transaction, the exclusive and over-collateralised jobs never even dispatched, nothing
   released, and no collateral left locked.
 - **`holds_its_lock_through_a_pause`**: a lock held while the router pauses is kept, then
@@ -747,8 +768,11 @@ cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-thread
 - **`holds_off_while_the_router_is_paused`**, **`refuses_to_claim_while_its_adapter_is_disabled`**,
   **`refuses_to_claim_on_a_skewed_clock`**: the miner's own gates hold every claim (none is even
   dispatched).
+- **`refuses_to_claim_without_a_matching_verifier`**: a miner configured with the risc0 3.0
+  selector refuses every risc0 claim.
 - **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) is the replay test with
-  real risc0 proofs of the fibonacci guest.
+  real risc0 proofs of the fibonacci guest; it also checks each `JobFulfilled` payout
+  (settled price + speed bonus - 1% protocol fee).
 
 The tests need Foundry's `anvil` and the testnet RPC, which serves archive state; anvil caches
 what it fetches. Settings (fork URL and block, worker paths, echoing the log) are in the file's
@@ -760,7 +784,9 @@ header. Move its `FORK_BLOCK` forward whenever `zkminer-chain/src/deployment.rs`
 signing key from the environment (`SUBMITTER_KEY`, `REQUESTER_KEY`) and refuse to run
 without it — never commit a funded key. The forge-based submitters additionally need
 `CONTRACTS_DIR` pointing at a HemiProve Foundry checkout; `testnet_submitter_cast.sh`
-needs only `cast`.
+needs only `cast`. The two `testnet_submitter*.sh` scripts still target an abandoned stack and the
+old descriptor and proof-system id: they are kept for reference and do not work against the
+2026-11-16 deployment.
 
 ## License
 

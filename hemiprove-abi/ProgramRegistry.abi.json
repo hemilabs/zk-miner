@@ -208,6 +208,19 @@
   },
   {
     "type": "function",
+    "name": "cancelRegistrantTransfer",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "claimExpiredBonds",
     "inputs": [
       {
@@ -751,6 +764,25 @@
   },
   {
     "type": "function",
+    "name": "getPendingRegistrantExpiry",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "getProgram",
     "inputs": [
       {
@@ -1109,13 +1141,6 @@
         "internalType": "uint256"
       }
     ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "initializeV2",
-    "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
   },
@@ -1956,6 +1981,25 @@
   },
   {
     "type": "event",
+    "name": "CommitmentConsumed",
+    "inputs": [
+      {
+        "name": "commitment",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "programKey",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "CommitmentForfeited",
     "inputs": [
       {
@@ -2247,7 +2291,7 @@
   },
   {
     "type": "event",
-    "name": "ProgramAdminTransferred_v2",
+    "name": "ProgramAdminTransferred",
     "inputs": [
       {
         "name": "programKey",
@@ -2341,6 +2385,19 @@
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ProgramKeyReservationCancelled",
+    "inputs": [
+      {
+        "name": "programKey",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
       }
     ],
     "anonymous": false
@@ -2771,11 +2828,6 @@
   },
   {
     "type": "error",
-    "name": "BondOverflow",
-    "inputs": []
-  },
-  {
-    "type": "error",
     "name": "CancelNotAuthorized",
     "inputs": [
       {
@@ -2960,8 +3012,8 @@
     "inputs": [
       {
         "name": "length",
-        "type": "uint8",
-        "internalType": "uint8"
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ]
   },
@@ -3009,6 +3061,22 @@
     "inputs": [
       {
         "name": "encoding",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidFieldSize",
+    "inputs": [
+      {
+        "name": "fieldType",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "byteSize",
         "type": "uint8",
         "internalType": "uint8"
       }
@@ -3120,11 +3188,6 @@
         "internalType": "address"
       }
     ]
-  },
-  {
-    "type": "error",
-    "name": "NotInitialized",
-    "inputs": []
   },
   {
     "type": "error",
@@ -3273,6 +3336,17 @@
   },
   {
     "type": "error",
+    "name": "ProgramNotDeprecated",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "ProgramNotRegistered",
     "inputs": [
       {
@@ -3311,8 +3385,35 @@
   },
   {
     "type": "error",
+    "name": "RegistrantTransferExpired",
+    "inputs": [
+      {
+        "name": "programId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "expiredAt",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "RenounceDisabled",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ReservedFlagBits",
+    "inputs": [
+      {
+        "name": "flags",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ]
   },
   {
     "type": "error",
@@ -3368,6 +3469,22 @@
       },
       {
         "name": "max",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "TrailingSchemaBytes",
+    "inputs": [
+      {
+        "name": "schemaEnd",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "length",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -3473,5 +3590,16 @@
     "type": "error",
     "name": "ZeroId",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ZeroRefProgramId",
+    "inputs": [
+      {
+        "name": "fieldIndex",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ]
   }
 ]
