@@ -793,15 +793,20 @@ public. The rules it follows are the format's own (§13.5 of the design):
   transaction estimates at most 19,500 DA bytes. A chunk unmined for 3 blocks with the gate open is
   replaced at its nonce with both fee fields raised, at most 16 times, the tip never past 64 times
   the measured tip floor and the max fee never past 8 times the starting base fee plus that; a
-  refused replacement leaves the pooled fees as they were; a failed creation is redeployed at a new
-  nonce;
+  refused replacement leaves the pooled fees as they were. Past the replacements or the caps it
+  waits while the pool holds the chunk; one the pool dropped is sent again as it was, at most 3
+  times, and the publish stops with an error if the pool refuses it or keeps dropping it. A failed
+  creation is redeployed at a new nonce;
 - it waits until every deploying block is at or below the safe head with its hash unchanged, reads
   the artifact back there with the miner's manifest, chunk and assembly checks, and only then
   prints the locator, sha256, length, addresses, total cost, and the `builderId` (or, for an ELF,
   the `addStorageURI` arguments). Submit the job only after that. `--json` prints it as JSON;
-- `--progress FILE` records each mined deployment; run the same command again after a failure
-  and it reuses the recorded chunks whose code is on chain, sending only the rest. Without it, a
-  run that stopped part-way is run again from the start: every chunk is sent (and paid) again.
+- `--progress FILE` records each mined deployment, and each transaction before it is sent (synced
+  to disk); run the same command again after a failure and it reuses the recorded chunks whose code
+  is on chain, and the transaction a killed run left in flight when it created the next one, sending
+  only the rest (while that transaction is still pending, the run refuses to start: let it settle).
+  Without it, a run that stopped part-way is run again from the start: every chunk is sent (and
+  paid) again.
 
 The router is the known deployment's on the chain, else `--router`. A configuration's `[dev]
 da_backlog_bytes` stands in for the backlog reading only in developer mode, and on Hemi testnet's

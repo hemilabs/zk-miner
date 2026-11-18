@@ -1374,7 +1374,9 @@ transactions.
   refused: miners count chunk reads from 16,384-byte chunks, `⌈max_builder_bytes / 16,384⌉ + 1` (257
   for 4 MiB), and a manifest over it is `NotAdmitted`, deferred for ever. At most 16 replacements
   per nonce, the max fee never above 8× the starting base fee plus the tip cap (above that the
-  publisher waits). A refused replacement leaves the pooled fees as they were.
+  publisher waits). A refused replacement leaves the pooled fees as they were. Waiting at the caps
+  lasts while the pool holds the transaction: one the pool dropped (nothing pending at its nonce) is
+  sent again as it was, at most 3 times; refused, or dropped again, the publish fails with an error.
 - **Deploy and verify:** chunks first, the manifest last; addresses from receipts, never precomputed;
   every receipt's status checked (an out-of-gas creation spends the nonce and leaves the address
   empty: redeploy at a new nonce); with a CREATE2 factory, identical code already present is success.
@@ -1391,9 +1393,13 @@ transactions.
   `chunk_body`, `Assembler`), run inside the publisher (the broker needs the miner's sandbox and the
   operator's endpoint). The assembled bytes must equal the file. For an ELF it prints
   `addStorageURI(<programId>, 3, locator, keccak256(elf))`. With `--progress FILE` every mined
-  deployment is recorded. A later run of the same artifact to the same chain reuses recorded chunks
-  from the start, while their receipt and code at that block match, plus the manifest when every
-  chunk was reused, and sends only the rest. Without it, a re-run sends every chunk again.
+  deployment is recorded, and every transaction before it is sent (its nonce, the address its
+  creation makes, each hash at that nonce), each record synced to disk. A later run of the same
+  artifact to the same chain reuses recorded chunks from the start, while their receipt and code at
+  that block match, then the transaction a killed run left in flight when one of its hashes created
+  the next deployment as recorded, plus the manifest when every chunk was reused, and sends only the
+  rest; while that transaction is still pending it refuses to start. Without it, a re-run sends every
+  chunk again.
 
 The full cost arithmetic is in Appendix B: about 231M gas per MiB; at a tip near the inclusion floor
 the L1 data fee dominates — about 0.0009 ETH per MiB at a 0.062 gwei L1 base fee, about 0.4 ETH at

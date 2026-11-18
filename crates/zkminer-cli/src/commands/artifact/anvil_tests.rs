@@ -466,3 +466,83 @@ async fn a_second_rpc_must_show_each_deployment_before_the_next_send() {
     assert!(e.contains("does not show"), "{e}");
     assert_eq!(a.nonce(me).await, start + 1, "the chunk, and nothing after it");
 }
+
+/// Past the replacements (here at once: the run's caps are its first send's), a transaction the
+/// pool dropped is sent again as it was, rather than waited for forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transaction_the_pool_dropped_at_the_caps_is_sent_again() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, me) = keystore(dir.path());
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, builder_wasm(10_000)).unwrap();
+    let start = a.nonce(me).await;
+    let faults = Faults { drop_first_send: true, no_fee_room: true, ..Default::default() };
+    let p = bounded(publish_with(&dev_config(), options(file, &a.url, ks, router), faults)).await.unwrap();
+    assert_eq!(p.chunks.len(), 1);
+    assert_eq!((p.chunks[0].nonce, p.chunks[0].replacements), (start, 0), "sent again as it was");
+    assert_eq!(a.nonce(me).await, start + 2);
+}
+
+/// One the pool keeps dropping fails the publish with an error that says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transaction_the_pool_keeps_dropping_fails_the_publish() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, me) = keystore(dir.path());
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, builder_wasm(10_000)).unwrap();
+    let start = a.nonce(me).await;
+    let faults = Faults { drop_first_send: true, no_fee_room: true, drop_resends: MAX_RESENDS, ..Default::default() };
+    let e = bounded(publish_with(&dev_config(), options(file, &a.url, ks, router), faults)).await.unwrap_err();
+    assert!(format!("{e:#}").contains("the pool dropped the transaction at nonce"), "{e:#}");
+    assert_eq!(a.nonce(me).await, start, "nothing mined");
+}
+
+/// A run killed with a chunk in flight records it before it goes: the next run finds it mined and
+/// reuses it, instead of deploying the chunk again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_killed_with_a_send_in_flight_reuses_what_it_sent() {
+    if !anvil_on_path() {
+        return;
+    }
+    let (a, router, _) = chain().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (ks, me) = keystore(dir.path());
+    let file = dir.path().join("b.wasm");
+    std::fs::write(&file, builder_wasm(10_000)).unwrap();
+    let progress = dir.path().join("progress.json");
+    let with_progress = || {
+        let mut o = options(file.clone(), &a.url, ks.clone(), router);
+        o.progress = Some(progress.clone());
+        o
+    };
+    let start = a.nonce(me).await;
+    let e = bounded(publish_with(&dev_config(), with_progress(), Faults { stop_after_send: true, ..Default::default() }))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("stopped by the test after sending"), "{e:#}");
+    let record: Value = serde_json::from_slice(&std::fs::read(&progress).unwrap()).unwrap();
+    assert_eq!(record["chunks"].as_array().unwrap().len(), 0, "{record:#}");
+    assert_eq!(record["pending"]["nonce"], json!(start), "{record:#}");
+    // Mined meanwhile (anvil mines a block a second).
+    for _ in 0..30 {
+        if a.nonce(me).await > start {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(a.nonce(me).await, start + 1);
+    let p = bounded(publish_with(&dev_config(), with_progress(), Faults::default())).await.unwrap();
+    assert!(p.chunks[0].reused && !p.manifest.reused, "{p:#?}");
+    assert_eq!(p.chunks[0].nonce, start);
+    assert_eq!(a.nonce(me).await, start + 2, "the manifest alone was sent");
+    let record: Value = serde_json::from_slice(&std::fs::read(&progress).unwrap()).unwrap();
+    assert!(record.get("pending").is_none() && record["manifest"].is_object(), "{record:#}");
+}
