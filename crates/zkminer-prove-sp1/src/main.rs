@@ -760,11 +760,12 @@ fn canary_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P) {
 /// on the messages of hemilabs/sp1's `sp1-core-executor-runner` (`native.rs`), which no guest
 /// writes; a match only makes the worker run its canary again ([`environment_fault_or_decline`]).
 fn is_executor_environment_fault(text: &str) -> bool {
-    const SETUP: [&str; 4] = [
+    const SETUP: [&str; 5] = [
         "create shm file for",
         "failed to create the child's stdin",
         "failed to spawn child process",
         "the executor runner exited before reading its input",
+        SIZING_RUNTIME_FAILED,
     ];
     SETUP.iter().any(|m| text.contains(m))
 }
@@ -2321,11 +2322,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             ErrorKind::Internal
                         } else if msg.contains("does not match job programId")
                             || msg.contains("could not parse SP1 vkey hash")
+                            || msg.starts_with(NOT_SHA256_COMMITTED)
                         {
-                            // The served ELF's verifying key cannot match this job's programId. No job
-                            // for this program can ever be proved, so report it as ProgramMismatch: the
-                            // host negative-caches the program and stops claiming its jobs, instead of
-                            // eating a release penalty per submitted job.
+                            // The served ELF's verifying key cannot match this job's programId, or its
+                            // proof commits its public values under a digest the chain does not
+                            // accept. No job for this program can be fulfilled, so report it as
+                            // ProgramMismatch: the host negative-caches the program and stops claiming
+                            // its jobs, instead of re-proving it and eating a release penalty per job.
                             ErrorKind::ProgramMismatch
                         } else if is_gpu_oom(&msg) {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
@@ -2869,7 +2872,7 @@ fn run_execute_sp1(
     elf: &[u8],
     input_data: &[u8],
 ) -> anyhow::Result<(u64, Vec<u8>, f64, u64)> {
-    use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+    use sp1_sdk::blocking::{Prover, SP1Stdin};
 
     let started = Instant::now();
 
@@ -2877,20 +2880,26 @@ fn run_execute_sp1(
     // One input element, consumed by a single `io::read_vec` in the guest — matching `run_proof`.
     stdin.write_slice(input_data);
 
-    let mut req = cpu.execute(Elf::from(elf), stdin);
+    // What the SDK's `execute(..).cycle_limit(..).run()` does, through the node it calls: that call
+    // drops the digest the guest committed its public values under, which is checked below.
+    let mut context = sp1_sdk::SP1ContextBuilder::new();
     if let Some(limit) = sp1_execute_cycle_limit() {
-        req = req.cycle_limit(limit);
+        context.max_cycles(limit);
     }
+    let context = context.build();
+    let runtime = sizing_runtime()?;
     // Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
     // the pinned SP1 build NEVER sets the executor's final VM state — `GasExecutingWorker::call`
     // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
     // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
     // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
-    let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
-    let (public_values, report) =
+    let (run_result, peak_host_bytes) =
+        with_peak_rss_sampling(|| runtime.block_on(cpu.inner().execute(elf, stdin, context)));
+    let (public_values, committed_digest, report) =
         run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
     refuse_unprovable_exit(report.exit_code)?;
+    refuse_non_sha256_commitment(&public_values, &committed_digest)?;
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
@@ -2917,6 +2926,58 @@ fn refuse_unprovable_exit(exit_code: u64) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The on-chain SP1 verifier recomputes `sha256(publicValues)` and checks the proof against that.
+/// A guest may instead commit its public values under Blake3, which the SDK's `verify` also accepts:
+/// such a job would be measured, claimed, proven and verified here, and its fulfil would revert.
+/// The digest a guest commits is fixed by its execution, so it is refused at measurement: here,
+/// `committed_digest` is what the measured execution committed.
+fn refuse_non_sha256_commitment(
+    public_values: &sp1_sdk::SP1PublicValues,
+    committed_digest: &[u8; 32],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        public_values.hash() == committed_digest,
+        "the guest commits its public values under a digest other than SHA-256, which the on-chain \
+         verifier does not accept"
+    );
+    Ok(())
+}
+
+/// After a proof: whether the digest its Groth16 public inputs commit to (`public_inputs[1]`, a
+/// decimal) is the masked SHA-256 of its public values (`hash_bn254`), the one value the on-chain
+/// verifier accepts. The measurement refuses another digest before any claim
+/// ([`refuse_non_sha256_commitment`]); this holds a job that reached a proof without one.
+fn proof_commits_sha256(proof: &sp1_sdk::SP1ProofWithPublicValues) -> bool {
+    let sp1_sdk::SP1Proof::Groth16(groth16) = &proof.proof else {
+        return false;
+    };
+    let sha256 = proof.public_values.hash_bn254();
+    groth16
+        .public_inputs
+        .get(1)
+        .and_then(|committed| committed.parse().ok())
+        == Some(sha256)
+}
+
+/// The phrase of `run_proof`'s refusal of a proof whose public values are not committed under
+/// SHA-256; the prove path reports it as [`ErrorKind::ProgramMismatch`].
+const NOT_SHA256_COMMITTED: &str = "SP1 proof's public values are not committed under SHA-256";
+
+/// The runtime the measurement's execution runs on (`run_execute_sp1`), made on first use: the SDK's
+/// blocking calls run on a runtime of their own, which is not reachable from here.
+fn sizing_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{SIZING_RUNTIME_FAILED}: {e}"))
+}
+
+/// The start of `sizing_runtime`'s error: the worker's fault, not the job's
+/// (`is_executor_environment_fault`).
+const SIZING_RUNTIME_FAILED: &str = "could not start the runtime SP1 executions run on";
 
 /// True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
 /// (the guest is too heavy to size). The pinned build signals the cap from the gas accumulator as the
@@ -3048,6 +3109,11 @@ fn run_proof(
         return Err(anyhow::anyhow!(
             "Proof verification FAILED — SP1 proof is invalid: {e}"
         ));
+    }
+    // `verify` also accepts public values committed under Blake3, which the on-chain verifier does
+    // not: such a proof would only revert at fulfil (`proof_commits_sha256`).
+    if !proof_commits_sha256(&proof) {
+        anyhow::bail!("{NOT_SHA256_COMMITTED}: the on-chain verifier would reject it");
     }
 
     let journal = proof.public_values.to_vec();
@@ -4518,6 +4584,77 @@ mod pk_cache_tests {
         let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(cpu, elf, &input)
             .expect("executing a valid guest must succeed and yield a cycle count");
         assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
+    }
+
+    /// The measurement keeps the digest the guest committed, and a guest that commits its public
+    /// values under SHA-256 (as every guest built with the default `sp1-zkvm` does) passes.
+    #[test]
+    fn a_sha256_committing_guest_is_measured() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        use sp1_sdk::blocking::{Prover, SP1Stdin};
+        let cpu = test_cpu_prover();
+        let mut stdin = SP1Stdin::new();
+        stdin.write_slice(&1000u32.to_le_bytes());
+        let context = sp1_sdk::SP1ContextBuilder::new().build();
+        let (public_values, digest, _) = super::sizing_runtime()
+            .unwrap()
+            .block_on(
+                cpu.inner()
+                    .execute(super::FIBONACCI_SP1_GUEST_ELF, stdin, context),
+            )
+            .unwrap();
+        assert!(super::refuse_non_sha256_commitment(&public_values, &digest).is_ok());
+        // And the measurement itself takes it.
+        super::run_execute_sp1(cpu, super::FIBONACCI_SP1_GUEST_ELF, &1000u32.to_le_bytes())
+            .unwrap();
+    }
+
+    /// A Blake3 commitment (what a guest built with `sp1-zkvm`'s `blake3` feature commits) is
+    /// refused at measurement, and a proof carrying one is refused before its fulfil.
+    #[test]
+    fn a_blake3_commitment_is_refused() {
+        let public_values = sp1_sdk::SP1PublicValues::from(b"some journal");
+        let blake3: [u8; 32] = public_values.blake3_hash().try_into().unwrap();
+        let sha256: [u8; 32] = public_values.hash().try_into().unwrap();
+        assert!(super::refuse_non_sha256_commitment(&public_values, &blake3).is_err());
+        assert!(super::refuse_non_sha256_commitment(&public_values, &sha256).is_ok());
+
+        let groth16 = |committed: String| sp1_sdk::SP1ProofWithPublicValues {
+            proof: sp1_sdk::SP1Proof::Groth16(groth16_with_digest(committed)),
+            public_values: public_values.clone(),
+            sp1_version: String::new(),
+            tee_proof: None,
+        };
+        let sha = public_values.hash_bn254().to_string();
+        let blake = public_values
+            .hash_bn254_with_fn(sp1_primitives::io::blake3_hash)
+            .to_string();
+        assert!(super::proof_commits_sha256(&groth16(sha.clone())));
+        // The same number, written another way, is the same digest.
+        assert!(super::proof_commits_sha256(&groth16(format!("00{sha}"))));
+        assert!(!super::proof_commits_sha256(&groth16(blake)));
+        assert!(!super::proof_commits_sha256(&groth16(
+            "not a number".into()
+        )));
+    }
+
+    /// A Groth16 proof whose public inputs commit `digest` as their second element.
+    fn groth16_with_digest(digest: String) -> sp1_prover::Groth16Bn254Proof {
+        sp1_prover::Groth16Bn254Proof {
+            public_inputs: [
+                String::new(),
+                digest,
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            encoded_proof: String::new(),
+            raw_proof: String::new(),
+            groth16_vkey_hash: [0; 32],
+        }
     }
 
     /// A guest that halts with a non-zero exit code is refused at measurement, before any claim: no
