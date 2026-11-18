@@ -1,0 +1,6 @@
+# actionlint configuration (scripts/ci/lint-workflows.sh): the self-hosted runner labels the
+# workflows use.
+self-hosted-runner:
+  labels:
+    - zkminer-gpu        # release.yml validate: the GPU host (scripts/ci/setup-gpu-runner.sh)
+    - zk-runner-mac-new  # build-macos.yml: the macOS 26 runner (vars.ZKMINER_MACOS_RUNNER overrides it)

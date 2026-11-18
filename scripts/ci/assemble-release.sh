@@ -13,6 +13,12 @@
 #   stack), with sp1-gpu-server-sycl-lib linked to it;
 # - SHA256SUMS over all of it.
 # Each tarball unpacks into the provers directory (~/.zkminer/provers/) beside the single files.
+# - zkminer-<version>-macos-arm64.tar.gz: the macOS (Apple Silicon, Metal) beta kit, as
+#   build-macos.yml built and checked it (dist-macos/; B9-CI). Its version must be ZKMINER_VERSION
+#   (default: [workspace.package].version of this checkout's Cargo.toml, which release.yml's
+#   check-version compared with the tag) and, when EXPECT_COMMIT is set (release.yml: the commit
+#   being released), its BUILDINFO commit, and its kernels must have been compiled by the validated
+#   Metal compiler (BUILDINFO metal_compiler_validated=yes); check-macos-kit.py checks it.
 # The localnet test and anvil, which the GPU validation runs, go to <validation kit dir>, not the
 # release.
 set -euo pipefail
@@ -88,6 +94,23 @@ pack() { # <dir> <tarball>
 }
 pack "$amd" zkminer-provers-amd-linux-x86_64.tar.zst
 pack "$intel" zkminer-provers-intel-linux-x86_64.tar.zst
+
+echo "== macOS"
+ci=$(dirname "$(readlink -f "$0")")
+version=${ZKMINER_VERSION:-$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ci/../../Cargo.toml" | head -1)}
+[ -n "$version" ] || { echo "::error::no version (ZKMINER_VERSION or Cargo.toml)" >&2; exit 1; }
+mac=zkminer-$version-macos-arm64.tar.gz
+need "$in/dist-macos/$mac"
+need "$in/dist-macos/SHA256SUMS"
+for k in "$in"/dist-macos/zkminer-*-macos-arm64.tar.gz; do
+  [ "$(basename "$k")" = "$mac" ] || { echo "::error::dist-macos holds a kit of another version: $(basename "$k") (want $mac)" >&2; exit 1; }
+done
+# The build job's own checksum line, then the kit itself (version, commit, Mach-O, SHA256SUMS).
+(cd "$in/dist-macos" && grep -E "^[0-9a-f]{64}  $mac\$" SHA256SUMS | sha256sum -c -) \
+  || { echo "::error::$mac does not match dist-macos/SHA256SUMS" >&2; exit 1; }
+python3 -I "$ci/check-macos-kit.py" --require-validated --version "$version" ${EXPECT_COMMIT:+--commit "$EXPECT_COMMIT"} "$in/dist-macos/$mac"
+cp "$in/dist-macos/$mac" "$out/"
+chmod 0644 "$out/$mac"
 
 echo "== validation kit"
 need "$in/dist-localnet-test/localnet"

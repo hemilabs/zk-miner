@@ -1,0 +1,322 @@
+name: macOS Build
+
+# The macOS (Apple Silicon, Metal, risc0 3.1) beta kit: zkminer-<version>-macos-arm64.tar.gz
+# (scripts/ci/assemble-macos.sh, docs/macos-beta.md), built, tested without a GPU and checked on
+# the repository's macOS runner. docs/ci-macos.md describes the jobs, the runner and the disk budget.
+#
+# The runner is the repository's self-hosted macOS 26 runner (label zk-runner-mac-new, or the one
+# the repository variable ZKMINER_MACOS_RUNNER names): 5 cores, 14 GB of RAM, 14 GB of disk, most
+# likely a VM without a usable Apple GPU. So the build and test jobs need no GPU, and the
+# metal-probe job, which reports what the runner's GPU can do, is never a required check.
+on:
+  push:
+    branches: [ "main" ]
+    # What the macOS kit is built from (the same list under pull_request).
+    paths:
+      - '.github/workflows/build-macos.yml'
+      - 'scripts/ci/**'
+      - 'scripts/mac/**'
+      - 'packaging/macos/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile.mac'
+      - 'rust-toolchain.toml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - '.github/workflows/build-macos.yml'
+      - 'scripts/ci/**'
+      - 'scripts/mac/**'
+      - 'packaging/macos/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile.mac'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+    inputs:
+      metal_toolchain:
+        description: 'Metal compiler: pinned (the validated 27B47; releases) or xcode (the runner''s Xcode one: unvalidated kernels, never for a release)'
+        type: choice
+        options: [ pinned, xcode ]
+        default: pinned
+      metal_probe:
+        description: 'Run the metal-probe job (the runner''s GPU; informational)'
+        type: boolean
+        default: true
+      probe_proof:
+        description: 'metal-probe: also try one tiny proof (downloads the 2.4 GB risc0-groth16 component once)'
+        type: boolean
+        default: true
+  # Called by release.yml, so a release ships the kit this workflow builds and checks.
+  workflow_call:
+    inputs:
+      retention_days:
+        description: 'How long to keep the uploaded artifacts'
+        type: number
+        default: 14
+        required: false
+      metal_probe:
+        type: boolean
+        default: true
+        required: false
+      probe_proof:
+        type: boolean
+        default: true
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Disk is the limit on the runner (14 GB): release profile only, no incremental build or debug
+# info, only the worker and the CLI, the cargo registry and git databases cached (never target/),
+# intermediates deleted before packaging, and the disk use printed after every heavy step.
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  RISC0_SRC: git
+  # git (cargo's git fetches go through it) gives up on a stalled transfer instead of hanging until
+  # the job's timeout: under 1 KB/s for 2 minutes.
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '120'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the Metal worker and the CLI, package and check the kit. Required.
+  # ---------------------------------------------------------------------------
+  build:
+    name: macOS kit (build, package, check)
+    # A self-hosted runner never runs a pull request from a fork.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
+    timeout-minutes: 240
+    concurrency:
+      group: build-macos-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    env:
+      METAL_TOOLCHAIN: ${{ inputs.metal_toolchain || 'pinned' }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      # A persistent runner keeps HOME between jobs: what an earlier job unpacked there goes first.
+      - name: "Clean the runner user's caches"
+        run: scripts/ci/macos-clean-home.sh "start of the job"
+
+      # B9-M26: the kernels are compiled with the validated Metal Toolchain 27B47 (SHA-256 pinned
+      # download from Apple's CDN), never with the runner's Xcode compiler, which is only reported.
+      - name: "Runner and Metal toolchain"
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = tag ] && [ "$METAL_TOOLCHAIN" != pinned ]; then
+            echo "::error::a tag builds with the pinned Metal toolchain only"; exit 1
+          fi
+          scripts/ci/macos-metal-toolchain.sh "$RUNNER_TEMP/metal-tc" "$METAL_TOOLCHAIN"
+          scripts/ci/macos-disk.sh "after the Metal toolchain"
+
+      # Only the downloads: the registry index and crate archives, and the git databases (hemilabs
+      # risc0, sp1, sppark). Never target/ (disk, and the kit must be built from source).
+      - name: "Cache the cargo registry and git databases"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-cargo-${{ hashFiles('Cargo.lock', 'crates/zkminer-prover/guests/**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      # rzup's downloads go through GitHub's API, which limits unauthenticated requests per IP.
+      - name: "Rust, the RISC Zero guest toolchain, protoc"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-toolchains.sh "$RUNNER_TEMP/tools"
+          scripts/ci/macos-disk.sh "after the toolchains"
+
+      # Makefile.mac mac-build-worker with the kit's settings (minimum macOS 26.0, the compiler
+      # wrapper), stopped before the archives and the kit.
+      - name: "Build the Metal worker and the CLI"
+        run: |
+          set -euo pipefail
+          ASSEMBLE_BUILD_ONLY=1 scripts/ci/assemble-macos.sh "$RUNNER_TEMP/build-only"
+          scripts/ci/macos-disk.sh "after the build"
+
+      - name: "Delete the build intermediates"
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-prune-target.sh .
+          scripts/ci/macos-disk.sh "after deleting the intermediates"
+
+      # No offline (AOT) archive set: building one needs an Apple GPU and ~5 GB more disk (the
+      # risc0 dump tests), and the archives must match this build's metallibs (docs/ci-macos.md).
+      # Macs compile their GPU pipelines once, at the first start.
+      - name: "Package and check the kit"
+        run: |
+          set -euo pipefail
+          ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none scripts/ci/assemble-macos.sh dist/macos
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          kit=dist/macos/zkminer-$version-macos-arm64.tar.gz
+          # What release.yml's assemble job checks on Linux, and that check's own test.
+          python3 -I scripts/ci/check-macos-kit.py --version "$version" --commit "$(git rev-parse HEAD)" "$kit"
+          scripts/ci/test-check-macos-kit.sh "$kit" "$(git rev-parse HEAD)"
+          ls -l dist/macos
+          scripts/ci/macos-disk.sh "after packaging"
+
+      - name: "Upload the kit"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-macos
+          path: dist/macos/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days || 14 }}
+
+      - name: "Unmount the Metal toolchain"
+        if: ${{ always() }}
+        run: scripts/ci/macos-metal-toolchain.sh --cleanup "$RUNNER_TEMP/metal-tc" "$RUNNER_TEMP/tools"
+
+      - name: "Clean the runner user's caches (end)"
+        if: ${{ always() }}
+        run: scripts/ci/macos-clean-home.sh "end of the job"
+
+  # ---------------------------------------------------------------------------
+  # The tests that need no GPU, built with the kit's settings. Required. Their
+  # own job: the tests' dev-dependencies change most dependencies' features,
+  # so their build is a second full build, and both do not fit in 14 GB.
+  # ---------------------------------------------------------------------------
+  cpu-tests:
+    name: macOS tests (no GPU)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
+    timeout-minutes: 240
+    concurrency:
+      group: build-macos-tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    env:
+      METAL_TOOLCHAIN: ${{ inputs.metal_toolchain || 'pinned' }}
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      # A persistent runner keeps HOME between jobs: what an earlier job unpacked there goes first.
+      - name: "Clean the runner user's caches"
+        run: scripts/ci/macos-clean-home.sh "start of the job"
+
+      - name: "Runner and Metal toolchain"
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-metal-toolchain.sh "$RUNNER_TEMP/metal-tc" "$METAL_TOOLCHAIN"
+          scripts/ci/macos-disk.sh "after the Metal toolchain"
+
+      - name: "Cache the cargo registry and git databases"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: macos-cargo-${{ hashFiles('Cargo.lock', 'crates/zkminer-prover/guests/**/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - name: "Rust, the RISC Zero guest toolchain, protoc"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-toolchains.sh "$RUNNER_TEMP/tools"
+          scripts/ci/macos-disk.sh "after the toolchains"
+
+      - name: "Tests that need no GPU"
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-cpu-tests.sh
+          scripts/ci/macos-disk.sh "after the tests"
+
+      # Before the cache is saved at the end of the job, which needs room for its archive.
+      - name: "Delete the test build"
+        if: ${{ always() }}
+        run: |
+          rm -rf target
+          scripts/ci/macos-disk.sh "after deleting the test build"
+
+      - name: "Unmount the Metal toolchain"
+        if: ${{ always() }}
+        run: scripts/ci/macos-metal-toolchain.sh --cleanup "$RUNNER_TEMP/metal-tc" "$RUNNER_TEMP/tools"
+
+      - name: "Clean the runner user's caches (end)"
+        if: ${{ always() }}
+        run: scripts/ci/macos-clean-home.sh "end of the job"
+
+  # ---------------------------------------------------------------------------
+  # What the runner's GPU can do with the kit: MTLCreateSystemDefaultDevice's
+  # name, family and recommendedMaxWorkingSetSize, then one tiny proof
+  # (scripts/ci/macos-probe.sh, the kit's tools/macos-smoke.sh). Informational
+  # only: on a VM's paravirtual GPU it proves nothing about a real Mac.
+  # ---------------------------------------------------------------------------
+  metal-probe:
+    name: metal-probe (informational)
+    needs: build
+    # On push and pull_request the inputs context is empty, and GitHub compares null and false as
+    # equal (both coerce to 0), so the inputs are compared as text: absent means the default (true).
+    # scripts/ci/test-workflow-expressions.py evaluates this per event.
+    if: ${{ format('{0}', inputs.metal_probe) != 'false' }}
+    continue-on-error: true
+    runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
+    timeout-minutes: 60
+    concurrency:
+      group: build-macos-probe-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      # Also cleans an earlier job's workspace on a persistent runner (disk).
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          persist-credentials: false
+
+      # A persistent runner keeps HOME between jobs: what an earlier job unpacked there goes first.
+      - name: "Clean the runner user's caches"
+        run: scripts/ci/macos-clean-home.sh "start of the job"
+
+      - name: "Download the kit"
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-macos
+          path: ${{ runner.temp }}/dist-macos
+
+      - name: "Probe the Metal device, try one proof"
+        env:
+          PROBE_PROOF: ${{ format('{0}', inputs.probe_proof) == 'false' && '0' || '1' }}
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-disk.sh "before the probe"
+          scripts/ci/macos-probe.sh "$RUNNER_TEMP"/dist-macos/zkminer-*-macos-arm64.tar.gz "$RUNNER_TEMP/probe"
+          scripts/ci/macos-disk.sh "after the probe"
+
+      - name: "Clean the runner user's caches (end)"
+        if: ${{ always() }}
+        run: scripts/ci/macos-clean-home.sh "end of the job"
+
+      - name: "Upload the probe logs"
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-probe-logs
+          path: |
+            ${{ runner.temp }}/probe/*.log
+          if-no-files-found: ignore
+          retention-days: ${{ inputs.retention_days || 14 }}
