@@ -2637,7 +2637,17 @@ mod tests {
         held.lock().unwrap();
         assert!(lock_held(&lock), "the miner's exclusive lock");
         drop(held);
-        assert!(!lock_held(&lock), "a miner that exited");
+        // Another test in this process may have forked while the lock was held: its child keeps a
+        // copy of the descriptor, and so the lock, until it execs. So a miner that exited is seen
+        // unlocked soon, not at once.
+        let start = std::time::Instant::now();
+        while lock_held(&lock) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "a miner that exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         let mut v: toml::Value = toml::from_str(
             "spool_dir = \"/s\"\n[[evm_rpc]]\nalias = \"a\"\nmax_concurrency = 6\nmax_requests_per_sec = 50\n\
