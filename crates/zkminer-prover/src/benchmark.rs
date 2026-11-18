@@ -871,6 +871,14 @@ pub fn physical_core_count() -> Option<u32> {
     windows_cpu::physical_cores()
 }
 
+/// Physical CPU cores, on macOS (`hw.physicalcpu`), which has no `/proc/cpuinfo` either.
+#[cfg(target_os = "macos")]
+pub fn physical_core_count() -> Option<u32> {
+    crate::memory::sysctl_u64("hw.physicalcpu")
+        .filter(|&n| n > 0)
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 /// The CPU's name and core count from Windows, which has no `/proc/cpuinfo`.
 #[cfg(windows)]
 mod windows_cpu {
