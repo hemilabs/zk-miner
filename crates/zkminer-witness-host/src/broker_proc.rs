@@ -72,12 +72,40 @@ pub struct BrokerProcess {
     refresher: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// §11.1: the broker refuses every endpoint on its `chain_rpc_host`, which only keeps the builder's
+/// and the artifact reader's traffic off the miner's chain RPC if it is that RPC's host. So the file's
+/// value must be the host of this miner's own `[chain] rpc_url`; anything else refuses the start.
+/// Developer mode (`[dev] private_network`, never on a production chain) only warns: its tests run
+/// the chain and the broker's endpoints on one loopback host.
+pub fn check_chain_rpc_host(broker: &BrokerConfig, miner: &ZkMinerConfig) -> Result<()> {
+    let ours = zkminer_witness_broker::config::chain_rpc_host_of(&miner.chain.rpc_url)
+        .context("[chain] rpc_url names no host")?;
+    if broker.chain_rpc_host == ours {
+        return Ok(());
+    }
+    if miner.net_mode() == NetMode::DevPrivate {
+        tracing::warn!(
+            "{}: the broker's chain_rpc_host {:?} is not [chain] rpc_url's host {ours:?}, so its endpoints may share \
+             the miner's chain RPC",
+            zkminer_netguard::DEV_MODE_BANNER,
+            broker.chain_rpc_host
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "its chain_rpc_host is {:?}, but this miner's [chain] rpc_url is on {ours:?}: set chain_rpc_host = {ours:?} \
+         (the broker refuses endpoints on the miner's chain-RPC host, and only that host)",
+        broker.chain_rpc_host
+    )
+}
+
 impl BrokerProcess {
     /// Spawns the broker with its config file `config`, in the network mode of `miner` (the miner's
     /// own config: [`ZkMinerConfig::net_mode`]), and serves its connector. Must be called inside a
     /// tokio runtime (the client and the connector are async). In public mode a config with an
     /// endpoint that is not on the public internet is refused here, by the miner's own load, before
-    /// anything is spawned (and the broker would refuse it too, exiting with status 2).
+    /// anything is spawned (and the broker would refuse it too, exiting with status 2); so is one
+    /// whose `chain_rpc_host` is not this miner's chain RPC host ([`check_chain_rpc_host`]).
     pub fn start(
         spawner: &Spawner,
         binary: &Path,
@@ -95,6 +123,8 @@ impl BrokerProcess {
         // The connector's only source: the operator's file as the miner reads it, in the miner's
         // mode. Nothing the broker says ever reaches it.
         let broker_cfg = BrokerConfig::load_for_connector(config, net_mode)
+            .with_context(|| format!("the broker config {}", config.display()))?;
+        check_chain_rpc_host(&broker_cfg, miner)
             .with_context(|| format!("the broker config {}", config.display()))?;
         let connector = Connector::for_miner(&broker_cfg, &miner_deny, facts_options.clone()).context("the broker's connector")?;
         drop(broker_cfg);
@@ -276,5 +306,114 @@ impl Drop for BrokerProcess {
             let _ = self.child.wait();
             let _ = cg.remove();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn miner(rpc_url: &str, dev: bool) -> ZkMinerConfig {
+        let mut c = ZkMinerConfig::default();
+        c.chain.chain_id = 31337;
+        c.chain.rpc_url = rpc_url.to_string();
+        if dev {
+            c.dev.private_network = true;
+            c.dev.chain_id = Some(31337);
+        }
+        assert_eq!(c.net_mode() == NetMode::DevPrivate, dev);
+        c
+    }
+
+    fn broker_file(dir: &Path, chain_rpc_host: &str) -> std::path::PathBuf {
+        let path = dir.join("broker.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "chain_rpc_host = \"{chain_rpc_host}\"\nspool_dir = \"{}\"\n",
+                dir.join("spool").display()
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn check(dir: &Path, chain_rpc_host: &str, miner: &ZkMinerConfig) -> Result<()> {
+        let cfg =
+            BrokerConfig::load_for_connector(&broker_file(dir, chain_rpc_host), miner.net_mode())
+                .unwrap();
+        check_chain_rpc_host(&cfg, miner)
+    }
+
+    /// The broker's own-host refusal is only as good as `chain_rpc_host`: it must be the host of the
+    /// miner's `[chain] rpc_url`, compared as the broker normalizes hosts.
+    #[test]
+    fn chain_rpc_host_must_be_the_miners_chain_rpc_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let public = miner("https://RPC.example.org/v1/some-key", false);
+        for same in [
+            "rpc.example.org",
+            "https://rpc.example.org:8443/other",
+            "RPC.EXAMPLE.ORG",
+        ] {
+            check(dir.path(), same, &public).unwrap_or_else(|e| panic!("{same}: {e:#}"));
+        }
+        for other in ["chain-rpc.invalid", "rpc2.example.org", "example.org"] {
+            let e = format!("{:#}", check(dir.path(), other, &public).unwrap_err());
+            assert!(
+                e.contains("set chain_rpc_host = \"rpc.example.org\""),
+                "{other}: {e}"
+            );
+        }
+        // Developer mode's loopback tests run the chain and the endpoints on one host: a warning.
+        check(
+            dir.path(),
+            "chain-rpc.invalid",
+            &miner("http://127.0.0.1:8545", true),
+        )
+        .unwrap();
+    }
+
+    /// And the miner refuses to start a broker whose file names another host, before anything is
+    /// spawned (the binary and the cgroup root here could never be).
+    #[tokio::test]
+    async fn a_broker_file_naming_another_chain_rpc_host_is_refused_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = broker_file(dir.path(), "chain-rpc.invalid");
+        let spawner = Spawner::new().unwrap();
+        let public = miner("https://rpc.example.org", false);
+        let e = match BrokerProcess::start(
+            &spawner,
+            Path::new("/nonexistent/broker"),
+            &config,
+            dir.path(),
+            1 << 26,
+            &public,
+        ) {
+            Ok(_) => panic!("a broker was started with another host's chain_rpc_host"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            e.contains("chain_rpc_host is \"chain-rpc.invalid\"") && e.contains("rpc.example.org"),
+            "{e}"
+        );
+        // A file without the key is refused too (it is required).
+        std::fs::write(
+            &config,
+            format!("spool_dir = \"{}\"\n", dir.path().join("spool").display()),
+        )
+        .unwrap();
+        let e = match BrokerProcess::start(
+            &spawner,
+            Path::new("/nonexistent/broker"),
+            &config,
+            dir.path(),
+            1 << 26,
+            &public,
+        ) {
+            Ok(_) => panic!("a broker was started without chain_rpc_host"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(e.contains("chain_rpc_host"), "{e}");
     }
 }

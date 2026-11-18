@@ -1010,7 +1010,10 @@ only *for a configuration*: chain id, archive, served proof age, method sets.
 - **Separation from the miner's chain RPC:** a builder or artifact endpoint never uses the same
   provider account or key as `chain.rpc_url`, never the same provider from the same egress IP, and
   never the same node process, database or host. zkminer refuses an endpoint whose host equals
-  `chain.rpc_url`'s. Different providers may share the host's IP. If the miner's own Hemi node is its
+  `chain.rpc_url`'s: the broker file's `chain_rpc_host` names that host, the broker refuses every
+  endpoint on it, and the miner refuses to start a broker whose file names another host (developer
+  mode only warns: a local test network runs its chain and endpoints on one host). Different
+  providers may share the host's IP. If the miner's own Hemi node is its
   only Hemi node, a Hemi-chain class is not provisioned.
 - **Operator nodes reachable by the broker** must have globally routable addresses (a node on
   loopback or the LAN is usable only in dev mode, §14) and expose only `eth`, `net` and `web3`, with
@@ -1983,6 +1986,7 @@ key. The rows marked *(broker file)* below are keys of that file.
 | `[broker] config` | required | The broker's config file: endpoints, roles, provider keys, DNS, egress (read by the broker, with keys, and by the miner's connector, endpoints only — never keys) |
 | `cidrs` per endpoint, `[egress] deny_cidrs`, `[dns] servers` *(broker file)* | `[]` | Explicit operator endpoint ranges (needed for local or LAN nodes); extra denied ranges; the broker's resolvers |
 | `[budget] inflight_bytes`, `held_lock_share` *(broker file)* | 256 MiB, 0.25 | Global in-flight byte budget and the share reserved for held-lock work |
+| `chain_rpc_host` *(broker file)* | required | The host of the miner's `[chain] rpc_url` (§11.1): the broker refuses endpoints on it, and the miner refuses to start a broker whose file names another host (developer mode: a warning) |
 | `[[evm_rpc]]` *(broker file)* | — | Per endpoint: `alias`, `url`, `chain_id`, `archive`, `max_proof_age`, `method_sets`, rates, key file |
 | `[[blob_mirror]]` *(broker file)* | — | Mirror URL templates (`{sha256}`) |
 | `[chain] preclaim_read_share` | 0.25 | Share of the chain limiter for pre-claim reads |

@@ -1106,6 +1106,12 @@ fn host_port(u: &Url) -> (String, Option<IpAddr>, u16) {
     }
 }
 
+/// The host the broker's `chain_rpc_host` names for a chain RPC URL (or host): normalized like an
+/// endpoint host, so the miner can hold the file's value to its own `[chain] rpc_url`.
+pub fn chain_rpc_host_of(url: &str) -> Option<String> {
+    normalize_host_input(url)
+}
+
 /// `chain_rpc_host` as a host, `host:port` or URL, normalized like an endpoint host.
 fn normalize_host_input(s: &str) -> Option<String> {
     let s = s.trim();
