@@ -1163,8 +1163,15 @@ impl WorkerHandle {
                 worker_version,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
+                    // A decline, like the arm below: a worker built for another protocol version
+                    // fails this handshake every time, so its slot must not count as a healthy
+                    // one that respawns, or the miner goes on claiming jobs for it. Such a worker
+                    // is usually an old one in `~/.zkminer/provers`, which is searched before the
+                    // workers shipped beside the miner.
                     bail!(
-                        "Protocol version mismatch with {}: expected {PROTOCOL_VERSION}, got {protocol_version}",
+                        "{} Protocol version mismatch with {}: expected {PROTOCOL_VERSION}, got \
+                         {protocol_version}; replace the worker binary",
+                        zkminer_prover_protocol::types::WORKER_DECLINED,
                         self.backend
                     );
                 }

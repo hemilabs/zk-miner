@@ -44,7 +44,14 @@ use serde::{Deserialize, Serialize};
 /// in the same version; so does its response's `sdk_version` / `worker_version` (in the same
 /// unreleased version: no handshake covers the one-shot execute, and a response from a binary built
 /// without them fails to decode rather than pass for one).
-pub const PROTOCOL_VERSION: u32 = 14;
+/// 15: no new field, new meanings, all of the SP1 worker's: it refuses at measurement a guest that
+/// halts with a non-zero exit code or commits its public values under a digest other than SHA-256,
+/// binds a proof's `programId` in the canonical byte order only, and reports cycles (measured,
+/// proven and benchmarked) as SP1's gas, which weights precompiles by what they cost to prove, not
+/// as its instruction count (`zkop-mix`'s scoring rows excepted). A v14 SP1 worker would measure such
+/// guests clean and size a host's jobs in other units, and `~/.zkminer/provers` is searched before
+/// the workers shipped beside the miner, so the handshake refuses it.
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -381,9 +388,9 @@ pub enum WorkerResponse {
     ProgramIdResult {
         request_id: u64,
         /// risc0: the image id (`Digest::as_bytes`, the order the deployed adapter verifies against).
-        /// SP1: the verifying-key hash as `vk.bytes32()` writes it. The on-chain order of an SP1
-        /// programId is deployment-defined, so a caller compares it in either order, as the SP1
-        /// worker's prove-path gate does.
+        /// SP1: the verifying-key hash as `vk.bytes32()` writes it, the big-endian order the
+        /// on-chain verifier reads `programId` in. A caller compares it in that order only, as the
+        /// SP1 worker's prove-path gate does.
         program_id: [u8; 32],
         /// How long the derivation took.
         duration_secs: f64,

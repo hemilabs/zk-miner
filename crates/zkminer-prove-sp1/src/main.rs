@@ -43,6 +43,15 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Whether an ELF whose verifying-key hash is `vk_hash` (as `decode_hex32` reads `bytes32()`) may be
+/// proven for a job whose on-chain `programId` is `program_id`. The canonical order only: the
+/// on-chain adapter passes `programId` straight into `verifyProof(programVKey, …)`, and the verifier
+/// reads it as `uint256(programVKey)`, the same big-endian bytes32 the SDK's `bytes32()` prints. Any
+/// other order only lets a decoy ELF through to a proof the chain then rejects.
+fn vkey_matches_program_id(vk_hash: &[u8; 32], program_id: &[u8; 32]) -> bool {
+    vk_hash == program_id
+}
+
 /// Largest number of distinct proving keys the worker keeps resident. Each entry is a large
 /// GPU-resident key, so without a bound the cache grows O(distinct ELFs a submitter sends) in host
 /// RAM and VRAM. LRU-evicted beyond this. Override with `ZKMINER_SP1_PK_CACHE_MAX`.
@@ -751,11 +760,12 @@ fn canary_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P) {
 /// on the messages of hemilabs/sp1's `sp1-core-executor-runner` (`native.rs`), which no guest
 /// writes; a match only makes the worker run its canary again ([`environment_fault_or_decline`]).
 fn is_executor_environment_fault(text: &str) -> bool {
-    const SETUP: [&str; 4] = [
+    const SETUP: [&str; 5] = [
         "create shm file for",
         "failed to create the child's stdin",
         "failed to spawn child process",
         "the executor runner exited before reading its input",
+        SIZING_RUNTIME_FAILED,
     ];
     SETUP.iter().any(|m| text.contains(m))
 }
@@ -2312,11 +2322,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             ErrorKind::Internal
                         } else if msg.contains("does not match job programId")
                             || msg.contains("could not parse SP1 vkey hash")
+                            || msg.starts_with(NOT_SHA256_COMMITTED)
                         {
-                            // The served ELF's verifying key cannot match this job's programId. No job
-                            // for this program can ever be proved, so report it as ProgramMismatch: the
-                            // host negative-caches the program and stops claiming its jobs, instead of
-                            // eating a release penalty per submitted job.
+                            // The served ELF's verifying key cannot match this job's programId, or its
+                            // proof commits its public values under a digest the chain does not
+                            // accept. No job for this program can be fulfilled, so report it as
+                            // ProgramMismatch: the host negative-caches the program and stops claiming
+                            // its jobs, instead of re-proving it and eating a release penalty per job.
                             ErrorKind::ProgramMismatch
                         } else if is_gpu_oom(&msg) {
                             // GPU OOM: tag as ResourceExhausted so the dispatcher kills +
@@ -2689,12 +2701,38 @@ fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Execute the guest WITHOUT proving, returning its true cycle count — the pre-claim sizing path for
-/// SP1, the analogue of the risc0 worker's `run_execute`. The count is SP1's `total_instruction_count`,
-/// the SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
+/// What an SP1 execution costs to prove, in the unit every SP1 figure the host sizes with is in (the
+/// measurement, a proof's reported cycles, the benchmark throughput): SP1's gas, which weights each
+/// operation by what it costs to prove. The instruction count counts a precompile call (keccak,
+/// sha, bigint) as one instruction, though it proves as far more, so a guest that loops one measured
+/// cheap, was claimed, and overran its proving budget on every attempt. For code without precompiles
+/// the two are close (within 0.89 to 1.06 of each other on the benchmark programs). The instruction
+/// count only where gas was not computed (it is unless an execution turns it off, which none here
+/// does).
+fn sp1_proving_cost(report: &sp1_sdk::ExecutionReport) -> u64 {
+    report
+        .gas()
+        .unwrap_or_else(|| report.total_instruction_count())
+}
+
+/// A benchmark row's cycles: [`sp1_proving_cost`], except `zkop-mix`'s, whose zkOP/s score divides
+/// `ZKOP_MIX_SP1_CYCLES`, an instruction count, by its proof's time and checks the row against it.
+/// That row sizes nothing (the host leaves it out of every throughput), so its unit is the score's.
+fn benchmark_cycles(program: &str, report: &sp1_sdk::ExecutionReport) -> u64 {
+    if program == BENCH_ZKOP_MIX {
+        report.total_instruction_count()
+    } else {
+        sp1_proving_cost(report)
+    }
+}
+
+/// Execute the guest WITHOUT proving, returning its proving cost — the pre-claim sizing path for
+/// SP1, the analogue of the risc0 worker's `run_execute`. The figure is [`sp1_proving_cost`], the
+/// SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
 /// feeds the deadline/look-ahead math in matching units. This lets the miner size an SP1 job on a
-/// MEASURED cycle count instead of the submitter-declared `expectedCycles`, closing the input-flood
-/// under-sizing vector for SP1.
+/// MEASURED cost instead of the submitter-declared `expectedCycles`, closing the input-flood
+/// under-sizing vector for SP1, and a precompile-heavy guest no longer measures as cheap as its
+/// instruction count.
 ///
 /// Runs on a lightweight `CpuProver`, never the CUDA prover: SP1 execution is pure CPU emulation and
 /// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
@@ -2860,7 +2898,7 @@ fn run_execute_sp1(
     elf: &[u8],
     input_data: &[u8],
 ) -> anyhow::Result<(u64, Vec<u8>, f64, u64)> {
-    use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+    use sp1_sdk::blocking::{Prover, SP1Stdin};
 
     let started = Instant::now();
 
@@ -2868,19 +2906,27 @@ fn run_execute_sp1(
     // One input element, consumed by a single `io::read_vec` in the guest — matching `run_proof`.
     stdin.write_slice(input_data);
 
-    let mut req = cpu.execute(Elf::from(elf), stdin);
+    // What the SDK's `execute(..).cycle_limit(..).run()` does, through the node it calls: that call
+    // drops the digest the guest committed its public values under, which is checked below.
+    let mut context = sp1_sdk::SP1ContextBuilder::new();
     if let Some(limit) = sp1_execute_cycle_limit() {
-        req = req.cycle_limit(limit);
+        context.max_cycles(limit);
     }
+    let context = context.build();
+    let runtime = sizing_runtime()?;
     // Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
     // the pinned SP1 build NEVER sets the executor's final VM state — `GasExecutingWorker::call`
     // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
     // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
-    // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
-    let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
-    let (public_values, report) =
+    // `opcode_counts`, i.e. `total_instruction_count()`, and gas is what the job is sized by
+    // (`sp1_proving_cost`). So we do NOT disable it.
+    let (run_result, peak_host_bytes) =
+        with_peak_rss_sampling(|| runtime.block_on(cpu.inner().execute(elf, stdin, context)));
+    let (public_values, committed_digest, report) =
         run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
+    refuse_unprovable_exit(report.exit_code)?;
+    refuse_non_sha256_commitment(&public_values, &committed_digest)?;
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
@@ -2888,12 +2934,77 @@ fn run_execute_sp1(
     // instead of learning either only after a full proof is wasted. `.to_vec()` matches how
     // `run_proof` extracts the journal.
     Ok((
-        report.total_instruction_count(),
+        sp1_proving_cost(&report),
         public_values.to_vec(),
         started.elapsed().as_secs_f64(),
         peak_host_bytes,
     ))
 }
+
+/// A measured guest that halted with a non-zero exit code (its own `exit(n)`, or a panic) runs to
+/// the end like one that succeeded, but no proof of it is accepted: the SDK's `verify` refuses an
+/// exit code other than 0, and so does the on-chain verifier. Without this it would be measured
+/// clean, claimed, and fail every proof attempt. Refused at measurement, as the risc0 worker refuses
+/// a session that did not halt with 0.
+fn refuse_unprovable_exit(exit_code: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exit_code == 0,
+        "the guest halted with exit code {exit_code}: no proof of it verifies"
+    );
+    Ok(())
+}
+
+/// The on-chain SP1 verifier recomputes `sha256(publicValues)` and checks the proof against that.
+/// A guest may instead commit its public values under Blake3, which the SDK's `verify` also accepts:
+/// such a job would be measured, claimed, proven and verified here, and its fulfil would revert.
+/// The digest a guest commits is fixed by its execution, so it is refused at measurement: here,
+/// `committed_digest` is what the measured execution committed.
+fn refuse_non_sha256_commitment(
+    public_values: &sp1_sdk::SP1PublicValues,
+    committed_digest: &[u8; 32],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        public_values.hash() == committed_digest,
+        "the guest commits its public values under a digest other than SHA-256, which the on-chain \
+         verifier does not accept"
+    );
+    Ok(())
+}
+
+/// After a proof: whether the digest its Groth16 public inputs commit to (`public_inputs[1]`, a
+/// decimal) is the masked SHA-256 of its public values (`hash_bn254`), the one value the on-chain
+/// verifier accepts. The measurement refuses another digest before any claim
+/// ([`refuse_non_sha256_commitment`]); this holds a job that reached a proof without one.
+fn proof_commits_sha256(proof: &sp1_sdk::SP1ProofWithPublicValues) -> bool {
+    let sp1_sdk::SP1Proof::Groth16(groth16) = &proof.proof else {
+        return false;
+    };
+    let sha256 = proof.public_values.hash_bn254();
+    groth16
+        .public_inputs
+        .get(1)
+        .and_then(|committed| committed.parse().ok())
+        == Some(sha256)
+}
+
+/// The phrase of `run_proof`'s refusal of a proof whose public values are not committed under
+/// SHA-256; the prove path reports it as [`ErrorKind::ProgramMismatch`].
+const NOT_SHA256_COMMITTED: &str = "SP1 proof's public values are not committed under SHA-256";
+
+/// The runtime the measurement's execution runs on (`run_execute_sp1`), made on first use: the SDK's
+/// blocking calls run on a runtime of their own, which is not reachable from here.
+fn sizing_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{SIZING_RUNTIME_FAILED}: {e}"))
+}
+
+/// The start of `sizing_runtime`'s error: the worker's fault, not the job's
+/// (`is_executor_environment_fault`).
+const SIZING_RUNTIME_FAILED: &str = "could not start the runtime SP1 executions run on";
 
 /// True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
 /// (the guest is too heavy to size). The pinned build signals the cap from the gas accumulator as the
@@ -2946,7 +3057,7 @@ fn run_proof(
         exec = exec.cycle_limit(limit);
     }
     let (public_values, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cycles = report.total_instruction_count();
+    let cycles = sp1_proving_cost(&report);
 
     // Get-or-create the proving key for this ELF. The key depends only on the
     // program (not the input), so it's cached and reused across proofs — no per-proof
@@ -2970,9 +3081,8 @@ fn run_proof(
     // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
     // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
     // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
-    // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
-    // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
-    // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
+    // guaranteed revert. Reject BEFORE proving, in the order the chain reads it
+    // (`vkey_matches_program_id`). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
     if let Some(pid) = program_id {
         let skip = matches!(
             std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
@@ -2988,9 +3098,7 @@ fn run_proof(
             // via `format!("0x{:0>64}", …)` and never panics.
             match decode_hex32(&pk.verifying_key().bytes32()) {
                 Some(vk_hash) => {
-                    let matches =
-                        vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
-                    if !matches {
+                    if !vkey_matches_program_id(&vk_hash, &pid) {
                         anyhow::bail!(
                             "ELF vkey hash does not match job programId (served ELF is not the \
                              registered program) — refusing to prove"
@@ -3028,6 +3136,11 @@ fn run_proof(
         return Err(anyhow::anyhow!(
             "Proof verification FAILED — SP1 proof is invalid: {e}"
         ));
+    }
+    // `verify` also accepts public values committed under Blake3, which the on-chain verifier does
+    // not: such a proof would only revert at fulfil (`proof_commits_sha256`).
+    if !proof_commits_sha256(&proof) {
+        anyhow::bail!("{NOT_SHA256_COMMITTED}: the on-chain verifier would reject it");
     }
 
     let journal = proof.public_values.to_vec();
@@ -3192,7 +3305,7 @@ fn benchmark_program(
         .execute(Elf::from(elf), stdin.clone())
         .run()
         .map_err(|e| anyhow::anyhow!("execute failed: {e}"))?;
-    let cycles = report.total_instruction_count();
+    let cycles = benchmark_cycles(name, &report);
 
     // Key setup OUTSIDE the timed region. It is not proving, and production caches the key per ELF
     // (`pk_cache` in `run_worker_loop`) so never pays it per proof. In practice the cost is
@@ -4376,6 +4489,19 @@ mod pk_cache_tests {
         assert!(super::decode_hex32(&("0x".to_owned() + &"zz".repeat(32))).is_none()); // non-hex
     }
 
+    /// The programId bind takes the order the chain verifies in, and only that one: a reversed id
+    /// is a decoy whose proof the on-chain verifier rejects, so it must be refused before the proof.
+    #[test]
+    fn the_program_id_binds_in_the_canonical_order_only() {
+        let vk = super::decode_hex32(&format!("0x{}", "0123456789abcdef".repeat(4))).unwrap();
+        let mut reversed = vk;
+        reversed.reverse();
+        assert!(super::vkey_matches_program_id(&vk, &vk));
+        assert!(!super::vkey_matches_program_id(&vk, &reversed));
+        assert!(!super::vkey_matches_program_id(&reversed, &vk));
+        assert!(!super::vkey_matches_program_id(&vk, &[0u8; 32]));
+    }
+
     #[test]
     fn elf_hash_is_deterministic_and_collision_resistant() {
         // Deterministic.
@@ -4459,6 +4585,12 @@ mod pk_cache_tests {
         assert!(!transient.to_lowercase().contains("exceeded cycle limit"));
     }
 
+    /// One CPU prover for the tests that execute guests: a debug build takes minutes to make one.
+    fn test_cpu_prover() -> &'static sp1_sdk::blocking::CpuProver {
+        static CPU: std::sync::OnceLock<sp1_sdk::blocking::CpuProver> = std::sync::OnceLock::new();
+        CPU.get_or_init(|| sp1_sdk::blocking::ProverClient::builder().cpu().build())
+    }
+
     // End-to-end guard against a critical failure mode: with
     // `.calculate_gas(false)` the pinned SP1 build returns Err("Failed to extract public value
     // digest") for EVERY guest, so NO SP1 job was ever claimable. Runs a REAL CPU execution of the
@@ -4472,13 +4604,149 @@ mod pk_cache_tests {
         }
         let elf = super::FIBONACCI_SP1_GUEST_ELF;
         let input = 1000u32.to_le_bytes(); // the known-good benchmark input
-        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        let cpu = test_cpu_prover();
 
         // Gas calculation left at its default (enabled) → a real guest returns a POSITIVE instruction
         // count. `.calculate_gas(false)` would make this return Err for every guest.
-        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(&cpu, elf, &input)
+        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(cpu, elf, &input)
             .expect("executing a valid guest must succeed and yield a cycle count");
         assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
+    }
+
+    /// The measurement keeps the digest the guest committed, and a guest that commits its public
+    /// values under SHA-256 (as every guest built with the default `sp1-zkvm` does) passes.
+    #[test]
+    fn a_sha256_committing_guest_is_measured() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        use sp1_sdk::blocking::{Prover, SP1Stdin};
+        let cpu = test_cpu_prover();
+        let mut stdin = SP1Stdin::new();
+        stdin.write_slice(&1000u32.to_le_bytes());
+        let context = sp1_sdk::SP1ContextBuilder::new().build();
+        let (public_values, digest, _) = super::sizing_runtime()
+            .unwrap()
+            .block_on(
+                cpu.inner()
+                    .execute(super::FIBONACCI_SP1_GUEST_ELF, stdin, context),
+            )
+            .unwrap();
+        assert!(super::refuse_non_sha256_commitment(&public_values, &digest).is_ok());
+        // And the measurement itself takes it.
+        super::run_execute_sp1(cpu, super::FIBONACCI_SP1_GUEST_ELF, &1000u32.to_le_bytes())
+            .unwrap();
+    }
+
+    /// A job is sized by what it costs to prove: a guest that loops precompiles (a sha256, a keccak
+    /// and a bigint call per round) measures well above its instruction count (1.94 times, measured),
+    /// where the instruction count made it look as cheap as plain code, which measures about its
+    /// instruction count (fibonacci 1.04 times). The `zkop-mix` scoring row keeps the instruction
+    /// count its score is defined in.
+    #[test]
+    fn jobs_are_sized_by_proving_cost() {
+        // Built beside the embedded guests, but not embedded (and not on every platform).
+        let Some(interleave) = option_env!("SP1_ELF_precompile-interleave-sp1-guest")
+            .and_then(|p| std::fs::read(p).ok())
+            .filter(|elf| !elf.is_empty())
+        else {
+            eprintln!("skipping: no precompile-interleave guest in this build");
+            return;
+        };
+        use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+        let cpu = test_cpu_prover();
+        let execute = |elf: &[u8], input: u32| {
+            let mut stdin = SP1Stdin::new();
+            stdin.write_slice(&input.to_le_bytes());
+            cpu.execute(Elf::from(elf.to_vec()), stdin).run().unwrap().1
+        };
+        let precompiles = execute(&interleave, 300);
+        let plain = execute(super::FIBONACCI_SP1_GUEST_ELF, 1000);
+        let ratio = |r: &sp1_sdk::ExecutionReport| {
+            super::sp1_proving_cost(r) as f64 / r.total_instruction_count() as f64
+        };
+        assert!(
+            ratio(&precompiles) > 1.5 * ratio(&plain),
+            "precompiles cost {:.2}x their instructions, plain code {:.2}x",
+            ratio(&precompiles),
+            ratio(&plain)
+        );
+        // What the measurement reports, for the host to size the job by.
+        let (measured, ..) =
+            super::run_execute_sp1(cpu, &interleave, &300u32.to_le_bytes()).unwrap();
+        assert_eq!(measured, super::sp1_proving_cost(&precompiles));
+        assert!(measured > precompiles.total_instruction_count());
+        assert_eq!(
+            super::benchmark_cycles(super::BENCH_ZKOP_MIX, &plain),
+            plain.total_instruction_count()
+        );
+        assert_eq!(
+            super::benchmark_cycles(super::BENCH_SHA256_CHAIN, &precompiles),
+            super::sp1_proving_cost(&precompiles)
+        );
+    }
+
+    /// A Blake3 commitment (what a guest built with `sp1-zkvm`'s `blake3` feature commits) is
+    /// refused at measurement, and a proof carrying one is refused before its fulfil.
+    #[test]
+    fn a_blake3_commitment_is_refused() {
+        let public_values = sp1_sdk::SP1PublicValues::from(b"some journal");
+        let blake3: [u8; 32] = public_values.blake3_hash().try_into().unwrap();
+        let sha256: [u8; 32] = public_values.hash().try_into().unwrap();
+        assert!(super::refuse_non_sha256_commitment(&public_values, &blake3).is_err());
+        assert!(super::refuse_non_sha256_commitment(&public_values, &sha256).is_ok());
+
+        let groth16 = |committed: String| sp1_sdk::SP1ProofWithPublicValues {
+            proof: sp1_sdk::SP1Proof::Groth16(groth16_with_digest(committed)),
+            public_values: public_values.clone(),
+            sp1_version: String::new(),
+            tee_proof: None,
+        };
+        let sha = public_values.hash_bn254().to_string();
+        let blake = public_values
+            .hash_bn254_with_fn(sp1_primitives::io::blake3_hash)
+            .to_string();
+        assert!(super::proof_commits_sha256(&groth16(sha.clone())));
+        // The same number, written another way, is the same digest.
+        assert!(super::proof_commits_sha256(&groth16(format!("00{sha}"))));
+        assert!(!super::proof_commits_sha256(&groth16(blake)));
+        assert!(!super::proof_commits_sha256(&groth16(
+            "not a number".into()
+        )));
+    }
+
+    /// A Groth16 proof whose public inputs commit `digest` as their second element.
+    fn groth16_with_digest(digest: String) -> sp1_prover::Groth16Bn254Proof {
+        sp1_prover::Groth16Bn254Proof {
+            public_inputs: [
+                String::new(),
+                digest,
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            encoded_proof: String::new(),
+            raw_proof: String::new(),
+            groth16_vkey_hash: [0; 32],
+        }
+    }
+
+    /// A guest that halts with a non-zero exit code is refused at measurement, before any claim: no
+    /// proof of it verifies. Fibonacci given no `u32` to read panics in its first `io::read`.
+    #[test]
+    fn a_guest_that_exits_non_zero_is_refused_at_measurement() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let err = super::run_execute_sp1(test_cpu_prover(), super::FIBONACCI_SP1_GUEST_ELF, &[])
+            .expect_err("a guest that panicked was measured clean");
+        assert!(
+            err.to_string().contains("exit code"),
+            "refused for another reason: {err:#}"
+        );
+        assert!(super::refuse_unprovable_exit(0).is_ok());
     }
 }
 

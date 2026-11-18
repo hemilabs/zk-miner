@@ -8,9 +8,10 @@
 //!   `cuInit`, is opened first and can accept nothing);
 //! - read access to the system's files, this binary's directory, `LD_LIBRARY_PATH`, the
 //!   `risc0-groth16` component (`RISC0_HOME`, `RISC0_GROTH16_DIR`) and, for CUDA, the driver's JIT
-//!   cache; write access to a private temporary directory (`TMPDIR`, made at startup by [`prepare`])
-//!   and to the GPU caches the build needs (CUDA: risc0's Groth16 cache; Intel: the SYCL and
-//!   compute-runtime kernel caches); the GPU device nodes. Nothing else of the home directory;
+//!   cache; write access to a private temporary directory (`TMPDIR`, made at startup by [`prepare`]),
+//!   to its proofs' segment directory (`crate::segments`) and to the GPU caches the build needs
+//!   (CUDA: risc0's Groth16 cache; Intel: the SYCL and compute-runtime kernel caches); the GPU
+//!   device nodes. Nothing else of the home directory;
 //! - no signal to, or `/proc` access to, the miner or another worker.
 //!
 //! The one-time setup that needs the network (the `risc0-groth16` component's download in
@@ -111,6 +112,10 @@ mod imp {
             c.allow(dir, Rights::READ);
         }
         c.allow(tmp, Rights::WRITE);
+        // Its proofs' segment files (segments.rs), made at startup.
+        if let Some(dir) = crate::segments::dir() {
+            c.allow(dir, Rights::WRITE);
+        }
         // The risc0-groth16 component: rzup's home and the component itself.
         match std::env::var_os("RISC0_HOME") {
             Some(h) => {

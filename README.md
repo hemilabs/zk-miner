@@ -372,7 +372,23 @@ Worth knowing:
   the known deployment's, `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` proves an ELF whose image
   id isn't the job's program id. Each one turns off a guard against losing collateral.
 - **Rebuild every worker with the miner.** A worker built for another protocol version is
-  refused at start.
+  refused at start, and its proof system is not offered on that card. Workers in
+  `~/.zkminer/provers` are found before the ones shipped beside the miner: replace them too, or
+  remove them, when you upgrade.
+- **One job locks at most half the stake.** A submitter chooses a job's collateral rate (up to
+  500%) and its minimum collateral, and a forced release burns a share of what is locked. So a job
+  whose collateral at its maximum price is over `ZKMINER_MAX_JOB_COLLATERAL_FRACTION` (default
+  `0.5`) of the total stake is set aside, not claimed; `0` turns the cap off. (Witness jobs, which
+  come only from the callers `[witness] callers` lists, are not capped.)
+- **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
+  sha, bigint) by what they cost to prove, where the instruction count counted each as one.
+  Benchmarks saved by an older miner count SP1 instructions per second, which is close for code
+  without precompiles; run `zkminer benchmark` (again with `--calibrate` if you calibrated) to
+  record SP1 in gas.
+- **risc0 proofs write their segments to disk**, under `~/.zkminer/risc0-segments/<pid>` (mode
+  0700), not to the temporary directory: a long proof stages gigabytes there, which on a tmpfs
+  would be RAM the miner does not count. Keep room on the home filesystem. Each proof empties the
+  directory, and a worker that was killed has its directory removed when the next one starts.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
@@ -542,7 +558,7 @@ With `--stdin`, a READY line comes first, once the measure workers run (an SP1 o
 any request is read; a reader should send nothing before it:
 
 ```json
-{"schema":1,"ready":true,"backends":["risc0","sp1"],"zkminerVersion":"0.1.0","protocolVersion":11}
+{"schema":1,"ready":true,"backends":["risc0","sp1"],"zkminerVersion":"0.1.0","protocolVersion":15}
 ```
 
 (`backends`: those with a live measure worker, sorted.) A line that is not a request is answered
@@ -565,9 +581,10 @@ Reading the counts:
 
 - **Units differ by backend.** risc0's count is cycles with every segment padded to its power of two
   at the report's `po2`, plus a charge of 2^20 for each keccak proof request (a price, not cycles: about a 2^20
-  segment's proving time; doubled per step of a larger keccak po2). SP1's is
-  the RV64 instruction count, where a precompile (keccak, sha, ...) counts once. Never add or compare
-  the two.
+  segment's proving time; doubled per step of a larger keccak po2). SP1's is SP1's gas, which
+  weights each operation by what it costs to prove: about the instruction count for plain code, far
+  more for precompiles (keccak, sha, ...), which the instruction count counted once. Never add or
+  compare the two.
 - **po2.** risc0 counts depend on the segment size: a job proven on a small card (po2 16) has about
   1.8 times the po2-20 count. A report carries the `po2` of its figure, which is the lowest of the
   seven sizes unless the request was `singleRun`.

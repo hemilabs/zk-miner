@@ -477,15 +477,13 @@ pub fn redact_urls(text: &str) -> String {
     out
 }
 
-/// Whether `derived` (as a worker reports it) is `program_id`. risc0: the native order only, the one
-/// the deployed adapter verifies (see the risc0 worker's `image_id_matches`). SP1: either order, as
-/// the SP1 worker's prove-path gate accepts, since the on-chain order of a vkey hash is
-/// deployment-defined and a wrong ELF matches neither.
-pub fn program_id_matches(backend: &str, derived: &[u8; 32], program_id: &B256) -> bool {
-    if derived == &program_id.0 {
-        return true;
-    }
-    backend == BACKEND_SP1 && derived.iter().rev().eq(program_id.0.iter())
+/// Whether `derived` (as a worker reports it) is `program_id`: in the native order only, the one the
+/// chain verifies. risc0: the deployed adapter's (see the risc0 worker's `image_id_matches`). SP1: the
+/// verifier reads `programId` as `uint256(programVKey)`, the big-endian bytes32 the worker derives,
+/// and the SP1 worker's prove-path gate refuses any other order, so a reversed id would bind here and
+/// then never be proven.
+pub fn program_id_matches(derived: &[u8; 32], program_id: &B256) -> bool {
+    derived == &program_id.0
 }
 
 /// Classify a failed `execute_cycles` the way the miner's measure path does: typed transients first
@@ -1342,7 +1340,7 @@ impl Simulator {
                 }
             }
         };
-        if !program_id_matches(backend, &derived, &program_id) {
+        if !program_id_matches(&derived, &program_id) {
             let derived_hex = alloy::hex::encode(derived);
             // Read again: a long derivation outlives the client's cache, and the entry may have
             // changed meanwhile.
@@ -1930,16 +1928,15 @@ mod tests {
     }
 
     #[test]
-    fn risc0_binds_in_native_order_only_and_sp1_in_either() {
+    fn a_program_binds_in_the_native_order_only() {
         let pid = B256::from(std::array::from_fn::<u8, 32, _>(|i| i as u8));
         let native = pid.0;
         let mut reversed = native;
         reversed.reverse();
-        assert!(program_id_matches(BACKEND_RISC0, &native, &pid));
-        assert!(!program_id_matches(BACKEND_RISC0, &reversed, &pid));
-        assert!(program_id_matches(BACKEND_SP1, &native, &pid));
-        assert!(program_id_matches(BACKEND_SP1, &reversed, &pid));
-        assert!(!program_id_matches(BACKEND_SP1, &[0u8; 32], &pid));
+        assert!(program_id_matches(&native, &pid));
+        // Neither a risc0 image id nor an SP1 verifying-key hash binds byte-reversed.
+        assert!(!program_id_matches(&reversed, &pid));
+        assert!(!program_id_matches(&[0u8; 32], &pid));
     }
 
     #[test]
