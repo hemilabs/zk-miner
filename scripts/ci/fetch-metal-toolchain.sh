@@ -30,7 +30,8 @@ DMG_SHA256=9a7f61869f1ec662b69634db473f81d7b18f947e9cd81601d4b2825f903b6265
 COMPILER="Apple metal version 32023.922 (metalfe-32023.922.4)"
 
 dir=${1:?usage: fetch-metal-toolchain.sh <dir>}
-mkdir -p "$dir"; dir=$(cd "$dir" && pwd)
+# Physical path: hdiutil reports mount points with symlinks resolved (the reuse check below).
+mkdir -p "$dir"; dir=$(cd "$dir" && pwd -P)
 dmg=$dir/MetalToolchain-$BUILD.dmg
 mnt=$dir/mnt
 die() { echo "fetch-metal-toolchain: $*" >&2; exit 1; }
@@ -51,7 +52,10 @@ if [ ! -f "$dmg" ] || [ "$(sha "$dmg")" != "$DMG_SHA256" ]; then
   work=$(mktemp -d "$dir/.fetch.XXXXXX")
   trap 'rm -rf "$work"' EXIT
   echo "fetch-metal-toolchain: downloading Metal Toolchain $BUILD ($AAR_URL)" >&2
-  curl -fL --retry 5 --retry-delay 5 -C - -o "$work/tc.aar" "$AAR_URL" || die "download failed"
+  # A stalled transfer (seen: 0 bytes for 9 minutes) is aborted after 60 s under 100 kB/s and
+  # resumed (-C -), up to 5 times (B9-CI).
+  curl -fL --connect-timeout 30 --speed-limit 102400 --speed-time 60 --retry 5 --retry-delay 5 \
+    --retry-all-errors -C - -o "$work/tc.aar" "$AAR_URL" || die "download failed"
   [ "$(sha "$work/tc.aar")" = "$AAR_SHA256" ] || die "the archive's SHA-256 is $(sha "$work/tc.aar"), not $AAR_SHA256"
   aea decrypt -i "$work/tc.aar" -o "$work/plain.aar" -key-value "base64:$AAR_KEY" || die "aea decrypt failed"
   rm -f "$work/tc.aar"

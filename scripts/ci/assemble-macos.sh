@@ -52,6 +52,13 @@
 # - ZKMINER_VERSION      default [workspace.package].version of Cargo.toml
 # - ASSEMBLE_SKIP_BUILD=1  package target/release as it is (it must have been built by this script's
 #                        settings, which the checks verify)
+# - ASSEMBLE_BUILD_ONLY=1  stop after the build and its checks (minimum macOS, compiler), before the
+#                        archives and the kit (CI: tests run between the build and the packaging,
+#                        which then runs with ASSEMBLE_SKIP_BUILD=1; B9-CI)
+# - ASSEMBLE_ENV_OUT=<file>  write the build environment this script sets (the target rustflags,
+#                        METAL_TC) to <file> as export lines, so a later cargo call (CI's tests)
+#                        builds with the kit's settings (B9-CI)
+# - ASSEMBLE_ENV_ONLY=1  with ASSEMBLE_ENV_OUT: write it and stop, before the build (B9-CI)
 # Needs what Makefile.mac needs (RELEASE-DEPS.md): the Metal toolchain (metal, metallib, metal-tt),
 # the rzup Rust guest toolchain, protoc, python3, and a Metal device for the AOT dump tests.
 set -euo pipefail
@@ -131,6 +138,15 @@ else
   echo "== minimum macOS $macos_min (linker minos; Metal compiler $real_metal with -mmacosx-version-min=$macos_min, METAL_TC=$tc)"
 fi
 
+if [ -n "${ASSEMBLE_ENV_OUT:-}" ]; then
+  : > "$ASSEMBLE_ENV_OUT"
+  for v in CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS METAL_TC; do
+    [ -n "${!v:-}" ] && printf 'export %s=%q\n' "$v" "${!v}" >> "$ASSEMBLE_ENV_OUT"
+  done
+  echo "== build environment written to $ASSEMBLE_ENV_OUT"
+  [ "${ASSEMBLE_ENV_ONLY:-0}" != 1 ] || exit 0
+fi
+
 work=$(mktemp -d "${TMPDIR:-/tmp}/zkminer-macos-kit.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
@@ -172,6 +188,10 @@ if [ "$metal_version" != "$VALIDATED_METAL_COMPILER" ]; then
   metal_validated=no
 fi
 echo "== Metal compiler: $metal_version"
+if [ "${ASSEMBLE_BUILD_ONLY:-0}" = 1 ]; then
+  echo "== ASSEMBLE_BUILD_ONLY=1: built and checked; no archives, no kit"
+  exit 0
+fi
 
 echo "== offline Metal archives ($aot_arches)"
 aot=$work/metal-aot
