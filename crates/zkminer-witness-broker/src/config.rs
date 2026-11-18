@@ -155,6 +155,10 @@ use zkminer_witness::envelope::MethodSet;
 use crate::egress::{NetMode, Prefix, Role};
 
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1 << 20;
+/// The default `max_concurrency` of every endpoint.
+pub const DEFAULT_MAX_CONCURRENCY: u32 = 8;
+/// The default `[artifacts] max_requests_per_sec`.
+pub const DEFAULT_ARTIFACT_REQUESTS_PER_SEC: u32 = 2;
 /// The default `[[evm_rpc]] head_fresh_secs`: three block times of a 12-second chain.
 pub const DEFAULT_HEAD_FRESH_SECS: u64 = 36;
 /// The largest `head_fresh_secs` accepted: an hour-old head is no evidence of a healthy node.
@@ -445,14 +449,14 @@ fn d_charge() -> u64 {
     30
 }
 fn d_concurrency() -> u32 {
-    8
+    DEFAULT_MAX_CONCURRENCY
 }
 /// Three block times of a 12-second chain (Ethereum, Hemi).
 fn d_head_fresh() -> u64 {
     DEFAULT_HEAD_FRESH_SECS
 }
 fn d_artifact_rps() -> u32 {
-    2
+    DEFAULT_ARTIFACT_REQUESTS_PER_SEC
 }
 fn d_max_builder_bytes() -> u64 {
     4 << 20

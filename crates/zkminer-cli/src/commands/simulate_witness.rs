@@ -534,6 +534,9 @@ struct SimHost {
     store: Arc<Store>,
     /// This run's `maxGuestCycles` maximum (see [`CyclesReport::host_max_source`]).
     max_guest_cycles: u64,
+    /// A running miner holds `~/.zkminer/miner.lock`: every broker of this run uses half of each
+    /// endpoint's rates and concurrency, so the two share the operator's endpoints.
+    beside_a_miner: bool,
 }
 
 impl Drop for SimHost {
@@ -617,6 +620,13 @@ impl SimHost {
             },
         )
         .map_err(|e| anyhow::anyhow!("opening the throwaway retention store: {e}"))?;
+        let beside_a_miner = miner_running();
+        if beside_a_miner {
+            tracing::warn!(
+                "simulate: a running miner holds ~/.zkminer/miner.lock: this simulation's broker uses half of each \
+                 endpoint's configured rates and concurrency, which it shares with the miner's"
+            );
+        }
         Ok(SimHost {
             spawner,
             root,
@@ -628,6 +638,7 @@ impl SimHost {
             work,
             store: Arc::new(store),
             max_guest_cycles: host_max_guest_cycles(config, opts).0,
+            beside_a_miner,
         })
     }
 
@@ -643,12 +654,17 @@ impl SimHost {
         let dir = self.work.join(name);
         std::fs::create_dir_all(dir.join("spool"))
             .with_context(|| format!("creating {}", dir.display()))?;
-        let text = broker_config_for(
+        let mut text = broker_config_for(
             &broker_config.value,
             &broker_config.dir,
             alias,
             &dir.join("spool"),
         )?;
+        if self.beside_a_miner {
+            let mut v: toml::Value = toml::from_str(&text)?;
+            halve_endpoint_rates(&mut v);
+            text = toml::to_string(&v)?;
+        }
         let path = dir.join("broker.toml");
         write_private(&path, &text)?;
         Ok(path)
@@ -849,6 +865,69 @@ fn broker_config_for(
     }
     t.insert("spool_dir".into(), toml::Value::String(spool.display().to_string()));
     Ok(toml::to_string(&v)?)
+}
+
+/// Whether a running miner holds `~/.zkminer/miner.lock` (never created here).
+fn miner_running() -> bool {
+    dirs::home_dir().is_some_and(|h| lock_held(&h.join(".zkminer").join("miner.lock")))
+}
+
+/// Whether another open file holds an exclusive `flock` on `path` (a missing file is not held).
+fn lock_held(path: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) else {
+        return false;
+    };
+    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Halves every endpoint's rates and concurrency in a broker configuration: `max_concurrency` (from
+/// its default when unset), `max_requests_per_sec` (the artifact reader's from its default) and
+/// `max_units_per_minute`, each at least 1. An endpoint with no rate configured stays unpaced.
+fn halve_endpoint_rates(v: &mut toml::Value) {
+    use zkminer_witness_broker::config::{
+        DEFAULT_ARTIFACT_REQUESTS_PER_SEC, DEFAULT_MAX_CONCURRENCY,
+    };
+    let halve = |e: &mut toml::Value, key: &str, default: Option<u32>| {
+        if let Some(t) = e.as_table_mut() {
+            if let Some(n) = t
+                .get(key)
+                .and_then(|n| n.as_integer())
+                .or(default.map(i64::from))
+            {
+                t.insert(key.into(), toml::Value::Integer((n / 2).max(1)));
+            }
+        }
+    };
+    let Some(t) = v.as_table_mut() else { return };
+    for e in t
+        .get_mut("evm_rpc")
+        .and_then(|e| e.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        halve(e, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+        halve(e, "max_requests_per_sec", None);
+        halve(e, "max_units_per_minute", None);
+    }
+    for e in t
+        .get_mut("blob_mirror")
+        .and_then(|e| e.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        halve(e, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+    }
+    if let Some(a) = t.get_mut("artifacts") {
+        halve(a, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+        halve(
+            a,
+            "max_requests_per_sec",
+            Some(DEFAULT_ARTIFACT_REQUESTS_PER_SEC),
+        );
+        if let Some(m) = a.get_mut("mirror") {
+            halve(m, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+        }
+    }
 }
 
 /// Writes `text` to a new file only this user can read (a broker configuration may carry endpoint
@@ -1334,6 +1413,10 @@ fn coverage(binding: &BindingReport, expected: B256, source: Option<String>) -> 
         Some("NONE: expectedJournalHash is 0, so nothing binds the statement; any prover may prove any".to_string())
     } else if binding.mode == "full" {
         None
+    } else if h == Some(0) {
+        Some(
+            "a 0-byte header: every journal header starts with its 32-byte scheme word".to_string(),
+        )
     } else if let Some(h) = h.filter(|&h| h > binding.statement_bytes) {
         Some(format!("the header is {h} bytes, longer than the {}-byte statement", binding.statement_bytes))
     } else if !binding.header_free.is_empty() {
@@ -1680,6 +1763,15 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
             ),
             _ => bail!("a miner with this configuration would skip this job: {v}"),
         }
+    }
+    // The router's binding check passed (a mismatch is skipped above), but the binding may still
+    // leave header bytes free or its header's length unknown. A miner serves such a job; the
+    // requester should know, and --adversarial fails it.
+    if let Some(b) = report.binding.as_ref().filter(|b| !b.ok) {
+        eprintln!(
+            "zkminer simulate: the binding check failed (a miner serves the job all the same; --adversarial fails it): {}",
+            redact_urls(&b.warnings.join("; "))
+        );
     }
     // Served at some sizes only: the verdict is the prover's segment size, so say so.
     if let Some(note) = report
@@ -2265,6 +2357,21 @@ mod tests {
         let marker_only = zkminer_witness::binding::clear_marker(marker) ^ marker;
         let none = binding(marker_only, B256::ZERO, &statement, Some(160));
         assert!(coverage(&none, B256::ZERO, None).failure.unwrap().starts_with("NONE"));
+        // A 0-byte header pins nothing, whatever the binding: refused (the flag cannot be 0 either).
+        let zero = binding(
+            journal_fields_for_header(32, true).unwrap(),
+            keccak256(&header[..32]),
+            &statement,
+            Some(0),
+        );
+        assert!(
+            !zero.ok && zero.warnings.iter().any(|w| w.contains("0-byte header")),
+            "{zero:?}"
+        );
+        assert!(coverage(&zero, keccak256(&header[..32]), None)
+            .failure
+            .unwrap()
+            .contains("0-byte header"));
         // FULL pins everything, whatever H.
         let full = binding(B256::ZERO, B256::repeat_byte(3), &statement, None);
         assert!(coverage(&full, B256::repeat_byte(3), None).ok);
@@ -2516,6 +2623,62 @@ mod tests {
         );
         let art = a.path().join("./art.key").display().to_string();
         assert_eq!(v["artifacts"]["key_file"].as_str(), Some(art.as_str()));
+    }
+
+    /// Beside a running miner (it holds `~/.zkminer/miner.lock`) simulate's broker takes half of
+    /// each endpoint's rates and concurrency, which it shares with the miner's own broker.
+    #[test]
+    fn beside_a_running_miner_each_endpoints_rates_are_halved() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("miner.lock");
+        assert!(!lock_held(&lock), "no file, no miner");
+        let held = std::fs::File::create(&lock).unwrap();
+        assert!(!lock_held(&lock), "a file nobody locks");
+        held.lock().unwrap();
+        assert!(lock_held(&lock), "the miner's exclusive lock");
+        drop(held);
+        assert!(!lock_held(&lock), "a miner that exited");
+
+        let mut v: toml::Value = toml::from_str(
+            "spool_dir = \"/s\"\n[[evm_rpc]]\nalias = \"a\"\nmax_concurrency = 6\nmax_requests_per_sec = 50\n\
+             max_units_per_minute = 6000\n[[evm_rpc]]\nalias = \"b\"\n[[blob_mirror]]\nalias = \"m\"\nmax_concurrency = 1\n\
+             [artifacts]\nalias = \"h\"\n[artifacts.mirror]\nalias = \"am\"\n",
+        )
+        .unwrap();
+        halve_endpoint_rates(&mut v);
+        let a = &v["evm_rpc"][0];
+        assert_eq!(
+            (
+                a["max_concurrency"].as_integer(),
+                a["max_requests_per_sec"].as_integer()
+            ),
+            (Some(3), Some(25))
+        );
+        assert_eq!(a["max_units_per_minute"].as_integer(), Some(3000));
+        let b = &v["evm_rpc"][1];
+        assert_eq!(
+            b["max_concurrency"].as_integer(),
+            Some(4),
+            "from the default of 8"
+        );
+        assert!(
+            b.get("max_requests_per_sec").is_none(),
+            "an unpaced endpoint stays unpaced"
+        );
+        assert_eq!(
+            v["blob_mirror"][0]["max_concurrency"].as_integer(),
+            Some(1),
+            "never below 1"
+        );
+        assert_eq!(
+            v["artifacts"]["max_requests_per_sec"].as_integer(),
+            Some(1),
+            "from the default of 2"
+        );
+        assert_eq!(
+            v["artifacts"]["mirror"]["max_concurrency"].as_integer(),
+            Some(4)
+        );
     }
 
     #[test]

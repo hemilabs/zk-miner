@@ -168,7 +168,8 @@ enum Commands {
         max_guest_cycles: Option<u64>,
         /// With --descriptor, the journal header's length in bytes, which the binding must pin whole
         /// (a scheme-1 W declares it; give it for a W of another layout, or --adversarial fails).
-        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        /// At least 1: a header starts with its scheme word.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"], value_parser = header_bytes_arg)]
         header_bytes: Option<usize>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
         /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…", "singleRun": true} (the submitting
@@ -460,8 +461,9 @@ enum BindingCommand {
         /// The statement (the journal after any prefix): 0x hex or a file.
         #[arg(long)]
         statement: Option<String>,
-        /// The header's length in bytes (default: 32 × the words given).
-        #[arg(long)]
+        /// The header's length in bytes (default: 32 × the words given). At least 1: a header starts
+        /// with its scheme word.
+        #[arg(long, value_parser = header_bytes_arg)]
         header_bytes: Option<usize>,
         /// The job's assigned prover (default: the descriptor's): a NONE binding without one fails.
         #[arg(long)]
@@ -845,6 +847,16 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
 
 /// A `simulate` bound in seconds, clamped to `MIN_BOUND_SECS..=86400`: below the minimum a request's
 /// own overhead would fail every request; far above it, the watchdog's deadline arithmetic overflows.
+/// `--header-bytes`: a length of 0 would declare that the binding has no header to pin, which passes
+/// any binding; it is refused.
+fn header_bytes_arg(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("a journal header is never empty (it starts with its 32-byte scheme word): give its length".into()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn simulate_bound(flag: &str, secs: u64) -> std::time::Duration {
     const MAX_BOUND_SECS: u64 = 86_400;
     let min = commands::simulate::MIN_BOUND_SECS;
@@ -1037,5 +1049,40 @@ mod tests {
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--descriptor", "d.json", "--stdin"]).is_err());
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--stdin", "--builder", "b.wasm"]).is_err());
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--descriptor", "d", "--flips", "3"]).is_err());
+        // A header of 0 bytes pins nothing: refused, by simulate and by `binding check`.
+        assert!(Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--descriptor",
+            "d",
+            "--header-bytes",
+            "0"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--descriptor",
+            "d",
+            "--header-bytes",
+            "32"
+        ])
+        .is_ok());
+        let check = |h: &str| {
+            Cli::try_parse_from([
+                "zkminer",
+                "witness",
+                "binding",
+                "check",
+                "--journal-fields",
+                &format!("0x{}", "00".repeat(32)),
+                "--statement",
+                "0x00",
+                "--header-bytes",
+                h,
+            ])
+        };
+        assert!(check("0").is_err());
+        assert!(check("160").is_ok());
     }
 }

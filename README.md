@@ -715,7 +715,10 @@ prove resources; the builder's availability through its URIs or a mirror with `-
 registry's ELF with `--elf`; a card-derived cycle maximum without `--max-guest-cycles`). The
 `sys_rand` seed is the public rule's, as a miner's (`sysRandRule`), and a journal-prefix job is
 reproduced exactly only with the real `jobId` (the file's `jobId`) and `--prover`. It exits non-zero
-when a miner with this configuration would skip the job. In `--job`/`--stdin` mode a witness job on
+when a miner with this configuration would skip the job: a journal the router's binding check
+refuses included (`BindingMismatch`). A binding the router accepts but that leaves header bytes
+free, or whose header's length is unknown, is reported (`binding.ok`, `binding.warnings`, and a
+line on stderr) with exit 0, since a miner serves it; `--adversarial` fails it. In `--job`/`--stdin` mode a witness job on
 chain is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
 
 **`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
