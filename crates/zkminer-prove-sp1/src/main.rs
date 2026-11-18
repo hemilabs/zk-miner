@@ -2701,12 +2701,38 @@ fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Execute the guest WITHOUT proving, returning its true cycle count — the pre-claim sizing path for
-/// SP1, the analogue of the risc0 worker's `run_execute`. The count is SP1's `total_instruction_count`,
-/// the SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
+/// What an SP1 execution costs to prove, in the unit every SP1 figure the host sizes with is in (the
+/// measurement, a proof's reported cycles, the benchmark throughput): SP1's gas, which weights each
+/// operation by what it costs to prove. The instruction count counts a precompile call (keccak,
+/// sha, bigint) as one instruction, though it proves as far more, so a guest that loops one measured
+/// cheap, was claimed, and overran its proving budget on every attempt. For code without precompiles
+/// the two are close (within 0.89 to 1.06 of each other on the benchmark programs). The instruction
+/// count only where gas was not computed (it is unless an execution turns it off, which none here
+/// does).
+fn sp1_proving_cost(report: &sp1_sdk::ExecutionReport) -> u64 {
+    report
+        .gas()
+        .unwrap_or_else(|| report.total_instruction_count())
+}
+
+/// A benchmark row's cycles: [`sp1_proving_cost`], except `zkop-mix`'s, whose zkOP/s score divides
+/// `ZKOP_MIX_SP1_CYCLES`, an instruction count, by its proof's time and checks the row against it.
+/// That row sizes nothing (the host leaves it out of every throughput), so its unit is the score's.
+fn benchmark_cycles(program: &str, report: &sp1_sdk::ExecutionReport) -> u64 {
+    if program == BENCH_ZKOP_MIX {
+        report.total_instruction_count()
+    } else {
+        sp1_proving_cost(report)
+    }
+}
+
+/// Execute the guest WITHOUT proving, returning its proving cost — the pre-claim sizing path for
+/// SP1, the analogue of the risc0 worker's `run_execute`. The figure is [`sp1_proving_cost`], the
+/// SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
 /// feeds the deadline/look-ahead math in matching units. This lets the miner size an SP1 job on a
-/// MEASURED cycle count instead of the submitter-declared `expectedCycles`, closing the input-flood
-/// under-sizing vector for SP1.
+/// MEASURED cost instead of the submitter-declared `expectedCycles`, closing the input-flood
+/// under-sizing vector for SP1, and a precompile-heavy guest no longer measures as cheap as its
+/// instruction count.
 ///
 /// Runs on a lightweight `CpuProver`, never the CUDA prover: SP1 execution is pure CPU emulation and
 /// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
@@ -2893,7 +2919,8 @@ fn run_execute_sp1(
     // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
     // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
-    // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
+    // `opcode_counts`, i.e. `total_instruction_count()`, and gas is what the job is sized by
+    // (`sp1_proving_cost`). So we do NOT disable it.
     let (run_result, peak_host_bytes) =
         with_peak_rss_sampling(|| runtime.block_on(cpu.inner().execute(elf, stdin, context)));
     let (public_values, committed_digest, report) =
@@ -2907,7 +2934,7 @@ fn run_execute_sp1(
     // instead of learning either only after a full proof is wasted. `.to_vec()` matches how
     // `run_proof` extracts the journal.
     Ok((
-        report.total_instruction_count(),
+        sp1_proving_cost(&report),
         public_values.to_vec(),
         started.elapsed().as_secs_f64(),
         peak_host_bytes,
@@ -3030,7 +3057,7 @@ fn run_proof(
         exec = exec.cycle_limit(limit);
     }
     let (public_values, report) = exec.run().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let cycles = report.total_instruction_count();
+    let cycles = sp1_proving_cost(&report);
 
     // Get-or-create the proving key for this ELF. The key depends only on the
     // program (not the input), so it's cached and reused across proofs — no per-proof
@@ -3278,7 +3305,7 @@ fn benchmark_program(
         .execute(Elf::from(elf), stdin.clone())
         .run()
         .map_err(|e| anyhow::anyhow!("execute failed: {e}"))?;
-    let cycles = report.total_instruction_count();
+    let cycles = benchmark_cycles(name, &report);
 
     // Key setup OUTSIDE the timed region. It is not proving, and production caches the key per ELF
     // (`pk_cache` in `run_worker_loop`) so never pays it per proof. In practice the cost is
@@ -4610,6 +4637,54 @@ mod pk_cache_tests {
         // And the measurement itself takes it.
         super::run_execute_sp1(cpu, super::FIBONACCI_SP1_GUEST_ELF, &1000u32.to_le_bytes())
             .unwrap();
+    }
+
+    /// A job is sized by what it costs to prove: a guest that loops precompiles (a sha256, a keccak
+    /// and a bigint call per round) measures well above its instruction count (1.94 times, measured),
+    /// where the instruction count made it look as cheap as plain code, which measures about its
+    /// instruction count (fibonacci 1.04 times). The `zkop-mix` scoring row keeps the instruction
+    /// count its score is defined in.
+    #[test]
+    fn jobs_are_sized_by_proving_cost() {
+        // Built beside the embedded guests, but not embedded (and not on every platform).
+        let Some(interleave) = option_env!("SP1_ELF_precompile-interleave-sp1-guest")
+            .and_then(|p| std::fs::read(p).ok())
+            .filter(|elf| !elf.is_empty())
+        else {
+            eprintln!("skipping: no precompile-interleave guest in this build");
+            return;
+        };
+        use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+        let cpu = test_cpu_prover();
+        let execute = |elf: &[u8], input: u32| {
+            let mut stdin = SP1Stdin::new();
+            stdin.write_slice(&input.to_le_bytes());
+            cpu.execute(Elf::from(elf.to_vec()), stdin).run().unwrap().1
+        };
+        let precompiles = execute(&interleave, 300);
+        let plain = execute(super::FIBONACCI_SP1_GUEST_ELF, 1000);
+        let ratio = |r: &sp1_sdk::ExecutionReport| {
+            super::sp1_proving_cost(r) as f64 / r.total_instruction_count() as f64
+        };
+        assert!(
+            ratio(&precompiles) > 1.5 * ratio(&plain),
+            "precompiles cost {:.2}x their instructions, plain code {:.2}x",
+            ratio(&precompiles),
+            ratio(&plain)
+        );
+        // What the measurement reports, for the host to size the job by.
+        let (measured, ..) =
+            super::run_execute_sp1(cpu, &interleave, &300u32.to_le_bytes()).unwrap();
+        assert_eq!(measured, super::sp1_proving_cost(&precompiles));
+        assert!(measured > precompiles.total_instruction_count());
+        assert_eq!(
+            super::benchmark_cycles(super::BENCH_ZKOP_MIX, &plain),
+            plain.total_instruction_count()
+        );
+        assert_eq!(
+            super::benchmark_cycles(super::BENCH_SHA256_CHAIN, &precompiles),
+            super::sp1_proving_cost(&precompiles)
+        );
     }
 
     /// A Blake3 commitment (what a guest built with `sp1-zkvm`'s `blake3` feature commits) is
