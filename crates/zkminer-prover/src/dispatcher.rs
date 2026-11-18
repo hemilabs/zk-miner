@@ -1286,6 +1286,12 @@ struct CardOccupancy {
     /// Kept back from what a worker may be sized or admitted against: on Windows, room for another
     /// program sharing the card to grow into (`with_windows_growth_margin`). 0 elsewhere.
     growth_margin: u64,
+    /// The card's process list could not be read (`nvidia-smi` timed out or refused, as it can
+    /// while a large context is torn down), so nothing on it is attributed and our own memory reads
+    /// as somebody else's. Such a reading still bounds what is free, but it is no evidence that
+    /// another program shares the card (`with_windows_growth_margin`) or keeps a proof off it
+    /// (`WorkerPool::note_risc0_card_short`).
+    apps_unread: bool,
 }
 
 impl CardOccupancy {
@@ -1480,17 +1486,23 @@ fn read_card_occupancy(
     // the conservative direction. An empty list is also the normal answer for an idle card, so the
     // two cannot be told apart here and must be safe either way.
     let apps = nvidia_smi_query("--query-compute-apps=pid,used_gpu_memory", device_index)
-        .map(|out| parse_compute_apps(&out))
-        .unwrap_or_default();
+        .map(|out| parse_compute_apps(&out));
+    let apps_unread = apps.is_none();
+    let apps = apps.unwrap_or_default();
     #[cfg(windows)]
-    let apps = crate::windows_gpu_memory::fill_unreported(apps);
+    let apps = crate::windows_gpu_memory::fill_unreported(
+        apps,
+        card_pci_bus_id(device_index).as_deref(),
+        used_mib,
+    );
     let miner = std::process::id();
     let retired = retired_groups();
     let owner = |pid: u32| owner_of(pid, miner, slot_pids, &retired);
     let known = apps_we_can_attribute(apps, &owner)?;
-    let card = CardOccupancy::from_readings(used_mib, total_mib, reserved_mib, &known, owner);
+    let mut card = CardOccupancy::from_readings(used_mib, total_mib, reserved_mib, &known, owner);
+    card.apps_unread = apps_unread;
     #[cfg(windows)]
-    let card = with_windows_growth_margin(card, device_index);
+    let card = with_windows_growth_margin(card, device_index, !retired_groups().is_empty());
     Some(card)
 }
 
@@ -1513,11 +1525,16 @@ const WINDOWS_SHARED_CARD_THRESHOLD: u64 = 64 * 1024 * 1024;
 
 /// Applies the margin to a card seen shared within [`WINDOWS_SHARED_CARD_HOLD`]. A card is SEEN
 /// shared only on a reading with no memory of ours on its way in or out (`draining`,
-/// `unattributed`): the separate queries a reading is made of can then put some of ours under
-/// "foreign" for a moment, and the hold would make that moment last minutes. Nothing with the
+/// `unattributed`, a worker retired within `RETIRED_GROUP_WINDOW`) and whose process list was
+/// read (`apps_unread`): otherwise some of ours can read as "foreign" for a moment, and the hold
+/// would make that moment last minutes. Nothing with the
 /// free-VRAM checks off (`discovery::free_vram_checks_off`).
 #[cfg(windows)]
-fn with_windows_growth_margin(mut card: CardOccupancy, device_index: u32) -> CardOccupancy {
+fn with_windows_growth_margin(
+    mut card: CardOccupancy,
+    device_index: u32,
+    recently_retired: bool,
+) -> CardOccupancy {
     if crate::discovery::free_vram_checks_off() {
         return card;
     }
@@ -1527,6 +1544,8 @@ fn with_windows_growth_margin(mut card: CardOccupancy, device_index: u32) -> Car
     if card.foreign() > WINDOWS_SHARED_CARD_THRESHOLD
         && card.draining == 0
         && card.unattributed == 0
+        && !card.apps_unread
+        && !recently_retired
     {
         seen.insert(device_index, Instant::now());
     }
@@ -1548,6 +1567,30 @@ static WINDOWS_SHARED_SEEN: Mutex<std::collections::BTreeMap<u32, Instant>> =
 
 #[cfg(windows)]
 const WINDOWS_SHARED_CARD_HOLD: Duration = Duration::from_secs(600);
+
+/// The PCI address of the card at `nvidia-smi` index `device_index`, normalized: read once and
+/// kept, as an index names the same card for the life of the process. For matching the card to its
+/// Windows adapter (`windows_gpu_memory::fill_unreported`).
+#[cfg(windows)]
+fn card_pci_bus_id(device_index: u32) -> Option<String> {
+    static KNOWN: Mutex<std::collections::BTreeMap<u32, String>> =
+        Mutex::new(std::collections::BTreeMap::new());
+    if let Some(pci) = KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&device_index)
+    {
+        return Some(pci.clone());
+    }
+    let pci = nvidia_smi_query("--query-gpu=pci.bus_id", device_index)
+        .map(|out| crate::discovery::normalize_pci_bus_id(out.trim()))
+        .filter(|pci| !pci.is_empty())?;
+    KNOWN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(device_index, pci.clone());
+    Some(pci)
+}
 
 /// How many charges of `each` bytes fit in `room` (all of it when a charge is 0).
 fn staging_capacity(room: u64, each: u64) -> usize {
@@ -1870,11 +1913,13 @@ fn oom_may_be_recorded(admitted_foreign: Option<u64>, foreign_now: Option<u64>) 
 /// it at once.
 pub const RISC0_SHORT_FOR: Duration = Duration::from_secs(300);
 
-/// A risc0 slot short of VRAM: until when, what its proof needs, and whether a check is reading it.
+/// A risc0 slot short of VRAM: until when, what its proof needs at which segment size, and whether
+/// a check is reading it.
 #[derive(Debug, Clone, Copy)]
 struct Risc0Short {
     until: Instant,
     need: u64,
+    po2: u8,
     checking: bool,
 }
 
@@ -2293,6 +2338,9 @@ pub struct WorkerPool {
     /// (`check_vram_budget`), to tell an out-of-memory the size caused from one another program's
     /// growth caused (`lower_sp1_shard_cap`).
     admitted_foreign: Mutex<HashMap<String, u64>>,
+    /// Tests only: card readings `read_card` returns instead of reading a card, by slot key.
+    #[cfg(test)]
+    test_cards: Mutex<HashMap<String, CardOccupancy>>,
     /// Set by `close` when the process is exiting: from then on no worker is spawned and no room is
     /// made. Without it, a dispatch in flight could respawn a worker after `shutdown_all` had swept
     /// the slots — and that window is up to tens of seconds, because
@@ -2388,6 +2436,8 @@ impl WorkerPool {
             risc0_short: Mutex::new(HashMap::new()),
             sp1_slot_caps: Mutex::new(HashMap::new()),
             admitted_foreign: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_cards: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
             shm_ledger: crate::memory::MemoryLedger::default(),
@@ -2514,7 +2564,10 @@ impl WorkerPool {
                 PendingSp1Cap {
                     cap: lower,
                     program,
-                    retry_here: true,
+                    // Its retry belongs here only if the size ran out: when another program's
+                    // memory grew, that memory is likely still here, and the retry is better
+                    // elsewhere.
+                    retry_here: record,
                     record,
                     previous,
                     previous_cap,
@@ -2663,11 +2716,20 @@ impl WorkerPool {
     /// little VRAM free, and no check since (`recheck_risc0_short`) has found the room. Each job
     /// claimed meanwhile would wait for that memory and, on a single card, be released. A map
     /// lookup: the claim side calls it every tick.
-    pub fn risc0_card_short(&self, key: &str) -> bool {
-        self.risc0_short
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(key)
+    ///
+    /// `po2` is the card's segment size now: a mark made for another (the operator, a calibration
+    /// or a re-benchmark has changed it since) is for a proof this card no longer runs, and is
+    /// dropped.
+    pub fn risc0_card_short(&self, key: &str, po2: u8) -> bool {
+        let mut short = self.risc0_short.lock().unwrap_or_else(|e| e.into_inner());
+        match short.get(key) {
+            Some(s) if s.po2 == po2 => true,
+            Some(_) => {
+                short.remove(key);
+                false
+            }
+            None => false,
+        }
     }
 
     /// The short risc0 slots whose [`RISC0_SHORT_FOR`] has run out and that no check is reading
@@ -2740,7 +2802,7 @@ impl WorkerPool {
         Some(free >= need)
     }
 
-    fn note_risc0_card_short(&self, key: &str, need: u64) {
+    fn note_risc0_card_short(&self, key: &str, need: u64, po2: u8) {
         let was = self
             .risc0_short
             .lock()
@@ -2750,6 +2812,7 @@ impl WorkerPool {
                 Risc0Short {
                     until: Instant::now() + RISC0_SHORT_FOR,
                     need,
+                    po2,
                     checking: false,
                 },
             );
@@ -7755,6 +7818,16 @@ impl WorkerPool {
     /// with "ours, unattributed". It is never a candidate for recycling: only same-card siblings are,
     /// because only they are behind the guard we hold.
     fn read_card(&self, key: &str) -> Option<CardOccupancy> {
+        #[cfg(test)]
+        if let Some(card) = self
+            .test_cards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+        {
+            return Some(card);
+        }
         let slot_pids: HashMap<u32, String> = self
             .workers
             .iter()
@@ -8258,8 +8331,8 @@ impl WorkerPool {
             tracing::warn!("not putting work on {key}: {shortage}");
             // Room was made and it still does not fit: claim no more risc0 jobs for this card a
             // while (`risc0_card_short`), as each would wait here and be released.
-            if risc0_proof {
-                self.note_risc0_card_short(key, needed);
+            if risc0_proof && !card.apps_unread {
+                self.note_risc0_card_short(key, needed, risc0_po2.unwrap_or_default());
             }
             return Err(anyhow::Error::new(shortage));
         }
@@ -9859,10 +9932,14 @@ mod tests {
         // reading, and does not hold the card short on none.
         let key = "risc0:rocm:7";
         let pool = pool_with_keys(&[key]);
-        assert!(!pool.risc0_card_short(key));
-        pool.note_risc0_card_short(key, 8 << 30);
-        assert!(pool.risc0_card_short(key));
-        assert!(!pool.risc0_card_short("risc0:rocm:6"));
+        assert!(!pool.risc0_card_short(key, 19));
+        pool.note_risc0_card_short(key, 8 << 30, 19);
+        assert!(pool.risc0_card_short(key, 19));
+        assert!(!pool.risc0_card_short("risc0:rocm:6", 19));
+        // A mark made for another segment size is dropped.
+        pool.note_risc0_card_short("risc0:rocm:5", 8 << 30, 19);
+        assert!(!pool.risc0_card_short("risc0:rocm:5", 18));
+        assert!(!pool.risc0_card_short("risc0:rocm:5", 19));
         // Not due within its window.
         assert!(pool.risc0_short_due().is_empty());
         pool.risc0_short.lock().unwrap().get_mut(key).unwrap().until =
@@ -9870,9 +9947,9 @@ mod tests {
         // Due once, and short until the check has read the card (the claim side never reads it).
         assert_eq!(pool.risc0_short_due(), vec![key.to_string()]);
         assert!(pool.risc0_short_due().is_empty());
-        assert!(pool.risc0_card_short(key));
+        assert!(pool.risc0_card_short(key, 19));
         pool.recheck_risc0_short(key);
-        assert!(!pool.risc0_card_short(key));
+        assert!(!pool.risc0_card_short(key, 19));
     }
 
     #[test]
@@ -9895,19 +9972,24 @@ mod tests {
             _ => PidOwner::Outside,
         };
         // Idle and headless: the whole figure.
-        let alone =
-            with_windows_growth_margin(CardOccupancy::from_readings(0, 12_282, 272, &[], ours), 11);
+        let alone = with_windows_growth_margin(
+            CardOccupancy::from_readings(0, 12_282, 272, &[], ours),
+            11,
+            false,
+        );
         assert_eq!(alone.available_to("risc0:cuda:1"), (12_282 - 272) * MIB);
         // Only our own worker on it: still the whole figure.
         let ours_only = with_windows_growth_margin(
             CardOccupancy::from_readings(1_806, 12_282, 272, &[(200, 1_806)], ours),
             12,
+            false,
         );
         assert_eq!(ours_only.available_to("risc0:cuda:1"), (12_282 - 272) * MIB);
         // A display holding 300 MiB: 1 GiB more is kept back, so SP1 sizes for 134M there.
         let shared = with_windows_growth_margin(
             CardOccupancy::from_readings(300, 12_282, 272, &[], ours),
             13,
+            false,
         );
         assert_eq!(
             shared.available_to("sp1:cuda:1"),
@@ -9929,6 +10011,7 @@ mod tests {
         let dipped = with_windows_growth_margin(
             CardOccupancy::from_readings(40, 12_282, 272, &[], ours),
             13,
+            false,
         );
         assert_eq!(
             dipped.available_to("sp1:cuda:1"),
@@ -9938,6 +10021,7 @@ mod tests {
         let noise = with_windows_growth_margin(
             CardOccupancy::from_readings(40, 12_282, 272, &[], ours),
             14,
+            false,
         );
         assert_eq!(noise.available_to("sp1:cuda:1"), (12_282 - 272 - 40) * MIB);
     }

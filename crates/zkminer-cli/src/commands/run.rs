@@ -5881,11 +5881,14 @@ fn retry_pin_after(
     }
 }
 
-/// Whether a prove error is a refusal before the proof started on its card: short of GPU or host
-/// memory at admission. Matched on the type, never the text.
+/// Whether a prove error is a refusal before the proof started on its card that a retry pin should
+/// outlast: short of GPU memory our own memory holds (the old server's still coming back), or of
+/// host memory at admission. Short of GPU memory another program holds is not: that card is then
+/// excluded, as any other, rather than waited on until the job is released while another card
+/// could prove it. Matched on the type, never the text.
 fn refused_before_start(e: &anyhow::Error) -> bool {
     e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
-        .is_some()
+        .is_some_and(|s| s.ours_in_the_way)
         || e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
             .is_some_and(|h| !h.attempted)
 }
@@ -7531,7 +7534,7 @@ async fn miner_brain(
             for key in pool.risc0_short_due() {
                 tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));
             }
-            risc0_cards.retain(|card| !pool.risc0_card_short(&card.slot));
+            risc0_cards.retain(|card| !pool.risc0_card_short(&card.slot, card.po2));
         }
         let risc0_cards_short = risc0_cards_before - risc0_cards.len();
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
@@ -8078,9 +8081,9 @@ async fn miner_brain(
                         {
                             last_no_risc0_card_warn = Some(now);
                             if risc0_cards_short > 0 {
-                                let detail = "Not claiming risc0 jobs: too little VRAM is free on \
-                                              every risc0 card here for its proof's segment size; \
-                                              each card is checked again every 5 minutes.";
+                                let detail = "Not claiming risc0 jobs: every risc0 card here \
+                                              with a job size has too little VRAM free for it; \
+                                              each is checked again every 5 minutes.";
                                 tracing::warn!("{detail}");
                                 state
                                     .write()
@@ -8104,7 +8107,7 @@ async fn miner_brain(
                         declines.note(
                             jid,
                             if risc0_cards_short > 0 {
-                                "every risc0 card is short of free VRAM"
+                                "no risc0 card with a size has the VRAM free for it"
                             } else {
                                 "no card has a risc0 job size"
                             },
@@ -11281,13 +11284,8 @@ async fn process_job_lifecycle(
                     if let Some(shortage) =
                         e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
                     {
-                        // Not the card an SP1 retry is pinned to: it holds the smaller size the
-                        // job needs, and its own memory coming back is what it waits for.
-                        let pinned = retry_card
-                            .as_ref()
-                            .is_some_and(|(slot, _)| used_slot.as_deref() == Some(slot.as_str()));
                         if let Some(k) = used_slot.clone() {
-                            if !shortage.ours_in_the_way && !pinned && !excluded.contains(&k) {
+                            if !shortage.ours_in_the_way && !excluded.contains(&k) {
                                 excluded.push(k);
                             }
                         }

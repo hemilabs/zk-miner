@@ -6,42 +6,43 @@
 //! process's video memory, in the `GPU Process Memory` performance counters Task Manager shows:
 //! one instance per process and adapter, `pid_<pid>_luid_<luid>_phys_<n>`, whose `Dedicated
 //! Usage` is the device memory that process holds there.
+//!
+//! Only the card being read counts: a process holds memory on each adapter it uses (our SP1 worker
+//! keeps every card visible to CUDA, so it can hold a context on a card it does not prove on), and
+//! crediting it with its total on each would read another card's memory as ours here, hiding
+//! another program's and overstating what is free. The card is matched by PCI address to its
+//! adapter LUID (`d3dkmt::adapters`), the id the counters name.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 
-/// Device memory each process holds, in MiB, summed over the adapters it uses. `None` when the
-/// counters cannot be read.
-///
-/// Summed over adapters rather than matched to one card: `nvidia-smi` gives no adapter LUID to
-/// match by, and a worker uses only the card it was started for (`CUDA_VISIBLE_DEVICES`), so its
-/// figure elsewhere is zero. The sum is used only for processes `nvidia-smi` lists on the card
-/// being read.
-pub(crate) fn dedicated_mib_by_pid() -> Option<HashMap<u32, u64>> {
-    let mut by_pid: HashMap<u32, u64> = HashMap::new();
-    for (instance, bytes) in pdh::read_counter_array(r"\GPU Process Memory(*)\Dedicated Usage")? {
-        if let Some(pid) = pid_of_instance(&instance) {
-            let held = by_pid.entry(pid).or_insert(0);
-            *held = held.saturating_add(bytes);
-        }
-    }
-    const MIB: u64 = 1024 * 1024;
-    Some(
-        by_pid
-            .into_iter()
-            .map(|(pid, bytes)| (pid, bytes.div_ceil(MIB)))
-            .collect(),
-    )
+const MIB: u64 = 1024 * 1024;
+
+/// An adapter LUID, as Windows' counters spell it: `luid_0x<high>_0x<low>`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct AdapterLuid {
+    pub high: u32,
+    pub low: u32,
 }
 
-/// Fills in the memory `nvidia-smi` left unreported, from the counters. A process the counters
-/// list nothing for holds no device memory. If the counters cannot be read, the rows are returned
-/// as they were.
-pub(crate) fn fill_unreported(apps: Vec<(u32, Option<u64>)>) -> Vec<(u32, Option<u64>)> {
+/// Fills in the memory `nvidia-smi` left unreported, from the counters, for the card at PCI address
+/// `pci_bus_id` (normalized, `0000:03:00.0`) whose `nvidia-smi` `memory.used` is `used_mib`. A
+/// process the counters list nothing for ON THIS CARD holds no device memory here.
+///
+/// When the card cannot be matched to an adapter (no PCI address, no single adapter at it, its
+/// adapter's own figure far from `used_mib` even after resolving again) or the counters cannot be
+/// read, the rows are returned as they were: one of ours left unreported makes the reading "no
+/// opinion" (`apps_we_can_attribute`), the safe answer, where crediting a process with what it
+/// holds on every card would not be.
+pub(crate) fn fill_unreported(
+    apps: Vec<(u32, Option<u64>)>,
+    pci_bus_id: Option<&str>,
+    used_mib: u64,
+) -> Vec<(u32, Option<u64>)> {
     if apps.iter().all(|(_, mib)| mib.is_some()) {
         return apps;
     }
-    let Some(held) = dedicated_mib_by_pid() else {
+    let Some(held) = pci_bus_id.and_then(|pci| dedicated_mib_on_card(pci, used_mib)) else {
         return apps;
     };
     apps.into_iter()
@@ -54,14 +55,230 @@ pub(crate) fn fill_unreported(apps: Vec<(u32, Option<u64>)>) -> Vec<(u32, Option
         .collect()
 }
 
-/// The pid in a `GPU Process Memory` instance name, `pid_<pid>_luid_..._phys_<n>`.
-fn pid_of_instance(instance: &str) -> Option<u32> {
-    instance
-        .strip_prefix("pid_")?
-        .split('_')
-        .next()?
-        .parse()
-        .ok()
+/// Device memory each process holds on the card at `pci_bus_id`, in MiB: `None` when the card
+/// cannot be matched to one adapter whose own figure agrees with `used_mib`, or the counters cannot
+/// be read. A LUID can change (a driver reset), so a disagreement resolves once more before giving
+/// up.
+fn dedicated_mib_on_card(pci_bus_id: &str, used_mib: u64) -> Option<HashMap<u32, u64>> {
+    for _ in 0..2 {
+        let luid = d3dkmt::adapters().and_then(|a| luid_for_pci(&a, pci_bus_id))?;
+        let processes = pdh::read_counter_array(r"\GPU Process Memory(*)\Dedicated Usage")?;
+        let adapters = pdh::read_counter_array(r"\GPU Adapter Memory(*)\Dedicated Usage")?;
+        let (by_pid, adapter_mib) = on_adapter(&processes, &adapters, luid);
+        if adapter_mib.is_some_and(|a| agrees_with_smi(a, used_mib)) {
+            return Some(by_pid);
+        }
+    }
+    None
+}
+
+/// Whether an adapter's own `Dedicated Usage` (MiB) is the same reading as `nvidia-smi`'s
+/// `memory.used`: within 256 MiB or 5%, the two being taken moments apart.
+fn agrees_with_smi(adapter_mib: u64, smi_used_mib: u64) -> bool {
+    adapter_mib.abs_diff(smi_used_mib) <= (smi_used_mib / 20).max(256)
+}
+
+/// `(pid, luid, phys)` from a `GPU Process Memory` instance `pid_<pid>_luid_0x<8>_0x<8>_phys_<n>`,
+/// or `(None, luid, phys)` from a `GPU Adapter Memory` one `luid_..._phys_<n>`. The hex comes in
+/// either case (PDH gives upper, `Get-Counter` lower); a trailing `#k` PDH adds to a duplicate name
+/// is ignored.
+fn parse_instance(name: &str) -> Option<(Option<u32>, AdapterLuid, u32)> {
+    let lower = name.to_ascii_lowercase();
+    let (pid, rest) = match lower.strip_prefix("pid_") {
+        Some(r) => {
+            let (p, r) = r.split_once('_')?;
+            (Some(p.parse().ok()?), r)
+        }
+        None => (None, lower.as_str()),
+    };
+    let rest = rest.strip_prefix("luid_0x")?;
+    let (high, rest) = rest.split_once("_0x")?;
+    let (low, rest) = rest.split_once("_phys_")?;
+    let phys: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    Some((
+        pid,
+        AdapterLuid {
+            high: u32::from_str_radix(high, 16).ok()?,
+            low: u32::from_str_radix(low, 16).ok()?,
+        },
+        phys.parse().ok()?,
+    ))
+}
+
+/// The one adapter at `pci` (`0000:bb:dd.f`) among `(luid, bus, device, function)`: `None` unless
+/// exactly one is. The PCI segment must be 0 (an adapter address carries none), and a software
+/// adapter's all-ones address never matches.
+fn luid_for_pci(adapters: &[(AdapterLuid, u32, u32, u32)], pci: &str) -> Option<AdapterLuid> {
+    let mut hits = adapters.iter().filter(|(_, b, d, f)| {
+        *b <= 255 && *d <= 31 && *f <= 7 && format!("0000:{b:02x}:{d:02x}.{f:x}") == pci
+    });
+    let first = hits.next()?.0;
+    hits.next().is_none().then_some(first)
+}
+
+/// MiB each pid holds on `luid`, summed over its `phys_<n>` parts, and the adapter's own figure in
+/// MiB, if listed.
+fn on_adapter(
+    processes: &[(String, u64)],
+    adapters: &[(String, u64)],
+    luid: AdapterLuid,
+) -> (HashMap<u32, u64>, Option<u64>) {
+    let mut by_pid: HashMap<u32, u64> = HashMap::new();
+    for (name, bytes) in processes {
+        if let Some((Some(pid), l, _)) = parse_instance(name) {
+            if l == luid {
+                let held = by_pid.entry(pid).or_insert(0);
+                *held = held.saturating_add(*bytes);
+            }
+        }
+    }
+    let mut adapter: Option<u64> = None;
+    for (name, bytes) in adapters {
+        if let Some((None, l, _)) = parse_instance(name) {
+            if l == luid {
+                adapter = Some(adapter.unwrap_or(0).saturating_add(*bytes));
+            }
+        }
+    }
+    (
+        by_pid
+            .into_iter()
+            .map(|(pid, bytes)| (pid, bytes.div_ceil(MIB)))
+            .collect(),
+        adapter.map(|bytes| bytes.div_ceil(MIB)),
+    )
+}
+
+/// Every display adapter's LUID and PCI address, from the kernel thunks D3D itself uses (no admin).
+mod d3dkmt {
+    use super::{c_void, AdapterLuid};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Luid {
+        low_part: u32,
+        high_part: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct AdapterInfo {
+        h_adapter: u32,
+        luid: Luid,
+        num_of_sources: u32,
+        precise_present_regions_preferred: i32,
+    }
+
+    #[repr(C)]
+    struct EnumAdapters2 {
+        num_adapters: u32,
+        p_adapters: *mut AdapterInfo,
+    }
+
+    #[repr(C)]
+    struct QueryAdapterInfo {
+        h_adapter: u32,
+        kind: i32,
+        data: *mut c_void,
+        size: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct AdapterAddress {
+        bus: u32,
+        device: u32,
+        function: u32,
+    }
+
+    #[repr(C)]
+    struct CloseAdapter {
+        h_adapter: u32,
+    }
+
+    const KMTQAITYPE_ADAPTERADDRESS: i32 = 6;
+    const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn D3DKMTEnumAdapters2(e: *mut EnumAdapters2) -> i32;
+        fn D3DKMTQueryAdapterInfo(q: *mut QueryAdapterInfo) -> i32;
+        fn D3DKMTCloseAdapter(c: *const CloseAdapter) -> i32;
+    }
+
+    /// `(luid, bus, device, function)` of every adapter, or `None` if they cannot be listed.
+    pub(super) fn adapters() -> Option<Vec<(AdapterLuid, u32, u32, u32)>> {
+        let mut probe = EnumAdapters2 {
+            num_adapters: 0,
+            p_adapters: std::ptr::null_mut(),
+        };
+        // SAFETY: a null array asks only for a capacity.
+        if unsafe { D3DKMTEnumAdapters2(&mut probe) } != 0 {
+            return None;
+        }
+        let mut capacity = probe.num_adapters.max(16);
+        // Adapters can appear between the calls.
+        for _ in 0..3 {
+            let mut buffer = vec![AdapterInfo::default(); capacity as usize];
+            let mut list = EnumAdapters2 {
+                num_adapters: capacity,
+                p_adapters: buffer.as_mut_ptr(),
+            };
+            // SAFETY: `list` points at `capacity` writable records.
+            match unsafe { D3DKMTEnumAdapters2(&mut list) } {
+                0 => {}
+                STATUS_BUFFER_TOO_SMALL => {
+                    capacity = capacity.saturating_mul(2);
+                    continue;
+                }
+                _ => return None,
+            }
+            let listed = (list.num_adapters as usize).min(buffer.len());
+            let mut out = Vec::with_capacity(listed);
+            for adapter in &buffer[..listed] {
+                let mut address = AdapterAddress::default();
+                let mut query = QueryAdapterInfo {
+                    h_adapter: adapter.h_adapter,
+                    kind: KMTQAITYPE_ADAPTERADDRESS,
+                    data: (&mut address as *mut AdapterAddress).cast(),
+                    size: std::mem::size_of::<AdapterAddress>() as u32,
+                };
+                // SAFETY: an open adapter handle and a buffer of the size the query names.
+                if unsafe { D3DKMTQueryAdapterInfo(&mut query) } == 0 {
+                    out.push((
+                        AdapterLuid {
+                            high: adapter.luid.high_part as u32,
+                            low: adapter.luid.low_part,
+                        },
+                        address.bus,
+                        address.device,
+                        address.function,
+                    ));
+                }
+                // SAFETY: every handle the listing opened is closed, once.
+                unsafe {
+                    D3DKMTCloseAdapter(&CloseAdapter {
+                        h_adapter: adapter.h_adapter,
+                    })
+                };
+            }
+            return Some(out);
+        }
+        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_records_have_the_kernel_layouts() {
+            assert_eq!(std::mem::size_of::<AdapterInfo>(), 20);
+            assert_eq!(std::mem::size_of::<EnumAdapters2>(), 16);
+            assert_eq!(std::mem::size_of::<QueryAdapterInfo>(), 24);
+            assert_eq!(std::mem::size_of::<AdapterAddress>(), 12);
+        }
+    }
 }
 
 mod pdh {
@@ -171,25 +388,154 @@ mod pdh {
 mod tests {
     use super::*;
 
+    const CARD: AdapterLuid = AdapterLuid {
+        high: 0,
+        low: 0x00c3_ca54,
+    };
+    const OTHER: AdapterLuid = AdapterLuid {
+        high: 0,
+        low: 0x00c5_debb,
+    };
+
     #[test]
-    fn the_pid_is_read_from_an_instance_name() {
+    fn an_instance_name_gives_its_pid_adapter_and_part() {
         assert_eq!(
-            pid_of_instance("pid_25880_luid_0x00000000_0x00e2dccb_phys_0"),
-            Some(25880)
+            parse_instance("pid_25880_luid_0x00000000_0x00C3CA54_phys_0"),
+            Some((Some(25880), CARD, 0))
         );
-        assert_eq!(pid_of_instance("luid_0x00000000_0x00e2dccb_phys_0"), None);
-        assert_eq!(pid_of_instance("pid_x_luid"), None);
+        assert_eq!(
+            parse_instance("pid_25880_luid_0x00000000_0x00c3ca54_phys_0"),
+            Some((Some(25880), CARD, 0))
+        );
+        assert_eq!(
+            parse_instance("luid_0x00000000_0x00c5debb_phys_0"),
+            Some((None, OTHER, 0))
+        );
+        // High part first, as the counters spell it.
+        assert_eq!(
+            parse_instance("luid_0x00000001_0x00000002_phys_1#2"),
+            Some((None, AdapterLuid { high: 1, low: 2 }, 1))
+        );
+        assert_eq!(parse_instance("pid_x_luid_0x0_0x0_phys_0"), None);
+        assert_eq!(parse_instance("pid_7_luid_0x00000000_0x00c3ca54"), None);
+        assert_eq!(
+            parse_instance("pid_7_luid_0x0000zz00_0x00c3ca54_phys_0"),
+            None
+        );
     }
 
-    /// Only unreported rows are filled, and a process the counters do not list holds nothing.
     #[test]
-    fn only_unreported_rows_are_filled() {
+    fn a_card_is_matched_to_the_one_adapter_at_its_pci_address() {
+        let adapters = [
+            (OTHER, 1, 0, 0),
+            (CARD, 3, 0, 0),
+            (
+                AdapterLuid {
+                    high: 0,
+                    low: 0x16958,
+                },
+                17,
+                0,
+                0,
+            ),
+            (
+                AdapterLuid {
+                    high: 0,
+                    low: 0x158f0,
+                },
+                0xFFFF_FFFF,
+                0xFFFF,
+                0xFFFF,
+            ),
+        ];
+        let smi = crate::discovery::normalize_pci_bus_id("00000000:03:00.0");
+        assert_eq!(luid_for_pci(&adapters, &smi), Some(CARD));
+        assert_eq!(
+            luid_for_pci(&adapters, "0000:11:00.0").map(|l| l.low),
+            Some(0x16958)
+        );
+        assert_eq!(luid_for_pci(&adapters, "0001:03:00.0"), None);
+        assert_eq!(luid_for_pci(&adapters, "0000:ff:ffff.ffff"), None);
+        // Two adapters at one address: not knowable, so no match.
+        assert_eq!(
+            luid_for_pci(&[(CARD, 3, 0, 0), (OTHER, 3, 0, 0)], "0000:03:00.0"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_process_is_credited_only_with_what_it_holds_on_this_card() {
+        const M: u64 = 1024 * 1024;
+        let processes = vec![
+            // On both cards: only its share here counts.
+            (
+                "pid_10_luid_0x00000000_0x00C3CA54_phys_0".to_string(),
+                500 * M,
+            ),
+            (
+                "pid_10_luid_0x00000000_0x00C5DEBB_phys_0".to_string(),
+                15_000 * M,
+            ),
+            // Two parts of one adapter add up.
+            (
+                "pid_11_luid_0x00000000_0x00C3CA54_phys_0".to_string(),
+                100 * M,
+            ),
+            (
+                "pid_11_luid_0x00000000_0x00C3CA54_phys_1".to_string(),
+                28 * M,
+            ),
+            // Only on the other card: nothing here.
+            (
+                "pid_12_luid_0x00000000_0x00C5DEBB_phys_0".to_string(),
+                2_000 * M,
+            ),
+        ];
+        let adapters = vec![
+            ("luid_0x00000000_0x00C3CA54_phys_0".to_string(), 700 * M),
+            ("luid_0x00000000_0x00C5DEBB_phys_0".to_string(), 17_000 * M),
+        ];
+        let (by_pid, adapter) = on_adapter(&processes, &adapters, CARD);
+        assert_eq!(by_pid.get(&10), Some(&500));
+        assert_eq!(by_pid.get(&11), Some(&128));
+        assert_eq!(by_pid.get(&12), None);
+        assert_eq!(adapter, Some(700));
+        // An adapter with no instance of its own (a stale LUID) gives no figure to check against.
+        let gone = AdapterLuid { high: 0, low: 1 };
+        assert_eq!(on_adapter(&processes, &adapters, gone).1, None);
+    }
+
+    #[test]
+    fn the_adapters_figure_must_agree_with_nvidia_smis() {
+        assert!(agrees_with_smi(1586, 1581));
+        assert!(agrees_with_smi(4, 0));
+        assert!(agrees_with_smi(12_000, 11_500)); // 5% of a full 12 GB card
+        assert!(!agrees_with_smi(1586, 17_000));
+        assert!(!agrees_with_smi(700, 1_000));
+    }
+
+    /// Reported rows are left as they are, and with no card to match, nothing is filled in: one of
+    /// ours left unreported makes the reading "no opinion".
+    #[test]
+    fn only_unreported_rows_are_filled_and_only_for_a_matched_card() {
         let ours = std::process::id();
-        let filled = fill_unreported(vec![(ours, None), (u32::MAX, None), (7, Some(512))]);
-        assert_eq!(filled[2], (7, Some(512)));
-        if dedicated_mib_by_pid().is_some() {
-            assert!(filled[0].1.is_some());
-            assert_eq!(filled[1], (u32::MAX, Some(0)));
+        let rows = vec![(ours, None), (u32::MAX, None), (7, Some(512))];
+        assert_eq!(fill_unreported(rows.clone(), None, 0), rows);
+        assert_eq!(fill_unreported(rows.clone(), Some("0000:ff:1f.7"), 0), rows);
+        assert_eq!(
+            fill_unreported(vec![(7, Some(512))], None, 0),
+            vec![(7, Some(512))]
+        );
+    }
+
+    /// On this machine: a listed card's adapter is found, and the listing closes its handles.
+    #[test]
+    fn the_adapters_can_be_listed_without_privileges() {
+        let Some(adapters) = d3dkmt::adapters() else {
+            return; // no display adapters (a service session)
+        };
+        for _ in 0..3 {
+            assert_eq!(d3dkmt::adapters().map(|a| a.len()), Some(adapters.len()));
         }
     }
 }
