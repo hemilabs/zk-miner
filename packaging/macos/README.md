@@ -12,7 +12,7 @@ quarantines a downloaded copy, and Gatekeeper blocks the programs until the quar
 
 | | |
 |---|---|
-| macOS | **27.0 or later** (`BUILDINFO` `min_macos`). The GPU kernels are Metal Shading Language 3.2 libraries built for macOS 27, and the binaries refuse to start on an older macOS. |
+| macOS | **26.0 (Tahoe) or later** (`BUILDINFO` `min_macos`). The GPU kernels are Metal Shading Language 3.2 libraries built for macOS 26, and the binaries refuse to start on an older macOS. `install.sh` checks this first. |
 | Mac | Apple Silicon (M1 or later) with **16 GB of RAM or more**. Not supported: Intel Macs, Macs with 8 GB, and a Terminal running under Rosetta. The prover refuses them and says why. |
 | Disk | About 0.5 GB for the kit, plus 5.4 GB for RISC Zero's Groth16 component (downloaded once, see below). |
 | Network | The first warm-up downloads the 2.4 GB Groth16 component from RISC Zero's artifact store. |
@@ -78,14 +78,21 @@ zkminer run
 
 Metal compiles every GPU kernel the first time a process uses it. For this prover's circuits that
 takes about a minute on an M5 Max (52-58 s measured), and longer with fewer CPU cores. The result is cached, so later
-starts take ~0.1 s.
+starts skip it (building the pipelines from the cache then takes ~0.1 s; a whole `--benchmark` start with a
+fibonacci proof, about 2.3 s).
 
 - **GPU family `applegpu_g17s`** (the M5 Max this beta was tested on; whether the M5 Pro reports
-  the same family has not been checked): the kit ships pre-compiled archives. The first start then
-  takes about 2.3 s.
+  the same family has not been checked) **on macOS 27**: the kit ships pre-compiled archives. The
+  first start then takes about 2.3 s.
+- **macOS 26 (Tahoe):** the archives are made for macOS 27, and macOS 26 cannot use them, so
+  `install.sh` installs none there. The first start compiles the kernels once (about a minute on an
+  M5 Max: 51-60 s measured with the archives out of play), and every later start takes about 2.3 s.
 - **Other GPU families** (M1 to M4, the base M5): no archives are installed, because none were
   validated on such a GPU.
   The first start compiles the kernels, once.
+- **Upgrading macOS 26 to 27:** `install.sh` installed archives for the macOS it ran on only, so after
+  the upgrade there are none for macOS 27 and the first start compiles the kernels once. Run
+  `./install.sh` from the kit again after upgrading to install the macOS 27 archives.
 - **Mismatches:** an archive for another GPU family or another macOS major version is never used.
   The prover compiles that kernel instead.
 - **Your GPU family:** `~/.zkminer/provers/zkminer-prove-risc0-metal --metal-arch`.
@@ -144,6 +151,6 @@ Groth16 component (`~/.risc0`) and the compiled-pipeline cache
 | `zkminer` | the CLI |
 | `provers/zkminer-prove-risc0-metal` | the Metal prover |
 | `metal-aot/` | offline GPU pipeline archives (`manifest.jsonl`, `SHA256SUMS`) |
-| `install.sh`, `tools/` | the installer and its archive helper |
+| `install.sh`, `tools/` | the installer, its archive helper, and `macos-smoke.sh` (checks that the prover starts, shows your GPU, and makes and verifies one small proof; run it from the kit folder **after** `./install.sh --with-groth16`: `tools/macos-smoke.sh`. It uses the installed copies, because the kit's own files keep the browser's quarantine flag; before installing it stops with exit 8 "quarantined", or exit 9 if an older build is still installed, and launches nothing) |
 | `BUILDINFO` | version, commit, risc0 revision, minimum macOS, Metal compiler, archive families, the Groth16 pin |
 | `SHA256SUMS` | checksums of every file in the kit |

@@ -20,7 +20,8 @@
 #   <prefix>/zkminer                              the CLI
 #   <prefix>/provers/zkminer-prove-risc0-metal    the Metal worker
 #   <prefix>/provers/metal-aot/                   this Mac's offline Metal archives, only when its GPU
-#                                                 family is one validated on hardware (BUILDINFO)
+#                                                 family is one validated on hardware (BUILDINFO) and
+#                                                 the kit has a set for its macOS major version
 # Every file is checked against the kit's SHA256SUMS first. The kit is not signed or notarized
 # (beta), so macOS marks a downloaded copy as quarantined; this script removes the
 # com.apple.quarantine attribute from the files it installs, and only from those.
@@ -43,10 +44,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-mkdir -p "$prefix"
-prefix=$(cd "$prefix" && pwd)
-provers=$prefix/provers
-worker=$provers/zkminer-prove-risc0-metal
+# Not created before the checks below: a refused install leaves nothing behind.
+set_prefix() { [ -d "$prefix" ] && prefix=$(cd "$prefix" && pwd); provers=$prefix/provers; worker=$provers/zkminer-prove-risc0-metal; }
+set_prefix
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -76,7 +76,11 @@ older() { # is $1 < $2 (dotted versions)?
   return 1
 }
 if [ -n "$min" ] && older "$have" "$min"; then
-  die "this build needs macOS $min or later; this Mac runs $have (Software Update, then run install.sh again)"
+  case "$min" in
+    26.*) name=" (Tahoe)" ;;
+    *) name= ;;
+  esac
+  die "this build needs macOS $min$name or later; this Mac runs macOS $have: update macOS (System Settings > General > Software Update), then run install.sh again"
 fi
 mem=$(sysctl -n hw.memsize)
 # 12 GiB: the worker's MIN_HOST_MEMORY_BYTES (crates/zkminer-prove-risc0/src/metal_host.rs), below
@@ -105,6 +109,7 @@ place() { # <src> <dest>
   xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$2"
 }
+mkdir -p "$prefix"; set_prefix
 mkdir -p "$provers"
 place "$kit/zkminer" "$prefix/zkminer"
 place "$kit/provers/zkminer-prove-risc0-metal" "$worker"
@@ -121,17 +126,31 @@ say "installed $worker"
 # (check-macos-release.sh), and the kit's SHA256SUMS just tied the archives to this worker.
 if [ $aot = 1 ]; then
   arch=$("$worker" --metal-arch 2>/dev/null) || die "$worker --metal-arch failed: does this Mac have a Metal GPU?"
-  if [ -n "$(ls "$kit/metal-aot" 2>/dev/null | grep '\.binarchive$' || true)" ]; then
+  # The runtime opens only the archives keyed for this Mac's macOS major version (macos<N>, B9-M26):
+  # hand install-metal-aot.sh just those (symlinks, with their SHA256SUMS and manifest lines).
+  key=macos${have%%.*}
+  set_dir=
+  if [ -n "$(ls "$kit/metal-aot" 2>/dev/null | grep -- "-$key-.*\.binarchive\$" || true)" ]; then
+    set_dir=$(mktemp -d "${TMPDIR:-/tmp}/zkminer-metal-aot.XXXXXX")
+    cleanup+=("$set_dir")
+    for f in "$kit"/metal-aot/*-"$key"-*.binarchive; do ln -s "$f" "$set_dir/$(basename "$f")"; done
+    grep -- "-$key-" "$kit/metal-aot/SHA256SUMS" > "$set_dir/SHA256SUMS" || true
+    grep -F -- "\"os_key\": \"$key\"" "$kit/metal-aot/manifest.jsonl" > "$set_dir/manifest.jsonl" 2>/dev/null || true
+  elif [ -n "$(ls "$kit/metal-aot" 2>/dev/null | grep '\.binarchive$' || true)" ]; then
+    say "this kit's offline Metal archives are for $(info aot_os_keys), not for macOS ${have%%.*}: none installed"
+    rm -rf "$provers/metal-aot"
+  fi
+  if [ -n "$set_dir" ]; then
     # shellcheck disable=SC2046
-    AOT_SKIP_DIGEST_CHECK=1 "$kit/tools/install-metal-aot.sh" "$kit/metal-aot" "$worker" \
+    AOT_SKIP_DIGEST_CHECK=1 "$kit/tools/install-metal-aot.sh" "$set_dir" "$worker" \
       ${ZKMINER_AOT_VALIDATED:-$(info aot_validated)}
     if [ -d "$provers/metal-aot" ]; then
       xattr -dr com.apple.quarantine "$provers/metal-aot" 2>/dev/null || true
     fi
-  else
+  elif [ -z "$(ls "$kit/metal-aot" 2>/dev/null | grep '\.binarchive$' || true)" ]; then
     say "this kit has no offline Metal archives; the first start compiles the GPU pipelines"
   fi
-  [ -d "$provers/metal-aot" ] || say "GPU $arch: the worker's first start compiles its GPU pipelines (a few minutes once; they are cached afterwards)"
+  [ -d "$provers/metal-aot" ] || say "GPU $arch: the worker's first start compiles its GPU pipelines (about a minute once on an M5 Max, longer on smaller Macs; cached afterwards)"
 else
   rm -rf "$provers/metal-aot"
   say "--no-aot: no offline Metal archives installed"
