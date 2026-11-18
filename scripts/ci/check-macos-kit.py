@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks the macOS beta kit tarball on any OS, without macOS tools (B9-CI).
 
-    check-macos-kit.py [--version V] [--commit SHA] <zkminer-<version>-macos-arm64.tar.gz>...
+    check-macos-kit.py [--version V] [--commit SHA] [--require-validated] <zkminer-<version>-macos-arm64.tar.gz>...
 
 The release's assemble job runs on Linux, where otool, lipo and codesign do not exist, so this reads
 the Mach-O load commands itself. It is the Mach-O counterpart of check-release-libs-inside.sh's ldd
@@ -14,7 +14,8 @@ For each tarball:
   component is never in the kit);
 - the kit's SHA256SUMS lists every file but the SHA256SUMS files, and every SHA256SUMS holds;
 - BUILDINFO: version equals the tarball's (and --version), commit equals --commit when given and
-  commit_dirty=no;
+  commit_dirty=no; with --require-validated (the release), metal_compiler_validated=yes: the kernels
+  were compiled by the validated Metal compiler (B9-M26), not by a runner's Xcode one;
 - zkminer and provers/zkminer-prove-risc0-metal are Mach-O programs; every Mach-O CPU file in the
   kit is a thin arm64 image (not universal, not x86_64), links only /usr/lib/ and /System/Library/
   libraries (no @rpath, @loader_path or @executable_path, nothing from Homebrew), has
@@ -109,7 +110,7 @@ def macho(name, data):
     return info
 
 
-def check_tarball(path, want_version, want_commit):
+def check_tarball(path, want_version, want_commit, require_validated=False):
     m = re.search(r'(?:^|/)(zkminer-([0-9][0-9A-Za-z.+-]*)-macos-arm64)\.tar\.gz$', path)
     if not m:
         fail(f'{path}: not a zkminer-<version>-macos-arm64.tar.gz')
@@ -179,6 +180,9 @@ def check_tarball(path, want_version, want_commit):
                 fail(f'{path}: BUILDINFO commit={bi.get("commit")}, want {want_commit}')
             if bi.get('commit_dirty') != 'no':
                 fail(f'{path}: BUILDINFO commit_dirty={bi.get("commit_dirty")}')
+        if require_validated and bi.get('metal_compiler_validated') != 'yes':
+            fail(f'{path}: BUILDINFO metal_compiler_validated={bi.get("metal_compiler_validated")} '
+                 f'(metal_compiler={bi.get("metal_compiler")}): a release needs the validated Metal compiler')
     want_minos = bi.get('binaries_minos')
     if not want_minos:
         fail(f'{path}: BUILDINFO has no binaries_minos')
@@ -240,6 +244,7 @@ def check_tarball(path, want_version, want_commit):
 
 def main(argv):
     want_version = want_commit = None
+    require_validated = False
     args = []
     i = 0
     while i < len(argv):
@@ -251,16 +256,20 @@ def main(argv):
                 want_commit = argv[i + 1]
             i += 2
             continue
+        if a == '--require-validated':
+            require_validated = True
+            i += 1
+            continue
         if a in ('-h', '--help'):
             print(__doc__)
             return 0
         args.append(a)
         i += 1
     if not args:
-        print('usage: check-macos-kit.py [--version V] [--commit SHA] <kit tarball>...', file=sys.stderr)
+        print('usage: check-macos-kit.py [--version V] [--commit SHA] [--require-validated] <kit tarball>...', file=sys.stderr)
         return 2
     for p in args:
-        check_tarball(p, want_version, want_commit)
+        check_tarball(p, want_version, want_commit, require_validated)
     if fails:
         print(f'{len(fails)} check(s) failed')
         return 1

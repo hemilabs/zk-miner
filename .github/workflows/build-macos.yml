@@ -83,6 +83,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: '1'
   RISC0_SRC: git
+  # git (cargo's git fetches go through it) gives up on a stalled transfer instead of hanging until
+  # the job's timeout: under 1 KB/s for 2 minutes.
+  GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+  GIT_HTTP_LOW_SPEED_TIME: '120'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -95,7 +99,7 @@ jobs:
     runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
     timeout-minutes: 240
     concurrency:
-      group: build-macos-${{ github.event_name }}-${{ github.ref }}
+      group: build-macos-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     env:
       METAL_TOOLCHAIN: ${{ inputs.metal_toolchain || 'pinned' }}
@@ -104,6 +108,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
+
+      # A persistent runner keeps HOME between jobs: what an earlier job unpacked there goes first.
+      - name: "Clean the runner user's caches"
+        run: scripts/ci/macos-clean-home.sh "start of the job"
 
       # B9-M26: the kernels are compiled with the validated Metal Toolchain 27B47 (SHA-256 pinned
       # download from Apple's CDN), never with the runner's Xcode compiler, which is only reported.
@@ -180,6 +188,10 @@ jobs:
         if: ${{ always() }}
         run: scripts/ci/macos-metal-toolchain.sh --cleanup "$RUNNER_TEMP/metal-tc" "$RUNNER_TEMP/tools"
 
+      - name: "Clean the runner user's caches (end)"
+        if: ${{ always() }}
+        run: scripts/ci/macos-clean-home.sh "end of the job"
+
   # ---------------------------------------------------------------------------
   # The tests that need no GPU, built with the kit's settings. Required. Their
   # own job: the tests' dev-dependencies change most dependencies' features,
@@ -191,7 +203,7 @@ jobs:
     runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
     timeout-minutes: 240
     concurrency:
-      group: build-macos-tests-${{ github.event_name }}-${{ github.ref }}
+      group: build-macos-tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     env:
       METAL_TOOLCHAIN: ${{ inputs.metal_toolchain || 'pinned' }}
@@ -200,6 +212,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
+
+      # A persistent runner keeps HOME between jobs: what an earlier job unpacked there goes first.
+      - name: "Clean the runner user's caches"
+        run: scripts/ci/macos-clean-home.sh "start of the job"
 
       - name: "Runner and Metal toolchain"
         run: |
@@ -242,6 +258,10 @@ jobs:
         if: ${{ always() }}
         run: scripts/ci/macos-metal-toolchain.sh --cleanup "$RUNNER_TEMP/metal-tc" "$RUNNER_TEMP/tools"
 
+      - name: "Clean the runner user's caches (end)"
+        if: ${{ always() }}
+        run: scripts/ci/macos-clean-home.sh "end of the job"
+
   # ---------------------------------------------------------------------------
   # What the runner's GPU can do with the kit: MTLCreateSystemDefaultDevice's
   # name, family and recommendedMaxWorkingSetSize, then one tiny proof
@@ -251,12 +271,15 @@ jobs:
   metal-probe:
     name: metal-probe (informational)
     needs: build
-    if: ${{ inputs.metal_probe != false }}
+    # On push and pull_request the inputs context is empty, and GitHub compares null and false as
+    # equal (both coerce to 0), so the inputs are compared as text: absent means the default (true).
+    # scripts/ci/test-workflow-expressions.py evaluates this per event.
+    if: ${{ format('{0}', inputs.metal_probe) != 'false' }}
     continue-on-error: true
     runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
     timeout-minutes: 60
     concurrency:
-      group: build-macos-probe-${{ github.event_name }}-${{ github.ref }}
+      group: build-macos-probe-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
       # Also cleans an earlier job's workspace on a persistent runner (disk).
@@ -264,6 +287,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           persist-credentials: false
+
+      # A persistent runner keeps HOME between jobs: what an earlier job unpacked there goes first.
+      - name: "Clean the runner user's caches"
+        run: scripts/ci/macos-clean-home.sh "start of the job"
 
       - name: "Download the kit"
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -273,12 +300,16 @@ jobs:
 
       - name: "Probe the Metal device, try one proof"
         env:
-          PROBE_PROOF: ${{ inputs.probe_proof == false && '0' || '1' }}
+          PROBE_PROOF: ${{ format('{0}', inputs.probe_proof) == 'false' && '0' || '1' }}
         run: |
           set -euo pipefail
           scripts/ci/macos-disk.sh "before the probe"
           scripts/ci/macos-probe.sh "$RUNNER_TEMP"/dist-macos/zkminer-*-macos-arm64.tar.gz "$RUNNER_TEMP/probe"
           scripts/ci/macos-disk.sh "after the probe"
+
+      - name: "Clean the runner user's caches (end)"
+        if: ${{ always() }}
+        run: scripts/ci/macos-clean-home.sh "end of the job"
 
       - name: "Upload the probe logs"
         if: ${{ always() }}

@@ -9,7 +9,8 @@
 #    /usr/lib and /System/Library (its libSystem load path rewritten), a universal (x86_64 + arm64)
 #    CLI, an unsigned CLI (LC_CODE_SIGNATURE removed by codesign), a BUILDINFO binaries_minos other
 #    than the binaries' minos, a file not in SHA256SUMS, a file that does not match it, a symbolic
-#    link, and a non-Mach-O worker.
+#    link, a non-Mach-O worker, and (with --require-validated, as the release runs it) a kit whose
+#    kernels were not compiled by the validated Metal compiler.
 # Each broken kit gets a correct SHA256SUMS (except the cases about it), so only the case's own
 # defect can fail it. Needs python3, tar and, for the signature and universal cases, codesign and lipo.
 set -euo pipefail
@@ -53,6 +54,11 @@ PY
 
 # 1.
 if check --version "$version" ${commit:+--commit "$commit"} "$tarball"; then ok "1: the kit passes"; else no "1: the kit fails:"; sed 's/^/    /' "$T/out"; fi
+if [ "$(tar -xzOf "$tarball" "$name/BUILDINFO" | sed -n 's/^metal_compiler_validated=//p')" = yes ]; then
+  if check --require-validated "$tarball"; then ok "1b: the kit passes --require-validated"; else no "1b: the kit fails --require-validated:"; sed 's/^/    /' "$T/out"; fi
+else
+  echo "SKIP 1b: this kit's kernels were not built by the validated Metal compiler"
+fi
 
 # 2.
 expect_fail "2a: another version" 'version .* want' --version 9.9.9 "$tarball"
@@ -108,6 +114,11 @@ expect_fail "2i: a symbolic link" 'not a regular file' "$T/link/$name.tar.gz"
 variant notmacho; printf '#!/bin/sh\nexit 0\n' > "$T/notmacho/$name/provers/zkminer-prove-risc0-metal"
 resum "$T/notmacho/$name"; pack notmacho
 expect_fail "2j: a worker that is not a Mach-O program" 'is not a Mach-O file' "$T/notmacho/$name.tar.gz"
+
+variant unvalidated; b=$T/unvalidated/$name/BUILDINFO
+sed -i.bak 's/^metal_compiler_validated=.*/metal_compiler_validated=no/' "$b"; rm -f "$b.bak"
+resum "$T/unvalidated/$name"; pack unvalidated
+expect_fail "2k: an unvalidated Metal compiler (--require-validated)" 'metal_compiler_validated=no' --require-validated "$T/unvalidated/$name.tar.gz"
 
 echo "test-check-macos-kit: $pass passed, $fails failed"
 [ $fails = 0 ]

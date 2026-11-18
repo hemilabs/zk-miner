@@ -17,7 +17,8 @@
 #   build-macos.yml built and checked it (dist-macos/; B9-CI). Its version must be ZKMINER_VERSION
 #   (default: [workspace.package].version of this checkout's Cargo.toml, which release.yml's
 #   check-version compared with the tag) and, when EXPECT_COMMIT is set (release.yml: the commit
-#   being released), its BUILDINFO commit; check-macos-kit.py checks it.
+#   being released), its BUILDINFO commit, and its kernels must have been compiled by the validated
+#   Metal compiler (BUILDINFO metal_compiler_validated=yes); check-macos-kit.py checks it.
 # The localnet test and anvil, which the GPU validation runs, go to <validation kit dir>, not the
 # release.
 set -euo pipefail
@@ -107,7 +108,7 @@ done
 # The build job's own checksum line, then the kit itself (version, commit, Mach-O, SHA256SUMS).
 (cd "$in/dist-macos" && grep -E "^[0-9a-f]{64}  $mac\$" SHA256SUMS | sha256sum -c -) \
   || { echo "::error::$mac does not match dist-macos/SHA256SUMS" >&2; exit 1; }
-python3 -I "$ci/check-macos-kit.py" --version "$version" ${EXPECT_COMMIT:+--commit "$EXPECT_COMMIT"} "$in/dist-macos/$mac"
+python3 -I "$ci/check-macos-kit.py" --require-validated --version "$version" ${EXPECT_COMMIT:+--commit "$EXPECT_COMMIT"} "$in/dist-macos/$mac"
 cp "$in/dist-macos/$mac" "$out/"
 chmod 0644 "$out/$mac"
 

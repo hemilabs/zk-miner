@@ -49,7 +49,13 @@ if ! command -v rustup >/dev/null 2>&1; then
 fi
 rustup --version 2>/dev/null
 echo "== Rust toolchain of rust-toolchain.toml"
-(cd "$repo" && rustup toolchain install --profile minimal && rustc -vV && cargo -V)
+# Named explicitly (channel and components from the file): a runner's older rustup (before 1.28)
+# does not take a bare `rustup toolchain install`.
+channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' "$repo/rust-toolchain.toml")
+components=$(sed -n 's/^components = \[\(.*\)\]/\1/p' "$repo/rust-toolchain.toml" | tr -d '" ')
+[ -n "$channel" ] || die "no channel in rust-toolchain.toml"
+rustup toolchain install "$channel" --profile minimal ${components:+--component "$components"}
+(cd "$repo" && rustc -vV && cargo -V)
 
 echo "== RISC Zero guest toolchain $RZUP_RUST_VERSION"
 risc0_home=${RISC0_HOME:-$HOME/.risc0}

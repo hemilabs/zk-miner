@@ -7,12 +7,12 @@ The maintainer documentation is `docs/ci-macos.md`. This note has the evidence.
 
 | path | what |
 |---|---|
-| `sim/sim.py`, `sim/dump.rb` | the harness that runs the workflow's steps |
-| `sim/logs/` | the final run, one log per step |
-| `sim/logs-try1/`, `sim/logs-try2/` | the earlier runs, with the findings below |
-| `sim/results*.jsonl`, `sim/report-final.md` | the per-step results |
+| `sim/sim.py`, `sim/dump.rb`, `sim/drive.sh` | the harness that runs the workflow's steps (round 1: expressions evaluated, `next <job>` driver) |
+| `sim/logs/`, `sim/results.jsonl`, `sim/report-r1.md` | the round-1 run: build, cpu-tests, metal-probe, build, cpu-tests (log names `<n>-<job>-<step>.log`) |
+| `sim/r0/` | the first round: `sim-r0.py`'s harness, logs of the final run and of tries 1 and 2, `report-final.md` |
 | `sim/artifacts/` | the CI-built kit and the probe logs |
-| `receipts/final/` | the probe's receipt |
+| `receipts/final/`, `receipts/r1/` | the probe's receipts (first round, round 1) |
+| `expr-before.log` | `test-workflow-expressions.py` on the first-round workflow (the finding reproduced) |
 | `reltest/` | the release-assembly tests: a fake staging set and shims |
 | `dl/` | actionlint and shellcheck downloads |
 
@@ -36,12 +36,12 @@ simulation build git mode through the mirror. The brief named `84df3e8c0`; the c
 | `.github/workflows/release.yml` | job `macos` calls `build-macos.yml` (`metal_probe: false`). `assemble` needs it and passes `ZKMINER_VERSION` (from `check-version`) and `EXPECT_COMMIT`. The release notes gain a macOS section |
 | `scripts/ci/macos-metal-toolchain.sh` (new) | runner facts; the pinned 27B47 (default) or the runner's Xcode compiler (`xcode`: `xcodebuild -downloadComponent MetalToolchain` when missing, marked unvalidated); versions; `METAL_TC`. `--cleanup` unmounts |
 | `scripts/ci/macos-toolchains.sh` (new) | rustup 1.29.3 (SHA-256), the `rust-toolchain.toml` Rust, rzup from the pinned fork rev, the guest toolchain 1.97.0, protoc 36.2 (SHA-256) |
-| `scripts/ci/macos-cpu-tests.sh` (new) | worker unit tests without the 3 device tests, zkminer-prover discovery/dispatcher, `test-metal-tc.sh`; kit build settings |
+| `scripts/ci/macos-cpu-tests.sh` (new) | worker unit tests without the device tests (round 1: and the host-state tests), zkminer-prover discovery/dispatcher, `test-metal-tc.sh`; kit build settings |
 | `scripts/ci/macos-prune-target.sh` (new) | deletes intermediates: `--guests` keeps only the embedded guest programs; the default keeps only the two binaries |
 | `scripts/ci/macos-disk.sh` (new) | `df` and `du` after every heavy step |
 | `scripts/ci/macos-probe.sh` (new) | the metal-probe job: kit install in temp, device probe, the Groth16 component streamed into temp, one proof, summary |
 | `scripts/ci/check-macos-kit.py` (new) | Mach-O and kit check without Apple tools (for the Linux assemble job) |
-| `scripts/ci/test-check-macos-kit.sh` (new) | the kit passes; 10 broken copies are rejected |
+| `scripts/ci/test-check-macos-kit.sh` (new) | the kit passes; 11 broken copies are rejected (round 1: + `--require-validated`) |
 | `scripts/ci/lint-workflows.sh`, `scripts/ci/actionlint.yaml` (new) | actionlint (+ shellcheck), with the self-hosted labels |
 | `scripts/ci/assemble-macos.sh` | `ASSEMBLE_BUILD_ONLY=1`, `ASSEMBLE_ENV_OUT=<file>`, `ASSEMBLE_ENV_ONLY=1` (no default changed) |
 | `scripts/ci/assemble-release.sh` | copies the macOS kit after checking its `SHA256SUMS` line, version and commit |
@@ -49,6 +49,8 @@ simulation build git mode through the mirror. The brief named `84df3e8c0`; the c
 | `scripts/ci/fetch-metal-toolchain.sh` | aborts and resumes a stalled download; resolves its directory physically (mount reuse check) |
 | `scripts/ci/{assemble-release,check-release-libs,gpu-validate,unpack-provers}.sh` | mode 0755 (see "Before") |
 | `docs/ci-macos.md` (new) | the jobs, the runner, the disk budget, release wiring, pins, knobs |
+| `scripts/ci/macos-clean-home.sh` (new, round 1) | at the start and end of every job: deletes `~/.cargo/registry/src`, `~/.cargo/git/checkouts`, the Groth16 coefficient cache and the risc0 kernel cache |
+| `scripts/ci/test-workflow-expressions.py` (new, round 1) | a GitHub expression evaluator and the per-event table test of `build-macos.yml`; run by `lint-workflows.sh` |
 
 ## Before
 
@@ -143,6 +145,9 @@ simulation build git mode through the mirror. The brief named `84df3e8c0`; the c
   with anchors.
 
 ## Validation
+
+First-round evidence. Its log paths (`logs/`, `logs-try1/`, `logs-try2/`) are now under `sim/r0/`.
+The round-1 re-runs are in "Fix round 1" below.
 
 ### Lint
 
@@ -274,11 +279,145 @@ Results:
   - The new knobs ran in the simulation: `ASSEMBLE_BUILD_ONLY`, `ASSEMBLE_ENV_ONLY` and
     `ASSEMBLE_SKIP_BUILD` after a pruned target.
 
+## Fix round 1
+
+Two blocking findings from the round-1 review, each reproduced before the fix. The review's
+non-blocking items that were cheap are fixed too.
+
+### 1. Disk on a persistent runner: a second build had 0.90 GB free
+
+- **Finding.** The first simulation ran each job once, on an empty image. The reviewer ran the order
+  build, cpu-tests, metal-probe, cpu-tests, build. The second build had **0.90 GB** free, below the
+  1.5 GB bar, and the second test run 1.69 GB. Left in `HOME` between jobs:
+  - `~/.cargo/registry` grew from 615 MB to 1.3 GB, because the tests' dev-dependencies unpack more
+    crate sources into `registry/src`;
+  - `~/.cache/risc0-groth16/coeffs_compact_metal_*.bin`, 343 MB, written by the probe's worker;
+  - `~/.cargo/git/checkouts`, 857 MB.
+- **Reproduced** in the reviewer's run of this item's harness
+  (`/Users/user/zkminer/scratch/w9/B9-CI-verify/sim/logs`, `report.md`): `build[4]` used 5.84 → 12.85
+  GB, peak 12.89 GB, `df` `Avail 893Mi`. Its `du` after the toolchains shows exactly the three items
+  above.
+- **Fix, at the root: no job leaves anything in `HOME` that a later job does not read back.**
+  - `scripts/ci/macos-clean-home.sh` runs right after the checkout and again at the end of every job
+    (`if: always()`, so also after a failure or cancellation). It deletes:
+    - `~/.cargo/registry/src` and `~/.cargo/git/checkouts`, which cargo recreates from what
+      `actions/cache` keeps (`registry/{index,cache}`, `git/db`);
+    - the Groth16 coefficient cache (`RISC0_G16_CACHE_DIR`, else `$XDG_CACHE_HOME/risc0-groth16`, else
+      `~/.cache/risc0-groth16`);
+    - risc0-build-kernel's kernel cache (`~/Library/Caches/com.risczero.RISC-Zero.risc0`). A release
+      build therefore never reuses an earlier job's kernel objects either.
+  - `macos-probe.sh` exports `RISC0_G16_CACHE_DIR=<work dir>/g16-cache` and deletes it, so the worker
+    never writes the coefficient cache into `HOME`.
+  - `macos-disk.sh` also prints the Groth16 cache's size.
+  - Rejected alternative: require an ephemeral runner. The repository's runner is what it is, and the
+    cleanup costs about 2 s per job plus re-extracting about 0.7 GB of crate sources.
+- **Validation: the round-1 simulation.** The commit before the docs, `81fdca1`, had the same
+  workflows and scripts. The order was build, cpu-tests, metal-probe, build, cpu-tests, from a fresh
+  clone in a new 14.0e9-byte image, with fresh `HOME`/`CARGO_HOME`, `CARGO_BUILD_JOBS=5`, the mirror,
+  and `HOME` and the workspace kept throughout. Every step returned rc 0 in one chunk.
+
+  | run | step | used start → end GB | peak used GB | least free GB | peak tree RSS GB | `time -l` max RSS GB | wall s |
+  |---|---|---|---|---|---|---|---|
+  | 1 build | toolchains | 0.96 → 3.58 | 3.76 | 10.03 | 1.36 | 1.08 | 56 |
+  | 1 build | build worker + CLI | 3.58 → 11.73 | 11.74 | **2.05** | 6.06 | 2.28 | 295 |
+  | 1 build | package + check | 4.84 → 4.97 | 7.68 | 6.11 | 0.35 | 0.38 | 48 |
+  | 1 build | clean (end) | 4.96 → 4.10 | | | | | 3 |
+  | 2 cpu-tests | tests | 3.76 → 8.54 | 10.90 | **2.89** | 6.52 | 2.29 | 262 |
+  | 2 cpu-tests | clean (end) | 5.30 → 3.83 | | | | | 3 |
+  | 3 metal-probe | probe + one proof | 3.94 → 4.21 | 10.60 | **3.19** | 5.43 | 6.83 | 58 |
+  | 4 build | build worker + CLI | 3.82 → 11.73 | 11.76 | **2.03** | 6.50 | 2.28 | 284 |
+  | 4 build | package + check | 4.84 → 4.98 | 7.68 | 6.11 | 0.30 | 0.38 | 48 |
+  | 5 cpu-tests | tests | 3.83 → 8.54 | 10.97 | **2.82** | 5.73 | 2.28 | 261 |
+
+  - The used space at the start of every job after the first is 3.75-3.83 GB, so the state is steady.
+    The second build's least free is 2.03 GB, against 0.90 GB before the fix. The second test run's
+    is 2.82 GB, against 1.69 GB.
+  - After the probe, `HOME` has no `.cache` at all. `~/.cargo` holds 222 MB of registry and 538 MB of
+    git databases.
+  - Tests: the worker **60 passed, 4 filtered**; zkminer-prover **128 passed** (3 more filtered, see
+    below); `test-metal-tc.sh` **18/18**; `test-check-macos-kit.sh` **13/13** in the build job.
+  - Probe: Apple M5 Max `applegpu_g17s`, recommendedMaxWorkingSetSize 30150672384. Groth16 component
+    streamed and checked in 51 s. fibonacci STARK 0.27 s, Groth16 wrap 1.75 s, verified.
+    **`STOCK 3.1 VERIFY: OK`** (selector `e71e6620`) on the receipt, copied to `receipts/r1/`.
+  - The CI kit's worker: `build-metal-aot.sh --worker-digests` gives the same sorted digest list as
+    before (sha256 `0d488ee9…a33`), the validated GPU code.
+  - The image was detached and deleted.
+
+### 2. metal-probe never ran on push or pull_request
+
+- **Finding.** `if: ${{ inputs.metal_probe != false }}`: on push and pull_request the `inputs` context
+  is empty, so the value is null. GitHub's loose `!=` coerces null and false both to 0, so the condition
+  is false and the job is skipped. `PROBE_PROOF: ${{ inputs.probe_proof == false && '0' || '1' }}` gave
+  '0' there for the same reason. The first simulation substituted both expressions from a hand-written
+  table, so it could not see this.
+- **Reproduced.** `scripts/ci/test-workflow-expressions.py` evaluates expressions with GitHub's
+  documented semantics. On the first-round workflow it reports `push: metal-probe runs: got False`,
+  `PROBE_PROOF: got '0'`, and the same for a same-repository PR (`expr-before.log`; 15 failures, 10 of
+  them the concurrency check below). It keeps the two old expressions as cases, which must evaluate to
+  "skipped" and '0' on push.
+- **Fix.** The inputs are compared as text, so an absent input counts as the default:
+  `if: ${{ format('{0}', inputs.metal_probe) != 'false' }}` and
+  `PROBE_PROOF: ${{ format('{0}', inputs.probe_proof) == 'false' && '0' || '1' }}`. `release.yml`'s call
+  (`metal_probe: false`) still skips the probe.
+- **Test** (`lint-workflows.sh` runs it). The evaluator is checked against the documented cases:
+  `null == 0`, `'' == null`, case-insensitive strings, `format` of null and booleans, and `&&`/`||`
+  returning operands. Then `build-macos.yml` is evaluated per event:
+  - push, pull_request from the repository and from a fork;
+  - workflow_dispatch with the defaults, `metal_probe=false`, `probe_proof=false` and
+    `metal_toolchain=xcode`;
+  - workflow_call with nothing, with `probe_proof=false`, and with `release.yml`'s own `with:` (read
+    from the file).
+
+  For each event it checks that `build` and `cpu-tests` run (except on a fork's PR), the probe's `if:`,
+  `PROBE_PROOF`, `METAL_TOOLCHAIN`, the concurrency groups, and that every `${{ }}` of the file
+  evaluates. Result: **425 passed, 0 failed**.
+- **The simulation now uses the same evaluator.** The job's `if:`, each step's `if:` (with the job's
+  status, so `always()` steps run after a failure) and every env value are evaluated in a push event's
+  contexts. The round-1 run's probe ran because its `if:` said so.
+
+### Non-blocking review items
+
+- **Fixed: host-state tests in the required `cpu-tests` job.** They are now skipped there:
+  - `metal_start::tests::this_macs_power_state_is_readable`;
+  - `discovery::tests::this_mac_reports_one_apple_gpu`, `this_macs_owner_probes_answer` and
+    `this_macs_power_state_answers_and_is_full`.
+
+  They assert this Mac's GPU, HID idle time and power source, which a headless or VM runner may not
+  have. `mac-test-miner` keeps running them on Macs.
+- **Fixed: the release did not check the Metal compiler.** `check-macos-kit.py --require-validated`
+  fails a kit whose `BUILDINFO` does not say `metal_compiler_validated=yes`, and
+  `assemble-release.sh` always passes it.
+  - `test-check-macos-kit.sh` case 2k: a kit with `metal_compiler_validated=no` and correct sums is
+    rejected. 1b: the CI kit passes. 13/13.
+  - `reltest/r1/`: `assemble-release.sh` on the staging set returns rc 0; with the unvalidated kit,
+    rc 1 with `BUILDINFO metal_compiler_validated=no … a release needs the validated Metal compiler`.
+- **Fixed: concurrency groups.** Each group now includes `github.workflow`. For a called workflow that
+  is the caller's name, so a release's `macos` job and a manual run on the same ref no longer share a
+  group. The expression test checks that the groups are distinct and name the workflow.
+- **Fixed: no git low-speed limit.** The workflow sets `GIT_HTTP_LOW_SPEED_LIMIT=1000` and
+  `GIT_HTTP_LOW_SPEED_TIME=120`. Cargo's CLI git fetches then fail on a stall instead of hanging for up
+  to 240 minutes.
+- **Fixed: an older rustup on the runner.** `macos-toolchains.sh` installs the toolchain by its channel
+  and components from `rust-toolchain.toml`. Before 1.28, rustup did not take a bare `rustup toolchain
+  install`.
+- **Not changed, need a user decision (open issues 3 and 4):**
+  - CI kits ship without AOT archives;
+  - the runner's SDK changes the metallib digests.
+- **Not changed:**
+  - `macos-smoke.sh`/`macos-validated.sh` shellcheck notes: B9-M26's files;
+  - the Groth16 tar is unpacked before its SHA-256 is compared: the pinned HTTPS URL, and bsdtar's
+    refusal of absolute and `..` paths, bound the risk;
+  - the `check-macos-kit.py` fat-file heuristic;
+  - `check-release-libs.sh` not looking inside the AMD and Intel tarballs: unchanged Linux code;
+  - the two version extractions: they agree, and a divergence fails the release loudly.
+
 ## Knobs
 
 `vars.ZKMINER_MACOS_RUNNER`, inputs `metal_toolchain` (`pinned`/`xcode`), `metal_probe`, `probe_proof`,
 `retention_days`; `PROBE_MIN_FREE_GIB`; `assemble-macos.sh` `ASSEMBLE_BUILD_ONLY`, `ASSEMBLE_ENV_OUT`,
-`ASSEMBLE_ENV_ONLY`; `assemble-release.sh` `ZKMINER_VERSION`, `EXPECT_COMMIT`. To revert, remove the
+`ASSEMBLE_ENV_ONLY`; `assemble-release.sh` `ZKMINER_VERSION`, `EXPECT_COMMIT`. Round 1 adds no knob.
+To take back the per-job cleanup, remove the two `Clean the runner user's caches` steps of a job. The
+disk numbers above then no longer hold on a persistent runner. To revert, remove the
 `macos` job from `release.yml` and `macos` from `assemble.needs`. `assemble-release.sh` then fails for
 the missing `dist-macos`, so the macOS block must go too.
 
@@ -305,3 +444,9 @@ the missing `dist-macos`, so the macOS block must go too.
 6. **`build-macos.yml` runs on push/PR for `crates/**`.** It occupies the single runner for about 10-40
    minutes per change. Narrow the paths if that hurts.
 7. **The `xcode` toolchain mode is untested** (no Xcode here).
+8. **`macos-clean-home.sh` assumes one runner per user account.** Two runners that share a `HOME` would
+   delete each other's crate sources mid-build. `docs/ci-macos.md` says so; nothing checks it.
+9. **The expression evaluator is this item's own** (no Node or `@actions/expressions` here). It
+   implements the documented subset and is checked against the documented cases. GitHub itself has
+   not evaluated these expressions yet, which happens on the first push.
+10. **`check-macos-kit.py` has not run on Linux** (no Linux host or Docker here).

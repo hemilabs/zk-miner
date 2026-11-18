@@ -19,7 +19,24 @@ How GitHub Actions builds, tests and releases the macOS beta kit `zkminer-<versi
 | `metal-probe` | no (`continue-on-error`) | what the runner's GPU can do: device facts and one tiny proof. Never a gate |
 
 A pull request from a fork never runs on the self-hosted runner: both required jobs carry an `if:` that
-skips them.
+skips them. `metal-probe` runs on push, same-repository pull request, a manual run and a call that does
+not pass `metal_probe: false`. Its `if:` and `PROBE_PROOF` compare the inputs as text
+(`format('{0}', inputs.metal_probe) != 'false'`). On push and pull_request the `inputs` context is empty,
+and GitHub's `==` coerces null and false both to 0, so `inputs.metal_probe != false` would skip the
+probe there (B9-CI round 1). `scripts/ci/test-workflow-expressions.py` evaluates every expression of
+the workflow per event.
+
+Every job starts, right after the checkout, and ends (`always()`) with `scripts/ci/macos-clean-home.sh`.
+It deletes what a job leaves in the runner user's `HOME` that no later job reads back as a cache:
+`~/.cargo/registry/src`, `~/.cargo/git/checkouts`, the Groth16 coefficient cache and risc0-build-kernel's
+kernel cache. It keeps the cached downloads (`registry/{index,cache}`, `git/db`) and the toolchains.
+One runner per user account: two runners sharing a `HOME` would delete each other's sources.
+
+Each job's concurrency group names the workflow (`github.workflow`; a called workflow sees its caller's
+name), the event and the ref. A release's `macos` job and a manual `build-macos` run on the same ref
+therefore never cancel each other's pending runs. Git gives up on a fetch slower than 1 KB/s for 2
+minutes (`GIT_HTTP_LOW_SPEED_LIMIT`/`_TIME`), so a stalled cargo git fetch fails the step instead of
+hanging until the job's timeout.
 
 ### `build`
 
@@ -38,7 +55,8 @@ skips them.
    `target/`.
 3. **Toolchains** (`scripts/ci/macos-toolchains.sh`). Each is pinned and skipped when already
    present:
-   - rustup-init 1.29.3 (SHA-256), then the toolchain `rust-toolchain.toml` names (profile minimal);
+   - rustup-init 1.29.3 (SHA-256) when the runner has no rustup, then the toolchain `rust-toolchain.toml`
+     names, by channel and components (profile minimal), which a runner's older rustup also accepts;
    - `rzup`, built with `cargo install --locked` from the hemilabs/risc0 rev that `Cargo.toml` pins,
      then the RISC Zero Rust guest toolchain 1.97.0 through it;
    - protoc 36.2 (the official zip, SHA-256).
@@ -51,17 +69,19 @@ skips them.
    - `ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none scripts/ci/assemble-macos.sh dist/macos`, which runs
      `check-macos-release.sh`;
    - `check-macos-kit.py` with the version and commit;
-   - `test-check-macos-kit.sh`, which builds ten broken copies of the fresh kit and checks that every one
-     is rejected.
+   - `test-check-macos-kit.sh`, which builds eleven broken copies of the fresh kit and checks that every
+     one is rejected.
 7. **Upload** `dist-macos`, then unmount the toolchain (`always()`).
 
 ### `cpu-tests`
 
 `scripts/ci/macos-cpu-tests.sh` runs, with the kit's build settings (`ASSEMBLE_ENV_ONLY=1`):
 
-- the Metal worker's unit tests (release), except the three that read the Mac's Metal device or need a
-  16 GB Mac (`MACOS_GPU_TESTS` in the script);
-- zkminer-prover's discovery and dispatcher tests;
+- the Metal worker's unit tests (release), except the four that read the Mac's Metal device or power
+  state, or need a 16 GB Mac (`MACOS_GPU_TESTS` in the script);
+- zkminer-prover's discovery and dispatcher tests, except the three that assert this Mac's GPU, input
+  devices and power source (`MACOS_HOST_TESTS`). A headless or VM runner may have none of them. Every
+  skipped test still runs in `Makefile.mac mac-test-miner` on a Mac;
 - `test-metal-tc.sh`, which pushes the compiler wrapper through risc0-build-kernel and cargo. It
   compiles kernels and runs none.
 
@@ -84,7 +104,9 @@ the Metal kernels and the guests. Run after the release build in one job, it fil
    Otherwise it is streamed into the job's temp directory (`curl | SHA-256 | tar`, checked against the
    kit's pin, deleted at the end) and never into `~/.risc0`: 5.4 GB left there would take the build
    job's room on a persistent runner.
-3. One fibonacci proof with its Groth16 wrap (`--try-paravirtual`).
+3. One fibonacci proof with its Groth16 wrap (`--try-paravirtual`). The worker's Groth16 coefficient
+   cache (343 MB) goes to the work directory (`RISC0_G16_CACHE_DIR`), deleted at the end, not to
+   `~/.cache/risc0-groth16`.
 
 The job summary gets the facts and the exit code's meaning. The job fails only on a code that points at
 the kit: 1 (proof failed), 6 (did not launch), 7, 8 or 2. Codes 3 (no device), 4 (paravirtual) and 5
@@ -111,38 +133,43 @@ the kit: 1 (proof failed), 6 (did not launch), 7, 8 or 2. Codes 3 (no device), 4
 
 ### Disk budget
 
-Measured by running every `run:` step of the three jobs locally, in order, from a fresh clone. The
-setup:
+Measured by running every `run:` step of the jobs locally from a fresh clone, as a persistent runner
+runs them. The setup:
 
 - a fresh `HOME`/`CARGO_HOME`, `CARGO_BUILD_JOBS=5`;
 - a 14.0 GB APFS disk image (13.79 GB usable) as workspace, `HOME` and `RUNNER_TEMP`;
-- `HOME` kept between the jobs: the worst case, a persistent runner.
+- `HOME` and the workspace kept between the jobs, run in the order build, cpu-tests, metal-probe,
+  build, cpu-tests. The second build and test runs are the steady state of a persistent runner, and
+  the worst case;
+- the expressions (env, `if:`) evaluated for a push event by `test-workflow-expressions.py`'s
+  evaluator, so the probe ran because its `if:` said so.
 
 Full numbers are in the B9-CI note.
 
-| job | peak used | least free | biggest single item |
+| job | peak used | least free (first / steady state) | biggest single item |
 |---|---|---|---|
-| build | 11.74-11.75 GB (end of the build) | 2.04 GB | `target/` 7.1 GB, of it 3.5 GB the 13 guests' builds |
-| cpu-tests | 10.88-11.63 GB | 2.16 GB | the test build, 6.2 GB before the guests are pruned |
-| metal-probe | 11.21-11.23 GB | 2.56 GB | the risc0-groth16 component, 5.4 GB (temporary, in `RUNNER_TEMP`) |
+| build | 11.74-11.76 GB (end of the build) | 2.05 / 2.03 GB | `target/` 7.1 GB, of it 3.5 GB the 13 guests' builds |
+| cpu-tests | 10.90-10.97 GB | 2.89 / 2.82 GB | the test build, 6.2 GB before the guests are pruned |
+| metal-probe | 10.60 GB | 3.19 GB | the risc0-groth16 component, 5.4 GB (temporary, in `RUNNER_TEMP`) |
 
-Peak memory: about 6.1 GB summed over the build's process tree with 5 jobs, and 7.5 GB for the worker's
-fibonacci proof with its Groth16 wrap. Both are well under the runner's 14 GB.
+Without `macos-clean-home.sh`, the second build had 0.90 GB left and the second test run 1.69 GB (B9-CI
+round-1 review). The test job's extra crate sources (0.7 GB) and the probe's coefficient cache (0.34
+GB) stayed in `HOME`.
 
-`HOME` after a build holds:
+Peak memory: about 6.5 GB summed over the build's process tree with 5 jobs, and 6.8-7.5 GB for the
+worker's fibonacci proof with its Groth16 wrap. Both are well under the runner's 14 GB.
+
+Between jobs, `HOME` holds:
 
 - rustup with the 1.97.1 toolchain: 0.57 GB;
 - the RISC Zero guest toolchain: 1.3 GB;
-- the cargo registry and git: about 1.6-2.1 GB;
-- the risc0 kernel cache: 0.08-0.15 GB.
+- the cargo registry index and archives, and the git databases: about 0.8 GB.
 
 The toolchain disk image takes 0.9 GB in `RUNNER_TEMP`, and its download peaks at about 1.8 GB.
 
-If the disk gets tighter (a bigger dependency tree, more guests), there are two levers:
-
-- prune the guests' builds as soon as the build has embedded them (`macos-prune-target.sh --guests`;
-  the build job does not need to, today);
-- delete the cargo registry's `src/` after the build.
+If the disk gets tighter (a bigger dependency tree, more guests), the next lever is to prune the guests'
+builds as soon as the build has embedded them (`macos-prune-target.sh --guests`; the build job does not
+need to, today).
 
 ## Release wiring
 
@@ -153,7 +180,9 @@ If the disk gets tighter (a bigger dependency tree, more guests), there are two 
   - `<version>` is `ZKMINER_VERSION`, which `release.yml` sets from `check-version`, the job that
     compared the tag with `Cargo.toml`;
   - it first checks the build job's `SHA256SUMS` line;
-  - then it runs `check-macos-kit.py --version <version> --commit <github.sha>`;
+  - then it runs `check-macos-kit.py --require-validated --version <version> --commit <github.sha>`.
+    `--require-validated` fails a kit whose `BUILDINFO` does not say `metal_compiler_validated=yes`, so
+    a kit built with the `xcode` compiler cannot be released even without a tag;
   - a kit of another version in the artifact fails it.
 - `scripts/ci/check-release-libs.sh` now also checks the macOS kit with `check-macos-kit.py` on the
   Linux host, since `ldd` cannot read Mach-O:
@@ -188,6 +217,10 @@ If the disk gets tighter (a bigger dependency tree, more guests), there are two 
   the `run:` scripts, and `scripts/ci/actionlint.yaml` for the self-hosted labels.
 - `scripts/ci/test-check-macos-kit.sh <kit tarball> [<commit>]` tests the Linux-side kit check (about
   a minute, no GPU).
+- `scripts/ci/test-workflow-expressions.py` evaluates `build-macos.yml`'s expressions per event (push,
+  pull request from the repository and from a fork, manual run with each input, call with nothing
+  and with `release.yml`'s `with:`). It covers which jobs run, `METAL_TOOLCHAIN`, `PROBE_PROOF` and the
+  concurrency groups. `lint-workflows.sh` runs it.
 - The B9-CI note has the harness that runs the jobs' steps locally in a 14 GB disk image.
 
 ## Knobs

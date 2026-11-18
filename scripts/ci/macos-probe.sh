@@ -15,7 +15,9 @@
 #    end; skipped with a notice when the disk has less than PROBE_MIN_FREE_GIB free, default 7) and
 #    one tiny proof (macos-smoke.sh --try-paravirtual:
 #    fibonacci, lift, join, Groth16 wrap, verified by the worker). On a paravirtual (VM) device the
-#    proof is informational: it says nothing about a real Mac's GPU.
+#    proof is informational: it says nothing about a real Mac's GPU. The worker's Groth16
+#    coefficient cache (343 MB) goes to <work dir>/g16-cache (RISC0_G16_CACHE_DIR), deleted at the
+#    end: on a persistent runner nothing of the probe stays in the runner user's HOME.
 # Exit: 0 when nothing points at a kit defect (smoke exit 0, 3 no Metal device, 4 paravirtual,
 # 5 the worker refuses this runner, or the proof skipped for disk); the smoke script's code for a
 # real failure (1 proof failed, 6 a binary did not launch, 7 no Groth16 component, 8 quarantined,
@@ -26,6 +28,7 @@ work=${2:?usage: $0 <kit tarball> <work dir>}
 proof=${PROBE_PROOF:-1}
 min_free=${PROBE_MIN_FREE_GIB:-7}
 mkdir -p "$work"; work=$(cd "$work" && pwd)
+export RISC0_G16_CACHE_DIR=$work/g16-cache
 summary=${GITHUB_STEP_SUMMARY:-/dev/null}
 note() { echo "$*"; echo "$*" >> "$summary"; }
 meaning() {
@@ -108,6 +111,7 @@ open(sys.argv[1], "w").write(h.hexdigest())' "$work/g16.sha256" | tar -xJf - -C 
   fi
   rm -rf "$work/g16"
 fi
+rm -rf "$RISC0_G16_CACHE_DIR"
 "$kit/install.sh" --uninstall --prefix "$work/prefix" > /dev/null || true
 
 case $rc in
