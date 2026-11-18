@@ -193,7 +193,14 @@ sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4
 
 # Patch SP1 crates to use hemilabs fork (AMD GPU + PLONK optimizations)
 #
-# Pinned by commit: hemilabs/sp1 `main` @ 6a372264b, the merge of #22 (`zkminer/b70-sp1-perf`:
+# Pinned by commit: hemilabs/sp1 @ 610b04beb, the head of #24 (`zkminer/sp1-oom-cause`, merged into
+# `main` with a merge commit, so it stays in `main`'s history): a proof whose device allocation
+# failed now fails with "out of GPU memory" rather than a bare "controller task failed", so the
+# worker retries it one shard size smaller, and under Windows the CUDA server refuses a pool block
+# the card has no room for instead of letting the driver spill it into system memory (a 12 GB card:
+# 60 s to fail, retry smaller and prove, against 408 s spilled). Not `main`'s merge commit, which
+# also carries #23 (the executor's memory through descriptors), a pin for other work. #24 sits on
+# 6a372264b, the merge of #22 (`zkminer/b70-sp1-perf`:
 # Arc Pro B70 SYCL speedups, the solved and stripped Groth16 R1CS kept between proofs on Windows, a
 # SYCL out-of-memory print fix) on #21 (`zkminer/circuit-artifacts-pin`: the SDK's circuit artifact
 # archives checked against pinned SHA-256s and unpacked without `tar -P`), on #20, which pinned
@@ -217,24 +224,24 @@ sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4
 # which installs it. A commit rather than a branch, so that a moved branch can never pair an SDK with
 # a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the commit directly, in step
 # with this.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "6a372264b975ab830b2fcd35e1078716b85d7b10" }
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "610b04beb7927aa5f275973ea956e7a6fd0e4d6a" }
 
 [profile.release]
 opt-level = 3
