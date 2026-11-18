@@ -1775,10 +1775,12 @@ with a throwaway retention store. It prints one JSON report:
 - fuel, fetches, bytes, the builder's peak memory and `|W|`;
 - cycles in the `maxGuestCycles` unit and the journal per po2, judged against `maxGuestCycles` as a
   miner judges the po2s it may use (§7.1): by default at the sizes this configuration's cards prove at
-  (its benchmark cache and `prover.risc0_job_po2`); when it names none, at every job po2, each on its
-  own, so a job over the limit at some sizes only is reported with them (`cycleLimit`) and not
-  skipped, since whether a miner serves it depends on the segment size its cards prove at; `--po2`
-  names the sizes to judge at (`--po2 16..22`: every one);
+  (its benchmark cache and `prover.risc0_job_po2`); when it names none, every job po2 is executed,
+  each on its own and reported (`cycleLimit`), and the job is judged at po2 20, the size every card
+  without a calibration or an operator's size proves at; `--po2` names the sizes to judge at (`--po2
+  16..22`: every one). The benchmark cache does not record a card's VRAM, by which the miner sizes a
+  card under 14 GiB below 20 (or gives it no job): such a card is judged as a larger one would be,
+  and the report's `po2Source` names the size it would have;
 - the pinned bytes and the binding's mutation check;
 - the estimated fulfil DA size (from `GasPriceOracle`, else an upper bound) and this host's
   admission parameters;

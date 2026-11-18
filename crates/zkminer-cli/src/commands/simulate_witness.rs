@@ -829,33 +829,43 @@ fn host_max_guest_cycles(config: &ZkMinerConfig, opts: &WitnessSimOptions) -> (u
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Po2Plan {
     pub po2s: Vec<u8>,
-    /// Over at one of these, the job is skipped. Empty: no prover's sizes are known, and only a job
-    /// over at every size is.
+    /// Over at one of these, the job is skipped (as it is when over at every size executed).
     pub required: Vec<u8>,
     pub source: String,
+    /// Who proves at `required`, in the report's words.
+    pub provers: &'static str,
 }
 
 /// `--po2`'s sizes, judged at every one; else the sizes this configuration's cards prove at
-/// ([`configured_card_po2s`]); else every job size, each judged on its own.
+/// ([`configured_card_po2s`]); else every job size, judged at [`RISC0_DEFAULT_JOB_PO2`]: the size
+/// every card without a calibration or an operator's size proves at, so a miner that names no sizes
+/// skips a job over the limit there.
+///
+/// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
 pub fn po2_plan(asked: Option<&[u8]>, cards: Option<(Vec<u8>, String)>) -> Po2Plan {
-    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    use zkminer_prover_protocol::{RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     match (asked, cards) {
         (Some(a), _) => Po2Plan {
             po2s: a.to_vec(),
             required: a.to_vec(),
             source: "--po2".into(),
+            provers: "--po2 says the prover",
         },
         (None, Some((c, source))) => Po2Plan {
             po2s: c.clone(),
             required: c,
             source,
+            provers: "this configuration",
         },
         (None, None) => Po2Plan {
             po2s: (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).collect(),
-            required: Vec::new(),
-            source:
-                "every job size: this configuration names no card sizes (--po2 gives a prover's)"
-                    .into(),
+            required: vec![RISC0_DEFAULT_JOB_PO2],
+            source: format!(
+                "every job size, judged at po2 {RISC0_DEFAULT_JOB_PO2}: this configuration names no card sizes, and \
+                 every card without a calibration or an operator's size proves at {RISC0_DEFAULT_JOB_PO2} (--po2 \
+                 gives a prover's sizes)"
+            ),
+            provers: "a miner whose cards have no calibrated or configured size",
         },
     }
 }
@@ -864,15 +874,22 @@ pub fn po2_plan(asked: Option<&[u8]>, cards: Option<(Vec<u8>, String)>) -> Po2Pl
 /// (`benchmark::risc0_job_po2`): each risc0 row of `suite` (the benchmark cache, while this
 /// hardware still matches it) at its `prover.risc0_job_po2` size, else its calibration or the
 /// default size; and each other card `prover.risc0_job_po2` names. `None` when neither names a card.
-/// The cards' VRAM is not read here, so a card the miner gives no jobs (under 14 GiB, uncalibrated)
-/// counts at the default size; the source names every card and its size.
+///
+/// The miner also sizes a card by its VRAM, which the benchmark cache does not record and this does
+/// not read: a card under 14 GiB proves at its calibrated size (below the default when the default
+/// failed there), or no job at all uncalibrated. Such a row counts at the size a card of 14 GiB or
+/// more would prove at, and the source names, card by card, the size it would have under 14 GiB
+/// wherever that differs, so a reader with a smaller card knows to give its size with `--po2`.
 pub fn configured_card_po2s(
     config: &ZkMinerConfig,
     suite: Option<&zkminer_prover::benchmark::BenchmarkSuite>,
 ) -> Option<(Vec<u8>, String)> {
+    use zkminer_prover::benchmark::{risc0_job_po2, RISC0_JOB_MIN_VRAM_BYTES};
     use zkminer_prover_protocol::{BACKEND_RISC0, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let overrides = &config.prover.risc0_job_po2;
     let mut cards: Vec<(String, u8)> = Vec::new();
+    // Cards whose size would differ under 14 GiB of VRAM: (device, that size, None for no jobs).
+    let mut small: Vec<(String, Option<u8>)> = Vec::new();
     let mut from = Vec::new();
     for row in suite
         .iter()
@@ -880,9 +897,14 @@ pub fn configured_card_po2s(
         .filter(|d| d.prover_backend == BACKEND_RISC0)
     {
         let over = overrides.get(&row.device_id).copied();
-        if let Some(po2) = zkminer_prover::benchmark::risc0_job_po2(over, Some(row), None) {
+        if let Some(po2) = risc0_job_po2(over, Some(row), None) {
             if !cards.iter().any(|(d, _)| *d == row.device_id) {
                 cards.push((row.device_id.clone(), po2));
+                // A CPU slot has no VRAM: the miner sizes it as one of unknown VRAM.
+                let under = risc0_job_po2(over, Some(row), Some(RISC0_JOB_MIN_VRAM_BYTES - 1));
+                if row.device_id != "cpu" && under != Some(po2) {
+                    small.push((row.device_id.clone(), under));
+                }
             }
         }
     }
@@ -909,13 +931,24 @@ pub fn configured_card_po2s(
     po2s.dedup();
     let list = cards
         .iter()
-        .map(|(d, p)| format!("{d} at po2 {p}"))
+        .map(|(d, p)| match small.iter().find(|(s, _)| s == d) {
+            Some((_, Some(q))) => format!("{d} at po2 {p} ({q} if it has under 14 GiB of VRAM)"),
+            Some((_, None)) => format!("{d} at po2 {p} (no jobs if it has under 14 GiB of VRAM)"),
+            None => format!("{d} at po2 {p}"),
+        })
         .collect::<Vec<_>>()
         .join(", ");
+    let vram = if small.is_empty() {
+        String::new()
+    } else {
+        "; the benchmark cache does not record VRAM, which the miner also sizes a card by: give a smaller \
+         card's size with --po2"
+            .to_string()
+    };
     Some((
         po2s,
         format!(
-            "this configuration's cards: {list} (from {})",
+            "this configuration's cards: {list} (from {}){vram}",
             from.join(" and ")
         ),
     ))
@@ -968,7 +1001,7 @@ fn cycle_limit_report(
             format!(
                 "over maxGuestCycles at po2 {}, which {} proves at: a miner proving there skips this job",
                 po2_list(&required_over),
-                if plan.source == "--po2" { "--po2 says the prover" } else { "this configuration" }
+                plan.provers
             )
         } else {
             format!(
@@ -1934,13 +1967,77 @@ mod tests {
         // The cards' sizes, as the miner executes and judges them.
         let p = po2_plan(None, cards());
         assert_eq!((p.po2s, p.required), (vec![19, 20], vec![19, 20]));
-        // Neither: every job size, none required, so a job over at some sizes only is not skipped.
+        // Neither: every job size executed, judged at the default size every uncalibrated card
+        // proves at, as a miner without card sizes judges it.
         let p = po2_plan(None, None);
         assert_eq!(p.po2s, (16..=22).collect::<Vec<u8>>());
+        assert_eq!(
+            p.required,
+            vec![zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2]
+        );
         assert!(
-            p.required.is_empty() && p.source.starts_with("every job size"),
+            p.source.starts_with("every job size, judged at po2 20"),
             "{p:?}"
         );
+        let r = cycle_limit_report(100, &[(18, Some(90)), (20, None)], &p).unwrap();
+        assert!(r
+            .note
+            .unwrap()
+            .contains("over maxGuestCycles at po2 20, which a miner whose cards have no"));
+    }
+
+    /// The miner sizes a card under 14 GiB of VRAM below the default (or gives it no jobs); the
+    /// benchmark cache does not record VRAM, so the source says what such a card would prove at.
+    #[test]
+    fn a_card_size_that_depends_on_vram_is_named() {
+        use zkminer_prover::benchmark::{risc0_job_po2, BenchmarkSuite, DeviceBenchmark};
+        let gib = 1u64 << 30;
+        // Calibrated: po2 20 proved, 21 failed (ceiling 19).
+        let calibrated: DeviceBenchmark = serde_json::from_value(serde_json::json!({
+            "device_id": "gpu0", "device_label": "gpu0", "prover_backend": "risc0",
+            "throughput": 1.0, "power_watts": 1.0, "optimal_po2": 20, "max_feasible_po2": 19,
+            "po2_samples": [{"po2": 20, "total_cycles": 1, "segment_count": 1, "duration_secs": 1.0, "throughput": 1.0}],
+        }))
+        .unwrap();
+        let uncalibrated: DeviceBenchmark = serde_json::from_value(serde_json::json!({
+            "device_id": "gpu1", "device_label": "gpu1", "prover_backend": "risc0",
+            "throughput": 1.0, "power_watts": 1.0,
+        }))
+        .unwrap();
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated), Some(12 * gib)),
+            Some(19)
+        );
+        assert_eq!(
+            risc0_job_po2(None, Some(&uncalibrated), Some(12 * gib)),
+            None
+        );
+        let config = ZkMinerConfig::default();
+        let suite = BenchmarkSuite {
+            device_benchmarks: vec![calibrated, uncalibrated],
+            ..Default::default()
+        };
+        let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
+        assert_eq!(po2s, vec![20], "judged as cards of 14 GiB or more");
+        assert!(
+            source.contains("gpu0 at po2 20 (19 if it has under 14 GiB of VRAM)"),
+            "{source}"
+        );
+        assert!(
+            source.contains("gpu1 at po2 20 (no jobs if it has under 14 GiB of VRAM)"),
+            "{source}"
+        );
+        assert!(
+            source.contains("give a smaller card's size with --po2"),
+            "{source}"
+        );
+        // An operator's size is the card's whatever its VRAM: nothing to name.
+        let mut config = ZkMinerConfig::default();
+        config.prover.risc0_job_po2 =
+            std::collections::HashMap::from([("gpu0".into(), 18), ("gpu1".into(), 18)]);
+        let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
+        assert_eq!(po2s, vec![18]);
+        assert!(!source.contains("VRAM"), "{source}");
     }
 
     #[test]
@@ -1967,7 +2064,9 @@ mod tests {
         let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
         assert_eq!(po2s, vec![20]);
         assert!(
-            source.contains("cpu at po2 20, gpu0 at po2 20") && !source.contains("gpu1"),
+            source
+                .contains("cpu at po2 20, gpu0 at po2 20 (no jobs if it has under 14 GiB of VRAM)")
+                && !source.contains("gpu1"),
             "{source}"
         );
         // prover.risc0_job_po2 sizes its card, names one the cache lacks, and is held to 16..=22.

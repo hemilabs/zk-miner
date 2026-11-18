@@ -677,9 +677,9 @@ FIELDS without a hash, a range past the journal) does not load anywhere.
 **Simulate a job before submitting it.** `zkminer simulate --descriptor d.json` runs the job through
 the miner's own pre-claim pipeline: the static gates, the builder (from `--builder`, or fetched by
 the broker from the envelope's `hemi-code` locators exactly as a miner fetches it), the sandboxed
-builder and execute at every `--po2` (default `16..=22`; one size, a range or a list), the router's
-binding check, a bundle published to a throwaway retention store under `--cache-dir` (removed at
-the end; it must not be tmpfs), and the claim gate's DA check (the exact fulfil against `[witness]
+builder and execute at every `--po2` (one size, a range or a list), the router's binding check, a
+bundle published to a throwaway retention store under `--cache-dir` (removed at the end; it must
+not be tmpfs), and the claim gate's DA check (the exact fulfil against `[witness]
 fulfil_da_cap_bytes`). The guest ELF is `--elf`, else the ProgramRegistry's. The broker uses your own
 endpoints: `--broker-config` (the broker's TOML; default `[broker] config`), copied into the run's
 work directory with a spool of its own, so a simulation never shares a running miner's. The
@@ -687,7 +687,13 @@ configuration's `[witness]` limits apply, the miner's per-job artifact budget (b
 holds `hemi-code` reads, and `[witness] sandbox_mode = "rootless"` on a host without root; the
 sandbox and broker self-tests must pass first. A miner without `[witness] max_guest_cycles` derives
 its cycle maximum from its cards and proving timeout; give `--max-guest-cycles` to judge the job by
-one (else 2^34 applies, and the check is listed as not done). Run it in a delegated cgroup:
+one (else 2^34 applies, and the check is listed as not done). Without `--po2`, `maxGuestCycles` is
+judged at the sizes this configuration's risc0 cards prove at (its benchmark cache and
+`prover.risc0_job_po2`), else every job size is executed and judged at po2 20, the size every card
+without a calibration or an operator's size proves at (`po2Source` says which). The miner also sizes
+a card by its VRAM, which the benchmark cache does not record: a card under 14 GiB proves at its
+calibrated size, below 20 when 20 failed there, or no job at all uncalibrated. `po2Source` names
+the size each such card would have, and `--po2` judges at it. Run it in a delegated cgroup:
 
 ```bash
 systemd-run --user --scope -q -p Delegate=yes -- \
