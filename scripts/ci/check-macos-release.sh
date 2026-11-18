@@ -19,7 +19,10 @@
 #   needlessly. (A default kit has all three equal; a ZKMINER_MACOS_MIN=sdk kit has minos 11.0 and
 #   metallibs for the build SDK, so its min_macos is the SDK's version.)
 # - the offline archive set: its SHA256SUMS hold, every archive is of a metallib the worker embeds
-#   (digest field), of a family BUILDINFO lists, and has the macos<major> key of min_macos;
+#   (digest field), of a family BUILDINFO lists, and has a macos<N> key BUILDINFO aot_os_keys lists,
+#   with N no older than min_macos's major (the runtime opens only macos<its major>, so a set keyed
+#   for an older macOS than the kit's minimum is never used) and, by manifest.jsonl, built with
+#   metal-tt -macos-version-min N.0; every key holds the same units and families (B9-M26);
 # - no risc0-groth16 component file is in the kit, and the worker pins the Groth16 blob BUILDINFO
 #   names (install.sh --with-groth16 downloads that one);
 # - install.sh and the tools parse (bash -n).
@@ -108,10 +111,10 @@ listed=$(cd "$k" && awk '{print $2}' SHA256SUMS | sort)
 present=$(cd "$k" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | sort)
 [ "$listed" = "$present" ] || bad "SHA256SUMS does not list exactly the kit's files: $(diff <(echo "$listed") <(echo "$present") | grep '^[<>]' | head -5 | tr '\n' ' ')"
 for f in zkminer provers/zkminer-prove-risc0-metal install.sh README.md LICENSE BUILDINFO \
-         tools/install-metal-aot.sh tools/build-metal-aot.sh metal-aot; do
+         tools/install-metal-aot.sh tools/build-metal-aot.sh tools/macos-smoke.sh metal-aot; do
   [ -e "$k/$f" ] || bad "missing $f"
 done
-for f in zkminer provers/zkminer-prove-risc0-metal install.sh tools/install-metal-aot.sh tools/build-metal-aot.sh; do
+for f in zkminer provers/zkminer-prove-risc0-metal install.sh tools/install-metal-aot.sh tools/build-metal-aot.sh tools/macos-smoke.sh; do
   [ -x "$k/$f" ] || bad "$f is not executable"
 done
 info() { sed -n "s/^$1=//p" "$k/BUILDINFO"; }
@@ -134,14 +137,33 @@ if [ "$n" -gt 0 ]; then
   (cd "$k/metal-aot" && shasum -a 256 -c --quiet SHA256SUMS) || bad "metal-aot/SHA256SUMS does not hold"
   digests=$("$k/tools/build-metal-aot.sh" --worker-digests "$w")
   arches=" $(info aot_arches) "
+  keys=" $(info aot_os_keys) "
+  [ "$keys" != "  " ] || bad "BUILDINFO has no aot_os_keys"
+  for key in $keys; do
+    [[ "$key" =~ ^macos[0-9]+$ ]] && [ "${key#macos}" -ge "${min%%.*}" ] \
+      || bad "BUILDINFO aot_os_keys: $key is not macos<N> with N >= ${min%%.*} (min_macos $min): the runtime of no supported macOS opens it"
+  done
+  : > "$root/sets"
   for f in "$k"/metal-aot/*.binarchive; do
     b=$(basename "$f")
     IFS=- read -r unit d arch oskey _ <<<"$b"
     grep -qx "$d" <<<"$digests" || bad "metal-aot/$b: digest $d is no metallib the worker embeds"
     [[ "$arches" == *" $arch "* ]] || bad "metal-aot/$b: family $arch is not in BUILDINFO aot_arches"
-    [ "$oskey" = "macos${min%%.*}" ] || bad "metal-aot/$b: OS key $oskey, want macos${min%%.*}"
+    [[ "$keys" == *" $oskey "* ]] || bad "metal-aot/$b: OS key $oskey is not in BUILDINFO aot_os_keys ($(info aot_os_keys))"
+    mm=$(python3 -I -c 'import json,sys
+for l in open(sys.argv[1]):
+    if l.strip() and json.loads(l)["file"] == sys.argv[2]: print(json.loads(l).get("macos_min", ""))' "$k/metal-aot/manifest.jsonl" "$b" 2>/dev/null | head -1)
+    [ "${mm%%.*}" = "${oskey#macos}" ] || bad "metal-aot/$b: manifest.jsonl says it was built for macOS '${mm:-?}', not for its key $oskey"
+    echo "$oskey $unit-$d-$arch" >> "$root/sets"
   done
-  echo "  $n archives ($(du -sh "$k/metal-aot" | cut -f1)) for $(info aot_arches), all of this worker's metallibs, key macos${min%%.*}"
+  first=
+  for key in $keys; do
+    this=$(awk -v k="$key" '$1 == k {print $2}' "$root/sets" | sort)
+    [ -n "$this" ] || bad "BUILDINFO aot_os_keys lists $key, but metal-aot has no $key archives"
+    if [ -z "$first" ]; then first=$this; firstkey=$key
+    elif [ "$this" != "$first" ]; then bad "metal-aot: the $key archives are not the same units and families as the $firstkey ones"; fi
+  done
+  echo "  $n archives ($(du -sh "$k/metal-aot" | cut -f1)) for $(info aot_arches), all of this worker's metallibs, keys$keys"
 else
   echo "  none (the first start compiles the GPU pipelines)"
 fi
@@ -159,7 +181,7 @@ LC_ALL=C grep -aqF "$url" "$w" || bad "the worker does not pin $url (BUILDINFO a
 echo "  not bundled; the worker and install.sh --with-groth16 fetch v$(info groth16_version), sha256 ${sha:0:16}..."
 
 echo "scripts:"
-for s in install.sh tools/install-metal-aot.sh tools/build-metal-aot.sh; do
+for s in install.sh tools/install-metal-aot.sh tools/build-metal-aot.sh tools/macos-smoke.sh; do
   bash -n "$k/$s" || bad "$s does not parse"
 done
 echo "  parse"

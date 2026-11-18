@@ -131,6 +131,7 @@ endif
 CARGO_ENV = if [ -f "$(ENV_SH)" ]; then source "$(ENV_SH)"; \
 	else echo "Makefile.mac: no $(ENV_SH): using the toolchains on PATH and xcrun (RELEASE-DEPS.md)" >&2; fi; set -eo pipefail; \
 	if [ -n "$${RISC0_SKIP_BUILD:-}" ]; then echo "Makefile.mac: unset RISC0_SKIP_BUILD (it builds empty guest ELFs)" >&2; exit 1; fi; \
+	if [ -n "$${MACOSX_DEPLOYMENT_TARGET:-}" ]; then echo "Makefile.mac: unset MACOSX_DEPLOYMENT_TARGET: the Metal compiler would target it while risc0's kernel cache key ignores it (a library cached for another macOS would be reused), and with the release profile's strip it breaks the proc-macros; scripts/ci/assemble-macos.sh sets the minimum macOS (ZKMINER_MACOS_MIN, docs/macos-beta.md)" >&2; exit 1; fi; \
 	export NVCC=off HIPCC=off CARGO_BUILD_JOBS=$(JOBS);
 # The risc0 tree the worker builds from, for the AOT archive build (its tools/metal_aot, and dump tests
 # built in that tree's own workspace): the local checkout; in git mode, a copy of cargo's checkout of the

@@ -221,9 +221,10 @@ GPU an SP1 slot.
 ### Install the beta (prebuilt kit)
 
 The macOS beta ships as `zkminer-<version>-macos-arm64.tar.gz`, built by
-`scripts/ci/assemble-macos.sh`. It needs **macOS 27.0 or later** on an Apple Silicon Mac with
-**16 GB or more**. It contains the CLI, the Metal worker, the worker's offline GPU pipeline archives
-(GPU family `applegpu_g17s`, the M5 Max it was tested on), an installer and a README.
+`scripts/ci/assemble-macos.sh`. It needs **macOS 26.0 (Tahoe) or later** on an Apple Silicon Mac
+with **16 GB or more**. It contains the CLI, the Metal worker, the worker's offline GPU pipeline
+archives (GPU family `applegpu_g17s`, the M5 Max it was tested on, for macOS 27), an installer, a
+smoke test (`tools/macos-smoke.sh`) and a README.
 
 ```sh
 tar -xzf zkminer-<version>-macos-arm64.tar.gz
@@ -239,12 +240,13 @@ zkminer init && zkminer benchmark
   Open Anyway.
 - **Groth16 component.** It is not in the kit (2.4 GB). The worker downloads it at its first warm-up,
   checked against its pinned SHA-256; `./install.sh --with-groth16` fetches it at install time instead.
-- **First start.** About 2.3 s on the M5 Max (`applegpu_g17s`; run the worker with `--metal-arch`
-  to see your Mac's family). Other families compile their GPU pipelines once,
-  about a minute on an M5 Max and longer on smaller chips.
+- **First start.** About 2.3 s on the M5 Max (`applegpu_g17s`) on macOS 27 (run the worker with
+  `--metal-arch` to see your Mac's family). Other families, and every Mac on macOS 26, compile their
+  GPU pipelines once, about a minute on an M5 Max and longer on smaller chips; later starts take
+  about 2.3 s.
 
 The kit's own `README.md` covers the details for users. Maintainers: see
-[docs/macos-beta.md](docs/macos-beta.md) for how the kit is built, why macOS 27, and which GPU
+[docs/macos-beta.md](docs/macos-beta.md) for how the kit is built, why macOS 26, and which GPU
 families get archives.
 
 ### Supported Macs
