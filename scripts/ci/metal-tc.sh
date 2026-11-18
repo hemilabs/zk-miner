@@ -6,8 +6,10 @@
 #
 # risc0-build-kernel takes no target flag but finds its compiler through METAL_TC; point METAL_TC at
 # the printed toolchain directory. With --in it is <parent dir>/metal-tc-<min>-<fingerprint>, the
-# fingerprint a SHA-256 (16 hex digits) over the real compiler's path, its `--version` first line and
-# the driver binary itself. Use --in for builds (assemble-macos.sh does): risc0-build-kernel reruns
+# fingerprint a SHA-256 (16 hex digits) over the real compiler's path, its `--version` first line,
+# the contents of every file in the compiler's directory (the driver and air-* tools beside it), and,
+# when that directory is <X>.xctoolchain/usr/bin, the path, size and mtime of every file under <X>.xctoolchain
+# (the backends in usr/lib and usr/metal; a content hash of those 2.9 GB would take seconds). Use --in for builds (assemble-macos.sh does): risc0-build-kernel reruns
 # the kernel build scripts only when the value of METAL_TC (or a source) changes, never when the
 # compiler behind the same METAL_TC path changes, so a fixed directory would keep the metallibs an
 # earlier compiler built (B9-M26 review; scripts/ci/test-metal-tc.sh reproduces it). With the
@@ -55,7 +57,11 @@ if head -c 2 "$real" | grep -q '#!'; then
 fi
 case "$real" in /*) ;; *) real=$(cd "$(dirname "$real")" && pwd)/$(basename "$real") ;; esac
 if [ -n "$in" ]; then
-  fp=$( { echo "$real"; "$real" --version 2>/dev/null | head -1; shasum -a 256 < "$real"; } | shasum -a 256 | cut -c1-16)
+  bin=$(dirname "$real") root=$(dirname "$(dirname "$real")")   # root: <X>.xctoolchain/usr for a toolchain
+  fp=$( { echo "$real"; "$real" --version 2>/dev/null | head -1
+          find "$bin" -maxdepth 1 -type f | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done
+          if [[ "$root" == *.xctoolchain/usr ]]; then (cd "$root/.." && find . -type f -exec stat -f '%N %z %m' {} + | LC_ALL=C sort); fi
+        } | shasum -a 256 | cut -c1-16)
   mkdir -p "$in"
   tc=$(cd "$in" && pwd)/metal-tc-$min-$fp
 fi

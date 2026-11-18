@@ -224,7 +224,8 @@ The macOS beta ships as `zkminer-<version>-macos-arm64.tar.gz`, built by
 `scripts/ci/assemble-macos.sh`. It needs **macOS 26.0 (Tahoe) or later** on an Apple Silicon Mac
 with **16 GB or more**. It contains the CLI, the Metal worker, the worker's offline GPU pipeline
 archives (GPU family `applegpu_g17s`, the M5 Max it was tested on, for macOS 27), an installer, a
-smoke test (`tools/macos-smoke.sh`) and a README.
+smoke test (`tools/macos-smoke.sh`, run from the kit folder after `./install.sh --with-groth16`) and a
+README.
 
 ```sh
 tar -xzf zkminer-<version>-macos-arm64.tar.gz

@@ -191,6 +191,9 @@ if [ "$built_by" != "$VALIDATED_METAL_COMPILER" ]; then
     bad "the worker's metallibs were built by '$built_by', not by the validated compiler '$VALIDATED_METAL_COMPILER' (scripts/ci/fetch-metal-toolchain.sh; METAL_COMPILER_UNVALIDATED=1 accepts it)"
   fi
 fi
+[ "$built_by" = "$VALIDATED_METAL_COMPILER" ] && want_v=yes || want_v=no
+[ "$(info metal_compiler_validated)" = "$want_v" ] \
+  || bad "BUILDINFO metal_compiler_validated=$(info metal_compiler_validated), but '$built_by' is$([ $want_v = yes ] || echo ' not') the validated compiler: it must say $want_v"
 echo "  every metallib: $built_by"
 
 echo "offline Metal archives:"
@@ -212,6 +215,10 @@ if [ "$n" -gt 0 ]; then
       fi
     fi
   done
+  unval=
+  for key in $keys; do [[ " $VALIDATED_AOT_OS_MAJORS " == *" ${key#macos} "* ]] || unval="$unval $key"; done
+  [ "$(info aot_os_unvalidated)" = "${unval# }" ] \
+    || bad "BUILDINFO aot_os_unvalidated='$(info aot_os_unvalidated)', but the unvalidated keys are '${unval# }'"
   : > "$root/sets"
   for f in "$k"/metal-aot/*.binarchive; do
     b=$(basename "$f")
@@ -234,6 +241,7 @@ for l in open(sys.argv[1]):
   done
   echo "  $n archives ($(du -sh "$k/metal-aot" | cut -f1)) for $(info aot_arches), all of this worker's metallibs, keys$keys"
 else
+  [ -z "$(info aot_os_unvalidated)" ] || bad "BUILDINFO aot_os_unvalidated='$(info aot_os_unvalidated)', but the kit has no archives"
   echo "  none (the first start compiles the GPU pipelines)"
 fi
 for a in $(info aot_validated); do

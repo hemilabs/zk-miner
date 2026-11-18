@@ -150,7 +150,7 @@ if [ $aot = 1 ]; then
   elif [ -z "$(ls "$kit/metal-aot" 2>/dev/null | grep '\.binarchive$' || true)" ]; then
     say "this kit has no offline Metal archives; the first start compiles the GPU pipelines"
   fi
-  [ -d "$provers/metal-aot" ] || say "GPU $arch: the worker's first start compiles its GPU pipelines (a few minutes once; they are cached afterwards)"
+  [ -d "$provers/metal-aot" ] || say "GPU $arch: the worker's first start compiles its GPU pipelines (about a minute once on an M5 Max, longer on smaller Macs; cached afterwards)"
 else
   rm -rf "$provers/metal-aot"
   say "--no-aot: no offline Metal archives installed"

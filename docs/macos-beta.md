@@ -97,8 +97,9 @@ The kit follows the Linux release's conventions:
     27.0 kit worker shows no change at any budget, and the six-program benchmark is at the baseline.
   - The language is unchanged (MSL 3.2), and 15.0 would give AIR 2.7, never validated.
   - **Not validated on this Mac: a real macOS 26 runtime.** The 26.0 libraries are validated as
-    macOS 27.2 runs them. Before tagging, run `tools/macos-smoke.sh` and a worker `--benchmark` on a
-    real macOS 26 Apple Silicon Mac (note, user checklist).
+    macOS 27.2 runs them. Before tagging, in the extracted kit on a real macOS 26 Apple Silicon Mac,
+    run `./install.sh --with-groth16`, then `tools/macos-smoke.sh` and
+    `~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark` (note, user checklist).
 - **The binaries.** `minos 26.0` in LC_BUILD_VERSION makes dyld refuse to start them on an older
   macOS with a clear message, instead of failing later at the first Metal library load. `install.sh`
   checks `sw_vers` first and says so in plain words. The audit of every API the binaries use (C
@@ -307,7 +308,11 @@ families, `recommendedMaxWorkingSetSize`; no developer tools needed), then one `
 its Groth16 wrap, verified by the worker (and by `STOCK_VERIFY=<stock-verify31>` if given). Exit 0
 ok, 1 proof failed, 3 no Metal device, **4 paravirtual or non-Apple-Silicon device** (proof skipped;
 `--try-paravirtual` tries it, informational), 5 the worker refuses this Mac, 6 a binary did not
-launch, 7 no Groth16 component.
+launch, 7 no Groth16 component, **8 quarantined** (the chosen worker or CLI carries
+`com.apple.quarantine`; nothing launched). By default it takes the first of the kit's own binaries,
+the installed ones (`--prefix`, default `~/.zkminer`) and `target/release` that is not quarantined,
+so in a browser-downloaded kit it uses the installed copies once `install.sh` has run, and says so
+when they are from another build. Exit 6 is only for a binary that was launched and failed.
 
 Caveats for that runner (macOS 26, 5 cores, 14 GB, 14 GB disk, likely a VM):
 

@@ -11,6 +11,7 @@
 # Without, or with, the crate dir:
 # 1. --in names the directory after the compiler: the same compiler gives the same directory (no
 #    needless rebuilds), another compiler or another minimum another one.
+# 1b. the fingerprint covers the other tools and the toolchain's backends (B9-M26 review round 2).
 # 2. it refuses to replace a directory that is not one of its own (e.g. a real Metal.xctoolchain).
 # 3. it unwraps its own wrappers and B9-PKG's assemble-macos.sh ones: one -mmacosx-version-min,
 #    named once in the version line.
@@ -78,6 +79,21 @@ a27=$("$ci/metal-tc.sh" 27.0 --in "$T/kit" "$real")
 [ "$a1" != "$a27" ] && [[ "$(basename "$a27")" == metal-tc-27.0-* ]] && ok "1: another minimum, another directory" || no "1: 27.0 got $a27"
 [ "$("$a1/usr/bin/metal" --version | head -1)" = "$("$real" --version | head -1) [-mmacosx-version-min=26.0]" ] \
   && ok "1: the version line names the target" || no "1: version line $("$a1/usr/bin/metal" --version | head -1)"
+
+# 1b. the fingerprint covers the toolchain, not only the driver: a changed air-lld beside an unchanged
+# `metal`, or a changed backend in usr/lib (same size, new mtime), gives another directory.
+mkdir -p "$T/F.xctoolchain/usr/bin" "$T/F.xctoolchain/usr/lib"
+cp "$T/B/metal" "$T/F.xctoolchain/usr/bin/metal"; echo lld1 > "$T/F.xctoolchain/usr/bin/air-lld"
+echo backend1 > "$T/F.xctoolchain/usr/lib/libbackend.dylib"; touch -t 202601010000 "$T/F.xctoolchain/usr/lib/libbackend.dylib"
+f1=$("$ci/metal-tc.sh" 26.0 --in "$T/kitf" "$T/F.xctoolchain/usr/bin/metal")
+echo lld2 > "$T/F.xctoolchain/usr/bin/air-lld"
+f2=$("$ci/metal-tc.sh" 26.0 --in "$T/kitf" "$T/F.xctoolchain/usr/bin/metal")
+echo backend2 > "$T/F.xctoolchain/usr/lib/libbackend.dylib"; touch -t 202601020000 "$T/F.xctoolchain/usr/lib/libbackend.dylib"
+f3=$("$ci/metal-tc.sh" 26.0 --in "$T/kitf" "$T/F.xctoolchain/usr/bin/metal")
+f4=$("$ci/metal-tc.sh" 26.0 --in "$T/kitf" "$T/F.xctoolchain/usr/bin/metal")
+[ "$f1" != "$f2" ] && ok "1b: a changed air-lld beside the same driver gives another directory" || no "1b: air-lld change kept $f1"
+[ "$f2" != "$f3" ] && ok "1b: a changed usr/lib backend gives another directory" || no "1b: backend change kept $f2"
+[ "$f3" = "$f4" ] && ok "1b: an unchanged toolchain keeps its directory" || no "1b: $f3 != $f4"
 
 # --- 2. refuses a foreign directory ----------------------------------------------------------------
 mkdir -p "$T/xc/usr/bin"; cp "$T/B/metal" "$T/xc/usr/bin/metal"; echo keep > "$T/xc/marker"

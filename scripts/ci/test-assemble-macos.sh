@@ -37,9 +37,18 @@
 #    32023.999, re-signed) as a stale build (wrapper mode, even with METAL_COMPILER_UNVALIDATED=1)
 #    and as unvalidated (sdk mode); with the opt-in it labels the kit with the AIR's compiler, which
 #    check-macos-release.sh then rejects without the opt-in.
+# 12. (with a kit build; runs the worker's --metal-arch, so a Metal device is needed; B9-M26 review
+#    round 2) the kit's tools/macos-smoke.sh on a browser-downloaded kit: the tarball marked
+#    com.apple.quarantine (tar copies it onto the kit's files). Before install.sh the smoke script
+#    reports the quarantine (exit 8) without launching anything, never "did not launch" (exit 6);
+#    after install.sh it picks the installed (cleared) copies and passes its launch step; an explicit
+#    --worker of a quarantined file is exit 8; an installed copy from another kit is named.
 # 4. check-macos-release.sh rejects the sdk kit with BUILDINFO edited (SHA256SUMS redone) to the
 #    old min_macos (the binaries' 11.0), to an older macOS than the metallibs', to a newer one than
-#    needed, and with a metal_target the worker does not embed.
+#    needed, with a metal_target the worker does not embed, with metal_compiler_validated=no for the
+#    validated compiler, and with aot_os_unvalidated set on a kit without archives (cases 10 and 11
+#    also check the reverse: an empty aot_os_unvalidated beside macos26 archives, and
+#    metal_compiler_validated=yes for another compiler, both with the opt-in set).
 # 5. install.sh (--no-aot, scratch HOME and prefix, a sw_vers shim) refuses the sdk kit on a macOS
 #    older than the metallibs' target and accepts it on that version; with the old BUILDINFO
 #    (min_macos = 11.0) it would have accepted the older macOS.
@@ -183,6 +192,8 @@ if [ -n "$tarball" ]; then
   neg "min_macos $older, older than the metallibs' $sdk_metal" "is not the newer of" "min_macos=$older"
   neg "min_macos 99.0, newer than needed" "is not the newer of" "min_macos=99.0"
   neg "metal_target $sdk_minos (min_macos $sdk_minos), which the worker does not embed" "embeds metallibs for another macOS" "metal_target=$sdk_minos" "min_macos=$sdk_minos"
+  neg "metal_compiler_validated=no for the validated compiler" "BUILDINFO metal_compiler_validated=no" "metal_compiler_validated=no"
+  neg "aot_os_unvalidated=macos26 on a kit without archives" "but the kit has no archives" "aot_os_unvalidated=macos26"
 fi
 
 # --- 5. install.sh on the sdk kit, on a faked macOS version ---------------------------------------
@@ -382,6 +393,12 @@ if [ -n "$kit_tarball" ]; then
         grep -q "macos26 archives, a key not validated on hardware" "$T/aot3c.log" && ok "10: check-macos-release.sh rejects the macos26 set without the opt-in" \
           || no "10: check failed for another reason: $(grep FAIL "$T/aot3c.log" | head -2)"
       fi
+      tarball_saved=$tarball; tarball=$t3; t=$(rekit "aot_os_unvalidated="); tarball=$tarball_saved
+      if AOT_ALLOW_UNVALIDATED_OS=1 "$ci/check-macos-release.sh" "$t" > "$T/aot3d.log" 2>&1; then
+        no "10: check (with the opt-in) accepted an empty aot_os_unvalidated on a kit with macos26 archives"
+      else grep -q "but the unvalidated keys are 'macos26'" "$T/aot3d.log" && ok "10: check (with the opt-in) rejects an empty aot_os_unvalidated beside macos26 archives" \
+        || no "10: rejected for another reason: $(grep FAIL "$T/aot3d.log" | head -2)"; fi
+      rm -f "$t"
     else
       no "10: AOT_OS_MAJORS=\"26 27\" AOT_ALLOW_UNVALIDATED_OS=1 failed"; tail -8 "$T/aot3.log"
     fi
@@ -424,10 +441,48 @@ if [ -n "$kit_tarball" ]; then
       || no "11: opt-in BUILDINFO: '$(info "$bi" metal_compiler)' validated=$(info "$bi" metal_compiler_validated)"
     if env -u METAL_COMPILER_UNVALIDATED "$ci/check-macos-release.sh" "$t3" > "$T/cc3c.log" 2>&1; then no "11: check accepted it without the opt-in"
     else grep -q "not by the validated compiler" "$T/cc3c.log" && ok "11: check rejects it without the opt-in" || no "11: check: $(grep FAIL "$T/cc3c.log" | head -2)"; fi
+    tarball_saved=$tarball; tarball=$t3; t=$(rekit "metal_compiler_validated=yes"); tarball=$tarball_saved
+    if METAL_COMPILER_UNVALIDATED=1 "$ci/check-macos-release.sh" "$t" > "$T/cc3d.log" 2>&1; then no "11: check (with the opt-in) accepted metal_compiler_validated=yes for '$relabel'"
+    else grep -q "BUILDINFO metal_compiler_validated=yes" "$T/cc3d.log" && ok "11: check (with the opt-in) rejects metal_compiler_validated=yes for an unvalidated compiler" \
+      || no "11: rejected for another reason: $(grep FAIL "$T/cc3d.log" | head -2)"; fi
+    rm -f "$t"
   else
     no "11: sdk mode with METAL_COMPILER_UNVALIDATED=1 failed"; tail -5 "$T/cc3.log"
   fi
   rm -rf "$r" "$rw" "$T"/out-cc* "$T"/u-cc3
+fi
+
+# --- 12. the kit's macos-smoke.sh on a quarantined (browser-downloaded) kit -------------------------
+if [ -n "$kit_tarball" ] && [ "${TEST_ASSEMBLE_GPU:-1}" = 1 ]; then
+  d=$T/q; rm -rf "$d"; mkdir -p "$d/home" "$d/x"
+  cp "$kit_tarball" "$d/kit.tar.gz"
+  xattr -w com.apple.quarantine "0083;$(printf %x "$(date +%s)");Safari;" "$d/kit.tar.gz"
+  /usr/bin/tar -xzf "$d/kit.tar.gz" -C "$d/x"
+  k=$(echo "$d"/x/zkminer-*-macos-arm64)
+  smoke() { HOME=$d/home "$k/tools/macos-smoke.sh" --no-proof "$@" > "$d/smoke.log" 2>&1; echo $?; }
+  if ! xattr -p com.apple.quarantine "$k/zkminer" > /dev/null 2>&1; then
+    no "12: setup: tar did not copy com.apple.quarantine onto the kit's zkminer"
+  else
+    rc=$(smoke)
+    [ "$rc" = 8 ] && grep -q 'quarantined' "$d/smoke.log" && ! grep -q 'FAILED (exit' "$d/smoke.log" \
+      && ok "12: before install.sh: the kit's smoke script reports the quarantine (exit 8), launches nothing" \
+      || no "12: before install.sh: rc $rc: $(grep -E 'RESULT|FAILED' "$d/smoke.log" | head -3 | tr '\n' ' ')"
+    HOME=$d/home "$k/install.sh" --no-aot > "$d/inst.log" 2>&1 || no "12: install.sh failed: $(tail -2 "$d/inst.log")"
+    rc=$(smoke)
+    { [ "$rc" = 0 ] || [ "$rc" = 4 ]; } && grep -q "worker $d/home/.zkminer/provers/zkminer-prove-risc0-metal" "$d/smoke.log" \
+      && grep -q 'launch: worker --metal-arch ok' "$d/smoke.log" \
+      && ok "12: after install.sh: the kit's smoke script uses the installed copies and passes (exit $rc)" \
+      || no "12: after install.sh: rc $rc: $(grep -E 'worker |RESULT|FAILED' "$d/smoke.log" | head -4 | tr '\n' ' ')"
+    rc=$(smoke --worker "$k/provers/zkminer-prove-risc0-metal")
+    [ "$rc" = 8 ] && grep -q 'quarantined' "$d/smoke.log" && ok "12: --worker of a quarantined file: exit 8" \
+      || no "12: --worker quarantined: rc $rc: $(grep RESULT "$d/smoke.log")"
+    cp "$sdk_cli" "$d/home/.zkminer/zkminer"
+    rc=$(smoke)
+    { [ "$rc" = 0 ] || [ "$rc" = 4 ]; } && grep -q "not this kit's" "$d/smoke.log" \
+      && ok "12: an installed CLI from another build is named (exit $rc)" \
+      || no "12: installed CLI from another build: rc $rc: $(grep -E 'cli |NOTE|RESULT' "$d/smoke.log" | head -3 | tr '\n' ' ')"
+  fi
+  rm -rf "$d"
 fi
 
 echo "test-assemble-macos: $pass passed, $fails failed"
