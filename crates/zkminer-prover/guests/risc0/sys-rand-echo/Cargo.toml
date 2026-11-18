@@ -1,0 +1,10 @@
+[package]
+name = "sys-rand-echo"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+risc0-zkvm = { version = "3.0", default-features = false }
+risc0-zkvm-platform = { version = "2.2", default-features = false }

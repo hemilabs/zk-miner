@@ -299,6 +299,45 @@
   },
   {
     "type": "function",
+    "name": "computeCommitHash",
+    "inputs": [
+      {
+        "name": "epochId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "member",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "jobIds",
+        "type": "bytes32[]",
+        "internalType": "bytes32[]"
+      },
+      {
+        "name": "cycleCounts",
+        "type": "uint64[]",
+        "internalType": "uint64[]"
+      },
+      {
+        "name": "salt",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
     "name": "currentEpochId",
     "inputs": [],
     "outputs": [
@@ -885,19 +924,6 @@
   },
   {
     "type": "function",
-    "name": "markFormerSink",
-    "inputs": [
-      {
-        "name": "sink",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "owner",
     "inputs": [],
     "outputs": [
@@ -1126,13 +1152,6 @@
   },
   {
     "type": "function",
-    "name": "reseedFormerSinksOnUpgrade",
-    "inputs": [],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "reveal",
     "inputs": [
       {
@@ -1184,19 +1203,6 @@
       }
     ],
     "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "setAuthorizedHemiProve",
-    "inputs": [
-      {
-        "name": "hemiProve_",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -1316,19 +1322,6 @@
   },
   {
     "type": "function",
-    "name": "voidVulnerableInFlightEpochOnUpgradeV2",
-    "inputs": [
-      {
-        "name": "epochIds",
-        "type": "uint256[]",
-        "internalType": "uint256[]"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "withdrawUnstaked",
     "inputs": [],
     "outputs": [],
@@ -1387,37 +1380,18 @@
   },
   {
     "type": "event",
-    "name": "BatchMigrationVoided",
-    "inputs": [
-      {
-        "name": "supplied",
-        "type": "uint256",
-        "indexed": false,
-        "internalType": "uint256"
-      },
-      {
-        "name": "voided",
-        "type": "uint256",
-        "indexed": false,
-        "internalType": "uint256"
-      }
-    ],
-    "anonymous": false
-  },
-  {
-    "type": "event",
     "name": "BurnDestinationUpdated",
     "inputs": [
       {
         "name": "oldDestination",
         "type": "address",
-        "indexed": true,
+        "indexed": false,
         "internalType": "address"
       },
       {
         "name": "newDestination",
         "type": "address",
-        "indexed": true,
+        "indexed": false,
         "internalType": "address"
       }
     ],
@@ -1482,6 +1456,12 @@
         "type": "uint16",
         "indexed": false,
         "internalType": "uint16"
+      },
+      {
+        "name": "quorum",
+        "type": "uint8",
+        "indexed": false,
+        "internalType": "uint8"
       }
     ],
     "anonymous": false
@@ -2056,22 +2036,6 @@
   },
   {
     "type": "error",
-    "name": "ActiveRoundsRemaining",
-    "inputs": [
-      {
-        "name": "member",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "count",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "AddressEmptyCode",
     "inputs": [
       {
@@ -2131,17 +2095,6 @@
         "name": "member",
         "type": "address",
         "internalType": "address"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "CommitWindowActive",
-    "inputs": [
-      {
-        "name": "epochId",
-        "type": "uint256",
-        "internalType": "uint256"
       }
     ]
   },
@@ -2221,17 +2174,6 @@
   },
   {
     "type": "error",
-    "name": "EpochNotCollecting",
-    "inputs": [
-      {
-        "name": "epochId",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "EpochNotCommitting",
     "inputs": [
       {
@@ -2275,6 +2217,17 @@
   },
   {
     "type": "error",
+    "name": "ImplementationHasNoCode",
+    "inputs": [
+      {
+        "name": "implementation",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "InsufficientFreeStake",
     "inputs": [
       {
@@ -2296,6 +2249,27 @@
   },
   {
     "type": "error",
+    "name": "InsufficientStake",
+    "inputs": [
+      {
+        "name": "prover",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "required",
+        "type": "uint128",
+        "internalType": "uint128"
+      },
+      {
+        "name": "actual",
+        "type": "uint128",
+        "internalType": "uint128"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "InvalidCommitHash",
     "inputs": []
   },
@@ -2306,40 +2280,7 @@
   },
   {
     "type": "error",
-    "name": "JobAlreadyInEpoch",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "JobNotInAnyEpoch",
-    "inputs": [
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ]
-  },
-  {
-    "type": "error",
     "name": "MaxCommitsReached",
-    "inputs": [
-      {
-        "name": "epochId",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "MaxJobsPerEpochReached",
     "inputs": [
       {
         "name": "epochId",
@@ -2457,11 +2398,6 @@
   },
   {
     "type": "error",
-    "name": "RegisterFormerSinkZero",
-    "inputs": []
-  },
-  {
-    "type": "error",
     "name": "RescueNotReady",
     "inputs": [
       {
@@ -2487,49 +2423,6 @@
       },
       {
         "name": "countsLen",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "RevealDuplicateJob",
-    "inputs": [
-      {
-        "name": "epochId",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "RevealJobNotInEpoch",
-    "inputs": [
-      {
-        "name": "epochId",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "jobId",
-        "type": "bytes32",
-        "internalType": "bytes32"
-      }
-    ]
-  },
-  {
-    "type": "error",
-    "name": "RevealWindowActive",
-    "inputs": [
-      {
-        "name": "epochId",
         "type": "uint256",
         "internalType": "uint256"
       }

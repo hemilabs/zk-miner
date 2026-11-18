@@ -145,17 +145,18 @@ const DEFAULT_MONITOR_BACKFILL_BLOCKS: u64 = u64::MAX;
 /// faster just burns eth_blockNumber/eth_getLogs calls. Override with `chain.monitor_poll_secs`.
 const DEFAULT_MONITOR_POLL_SECS: u64 = 10;
 
-/// RISC Zero Groth16 seal selector (risc0 v3.0.x). On-chain verification requires
-/// the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the worker returns
-/// the bare 256-byte proof, so the miner prepends this. It is the first 4 bytes of
-/// the verifier-parameters digest and is fixed per risc0 version — override via
-/// config for a testnet on a different version.
-const RISC0_GROTH16_SELECTOR: [u8; 4] = [0x73, 0xc4, 0x57, 0xba];
+/// RISC Zero Groth16 seal selector (risc0 v3.1.x: 0xe71e6620, the pinned verifier's `SELECTOR()`).
+/// On-chain verification requires the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the
+/// worker returns the bare 256-byte proof, so the miner prepends this. It is the first 4 bytes of
+/// the verifier-parameters digest and is fixed per risc0 version (the worker's
+/// `groth16_selector_tests` hold its risc0 to it) — override via config for a testnet on a
+/// different version.
+const RISC0_GROTH16_SELECTOR: [u8; 4] = zkminer_chain::deployment::pins::RISC0_V3_1_SELECTOR;
 
 /// The resolved seal selector for this run (config override, else the default).
 static SEAL_SELECTOR: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
 
-/// Parse a 4-byte hex selector like "0x73c457ba" (or "73c457ba").
+/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620").
 fn parse_seal_selector(s: &str) -> Option<[u8; 4]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
     let bytes = (0..h.len())
@@ -1303,9 +1304,8 @@ pub(crate) type MeasuredJournal = Option<(alloy::primitives::B256, std::sync::Ar
 /// ~3 GiB of them; past this bound other entries are evicted, and an evicted pair is re-measured.
 const MEASURED_JOURNAL_BYTES_CAP: usize = 64 * 1024 * 1024;
 
-/// How long a real measurement that came back without its journal (a worker that could not vouch
-/// for it, such as one seeding `sys_rand` with a key for its process alone) sizes jobs before the
-/// pair is re-measured. It never makes a journal-bound job claimable; this only bounds how long those
+/// How long a real measurement that came back without its journal sizes jobs before the pair is
+/// re-measured (defensive: a worker reports every journal within the size a fulfil could carry). It never makes a journal-bound job claimable; this only bounds how long those
 /// jobs wait for a measurement that does. Not submitter-reachable: an over-cap journal is a permanent
 /// infeasible verdict instead.
 const MEASURED_NO_JOURNAL_TTL: Duration = Duration::from_secs(10 * 60);
@@ -2102,7 +2102,7 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
 /// Post-claim FAILURE breaker. A claimed job whose (program, input) measured clean and then failed
 /// after the lock — ANY terminal prove failure (a guest fault, a watchdog kill, a health failure, a
 /// budget run-out) or an over-cap journal — pays the release penalty, and a submitter can assign NONE
-/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (ELF, input), so
+/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (image id, input), so
 /// a guest's randomness no longer splits its measurement from its proof; but proving still runs paths
 /// a measurement doesn't (the GPU, another segment size, more memory). Worker error text can carry
 /// guest-chosen strings, so this is deliberately class-agnostic: it cannot be evaded by choosing how
@@ -2663,7 +2663,7 @@ fn descriptor_carries_revert_lever(d: &zkminer_contracts::bindings::JobDescripto
 /// The pre-claim verdict on a job's journal binding: does the journal its (program, input) measured
 /// satisfy it, for `prover`? `None` when no whole journal measured on exactly this descriptor's input
 /// is in hand — never a reason to claim. The journal is a deterministic function of (ELF, input) (the
-/// risc0 worker seeds `sys_rand` per (ELF, input)), so a mismatch here is the `JournalMismatch` the
+/// risc0 worker seeds `sys_rand` per (image id, input)), so a mismatch here is the `JournalMismatch` the
 /// fulfil would revert after the lock.
 pub(crate) fn measured_binding_verdict(
     d: &zkminer_contracts::bindings::JobDescriptor,
@@ -3038,6 +3038,15 @@ pub(crate) fn is_measure_preempted(e: &anyhow::Error) -> bool {
         .is_some()
 }
 
+/// Could the measure worker not be SET UP before the request ran (SP1's per-spawn CPU prover, built
+/// under its own bound; see the dispatcher's `set_up_measure_slot`)? No guest ran and the setup is
+/// the same for every program, so, like a preemption, it is transient: no strike, no
+/// negative-cache, no retry TTL. By the dispatcher-only TYPE, never by message.
+pub(crate) fn is_measure_setup_failed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::MeasureSetupFailed>()
+        .is_some()
+}
+
 fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
     match measured {
         Some(m) => declared.max(m),
@@ -3228,7 +3237,7 @@ pub async fn run(
             DEPLOYMENT_RETRY.as_secs()
         ),
     }
-    // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.0.x
+    // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.1.x
     // default) BEFORE verifying it against the live verifier: verifying the default while seals are
     // later prefixed with an override would pass the check and then revert every fulfil.
     let sel = match config.prover.risc0_groth16_selector.as_deref() {
@@ -3296,20 +3305,6 @@ pub async fn run(
     // Each card's SP1 shard-size cap, recorded when a job that ran out of GPU memory there
     // proved at a smaller size.
     pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
-    // One `sys_rand` key for every risc0 worker this miner spawns, loaded once: a measured journal is
-    // only worth checking a binding against if the proof that follows, on whichever worker, seeds the
-    // guest alike — and the measurements live in this process, as long as the key does.
-    {
-        let (key, err) = zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref());
-        if let Some(e) = &err {
-            tracing::warn!(
-                "risc0 sys_rand key file unusable ({e}): using a key for this run only, so no \
-                 journal-bound job is claimed (its journal could change when a lock is re-proved \
-                 after a restart)"
-            );
-        }
-        zkminer_prover::worker::set_risc0_sys_rand_key(key, err.is_some());
-    }
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -6308,6 +6303,27 @@ async fn miner_brain(
             tracing::info!("Loaded job journal with {n} claimed entries");
         }
     }
+    // A lock measured under another `sys_rand` rule re-proves under this one, and a guest whose journal
+    // or path follows its random bytes may then fail or commit something else: the binding check before
+    // the fulfil releases it rather than publish a proof that would revert. A held lock is the one
+    // thing that spans the rule, so say so while there is still time to look at it. (Run before
+    // recovery reconciles the journal, so an entry may turn out to be gone already.)
+    {
+        let stale = journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .measured_under_another_sys_rand_rule(zkminer_prover_protocol::sys_rand::SYS_RAND_RULE);
+        if !stale.is_empty() {
+            let ids: Vec<String> = stale.iter().map(|id| short_id(*id)).collect();
+            tracing::error!(
+                "PAGE: {} risc0 job(s) in the journal were measured under an older sys_rand rule ({}): a \
+                 guest whose journal or path depends on its random bytes may fail or commit something \
+                 else when re-proved, and is then released at the job's release penalty.",
+                stale.len(),
+                ids.join(", ")
+            );
+        }
+    }
     // Concurrency: run one job per detected GPU (bounded by max_concurrent_proofs).
     // `in_flight` maps each in-progress job to the collateral it committed on-chain,
     // so concurrent claims don't over-commit before stake_info next refreshes;
@@ -8178,8 +8194,10 @@ async fn miner_brain(
                     // Not before the backend's one-time setup is done. SP1's first proof would
                     // otherwise download ~8 GB of circuit artifacts inside its 90 s watchdog, be
                     // killed mid-way, and leave an install that fails every later proof. See
-                    // `spawn_sp1_warmup`.
-                    if !sim_mode {
+                    // `spawn_sp1_warmup`. Not when watching: a watch-only run proves nothing, so it
+                    // never warms a backend up (see the startup warm-up), and this gate would hold
+                    // every risc0 and SP1 verdict short of the claim it is there to report.
+                    if !sim_mode && !watch_only() {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
                             if !pool.backend_warmed(backend) {
                                 if memory_skips_this_tick.insert(format!("{backend}:warmup")) {
@@ -9798,9 +9816,14 @@ async fn watch_inspector(
     const PASS_EVERY: Duration = Duration::from_secs(5);
     const SUMMARY_EVERY: Duration = Duration::from_secs(600);
     // How long a job may stay inconclusive (waiting on a measurement the brain runs, a busy measure
-    // pool, a slow source) before it is reported as such: a measurement's whole budget, and some.
-    const GIVE_UP_AFTER: Duration =
-        Duration::from_secs(MEASURE_TIMEOUT.as_secs() + 2 * MEASURE_FETCH_BUDGET.as_secs() + 60);
+    // pool, a slow source) before it is reported as such: a measurement's whole budget, and some. A
+    // spawn's first SP1 measurement first sets its worker up, under its own bound.
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(
+        MEASURE_TIMEOUT.as_secs()
+            + 2 * MEASURE_FETCH_BUDGET.as_secs()
+            + zkminer_prover::dispatcher::SP1_MEASURE_SETUP_BOUND.as_secs()
+            + 60,
+    );
     const MAX_RETRY_GAP: Duration = Duration::from_secs(60);
     let started = std::time::Instant::now();
     let mut last_summary = started;
@@ -12166,7 +12189,7 @@ pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Optio
     use zkminer_chain::auction::ProofSystem;
     match ProofSystem::from_id(proof_system_id)? {
         // The one system this build can prove AND verify end-to-end against the deployed verifier:
-        // risc0 3.0.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0x73c457ba ‖ proof).
+        // risc0 3.1.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0xe71e6620 ‖ proof).
         // Checked at startup against the live adapter's native verifier.
         ProofSystem::Risc0Groth16 => Some("risc0"),
         // SP1 6.8.1 (hemilabs/sp1 #19) Groth16 proofs of circuit v6.1.0, the circuit the 743111 SP1
@@ -12903,8 +12926,10 @@ async fn measure_cycles(
                     peak_host_bytes,
                     duration_secs,
                     // Simulate's evidence rule; the miner's own measure-matches-prove guarantee is the
-                    // shared seed key, not this count.
+                    // public seed, not this count.
                     host_entropy_reads: _,
+                    user_cycles: _,
+                    keccak_cycles: _,
                 } = measurement;
                 if paces_claims {
                     clear_preclaim_strikes(job_id);
@@ -13093,6 +13118,15 @@ async fn measure_cycles(
                 if is_measure_preempted(&e) {
                     tracing::debug!(
                         "measure {}: preempted by a claimed proof, not sizing now (transient)",
+                        short_id(program_id)
+                    );
+                    continue;
+                }
+                // The worker could not be set up (its SP1 CPU prover) before the execute: nothing
+                // ran, and nothing about the program is known. The dispatcher has logged why.
+                if is_measure_setup_failed(&e) {
+                    tracing::debug!(
+                        "measure {}: the measure worker is not set up, not sizing now (transient)",
                         short_id(program_id)
                     );
                     continue;
@@ -16841,6 +16875,23 @@ mod r2_sizing_tests {
         // A guest-forged message does not win the transient treatment.
         let forged = anyhow::anyhow!("cycle measurement failed: Guest panicked: preempted (transient)");
         assert!(!is_measure_preempted(&forged));
+    }
+
+    /// A measure worker that could not be set up is its own typed transient: not a timeout (no
+    /// retry TTL, no strike), not a preemption, and not forgeable from guest text.
+    #[test]
+    fn a_setup_failure_is_classified_by_type_and_is_not_a_timeout() {
+        let real: anyhow::Error =
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureSetupFailed {
+                slot_key: "sp1:measure:0".to_string(),
+                message: "not set up within 600 s".to_string(),
+            });
+        assert!(is_measure_setup_failed(&real));
+        assert!(!is_measure_wall_clock_timeout(&real));
+        assert!(!is_measure_preempted(&real));
+        let forged =
+            anyhow::anyhow!("Guest panicked: measure worker could not be set up (transient)");
+        assert!(!is_measure_setup_failed(&forged));
     }
 
     /// A measured entry: `cycles`, a journal, the verified ELF keccak and the execute's seconds.

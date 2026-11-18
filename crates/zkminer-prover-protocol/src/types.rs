@@ -30,14 +30,18 @@ use serde::{Deserialize, Serialize};
 /// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
 /// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
 /// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
-/// 13: `Benchmark` gained `po2`, the segment size a risc0 worker proves the suite at: the card's
+/// 13: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
+/// A v12 worker would seed guests by its host's key, unlike a v13 one proving the same job. And
+/// `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
+/// segment sizes (both in the same unreleased version).
+/// 14: `Benchmark` gained `po2`, the segment size a risc0 worker proves the suite at: the card's
 /// own job size, so its rate describes the jobs it proves (a 12 GB card benchmarked at 20 spills
-/// into shared memory and records a rate several times too low). A v12 worker would prove at 20.
-/// 14: no new field, a new meaning: an SP1 worker applies the card's shard-size cap
+/// into shared memory and records a rate several times too low). A v13 worker would prove at 20.
+/// 15: no new field, a new meaning: an SP1 worker applies the card's shard-size cap
 /// (`SP1_ELEMENT_THRESHOLD_CAP_ENV`) and reports sp1-gpu's own out-of-memory wordings as
-/// `ResourceExhausted`. A v13 worker would run larger than the dispatcher plans for, and a cap
+/// `ResourceExhausted`. A v14 worker would run larger than the dispatcher plans for, and a cap
 /// recorded after it proved would be one that was never in force.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -316,8 +320,8 @@ pub enum WorkerResponse {
         /// have run another path, and committed another journal, when its prover ran it, so a
         /// measurement with any is no evidence of the proven run.
         ///
-        /// risc0: the guest's `sys_rand` calls (the only syscall the host answers from entropy rather
-        /// than from the job's input or the run itself), less the one 4-word draw risc0's guest
+        /// risc0: the guest's `sys_rand` calls (the one syscall not answered from the job's input or
+        /// the run itself; the public seed answers it), less the one 4-word draw risc0's guest
         /// runtime makes before `main` for its memory-image entropy. A guest that reads that draw's
         /// bytes cannot be told from one that does not. `None` when the run drew nothing at all: a
         /// guest without risc0's runtime, or a count that does not work in this build.
@@ -326,6 +330,13 @@ pub enum WorkerResponse {
         /// `None` from any other worker: not counted.
         #[serde(default)]
         host_entropy_reads: Option<u64>,
+        /// The cycles the guest itself executed: no paging, no padding, so the same at every segment
+        /// size unless the guest steers on the size. `None` from a worker that has no such figure.
+        #[serde(default)]
+        user_cycles: Option<u64>,
+        /// The part of `cycles` that is keccak proof charges. `None` as for `user_cycles`.
+        #[serde(default)]
+        keccak_cycles: Option<u64>,
     },
     /// Progress update during proving.
     Progress {
@@ -1095,6 +1106,35 @@ impl std::fmt::Display for MeasurePreempted {
 }
 
 impl std::error::Error for MeasurePreempted {}
+
+/// A measure worker could not be SET UP before a sizing request (`Execute`, `ProgramId`) ran on it:
+/// SP1's measure worker builds its CPU prover once per spawn, and the dispatcher runs that setup
+/// first, under its own bound, so the request's bound is the request's alone. The setup is the same
+/// work whatever the program (no guest has run), so this is TRANSIENT like `MeasureSlotsBusy`: no
+/// strike, no negative-cache, no retry TTL. The dispatcher has cleared the slot when the worker
+/// died or was killed at the bound, so the next request revives it.
+///
+/// Dispatcher-only: only its setup path constructs it, never from a `WorkerResponse::Error`
+/// carrying guest-controlled text, so a guest cannot forge it to win the lenient treatment.
+#[derive(Debug, Clone)]
+pub struct MeasureSetupFailed {
+    /// The measure slot whose worker could not be set up, e.g. `sp1:measure:0`.
+    pub slot_key: String,
+    /// Why: past the bound, died, or the worker's own answer.
+    pub message: String,
+}
+
+impl std::fmt::Display for MeasureSetupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "measure worker {} could not be set up ({}); nothing ran (transient)",
+            self.slot_key, self.message
+        )
+    }
+}
+
+impl std::error::Error for MeasureSetupFailed {}
 
 /// Not enough of this card's VRAM is free for this backend to be given work on it.
 ///
@@ -2062,6 +2102,25 @@ mod tests {
         });
         assert!(boxed.downcast_ref::<MeasurePreempted>().is_some());
         assert!(boxed.downcast_ref::<MeasureSlotsBusy>().is_none());
+        assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
+    }
+
+    /// `MeasureSetupFailed` names its slot and the cause, says "transient", and is its own type:
+    /// the measure path downcasts it to skip a strike, so it must not read as a timeout or a
+    /// preemption.
+    #[test]
+    fn measure_setup_failed_is_a_typed_transient() {
+        let e = MeasureSetupFailed {
+            slot_key: "sp1:measure:1".to_string(),
+            message: "not set up within 600 s".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("sp1:measure:1"), "names the slot: {msg}");
+        assert!(msg.contains("within 600 s"), "says why: {msg}");
+        assert!(msg.contains("transient"), "flagged transient: {msg}");
+        let boxed: Box<dyn std::error::Error> = Box::new(e);
+        assert!(boxed.downcast_ref::<MeasureSetupFailed>().is_some());
+        assert!(boxed.downcast_ref::<MeasurePreempted>().is_none());
         assert!(boxed.downcast_ref::<MeasureWallClockTimeout>().is_none());
     }
 }
