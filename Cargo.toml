@@ -88,7 +88,8 @@ zkminer-config = { path = "crates/zkminer-config" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
-# Pinned by REV to branch `zkminer/intel-aot` @ 68b3eacbb: two Intel commits on top of branch
+# History (risc0 3.0; the current 3.1 pin is described just below `[patch.crates-io]`): the 3.0 releases
+# were pinned by REV to branch `zkminer/intel-aot` @ 68b3eacbb: two Intel commits on top of branch
 # `zkminer/release-3.0-8007a99` @ 8b16ef0c8 (tag `zkminer-pin-2026-11-02b`), so that an Intel card the
 # build targets compiles almost nothing at its first proof:
 # - 0bb393f6e (branch `zkminer/witgen-scan-width`) sizes the rv32im witgen scans from the card's
@@ -135,31 +136,34 @@ zkminer-config = { path = "crates/zkminer-config" }
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
 # the next `cargo update` without anyone choosing to.
 [patch.crates-io]
-# macOS/Metal port: the risc0 crates come from the local clone ../deps/risc0-3.1 (branch zkminer/metal-3.1:
-# hemilabs release-3.1 = risc0 v3.1.0 with the fork re-applied, plus the Metal port merged onto it) while
-# the Metal kernels are being fixed and extended. risc0 3.1 carries the GHSA-g6qg-9j8p-7j87 circuit and
-# verifier fixes: its receipts (control root e6feef13..., Groth16 selector e71e6620) are not accepted by a
-# 3.0 verifier, and 3.0 receipts are not accepted by a 3.1 verifier. The 3.1-only crates
-# risc0-circuit-recursion-zkrs / -control-zkrs are path dependencies inside that workspace, so they
-# need no patch line here. To go back to a pinned fork, restore the `git = ..., rev = "..."` form on
-# each line (a release-3.1 rev; the old 68b3eacb rev is risc0 3.0).
-risc0-zkvm = { path = "../deps/risc0-3.1/risc0/zkvm" }
-risc0-build = { path = "../deps/risc0-3.1/risc0/build" }
-risc0-zkp = { path = "../deps/risc0-3.1/risc0/zkp" }
-risc0-sys = { path = "../deps/risc0-3.1/risc0/sys" }
-risc0-core = { path = "../deps/risc0-3.1/risc0/core" }
-risc0-binfmt = { path = "../deps/risc0-3.1/risc0/binfmt" }
-risc0-build-kernel = { path = "../deps/risc0-3.1/risc0/build_kernel" }
-risc0-groth16 = { path = "../deps/risc0-3.1/risc0/groth16" }
-risc0-groth16-sys = { path = "../deps/risc0-3.1/risc0/groth16-sys" }
-risc0-circuit-rv32im = { path = "../deps/risc0-3.1/risc0/circuit/rv32im" }
-risc0-circuit-rv32im-sys = { path = "../deps/risc0-3.1/risc0/circuit/rv32im-sys" }
-risc0-circuit-recursion = { path = "../deps/risc0-3.1/risc0/circuit/recursion" }
-risc0-circuit-recursion-sys = { path = "../deps/risc0-3.1/risc0/circuit/recursion-sys" }
-risc0-circuit-keccak = { path = "../deps/risc0-3.1/risc0/circuit/keccak" }
-risc0-circuit-keccak-sys = { path = "../deps/risc0-3.1/risc0/circuit/keccak-sys" }
-risc0-zkos-v1compat = { path = "../deps/risc0-3.1/risc0/zkos/v1compat" }
-risc0-zkvm-platform = { path = "../deps/risc0-3.1/risc0/zkvm/platform" }
+# risc0 3.1 with the macOS/Metal port: hemilabs/risc0 branch `zkminer/metal-3.1` @ d94ef6501 (B9-DEP;
+# RELEASE-DEPS.md records the pin and how it was validated). That branch is hemilabs release-3.1 (risc0
+# v3.1.0 with the fork re-applied) plus the Metal port, the 3.1 security fixes (B9-SEC) and the 4 GiB
+# Groth16 wrap (B9-G1, B9-4G). risc0 3.1 carries the GHSA-g6qg-9j8p-7j87 circuit and verifier fixes: its
+# receipts (control root e6feef13..., Groth16 selector e71e6620) are not accepted by a 3.0 verifier, and
+# 3.0 receipts are not accepted by a 3.1 verifier. Pinned by REV (see `sppark` below for why not a
+# branch); do not `cargo update` these without re-validating.
+#
+# Local development against a risc0 checkout (edits to the Metal kernels, say) does not edit this file:
+# `make -f Makefile.mac RISC0_SRC=local ...` (or `cargo --config .cargo/risc0-local.toml ...`) patches
+# these crates to ../deps/risc0-3.1 instead. RELEASE-DEPS.md explains both modes and the lockfile.
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "d94ef65015f4753c5496ad7302f15c44513370f3" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
@@ -210,6 +214,15 @@ sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "9a0de
 sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
 sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
 sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "9a0de7462ebed8a77d54886e49a9ba97de2be813" }
+
+# The recursion ZKR crates that risc0 3.1's risc0-circuit-recursion depends on (path dependencies inside
+# the fork's workspace). In git their src/zkrs.tar.xz are Git LFS objects, and cargo's git checkout
+# never runs LFS: built from the fork they would see the LFS pointer files. Take them from crates.io
+# instead: 4.1.0 is byte-identical to the fork's (same build.rs and src/; zkrs.tar.xz sha256 53388c58...
+# (lift) and 202fd7e7... (control), equal to the fork's LFS oids). B9-DEP note, RELEASE-DEPS.md.
+[patch."https://github.com/hemilabs/risc0"]
+risc0-circuit-recursion-zkrs = { version = "=4.1.0" }
+risc0-circuit-recursion-control-zkrs = { version = "=4.1.0" }
 
 [profile.release]
 opt-level = 3
