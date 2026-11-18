@@ -86,7 +86,7 @@ impl Worker {
         match w.recv() {
             WorkerResponse::HelloAck {
                 protocol_version, ..
-            } => assert_eq!(protocol_version, 14),
+            } => assert_eq!(protocol_version, PROTOCOL_VERSION),
             other => panic!("{other:?}"),
         }
         w

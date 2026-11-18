@@ -31,6 +31,32 @@ fn mock_env(hang_on: &str, crash_on: &str) -> HashMap<String, String> {
     env
 }
 
+// ---- Handshake ----
+
+/// A worker built for another protocol version (an old one left in `~/.zkminer/provers`, which is
+/// searched first) is a DECLINE, not a transient spawn failure: otherwise its slot stays "healthy",
+/// is respawned on every dispatch, and the miner claims jobs only a stale worker would take.
+#[test]
+fn a_worker_of_another_protocol_version_declines() {
+    let mut env = mock_env("", "");
+    env.insert(
+        "MOCK_PROTOCOL_VERSION".to_string(),
+        (zkminer_prover_protocol::PROTOCOL_VERSION - 1).to_string(),
+    );
+    let err = match zkminer_prover::worker::WorkerHandle::spawn("mock", &mock_worker_path(), &env) {
+        Ok(_) => panic!("a worker of another protocol version was accepted"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains(zkminer_prover_protocol::types::WORKER_DECLINED),
+        "not a decline: {err}"
+    );
+    assert!(err.contains("Protocol version mismatch"), "{err}");
+    // This build's version is accepted.
+    zkminer_prover::worker::WorkerHandle::spawn("mock", &mock_worker_path(), &mock_env("", ""))
+        .expect("a worker of this protocol version");
+}
+
 // ---- Benchmark timeout tests ----
 
 #[test]

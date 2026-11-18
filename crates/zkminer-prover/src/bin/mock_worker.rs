@@ -35,6 +35,8 @@
 //! - `MOCK_SETUP_SECS`: a one-time setup of this many seconds (default 0), paid by the first
 //!   Warmup, Execute or ProgramId, as SP1's measure worker builds its CPU prover on first use.
 //! - `MOCK_WARMUP_LOG`: a file each Warmup appends a line to, so a test can count them.
+//! - `MOCK_PROTOCOL_VERSION`: the protocol version the HelloAck reports, as a worker built for
+//!   another version would. Default: this build's.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -124,7 +126,10 @@ fn main() {
                 protocol_version: _,
             } => {
                 let resp = WorkerResponse::HelloAck {
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: std::env::var("MOCK_PROTOCOL_VERSION")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(PROTOCOL_VERSION),
                     backend: backend.clone(),
                     sdk_version: "mock 0.1.0".to_string(),
                     worker_version: "0.1.0".to_string(),
