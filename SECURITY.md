@@ -310,16 +310,19 @@ executor:
   worker's own directory, `LD_LIBRARY_PATH`, and what the
   backend proves with (`~/.risc0` or `RISC0_HOME`, `~/.sp1`); for witness proofs, the retention
   store (read) and the segment directories (write). Write only a private temporary directory
-  (`TMPDIR`, made per worker, mode 0700), the GPU caches the build needs (risc0's CUDA Groth16
-  cache; the Intel SYCL and compute-runtime kernel caches) and, for an SP1 server, its host-wide
-  Groth16 queue (below). Nothing in `/dev/shm`: SP1's executor shares the guest's memory and trace
+  (`TMPDIR`, made per worker, mode 0700), a risc0 worker's own segment directory
+  (`~/.zkminer/risc0-segments/<pid>`, mode 0700, made before it confines itself), the GPU caches
+  the build needs (risc0's CUDA Groth16 cache; the Intel SYCL and compute-runtime kernel caches)
+  and, for an SP1 server, its host-wide Groth16 queue (below). Nothing in `/dev/shm`: SP1's
+  executor shares the guest's memory and trace
   ring with its runner process through file descriptors (memfds, handed over a Unix socket), which
   no path reaches, and whatever SP1's final-wrap provers would put in `/dev/shm` goes to the
   private temporary directory (`SP1_SHM_DIR`). Execute only
   the dynamic loader and what the worker must start (SP1's executor runner in its temporary
   directory, the server's own Groth16 helper). Open only the GPU device nodes. Nothing else in the
   home directory is readable or writable: not the dotfiles, `~/.config` (autostart, `systemd
-  --user` units, `environment.d`), `~/.ssh`, `~/.zkminer` (keys, config, the provers); `~/.risc0`
+  --user` units, `environment.d`), `~/.ssh`, `~/.zkminer` (keys, config, the provers; only a risc0
+  worker's own segment directory there is writable, to that worker); `~/.risc0`
   and `~/.sp1` (the server binaries included) are read-only. TCP bind and connect are denied by
   Landlock as well.
 - **Filesystems within reach.** Landlock decides what may be opened, read, written or executed,
@@ -664,8 +667,9 @@ no second one):
   reading the system's files and its own `/proc` entries (an SP1 worker or server all of `/proc`:
   other processes' command lines and status, not their memory or environment), and writing the
   caches listed above, which other GPU programs of the same user also load (a confined worker could
-  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them). An SP1 server can write the
-  Groth16 queue's lock files, which every SP1 server of the user on the host shares: it can hold a
+  poison an Intel kernel cache or risc0's CUDA Groth16 cache for them), and its own segment
+  directories, which are on disk: it could fill the filesystem they are on. An SP1 server can write
+  the Groth16 queue's lock files, which every SP1 server of the user on the host shares: it can hold a
   slot, and so delay the others' final wraps. Nothing of the uid's in `/dev/shm` can be opened (the
   system's listing of `/dev` still shows the names there). A witness
   proof's worker can read every bundle in the retention store, other requesters' included.
