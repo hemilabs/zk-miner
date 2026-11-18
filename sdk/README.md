@@ -145,11 +145,11 @@ Toolchain `rustc 1.97.1 (8bab26f4f 2026-07-14)`, LLVM 22.1.6, x86_64-unknown-lin
 of the scanner changes how the optimiser inlines it into the example, though the example does not
 call the new function.)
 
-| Build | sha256 of `proxy_slots_builder.wasm` (98,806 bytes) |
+| Build | sha256 of `proxy_slots_builder.wasm` (99,093 bytes) |
 |---|---|
-| `./build-reproducible.sh -p proxy-slots-builder`, clean target dir #1 | `8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` |
-| same, clean target dir #2 | `8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` |
-| same, from a copy of `sdk/` and `reference/` in another directory | `8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` |
+| `./build-reproducible.sh -p proxy-slots-builder`, clean target dir #1 | `c39381f5d49e24e4eaa7340e3db2a7931321d16c04261b21e4fb25ae71fd37f6` |
+| same, clean target dir #2 | `c39381f5d49e24e4eaa7340e3db2a7931321d16c04261b21e4fb25ae71fd37f6` |
+| same, from a copy of `sdk/` and `reference/` in another directory | `c39381f5d49e24e4eaa7340e3db2a7931321d16c04261b21e4fb25ae71fd37f6` |
 
 (It was `9e9ca969…88f2e4`, 98,683 bytes, until the prelude sealed its guards and gave `EXTCODEHASH`
 the EVM's answer for an account empty under EIP-161: the builder links the prelude.)

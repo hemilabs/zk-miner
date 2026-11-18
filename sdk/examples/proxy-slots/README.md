@@ -32,7 +32,7 @@ cd sdk
 sha256sum target/wasm32-unknown-unknown/release/proxy_slots_builder.wasm
 ```
 
-`8aef79957460332b066cf14ba5c4ad8b23368a6203d7125a65449f2283e4cc3e` (98,806 bytes) on the pinned
+`c39381f5d49e24e4eaa7340e3db2a7931321d16c04261b21e4fb25ae71fd37f6` (99,093 bytes) on the pinned
 toolchain, from two clean target dirs and from a copy of the tree elsewhere. It shares the prelude
 and the statement with the guest through the SDK's `reference` symlink, which keeps their source
 paths under the SDK directory, where the build's path remapping rewrites them (see the SDK README,
