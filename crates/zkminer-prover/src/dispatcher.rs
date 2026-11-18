@@ -1550,6 +1550,270 @@ impl WatchdogClock {
     }
 }
 
+/// A proof's memory Windows has moved off its card, in MiB, past which a sample counts toward a
+/// spill. A proof with the card to itself reads 0 (an SP1 proof at 2^28 on an RTX 4070, every sample
+/// of a whole suite, allocations included); one paged against another program's memory read ~9.8 GB.
+#[cfg(any(windows, test))]
+const SPILL_EVICTED_MIB: u64 = 256;
+/// How often a running proof's evicted memory is read (`SpillWatch`).
+#[cfg(any(windows, test))]
+const SPILL_SAMPLE_EVERY: Duration = Duration::from_secs(2);
+/// Samples a spill is judged over: the last 30 s.
+#[cfg(any(windows, test))]
+const SPILL_WINDOW: usize = 15;
+/// Spilling samples within [`SPILL_WINDOW`] that stop the proof. Windows pages two programs that do
+/// not fit together in turns of several seconds each, so a paged proof shows evicted on and off;
+/// three samples (6 s at least) are no passing moment, and the proof has run 8-12 times slower all
+/// along (sha256-chain 242 s instead of 29 on the 4070).
+#[cfg(any(windows, test))]
+const SPILL_CONFIRM: usize = 3;
+
+/// What one evicted-memory sample makes of a running proof (`SpillDetector::observe`).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillVerdict {
+    /// Nothing of the proof's memory is off the card now, nor has been in the window.
+    Clear,
+    /// Some of it is, or was within the window, but not long enough to act on.
+    Spilling,
+    /// It has been paged long enough: stop the proof.
+    Confirmed,
+}
+
+/// Judges a running proof's evicted-memory samples, oldest first (see [`SPILL_CONFIRM`]).
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+struct SpillDetector {
+    recent: std::collections::VecDeque<bool>,
+}
+
+#[cfg(any(windows, test))]
+impl SpillDetector {
+    fn observe(&mut self, evicted_mib: u64) -> SpillVerdict {
+        if self.recent.len() == SPILL_WINDOW {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(evicted_mib > SPILL_EVICTED_MIB);
+        match self.recent.iter().filter(|s| **s).count() {
+            0 => SpillVerdict::Clear,
+            n if n >= SPILL_CONFIRM => SpillVerdict::Confirmed,
+            _ => SpillVerdict::Spilling,
+        }
+    }
+}
+
+/// A slot whose running proof Windows is paging off its card, for the dashboard
+/// (`WorkerPool::gpu_spills`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuSpill {
+    /// The proof's memory off the card at the last reading, in MiB.
+    pub evicted_mib: u64,
+    /// It has gone on long enough that the proof is being stopped, to run again where it fits.
+    pub stopping: bool,
+}
+
+/// Watches a running proof on a Windows GPU for its memory being paged off the card by another
+/// program's (`windows_gpu_memory::evicted_mib_on_card`, over the worker's whole process tree:
+/// SP1's server and its helpers are children of the worker), reports it for the dashboard, and once
+/// it is confirmed stops the proof: the worker is killed as the proving watchdog kills it, and
+/// [`stopped`](Self::stopped) tells the prove path to report a `GpuMemoryShortage` rather than a
+/// failure. Such a proof would have finished, but 8-12 times slower, past most deadlines; run
+/// again, it is admitted only where it fits beside that program (SP1 then sized down to the tier
+/// that fits). Drop stops the watch and clears the slot's report.
+///
+/// Elsewhere a card that runs out of memory fails the allocation, which is reported as such: there
+/// is nothing to watch.
+struct SpillWatch {
+    cancel: Arc<AtomicBool>,
+    stopped_mib: Arc<AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    spills: Arc<Mutex<HashMap<String, GpuSpill>>>,
+    slot_key: String,
+}
+
+impl SpillWatch {
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    fn new(
+        pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        pci_bus_id: Option<String>,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+        spills: Arc<Mutex<HashMap<String, GpuSpill>>>,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped_mib = Arc::new(AtomicU64::new(0));
+        #[cfg(windows)]
+        let thread = {
+            let original_pid = pid_ref.load(Ordering::Acquire);
+            match pci_bus_id {
+                Some(pci) if original_pid != 0 => {
+                    let watched = Watched {
+                        original_pid,
+                        pid_ref,
+                        starttime_ref,
+                        pci,
+                        key: slot_key.clone(),
+                        intentional_kill,
+                        cancel: cancel.clone(),
+                        stopped_mib: stopped_mib.clone(),
+                        spills: spills.clone(),
+                    };
+                    std::thread::Builder::new()
+                        .name(format!("spill-watch-{slot_key}"))
+                        .spawn(move || watched.watch())
+                        .ok()
+                }
+                _ => None,
+            }
+        };
+        #[cfg(not(windows))]
+        let thread = None;
+        Self {
+            cancel,
+            stopped_mib,
+            thread,
+            spills,
+            slot_key,
+        }
+    }
+
+    /// The MiB that were off the card when the watch stopped the proof, if it did.
+    fn stopped(&self) -> Option<u64> {
+        match self.stopped_mib.load(Ordering::Acquire) {
+            0 => None,
+            mib => Some(mib),
+        }
+    }
+}
+
+/// What a [`SpillWatch`] thread watches: the worker (its pid as spawned, and the slot's live pid and
+/// start time), its card, and where it reports.
+#[cfg(windows)]
+struct Watched {
+    original_pid: u32,
+    pid_ref: Arc<AtomicU32>,
+    starttime_ref: Arc<AtomicU64>,
+    pci: String,
+    key: String,
+    intentional_kill: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    stopped_mib: Arc<AtomicU64>,
+    spills: Arc<Mutex<HashMap<String, GpuSpill>>>,
+}
+
+#[cfg(windows)]
+impl Watched {
+    fn watch(self) {
+        let Watched {
+            original_pid,
+            pid_ref,
+            starttime_ref,
+            pci,
+            key,
+            intentional_kill,
+            cancel,
+            stopped_mib,
+            spills,
+        } = self;
+        let mut detector = SpillDetector::default();
+        let mut reported = false;
+        loop {
+            // Waits in short steps, so a finished proof's Drop does not wait out a whole interval.
+            let next = Instant::now() + SPILL_SAMPLE_EVERY;
+            while Instant::now() < next {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let pid = pid_ref.load(Ordering::Acquire);
+            if pid != original_pid || pid == 0 {
+                return;
+            }
+            let started = starttime_ref.load(Ordering::Acquire);
+            let tree: Vec<u32> =
+                crate::memory::process_tree(pid, (started != 0).then_some(started))
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect();
+            // No reading is no opinion: the proof goes on.
+            let Some(evicted) = crate::windows_gpu_memory::evicted_mib_on_card(&tree, &pci) else {
+                continue;
+            };
+            let verdict = detector.observe(evicted);
+            let mut map = spills.lock().unwrap_or_else(|e| e.into_inner());
+            match verdict {
+                SpillVerdict::Clear => {
+                    map.remove(&key);
+                }
+                SpillVerdict::Spilling => {
+                    if evicted > SPILL_EVICTED_MIB {
+                        map.insert(
+                            key.clone(),
+                            GpuSpill {
+                                evicted_mib: evicted,
+                                stopping: false,
+                            },
+                        );
+                    }
+                    if !reported {
+                        reported = true;
+                        tracing::warn!(
+                            "{key}: Windows is moving this proof's memory off the card ({evicted} \
+                             MiB now) to make room for another program's, which slows it many times \
+                             over; it is stopped and run again if that goes on"
+                        );
+                    }
+                }
+                SpillVerdict::Confirmed => {
+                    map.insert(
+                        key.clone(),
+                        GpuSpill {
+                            evicted_mib: evicted.max(1),
+                            stopping: true,
+                        },
+                    );
+                    drop(map);
+                    if cancel.load(Ordering::Relaxed) || pid_ref.load(Ordering::Acquire) != pid {
+                        return;
+                    }
+                    tracing::warn!(
+                        "{key}: stopping the proof: Windows has kept moving its memory off the card \
+                         for another program's ({evicted} MiB at the last reading); it runs again \
+                         where it fits"
+                    );
+                    stopped_mib.store(evicted.max(1), Ordering::Release);
+                    intentional_kill.store(true, Ordering::Release);
+                    if !crate::memory::terminate_if_our_worker(
+                        pid,
+                        (started != 0).then_some(started),
+                    ) {
+                        tracing::warn!(
+                            "not stopping PID {pid} for {key}: it is no longer our worker (exited, \
+                             and the number may have been reused)"
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SpillWatch {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.spills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.slot_key);
+    }
+}
+
 /// RAII guard that kills a worker process after a deadline.
 /// Drop cancels the watchdog thread.
 struct ProvingWatchdog {
@@ -3549,6 +3813,9 @@ pub struct WorkerPool {
     /// out-of-memory its fork did not report, say) failed every proof it was given while the
     /// worker, which answered, was kept.
     sp1_prove_errors: Mutex<HashMap<String, u32>>,
+    /// Slots whose running proof Windows is paging off its card (`SpillWatch`), for the dashboard.
+    /// Shared with each proof's watch thread; read without a slot's lock (`gpu_spills`).
+    gpu_spills: Arc<Mutex<HashMap<String, GpuSpill>>>,
     /// What another program held on each risc0/SP1 slot's card when its proof was admitted
     /// (`check_vram_budget`), to tell an out-of-memory the size caused from one another program's
     /// growth caused (`lower_sp1_shard_cap`).
@@ -3679,6 +3946,7 @@ impl WorkerPool {
             risc0_short: Mutex::new(HashMap::new()),
             sp1_slot_caps: Mutex::new(HashMap::new()),
             sp1_prove_errors: Mutex::new(HashMap::new()),
+            gpu_spills: Arc::new(Mutex::new(HashMap::new())),
             admitted_foreign: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "testing"))]
             test_cards: Mutex::new(HashMap::new()),
@@ -9023,6 +9291,21 @@ impl WorkerPool {
     ///
     /// Takes NO lock: see `WorkerEntry::pci_bus_id`. It is called from the proving progress
     /// callback, which runs on the thread that already holds that slot's guard.
+    /// Slots whose running proof Windows is moving off its card for another program's memory,
+    /// with how much is off it and whether it is being stopped (see `SpillWatch`). Empty except
+    /// under Windows. Reads no slot's lock: a proof holds its slot's for its whole length.
+    pub fn gpu_spills(&self) -> Vec<(String, GpuSpill)> {
+        let mut spills: Vec<(String, GpuSpill)> = self
+            .gpu_spills
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(key, spill)| (key.clone(), *spill))
+            .collect();
+        spills.sort_by(|a, b| a.0.cmp(&b.0));
+        spills
+    }
+
     pub fn bus_id_for_slot(&self, key: &str) -> Option<String> {
         self.workers.get(key)?.pci_bus_id.clone()
     }
@@ -10314,6 +10597,7 @@ impl WorkerPool {
                 },
                 ours_in_the_way: true,
                 total_bytes: card.total,
+                evicted_bytes: 0,
             };
             tracing::warn!("not putting work on {key} yet ({what}): {shortage}");
             anyhow::Error::new(shortage)
@@ -10437,6 +10721,7 @@ impl WorkerPool {
                 needed_bytes: Some(needed),
                 ours_in_the_way: false,
                 total_bytes: budget.total,
+                evicted_bytes: 0,
             };
             tracing::warn!("not putting work on {key}: {shortage}");
             // Room was made and it still does not fit: claim no more risc0 jobs for this card a
@@ -10889,6 +11174,8 @@ impl WorkerPool {
                 spawned,
             )
         });
+        // Likewise whether it proves on a GPU, for the spill watch below.
+        let on_gpu = matches!(slot.gpu_tag.as_str(), "cuda" | "rocm" | "intel");
 
         // Re-borrow handle after PID update
         let handle = slot
@@ -10929,6 +11216,20 @@ impl WorkerPool {
                 entry.intentional_kill.clone(),
             )
         });
+        // Under Windows, a GPU proof whose memory another program's pushes off the card is stopped
+        // rather than left to run many times slower (see `SpillWatch`).
+        let spill_watch = SpillWatch::new(
+            entry.pid.clone(),
+            entry.pid_starttime.clone(),
+            entry
+                .pci_bus_id
+                .as_deref()
+                .filter(|_| on_gpu)
+                .map(crate::discovery::normalize_pci_bus_id),
+            key.to_string(),
+            entry.intentional_kill.clone(),
+            self.gpu_spills.clone(),
+        );
 
         // The worker protocol's progress callback carries only a fraction. Bake the
         // slot key in here so callers learn WHICH card is running the proof --
@@ -11030,6 +11331,26 @@ impl WorkerPool {
                         available: crate::memory::mem_available_bytes().unwrap_or(0),
                     },
                 ));
+            }
+
+            // Stopped because Windows was paging the proof off its card for another program's memory:
+            // that card is short of memory now, not ill and not the job's fault. Reported as the
+            // shortage it is, so the job goes to a card where it fits (or waits for this one) rather
+            // than spending an attempt; the slot was not counted a failure (an intentional kill).
+            if let Some(evicted_mib) = spill_watch.stopped() {
+                let card = self.read_card(key);
+                let shortage = zkminer_prover_protocol::types::GpuMemoryShortage {
+                    slot_key: key.to_string(),
+                    foreign_bytes: card.as_ref().map_or(0, CardOccupancy::foreign),
+                    sibling_bytes: 0,
+                    available_bytes: card.as_ref().map_or(0, |c| c.available_to(key)),
+                    needed_bytes: None,
+                    ours_in_the_way: false,
+                    total_bytes: card.as_ref().map_or(0, |c| c.total),
+                    evicted_bytes: evicted_mib.saturating_mul(1024 * 1024),
+                };
+                tracing::warn!("{shortage}");
+                return Err(anyhow::Error::new(shortage));
             }
 
             // Distinguish a DEADLINE-driven kill from a GPU wedge. When the deadline
@@ -13614,6 +13935,110 @@ mod tests {
         let pool = pool_with_keys(&["risc0x:cuda:0", "risc0:cuda:0"]);
         let keys = pool.keys_for_prefix("risc0");
         assert_eq!(keys, vec!["risc0:cuda:0"]);
+    }
+
+    /// A proof is judged spilling from the first sample with memory off the card, stopped only once
+    /// that has been seen SPILL_CONFIRM times within the window, and clear once it has left the
+    /// window: the pattern measured on an RTX 4070, where Windows paged the proof in turns of
+    /// several seconds against another program's memory.
+    #[test]
+    fn a_proof_is_stopped_only_when_its_memory_keeps_leaving_the_card() {
+        let mut d = SpillDetector::default();
+        // A proof with the card to itself.
+        for _ in 0..40 {
+            assert_eq!(d.observe(0), SpillVerdict::Clear);
+        }
+        // Up to the threshold is not a spill (a block on its way back in).
+        assert_eq!(d.observe(SPILL_EVICTED_MIB), SpillVerdict::Clear);
+        // Paged out, then back, then out: spilling, not yet stopped.
+        assert_eq!(d.observe(9_792), SpillVerdict::Spilling);
+        for _ in 0..4 {
+            assert_eq!(d.observe(0), SpillVerdict::Spilling);
+        }
+        assert_eq!(d.observe(9_866), SpillVerdict::Spilling);
+        assert_eq!(d.observe(0), SpillVerdict::Spilling);
+        // The third time within the window stops it.
+        assert_eq!(d.observe(9_870), SpillVerdict::Confirmed);
+
+        // Two brief evictions, a window apart, never add up to a stop.
+        let mut d = SpillDetector::default();
+        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
+        for _ in 0..SPILL_WINDOW - 2 {
+            assert_eq!(d.observe(0), SpillVerdict::Spilling);
+        }
+        // Both have left the window.
+        assert_eq!(d.observe(0), SpillVerdict::Spilling);
+        assert_eq!(d.observe(0), SpillVerdict::Clear);
+        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
+        assert_eq!(d.observe(0), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000), SpillVerdict::Confirmed);
+    }
+
+    /// A watch with nothing to watch (no worker, no card, or not Windows) never stops a proof, and
+    /// its drop clears whatever its slot reported.
+    #[test]
+    fn a_spill_watch_without_a_card_reports_nothing_and_clears_its_slot() {
+        let spills: Arc<Mutex<HashMap<String, GpuSpill>>> = Arc::default();
+        spills.lock().unwrap().insert(
+            "sp1:cuda:1".to_string(),
+            GpuSpill {
+                evicted_mib: 1_000,
+                stopping: false,
+            },
+        );
+        let watch = SpillWatch::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Some("0000:03:00.0".to_string()),
+            "sp1:cuda:1".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            spills.clone(),
+        );
+        assert_eq!(watch.stopped(), None);
+        drop(watch);
+        assert!(spills.lock().unwrap().is_empty());
+        let watch = SpillWatch::new(
+            Arc::new(AtomicU32::new(std::process::id())),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            "sp1:cuda:1".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            spills.clone(),
+        );
+        assert_eq!(watch.stopped(), None);
+    }
+
+    /// The prove path watches every GPU proof for spilling from before it awaits the proof, and
+    /// reports one the watch stopped as a GPU memory shortage, before the deadline and failure
+    /// handling could call it anything else.
+    #[test]
+    fn a_stopped_spill_is_reported_as_a_gpu_memory_shortage() {
+        let src = include_str!("dispatcher.rs");
+        let prove = src
+            .split_once("    fn prove_on_slot(")
+            .expect("prove_on_slot")
+            .1;
+        let watch = prove
+            .find("let spill_watch = SpillWatch::new(")
+            .expect("the watch");
+        let recv = prove
+            .find("let proof_response = handle.recv_proof(")
+            .expect("the proof");
+        assert!(watch < recv, "the watch starts before the proof is awaited");
+        assert!(prove[watch..recv].contains(".filter(|_| on_gpu)"));
+        let stopped = prove
+            .find("if let Some(evicted_mib) = spill_watch.stopped() {")
+            .expect("the report");
+        let deadline = prove
+            .find("// Distinguish a DEADLINE-driven kill from a GPU wedge.")
+            .expect("the deadline arm");
+        assert!(recv < stopped && stopped < deadline);
+        let report = &prove[stopped..deadline];
+        assert!(report.contains("GpuMemoryShortage {"));
+        assert!(report.contains("ours_in_the_way: false"));
+        assert!(report.contains("evicted_bytes: evicted_mib.saturating_mul(1024 * 1024)"));
     }
 
     /// The second SP1 proof in a row to fail restarts its worker, and the count starts over; a

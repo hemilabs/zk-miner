@@ -437,6 +437,18 @@ fn card_job<'a>(jobs: &'a [TrackedJob], pci_bus_id: &str) -> Option<&'a TrackedJ
         .min_by_key(|j| rank(j))
 }
 
+/// What a GPU row says while Windows moves its proof's memory off the card for another program's
+/// (`WorkerPool::gpu_spills`): how much is off it, and once the proof is being stopped to run again
+/// where it fits, that.
+fn spill_text(spill: zkminer_prover::dispatcher::GpuSpill) -> String {
+    let gib = spill.evicted_mib as f64 / 1024.0;
+    if spill.stopping {
+        format!("⚠ {gib:.1} GiB in RAM: stopping")
+    } else {
+        format!("⚠ {gib:.1} GiB paged to RAM")
+    }
+}
+
 fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     let gpu_color = theme::usage_color(gpu.gpu_usage_percent);
 
@@ -473,6 +485,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     };
 
     let gpu_job = card_job(&state.active_jobs, &gpu.pci_bus_id);
+    let spill = state.gpu_spills.get(&gpu.pci_bus_id).copied();
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -482,6 +495,12 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
             id
         };
         match &job.status {
+            // Said in place of the bar: the proof is running many times slower than it shows.
+            MinerJobStatus::Proving { .. } if spill.is_some() => (
+                id_short,
+                spill.map(spill_text).unwrap_or_default(),
+                theme::warning(),
+            ),
             MinerJobStatus::Proving { progress, .. } => {
                 let (filled, empty) = theme::progress_bar(*progress, 12);
                 (
@@ -1236,6 +1255,93 @@ mod card_job_tests {
         // Another card's job, or one not yet on any card, is never shown.
         assert!(card_job(&jobs[4..], card).is_none());
         assert!(card_job(&jobs, "").is_none());
+    }
+
+    /// A card whose proof Windows is paging off it to make room for another program's memory says
+    /// so in place of its progress bar, and that the proof is being stopped once it is; a card
+    /// without a spill keeps its bar.
+    #[test]
+    fn the_row_says_when_a_proof_is_paged_off_its_card() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let card = "0000:03:00.0";
+        let mut state = MinerState::default();
+        state.hardware.gpus = vec![crate::hardware::GpuInfo {
+            index: 0,
+            name: "RTX 4070".into(),
+            vendor: GpuVendor::Nvidia,
+            pci_id: String::new(),
+            pci_bus_id: card.into(),
+            gpu_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            gpu_usage_percent: 0,
+            mem_usage_percent: 0,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            temp_edge_c: None,
+            temp_junction_c: None,
+            temp_mem_c: None,
+            fan_rpm: 0,
+            fan_max_rpm: 0,
+            power_watts: 0.0,
+            power_cap_watts: 0.0,
+            voltage_mv: 0,
+            pcie_speed: String::new(),
+            pcie_width: 0,
+            vbios: String::new(),
+            throttle_reasons: Vec::new(),
+        }];
+        state.active_jobs = vec![job(
+            1,
+            Some(card),
+            MinerJobStatus::Proving {
+                progress: 0.4,
+                elapsed_secs: 30,
+            },
+        )];
+        let screen = |state: &MinerState| {
+            let mut term = Terminal::new(TestBackend::new(200, 50)).unwrap();
+            term.draw(|f| render(f, f.area(), state)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let shown = screen(&state);
+        assert!(shown.contains("40%"), "{shown}");
+        assert!(!shown.contains("paged to RAM"), "{shown}");
+        state.gpu_spills.insert(
+            card.to_string(),
+            zkminer_prover::dispatcher::GpuSpill {
+                evicted_mib: 9_866,
+                stopping: false,
+            },
+        );
+        let shown = screen(&state);
+        assert!(shown.contains("⚠ 9.6 GiB paged to RAM"), "{shown}");
+        assert!(!shown.contains("40%"), "{shown}");
+        state.gpu_spills.insert(
+            card.to_string(),
+            zkminer_prover::dispatcher::GpuSpill {
+                evicted_mib: 9_866,
+                stopping: true,
+            },
+        );
+        assert!(screen(&state).contains("⚠ 9.6 GiB in RAM: stopping"));
+        // Another card's spill is not this one's.
+        state.gpu_spills.clear();
+        state.gpu_spills.insert(
+            "0000:01:00.0".to_string(),
+            zkminer_prover::dispatcher::GpuSpill {
+                evicted_mib: 9_866,
+                stopping: false,
+            },
+        );
+        assert!(screen(&state).contains("40%"));
     }
 
     /// The Temp cell names the hottest VRAM sensor beside the core when there is one, and the name

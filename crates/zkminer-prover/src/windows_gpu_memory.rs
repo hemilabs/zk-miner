@@ -72,6 +72,45 @@ fn dedicated_mib_on_card(pci_bus_id: &str, used_mib: u64) -> Option<HashMap<u32,
     None
 }
 
+/// Device memory of `pids` on the card at `pci_bus_id` (normalized, `0000:03:00.0`) that Windows has
+/// moved off the card, in MiB: `None` when the card cannot be matched to one adapter or the counters
+/// cannot be read.
+///
+/// A process's `Dedicated Usage` is the device memory it has allocated, and its `Local Usage` the
+/// part of it resident on the card right now. They are equal while it has the card to itself: an
+/// SP1 proof at 2^28 on an RTX 4070 read 0 MiB apart in every sample, allocating included. When
+/// another program's memory and ours no longer fit together, Windows does not fail either of them:
+/// it pages them in turns, and our server read 9 MiB resident of 9,875 allocated for seconds at a
+/// time while its proofs took 8-12 times as long. That gap is what this measures. Both counters are
+/// read in one collection, so a block freed between two reads cannot look evicted.
+pub(crate) fn evicted_mib_on_card(pids: &[u32], pci_bus_id: &str) -> Option<u64> {
+    let luid = d3dkmt::adapters().and_then(|a| luid_for_pci(&a, pci_bus_id))?;
+    let mut read = pdh::read_counter_arrays(&[
+        r"\GPU Process Memory(*)\Dedicated Usage",
+        r"\GPU Process Memory(*)\Local Usage",
+    ])?;
+    let local = read.pop()?;
+    let dedicated = read.pop()?;
+    Some(evicted_mib(&dedicated, &local, luid, pids))
+}
+
+/// MiB of `pids`' `dedicated` memory on `luid` that is not `local` (resident), summed.
+fn evicted_mib(
+    dedicated: &[(String, u64)],
+    local: &[(String, u64)],
+    luid: AdapterLuid,
+    pids: &[u32],
+) -> u64 {
+    let (dedicated, _) = on_adapter(dedicated, &[], luid);
+    let (local, _) = on_adapter(local, &[], luid);
+    pids.iter()
+        .map(|pid| {
+            let held = dedicated.get(pid).copied().unwrap_or(0);
+            held.saturating_sub(local.get(pid).copied().unwrap_or(0))
+        })
+        .sum()
+}
+
 /// Whether an adapter's own `Dedicated Usage` (MiB) is the same reading as `nvidia-smi`'s
 /// `memory.used`: within 256 MiB or 5%, the two being taken moments apart.
 fn agrees_with_smi(adapter_mib: u64, smi_used_mib: u64) -> bool {
@@ -324,63 +363,78 @@ mod pdh {
     /// Every instance of a wildcard counter path, with its current value. `None` on any failure,
     /// including a counter set this Windows does not have.
     pub(super) fn read_counter_array(path: &str) -> Option<Vec<(String, u64)>> {
-        let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        read_counter_arrays(&[path])?.pop()
+    }
+
+    /// [`read_counter_array`] for each of `paths`, all from ONE collection: the same moment, so
+    /// that two counters of one process can be compared.
+    pub(super) fn read_counter_arrays(paths: &[&str]) -> Option<Vec<Vec<(String, u64)>>> {
         let mut query = std::ptr::null_mut();
         if unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } != 0 {
             return None;
         }
         let result = (|| {
-            let mut counter = std::ptr::null_mut();
-            if unsafe { PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) } != 0 {
-                return None;
+            let mut counters = Vec::with_capacity(paths.len());
+            for path in paths {
+                let path: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+                let mut counter = std::ptr::null_mut();
+                if unsafe { PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) } != 0 {
+                    return None;
+                }
+                counters.push(counter);
             }
             // Instantaneous counters: one sample is a reading.
             if unsafe { PdhCollectQueryData(query) } != 0 {
                 return None;
             }
-            let (mut size, mut count) = (0u32, 0u32);
-            let status = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    counter,
-                    PDH_FMT_LARGE,
-                    &mut size,
-                    &mut count,
-                    std::ptr::null_mut(),
-                )
-            };
-            if status == 0 {
-                return Some(Vec::new()); // no instances
-            }
-            if status != PDH_MORE_DATA {
-                return None;
-            }
-            // The items, then the strings they point to, in one buffer of `size` bytes.
-            let item_size = std::mem::size_of::<FmtCounterValueItem>();
-            let mut buffer = vec![0u64; (size as usize).div_ceil(8).max(1)];
-            let items = buffer.as_mut_ptr().cast::<FmtCounterValueItem>();
-            if unsafe {
-                PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &mut size, &mut count, items)
-            } != 0
-            {
-                return None;
-            }
-            debug_assert!(count as usize * item_size <= buffer.len() * 8);
-            let mut out = Vec::with_capacity(count as usize);
-            for i in 0..count as usize {
-                let item = unsafe { &*items.add(i) };
-                if item.value.c_status != 0 || item.name.is_null() {
-                    continue;
-                }
-                let name = unsafe {
-                    let len = (0..).take_while(|&n| *item.name.add(n) != 0).count();
-                    String::from_utf16_lossy(std::slice::from_raw_parts(item.name, len))
-                };
-                out.push((name, item.value.large_value.max(0) as u64));
-            }
-            Some(out)
+            counters.into_iter().map(instances).collect()
         })();
         unsafe { PdhCloseQuery(query) };
         result
+    }
+
+    /// The instances of a collected `counter`, with their values.
+    fn instances(counter: *mut c_void) -> Option<Vec<(String, u64)>> {
+        let (mut size, mut count) = (0u32, 0u32);
+        let status = unsafe {
+            PdhGetFormattedCounterArrayW(
+                counter,
+                PDH_FMT_LARGE,
+                &mut size,
+                &mut count,
+                std::ptr::null_mut(),
+            )
+        };
+        if status == 0 {
+            return Some(Vec::new()); // no instances
+        }
+        if status != PDH_MORE_DATA {
+            return None;
+        }
+        // The items, then the strings they point to, in one buffer of `size` bytes.
+        let item_size = std::mem::size_of::<FmtCounterValueItem>();
+        let mut buffer = vec![0u64; (size as usize).div_ceil(8).max(1)];
+        let items = buffer.as_mut_ptr().cast::<FmtCounterValueItem>();
+        if unsafe {
+            PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &mut size, &mut count, items)
+        } != 0
+        {
+            return None;
+        }
+        debug_assert!(count as usize * item_size <= buffer.len() * 8);
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let item = unsafe { &*items.add(i) };
+            if item.value.c_status != 0 || item.name.is_null() {
+                continue;
+            }
+            let name = unsafe {
+                let len = (0..).take_while(|&n| *item.name.add(n) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(item.name, len))
+            };
+            out.push((name, item.value.large_value.max(0) as u64));
+        }
+        Some(out)
     }
 }
 
@@ -396,6 +450,57 @@ mod tests {
         high: 0,
         low: 0x00c5_debb,
     };
+
+    /// What Windows moved off the card is counted for the processes asked about, on this card only,
+    /// and memory resident beyond what is allocated (counters a moment apart) never goes negative.
+    #[test]
+    fn evicted_memory_is_the_allocated_less_the_resident_on_this_card() {
+        let mib = |n: u64| n * MIB;
+        let dedicated = vec![
+            // The server, paged out: 9,875 MiB allocated here, 9 resident.
+            (
+                "pid_100_luid_0x00000000_0x00c3ca54_phys_0".to_string(),
+                mib(9_875),
+            ),
+            // Its worker, holding a little here, all resident.
+            (
+                "pid_101_luid_0x00000000_0x00c3ca54_phys_0".to_string(),
+                mib(300),
+            ),
+            // The server's context on another card, evicted there: not this card's business.
+            (
+                "pid_100_luid_0x00000000_0x00c5debb_phys_0".to_string(),
+                mib(500),
+            ),
+            // Another program, evicted too: not ours.
+            (
+                "pid_200_luid_0x00000000_0x00c3ca54_phys_0".to_string(),
+                mib(2_048),
+            ),
+        ];
+        let local = vec![
+            (
+                "pid_100_luid_0x00000000_0x00c3ca54_phys_0".to_string(),
+                mib(9),
+            ),
+            (
+                "pid_101_luid_0x00000000_0x00c3ca54_phys_0".to_string(),
+                mib(310),
+            ),
+            ("pid_100_luid_0x00000000_0x00c5debb_phys_0".to_string(), 0),
+            ("pid_200_luid_0x00000000_0x00c3ca54_phys_0".to_string(), 0),
+        ];
+        assert_eq!(evicted_mib(&dedicated, &local, CARD, &[100, 101]), 9_866);
+        assert_eq!(evicted_mib(&dedicated, &local, CARD, &[101]), 0);
+        assert_eq!(evicted_mib(&dedicated, &local, OTHER, &[100]), 500);
+        // A process with no memory on the card, or no reading, has none evicted.
+        assert_eq!(evicted_mib(&dedicated, &local, CARD, &[999]), 0);
+        // Resident and allocated alike: nothing evicted.
+        assert_eq!(
+            evicted_mib(&dedicated, &dedicated, CARD, &[100, 101, 200]),
+            0
+        );
+    }
 
     #[test]
     fn an_instance_name_gives_its_pid_adapter_and_part() {

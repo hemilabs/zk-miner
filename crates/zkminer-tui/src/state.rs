@@ -544,6 +544,10 @@ pub struct MinerState {
     /// (`zkminer_prover::benchmark::risc0_job_po2`): `None` for a card that proves no risc0 job.
     /// Published by the brain; empty until it runs.
     pub risc0_job_po2s: Vec<(String, Option<u8>)>,
+    /// Cards whose running proof Windows is moving off the card to make room for another
+    /// program's memory, by PCI bus id as the pool names it (`WorkerPool::bus_id_for_slot`), so
+    /// the GPU row can say so. Published every 2 s; empty except under Windows.
+    pub gpu_spills: std::collections::HashMap<String, zkminer_prover::dispatcher::GpuSpill>,
     pub benchmark_running: bool,
     /// The benchmark started at launch is still running. It has the cards, so no job is claimed.
     pub startup_benchmark_pending: bool,
@@ -1050,6 +1054,7 @@ impl Default for MinerState {
             claim_outlook: ClaimOutlook::default(),
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
+            gpu_spills: std::collections::HashMap::new(),
             benchmark_running: false,
             startup_benchmark_pending: false,
             startup_problems: Vec::new(),
