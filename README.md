@@ -375,11 +375,17 @@ Worth knowing:
   refused at start, and its proof system is not offered on that card. Workers in
   `~/.zkminer/provers` are found before the ones shipped beside the miner: replace them too, or
   remove them, when you upgrade.
-- **One job locks at most half the stake.** A submitter chooses a job's collateral rate (up to
-  500%) and its minimum collateral, and a forced release burns a share of what is locked. So a job
-  whose collateral at its maximum price is over `ZKMINER_MAX_JOB_COLLATERAL_FRACTION` (default
-  `0.5`) of the total stake is set aside, not claimed; `0` turns the cap off. (Witness jobs, which
-  come only from the callers `[witness] callers` lists, are not capped.)
+- **One job locks at most half the stake, and so do one program's and one submitter's jobs
+  together.** A submitter chooses a job's collateral rate (up to 500%) and its maximum price, and a
+  forced release burns a share of what is locked. The cap is `ZKMINER_MAX_JOB_COLLATERAL_FRACTION`
+  (default `0.5`; `0` turns it off) of the total stake, but never less than the deployment's
+  per-job floor (`MIN_COLLATERAL_AMOUNT`, 100 HEMI on 743111), so a stake of 100–199 HEMI can still
+  claim one job (the miner says so once at startup). A job whose collateral at its maximum price is
+  over the cap is set aside, not claimed; one that would take the jobs of its program, or of its
+  submitter, that this miner holds and has not proven yet over the cap waits until they are proven.
+  Witness jobs are held to the same cap, inline and witness locks counting together, and
+  `run --watch-only` reports a job over it. A value that is not a number from 0 up is warned
+  about and the default used.
 - **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
   sha, bigint) by what they cost to prove, where the instruction count counted each as one.
   Benchmarks saved by an older miner count SP1 instructions per second, which is close for code
