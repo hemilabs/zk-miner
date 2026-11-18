@@ -383,7 +383,11 @@ Worth knowing:
   dashboard's GPU row shows "⚠ … GiB paged to RAM", and once it has gone on for a few seconds the
   proof is stopped and run again where it fits, on another card or on this one at a size that
   fits beside the other program (on an RTX 4070: stopped 6 s after a 2 GB program started, then
-  proved in 62 s, against 242 s left to page). Still, leave the card the room these figures say.
+  proved in 62 s, against 242 s left to page). Benchmarks are guarded the same way, since the
+  miner saves their rates and plans with them: one that another program's memory paged, or that
+  ran while another program took more of the card, is measured again (up to four runs, 30 s
+  apart), and an SP1 benchmark that runs out of GPU memory is measured again one shard size
+  smaller, that size then kept for the card. Still, leave the card the room these figures say.
   The miner helps:
   a RISC Zero proof on an NVIDIA card starts only when its segment size's measured peak fits in
   what is free (else it waits, or goes to another card, and no RISC Zero job is claimed for that

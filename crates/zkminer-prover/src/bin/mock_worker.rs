@@ -30,9 +30,9 @@
 //! - `MOCK_PROVE_ERROR_KIND`: answer every Prove with a `WorkerResponse::Error` of this kind
 //!   (`resource_exhausted`, `proof_failed` or `invalid_input`), and `MOCK_PROVE_ERROR_MESSAGE` as
 //!   its message.
-//! - `MOCK_OOM_UNLESS_CAP_AT_MOST`: answer a Prove with a `ResourceExhausted` error unless
-//!   `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` (the SP1 shard-size cap the dispatcher spawns a worker
-//!   with) is set to at most this: a program that fits only at the smaller size.
+//! - `MOCK_OOM_UNLESS_CAP_AT_MOST`: answer a Prove, and a Benchmark, with a `ResourceExhausted`
+//!   error unless `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` (the SP1 shard-size cap the dispatcher spawns
+//!   a worker with) is set to at most this: a program, or a card, that fits only at the smaller size.
 //! - `MOCK_RECORD_TO`: a file each Benchmark and Prove appends a line to, saying what it was sent
 //!   (`benchmark po2=<po2>`) or what it ran with (`prove cap=<ZKMINER_SP1_ELEMENT_THRESHOLD_CAP>`).
 
@@ -72,6 +72,19 @@ fn main() {
         }
     };
     let cap = std::env::var("ZKMINER_SP1_ELEMENT_THRESHOLD_CAP").ok();
+    // `MOCK_OOM_UNLESS_CAP_AT_MOST`: runs out of memory at this worker's cap.
+    let oom_at_cap = std::env::var("MOCK_OOM_UNLESS_CAP_AT_MOST")
+        .ok()
+        .map(|most| {
+            most.trim()
+                .parse::<u64>()
+                .expect("MOCK_OOM_UNLESS_CAP_AT_MOST")
+        })
+        .is_some_and(|most| {
+            cap.as_deref()
+                .and_then(|c| c.trim().parse::<u64>().ok())
+                .is_none_or(|c| c > most)
+        });
     let prove_delay = Duration::from_secs(
         std::env::var("MOCK_PROVE_DELAY_SECS")
             .ok()
@@ -127,7 +140,16 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
-                let resp = WorkerResponse::BenchmarkResult { results: vec![] };
+                let resp = if oom_at_cap {
+                    WorkerResponse::Error {
+                        request_id: 0,
+                        kind: ErrorKind::ResourceExhausted,
+                        message: "mock: an SP1 benchmark ran out of GPU memory at this shard size"
+                            .to_string(),
+                    }
+                } else {
+                    WorkerResponse::BenchmarkResult { results: vec![] }
+                };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
@@ -157,18 +179,7 @@ fn main() {
                 }
                 std::thread::sleep(prove_delay);
                 record(format!("prove cap={}", cap.as_deref().unwrap_or("none")));
-                let oom = std::env::var("MOCK_OOM_UNLESS_CAP_AT_MOST")
-                    .ok()
-                    .map(|most| {
-                        most.trim()
-                            .parse::<u64>()
-                            .expect("MOCK_OOM_UNLESS_CAP_AT_MOST")
-                    })
-                    .is_some_and(|most| {
-                        cap.as_deref()
-                            .and_then(|c| c.trim().parse::<u64>().ok())
-                            .is_none_or(|c| c > most)
-                    });
+                let oom = oom_at_cap;
                 let error_kind = match std::env::var("MOCK_PROVE_ERROR_KIND").as_deref() {
                     Ok("resource_exhausted") => Some(ErrorKind::ResourceExhausted),
                     Ok("proof_failed") => Some(ErrorKind::ProofFailed),
