@@ -38,7 +38,9 @@ Settings (environment):
 |---|---|---|
 | `ZKMINER_MACOS_MIN` | `26.0` | minimum macOS; `27.0` = B9-PKG's kit (revert knob); `sdk` = no target flags (revert knob): minos 11.0 and metallibs for the build SDK, so the kit's `min_macos` is the SDK's version (27.2 here) |
 | `AOT_ARCHES` | `applegpu_g17s` | GPU families of the archive set; `none` = no set |
-| `AOT_OS_MAJORS` | the build host's major (`27`) | macOS major versions the set has archives for (key `macos<N>`, built with `metal-tt -macos-version-min <N>.0`); `26 27` adds an unvalidated `macos26` set (below) |
+| `AOT_OS_MAJORS` | the validated majors (`27`, `scripts/ci/macos-validated.sh`), whatever macOS the build host runs | macOS major versions the set has archives for (key `macos<N>`, built with `metal-tt -macos-version-min <N>.0`); `26 27` adds an unvalidated `macos26` set (below), and needs `AOT_ALLOW_UNVALIDATED_OS=1` |
+| `AOT_ALLOW_UNVALIDATED_OS=1` | | opt-in for an archive key outside `VALIDATED_AOT_OS_MAJORS` (assemble and the check refuse it otherwise; `BUILDINFO` `aot_os_unvalidated` lists it) |
+| `METAL_COMPILER_UNVALIDATED=1` | | opt-in for metallibs from another compiler than `VALIDATED_METAL_COMPILER` (`BUILDINFO` `metal_compiler_validated=no`) |
 | `AOT_VALIDATED` | `applegpu_g17s` | families `install.sh` installs archives for (written to `BUILDINFO`) |
 | `AOT_SRC` | | a prebuilt set for this exact worker (digests are checked) |
 | `RISC0_SRC` | `git` | `local` builds a risc0 checkout (`RELEASE-DEPS.md`) |
@@ -123,9 +125,20 @@ How the build sets it (`assemble-macos.sh`):
   - The guests never see it (risc0-build drops `CARGO*`).
   - `CARGO_PROFILE_RELEASE_STRIP=none` does not work for this: the manifest's
     `[profile.release.package."*"]` keeps the dependencies at the manifest's strip.
-- **Metallibs:** `METAL_TC` points at a toolchain directory made by `scripts/ci/metal-tc.sh`,
-  `target/macos-kit/metal-tc-26.0`. Its `metal` runs the real compiler with
+- **Metallibs:** `METAL_TC` points at a toolchain directory made by `scripts/ci/metal-tc.sh --in`,
+  `target/macos-kit/metal-tc-26.0-<fingerprint>`. Its `metal` runs the real compiler with
   `-mmacosx-version-min=26.0`, and its `--version` line names that flag.
+  - **The compiler is in the path.** The fingerprint is a SHA-256 over the real compiler's path, its
+    version line and the `metal` driver binary. Cargo reruns risc0-build-kernel's build scripts only
+    when the value of `METAL_TC` (or a source) changes, so with one fixed path per target another
+    compiler behind it would leave the old compiler's metallibs in the build, labelled with the new
+    one (B9-M26 review; `scripts/ci/test-metal-tc.sh` case 5 reproduces it, case 6 shows the fix).
+  - **The label comes from the kernels.** Every metallib's AIR carries its compiler's version line
+    (`Apple metal version ...`). `assemble-macos.sh` takes `BUILDINFO` `metal_compiler` from there
+    (`check-macos-release.sh --compilers`), refuses a build whose kernels are not from the wrapped
+    compiler (a stale build) or not from the validated one (`VALIDATED_METAL_COMPILER` in
+    `scripts/ci/macos-validated.sh`), and `check-macos-release.sh` checks the same on the tarball
+    (`test-assemble-macos.sh` case 11).
   - **Kernel cache keyed by the target.** risc0's kernel cache
     (`~/Library/Caches/com.risczero.RISC-Zero.risc0`) is a SHA-256 over flags, SDK, sources and that
     version line, and not over any deployment target. With the target in the line, a 26.0 build, a
@@ -208,8 +221,12 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
   for it: the Warmup that builds the pipelines has `WARMUP_TIMEOUT` = 60 min, and the Metal
   benchmark deadline is at least 109,200 GPU-core-seconds / cores (`metal_benchmark_timeout`, about
   45 min on a 40-core GPU), both in `crates/zkminer-prover/src/dispatcher.rs`.
-- **No `macos26` set by default.** `metal-tt -macos-version-min 26.0` builds one (`AOT_OS_MAJORS="26
-  27"`), but it cannot be validated on macOS 27: renamed to the `macos27` key, the runtime opens each
+- **No `macos26` set by default, on any build host.** The default keys are the validated ones
+  (`VALIDATED_AOT_OS_MAJORS=27` in `scripts/ci/macos-validated.sh`), not the build host's major: on
+  the macOS 26 CI runner a default build still ships `macos27` only (`test-assemble-macos.sh` case
+  10, with a `sw_vers` shim). `metal-tt -macos-version-min 26.0` builds a `macos26` set
+  (`AOT_OS_MAJORS="26 27" AOT_ALLOW_UNVALIDATED_OS=1`; without the opt-in assemble and the check
+  refuse it), but it cannot be validated on macOS 27: renamed to the `macos27` key, the runtime opens each
   file and takes 0 pipelines from it (all compiled; proofs correct). Whether macOS 26 uses it, and
   whether its GPU code is bit-exact, is unknown. Validate on a macOS 26 Mac (README procedure, key
   `macos26`) before turning it on.
@@ -256,7 +273,7 @@ The workflow files are not part of this item (B9-CI). A macOS job would run:
       # The validated compiler (27B47), not the runner's Xcode 26 one ("Metal compiler" above).
       - run: echo "METAL_TC=$(scripts/ci/fetch-metal-toolchain.sh "$RUNNER_TEMP/metal-tc")" >> "$GITHUB_ENV"
       - run: scripts/ci/assemble-macos.sh dist/macos
-        env: { AOT_SRC: ... }   # see below
+        env: { AOT_SRC: ... }   # see below; leave AOT_OS_MAJORS unset (= 27, the validated key)
       - uses: actions/upload-artifact@<pinned sha>
         with: { name: dist-macos, path: dist/macos }
   metal-probe:     # opt-in: what the runner's GPU can do
@@ -273,13 +290,16 @@ Pins for B9-CI:
 | Metal toolchain | build **27B47** (Xcode 27.2), `Apple metal version 32023.922 (metalfe-32023.922.4)`; `fetch-metal-toolchain.sh` pins the `.aar` (SHA-256 `fcea0f3c…6513d9`) and the disk image (SHA-256 `9a7f6186…3b6265`) |
 | kernel target | `-mmacosx-version-min=26.0` (AIR 2.8), MSL 3.2 (`metal-tc.sh` wrapper, `assemble-macos.sh`) |
 | binaries | minos 26.0 (`-C link-arg=-mmacosx-version-min=26.0`, `-C strip=none`, `-Wl,-S`) |
-| offline archives | `metal-tt` of the same toolchain, `-macos-version-min 27.0`, key `macos27`, family `applegpu_g17s` |
+| offline archives | `metal-tt` of the same toolchain, `-macos-version-min 27.0`, key `macos27`, family `applegpu_g17s`; `AOT_OS_MAJORS` unset (default `27`); never `AOT_ALLOW_UNVALIDATED_OS` or `METAL_COMPILER_UNVALIDATED` in a release job |
 | SDK | the release kit was built with the CLT 27.2 SDK (`BUILDINFO` `metal_sdk`); the runner's Xcode 26 SDK changes only the AIR `"SDK Version"` flag (above) |
 
 `scripts/ci/test-assemble-macos.sh <sdk worker> <sdk CLI> [<kit worker> <kit CLI>]` tests the
 script's minimum-macOS handling (26.0, 27.0 and sdk), the kit checks and `install.sh` (the macOS
-floor, the per-macOS archive selection) from prebuilt binaries, without a build (about a minute;
-case 8 runs the worker's `--metal-arch`, `TEST_ASSEMBLE_GPU=0` skips it).
+floor, the per-macOS archive selection), the archive keys on a macOS 26 build host and the compiler
+label, from prebuilt binaries, without a build (a few minutes; case 8 runs the worker's
+`--metal-arch`, `TEST_ASSEMBLE_GPU=0` skips it). `scripts/ci/test-metal-tc.sh [<risc0
+build_kernel dir>]` tests the compiler wrapper, and with the crate dir rebuilds a one-kernel crate
+through risc0-build-kernel under compilers A, B, C (no GPU, under a minute).
 
 `scripts/ci/macos-smoke.sh` (also `tools/macos-smoke.sh` in the kit): launch checks (`zkminer --help`,
 `worker --metal-arch`, crash reports), a device probe through `osascript` (name, architecture,

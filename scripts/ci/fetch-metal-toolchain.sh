@@ -39,6 +39,12 @@ sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
 if [ -x "$mnt/Metal.xctoolchain/usr/bin/metal" ]; then
   v=$("$mnt/Metal.xctoolchain/usr/bin/metal" --version | head -1)
   [ "$v" = "$COMPILER" ] || die "$mnt holds another compiler ($v); unmount it (hdiutil detach $mnt)"
+  # The version line alone could be anyone's: reuse the mount only when it is the pinned image.
+  img=$(hdiutil info -plist | python3 -I -c 'import plistlib, sys
+for i in plistlib.loads(sys.stdin.buffer.read()).get("images", []):
+    if any(e.get("mount-point") == sys.argv[1] for e in i.get("system-entities", [])): print(i.get("image-path", ""))' "$mnt")
+  [ -n "$img" ] && [ -f "$img" ] && [ "$(sha "$img")" = "$DMG_SHA256" ] \
+    || die "$mnt is mounted from '${img:-?}', not the pinned disk image (SHA-256 $DMG_SHA256); unmount it (hdiutil detach $mnt)"
   echo "$mnt/Metal.xctoolchain"; exit 0
 fi
 if [ ! -f "$dmg" ] || [ "$(sha "$dmg")" != "$DMG_SHA256" ]; then

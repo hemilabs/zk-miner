@@ -78,7 +78,8 @@ zkminer run
 
 Metal compiles every GPU kernel the first time a process uses it. For this prover's circuits that
 takes about a minute on an M5 Max (52-58 s measured), and longer with fewer CPU cores. The result is cached, so later
-starts take ~0.1 s.
+starts skip it (building the pipelines from the cache then takes ~0.1 s; a whole `--benchmark` start with a
+fibonacci proof, about 2.3 s).
 
 - **GPU family `applegpu_g17s`** (the M5 Max this beta was tested on; whether the M5 Pro reports
   the same family has not been checked) **on macOS 27**: the kit ships pre-compiled archives. The
@@ -89,6 +90,9 @@ starts take ~0.1 s.
 - **Other GPU families** (M1 to M4, the base M5): no archives are installed, because none were
   validated on such a GPU.
   The first start compiles the kernels, once.
+- **Upgrading macOS 26 to 27:** `install.sh` installed archives for the macOS it ran on only, so after
+  the upgrade there are none for macOS 27 and the first start compiles the kernels once. Run
+  `./install.sh` from the kit again after upgrading to install the macOS 27 archives.
 - **Mismatches:** an archive for another GPU family or another macOS major version is never used.
   The prover compiles that kernel instead.
 - **Your GPU family:** `~/.zkminer/provers/zkminer-prove-risc0-metal --metal-arch`.

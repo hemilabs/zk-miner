@@ -2,9 +2,16 @@
 # Makes a Metal toolchain directory whose compiler targets one macOS release (B9-PKG, B9-M26):
 #
 #   metal-tc.sh <macOS min, e.g. 26.0> <toolchain dir> [<real metal compiler>]
+#   metal-tc.sh <macOS min> --in <parent dir> [<real metal compiler>]
 #
 # risc0-build-kernel takes no target flag but finds its compiler through METAL_TC; point METAL_TC at
-# <toolchain dir>. Its usr/bin holds symlinks to the real toolchain's tools, except `metal`, a
+# the printed toolchain directory. With --in it is <parent dir>/metal-tc-<min>-<fingerprint>, the
+# fingerprint a SHA-256 (16 hex digits) over the real compiler's path, its `--version` first line and
+# the driver binary itself. Use --in for builds (assemble-macos.sh does): risc0-build-kernel reruns
+# the kernel build scripts only when the value of METAL_TC (or a source) changes, never when the
+# compiler behind the same METAL_TC path changes, so a fixed directory would keep the metallibs an
+# earlier compiler built (B9-M26 review; scripts/ci/test-metal-tc.sh reproduces it). With the
+# compiler in the path, another compiler is another METAL_TC and the kernels are rebuilt. Its usr/bin holds symlinks to the real toolchain's tools, except `metal`, a
 # wrapper that adds -mmacosx-version-min=<min> to every compile and whose `--version` first line ends
 # in " [-mmacosx-version-min=<min>]".
 #
@@ -21,18 +28,43 @@
 set -euo pipefail
 min=${1:?usage: metal-tc.sh <macOS min> <toolchain dir> [<real metal compiler>]}
 tc=${2:?usage: metal-tc.sh <macOS min> <toolchain dir> [<real metal compiler>]}
-real=${3:-}
+in=
+if [ "$tc" = --in ]; then
+  in=${3:?usage: metal-tc.sh <macOS min> --in <parent dir> [<real metal compiler>]}
+  real=${4:-}
+else
+  real=${3:-}
+fi
 [[ "$min" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "metal-tc.sh: the minimum must be <major>.<minor> (got '$min')" >&2; exit 2; }
 if [ -z "$real" ]; then
   real=${METAL_TC:+$METAL_TC/usr/bin/metal}
   [ -n "$real" ] && [ -x "$real" ] || real=$(xcrun --sdk macosx --find metal 2>/dev/null || command -v metal || true)
 fi
 [ -x "$real" ] || { echo "metal-tc.sh: no Metal compiler (xcrun --sdk macosx --find metal): RELEASE-DEPS.md" >&2; exit 1; }
-# A wrapper of a wrapper would add the flag twice and name it twice: take the compiler it wraps.
-if head -c 2 "$real" | grep -q '#!' && grep -q '^# metal-tc.sh: real=' "$real"; then
-  real=$(sed -n 's/^# metal-tc.sh: real=//p' "$real")
+given=$real
+# A wrapper of a wrapper would add the flag twice and name it twice: take the compiler it wraps
+# (this script's wrappers, and B9-PKG's assemble-macos.sh ones: "# assemble-macos.sh: the Metal
+# compiler at <real>, targeting macOS <min>.").
+if head -c 2 "$real" | grep -q '#!'; then
+  if grep -q '^# metal-tc.sh: real=' "$real"; then
+    real=$(sed -n 's/^# metal-tc.sh: real=//p' "$real" | head -1)
+  elif grep -q '^# assemble-macos.sh: the Metal compiler at ' "$real"; then
+    real=$(sed -n 's/^# assemble-macos.sh: the Metal compiler at \(.*\), targeting macOS [0-9.]*\.$/\1/p' "$real" | head -1)
+  fi
+  [ -x "$real" ] || { echo "metal-tc.sh: cannot find the compiler behind the wrapper $given" >&2; exit 1; }
 fi
 case "$real" in /*) ;; *) real=$(cd "$(dirname "$real")" && pwd)/$(basename "$real") ;; esac
+if [ -n "$in" ]; then
+  fp=$( { echo "$real"; "$real" --version 2>/dev/null | head -1; shasum -a 256 < "$real"; } | shasum -a 256 | cut -c1-16)
+  mkdir -p "$in"
+  tc=$(cd "$in" && pwd)/metal-tc-$min-$fp
+fi
+# The directory is replaced: refuse one that is not empty and not a wrapper directory of this
+# script (e.g. METAL_TC itself, a real Metal.xctoolchain, passed by mistake).
+if [ -e "$tc" ] && [ -n "$(ls -A "$tc" 2>/dev/null)" ] && ! grep -qs '^# metal-tc.sh: real=' "$tc/usr/bin/metal"; then
+  echo "metal-tc.sh: $tc exists and is not a metal-tc.sh toolchain directory; refusing to replace it" >&2
+  exit 1
+fi
 rm -rf "$tc"; mkdir -p "$tc/usr/bin"
 tc=$(cd "$tc" && pwd)
 for t in "$(dirname "$real")"/*; do ln -s "$t" "$tc/usr/bin/$(basename "$t")"; done

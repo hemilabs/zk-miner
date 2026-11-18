@@ -44,10 +44,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-mkdir -p "$prefix"
-prefix=$(cd "$prefix" && pwd)
-provers=$prefix/provers
-worker=$provers/zkminer-prove-risc0-metal
+# Not created before the checks below: a refused install leaves nothing behind.
+set_prefix() { [ -d "$prefix" ] && prefix=$(cd "$prefix" && pwd); provers=$prefix/provers; worker=$provers/zkminer-prove-risc0-metal; }
+set_prefix
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -110,6 +109,7 @@ place() { # <src> <dest>
   xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
   mv -f "$tmp" "$2"
 }
+mkdir -p "$prefix"; set_prefix
 mkdir -p "$provers"
 place "$kit/zkminer" "$prefix/zkminer"
 place "$kit/provers/zkminer-prove-risc0-metal" "$worker"

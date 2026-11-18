@@ -6,6 +6,9 @@
 #                          and every embedded metallib's target equal to <min macOS>)
 #   check-macos-release.sh --requirements <Mach-O file>...  prints "<minos> <metallib target>" of the
 #                          files (`none` without metallibs); fails if they disagree among themselves
+#   check-macos-release.sh --compilers <Mach-O file>...  prints the distinct compiler lines ("Apple metal
+#                          version ...", the first line of `metal --version`) the embedded metallibs'
+#                          AIR names, one per line; fails if a metallib names none
 #
 # On the tarball:
 # - it unpacks as one directory, zkminer-<version>-macos-arm64/, and its SHA256SUMS hold;
@@ -22,14 +25,44 @@
 #   (digest field), of a family BUILDINFO lists, and has a macos<N> key BUILDINFO aot_os_keys lists,
 #   with N no older than min_macos's major (the runtime opens only macos<its major>, so a set keyed
 #   for an older macOS than the kit's minimum is never used) and, by manifest.jsonl, built with
-#   metal-tt -macos-version-min N.0; every key holds the same units and families (B9-M26);
+#   metal-tt -macos-version-min N.0; every key holds the same units and families (B9-M26), and every
+#   key is one validated on hardware (macos-validated.sh VALIDATED_AOT_OS_MAJORS; opt-in for another:
+#   AOT_ALLOW_UNVALIDATED_OS=1);
+# - every embedded metallib names one compiler in its AIR, the same for all, BUILDINFO's
+#   metal_compiler, and the validated one (macos-validated.sh VALIDATED_METAL_COMPILER; opt-in for
+#   another: METAL_COMPILER_UNVALIDATED=1): kernels another compiler built never pass as built by the
+#   pinned one (B9-M26 review);
 # - no risc0-groth16 component file is in the kit, and the worker pins the Groth16 blob BUILDINFO
 #   names (install.sh --with-groth16 downloads that one);
 # - install.sh and the tools parse (bash -n).
 set -euo pipefail
 ci=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=macos-validated.sh
+. "$ci/macos-validated.sh"
 fail=0
 bad() { echo "FAIL $*"; fail=1; }
+
+# The compiler lines in every embedded metallib: "<offset> <line>" per (metallib, line); a metallib
+# without one prints "<offset> none".
+metallib_compilers() {
+  python3 -I - "$1" <<'PY'
+import re, struct, sys
+d = open(sys.argv[1], 'rb').read()
+p = d.find(b'MTLB')
+while p >= 0:
+    step = 4
+    if p + 0x58 <= len(d):
+        (size,) = struct.unpack_from('<Q', d, p + 0x10)
+        if 0x58 < size <= len(d) - p:
+            offs = struct.unpack_from('<8Q', d, p + 0x18)
+            if all(o + s <= size for o, s in zip(offs[0::2], offs[1::2])) and offs[0] >= 0x58:
+                found = sorted(set(re.findall(rb'Apple metal version [0-9.]+ \([^)\n]*\)', d[p:p + size])))
+                for c in found or [b'none']:
+                    print(f"{p:#x} {c.decode('ascii', 'replace')}")
+                step = size
+    p = d.find(b'MTLB', p + step)
+PY
+}
 
 # MTLB headers in a file: "<offset> <os major>.<os minor> <platform>" per embedded metallib.
 metallib_targets() {
@@ -84,6 +117,18 @@ if [ "${1:-}" = --binaries ]; then
   exit $fail
 fi
 
+if [ "${1:-}" = --compilers ]; then
+  shift
+  [ $# -gt 0 ] || { echo "usage: $0 --compilers <file>..." >&2; exit 2; }
+  all=$(for f in "$@"; do metallib_compilers "$f"; done)
+  [ -n "$all" ] || { echo "FAIL no embedded metallib in $*" >&2; exit 1; }
+  if grep -q ' none$' <<<"$all"; then
+    echo "FAIL a metallib names no compiler: $(grep ' none$' <<<"$all" | head -3 | tr '\n' ' ')" >&2; exit 1
+  fi
+  cut -d' ' -f2- <<<"$all" | sort -u
+  exit 0
+fi
+
 if [ "${1:-}" = --requirements ]; then
   shift
   [ $# -gt 0 ] || { echo "usage: $0 --requirements <file>..." >&2; exit 2; }
@@ -130,8 +175,25 @@ while IFS= read -r f; do
   if file -b "$f" | grep -q '^Mach-O'; then check_binary "$bin_minos" "$metal_target" "$f"; fi
 done < <(find "$k" -type f ! -name '*.binarchive')
 
-echo "offline Metal archives:"
+echo "Metal compiler:"
 w=$k/provers/zkminer-prove-risc0-metal
+built_by=$("$ci/check-macos-release.sh" --compilers "$w" 2>&1) || bad "$built_by"
+claimed=$(info metal_compiler)
+if [ "$(grep -c . <<<"$built_by")" != 1 ]; then
+  bad "the worker's metallibs were built by more than one compiler: $(echo $built_by)"
+elif [ "$built_by" != "$claimed" ]; then
+  bad "the worker's metallibs were built by '$built_by', BUILDINFO metal_compiler says '$claimed'"
+fi
+if [ "$built_by" != "$VALIDATED_METAL_COMPILER" ]; then
+  if [ "${METAL_COMPILER_UNVALIDATED:-0}" = 1 ]; then
+    echo "  note: built by '$built_by', not the validated '$VALIDATED_METAL_COMPILER' (METAL_COMPILER_UNVALIDATED=1)"
+  else
+    bad "the worker's metallibs were built by '$built_by', not by the validated compiler '$VALIDATED_METAL_COMPILER' (scripts/ci/fetch-metal-toolchain.sh; METAL_COMPILER_UNVALIDATED=1 accepts it)"
+  fi
+fi
+echo "  every metallib: $built_by"
+
+echo "offline Metal archives:"
 n=$(find "$k/metal-aot" -name '*.binarchive' | wc -l | tr -d ' ')
 if [ "$n" -gt 0 ]; then
   (cd "$k/metal-aot" && shasum -a 256 -c --quiet SHA256SUMS) || bad "metal-aot/SHA256SUMS does not hold"
@@ -142,6 +204,13 @@ if [ "$n" -gt 0 ]; then
   for key in $keys; do
     [[ "$key" =~ ^macos[0-9]+$ ]] && [ "${key#macos}" -ge "${min%%.*}" ] \
       || bad "BUILDINFO aot_os_keys: $key is not macos<N> with N >= ${min%%.*} (min_macos $min): the runtime of no supported macOS opens it"
+    if [[ " $VALIDATED_AOT_OS_MAJORS " != *" ${key#macos} "* ]]; then
+      if [ "${AOT_ALLOW_UNVALIDATED_OS:-0}" = 1 ]; then
+        echo "  note: the $key archives are not validated on hardware (AOT_ALLOW_UNVALIDATED_OS=1)"
+      else
+        bad "metal-aot holds $key archives, a key not validated on hardware (validated: $VALIDATED_AOT_OS_MAJORS; AOT_ALLOW_UNVALIDATED_OS=1 accepts it)"
+      fi
+    fi
   done
   : > "$root/sets"
   for f in "$k"/metal-aot/*.binarchive; do

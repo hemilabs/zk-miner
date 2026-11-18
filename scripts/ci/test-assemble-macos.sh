@@ -24,7 +24,19 @@
 #    macos26 and macos27 in the kit, a sw_vers shim): on 27.x only the macos27 files, on 26.x none
 #    (with a message) when the kit has no macos26 files, and the macos26 ones when it has them.
 # 9. (with a 26.0 kit build) install.sh refuses macOS 25.9 naming macOS 26.0 (Tahoe), and installs
-#    on 26.0.
+#    on 26.0; the refused install creates no prefix directory.
+# 10. (with a kit build; B9-M26 review) the archive keys do not follow the build host: with a sw_vers
+#    shim reporting macOS 26.4.1 and a fake mac-build-aot (archives named after the worker's
+#    metallib digests, keyed macos<AOT_MACOS_MIN's major>), the default builds only the validated
+#    macos27 set; AOT_OS_MAJORS="26 27" is refused without AOT_ALLOW_UNVALIDATED_OS=1, and with it
+#    BUILDINFO aot_os_unvalidated=macos26 and check-macos-release.sh rejects that kit without the
+#    opt-in.
+# 11. (with a kit build; B9-M26 review) the compiler: check-macos-release.sh rejects a BUILDINFO
+#    metal_compiler that is not what the metallibs' AIR names; assemble-macos.sh refuses a worker
+#    whose metallibs another compiler built (the worker with its compiler line relabelled
+#    32023.999, re-signed) as a stale build (wrapper mode, even with METAL_COMPILER_UNVALIDATED=1)
+#    and as unvalidated (sdk mode); with the opt-in it labels the kit with the AIR's compiler, which
+#    check-macos-release.sh then rejects without the opt-in.
 # 4. check-macos-release.sh rejects the sdk kit with BUILDINFO edited (SHA256SUMS redone) to the
 #    old min_macos (the binaries' 11.0), to an older macOS than the metallibs', to a newer one than
 #    needed, and with a metal_target the worker does not embed.
@@ -181,6 +193,7 @@ inst() { # <tarball> <macOS version>: install.sh --no-aot into scratch; prints i
   chmod 0755 "$d/bin/sw_vers"
   tar -xzf "$1" -C "$d/kit"
   HOME=$d/home PATH="$d/bin:$PATH" "$(echo "$d"/kit/zkminer-*-macos-arm64)/install.sh" --no-aot --prefix "$d/home/.zkminer" > "$T/inst.log" 2>&1 || rc=$?
+  [ -e "$d/home/.zkminer" ] && echo yes > "$T/inst.prefix" || echo no > "$T/inst.prefix"
   rm -rf "$d"; echo $rc
 }
 if [ -n "$tarball" ]; then
@@ -315,8 +328,106 @@ if [ -n "$kit_tarball" ] && [ "$tm" = 26.0 ]; then
   rc=$(inst "$kit_tarball" 25.9)
   [ "$rc" != 0 ] && grep -q "needs macOS 26.0 (Tahoe) or later; this Mac runs macOS 25.9" "$T/inst.log" \
     && ok "9: install.sh refuses macOS 25.9: $(tail -1 "$T/inst.log" | cut -c1-110)" || no "9: macOS 25.9: rc $rc: $(tail -1 "$T/inst.log")"
+  [ "$(cat "$T/inst.prefix")" = no ] && ok "9: the refused install created no prefix directory" || no "9: the refused install left an (empty) prefix directory"
   rc=$(inst "$kit_tarball" 26.0)
   [ "$rc" = 0 ] && ok "9: install.sh installs the 26.0 kit on macOS 26.0" || no "9: macOS 26.0: rc $rc: $(tail -2 "$T/inst.log")"
+fi
+
+# --- 10. archive keys do not follow the build host ------------------------------------------------
+if [ -n "$kit_tarball" ]; then
+  r=$T/r-aot
+  fake_repo "$r" "$m27_worker" "$m27_cli"
+  printf '%s\n' \
+    'mac-build-aot:' \
+    '	@set -e; m=$${AOT_MACOS_MIN%%.*}; mkdir -p "$(AOT_OUT)"; rm -f "$(AOT_OUT)"/*.binarchive; : > "$(AOT_OUT)/manifest.jsonl"; \' \
+    '	i=0; for d in $$(scripts/mac/build-metal-aot.sh --worker-digests target/release/zkminer-prove-risc0-metal); do i=$$((i+1)); \' \
+    '	  f=u$$i-$$d-applegpu_g17s-macos$$m-0000000000000000.binarchive; echo "fake $$m $$d" > "$(AOT_OUT)/$$f"; \' \
+    '	  echo "{\"file\": \"$$f\", \"macos_min\": \"$$m.0\"}" >> "$(AOT_OUT)/manifest.jsonl"; done; \' \
+    '	echo "fake worker macos$$m" > "$(AOT_OUT)/WORKER"' > "$r/Makefile.mac"
+  mkdir -p "$T/sv26"
+  printf '#!/bin/sh\n[ "$1" = -productVersion ] && echo 26.4.1 || /usr/bin/sw_vers "$@"\n' > "$T/sv26/sw_vers"; chmod 0755 "$T/sv26/sw_vers"
+  asm_aot() { # <out> <env...>: assemble with archives on a "macOS 26.4.1" build host
+    local o=$1; shift
+    env -u MACOSX_DEPLOYMENT_TARGET -u RUSTFLAGS -u AOT_OS_MAJORS -u AOT_ALLOW_UNVALIDATED_OS PATH="$T/sv26:$PATH" \
+      ENV_SH=/nonexistent ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=applegpu_g17s ZKMINER_MACOS_MIN="$tm" "$@" \
+      "$r/scripts/ci/assemble-macos.sh" "$o"
+  }
+  if asm_aot "$T/out-aot" > "$T/aot.log" 2>&1; then
+    bi=$(kit_buildinfo "$(ls "$T"/out-aot/zkminer-*-macos-arm64.tar.gz)" "$T/u-aot")
+    [ "$(info "$bi" aot_os_keys)" = macos27 ] && [ -z "$(info "$bi" aot_os_unvalidated)" ] && grep -q '^build_macos=26.4.1' "$bi" \
+      && ok "10: on a macOS 26.4.1 build host the default ships only the validated macos27 set (check passes)" \
+      || no "10: default keys '$(info "$bi" aot_os_keys)', unvalidated '$(info "$bi" aot_os_unvalidated)', $(grep '^build_macos' "$bi")"
+  else
+    no "10: the default assemble failed"; tail -8 "$T/aot.log"
+  fi
+  if [ "${tm%%.*}" -gt 26 ]; then
+    if asm_aot "$T/out-aot2" AOT_OS_MAJORS="26 27" AOT_ALLOW_UNVALIDATED_OS=1 > "$T/aot2.log" 2>&1; then no "10: the $tm kit took macos26 archives"
+    else grep -q "macOS 26 is older than the kit.s minimum" "$T/aot2.log" && ok "10: the $tm kit refuses macos26 archives (older than its minimum)" || no "10: $(tail -2 "$T/aot2.log")"; fi
+  elif asm_aot "$T/out-aot2" AOT_OS_MAJORS="26 27" > "$T/aot2.log" 2>&1; then
+    no "10: AOT_OS_MAJORS=\"26 27\" built an unvalidated macos26 set without the opt-in"
+  else
+    grep -q "macos26 archives are not validated on hardware" "$T/aot2.log" && ok "10: AOT_OS_MAJORS=\"26 27\" refused without AOT_ALLOW_UNVALIDATED_OS=1" \
+      || { no "10: AOT_OS_MAJORS=\"26 27\" failed for another reason"; tail -5 "$T/aot2.log"; }
+  fi
+  if [ "${tm%%.*}" -le 26 ]; then
+    if asm_aot "$T/out-aot3" AOT_OS_MAJORS="26 27" AOT_ALLOW_UNVALIDATED_OS=1 > "$T/aot3.log" 2>&1; then
+      t3=$(ls "$T"/out-aot3/zkminer-*-macos-arm64.tar.gz)
+      bi=$(kit_buildinfo "$t3" "$T/u-aot3")
+      [ "$(info "$bi" aot_os_keys)" = "macos26 macos27" ] && [ "$(info "$bi" aot_os_unvalidated)" = macos26 ] \
+        && ok "10: with the opt-in: keys macos26 macos27, BUILDINFO aot_os_unvalidated=macos26" \
+        || no "10: opt-in: keys '$(info "$bi" aot_os_keys)', unvalidated '$(info "$bi" aot_os_unvalidated)'"
+      if env -u AOT_ALLOW_UNVALIDATED_OS "$ci/check-macos-release.sh" "$t3" > "$T/aot3c.log" 2>&1; then
+        no "10: check-macos-release.sh accepted a macos26 set without the opt-in"
+      else
+        grep -q "macos26 archives, a key not validated on hardware" "$T/aot3c.log" && ok "10: check-macos-release.sh rejects the macos26 set without the opt-in" \
+          || no "10: check failed for another reason: $(grep FAIL "$T/aot3c.log" | head -2)"
+      fi
+    else
+      no "10: AOT_OS_MAJORS=\"26 27\" AOT_ALLOW_UNVALIDATED_OS=1 failed"; tail -8 "$T/aot3.log"
+    fi
+  fi
+  rm -rf "$r" "$T"/out-aot* "$T"/u-aot*
+fi
+
+# --- 11. the compiler that built the metallibs ------------------------------------------------------
+if [ -n "$kit_tarball" ]; then
+  tarball_saved=$tarball; tarball=$kit_tarball
+  t=$(rekit "metal_compiler=Apple metal version 32023.999 (metalfe-32023.999.4)")
+  if "$ci/check-macos-release.sh" "$t" > "$T/c1.log" 2>&1; then no "11: check accepted a BUILDINFO metal_compiler the metallibs do not name"
+  else grep -q "BUILDINFO metal_compiler says" "$T/c1.log" && ok "11: check rejects a BUILDINFO metal_compiler the metallibs do not name" \
+    || no "11: rejected for another reason: $(grep FAIL "$T/c1.log" | head -2)"; fi
+  rm -f "$t"; tarball=$tarball_saved
+  rw=$T/relabelled-worker
+  perl -0pe 's/Apple metal version (\d+)\.(\d+) \(metalfe-\1\.\2/"Apple metal version " . ("9" x length($1)) . "." . ("9" x length($2)) . " (metalfe-" . ("9" x length($1)) . "." . ("9" x length($2))/ge' "$m27_worker" > "$rw"
+  chmod 0755 "$rw"; codesign -f -s - "$rw" 2>/dev/null
+  relabel=$("$ci/check-macos-release.sh" --compilers "$rw")
+  [ "$relabel" != "$("$ci/check-macos-release.sh" --compilers "$m27_worker")" ] || no "11: relabelling the worker changed nothing"
+  r=$T/r-cc; fake_repo "$r" "$rw" "$m27_cli"
+  for optin in 0 1; do
+    if METAL_COMPILER_UNVALIDATED=$optin assemble "$r" "$T/out-cc" "$tm" > "$T/cc.log" 2>&1; then
+      no "11: the $tm mode packaged metallibs of '$relabel' (METAL_COMPILER_UNVALIDATED=$optin)"
+    else
+      grep -q "a stale build" "$T/cc.log" && ok "11: the $tm mode refuses metallibs another compiler built as a stale build (METAL_COMPILER_UNVALIDATED=$optin)" \
+        || { no "11: the $tm mode failed for another reason"; tail -4 "$T/cc.log"; }
+    fi
+  done
+  if (unset METAL_COMPILER_UNVALIDATED; assemble "$r" "$T/out-cc" sdk) > "$T/cc2.log" 2>&1; then
+    no "11: sdk mode packaged metallibs of an unvalidated compiler"
+  else
+    grep -q "not by the validated" "$T/cc2.log" && ok "11: sdk mode refuses metallibs of an unvalidated compiler" || { no "11: sdk mode failed for another reason"; tail -4 "$T/cc2.log"; }
+  fi
+  if METAL_COMPILER_UNVALIDATED=1 assemble "$r" "$T/out-cc3" sdk > "$T/cc3.log" 2>&1; then
+    t3=$(ls "$T"/out-cc3/zkminer-*-macos-arm64.tar.gz)
+    bi=$(kit_buildinfo "$t3" "$T/u-cc3")
+    [ "$(info "$bi" metal_compiler)" = "$relabel" ] && [ "$(info "$bi" metal_compiler_validated)" = no ] \
+      && ok "11: with the opt-in the kit is labelled with the AIR's compiler ('$relabel', metal_compiler_validated=no)" \
+      || no "11: opt-in BUILDINFO: '$(info "$bi" metal_compiler)' validated=$(info "$bi" metal_compiler_validated)"
+    if env -u METAL_COMPILER_UNVALIDATED "$ci/check-macos-release.sh" "$t3" > "$T/cc3c.log" 2>&1; then no "11: check accepted it without the opt-in"
+    else grep -q "not by the validated compiler" "$T/cc3c.log" && ok "11: check rejects it without the opt-in" || no "11: check: $(grep FAIL "$T/cc3c.log" | head -2)"; fi
+  else
+    no "11: sdk mode with METAL_COMPILER_UNVALIDATED=1 failed"; tail -5 "$T/cc3.log"
+  fi
+  rm -rf "$r" "$rw" "$T"/out-cc* "$T"/u-cc3
 fi
 
 echo "test-assemble-macos: $pass passed, $fails failed"
