@@ -6142,6 +6142,98 @@ fn retry_pin_after(
     }
 }
 
+/// The card an attempt tries first: the one an SP1 retry is pinned to (`retry_pin_after`), else the
+/// card the job was planned for (`planned`). A card that refused it admission moves to the back of
+/// the order instead (`job_card_order`).
+fn preferred_device(
+    retry_card: Option<&(String, String)>,
+    planned: Option<&String>,
+) -> Option<String> {
+    retry_card
+        .map(|(_, card)| card.clone())
+        .or_else(|| planned.cloned())
+}
+
+/// Where the next attempt goes after one on `used_slot` failed: an SP1 out-of-memory that lowered
+/// the card's shard size (`sp1_smaller_here`, its benchmark device id) pins the retry there, at the
+/// smaller size; otherwise any failure but an invalid proof excludes the card, and an out-of-memory
+/// asks for a card with more VRAM than it (`used_slot_vram`), or the large-job floor when unknown.
+#[allow(clippy::too_many_arguments)]
+fn steer_after_failure(
+    excluded: &mut Vec<String>,
+    retry_card: &mut Option<(String, String)>,
+    min_vram: &mut Option<u64>,
+    used_slot: Option<&str>,
+    invalid: bool,
+    real_oom: bool,
+    sp1_smaller_here: Option<&str>,
+    used_slot_vram: impl FnOnce(&str) -> Option<u64>,
+) {
+    if let Some(card) = sp1_smaller_here {
+        *retry_card = used_slot.map(|slot| (slot.to_string(), card.to_string()));
+    } else if !invalid {
+        if let Some(k) = used_slot {
+            if !excluded.iter().any(|e| e.as_str() == k) {
+                excluded.push(k.to_string());
+            }
+        }
+    }
+    if real_oom && sp1_smaller_here.is_none() {
+        *min_vram = used_slot
+            .and_then(used_slot_vram)
+            .map(|v| v.saturating_add(1))
+            .or(Some(LARGE_JOB_MIN_VRAM_BYTES));
+    }
+}
+
+/// The risc0 cards a job may be claimed for: `cards` less those whose last proof found too little
+/// VRAM free at their size and no check since has found it (`is_short`, by slot and size), and how
+/// many that took out.
+fn claimable_risc0_cards(
+    mut cards: Vec<Risc0Card>,
+    is_short: impl Fn(&str, u8) -> bool,
+) -> (Vec<Risc0Card>, usize) {
+    let before = cards.len();
+    cards.retain(|card| !is_short(&card.slot, card.po2));
+    let short = before - cards.len();
+    (cards, short)
+}
+
+/// A saved benchmark's time, in seconds since the Unix epoch, from its RFC 3339 `timestamp`.
+fn benchmark_unix_secs(timestamp: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .and_then(|t| u64::try_from(t.timestamp()).ok())
+}
+
+/// The rate the planner gives a card's benchmark row `d`, or `None` for a risc0 row of a card that
+/// proves no risc0 job. A risc0 row is the rate of the card's job size (`risc0_job_throughput`),
+/// priced down above the largest size its VRAM holds (`risc0_vram`, by slot); an SP1 row is scaled
+/// by `sp1_factor(bus id, benchmarked)` (`WorkerPool::sp1_rate_factor`): a card whose shard size was
+/// capped after its benchmark proves slower than the benchmark did.
+fn planned_throughput(
+    d: &zkminer_prover::benchmark::DeviceBenchmark,
+    risc0_cards: &[Risc0Card],
+    risc0_vram: &HashMap<String, Option<u64>>,
+    benchmarked: Option<u64>,
+    sp1_factor: impl Fn(&str, Option<u64>) -> f64,
+) -> Option<f64> {
+    if d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0 {
+        let card = risc0_cards.iter().find(|c| c.device == d.device_id)?;
+        let fit = zkminer_prover::benchmark::risc0_largest_fitting_po2(
+            risc0_vram.get(&card.slot).copied().flatten(),
+            card.slot.split(':').nth(1).unwrap_or(""),
+        );
+        Some(zkminer_prover::benchmark::risc0_job_throughput(
+            d, card.po2, fit,
+        ))
+    } else if d.prover_backend == zkminer_prover_protocol::BACKEND_SP1 {
+        Some(d.throughput * sp1_factor(&d.pci_bus_id, benchmarked))
+    } else {
+        Some(d.throughput)
+    }
+}
+
 /// Whether a prove error is a refusal before the proof started on its card that a retry pin should
 /// outlast: short of GPU memory our own memory holds (the old server's still coming back), or of
 /// host memory at admission. Short of GPU memory another program holds is not: that card is then
@@ -7868,22 +7960,23 @@ async fn miner_brain(
         // Collapsed to the job's own backend at each use site instead.
         // The risc0 cards that prove jobs, each at its own segment size, and the sizes every risc0 job
         // is measured at before it is claimed (see `risc0_job_sizes`).
-        let mut risc0_cards = risc0_job_cards(
+        let risc0_cards = risc0_job_cards(
             &risc0_slot_sizes_now,
             &disabled_slots_by_backend,
             disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
         );
         // Not a card whose last risc0 proof found too little VRAM free and still does: a job
         // claimed for it would wait there and be released (see `WorkerPool::risc0_card_short`).
-        let risc0_cards_before = risc0_cards.len();
-        if let Some(pool) = zkminer_prover::engine::worker_pool() {
-            // Reading a card can take seconds (nvidia-smi), which this loop must not wait on.
-            for key in pool.risc0_short_due() {
-                tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));
+        let (risc0_cards, risc0_cards_short) = match zkminer_prover::engine::worker_pool() {
+            Some(pool) => {
+                // Reading a card can take seconds (nvidia-smi), which this loop must not wait on.
+                for key in pool.risc0_short_due() {
+                    tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));
+                }
+                claimable_risc0_cards(risc0_cards, |slot, po2| pool.risc0_card_short(slot, po2))
             }
-            risc0_cards.retain(|card| !pool.risc0_card_short(&card.slot, card.po2));
-        }
-        let risc0_cards_short = risc0_cards_before - risc0_cards.len();
+            None => (risc0_cards, 0),
+        };
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
 
         let device_backend_throughputs: Vec<(String, String, f64)> = {
@@ -7897,33 +7990,18 @@ async fn miner_brain(
                 })
                 .unwrap_or_default();
             let mut v: Vec<(String, String, f64)> = Vec::new();
+            let benchmarked = benchmark_unix_secs(&benchmarks.timestamp);
             for d in &benchmarks.device_benchmarks {
                 if !d.device_id.starts_with("gpu") {
                     continue; // CPU rows are not proving slots here
                 }
-                // A risc0 row only for a card that proves risc0 jobs, at the rate of its job size.
-                let throughput = if d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0 {
-                    match risc0_cards.iter().find(|c| c.device == d.device_id) {
-                        Some(card) => {
-                            let fit = zkminer_prover::benchmark::risc0_largest_fitting_po2(
-                                risc0_vram.get(&card.slot).copied().flatten(),
-                                card.slot.split(':').nth(1).unwrap_or(""),
-                            );
-                            zkminer_prover::benchmark::risc0_job_throughput(d, card.po2, fit)
-                        }
-                        None => continue,
-                    }
-                } else if d.prover_backend == zkminer_prover_protocol::BACKEND_SP1 {
-                    // A card whose SP1 shard size was capped after its benchmark proves slower than
-                    // the benchmark did.
-                    let benchmarked = chrono::DateTime::parse_from_rfc3339(&benchmarks.timestamp)
-                        .ok()
-                        .and_then(|t| u64::try_from(t.timestamp()).ok());
-                    let factor = zkminer_prover::engine::worker_pool()
-                        .map_or(1.0, |p| p.sp1_rate_factor(&d.pci_bus_id, benchmarked));
-                    d.throughput * factor
-                } else {
-                    d.throughput
+                let Some(throughput) =
+                    planned_throughput(d, &risc0_cards, &risc0_vram, benchmarked, |bus, at| {
+                        zkminer_prover::engine::worker_pool()
+                            .map_or(1.0, |p| p.sp1_rate_factor(bus, at))
+                    })
+                else {
+                    continue;
                 };
                 v.push((d.device_id.clone(), d.prover_backend.clone(), throughput));
             }
@@ -11632,15 +11710,11 @@ async fn process_job_lifecycle(
             let disabled_for_prove = disabled_slots.clone();
             // The cards this job was admitted on (a hard filter) and the order to try them in: the card
             // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
-            // host-memory refusal of a card, that card leaves the order (see `refused_admission`). An
-            // SP1 job whose card's shard size an out-of-memory lowered goes back there first, kept
-            // until an attempt actually runs there: one refused before it starts (memory short a
-            // moment) must not send the next to a card still at the size that ran out.
+            // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
             let eligible_for_prove = snapshot.eligible_devices.clone();
-            let planned = retry_card
-                .clone()
-                .map(|(_, card)| card)
-                .or_else(|| snapshot.preferred_device.clone());
+            // An SP1 job whose card's shard size an out-of-memory lowered goes back there first, to
+            // prove at the smaller size (`take_sp1_retry_card`); else the card it was planned for.
+            let planned = preferred_device(retry_card.as_ref(), snapshot.preferred_device.as_ref());
             let order_for_prove =
                 job_card_order(planned.as_ref(), &eligible_for_prove, &refused_admission);
             // This job's pre-claim measured execute PEAK (SP1 only; 0 otherwise), for the dispatcher's
@@ -12059,15 +12133,7 @@ async fn process_job_lifecycle(
                         //
                         // Excluding cannot strand a job: `prove_min_vram` restores the
                         // full set when pruning empties it.
-                        if let Some(card) = sp1_smaller_here.clone() {
-                            retry_card = used_slot.clone().map(|slot| (slot, card));
-                        } else if !invalid {
-                            if let Some(k) = used_slot.clone() {
-                                if !excluded.contains(&k) {
-                                    excluded.push(k);
-                                }
-                            }
-                        }
+                        //
                         // A VRAM OOM means the job did not fit THAT card, so ask for a
                         // strictly bigger one. A fixed floor cannot do that job:
                         // LARGE_JOB_MIN_VRAM_BYTES is 30 GiB and exceeds every card on
@@ -12078,16 +12144,20 @@ async fn process_job_lifecycle(
                         // correctly on the first retry while a 30 GiB floor routes it
                         // nowhere. Falls back to the constant when the card's VRAM is
                         // unknown (non-CUDA, or nvidia-smi unavailable).
-                        if real_oom && sp1_smaller_here.is_none() {
-                            // `used_slot`, NOT `proved_on`: the latter is assigned only on
-                            // the success path, so reading it here always yields None and
-                            // silently falls back to the inert constant.
-                            min_vram = used_slot
-                                .as_deref()
-                                .and_then(|k| pool.vram_bytes_for_slot(k))
-                                .map(|v| v.saturating_add(1))
-                                .or(Some(LARGE_JOB_MIN_VRAM_BYTES));
-                        }
+                        //
+                        // `used_slot`, NOT `proved_on`: the latter is assigned only on the
+                        // success path, so reading it here always yields None and silently
+                        // falls back to the inert constant.
+                        steer_after_failure(
+                            &mut excluded,
+                            &mut retry_card,
+                            &mut min_vram,
+                            used_slot.as_deref(),
+                            invalid,
+                            real_oom,
+                            sp1_smaller_here.as_deref(),
+                            |k| pool.vram_bytes_for_slot(k),
+                        );
                         // invalid ⇒ just re-prove (round-robin may pick another worker).
                         tracing::warn!(
                             "Proof attempt {attempt}/{} for {} failed ({}); retrying{}",
@@ -15293,6 +15363,283 @@ mod tests {
         });
         assert!(refused_before_start(&gpu));
         assert!(!refused_before_start(&anyhow::anyhow!("GpuMemoryShortage")));
+    }
+
+    /// A pin outlasts only a refusal our own memory causes, or a host-memory admission refusal:
+    /// short of GPU memory another program holds drops it (that card is then excluded), and a
+    /// host-memory shortage met mid-proof is an attempt that ran.
+    #[test]
+    fn a_retry_pin_outlasts_only_a_refusal_that_clears_on_its_own() {
+        use zkminer_prover_protocol::types::{GpuMemoryShortage, HostMemoryShortage};
+        let gpu = |ours_in_the_way| {
+            anyhow::Error::new(GpuMemoryShortage {
+                slot_key: "sp1:cuda:1".into(),
+                foreign_bytes: 1 << 30,
+                sibling_bytes: 0,
+                available_bytes: 0,
+                needed_bytes: Some(1 << 33),
+                ours_in_the_way,
+                total_bytes: 12 << 30,
+            })
+        };
+        let host = |attempted| {
+            anyhow::Error::new(HostMemoryShortage {
+                attempted,
+                slot_key: "sp1:cuda:1".into(),
+                needed: 1 << 34,
+                reserved: 0,
+                available: 1 << 30,
+            })
+        };
+        assert!(refused_before_start(&gpu(true)));
+        assert!(!refused_before_start(&gpu(false)));
+        assert!(refused_before_start(&host(false)));
+        assert!(!refused_before_start(&host(true)));
+        let pin = || Some(("sp1:cuda:1".to_string(), "gpu1".to_string()));
+        let after =
+            |e: &anyhow::Error| retry_pin_after(pin(), Some("sp1:cuda:1"), refused_before_start(e));
+        assert_eq!(after(&gpu(true)), pin());
+        assert_eq!(after(&gpu(false)), None);
+        assert_eq!(after(&host(false)), pin());
+        assert_eq!(after(&host(true)), None);
+    }
+
+    /// The card an attempt tries first: the pinned one, else the planned one.
+    #[test]
+    fn a_pinned_card_is_preferred_over_the_planned_one() {
+        let pin = ("sp1:cuda:1".to_string(), "gpu1".to_string());
+        let planned = "gpu0".to_string();
+        assert_eq!(
+            preferred_device(Some(&pin), Some(&planned)).as_deref(),
+            Some("gpu1")
+        );
+        assert_eq!(
+            preferred_device(None, Some(&planned)).as_deref(),
+            Some("gpu0")
+        );
+        assert_eq!(preferred_device(None, None), None);
+    }
+
+    /// After a failed attempt: an SP1 out-of-memory that lowered its card pins the retry there and
+    /// neither excludes the card nor asks for a bigger one; any other out-of-memory excludes the card
+    /// and asks for more VRAM than it has (or the large-job floor); a health failure excludes it; an
+    /// invalid proof steers nowhere.
+    #[test]
+    fn a_failed_attempt_steers_the_next() {
+        struct Steer {
+            excluded: Vec<String>,
+            pin: Option<(String, String)>,
+            min_vram: Option<u64>,
+        }
+        let steer = |used: Option<&str>, invalid, oom, smaller: Option<&str>, vram: Option<u64>| {
+            let mut s = Steer {
+                excluded: vec!["sp1:cuda:2".to_string()],
+                pin: None,
+                min_vram: None,
+            };
+            steer_after_failure(
+                &mut s.excluded,
+                &mut s.pin,
+                &mut s.min_vram,
+                used,
+                invalid,
+                oom,
+                smaller,
+                |_| vram,
+            );
+            s
+        };
+        let lowered = steer(
+            Some("sp1:cuda:1"),
+            false,
+            true,
+            Some("gpu1"),
+            Some(12 << 30),
+        );
+        assert_eq!(
+            lowered.pin,
+            Some(("sp1:cuda:1".to_string(), "gpu1".to_string()))
+        );
+        assert_eq!(lowered.excluded, ["sp1:cuda:2"]);
+        assert_eq!(lowered.min_vram, None);
+
+        let oom = steer(Some("sp1:cuda:1"), false, true, None, Some(12 << 30));
+        assert_eq!(oom.pin, None);
+        assert_eq!(oom.excluded, ["sp1:cuda:2", "sp1:cuda:1"]);
+        assert_eq!(oom.min_vram, Some((12 << 30) + 1));
+        let unknown = steer(Some("sp1:cuda:1"), false, true, None, None);
+        assert_eq!(unknown.min_vram, Some(LARGE_JOB_MIN_VRAM_BYTES));
+
+        let unhealthy = steer(Some("sp1:cuda:1"), false, false, None, Some(12 << 30));
+        assert_eq!(unhealthy.excluded, ["sp1:cuda:2", "sp1:cuda:1"]);
+        assert_eq!(unhealthy.min_vram, None);
+        // Excluded once only.
+        let again = steer(Some("sp1:cuda:2"), false, false, None, None);
+        assert_eq!(again.excluded, ["sp1:cuda:2"]);
+
+        let invalid = steer(Some("sp1:cuda:1"), true, false, None, Some(12 << 30));
+        assert_eq!(invalid.excluded, ["sp1:cuda:2"]);
+        assert_eq!((invalid.pin, invalid.min_vram), (None, None));
+    }
+
+    fn row(device: &str, backend: &str, bus: &str) -> zkminer_prover::benchmark::DeviceBenchmark {
+        zkminer_prover::benchmark::DeviceBenchmark {
+            device_id: device.to_string(),
+            device_label: String::new(),
+            prover_backend: backend.to_string(),
+            throughput: 1_000_000.0,
+            power_watts: 300.0,
+            optimal_po2: 20,
+            memory_usage_bytes: 1,
+            max_feasible_po2: 22,
+            program_throughputs: HashMap::new(),
+            po2_samples: Vec::new(),
+            program_stages: Vec::new(),
+            pci_bus_id: bus.to_string(),
+            host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
+        }
+    }
+
+    /// A card short of VRAM for its risc0 size claims no risc0 job, by slot AND size, and is counted
+    /// for the claim side's message; the rest are claimable.
+    #[test]
+    fn a_risc0_card_short_at_its_size_is_not_claimable() {
+        let card = |slot: &str, device: &str, po2| Risc0Card {
+            slot: slot.to_string(),
+            device: device.to_string(),
+            po2,
+        };
+        let cards = vec![
+            card("risc0:cuda:0", "gpu0", 19),
+            card("risc0:cuda:1", "gpu1", 20),
+        ];
+        let (left, short) = claimable_risc0_cards(cards.clone(), |slot, po2| {
+            slot == "risc0:cuda:0" && po2 == 19
+        });
+        assert_eq!(short, 1);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].slot, "risc0:cuda:1");
+        let (left, short) = claimable_risc0_cards(cards, |_, _| false);
+        assert_eq!((left.len(), short), (2, 0));
+    }
+
+    /// The planner's rates: an SP1 row scaled by the card's cap factor, asked with the row's bus id
+    /// and the benchmark's time; a risc0 row only for a card that proves risc0 jobs; others as
+    /// measured.
+    #[test]
+    fn the_planner_prices_each_row_as_its_card_runs_now() {
+        assert_eq!(
+            benchmark_unix_secs("2026-11-17T00:00:00Z"),
+            Some(1_794_873_600)
+        );
+        assert_eq!(benchmark_unix_secs("yesterday"), None);
+        let asked = std::sync::Mutex::new(Vec::new());
+        let factor = |bus: &str, at: Option<u64>| {
+            asked.lock().unwrap().push((bus.to_string(), at));
+            0.79
+        };
+        let none = HashMap::new();
+        let sp1 = row("gpu1", "sp1", "0000:03:00.0");
+        let rate = planned_throughput(&sp1, &[], &none, Some(42), factor).unwrap();
+        assert!((rate - 790_000.0).abs() < 1e-6);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [("0000:03:00.0".to_string(), Some(42))]
+        );
+        // A risc0 row of a card that proves no risc0 job: none.
+        let r0 = row("gpu0", "risc0", "");
+        assert_eq!(planned_throughput(&r0, &[], &none, None, |_, _| 1.0), None);
+        let cards = [Risc0Card {
+            slot: "risc0:cuda:0".to_string(),
+            device: "gpu0".to_string(),
+            po2: 20,
+        }];
+        assert!(planned_throughput(&r0, &cards, &none, None, |_, _| 1.0).is_some());
+        // Another backend: as measured, with no factor asked.
+        let ovm = row("gpu0", "openvm", "");
+        assert_eq!(
+            planned_throughput(&ovm, &[], &none, None, |_, _| panic!("not SP1")),
+            Some(1_000_000.0)
+        );
+    }
+
+    /// `f`'s body in `src`, up to the next item at module or impl depth.
+    fn body<'a>(src: &'a str, f: &str) -> &'a str {
+        let after = src
+            .split_once(f)
+            .unwrap_or_else(|| panic!("{f} moved; move this assertion with it"))
+            .1;
+        let end = ["\nfn ", "\nasync fn ", "\npub fn ", "\npub async fn "]
+            .iter()
+            .filter_map(|n| after.find(n))
+            .min()
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// The claim side never reads a card itself: a short card's re-check runs on a blocking thread,
+    /// and what it found is a lookup, applied to the cards before their sizes are taken. The retry
+    /// after an out-of-memory asks the pool for its pinned card only for an out-of-memory, and the
+    /// steering and the preference go through the helpers tested above.
+    #[test]
+    fn the_brain_and_the_job_loop_use_the_tested_helpers() {
+        let src = include_str!("run.rs");
+        let brain = body(src, "\nasync fn miner_brain(");
+        let due = brain
+            .find("pool.risc0_short_due()")
+            .expect("re-checks short cards");
+        assert!(brain[due..]
+            .starts_with("pool.risc0_short_due() {\n                    tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));"));
+        assert_eq!(brain.matches("recheck_risc0_short").count(), 1);
+        let claimable = brain
+            .find(
+                "claimable_risc0_cards(risc0_cards, |slot, po2| pool.risc0_card_short(slot, po2))",
+            )
+            .expect("filters short cards");
+        assert!(claimable < brain.find("risc0_job_sizes(&risc0_cards)").unwrap());
+        assert!(brain.contains("let benchmarked = benchmark_unix_secs(&benchmarks.timestamp);"));
+        assert!(brain.contains(".map_or(1.0, |p| p.sp1_rate_factor(bus, at))"));
+        let job = body(src, "\nasync fn process_job_lifecycle(");
+        assert!(job.contains(
+            "let sp1_smaller_here = if real_oom {\n                        used_slot\n                            \
+             .as_deref()\n                            .and_then(|k| pool.take_sp1_retry_card(k))"
+        ));
+        assert_eq!(job.matches("pool.take_sp1_retry_card(").count(), 1);
+        assert_eq!(job.matches("steer_after_failure(").count(), 1);
+        assert!(job.contains("let planned = preferred_device(retry_card.as_ref(), snapshot.preferred_device.as_ref());"));
+        assert!(job.contains(".is_some_and(refused_before_start),"));
+    }
+
+    /// The miner, its benchmark and `zkminer mock` (which writes the miner's benchmarks.json) keep
+    /// the SP1 cap record, set before any worker is spawned; nothing else does, so a simulation or
+    /// a test never writes `~/.zkminer`.
+    #[test]
+    fn only_the_miner_and_its_benchmarks_keep_the_cap_record() {
+        for (name, src) in [
+            ("run.rs", include_str!("run.rs")),
+            ("benchmark.rs", include_str!("benchmark.rs")),
+            ("mock.rs", include_str!("mock.rs")),
+        ] {
+            // The first of each: the production code, before this test's own text.
+            let kept = src
+                .find("pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());")
+                .unwrap_or_else(|| panic!("{name} no longer keeps the cap record"));
+            let spawned = src
+                .find(".discover_and_spawn()")
+                .unwrap_or_else(|| panic!("{name} no longer spawns workers"));
+            assert!(
+                kept < spawned,
+                "{name}: the record must be read before the spawn"
+            );
+        }
+        for (name, src) in [
+            ("simulate.rs", include_str!("simulate.rs")),
+            ("doctor.rs", include_str!("doctor.rs")),
+        ] {
+            assert!(!src.contains("use_sp1_shard_caps"), "{name}");
+        }
     }
 
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.

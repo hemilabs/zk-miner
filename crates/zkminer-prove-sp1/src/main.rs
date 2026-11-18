@@ -1778,6 +1778,25 @@ fn sp1_element_threshold_for(scale: f64) -> Option<u64> {
 /// can do is leave performance on the table. That direction also matters for soundness: the shape
 /// allow-list is enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a value below
 /// the constant yields shapes the circuit already accepts while one above it does not.
+/// The element threshold `apply_sp1_element_threshold` sets when the operator has not: the smallest
+/// of the host's tier, the free-VRAM tier (`sp1_element_threshold_cap`) and the card's recorded cap
+/// (`card_cap_raw`, as `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` reads, see `sp1_card_cap`). `None`:
+/// nothing bounds it.
+fn element_threshold_to_apply(
+    scale: f64,
+    available_vram: Option<u64>,
+    total_vram: Option<u64>,
+    card_cap_raw: Option<&str>,
+) -> Option<u64> {
+    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(card_cap_raw);
+    let computed = zkminer_prover_protocol::types::sp1_element_threshold_cap(
+        scale,
+        available_vram,
+        total_vram,
+    );
+    [computed, card_cap].into_iter().flatten().min()
+}
+
 fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
     // Never override what the operator set by hand.
     if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok() {
@@ -1800,17 +1819,12 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
     });
     // A card whose SP1 proof once ran out of GPU memory carries a cap from the dispatcher
     // (`sp1_shard_caps`), which it also applies when it predicts this worker's tier (`SizingCap`).
-    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(
-        std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)
-            .ok()
-            .as_deref(),
-    );
-    let computed = zkminer_prover_protocol::types::sp1_element_threshold_cap(
-        scale,
-        available_vram,
-        total_vram,
-    );
-    let Some(threshold) = [computed, card_cap].into_iter().flatten().min() else {
+    let card_cap_raw =
+        std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV).ok();
+    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(card_cap_raw.as_deref());
+    let Some(threshold) =
+        element_threshold_to_apply(scale, available_vram, total_vram, card_cap_raw.as_deref())
+    else {
         return;
     };
     // Only say so when it lowers the fork's own default. With today's tables every computed value
@@ -2334,7 +2348,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     }
                     Ok(Err(e)) => {
                         let msg = format!("{e:#}");
-                        // The vkey-binding bails below are THIS binary's own host-authored strings, not
+                        // The vkey-binding bails are THIS binary's own host-authored strings, not
                         // guest text (the executor's errors are a typed enum with no free-form guest
                         // field), so matching them is safe — unlike matching the guest-controlled
                         // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
@@ -4519,6 +4533,95 @@ mod threshold_tests {
             "the element threshold is settled AFTER the `scale >= 1.0` early return, so a host with \
              plenty of RAM skips the free-VRAM cap entirely and an occupied card sizes itself for a \
              tier that does not fit"
+        );
+    }
+
+    /// The card's recorded cap (`ZKMINER_SP1_ELEMENT_THRESHOLD_CAP`, from the dispatcher's
+    /// `sp1_shard_caps`) bounds the worker as the host's and the free VRAM's tiers do: the smallest
+    /// wins; one below every measured tier is held at the smallest, and one that does not parse is
+    /// ignored.
+    #[test]
+    fn the_cards_recorded_cap_bounds_the_worker_with_the_others() {
+        use super::element_threshold_to_apply as apply;
+        const RTX4070: Option<u64> = Some(12_282 * 1024 * 1024);
+        let idle_4070 = Some(12_010 * 1024 * 1024);
+        assert_eq!(apply(1.0, idle_4070, RTX4070, None), Some(LARGEST_MEASURED));
+        assert_eq!(
+            apply(1.0, idle_4070, RTX4070, Some("134217728")),
+            Some(SMALL)
+        );
+        // The cap only lowers.
+        assert_eq!(
+            apply(1.0, Some(9 * GIB), RTX4070, Some("268435456")),
+            cap(1.0, Some(9 * GIB), RTX4070)
+        );
+        // Below every measured size: held at the smallest, never a size nothing measured.
+        assert_eq!(apply(1.0, idle_4070, RTX4070, Some("1000")), Some(SMALL));
+        // Not a number: no cap.
+        assert_eq!(
+            apply(1.0, idle_4070, RTX4070, Some("lots")),
+            Some(LARGEST_MEASURED)
+        );
+        // Nothing else bounds it: the cap alone does.
+        assert_eq!(apply(1.0, None, None, Some("134217728")), Some(SMALL));
+        assert_eq!(apply(1.0, None, None, None), None);
+        // The worker applies it as computed here, after the operator's own value.
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("\nfn apply_sp1_element_threshold(")
+            .expect("apply_sp1_element_threshold moved")
+            .1;
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        let operator = body
+            .find("if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok()")
+            .expect("the operator's threshold is no longer left alone");
+        let cap_env = body
+            .find("std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)")
+            .expect("the card's cap is no longer read");
+        let applied = body
+            .find("element_threshold_to_apply(scale, available_vram, total_vram, card_cap_raw.as_deref())")
+            .expect("the threshold is no longer computed with the card's cap");
+        assert!(operator < cap_env && cap_env < applied);
+    }
+
+    /// A failed prove's kind, which decides what the dispatcher does: sp1-gpu's own out-of-memory
+    /// wordings (slop's "allocation failed", the server's "out of GPU memory") are an out-of-memory,
+    /// which lowers the card one shard size; a vkey mismatch is permanent for the program, even when
+    /// its text also says "out of memory".
+    #[test]
+    fn a_prove_error_is_classified_by_this_binarys_and_the_provers_wordings() {
+        use super::prove_error_kind as kind;
+        use zkminer_prover_protocol::ErrorKind;
+        for oom in [
+            "allocation failed on evaluated: 1728053248 bytes",
+            "Proving failed: out of GPU memory",
+            "cudaMallocAsync failed: out of memory",
+        ] {
+            assert!(matches!(kind(oom), ErrorKind::ResourceExhausted), "{oom}");
+        }
+        assert!(matches!(
+            kind("vkey hash does not match job programId (out of memory)"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("could not parse SP1 vkey hash"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("bincode: unexpected end"),
+            ErrorKind::Internal
+        ));
+        assert!(matches!(kind("guest panicked"), ErrorKind::ProofFailed));
+        // The prove arm reports it as classified here.
+        let production = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert_eq!(
+            production
+                .matches("let kind = prove_error_kind(&msg);")
+                .count(),
+            1
         );
     }
 }
