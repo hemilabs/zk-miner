@@ -719,16 +719,23 @@ when a miner with this configuration would skip the job. In `--job`/`--stdin` mo
 chain is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
 
 **`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
-(default 600; every execute and broker start gets what is left of it and is killed there):
+(default 600; every execute and broker start gets what is left of it and is killed there). It
+checks the binding's coverage, then the host inputs and the providers (a few runs each), then
+spends what is left on the mutations, each execute getting a share of the time left (the time over
+the mutations still to run, and at least four times the unchanged `W`'s execute): one mutation that
+runs away cannot starve the others, and one cut at its share is inconclusive. Every re-execution
+runs under the attack's cycle cap: this host's maximum when one is configured (`--max-guest-cycles`,
+`[witness] max_guest_cycles`), else 4 × the job's `maxGuestCycles` (`attackCycleCap`):
 
 - **the binding's coverage** first: it must pin the whole journal header `[0, H)` with a non-zero
   `expectedJournalHash` (`H` from a scheme-1 `W`, or `--header-bytes`), else the verdict is `fail`.
   A free header word is exploitable only with a consistent change of `W` (another block and its
   header, another `k` and its proofs), which no mutation makes, so the mutations alone would pass it;
 - **mutations of `W`**, each made just before it runs (repeats recognised by their sha256) and
-  re-executed by the same sandboxed worker under this host's cycle maximum, not the job's (the
-  router does not check cycles: a run past `maxGuestCycles` is judged on its journal, and only one
-  stopped at the host's maximum is inconclusive, which under FULL decides nothing): byte flips at `--flips`
+  re-executed by the same sandboxed worker under the attack's cycle cap, not the job's (the router
+  does not check cycles: a run past `maxGuestCycles` is judged on its journal, and only one stopped
+  at the cap, cut at its share of the time, or that ends in an executor panic or a run no proof can
+  verify is inconclusive, which under FULL decides nothing): byte flips at `--flips`
   sampled offsets (default 32; the first and last byte always), truncations, trailing bytes, and
   the drop, duplication and reordering of items in every length-delimited framing `W` parses as
   (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus, first, the
@@ -754,12 +761,18 @@ chain is reported `not_served`: its proven input is the builder's `W`, not its `
   guest that reads its runtime's own draw from memory is not caught by it;
 - **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
   (`--providers a,b`, default the first two serving the job's chain), each alone; different
-  journals that both satisfy the binding are a soundness failure.
+  journals that both satisfy the binding are a soundness failure. So a `pass` needs two `evm-rpc`
+  endpoints for the job's chain in the broker configuration (with fewer the differential is not run,
+  and the verdict is `incomplete`).
 
-`adversarial.verdict` is `pass`, `fail`, or `incomplete` (something not run in time or
-inconclusive); the command exits non-zero unless it is `pass`. A `W` above
-`--adversarial-max-w-bytes` (default 8 MiB) is not attacked (`refused`): the attack runs in this
-process, unsandboxed, and holds `W` and a few copies of it.
+`adversarial.verdict` is `pass`, `fail`, or `incomplete`: something not run in time or
+inconclusive, no mutation run (`--max-mutations 0`), or, unless the binding is FULL (which decides
+every journal), no structured mutations (the job's scheme is not registered, or `W` is not of it:
+the generic ones change bytes, never a consistent `W`). The command exits non-zero unless it is
+`pass`. A `W` above `--adversarial-max-w-bytes` (default 8 MiB) is not attacked (`refused`): the
+attack runs in this process, unsandboxed, and its peak memory grows with `W`: about 4 × `|W|` for
+the generic mutations, and up to about 32 × `|W|` for a scheme-1 `W` of many small trie nodes
+(the decoded proofs it rearranges), so set the bound by the memory you can give it.
 
 **Publish a builder.** `zkminer artifact publish FILE --kind builder|elf --rpc-url URL --chain-id N
 --keystore KEY.json` stores the file on the HemiProve chain as contract code (`hemi-code`): chunks

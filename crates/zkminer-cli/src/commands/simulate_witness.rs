@@ -31,16 +31,20 @@
 //!
 //! **`--adversarial`** (see `zkminer_witness_host::adversarial`): first the binding's coverage, which
 //! must pin the whole journal header `[0, H)` with a non-zero `expectedJournalHash` (`H` from a
-//! scheme-1 `W`'s word count, or `--header-bytes`), else the verdict is `fail`; then the generic
-//! mutations of `W` and the job's scheme's own (by the scheme id in the journal header, or
-//! `--scheme`), each re-executed under this host's cycle maximum; re-execution under two `sys_rand`
-//! seeds (the public rule's, which every run uses, and a random one), two po2s and two keccak po2s;
-//! and a differential run of the whole pipeline against two `evm-rpc` providers of the broker
-//! configuration (`--providers`, default the first two serving the job's chain), each from a broker
-//! configuration holding only that provider. All within
+//! scheme-1 `W`'s word count, or `--header-bytes`), else the verdict is `fail`; then re-execution
+//! under two `sys_rand` seeds (the public rule's, which every run uses, and a random one), two po2s
+//! and two keccak po2s; a differential run of the whole pipeline against two `evm-rpc` providers of
+//! the broker configuration (`--providers`, default the first two serving the job's chain), each
+//! from a broker configuration holding only that provider; and last the job's scheme's mutations of
+//! `W` (by the scheme id in the journal header, or `--scheme`) and the generic ones, each with a
+//! share of the time left. Every re-execution runs under the attack's cycle cap: this host's
+//! configured maximum, else [`ATTACK_CYCLE_MULTIPLE`] × the job's `maxGuestCycles`. All within
 //! `--adversarial-secs`, every execute and broker start bounded by what is left of it; anything not
-//! run is reported, and makes the verdict `incomplete`. A `W` above `--adversarial-max-w-bytes` is
-//! refused: the mutations are made one at a time, but this process still holds `W` and a few copies.
+//! run, a sweep that ran no mutation, and (unless the binding is FULL) one without structured
+//! mutations make the verdict `incomplete`. A `W` above `--adversarial-max-w-bytes` is refused: the
+//! mutations are made one at a time, but this process holds `W`, one changed `W` and what making it
+//! takes: about 4 × `|W|` for the generic mutations, up to about 32 × `|W|` for a scheme-1 `W` of many
+//! small trie nodes (its decoded proofs).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -84,6 +88,13 @@ use super::witness_tools::{check_binding, BindingReport, CheckInput, DescriptorF
 
 /// The default `--adversarial-max-w-bytes`.
 pub const DEFAULT_ADVERSARIAL_MAX_W_BYTES: u64 = 8 << 20;
+/// Without a configured cycle maximum, the attack's cycle cap is this multiple of the job's
+/// `maxGuestCycles`.
+pub const ATTACK_CYCLE_MULTIPLE: u64 = 4;
+/// A mutation's execute gets at least this many times the unchanged `W`'s execute at one po2...
+const MUTATION_FLOOR_RUNS: u32 = 4;
+/// ...and at least this long (a worker's start).
+const MUTATION_FLOOR_MIN: Duration = Duration::from_secs(5);
 
 /// The witness report's schema version.
 pub const WITNESS_REPORT_SCHEMA: u32 = 1;
@@ -373,6 +384,11 @@ pub struct AdversarialReport {
     pub refused: Option<String>,
     /// The binding's coverage of the journal header, checked first.
     pub binding_coverage: CoverageReport,
+    /// The sized-cycle cap every re-execution runs under (a decimal string), and where it came from:
+    /// this host's maximum when one is configured, else a bounded multiple of the job's
+    /// `maxGuestCycles`. Past it a run is inconclusive.
+    pub attack_cycle_cap: String,
+    pub attack_cycle_cap_source: String,
     pub budget_secs: u64,
     pub elapsed_secs: f64,
     pub run_seed: String,
@@ -1231,9 +1247,41 @@ fn da_cap_check(cap_bytes: u64, estimated: u64) -> Option<String> {
     }
 }
 
-/// The verdict of an adversarial run.
+/// What the mutation sweep was set to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MutationsRan {
+    /// `--max-mutations` (capped at [`MAX_MUTATIONS`]).
+    max: usize,
+    /// The job's scheme had structured mutations, and they were made.
+    structured: bool,
+}
+
+/// Whether the scheme report says its structured mutations were made.
+fn scheme_ran(scheme: &SchemeReport) -> bool {
+    scheme.name.is_some() && scheme.status.starts_with("structured mutations first")
+}
+
+/// The attack's sized-cycle cap: this host's configured maximum (`--max-guest-cycles`, `[witness]
+/// max_guest_cycles`), else [`ATTACK_CYCLE_MULTIPLE`] times the job's `maxGuestCycles` (never past
+/// [`MAX_HOST_GUEST_CYCLES`]): without one, 2^34 let a single mutation that loops run for hours.
+fn attack_cycle_cap((host, source): (u64, &'static str), max_guest_cycles: u64) -> (u64, String) {
+    if source == "unset" {
+        let cap = max_guest_cycles
+            .saturating_mul(ATTACK_CYCLE_MULTIPLE)
+            .min(MAX_HOST_GUEST_CYCLES)
+            .max(1);
+        (cap, format!("{ATTACK_CYCLE_MULTIPLE} × the job's maxGuestCycles (no --max-guest-cycles or [witness] max_guest_cycles)"))
+    } else {
+        (host, source.to_string())
+    }
+}
+
+/// The verdict of an adversarial run. Under FULL the router refuses every journal but the honest
+/// one, so what the mutations could not decide leaves nothing undecided; under any other binding a
+/// sweep that ran no mutation, or none of the scheme's structured ones, is incomplete.
 fn adversarial_verdict(
     coverage: &CoverageReport,
+    ran: MutationsRan,
     mutations: &[MutationResult],
     host: &[HostInputResult],
     diff: &DifferentialReport,
@@ -1246,7 +1294,8 @@ fn adversarial_verdict(
         MutationOutcome::NotRun => true,
         MutationOutcome::Inconclusive { .. } => !coverage.whole_journal,
         _ => false,
-    })
+    }) || ran.max == 0
+        || (!ran.structured && !coverage.whole_journal)
         || host.iter().any(|h| !h.ran)
         || diff.runs.len() < 2
         || diff.runs.iter().any(|r| r.outcome != "simulated");
@@ -1720,6 +1769,8 @@ impl Adversary<'_> {
                 verdict: if coverage.ok { "incomplete" } else { "fail" }.into(),
                 refused: Some(refused),
                 binding_coverage: coverage,
+                attack_cycle_cap: String::new(),
+                attack_cycle_cap_source: String::new(),
                 budget_secs: adv.budget.as_secs(),
                 elapsed_secs: started.elapsed().as_secs_f64(),
                 run_seed: String::new(),
@@ -1796,6 +1847,13 @@ impl Adversary<'_> {
             None => Box::new(generic.into_iter()),
         };
         let judge = Judge { descriptor: &p.descriptor, job_id: p.job_id, prover: p.prover, baseline_journal: &s.journal };
+        let (attack_cap, attack_cap_source) = attack_cycle_cap(
+            host_max_guest_cycles(&p.config, self.opts),
+            s.limits.maxGuestCycles,
+        );
+        // The unchanged W's execute at one po2, as the pipeline timed it: what a mutation that runs
+        // like it needs.
+        let per_po2 = s.timings.execute / u32::try_from(s.per_po2.len().max(1)).unwrap_or(1);
         let baseline = Baseline {
             ctx: self.ctx,
             token: self.token,
@@ -1806,12 +1864,18 @@ impl Adversary<'_> {
             po2: *self.po2s.first().expect("a po2 within the cap"),
             po2s: &self.po2s,
             keccak_po2: self.opts.keccak_po2,
-            cycles: CycleLimits { host: self.host.max_guest_cycles, job: s.limits.maxGuestCycles },
+            cycles: CycleLimits {
+                host: attack_cap,
+                job: s.limits.maxGuestCycles,
+            },
             deadline,
+            mutation_floor: (per_po2 * MUTATION_FLOOR_RUNS).max(MUTATION_FLOOR_MIN),
         };
-        let results = run_mutations(&baseline, plan, max).await;
+        // The host inputs and the providers first: a few runs each, and each a whole class of
+        // failure; the mutations then share what is left.
         let host_inputs = host_input_checks(&baseline, rand::random()).await;
         let differential = self.differential(adv, s, deadline).await;
+        let results = run_mutations(&baseline, plan, max).await;
 
         for m in &results {
             if let MutationOutcome::SoundnessFailure { first_difference, .. } = &m.outcome {
@@ -1846,8 +1910,18 @@ impl Adversary<'_> {
         if over > 0 {
             notes.push(format!(
                 "{over} mutation(s) ran past the job's maxGuestCycles ({}): a miner skips such a W, but the router does not \
-                 check cycles, so each was judged on its journal under this host's maximum ({})",
-                s.limits.maxGuestCycles, self.host.max_guest_cycles
+                 check cycles, so each was judged on its journal under the attack's cycle cap ({attack_cap})",
+                s.limits.maxGuestCycles
+            ));
+        }
+        let structured = scheme_ran(&scheme);
+        if max == 0 {
+            notes.push("--max-mutations 0: no mutation of W was run".to_string());
+        } else if !structured && !coverage.whole_journal {
+            notes.push(format!(
+                "no structured mutations ran ({}): the generic ones alone change bytes, not a consistent W (another \
+                 proof, another block), so the attack is incomplete under this binding",
+                scheme.status
             ));
         }
         let undecided = results.iter().filter(|m| matches!(m.outcome, MutationOutcome::Inconclusive { .. })).count();
@@ -1857,11 +1931,15 @@ impl Adversary<'_> {
                  honest one, so they leave nothing undecided"
             ));
         }
-        let verdict = adversarial_verdict(&coverage, &results, &host_inputs, &differential).to_string();
+        let ran = MutationsRan { max, structured };
+        let verdict =
+            adversarial_verdict(&coverage, ran, &results, &host_inputs, &differential).to_string();
         Ok(AdversarialReport {
             verdict,
             refused: None,
             binding_coverage: coverage,
+            attack_cycle_cap: attack_cap.to_string(),
+            attack_cycle_cap_source: attack_cap_source,
             budget_secs: adv.budget.as_secs(),
             elapsed_secs: started.elapsed().as_secs_f64(),
             run_seed: format!("{seed:#018x}"),
@@ -2198,7 +2276,20 @@ mod tests {
             soundness_failure: false,
             note: None,
         };
-        assert_eq!(adversarial_verdict(&coverage(&one, keccak256(&header[..32]), None), &[], &[], &diff), "fail");
+        let ran = MutationsRan {
+            max: 256,
+            structured: true,
+        };
+        assert_eq!(
+            adversarial_verdict(
+                &coverage(&one, keccak256(&header[..32]), None),
+                ran,
+                &[],
+                &[],
+                &diff
+            ),
+            "fail"
+        );
         // A mutation this host could not run to a journal decides nothing under FULL, and leaves
         // FIELDS incomplete.
         let host = HostInputResult {
@@ -2235,10 +2326,88 @@ mod tests {
         };
         let full_cov = coverage(&full, B256::repeat_byte(3), None);
         assert!(full_cov.whole_journal);
-        assert_eq!(adversarial_verdict(&full_cov, std::slice::from_ref(&capped), &hosts, &agreed), "pass");
+        assert_eq!(
+            adversarial_verdict(
+                &full_cov,
+                ran,
+                std::slice::from_ref(&capped),
+                &hosts,
+                &agreed
+            ),
+            "pass"
+        );
         let fields_cov = coverage(&all, keccak256(header), None);
-        assert_eq!(adversarial_verdict(&fields_cov, std::slice::from_ref(&capped), &hosts, &agreed), "incomplete");
-        assert_eq!(adversarial_verdict(&fields_cov, &[], &hosts, &agreed), "pass");
+        assert_eq!(
+            adversarial_verdict(
+                &fields_cov,
+                ran,
+                std::slice::from_ref(&capped),
+                &hosts,
+                &agreed
+            ),
+            "incomplete"
+        );
+        assert_eq!(
+            adversarial_verdict(&fields_cov, ran, &[], &hosts, &agreed),
+            "pass"
+        );
+        // No mutation run at all (--max-mutations 0) is never a pass, under any binding.
+        let none = MutationsRan {
+            max: 0,
+            structured: true,
+        };
+        assert_eq!(
+            adversarial_verdict(&fields_cov, none, &[], &hosts, &agreed),
+            "incomplete"
+        );
+        assert_eq!(
+            adversarial_verdict(&full_cov, none, &[], &hosts, &agreed),
+            "incomplete"
+        );
+        // Without the scheme's structured mutations (no scheme registered, or W not of it): incomplete,
+        // unless FULL decides every journal.
+        let generic = MutationsRan {
+            max: 256,
+            structured: false,
+        };
+        assert_eq!(
+            adversarial_verdict(&fields_cov, generic, &[], &hosts, &agreed),
+            "incomplete"
+        );
+        assert_eq!(
+            adversarial_verdict(&full_cov, generic, &[], &hosts, &agreed),
+            "pass"
+        );
+        assert!(scheme_ran(&SchemeReport {
+            id: Some(1),
+            name: Some("eth-block".into()),
+            status: "structured mutations first (2 of 2 fetched answers used)".into()
+        }));
+        assert!(!scheme_ran(&SchemeReport {
+            id: Some(0x77),
+            name: None,
+            status: "no structured mutations registered for this scheme".into()
+        }));
+        assert!(!scheme_ran(&SchemeReport {
+            id: Some(1),
+            name: Some("eth-block".into()),
+            status: "not a scheme-1 W".into()
+        }));
+        // A cycle maximum the operator set is the attack's; without one, a bounded multiple of the job's.
+        assert_eq!(
+            attack_cycle_cap((1 << 30, "--max-guest-cycles"), 1 << 20),
+            (1 << 30, "--max-guest-cycles".into())
+        );
+        let (cap, source) = attack_cycle_cap((MAX_HOST_GUEST_CYCLES, "unset"), 1 << 20);
+        assert_eq!(cap, ATTACK_CYCLE_MULTIPLE << 20);
+        assert!(
+            source.starts_with("4 × the job's maxGuestCycles"),
+            "{source}"
+        );
+        assert_eq!(
+            attack_cycle_cap((MAX_HOST_GUEST_CYCLES, "unset"), u64::MAX).0,
+            MAX_HOST_GUEST_CYCLES
+        );
     }
 
     #[test]

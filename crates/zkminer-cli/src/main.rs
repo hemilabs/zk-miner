@@ -132,9 +132,10 @@ enum Commands {
         /// Write the witness report here instead of stdout.
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         out: Option<std::path::PathBuf>,
-        /// Attack the witness: structured mutations of W, re-execution under two sys_rand seeds
-        /// (the public rule's and a random one), two po2s and two keccak po2s, and a differential
-        /// run against two evm-rpc providers. Exits non-zero unless the verdict is `pass`.
+        /// Attack the witness: re-execution under two sys_rand seeds (the public rule's and a random
+        /// one), two po2s and two keccak po2s, a differential run against two evm-rpc providers,
+        /// then structured and generic mutations of W, each with a share of the time left. Exits
+        /// non-zero unless the verdict is `pass`.
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         adversarial: bool,
         /// The adversarial run's bound, in seconds.
@@ -143,18 +144,21 @@ enum Commands {
         /// Byte flips at sampled offsets of W.
         #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_FLIPS, requires = "adversarial")]
         flips: usize,
-        /// The most mutations executed: the scheme's structured ones first, then the generic ones.
+        /// The most mutations executed: the scheme's structured ones first, then the generic ones
+        /// (0 runs none, and the verdict is `incomplete`).
         #[arg(long, default_value_t = commands::simulate_witness::MAX_MUTATIONS, requires = "adversarial")]
         max_mutations: usize,
         /// The scheme id whose structured mutations apply (default: the journal header's first word).
         #[arg(long, requires = "adversarial")]
         scheme: Option<u64>,
         /// The two `[[evm_rpc]]` aliases of the broker configuration for the differential run
-        /// (default: the first two serving the job's chain).
+        /// (default: the first two serving the job's chain; with fewer than two the verdict is at
+        /// best `incomplete`).
         #[arg(long, value_delimiter = ',', requires = "adversarial")]
         providers: Option<Vec<String>>,
         /// The largest W --adversarial attacks, in bytes: it runs in this process, unsandboxed, and
-        /// holds W and a few copies of it.
+        /// its peak memory is about 4 × |W| for the generic mutations and up to about 32 × |W| for a
+        /// scheme-1 W of many small trie nodes.
         #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_ADVERSARIAL_MAX_W_BYTES, requires = "adversarial")]
         adversarial_max_w_bytes: u64,
         /// With --descriptor, this host's maxGuestCycles maximum (over [witness] max_guest_cycles). A

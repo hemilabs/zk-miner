@@ -882,6 +882,28 @@ pub async fn execute_worker_build(binary: &Path, cgroup_root: &Path, timeout: Du
     Ok(risc0_build_id(&build.sdk_version, &build.worker_version))
 }
 
+/// Why an execute produced no response: the verdict the pipeline gives it, and what the worker's
+/// typed exit or the launcher said of it, for a caller that judges more finely than a verdict
+/// (`zkminer simulate --adversarial`: a panic or an unprovable run is not the guest refusing `W`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecuteFailed {
+    pub skip: Skip,
+    /// The worker's typed failure, when it exited with one.
+    pub failure: Option<WitnessExecuteFailure>,
+    /// The wall clock passed and the worker's cgroup was killed.
+    pub timed_out: bool,
+}
+
+impl From<Skip> for ExecuteFailed {
+    fn from(skip: Skip) -> Self {
+        ExecuteFailed {
+            skip,
+            failure: None,
+            timed_out: false,
+        }
+    }
+}
+
 async fn execute(
     ctx: &HostContext,
     token: &AbortToken,
@@ -889,7 +911,7 @@ async fn execute(
     w: File,
     cgroup_name: String,
     timeout: Duration,
-) -> Result<WitnessExecuteResponse, Skip> {
+) -> Result<WitnessExecuteResponse, ExecuteFailed> {
     const S: Step = Step::Execute;
     let kill_path = ctx.cgroup_root.join(&cgroup_name).join("cgroup.kill");
     let spec = CgroupSpec {
@@ -908,7 +930,13 @@ async fn execute(
             drop(w);
             let _ = tx.send(r);
         })
-        .map_err(|e| Skip::new(SkipReason::HostInternal, S, format!("spawning the execute thread: {e}")))?;
+        .map_err(|e| {
+            ExecuteFailed::from(Skip::new(
+                SkipReason::HostInternal,
+                S,
+                format!("spawning the execute thread: {e}"),
+            ))
+        })?;
     let mut finished = None;
     let mut aborted = None;
     tokio::select! {
@@ -925,12 +953,19 @@ async fn execute(
                 _ = tokio::time::sleep(EXECUTE_KILL_RETRY) => {}
             }
         }
-        return Err(Skip::Aborted { reason, step: S });
+        return Err(Skip::Aborted { reason, step: S }.into());
     }
     let result = finished
         .expect("one branch completed")
         .map_err(|_| Skip::new(SkipReason::HostInternal, S, "the execute thread died"))?;
-    result.map_err(|e| Skip::new(execute_reason(&e), S, execute_detail(&e)))
+    result.map_err(|e| ExecuteFailed {
+        skip: Skip::new(execute_reason(&e), S, execute_detail(&e)),
+        failure: match &e {
+            WitnessExecError::Exit { failure, .. } => *failure,
+            _ => None,
+        },
+        timed_out: matches!(e, WitnessExecError::Timeout { .. }),
+    })
 }
 
 /// [`CycleJudging::PerPo2`]: `req` executed at each of `po2s` on its own, under the job's cap
@@ -977,12 +1012,12 @@ async fn execute_per_po2(
         .await
         {
             Ok(r) => r,
-            Err(s) if s.reason() == Some(SkipReason::GuestCyclesAboveLimit) => {
+            Err(f) if f.skip.reason() == Some(SkipReason::GuestCyclesAboveLimit) => {
                 hooks.executed_po2(po2, None);
                 over.push(po2);
                 continue;
             }
-            Err(s) => return Err(s),
+            Err(f) => return Err(f.skip),
         };
         let cycles = match r.results.as_slice() {
             [one] if one.po2 == po2 => one.cycles,
@@ -1096,14 +1131,14 @@ pub struct ExecuteOnce<'a> {
 }
 
 /// Runs [`ExecuteOnce`] on `w` (sealed in a memfd) and returns the worker's response unjudged; the
-/// caller applies [`check_execution`] and the binding as it needs. `Err` is the verdict the pipeline
-/// would give an execute that produced no response.
+/// caller applies [`check_execution`] and the binding as it needs. `Err` carries the verdict the
+/// pipeline would give an execute that produced no response, and what the worker said.
 pub async fn execute_once(
     ctx: &HostContext,
     token: &AbortToken,
     w: &[u8],
     spec: &ExecuteOnce<'_>,
-) -> Result<WitnessExecuteResponse, Skip> {
+) -> Result<WitnessExecuteResponse, ExecuteFailed> {
     static N: AtomicU64 = AtomicU64::new(0);
     const S: Step = Step::Execute;
     let (input, w_len) = input_sha256(spec.prefix.as_ref(), w)
@@ -1285,7 +1320,8 @@ pub async fn simulate_witness_job(
                 format!("wexec-{}", short(job_key)),
                 ctx.execute_timeout,
             )
-            .await?;
+            .await
+            .map_err(|f| f.skip)?;
             (resp, po2s)
         }
         CycleJudging::PerPo2 { required } => {

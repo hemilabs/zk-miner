@@ -29,16 +29,20 @@
 //! run holds `W`, one changed `W` and the working copies that one change needs, whatever the number
 //! of mutations; the scheme mutators enumerate lazily too.
 //!
-//! **Cycles.** Every re-execution runs under this host's maximum, not the job's `maxGuestCycles`:
-//! the router never checks cycles at fulfil, so a changed `W` that runs longer than the job declares
-//! can still be proven by a prover with the hardware for it, and its journal is judged like any
-//! other. Only a run stopped at the host's maximum, with no journal to judge, is inconclusive.
+//! **Cycles.** Every re-execution runs under the attack's cap ([`CycleLimits::host`]: this host's
+//! maximum, or a bounded multiple of the job's `maxGuestCycles`), not the job's `maxGuestCycles`
+//! itself: the router never checks cycles at fulfil, so a changed `W` that runs longer than the job
+//! declares can still be proven by a prover with the hardware for it, and its journal is judged like
+//! any other. Only a run stopped at the cap, with no journal to judge, is inconclusive.
+//!
+//! **Time.** Each mutation's execute gets a share of the time left ([`run_mutations`]), so one that
+//! runs away cannot take every other's; one cut there is inconclusive.
 //!
 //! Every mutation is deterministic for a given `W` and run seed, so a failure reproduces.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
 use hemiprove_eth_prelude::scheme1::{judge_with, Verdict};
@@ -46,12 +50,14 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zkminer_chain::binding::check_journal_binding;
 use zkminer_contracts::bindings::JobDescriptor;
-use zkminer_prover_protocol::{WitnessExecuteResponse, GUEST_EXIT_HALTED};
+use zkminer_prover_protocol::{WitnessExecuteFailure, WitnessExecuteResponse, GUEST_EXIT_HALTED};
 use zkminer_witness::binding::PREFIX_BYTES;
 use zkminer_witness::verdict::SkipReason;
 
 use crate::abort::AbortToken;
-use crate::pipeline::{check_execution, execute_once, ExecuteOnce, HostContext, Skip};
+use crate::pipeline::{
+    check_execution, execute_once, ExecuteFailed, ExecuteOnce, HostContext, Skip,
+};
 
 /// One change to `W`, described: [`Mutation::make`] builds the changed bytes only when they are
 /// about to run.
@@ -628,7 +634,8 @@ pub struct Judge<'a> {
 /// The cycle limits a re-execution is judged by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleLimits {
-    /// This host's maximum: the cap every re-execution runs under.
+    /// The attack's cap every re-execution runs under: this host's maximum, or a bounded multiple
+    /// of the job's `maxGuestCycles` when none is configured.
     pub host: u64,
     /// The job's `maxGuestCycles`: a run past it is reported as such, and judged all the same.
     pub job: u64,
@@ -644,8 +651,22 @@ fn sha(b: &[u8]) -> B256 {
 
 fn over_host_cap(limits: CycleLimits) -> String {
     format!(
-        "ran past this host's maximum of {} sized cycles (the job declares {}): no journal to judge",
+        "ran past the attack's cap of {} sized cycles (the job declares {}): no journal to judge",
         limits.host, limits.job
+    )
+}
+
+/// Whether the worker's typed failure is the guest refusing its input. A panic of the executor (a
+/// malformed or hostile ELF) and a run that halted 0 but that no proof can verify are not: they
+/// leave the changed `W` unjudged.
+fn refused_by_guest(failure: Option<WitnessExecuteFailure>) -> bool {
+    !matches!(
+        failure,
+        Some(
+            WitnessExecuteFailure::Panicked
+                | WitnessExecuteFailure::Unprovable
+                | WitnessExecuteFailure::OldRisc0Guest
+        )
     )
 }
 
@@ -653,18 +674,30 @@ fn over_host_cap(limits: CycleLimits) -> String {
 /// count of its po2s when it halted.
 pub fn classify(
     judge: &Judge<'_>,
-    result: Result<WitnessExecuteResponse, Skip>,
+    result: Result<WitnessExecuteResponse, ExecuteFailed>,
     po2s: &[u8],
     limits: CycleLimits,
 ) -> (MutationOutcome, Option<u64>) {
     let resp = match result {
         Ok(r) => r,
-        Err(Skip::Aborted { reason, .. }) => {
-            return (MutationOutcome::Inconclusive { why: format!("aborted: {reason:?}") }, None)
+        Err(ExecuteFailed {
+            skip: Skip::Aborted { reason, .. },
+            ..
+        }) => {
+            return (
+                MutationOutcome::Inconclusive {
+                    why: format!("aborted: {reason:?}"),
+                },
+                None,
+            )
         }
-        Err(Skip::Verdict { reason, detail, .. }) => {
+        Err(ExecuteFailed {
+            skip: Skip::Verdict { reason, detail, .. },
+            failure,
+            ..
+        }) => {
             let outcome = match reason {
-                SkipReason::GuestFailed => {
+                SkipReason::GuestFailed if refused_by_guest(failure) => {
                     MutationOutcome::RejectedInGuest { why: format!("{reason:?}: {}", tail(&detail)) }
                 }
                 SkipReason::GuestCyclesAboveLimit => MutationOutcome::Inconclusive { why: over_host_cap(limits) },
@@ -751,6 +784,9 @@ pub struct Baseline<'a> {
     pub cycles: CycleLimits,
     /// The run's time bound: every execute gets at most what is left of it, and is killed there.
     pub deadline: Instant,
+    /// The least time one mutation's execute is given ([`run_mutations`]): a few times the unchanged
+    /// `W`'s own, so a mutation that runs like it is never cut.
+    pub mutation_floor: Duration,
 }
 
 impl Baseline<'_> {
@@ -758,14 +794,17 @@ impl Baseline<'_> {
         Instant::now() >= self.deadline || self.token.reason().is_some()
     }
 
-    /// One execution of `w`, under the rule's `sys_rand` seed unless `seed` names another.
+    /// One execution of `w`, under the rule's `sys_rand` seed unless `seed` names another, within
+    /// `within` (and what is left of the run's time).
     async fn execute(
         &self,
         w: &[u8],
         po2s: &[u8],
         keccak_po2: u8,
         seed: Option<[u8; 32]>,
-    ) -> Result<WitnessExecuteResponse, Skip> {
+        within: Option<Duration>,
+    ) -> Result<WitnessExecuteResponse, ExecuteFailed> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
         let spec = ExecuteOnce {
             elf: self.elf,
             program_id: self.judge.descriptor.programId,
@@ -774,7 +813,7 @@ impl Baseline<'_> {
             keccak_po2,
             sys_rand_seed: seed,
             max_cycles: self.cycles.host,
-            timeout: Some(self.deadline.saturating_duration_since(Instant::now())),
+            timeout: Some(within.map_or(left, |w| w.min(left))),
         };
         execute_once(self.ctx, self.token, w, &spec).await
     }
@@ -805,6 +844,11 @@ pub struct MutationResult {
 /// passes; those left after the deadline (up to `max`) are [`MutationOutcome::NotRun`]. Each is made
 /// just before it runs and dropped after. One that does not apply, or makes `W` or the bytes of an
 /// earlier one (by sha256), is skipped without a result.
+///
+/// Each execute gets a share of the time left: that time over the results still to come (at least
+/// [`Baseline::mutation_floor`]), so one mutation that runs away (a changed count that loops for
+/// billions of cycles) cannot take the time of every other. One cut at its share is
+/// [`MutationOutcome::Inconclusive`].
 pub async fn run_mutations<'m>(
     b: &Baseline<'_>,
     mutations: impl IntoIterator<Item = Mutation<'m>>,
@@ -833,16 +877,42 @@ pub async fn run_mutations<'m>(
         if !seen.insert(sha(&bytes)) {
             continue;
         }
-        let r = b.execute(&bytes, &[b.po2], b.keccak_po2, None).await;
-        // An execute the deadline cut short says nothing.
-        let cut =
-            Instant::now() >= b.deadline && matches!(&r, Err(Skip::Verdict { reason: SkipReason::ProveResources, .. }));
-        let (outcome, cycles) =
-            if cut { (MutationOutcome::NotRun, None) } else { classify(&b.judge, r, &[b.po2], b.cycles) };
+        let share = mutation_share(
+            b.deadline.saturating_duration_since(Instant::now()),
+            max - out.len(),
+            b.mutation_floor,
+        );
+        let r = b
+            .execute(&bytes, &[b.po2], b.keccak_po2, None, Some(share))
+            .await;
+        let (outcome, cycles) = match &r {
+            // An execute the run's own deadline cut short says nothing.
+            Err(f) if f.timed_out && Instant::now() >= b.deadline => {
+                (MutationOutcome::NotRun, None)
+            }
+            Err(f) if f.timed_out => (
+                MutationOutcome::Inconclusive {
+                    why: format!(
+                        "cut at its share of the run's time ({:.0} s): no journal to judge",
+                        share.as_secs_f64()
+                    ),
+                },
+                None,
+            ),
+            _ => classify(&b.judge, r, &[b.po2], b.cycles),
+        };
         tracing::debug!(mutation = %m.id, ?outcome, "adversarial: mutation judged");
         out.push(result(Some(bytes.len()), cycles, outcome));
     }
     out
+}
+
+/// One mutation's time: `left` over the `slots` results still to come, at least `floor`, at most
+/// `left`.
+pub fn mutation_share(left: Duration, slots: usize, floor: Duration) -> Duration {
+    (left / u32::try_from(slots.max(1)).unwrap_or(u32::MAX))
+        .max(floor)
+        .min(left)
 }
 
 /// A host input a prover controls.
@@ -909,9 +979,10 @@ pub fn other_keccak_po2(k: u8) -> u8 {
 enum NoJournal {
     /// The guest refused it: under one value only, a dependence.
     Guest(String),
-    /// It ran past this host's cycle maximum: no journal to compare, and no dependence shown.
+    /// It ran past the attack's cycle cap: no journal to compare, and no dependence shown.
     CycleCap(String),
-    /// This host could not run it (time, memory, the sandbox, the deadline).
+    /// This host could not run it (time, memory, the sandbox, the deadline), or the run tells
+    /// nothing of the guest (the executor panicked, or no proof of it can verify).
     Host(String),
 }
 
@@ -919,7 +990,7 @@ enum NoJournal {
 /// runtime's own draw.
 type Ran = Result<(B256, Vec<u8>, u64, Option<u64>), NoJournal>;
 
-fn journal_of(resp: &Result<WitnessExecuteResponse, Skip>, i: usize) -> Ran {
+fn journal_of(resp: &Result<WitnessExecuteResponse, ExecuteFailed>, i: usize) -> Ran {
     match resp {
         Ok(r) => match r.results.get(i) {
             Some(p) if p.exit_kind == GUEST_EXIT_HALTED && p.exit_code == 0 => {
@@ -928,11 +999,26 @@ fn journal_of(resp: &Result<WitnessExecuteResponse, Skip>, i: usize) -> Ran {
             Some(p) => Err(NoJournal::Guest(format!("po2 {}: exit kind {} code {}", p.po2, p.exit_kind, p.exit_code))),
             None => Err(NoJournal::Host("no result".into())),
         },
-        Err(Skip::Verdict { reason: SkipReason::GuestFailed, detail, .. }) => Err(NoJournal::Guest(tail(detail))),
-        Err(Skip::Verdict { reason: SkipReason::GuestCyclesAboveLimit, detail, .. }) => {
-            Err(NoJournal::CycleCap(tail(detail)))
-        }
-        Err(s) => Err(NoJournal::Host(tail(&s.to_string()))),
+        Err(ExecuteFailed {
+            skip:
+                Skip::Verdict {
+                    reason: SkipReason::GuestFailed,
+                    detail,
+                    ..
+                },
+            failure,
+            ..
+        }) if refused_by_guest(*failure) => Err(NoJournal::Guest(tail(detail))),
+        Err(ExecuteFailed {
+            skip:
+                Skip::Verdict {
+                    reason: SkipReason::GuestCyclesAboveLimit,
+                    detail,
+                    ..
+                },
+            ..
+        }) => Err(NoJournal::CycleCap(tail(detail))),
+        Err(f) => Err(NoJournal::Host(tail(&f.skip.to_string()))),
     }
 }
 
@@ -959,7 +1045,7 @@ fn pair_result(input: HostInput, values: [String; 2], a: Ran, b: Ran, limits: Cy
                 limits.job
             )),
             Err(NoJournal::CycleCap(e)) => {
-                notes.push(format!("{v}: past this host's cycle maximum ({}): {e}", limits.host))
+                notes.push(format!("{v}: past the attack's cycle cap ({}): {e}", limits.host))
             }
             Err(NoJournal::Host(e)) => notes.push(format!("{v}: not run: {e}")),
             _ => {}
@@ -1006,13 +1092,16 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_seed: [u8; 32]) -> Vec<Ho
     let base = if b.late() {
         None
     } else {
-        Some(journal_of(&b.execute(b.w, &[b.po2], b.keccak_po2, None).await, 0))
+        Some(journal_of(
+            &b.execute(b.w, &[b.po2], b.keccak_po2, None, None).await,
+            0,
+        ))
     };
     let values = ["rule (zkminer's)".to_string(), "random (another prover's)".to_string()];
     match &base {
         Some(a) if !b.late() => {
             let c = b
-                .execute(b.w, &[b.po2], b.keccak_po2, Some(other_seed))
+                .execute(b.w, &[b.po2], b.keccak_po2, Some(other_seed), None)
                 .await;
             out.push(pair_result(HostInput::SysRandSeed, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
@@ -1022,7 +1111,7 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_seed: [u8; 32]) -> Vec<Ho
     let values = [b.po2.to_string(), p2.to_string()];
     match &base {
         Some(a) if !b.late() => {
-            let c = b.execute(b.w, &[p2], b.keccak_po2, None).await;
+            let c = b.execute(b.w, &[p2], b.keccak_po2, None, None).await;
             out.push(pair_result(HostInput::Po2, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::Po2, values)),
@@ -1031,7 +1120,7 @@ pub async fn host_input_checks(b: &Baseline<'_>, other_seed: [u8; 32]) -> Vec<Ho
     let values = [b.keccak_po2.to_string(), k2.to_string()];
     match &base {
         Some(a) if !b.late() => {
-            let c = b.execute(b.w, &[b.po2], k2, None).await;
+            let c = b.execute(b.w, &[b.po2], k2, None, None).await;
             out.push(pair_result(HostInput::KeccakPo2, values, a.clone(), journal_of(&c, 0), b.cycles));
         }
         _ => out.push(skipped(HostInput::KeccakPo2, values)),
@@ -1264,9 +1353,11 @@ mod tests {
             drawing(&out2),
             MutationOutcome::SoundnessFailure { .. }
         ));
-        // Past the host's own maximum there is no journal to judge: inconclusive, never a rejection.
+        // Past the attack's cycle cap there is no journal to judge: inconclusive, never a rejection.
         assert!(matches!(run(&out2, 0, (1 << 30) + 1).0, MutationOutcome::Inconclusive { .. }));
-        let skip = |r| Err(Skip::Verdict { reason: r, step: crate::pipeline::Step::Execute, detail: "d".into() });
+        let skip = |r| {
+            Err(ExecuteFailed::from(Skip::Verdict { reason: r, step: crate::pipeline::Step::Execute, detail: "d".into() }))
+        };
         assert!(matches!(
             classify(&judge, skip(SkipReason::GuestCyclesAboveLimit), &[20], limits).0,
             MutationOutcome::Inconclusive { .. }
@@ -1280,6 +1371,37 @@ mod tests {
             classify(&judge, skip(SkipReason::ProveResources), &[20], limits).0,
             MutationOutcome::Inconclusive { .. }
         ));
+        // A guest fault is the guest refusing W; the executor panicking, or a run no proof can
+        // verify, is not: those leave the W unjudged.
+        let worker = |f: WitnessExecuteFailure| {
+            let mut e = skip(SkipReason::GuestFailed).unwrap_err();
+            e.failure = Some(f);
+            classify(&judge, Err(e), &[20], limits).0
+        };
+        assert!(matches!(
+            worker(WitnessExecuteFailure::GuestFault),
+            MutationOutcome::RejectedInGuest { .. }
+        ));
+        for f in [
+            WitnessExecuteFailure::Panicked,
+            WitnessExecuteFailure::Unprovable,
+            WitnessExecuteFailure::OldRisc0Guest,
+        ] {
+            assert!(
+                matches!(worker(f), MutationOutcome::Inconclusive { .. }),
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_mutation_gets_a_share_of_the_time_left() {
+        let s = Duration::from_secs;
+        assert_eq!(mutation_share(s(600), 100, s(1)), s(6));
+        // Never below the floor (a few runs of the unchanged W), never past the time left.
+        assert_eq!(mutation_share(s(600), 1000, s(5)), s(5));
+        assert_eq!(mutation_share(s(3), 10, s(5)), s(3));
+        assert_eq!(mutation_share(s(60), 0, s(1)), s(60));
     }
 
     #[test]
@@ -1312,7 +1434,7 @@ mod tests {
         // A cycle cap at one po2 is reported as such: no dependence, not compared.
         let cap = pair_result(HostInput::Po2, v(), ok(b"x"), Err(NoJournal::CycleCap("over".into())), limits);
         assert!(!cap.dependent && !cap.ran);
-        assert!(cap.note.unwrap().contains("past this host's cycle maximum"));
+        assert!(cap.note.unwrap().contains("past the attack's cycle cap"));
         // Past the job's cap at one po2, the journals still compare, with a note.
         let over: Ran = Ok((sha(b"x"), b"x".to_vec(), 1 << 21, Some(0)));
         let r = pair_result(HostInput::Po2, v(), ok(b"x"), over, limits);

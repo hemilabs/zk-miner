@@ -2108,11 +2108,15 @@ provider units, retention bytes.
 
    Each mutation must fail in the guest, give a byte-identical journal, or change bytes the binding
    pins (the router refuses it). A changed journal that still satisfies the binding is reported as a
-   soundness failure naming the mutation. Each mutation runs under this host's cycle maximum, not
-   the job's `maxGuestCycles` (the router does not check cycles); a run stopped at the host maximum
-   is inconclusive (under FULL it decides nothing). Differential runs go against two providers, each
-   alone in its own broker; different journals that both satisfy the binding are a soundness
-   failure. Re-execution runs under two `sys_rand` seeds (the public rule's and a fresh random one), two po2s (each in a request of its own, the
+   soundness failure naming the mutation. Each mutation runs under the attack's cycle cap (this
+   host's configured maximum, else 4 × the job's `maxGuestCycles`), not `maxGuestCycles` itself (the
+   router does not check cycles), and within a share of the time left; a run stopped at the cap or
+   cut at its share, an executor panic and a run no proof can verify are inconclusive (under FULL
+   they decide nothing). A sweep that ran no mutation, or (unless the binding is FULL) none of a
+   registered scheme's structured ones, is `incomplete`. Differential runs go against two providers,
+   each alone in its own broker, so a `pass` needs two `evm-rpc` endpoints for the job's chain;
+   different journals that both satisfy the binding are a soundness failure. The host-input checks
+   and the differential run before the mutations, which share what time is left. Re-execution runs under two `sys_rand` seeds (the public rule's and a fresh random one), two po2s (each in a request of its own, the
    second from `--po2`, a cycle cap reported as such) and two keccak po2s, and any journal change is
    reported as a dependence on a prover-controlled host input. These checks compare journals only,
    which cannot show a check of `W` that follows the seed while the journal does not (a spot check

@@ -423,6 +423,65 @@ fn a_descriptor_job_runs_the_miners_pipeline_and_survives_the_attacks() {
     assert_eq!(a["differential"]["runs"][1]["alias"], "anvil-b");
 }
 
+/// The correctness review's PoC: no configured cycle maximum, and flipping n's high byte makes
+/// billions of iterations. Under 2^34 that one mutation took the whole bound (the host inputs and
+/// most mutations not run: `incomplete`). Now the host inputs and the providers run first, the
+/// attack's cycle cap is 4 × maxGuestCycles, and each mutation gets a share of the time left: the
+/// runaway is cut at its share or the cap, inconclusive (deciding nothing under FULL), and the rest
+/// of the attack runs.
+#[test]
+fn a_runaway_mutation_cannot_starve_the_attack() {
+    let _g = serial();
+    if unavailable("a_runaway_mutation_cannot_starve_the_attack") {
+        return;
+    }
+    let env = Env::new();
+    let d = env.descriptor("runaway", 10, &full_binding(10), &[], "");
+    let wasm = env.path("echo.wasm");
+    let (out, r) = env.simulate(
+        &d,
+        &[
+            "--builder",
+            wasm.to_str().unwrap(),
+            "--po2",
+            "20",
+            "--adversarial",
+            "--flips",
+            "8",
+            "--adversarial-secs",
+            "120",
+        ],
+    );
+    let a = &r["adversarial"];
+    assert_eq!(a["attackCycleCap"], (4u64 << 24).to_string(), "{a:#}");
+    assert!(a["attackCycleCapSource"]
+        .as_str()
+        .unwrap()
+        .starts_with("4 × the job's maxGuestCycles"));
+    assert!(
+        a["hostInputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["ran"] == true),
+        "{:#}",
+        a["hostInputs"]
+    );
+    assert_eq!(a["counts"]["notRun"], 0, "{:#}", a["counts"]);
+    assert!(
+        a["counts"]["inconclusive"].as_u64().unwrap() >= 1,
+        "the runaway flip: {:#}",
+        a["mutations"]
+    );
+    assert_eq!(a["differential"]["journalSame"], true);
+    assert_eq!(a["verdict"], "pass", "{a:#}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn a_none_bound_job_fails_the_attack_and_names_the_mutation() {
     let _g = serial();
