@@ -60,7 +60,9 @@ zkminer-<version>-macos-arm64/
 ├── install.sh                           packaging/macos/install.sh
 ├── tools/install-metal-aot.sh           scripts/mac (install.sh uses it)
 ├── tools/build-metal-aot.sh             scripts/mac (its --worker-digests)
-├── README.md                            packaging/macos/README.md
+├── README.md                            packaging/macos/README.md (says "This kit has no offline GPU
+│                                        pipeline archives" exactly when metal-aot/ has none, and
+│                                        "About <x> GB for the kit"; check-macos-kit.py checks both)
 ├── LICENSE
 ├── BUILDINFO                            version, commit, risc0 rev, min_macos (the newer of
 │                                        binaries_minos and metal_target), Metal compiler,

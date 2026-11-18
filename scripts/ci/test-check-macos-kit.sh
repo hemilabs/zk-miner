@@ -9,8 +9,10 @@
 #    /usr/lib and /System/Library (its libSystem load path rewritten), a universal (x86_64 + arm64)
 #    CLI, an unsigned CLI (LC_CODE_SIGNATURE removed by codesign), a BUILDINFO binaries_minos other
 #    than the binaries' minos, a file not in SHA256SUMS, a file that does not match it, a symbolic
-#    link, a non-Mach-O worker, and (with --require-validated, as the release runs it) a kit whose
-#    kernels were not compiled by the validated Metal compiler.
+#    link, a non-Mach-O worker, (with --require-validated, as the release runs it) a kit whose
+#    kernels were not compiled by the validated Metal compiler, and a README.md that does not
+#    describe the kit: one that claims offline archives the kit lacks (or, for a kit with archives,
+#    denies them), one that says there are none while metal-aot/ holds one, and a wrong kit size.
 # Each broken kit gets a correct SHA256SUMS (except the cases about it), so only the case's own
 # defect can fail it. Needs python3, tar and, for the signature and universal cases, codesign and lipo.
 set -euo pipefail
@@ -119,6 +121,37 @@ variant unvalidated; b=$T/unvalidated/$name/BUILDINFO
 sed -i.bak 's/^metal_compiler_validated=.*/metal_compiler_validated=no/' "$b"; rm -f "$b.bak"
 resum "$T/unvalidated/$name"; pack unvalidated
 expect_fail "2k: an unvalidated Metal compiler (--require-validated)" 'metal_compiler_validated=no' --require-validated "$T/unvalidated/$name.tar.gz"
+
+readme_edit() { # <kit README> <python expression on the whitespace-normalised text t>
+  python3 -I - "$@" <<'PY'
+import sys
+p, expr = sys.argv[1], sys.argv[2]
+t = ' '.join(open(p, encoding='utf-8').read().split())
+new = eval(expr, {'t': t})
+assert new != t, 'README edit changed nothing'
+open(p, 'w', encoding='utf-8').write(new + '\n')
+PY
+}
+none_text='This kit has no offline GPU pipeline archives'
+if tar -tzf "$tarball" | grep -q '^[^/]*/metal-aot/.*\.binarchive$'; then
+  variant readme_aot; readme_edit "$T/readme_aot/$name/README.md" "t + ' $none_text.'"
+  resum "$T/readme_aot/$name"; pack readme_aot
+  expect_fail "2l: a README denying the kit's offline archives" 'README.md says .* GPU binary archives' "$T/readme_aot/$name.tar.gz"
+  echo "SKIP 2n: this kit has offline archives"
+else
+  variant readme_aot; readme_edit "$T/readme_aot/$name/README.md" "t.replace('$none_text', 'This kit ships offline GPU pipeline archives')"
+  resum "$T/readme_aot/$name"; pack readme_aot
+  expect_fail "2l: a README claiming offline archives the kit lacks" 'README.md does not say' "$T/readme_aot/$name.tar.gz"
+  variant aot_added; mkdir -p "$T/aot_added/$name/metal-aot"
+  # A Mach-O header for the Apple GPU's CPU type: the checker counts it as a GPU binary archive.
+  python3 -I -c 'import struct,sys; open(sys.argv[1],"wb").write(struct.pack("<IiiIIIII",0xFEEDFACF,0x01000013,0,1,0,0,0,0))' \
+    "$T/aot_added/$name/metal-aot/zkp-applegpu_g17s-macos27-0.binarchive"
+  resum "$T/aot_added/$name"; pack aot_added
+  expect_fail "2n: a README saying 'no archives' over a kit with one" 'README.md says .* 1 GPU binary archives' "$T/aot_added/$name.tar.gz"
+fi
+variant readme_size; readme_edit "$T/readme_size/$name/README.md" "__import__('re').sub(r'About [0-9.]+ GB for the kit', 'About 9.5 GB for the kit', t)"
+resum "$T/readme_size/$name"; pack readme_size
+expect_fail "2m: a README with a wrong kit size" 'About 9.5 GB for the kit' "$T/readme_size/$name.tar.gz"
 
 echo "test-check-macos-kit: $pass passed, $fails failed"
 [ $fails = 0 ]

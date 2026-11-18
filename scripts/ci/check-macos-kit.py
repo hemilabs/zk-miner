@@ -21,8 +21,11 @@ For each tarball:
   libraries (no @rpath, @loader_path or @executable_path, nothing from Homebrew), has
   LC_BUILD_VERSION platform macOS with minos = BUILDINFO binaries_minos, and has a code signature
   (LC_CODE_SIGNATURE: arm64 macOS kills an unsigned program);
-- Metal GPU binary archives (metal-aot/*.binarchive, Mach-O files for the GPU's CPU type) are only
-  counted.
+- Metal GPU binary archives (metal-aot/*.binarchive, Mach-O files for the GPU's CPU type) are
+  counted, and the kit's README.md must say what the kit has (BETA-FIX): a kit without archives
+  carries the sentence NO_ARCHIVES_TEXT (every Mac then compiles its pipelines at first start), a
+  kit with archives must not; the README's "About <x> GB for the kit" must be within a factor of
+  two of the unpacked kit.
 Exit 0 when every check passes; each failure is printed as a FAIL line.
 """
 import hashlib
@@ -48,6 +51,9 @@ PLATFORM_MACOS = 1
 SYSTEM_PREFIXES = ('/usr/lib/', '/System/Library/')
 MAX_KIT = 1 << 30
 PROGRAMS = ('zkminer', 'provers/zkminer-prove-risc0-metal')
+# The kit README's statement that the kit has no offline Metal archives (packaging/macos/README.md).
+NO_ARCHIVES_TEXT = 'This kit has no offline GPU pipeline archives'
+KIT_SIZE_RE = re.compile(r'About ([0-9]+(?:\.[0-9]+)?) GB for the kit')
 
 fails = []
 
@@ -239,7 +245,28 @@ def check_tarball(path, want_version, want_commit, require_validated=False):
     for p in PROGRAMS:
         if p not in files:
             fail(f'{path}: no {p}')
+    check_readme(path, files, archives)
     print(f'{path}: version {version}, {len(files)} files, {programs} programs, {archives} GPU binary archives')
+
+
+def check_readme(path, files, archives):
+    """The kit README must describe this kit: whether it has offline archives, and its size."""
+    if 'README.md' not in files:
+        fail(f'{path}: no README.md')
+        return
+    text = ' '.join(files['README.md'].decode('utf-8', 'replace').split())
+    says_none = NO_ARCHIVES_TEXT in text
+    if archives == 0 and not says_none:
+        fail(f'{path}: README.md does not say "{NO_ARCHIVES_TEXT}", but the kit has no metal-aot/*.binarchive '
+             f'(its first start compiles the GPU pipelines on every Mac)')
+    if archives > 0 and says_none:
+        fail(f'{path}: README.md says "{NO_ARCHIVES_TEXT}", but the kit has {archives} GPU binary archives')
+    m = KIT_SIZE_RE.search(text)
+    unpacked = sum(len(d) for d in files.values())
+    if not m:
+        fail(f'{path}: README.md does not give the kit size ("About <x> GB for the kit")')
+    elif not 0.5 <= float(m.group(1)) * 1e9 / unpacked <= 2.0:
+        fail(f'{path}: README.md says "About {m.group(1)} GB for the kit", the kit unpacks to {unpacked / 1e9:.2f} GB')
 
 
 def main(argv):

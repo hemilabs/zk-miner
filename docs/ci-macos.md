@@ -69,8 +69,9 @@ hanging until the job's timeout.
    - `ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none scripts/ci/assemble-macos.sh dist/macos`, which runs
      `check-macos-release.sh`;
    - `check-macos-kit.py` with the version and commit;
-   - `test-check-macos-kit.sh`, which builds eleven broken copies of the fresh kit and checks that every
-     one is rejected.
+   - `test-check-macos-kit.sh`, which builds broken copies of the fresh kit (fourteen for a kit
+     without archives) and checks that every one is rejected. `check-macos-kit.py` also checks that
+     the kit's README.md says whether the kit has offline archives and gives its size (BETA-FIX).
 7. **Upload** `dist-macos`, then unmount the toolchain (`always()`).
 
 ### `cpu-tests`

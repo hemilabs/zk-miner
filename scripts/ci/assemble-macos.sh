@@ -30,7 +30,10 @@
 #                        knob): the binaries keep minos 11.0 and the Metal libraries target the build
 #                        SDK, so the kit's minimum (BUILDINFO min_macos, which install.sh enforces)
 #                        is the newer of the two, the SDK's version (27.2 with the CLT 27.2 SDK).
-# - AOT_ARCHES           GPU families of the archive set (default applegpu_g17s; `none`: no set)
+# - AOT_ARCHES           GPU families of the archive set (default applegpu_g17s; `none`: no set, as
+#                        CI and the beta build it). packaging/macos/README.md describes a kit
+#                        without archives; a kit with them needs its archive text back first
+#                        (check-macos-kit.py fails a README that does not match the kit, BETA-FIX)
 # - AOT_OS_MAJORS        the macOS major versions the set has archives for, each keyed macos<N> and
 #                        built with metal-tt -macos-version-min <N>.0 (the runtime opens only its own
 #                        major's files). Default: the validated ones (macos-validated.sh
