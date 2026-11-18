@@ -48,12 +48,16 @@
 //!   `ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE=1` (without it a miner refuses risc0 claims under an
 //!   override that differs from its linked risc0's selector);
 //! - `refuses_to_claim_without_a_matching_verifier` is the negative case: a miner with the build's
-//!   own selector against that verifier must refuse every risc0 claim (its startup check reads the
-//!   verifier's `SELECTOR()`);
+//!   own selector against that verifier must refuse every risc0 claim (while no 3.1 verifier is
+//!   pinned its startup check refuses from the empty pin, after reading the registry's adapter
+//!   but before calling the verifier's `SELECTOR()`; once one is, from that `SELECTOR()`);
 //! - the tests that prove with the real risc0 worker (`watch_only_reports_every_job`,
 //!   `mines_the_claimable_jobs`, `mines_on_every_gpu`) report SKIPPED until the deployment carries a
 //!   verifier for this build's selector (and zkminer-chain pins it); set
 //!   `ZKMINER_LOCALNET_FORCE_RISC0=1` to run them anyway (on a fork where one was registered).
+//!   While `pins::RISC0_V3_1_GROTH16_VERIFIER` is empty (B9-ZK: no 3.1 verifier deployed yet), the
+//!   miner refuses a 3.1 verifier by its code pin too, so such a run also needs
+//!   `ZKMINER_SKIP_CODE_PINS=1` in the miner's environment.
 //!
 //! All are ignored by default: they need anvil (Foundry), the workers, and the testnet RPC, which
 //! must serve state at the fork block (it does: it is an archive node). anvil caches what it
@@ -155,20 +159,22 @@ fn build_selector() -> [u8; 4] {
     d.as_bytes()[..4].try_into().unwrap()
 }
 
-/// Whether the real risc0 worker's proofs can verify on the fork: the deployment's pinned verifier
-/// selector is this build's. Not so on risc0 3.1 against the 743111 v3.0 verifier (P31-19), and then
-/// the test reports SKIPPED unless `ZKMINER_LOCALNET_FORCE_RISC0=1`.
+/// Whether the real risc0 worker's proofs can verify on the fork: zkminer-chain pins an audited
+/// verifier for this build's seal selector (`deployment::risc0_verifier_pin`, B9-ZK), so the gate
+/// follows the pin: on risc0 3.1 it opens by itself once `pins::RISC0_V3_1_GROTH16_VERIFIER` is
+/// filled. Until then (P31-19: the 743111 verifier is v3.0) the test reports SKIPPED unless
+/// `ZKMINER_LOCALNET_FORCE_RISC0=1`.
 fn risc0_proofs_verify_on_the_fork(test: &str) -> bool {
-    let pinned = zkminer_chain::deployment::pins::RISC0_V3_0_SELECTOR;
-    if build_selector() == pinned || env_flag("ZKMINER_LOCALNET_FORCE_RISC0") {
+    let pin = zkminer_chain::deployment::risc0_verifier_pin(build_selector());
+    if pin.is_ok() || env_flag("ZKMINER_LOCALNET_FORCE_RISC0") {
         return true;
     }
     eprintln!(
         "localnet: SKIPPED {test} (it did not run): this build's risc0 seals carry selector 0x{} and \
-         the 743111 deployment's RiscZeroGroth16Verifier is the 0x{} one, so every risc0 claim is \
-         refused; set ZKMINER_LOCALNET_FORCE_RISC0=1 on a fork with a matching verifier",
+         no verifier is pinned for it ({}), so every risc0 claim is refused; set \
+         ZKMINER_LOCALNET_FORCE_RISC0=1 on a fork with a matching verifier",
         alloy::hex::encode(build_selector()),
-        alloy::hex::encode(pinned)
+        pin.err().unwrap_or_default()
     );
     false
 }
@@ -2722,9 +2728,11 @@ async fn refuses_to_claim_while_its_adapter_is_disabled() {
 
 /// P31-19, the negative case of the 3.0 fixture: a miner whose seals carry this build's selector
 /// (risc0 3.1, 0xe71e6620) against the fork's risc0 3.0 verifier (0x73c457ba). Its startup check
-/// reads the verifier's `SELECTOR()` (an eth_call) and refuses risczero.groth16.v1, so the brain
-/// holds the job and nothing is sent: a claim would lock collateral for a fulfil that can only
-/// revert. Runs only while the two selectors differ.
+/// refuses risczero.groth16.v1 (while `pins::RISC0_V3_1_GROTH16_VERIFIER` is empty, from that empty
+/// pin via `risc0_verifier_pin`, after the registry/adapter reads but before the verifier's
+/// `SELECTOR()` call; once filled, from that `SELECTOR()`, which differs from the seal's), so the
+/// brain holds the job and nothing is sent: a claim would lock collateral for a fulfil that can
+/// only revert. Runs only while the two selectors differ.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
 async fn refuses_to_claim_without_a_matching_verifier() {

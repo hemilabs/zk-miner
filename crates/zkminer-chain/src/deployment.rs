@@ -3,8 +3,11 @@
 //!
 //! Before the first transaction zkminer proves it is talking to the AUDITED code: every proxy is the
 //! audited ERC-1967 proxy, every implementation and router facet it routes through is audited code,
-//! and the RISC Zero adapter wraps the audited risc0-ethereum v3.0 verifier whose `SELECTOR()` is the
-//! seal prefix zkminer emits. The pins below are copied verbatim from the deployed contracts repo
+//! and the RISC Zero adapter wraps the audited risc0-ethereum verifier whose `SELECTOR()` is the
+//! seal prefix zkminer emits: the v3.0 verifier for 3.0 seals, the 3.1 verifier for the 3.1 seals
+//! this build makes. No 3.1 verifier is deployed yet, so its pin is empty
+//! ([`pins::RISC0_V3_1_GROTH16_VERIFIER`]) and risc0 claims are refused with what is missing
+//! ([`risc0_v3_1_verifier_missing`]). The pins below are copied verbatim from the deployed contracts repo
 //! (`script/lib/AuditedCorePins.sol`, `script/lib/VerifierPins.sol` at zkmarket c8333aa) and are
 //! DEPLOYMENT-INDEPENDENT: an implementation's pin is its runtime keccak with its immutables zeroed,
 //! so the same audited code verifies at any address. Only the addresses and the scan floor are
@@ -57,6 +60,22 @@ pub mod pins {
         b256!("0d2be77d8f4614c7c80be0da5f3b2a836b72b8650071d14006fbf43ecf34cf29");
     /// Its `SELECTOR()`: the 4-byte prefix of every risc0 3.0 Groth16 seal it accepts.
     pub const RISC0_V3_0_SELECTOR: [u8; 4] = [0x73, 0xc4, 0x57, 0xba];
+    /// The `SELECTOR()` of a risc0-ethereum `RiscZeroGroth16Verifier` for risc0 3.1 (the 2026-10-20
+    /// Groth16 setup, v0.2.0 key): the first 4 bytes of 3.1's default
+    /// `Groth16ReceiptVerifierParameters` digest (`e71e6620a834f4d8...`), the prefix of every seal a
+    /// 3.1 worker's receipt is sent with. Derived from the parameters, not from a deployment (the
+    /// CLI's tests tie it to the linked risc0).
+    pub const RISC0_V3_1_SELECTOR: [u8; 4] = [0xe7, 0x1e, 0x66, 0x20];
+    /// **TO FILL IN when the risc0 3.1 verifier is deployed:** the runtime keccak (immutables
+    /// filled, raw keccak, as [`RISC0_V3_0_GROTH16_VERIFIER`]) of the audited risc0-ethereum 3.1
+    /// `RiscZeroGroth16Verifier` (`SELECTOR()` = [`RISC0_V3_1_SELECTOR`]), copied from the deployed
+    /// contracts repo's `script/lib/VerifierPins.sol`, like every pin here.
+    ///
+    /// `None` until then: no such verifier is deployed (2026-11-17; a user/organisation action), so
+    /// there is nothing to pin, and a risc0 3.1 miner refuses every risc0 claim with
+    /// [`risc0_v3_1_verifier_missing`]'s message. Never fill it from anything but the audited
+    /// deployment's pin file.
+    pub const RISC0_V3_1_GROTH16_VERIFIER: Option<B256> = None;
     /// SP1Groth16VerifierAdapter runtime with its `nativeVerifier` immutable zeroed at
     /// [`SP1_GROTH16_ADAPTER_IMMUTABLES`] (1,851 B).
     pub const SP1_GROTH16_ADAPTER: B256 =
@@ -70,6 +89,56 @@ pub mod pins {
     /// first 4 bytes prefix every v6.1.0 Groth16 seal.
     pub const SP1_V6_1_0_GROTH16_VERIFIER_HASH: B256 =
         b256!("4388a21c687fdd5f218d7e3d13190cac4c5355818d3605fd5fb811df468ee696");
+}
+
+/// What an operator must do before a risc0 3.1 miner can claim risc0 jobs while
+/// [`pins::RISC0_V3_1_GROTH16_VERIFIER`] is empty: the exact missing pieces, for the startup log and
+/// for every refusal of `risczero.groth16.v1`.
+pub fn risc0_v3_1_verifier_missing() -> String {
+    format!(
+        "this zkminer proves risc0 3.1, whose Groth16 seals carry SELECTOR 0x{sel}, and it has no \
+         audited risc0 3.1 verifier to check the chain against: \
+         zkminer_chain::deployment::pins::RISC0_V3_1_GROTH16_VERIFIER is empty \
+         (crates/zkminer-chain/src/deployment.rs). Missing: (1) a risc0-ethereum 3.1 \
+         RiscZeroGroth16Verifier (SELECTOR() = 0x{sel}) deployed on this chain and routed by the \
+         risczero.groth16.v1 adapter (Registry status Active or Deprecated); (2) that verifier's \
+         runtime keccak, from the audited deployment's VerifierPins.sol, in \
+         RISC0_V3_1_GROTH16_VERIFIER, and a rebuilt zkminer. Until both exist no risc0 job is \
+         claimed (held locks are still driven); ZKMINER_SKIP_CODE_PINS=1 skips the code pins, \
+         only for a verifier you have checked yourself",
+        sel = alloy::hex::encode(pins::RISC0_V3_1_SELECTOR),
+    )
+}
+
+/// The audited native-verifier pin (raw runtime keccak) for risc0 Groth16 seals prefixed with
+/// `seal_prefix`, or why there is none: 3.0's pinned verifier, 3.1's once
+/// [`pins::RISC0_V3_1_GROTH16_VERIFIER`] is filled ([`risc0_v3_1_verifier_missing`] until then),
+/// and no pin for any other selector.
+pub fn risc0_verifier_pin(seal_prefix: [u8; 4]) -> std::result::Result<B256, String> {
+    if seal_prefix == pins::RISC0_V3_0_SELECTOR {
+        return Ok(pins::RISC0_V3_0_GROTH16_VERIFIER);
+    }
+    if seal_prefix == pins::RISC0_V3_1_SELECTOR {
+        return pins::RISC0_V3_1_GROTH16_VERIFIER.ok_or_else(risc0_v3_1_verifier_missing);
+    }
+    Err(format!(
+        "no audited risc0 Groth16 verifier is pinned for seal SELECTOR 0x{} (pinned: 3.0 0x{}, 3.1 \
+         0x{})",
+        alloy::hex::encode(seal_prefix),
+        alloy::hex::encode(pins::RISC0_V3_0_SELECTOR),
+        alloy::hex::encode(pins::RISC0_V3_1_SELECTOR),
+    ))
+}
+
+/// The startup notice for a build whose risc0 seals cannot be checked against an audited verifier
+/// (see [`risc0_verifier_pin`]), or `None` when one is pinned or the operator skipped the code pins.
+/// Pure, so the caller logs it before any RPC: an operator learns what is missing even when the
+/// chain cannot be reached.
+pub fn risc0_verifier_pin_notice(seal_prefix: [u8; 4], pins_skipped: bool) -> Option<String> {
+    if pins_skipped {
+        return None;
+    }
+    risc0_verifier_pin(seal_prefix).err()
 }
 
 /// ERC-1967 implementation slot: `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`.
@@ -447,11 +516,17 @@ impl ChainClient {
                 ))
                 .into());
             }
+            // The pin follows the seal's selector: 3.0's verifier for 0x73c457ba, 3.1's for
+            // 0xe71e6620 (refused with what is missing while that pin is empty).
+            let pin = risc0_verifier_pin(seal_prefix)
+                .map_err(|why| ProofSystemRefused(format!("{}: {why}", ps.label())))?;
             let vcode = self.provider.get_code_at(native).await.context("verifier code")?;
-            if keccak256(&vcode) != pins::RISC0_V3_0_GROTH16_VERIFIER {
+            if keccak256(&vcode) != pin {
                 return Err(ProofSystemRefused(format!(
-                    "{} native verifier {native} is not the audited risc0-ethereum v3.0 verifier",
-                    ps.label()
+                    "{} native verifier {native} is not the audited risc0-ethereum verifier for \
+                     seal SELECTOR 0x{}",
+                    ps.label(),
+                    alloy::hex::encode(seal_prefix)
                 ))
                 .into());
             }
@@ -589,6 +664,60 @@ mod tests {
         let code = vec![1u8; 64];
         assert!(keccak_offsets_zeroed(&code, &[32]).is_some());
         assert!(keccak_offsets_zeroed(&code, &[33]).is_none());
+    }
+
+    /// B9-ZK: the risc0 verifier pin follows the seal selector, and 3.1's is empty until a 3.1
+    /// verifier is deployed: refused, with a message naming exactly what is missing.
+    #[test]
+    fn the_risc0_verifier_pin_follows_the_selector() {
+        assert_eq!(
+            risc0_verifier_pin(pins::RISC0_V3_0_SELECTOR),
+            Ok(pins::RISC0_V3_0_GROTH16_VERIFIER)
+        );
+        assert_eq!(pins::RISC0_V3_1_SELECTOR, [0xe7, 0x1e, 0x66, 0x20]);
+        match pins::RISC0_V3_1_GROTH16_VERIFIER {
+            None => {
+                let why = risc0_verifier_pin(pins::RISC0_V3_1_SELECTOR).unwrap_err();
+                assert_eq!(why, risc0_v3_1_verifier_missing());
+                for needed in [
+                    "0xe71e6620",
+                    "RISC0_V3_1_GROTH16_VERIFIER",
+                    "crates/zkminer-chain/src/deployment.rs",
+                    "RiscZeroGroth16Verifier",
+                    "risczero.groth16.v1",
+                    "VerifierPins.sol",
+                    "no risc0 job is claimed",
+                ] {
+                    assert!(why.contains(needed), "{needed:?} missing from: {why}");
+                }
+                assert_eq!(
+                    risc0_verifier_pin_notice(pins::RISC0_V3_1_SELECTOR, false),
+                    Some(why)
+                );
+            }
+            // Once filled: the 3.1 selector checks against it, and there is no notice.
+            Some(pin) => {
+                assert_eq!(risc0_verifier_pin(pins::RISC0_V3_1_SELECTOR), Ok(pin));
+                assert_ne!(pin, pins::RISC0_V3_0_GROTH16_VERIFIER);
+                assert_eq!(
+                    risc0_verifier_pin_notice(pins::RISC0_V3_1_SELECTOR, false),
+                    None
+                );
+            }
+        }
+        // Skipped code pins: no notice (the operator opted out of every code check).
+        assert_eq!(
+            risc0_verifier_pin_notice(pins::RISC0_V3_1_SELECTOR, true),
+            None
+        );
+        assert_eq!(
+            risc0_verifier_pin_notice(pins::RISC0_V3_0_SELECTOR, false),
+            None
+        );
+        // Any other selector: no pin.
+        let other = risc0_verifier_pin([0xde, 0xad, 0xbe, 0xef]).unwrap_err();
+        assert!(other.contains("0xdeadbeef"), "{other}");
+        assert!(risc0_verifier_pin_notice([0xde, 0xad, 0xbe, 0xef], false).is_some());
     }
 
     #[test]

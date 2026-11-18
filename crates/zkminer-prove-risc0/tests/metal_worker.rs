@@ -183,6 +183,227 @@ fn a_first_prove_without_warmup_proves() {
     assert!(child.wait().unwrap().success());
 }
 
+/// The fork's `multi_test` guest (risc0-zkvm-methods), which `MultiTestSpec::KeccakUnion(n)` makes
+/// request keccak proofs (the keccak circuit on the GPU, then its lift and join into the receipt).
+/// zk-miner's own guests use no keccak precompile. Built by the fork's zkvm test build; override with
+/// `ZKMINER_B9_KECCAK_ELF`.
+const FORK_MULTI_TEST_BIN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../deps/risc0-3.1/target/riscv-guest/risc0-zkvm-methods/risc0-zkvm-methods-guest/",
+    "riscv32im-risc0-zkvm-elf/release/multi_test.bin"
+);
+
+/// `MultiTestSpec::KeccakUnion(1)` in risc0's serde words: variant 16 (the enum's 17th, counted in
+/// risc0/zkvm/methods/src/multi_test.rs), then its `usize` as a u64 (two words; serde serializes
+/// usize as u64 on every target).
+const KECCAK_UNION_1_WORDS: [u32; 3] = [16, 1, 0];
+
+/// B9-ZK: one worker at a tight budget (default the 4 GiB tier; `ZKMINER_B9_BUDGET` = bytes for
+/// any other limit at which the worker releases the key, i.e. below
+/// `zkminer_prover::metal_sizing::keep_groth16_cache`'s ~29.5 GiB at po2 20) through the job
+/// order that used to break the 4 GiB tier (P31-14 / P31-19): Warmup (every pipeline, keccak's included, then a verified Groth16 proof), fibonacci,
+/// a keccak job, an rv32im job (memory-merkle) and fibonacci again, each wrapped in Groth16 (the
+/// worker verifies every receipt before answering). Under such a limit the worker releases the
+/// Groth16 key after every proof; its stderr must show one release per wrap, each freeing a whole
+/// prover of one named layout (under the default layout switches, exactly 4 GiB: split_h + tw_lent;
+/// 8 GiB: whole; any other budget or any `RISC0_G16_METAL_{G10,G10_OFF,SPLIT_H,TW_LENT}` set:
+/// whichever single layout the worker identified), back to the pipelines alone.
+///
+///   cargo test --release -p zkminer-prove-risc0 --features metal --test metal_worker --no-run
+///   gpu-run --tag <who> -- <that test binary> --ignored --nocapture --test-threads=1 a_tight_worker
+#[test]
+#[ignore = "proves on the Apple GPU; run with --ignored"]
+fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
+    use std::io::BufRead;
+    use std::sync::{Arc, Mutex};
+    let _gpu = gpu_test_lock();
+    const GIB: u64 = 1 << 30;
+    let budget: u64 = std::env::var("ZKMINER_B9_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(4 * GIB);
+    {
+        use zkminer_prover::metal_sizing::{job_po2_for_limit, keep_groth16_cache};
+        let po2 = job_po2_for_limit(budget);
+        assert!(
+            !keep_groth16_cache(budget, po2),
+            "a {budget} B limit keeps the Groth16 key at po2 {po2} (metal_sizing::keep_groth16_cache): \
+             nothing to release"
+        );
+    }
+    // `ZKMINER_B9_WORKER`: another worker binary (e.g. one built before B9-ZK, which proves the same
+    // jobs but does not log its releases; the release checks are then skipped).
+    let other_worker = std::env::var("ZKMINER_B9_WORKER").ok();
+    let worker: &str = other_worker
+        .as_deref()
+        .unwrap_or(env!("CARGO_BIN_EXE_zkminer-prove-risc0-metal"));
+    let keccak_path =
+        std::env::var("ZKMINER_B9_KECCAK_ELF").unwrap_or_else(|_| FORK_MULTI_TEST_BIN.to_string());
+    let keccak_elf = std::fs::read(&keccak_path).unwrap_or_else(|e| {
+        panic!(
+            "the keccak guest {keccak_path}: {e}. Build the fork's risc0-zkvm-methods (any risc0-zkvm \
+             test build does) or point ZKMINER_B9_KECCAK_ELF at a multi_test .bin"
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let export = |name: &str| -> Vec<u8> {
+        let path = dir.path().join(format!("{name}.elf"));
+        // This build's worker: one built before B9-ZK exports only fibonacci.
+        let out = Command::new(env!("CARGO_BIN_EXE_zkminer-prove-risc0-metal"))
+            .arg("--export-guest")
+            .arg(name)
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "export {name}");
+        std::fs::read(&path).unwrap()
+    };
+    let fibonacci = export("fibonacci");
+    let merkle = export("memory-merkle");
+
+    let mut child = Command::new(worker)
+        .env("RISC0_METAL_MAX_WORKING_SET_BYTES", budget.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the worker");
+    // The worker's log, echoed and kept for the checks below.
+    let log: Arc<Mutex<Vec<String>>> = Arc::default();
+    let tee = {
+        let log = log.clone();
+        let err = BufReader::new(child.stderr.take().unwrap());
+        std::thread::spawn(move || {
+            for line in err.lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                log.lock().unwrap().push(line);
+            }
+        })
+    };
+    let mut to = BufWriter::new(child.stdin.take().unwrap());
+    let mut from = BufReader::new(child.stdout.take().unwrap());
+    let mut ask = |cmd: &WorkerCommand| -> WorkerResponse {
+        write_message(&mut to, cmd).unwrap();
+        to.flush().unwrap();
+        loop {
+            match read_message(&mut from).unwrap() {
+                WorkerResponse::Progress { .. } => continue,
+                other => return other,
+            }
+        }
+    };
+
+    let t = Instant::now();
+    match ask(&WorkerCommand::Warmup { request_id: 1 }) {
+        WorkerResponse::WarmupDone { summary, .. } => {
+            eprintln!("B9 warm-up ({:.1} s): {summary}", t.elapsed().as_secs_f64());
+            assert!(summary.contains("verified a Groth16 proof"), "{summary}");
+        }
+        other => panic!("warm-up: unexpected {other:?}"),
+    }
+    let keccak_input: Vec<u8> = KECCAK_UNION_1_WORDS
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let jobs: [(&str, &[u8], Vec<u8>); 4] = [
+        ("fibonacci", &fibonacci, 100_000u32.to_le_bytes().to_vec()),
+        ("keccak", &keccak_elf, keccak_input),
+        (
+            "rv32im (memory-merkle)",
+            &merkle,
+            64u32.to_le_bytes().to_vec(),
+        ),
+        (
+            "fibonacci again",
+            &fibonacci,
+            1_000u32.to_le_bytes().to_vec(),
+        ),
+    ];
+    for (i, (name, elf, input)) in jobs.iter().enumerate() {
+        let t = Instant::now();
+        match ask(&WorkerCommand::Prove {
+            request_id: 10 + i as u64,
+            elf: elf.to_vec(),
+            input_data: input.clone(),
+            po2: None,
+            program_id: None,
+        }) {
+            WorkerResponse::ProofResult { seal, cycles, .. } => {
+                eprintln!(
+                    "B9 job {name}: {cycles} cycles, {} seal bytes, {:.2} s",
+                    seal.len(),
+                    t.elapsed().as_secs_f64()
+                );
+                assert_eq!(seal.len(), 256, "{name}: a Groth16 proof");
+            }
+            other => panic!("{name}: unexpected {other:?}"),
+        }
+    }
+    write_message(&mut to, &WorkerCommand::Shutdown).unwrap();
+    to.flush().unwrap();
+    assert!(child.wait().unwrap().success());
+    tee.join().unwrap();
+
+    // One release per wrap (the warm-up's and the four jobs'), each a whole prover.
+    let log = log.lock().unwrap();
+    let releases: Vec<&String> = log
+        .iter()
+        .filter(|l| l.contains("Groth16 proving key released:"))
+        .collect();
+    if releases.is_empty() && other_worker.is_some() {
+        eprintln!("B9: {worker} logs no releases: release checks skipped");
+        return;
+    }
+    assert_eq!(releases.len(), 1 + jobs.len(), "{releases:#?}");
+    // The two measured tiers name their layout under the default switches; any other budget, or
+    // any Groth16 layout revert knob set, must name exactly one layout (not a tie, not
+    // unidentified), whichever choose_layout took there (round-2 review: with
+    // RISC0_G16_METAL_SPLIT_H=off at 4 GiB it is whole + tw_lent).
+    let default_switches = [
+        "RISC0_G16_METAL_G10",
+        "RISC0_G16_METAL_G10_OFF",
+        "RISC0_G16_METAL_SPLIT_H",
+        "RISC0_G16_METAL_TW_LENT",
+    ]
+    .iter()
+    .all(|k| std::env::var_os(k).is_none());
+    let want = match budget {
+        _ if !default_switches => None,
+        b if b == 4 * GIB => Some("prover layout split_h + tw_lent"),
+        b if b == 8 * GIB => Some("prover layout whole"),
+        _ => None,
+    };
+    let number_before = |l: &str, tail: &str| -> f64 {
+        let head = &l[..l.find(tail).unwrap_or_else(|| panic!("{tail:?} in {l}"))];
+        head.rsplit(' ').next().unwrap().parse().unwrap()
+    };
+    for l in &releases {
+        match want {
+            Some(want) => assert!(l.contains(want), "expected {want}: {l}"),
+            None => {
+                let layout = l
+                    .split("prover layout ")
+                    .nth(1)
+                    .and_then(|t| t.split([';', ',']).next())
+                    .unwrap_or_else(|| panic!("no layout in {l}"));
+                assert!(
+                    layout != "unidentified" && !layout.contains(" or "),
+                    "one named layout expected: {l}"
+                );
+            }
+        }
+        let freed = number_before(l, " MiB of device memory freed");
+        assert!(freed > 3800.0, "a whole Groth16 prover is freed: {l}");
+        let now: f64 = l
+            .split("device allocation now ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no allocation in {l}"));
+        assert!(now < 256.0, "back to the pipelines after the release: {l}");
+    }
+}
+
 /// `phys_footprint` (now, lifetime peak) of a child process, in bytes.
 fn footprint(pid: u32) -> Option<(u64, u64)> {
     // SAFETY: plain old data; `proc_pid_rusage` fills at most one `rusage_info_v4`.

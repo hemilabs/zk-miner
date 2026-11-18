@@ -214,13 +214,15 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--export-guest") {
         let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
-            eprintln!("usage: --export-guest fibonacci <path>");
+            eprintln!("usage: --export-guest fibonacci|memory-merkle <path>");
             std::process::exit(2);
         };
         let elf = match name.as_str() {
             "fibonacci" => FIBONACCI_ELF,
+            // B9-ZK: a second rv32im guest for the IPC job-sequence test (tests/metal_worker.rs).
+            "memory-merkle" => MEMORY_MERKLE_ELF,
             other => {
-                eprintln!("unknown guest {other:?} (known: fibonacci)");
+                eprintln!("unknown guest {other:?} (known: fibonacci, memory-merkle)");
                 std::process::exit(2);
             }
         };
@@ -1524,9 +1526,14 @@ fn release_groth16_cache_if_tight() {
         release
     });
     if release {
+        #[cfg(feature = "metal")]
+        let before = metal_host::allocated_bytes();
         if let Err(e) = risc0_groth16::prove::release_srs() {
             tracing::warn!("could not release the Groth16 SRS cache: {e:#}");
         }
+        // B9-ZK: one line per release with what it freed and the prover layout that identifies.
+        #[cfg(feature = "metal")]
+        metal_host::log_groth16_release(before, metal_host::allocated_bytes());
     }
 }
 

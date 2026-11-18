@@ -24,7 +24,6 @@ const GIB: u64 = 1 << 30;
 /// 16, so a 16 GB machine is never refused over how the OS rounds `hw.memsize`.
 pub const MIN_HOST_MEMORY_BYTES: u64 = 12 * GIB;
 
-
 /// The Mac this worker runs on, if it is one the worker supports.
 #[derive(Debug, Clone)]
 pub struct MetalHost {
@@ -384,6 +383,142 @@ pub fn release_after_proof() {
     );
 }
 
+/// The Groth16 prover's memory layouts (risc0 groth16-sys `MemOptions`, items P31-12 / B9-4G), named
+/// as the worker logs them, with the switches that force each one.
+const GROTH16_LAYOUTS: [(&str, bool, bool); 4] = [
+    ("whole", false, false),
+    ("split_h", true, false),
+    ("whole + tw_lent", false, true),
+    ("split_h + tw_lent", true, true),
+];
+
+/// Whether risc0's `choose_layout` can build the layout (`split`, `lent`) under these switches: a
+/// forced switch admits only its own side; under `auto` for both, whole + tw_lent is never taken
+/// (its plan is above split_h's, which is tried first, so it is never the first that fits nor the
+/// smallest). Release-line review finding: at a 4300 MiB budget the prover took split_h, 2 MiB from
+/// whole + tw_lent's plan, and the line named both.
+fn groth16_layout_reachable(
+    split_h: risc0_groth16_sys::metal::prover::SplitH,
+    tw_lent: risc0_groth16_sys::metal::prover::TwLent,
+    split: bool,
+    lent: bool,
+) -> bool {
+    use risc0_groth16_sys::metal::prover::{SplitH, TwLent};
+    let split_ok = match split_h {
+        SplitH::On => split,
+        SplitH::Off => !split,
+        SplitH::Auto => true,
+    };
+    let lent_ok = match tw_lent {
+        TwLent::On => lent,
+        TwLent::Off => !lent,
+        TwLent::Auto => true,
+    };
+    let auto_never = split_h == SplitH::Auto && tw_lent == TwLent::Auto && !split && lent;
+    split_ok && lent_ok && !auto_never
+}
+
+/// Device bytes each Groth16 layout reachable under this process's memory switches plans (header
+/// reads only; kept once read, retried while the component is missing). Each layout is forced, so
+/// the figure does not depend on the room at the moment it is read. [warm_up_pipelines] reads it at
+/// start, so no proof waits for it.
+fn groth16_layout_plans() -> Option<&'static [(&'static str, u64)]> {
+    static PLANS: OnceLock<Vec<(&'static str, u64)>> = OnceLock::new();
+    if let Some(plans) = PLANS.get() {
+        return Some(plans);
+    }
+    use risc0_groth16_sys::metal::prover::{planned_bytes, MemOptions, SplitH, TwLent};
+    let dir = crate::groth16_component::dir()?;
+    let setup = risc0_groth16_sys::SetupParams::new(&dir).ok()?;
+    let base = MemOptions::from_env();
+    let plans: Vec<_> = GROTH16_LAYOUTS
+        .iter()
+        .filter(|&&(_, split, lent)| {
+            groth16_layout_reachable(base.split_h, base.tw_lent, split, lent)
+        })
+        .filter_map(|&(name, split, lent)| {
+            let mem = MemOptions {
+                split_h: if split { SplitH::On } else { SplitH::Off },
+                tw_lent: if lent { TwLent::On } else { TwLent::Off },
+                ..base
+            };
+            Some((name, planned_bytes(&setup, mem).ok()?))
+        })
+        .collect();
+    if plans.is_empty() {
+        return None;
+    }
+    Some(PLANS.get_or_init(|| plans))
+}
+
+/// The layout whose planned footprint is nearest to `freed` (the device bytes a release of the
+/// cached prover gave back; the plan is the real growth plus at most a few MiB, B9-4G), or both
+/// names when two are within 8 MiB of each other (split_h and whole + tw_lent are 2 MiB apart with
+/// the v0.2.0 key; under the default `auto` switches whole + tw_lent is never chosen). `None`
+/// when nothing is within 64 MiB (no prover was cached, or the switches changed).
+fn groth16_layout_of(freed: u64, plans: &[(&'static str, u64)]) -> Option<String> {
+    const NEAR: u64 = 64 << 20;
+    const TIE: u64 = 8 << 20;
+    let mut by_distance: Vec<(u64, &str)> = plans
+        .iter()
+        .map(|&(name, planned)| (planned.abs_diff(freed), name))
+        .collect();
+    by_distance.sort();
+    let &(best, name) = by_distance.first()?;
+    if best > NEAR {
+        return None;
+    }
+    Some(match by_distance.get(1) {
+        Some(&(next, other)) if next <= best + TIE => format!("{name} or {other}"),
+        _ => name.to_string(),
+    })
+}
+
+/// Logs what releasing the Groth16 proving key gave back (`before` / `after`: the device allocation
+/// around `release_srs`), and the prover layout that size identifies (B9-4G open issue: the 4 GiB
+/// tier must build split_h + tw_lent, the 8 GiB tier the whole layout). One info line per release:
+/// the evidence that the worker frees the key between jobs below the keep threshold.
+pub fn log_groth16_release(before: u64, after: u64) {
+    let freed = before.saturating_sub(after);
+    if freed < (256 << 20) {
+        tracing::info!(
+            "Groth16 proving key released: no prover was cached ({:.1} MiB freed); device \
+             allocation now {:.1} MiB",
+            mib(freed),
+            mib(after)
+        );
+        return;
+    }
+    let layout = groth16_layout_plans()
+        .and_then(|plans| groth16_layout_of(freed, plans))
+        .unwrap_or_else(|| "unidentified".to_string());
+    // Only when every named layout lends the twiddles (a tie can name one that does not).
+    let prefault = if layout.split(" or ").all(|name| name.contains("tw_lent")) {
+        if std::env::var("RISC0_G16_METAL_TW_PREFAULT").as_deref() == Ok("0") {
+            ", tw_prefault off"
+        } else {
+            ", tw_prefault on"
+        }
+    } else {
+        ""
+    };
+    tracing::info!(
+        "Groth16 proving key released: {:.1} MiB of device memory freed (prover layout {layout}\
+         {prefault}; planned {}), device allocation now {:.1} MiB",
+        mib(freed),
+        groth16_layout_plans().map_or_else(
+            || "unknown".to_string(),
+            |plans| plans
+                .iter()
+                .map(|(n, b)| format!("{n} {:.1}", mib(*b)))
+                .collect::<Vec<_>>()
+                .join(", ")
+                + " MiB"
+        ),
+        mib(after)
+    );
+}
+
 /// Samples `currentAllocatedSize` every 2 ms on a background thread and records the peak per named
 /// phase (PLAN 9.1: peak GPU memory per phase is a first-class metric).
 pub struct PeakSampler {
@@ -543,31 +678,68 @@ const KECCAK_PREWARM_TIGHT_MARGIN: u64 = 512 << 20;
 
 /// The Groth16 prover's planned footprint assumed while it cannot be read (the v0.2.0 component not
 /// installed yet: a host upgraded from risc0 3.0 gets it from the first Warmup, after this decision
-/// is latched): what risc0 3.1's prover plans under a 4 GiB limit (4235118872 B, its smallest plan,
-/// P31-19). Assuming it defers keccak on a tight host instead of building it and then refusing every
-/// wrap; a roomy limit is unaffected.
-const GROTH16_PLAN_FALLBACK: u64 = 4_235_118_872;
+/// is latched): risc0 3.1's smallest plan, split_h + tw_lent, which a 4 GiB limit takes since B9-4G
+/// (3885.0 MiB in the worker's release line, B9-ZK; rounded up). Was 4235118872 B (P31-19, before
+/// B9-4G made the check exact and lent the NTT twiddles). Below about 3.9 GiB + the pipelines this
+/// still defers keccak instead of building it and then refusing every wrap; a roomy limit is
+/// unaffected. It assumes the default `auto` split_h/tw_lent switches; with either not `auto` the
+/// smallest buildable plan can be larger, so [groth16_plan_fallback] takes
+/// [GROTH16_PLAN_FALLBACK_FORCED] instead.
+const GROTH16_PLAN_FALLBACK: u64 = 3886 << 20;
+
+/// The fallback when the split_h or tw_lent switch is not `auto`: the whole layout's plan, the
+/// largest of the four split_h/tw_lent layouts (4141.0 MiB with the v0.2.0 key, B9-4G), rounded
+/// up. Defers keccak where the forced layout might not fit. It covers those two switches only: with
+/// compact, mmap or alias off (`RISC0_G16_METAL_G10=0`, which is the G9 layout, or
+/// `RISC0_G16_METAL_G10_OFF=compact|alias`) the real plan is about 1.3 GB larger and both fallbacks
+/// understate it. That only matters before the component is installed and with a debug knob set.
+const GROTH16_PLAN_FALLBACK_FORCED: u64 = 4142 << 20;
+
+/// [GROTH16_PLAN_FALLBACK] under the default switches, [GROTH16_PLAN_FALLBACK_FORCED] otherwise.
+fn groth16_plan_fallback_for(
+    split_h: risc0_groth16_sys::metal::prover::SplitH,
+    tw_lent: risc0_groth16_sys::metal::prover::TwLent,
+) -> u64 {
+    use risc0_groth16_sys::metal::prover::{SplitH, TwLent};
+    if split_h == SplitH::Auto && tw_lent == TwLent::Auto {
+        GROTH16_PLAN_FALLBACK
+    } else {
+        GROTH16_PLAN_FALLBACK_FORCED
+    }
+}
+
+/// [groth16_plan_fallback_for] this process's switches.
+fn groth16_plan_fallback() -> u64 {
+    let mem = risc0_groth16_sys::metal::prover::MemOptions::from_env();
+    groth16_plan_fallback_for(mem.split_h, mem.tw_lent)
+}
 
 /// Why the worker-start keccak pipeline build must not run, or `None` when it should. `limit` is
 /// the working-set limit, `allocated` the device allocation after the other circuits' pipelines,
-/// `groth16` the Groth16 prover's planned footprint (`None`: unknown, e.g. no component yet).
+/// `groth16` the Groth16 prover's planned footprint (`None`: unknown, e.g. no component yet), and
+/// `fallback` the footprint assumed when it is unknown (production passes
+/// [groth16_plan_fallback], which reads this process's layout switches; taking it as an argument
+/// keeps this function pure, so its tests do not depend on the environment's revert knobs).
 ///
-/// risc0 3.1's Groth16 prover (v0.2.0 key) plans 4039 MiB at a 4 GiB budget (P31-12 `split_h`), and
-/// the worker's process-wide pipelines hold 62 MiB with keccak's, 46 MiB without: 4101 MiB does not
-/// fit 4096, 4085 MiB does. The keccak pipelines are never freed once built, so building them at
-/// start under such a limit would fail every wrap of the worker's life, keccak or not.
+/// The keccak pipelines are never freed once built, so building them at start under a limit that
+/// then cannot hold the Groth16 prover beside them would fail every wrap of the worker's life,
+/// keccak or not. Before B9-4G that was the 4 GiB tier (a 4039 MiB plan + 62 MiB of pipelines >
+/// 4096 MiB). Since B9-4G the prover plans 3885 MiB there (split_h + tw_lent) and keccak is built at
+/// start (151.8 MiB of headroom measured with every pipeline built); the rule still guards
+/// smaller limits.
 fn keccak_prewarm_refusal(
     knob: Option<&str>,
     limit: Option<u64>,
     allocated: u64,
     groth16: Option<u64>,
+    fallback: u64,
 ) -> Option<String> {
     match knob.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
         Some("off" | "0" | "false") => return Some(format!("{KECCAK_PREWARM_ENV}=off")),
         Some("on" | "1" | "true") => return None,
         _ => {}
     }
-    let (limit, groth16) = (limit?, groth16.unwrap_or(GROTH16_PLAN_FALLBACK));
+    let (limit, groth16) = (limit?, groth16.unwrap_or(fallback));
     let need = allocated
         .saturating_add(groth16)
         .saturating_add(KECCAK_PIPELINES_RESERVE);
@@ -622,19 +794,27 @@ pub fn warm_up_pipelines() -> &'static str {
         }
         let limit = risc0_groth16_sys::effective_working_set_limit();
         let groth16_plan = groth16_planned_bytes();
+        // Read now (header reads, off any proof's path) for the per-release layout line.
+        let _ = groth16_layout_plans();
         // Decide now when the answer cannot depend on what the other builds allocate.
         let early = match knob
             .as_deref()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref()
         {
-            Some("off" | "0" | "false") | Some("on" | "1" | "true") => Some(
-                keccak_prewarm_refusal(knob.as_deref(), limit, 0, groth16_plan),
-            ),
+            Some("off" | "0" | "false") | Some("on" | "1" | "true") => {
+                Some(keccak_prewarm_refusal(
+                    knob.as_deref(),
+                    limit,
+                    0,
+                    groth16_plan,
+                    groth16_plan_fallback(),
+                ))
+            }
             _ => match limit {
                 Some(l)
                     if l < groth16_plan
-                        .unwrap_or(GROTH16_PLAN_FALLBACK)
+                        .unwrap_or_else(groth16_plan_fallback)
                         .saturating_add(KECCAK_PREWARM_TIGHT_MARGIN) =>
                 {
                     None
@@ -665,9 +845,13 @@ pub fn warm_up_pipelines() -> &'static str {
         if keccak.is_none() {
             let refusal = match early {
                 Some(r) => r,
-                None => {
-                    keccak_prewarm_refusal(knob.as_deref(), limit, allocated_bytes(), groth16_plan)
-                }
+                None => keccak_prewarm_refusal(
+                    knob.as_deref(),
+                    limit,
+                    allocated_bytes(),
+                    groth16_plan,
+                    groth16_plan_fallback(),
+                ),
             };
             keccak = Some(match refusal {
                 None => Ok(timed(risc0_circuit_keccak::prove::metal_warmup)()),
@@ -787,8 +971,12 @@ mod tests {
         assert!(is_metal_oom(
             "failed to load the groth16 proving key: Metal working-set budget exceeded: x"
         ));
-        assert!(is_metal_oom("Metal allocation failed on evaluated: 7 bytes"));
-        assert!(!is_metal_oom("called `Result::unwrap()` on an `Err` value: PoisonError"));
+        assert!(is_metal_oom(
+            "Metal allocation failed on evaluated: 7 bytes"
+        ));
+        assert!(!is_metal_oom(
+            "called `Result::unwrap()` on an `Err` value: PoisonError"
+        ));
     }
 
     #[test]
@@ -805,38 +993,193 @@ mod tests {
     #[test]
     fn the_keccak_prewarm_yields_to_the_groth16_prover_under_a_tight_limit() {
         const MIB: u64 = 1 << 20;
+        // The default switches' fallback, named explicitly: the env's revert knobs must not matter.
+        const FB: u64 = GROTH16_PLAN_FALLBACK;
         let g16 = 4039 * MIB;
-        // The 4 GiB tier on risc0 3.1: 46 MiB of other pipelines, 4039 MiB prover.
-        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, Some(g16)).is_some());
-        assert!(keccak_prewarm_refusal(Some("auto"), Some(4 * GIB), 46 * MIB, Some(g16)).is_some());
+        // The 4 GiB tier on risc0 3.1 before B9-4G: 46 MiB of other pipelines, 4039 MiB prover.
+        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, Some(g16), FB).is_some());
+        assert!(
+            keccak_prewarm_refusal(Some("auto"), Some(4 * GIB), 46 * MIB, Some(g16), FB).is_some()
+        );
+        // Since B9-4G: 3885 MiB (split_h + tw_lent) beside 46 MiB of pipelines leaves room: built.
+        assert_eq!(
+            keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, Some(3885 * MIB), FB),
+            None
+        );
         // Room enough: built.
         assert_eq!(
-            keccak_prewarm_refusal(None, Some(8 * GIB), 46 * MIB, Some(g16)),
+            keccak_prewarm_refusal(None, Some(8 * GIB), 46 * MIB, Some(g16), FB),
             None
         );
         assert_eq!(
-            keccak_prewarm_refusal(None, Some(4 * GIB + 100 * MIB), 46 * MIB, Some(g16)),
+            keccak_prewarm_refusal(None, Some(4 * GIB + 100 * MIB), 46 * MIB, Some(g16), FB),
             None
         );
         // Unknown limit: built (wave 7's behaviour).
         assert_eq!(
-            keccak_prewarm_refusal(None, None, 46 * MIB, Some(g16)),
+            keccak_prewarm_refusal(None, None, 46 * MIB, Some(g16), FB),
             None
         );
         // Unknown prover footprint (a host upgraded from 3.0, the v0.2.0 component not installed
-        // yet when the decision is latched): the 4 GiB tier defers keccak, a roomy limit builds it.
-        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None).is_some());
+        // yet when the decision is latched): assumed the smallest plan, as at a known 4 GiB plan
+        // (built at 4 GiB); a limit that cannot hold it beside the pipelines defers keccak.
         assert_eq!(
-            keccak_prewarm_refusal(None, Some(8 * GIB), 46 * MIB, None),
+            keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None, FB),
+            None
+        );
+        assert!(keccak_prewarm_refusal(None, Some(3900 * MIB), 46 * MIB, None, FB).is_some());
+        assert_eq!(
+            keccak_prewarm_refusal(None, Some(8 * GIB), 46 * MIB, None, FB),
             None
         );
         // The knob wins either way.
         assert_eq!(
-            keccak_prewarm_refusal(Some("on"), Some(4 * GIB), 46 * MIB, Some(g16)),
+            keccak_prewarm_refusal(Some("on"), Some(4 * GIB), 46 * MIB, Some(g16), FB),
             None
         );
-        assert!(keccak_prewarm_refusal(Some("off"), Some(28 * GIB), 0, Some(g16)).is_some());
-        assert!(keccak_prewarm_refusal(Some("0"), None, 0, None).is_some());
+        assert!(keccak_prewarm_refusal(Some("off"), Some(28 * GIB), 0, Some(g16), FB).is_some());
+        assert!(keccak_prewarm_refusal(Some("0"), None, 0, None, FB).is_some());
+    }
+
+    /// B9-ZK: the release line names the layout from the freed size (B9-4G's v0.2.0 plans: whole
+    /// 4141.0, split_h 4010.9, whole + tw_lent 4013.0, split_h + tw_lent 3885.0 MiB; real growth
+    /// 2.7-2.9 MiB below each).
+    #[test]
+    fn a_released_prover_is_named_by_its_size() {
+        const MIB: u64 = 1 << 20;
+        let mb = |m: f64| (m * MIB as f64) as u64;
+        let plans = [
+            ("whole", mb(4141.0)),
+            ("split_h", mb(4010.9)),
+            ("whole + tw_lent", mb(4013.0)),
+            ("split_h + tw_lent", mb(3885.0)),
+        ];
+        assert_eq!(
+            groth16_layout_of(mb(4138.1), &plans).as_deref(),
+            Some("whole")
+        );
+        assert_eq!(
+            groth16_layout_of(mb(3882.2), &plans).as_deref(),
+            Some("split_h + tw_lent")
+        );
+        // split_h and whole + tw_lent are 2.1 MiB apart: both named.
+        let mid = groth16_layout_of(mb(4008.0), &plans).unwrap();
+        assert!(
+            mid.contains("split_h") && mid.contains("whole + tw_lent"),
+            "{mid}"
+        );
+        // Nothing near any layout: not named.
+        assert_eq!(groth16_layout_of(mb(3000.0), &plans), None);
+        assert_eq!(groth16_layout_of(mb(4141.0), &[]), None);
+        // Review finding (4300 MiB budget): under the default auto switches whole + tw_lent is not
+        // reachable, so the 4008 MiB release of a split_h prover is named split_h alone.
+        use risc0_groth16_sys::metal::prover::{SplitH, TwLent};
+        let reachable: Vec<_> = GROTH16_LAYOUTS
+            .iter()
+            .zip(plans)
+            .filter(|((_, s, l), _)| groth16_layout_reachable(SplitH::Auto, TwLent::Auto, *s, *l))
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            reachable.iter().map(|p| p.0).collect::<Vec<_>>(),
+            ["whole", "split_h", "split_h + tw_lent"]
+        );
+        assert_eq!(
+            groth16_layout_of(mb(4008.0), &reachable).as_deref(),
+            Some("split_h")
+        );
+    }
+
+    #[test]
+    fn a_forced_layout_switch_admits_only_its_side() {
+        use risc0_groth16_sys::metal::prover::{SplitH, TwLent};
+        let names = |s: SplitH, t: TwLent| -> Vec<&str> {
+            GROTH16_LAYOUTS
+                .iter()
+                .filter(|&&(_, sp, l)| groth16_layout_reachable(s, t, sp, l))
+                .map(|l| l.0)
+                .collect()
+        };
+        assert_eq!(names(SplitH::Off, TwLent::Off), ["whole"]);
+        assert_eq!(
+            names(SplitH::On, TwLent::Auto),
+            ["split_h", "split_h + tw_lent"]
+        );
+        assert_eq!(
+            names(SplitH::Off, TwLent::Auto),
+            ["whole", "whole + tw_lent"]
+        );
+        assert_eq!(
+            names(SplitH::Auto, TwLent::On),
+            ["whole + tw_lent", "split_h + tw_lent"]
+        );
+        assert_eq!(names(SplitH::Auto, TwLent::Off), ["whole", "split_h"]);
+    }
+
+    /// Review finding: the fallback plan (no component yet) is the smallest auto plan; with a
+    /// forced switch the real plan can be larger, so the fallback is the largest one, and a 4 GiB
+    /// host then defers keccak instead of building it beside a prover that may not fit.
+    #[test]
+    fn the_keccak_fallback_plan_follows_the_layout_switches() {
+        use risc0_groth16_sys::metal::prover::{SplitH, TwLent};
+        assert_eq!(
+            groth16_plan_fallback_for(SplitH::Auto, TwLent::Auto),
+            GROTH16_PLAN_FALLBACK
+        );
+        for (s, t) in [
+            (SplitH::On, TwLent::Auto),
+            (SplitH::Auto, TwLent::Off),
+            (SplitH::Off, TwLent::Off),
+        ] {
+            assert_eq!(
+                groth16_plan_fallback_for(s, t),
+                GROTH16_PLAN_FALLBACK_FORCED
+            );
+        }
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let forced = GROTH16_PLAN_FALLBACK_FORCED;
+        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 62 * MIB, Some(forced), 0).is_some());
+        assert!(keccak_prewarm_refusal(
+            None,
+            Some(4 * GIB),
+            62 * MIB,
+            Some(GROTH16_PLAN_FALLBACK),
+            0
+        )
+        .is_none());
+        // Unknown plan: the fallback passed in decides (the default one builds keccak at 4 GiB,
+        // the forced one defers it).
+        assert!(keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None, forced).is_some());
+        assert!(
+            keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None, GROTH16_PLAN_FALLBACK)
+                .is_none()
+        );
+    }
+
+    /// Round-2 review finding: the env-reading path, checked against the environment the suite
+    /// runs in (so it passes with or without a layout revert knob set). With none of the knobs set
+    /// it must be the default fallback; with any, one of the two.
+    #[test]
+    fn the_process_fallback_plan_reads_the_layout_knobs() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        let fb = groth16_plan_fallback();
+        let knobs = [
+            "RISC0_G16_METAL_G10",
+            "RISC0_G16_METAL_G10_OFF",
+            "RISC0_G16_METAL_SPLIT_H",
+            "RISC0_G16_METAL_TW_LENT",
+        ];
+        if knobs.iter().all(|k| std::env::var_os(k).is_none()) {
+            assert_eq!(fb, GROTH16_PLAN_FALLBACK);
+        } else {
+            assert!(fb == GROTH16_PLAN_FALLBACK || fb == GROTH16_PLAN_FALLBACK_FORCED);
+        }
+        assert_eq!(
+            keccak_prewarm_refusal(None, Some(4 * GIB), 46 * MIB, None, fb).is_some(),
+            fb == GROTH16_PLAN_FALLBACK_FORCED
+        );
     }
 
     #[test]
