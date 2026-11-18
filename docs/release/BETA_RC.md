@@ -81,6 +81,9 @@ The kit from the build job's upload is the candidate above.
 
 **Where the docs are wrong or unclear** (none blocks the beta; items 1 and 2 should be fixed before the tag):
 
+Fixed after RC1 by BETA-FIX (`docs/metal-port-notes/BETA-FIX.md`): items 1 and 5, and `check-macos-kit.py` now
+fails a kit whose README does not match its archives or size.
+
 1. **README "First start and the offline archives" does not match a CI-built kit.**
    - What it says: "GPU family `applegpu_g17s` on macOS 27: the kit ships pre-compiled archives. The first
      start then takes about 2.3 s." Install step 5 and the Files table also describe `metal-aot/` archives
