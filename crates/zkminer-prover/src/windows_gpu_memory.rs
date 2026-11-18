@@ -72,9 +72,20 @@ fn dedicated_mib_on_card(pci_bus_id: &str, used_mib: u64) -> Option<HashMap<u32,
     None
 }
 
-/// Device memory of `pids` on the card at `pci_bus_id` (normalized, `0000:03:00.0`) that Windows has
-/// moved off the card, in MiB: `None` when the card cannot be matched to one adapter or the counters
-/// cannot be read.
+/// What a running proof's processes (`pids`) and every other process hold of a card, in MiB, from
+/// one reading of Windows' counters (`proof_card_use`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProofCardUse {
+    /// Of `pids`' memory on the card, what Windows has moved off it.
+    pub evicted_mib: u64,
+    /// What every OTHER process has allocated on the card: other programs, and our other workers.
+    pub others_mib: u64,
+}
+
+/// [`ProofCardUse`] for `pids` on the card at `pci_bus_id` (normalized, `0000:03:00.0`): `None`
+/// when the card cannot be matched to one adapter or the counters cannot be read.
+///
+/// `evicted_mib` is the device memory of `pids` that Windows has moved off the card.
 ///
 /// A process's `Dedicated Usage` is the device memory it has allocated, and its `Local Usage` the
 /// part of it resident on the card right now. They are equal while it has the card to itself: an
@@ -83,7 +94,12 @@ fn dedicated_mib_on_card(pci_bus_id: &str, used_mib: u64) -> Option<HashMap<u32,
 /// it pages them in turns, and our server read 9 MiB resident of 9,875 allocated for seconds at a
 /// time while its proofs took 8-12 times as long. That gap is what this measures. Both counters are
 /// read in one collection, so a block freed between two reads cannot look evicted.
-pub(crate) fn evicted_mib_on_card(pids: &[u32], pci_bus_id: &str) -> Option<u64> {
+///
+/// `others_mib` is what the card's other processes have allocated there. A program that takes
+/// memory without either of them being paged (it and ours fit together) still leaves ours less to
+/// work with: a risc0 benchmark on an RTX 4070 ran at half speed beside 6 GB of another program's,
+/// resident throughout. A measurement during which this grew is no measurement of the card.
+pub(crate) fn proof_card_use(pids: &[u32], pci_bus_id: &str) -> Option<ProofCardUse> {
     let luid = d3dkmt::adapters().and_then(|a| luid_for_pci(&a, pci_bus_id))?;
     let mut read = pdh::read_counter_arrays(&[
         r"\GPU Process Memory(*)\Dedicated Usage",
@@ -91,24 +107,35 @@ pub(crate) fn evicted_mib_on_card(pids: &[u32], pci_bus_id: &str) -> Option<u64>
     ])?;
     let local = read.pop()?;
     let dedicated = read.pop()?;
-    Some(evicted_mib(&dedicated, &local, luid, pids))
+    Some(card_use(&dedicated, &local, luid, pids))
 }
 
-/// MiB of `pids`' `dedicated` memory on `luid` that is not `local` (resident), summed.
-fn evicted_mib(
+/// [`ProofCardUse`] from one reading: `pids`' `dedicated` memory on `luid` that is not `local`
+/// (resident), summed, and every other process's `dedicated` memory there.
+fn card_use(
     dedicated: &[(String, u64)],
     local: &[(String, u64)],
     luid: AdapterLuid,
     pids: &[u32],
-) -> u64 {
+) -> ProofCardUse {
     let (dedicated, _) = on_adapter(dedicated, &[], luid);
     let (local, _) = on_adapter(local, &[], luid);
-    pids.iter()
+    let evicted_mib = pids
+        .iter()
         .map(|pid| {
             let held = dedicated.get(pid).copied().unwrap_or(0);
             held.saturating_sub(local.get(pid).copied().unwrap_or(0))
         })
-        .sum()
+        .sum();
+    let others_mib = dedicated
+        .iter()
+        .filter(|(pid, _)| !pids.contains(pid))
+        .map(|(_, mib)| *mib)
+        .sum();
+    ProofCardUse {
+        evicted_mib,
+        others_mib,
+    }
 }
 
 /// Whether an adapter's own `Dedicated Usage` (MiB) is the same reading as `nvidia-smi`'s
@@ -490,16 +517,26 @@ mod tests {
             ("pid_100_luid_0x00000000_0x00c5debb_phys_0".to_string(), 0),
             ("pid_200_luid_0x00000000_0x00c3ca54_phys_0".to_string(), 0),
         ];
-        assert_eq!(evicted_mib(&dedicated, &local, CARD, &[100, 101]), 9_866);
-        assert_eq!(evicted_mib(&dedicated, &local, CARD, &[101]), 0);
-        assert_eq!(evicted_mib(&dedicated, &local, OTHER, &[100]), 500);
+        let evicted = |local: &[(String, u64)], luid, pids: &[u32]| {
+            card_use(&dedicated, local, luid, pids).evicted_mib
+        };
+        assert_eq!(evicted(&local, CARD, &[100, 101]), 9_866);
+        assert_eq!(evicted(&local, CARD, &[101]), 0);
+        assert_eq!(evicted(&local, OTHER, &[100]), 500);
         // A process with no memory on the card, or no reading, has none evicted.
-        assert_eq!(evicted_mib(&dedicated, &local, CARD, &[999]), 0);
+        assert_eq!(evicted(&local, CARD, &[999]), 0);
         // Resident and allocated alike: nothing evicted.
+        assert_eq!(evicted(&dedicated, CARD, &[100, 101, 200]), 0);
+        // Everyone else's memory on this card: the other program's, not ours, not another card's.
         assert_eq!(
-            evicted_mib(&dedicated, &dedicated, CARD, &[100, 101, 200]),
-            0
+            card_use(&dedicated, &local, CARD, &[100, 101]).others_mib,
+            2_048
         );
+        assert_eq!(
+            card_use(&dedicated, &local, CARD, &[101]).others_mib,
+            9_875 + 2_048
+        );
+        assert_eq!(card_use(&dedicated, &local, OTHER, &[100]).others_mib, 0);
     }
 
     #[test]

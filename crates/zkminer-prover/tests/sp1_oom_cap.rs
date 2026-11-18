@@ -303,6 +303,49 @@ fn a_worker_of_an_older_protocol_is_refused() {
     const _: () = assert!(zkminer_prover_protocol::PROTOCOL_VERSION >= 14);
 }
 
+/// An SP1 benchmark that runs out of GPU memory at the card's size is measured again at once one
+/// shard size smaller, and that size is recorded once the benchmark completes there: the rate the
+/// miner saves is one the card can run at, not a rate measured at a size it overflows.
+#[test]
+fn an_sp1_benchmark_that_runs_out_of_memory_is_measured_again_smaller_and_recorded() {
+    let dir = TempDir::new("sp1-bench-oom");
+    let pool = sp1_pool(
+        &dir,
+        &[("MOCK_OOM_UNLESS_CAP_AT_MOST", &SMALLER.to_string())],
+    );
+    pool.benchmark("sp1").expect("benchmarked");
+    assert_eq!(
+        pool.spawn_env_value(SP1_KEY, t::SP1_ELEMENT_THRESHOLD_CAP_ENV)
+            .as_deref(),
+        Some("134217728")
+    );
+    assert_eq!(
+        recorded_cap(&dir),
+        Some(SMALLER),
+        "recorded once it completed"
+    );
+    assert_eq!(pool.test_consecutive_failures(SP1_KEY), Some(0));
+    // Two runs: the warm-up and the suite at the card's size, then both again at the smaller one.
+    assert_eq!(dir.record().len(), 4, "{:?}", dir.record());
+}
+
+/// One that runs out at the smallest size too gets no row: the lowering is undone, nothing is
+/// recorded, and the card is not given a rate it cannot run at.
+#[test]
+fn an_sp1_benchmark_out_of_memory_at_every_size_gives_no_row() {
+    let dir = TempDir::new("sp1-bench-oom-all");
+    let pool = sp1_pool(&dir, &[("MOCK_OOM_UNLESS_CAP_AT_MOST", "1")]);
+    let rows = pool.benchmark("sp1").expect("the pool answers");
+    assert!(rows.is_empty());
+    assert_eq!(
+        pool.spawn_env_value(SP1_KEY, t::SP1_ELEMENT_THRESHOLD_CAP_ENV),
+        None,
+        "undone"
+    );
+    assert_eq!(recorded_cap(&dir), None);
+    assert!(!dir.caps().exists());
+}
+
 /// A risc0 slot on `vram_mib` of CUDA card, its worker the mock, with `card` as its reading.
 fn risc0_pool(dir: &TempDir, vram_mib: u64, reading: TestCard) -> WorkerPool {
     let key = "risc0:cuda:0";

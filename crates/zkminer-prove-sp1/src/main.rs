@@ -2195,7 +2195,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         //
                         // Zero rows is a failure, and an answer of zero rows hides it: the host
                         // skips an empty result without a word.
-                        let resp = if run.results.is_empty() {
+                        let resp = if run.out_of_memory {
+                            let message = format!(
+                                "an SP1 benchmark ran out of GPU memory at this shard size: {}",
+                                run.failed.join("; ")
+                            );
+                            tracing::error!("{message}");
+                            WorkerResponse::Error {
+                                request_id: 0,
+                                kind: ErrorKind::ResourceExhausted,
+                                message,
+                            }
+                        } else if run.results.is_empty() {
                             let message =
                                 format!("no SP1 benchmark completed: {}", run.failed.join("; "));
                             tracing::error!("{message}");
@@ -3238,6 +3249,11 @@ struct BenchmarkRun {
     /// A [`ServerLost`], which ended the run where it happened. `results` still holds what came
     /// before, and a row whose wrap alone was lost.
     server_lost: Option<anyhow::Error>,
+    /// A program ran out of GPU memory (`classify_prove_error`), which also ended the run: the
+    /// card cannot hold this shard size, the programs after it would fail the same way, and rows
+    /// measured at a size that does not fit are no measurement of the card. Answered as an
+    /// out-of-memory, for the host to measure again one shard size smaller.
+    out_of_memory: bool,
 }
 
 /// Run the zkOP/s scoring proofs, adding their row to `run`. For `--benchmark`: under a host, the
@@ -3320,6 +3336,7 @@ fn run_benchmarks(
         results: Vec::new(),
         failed: Vec::new(),
         server_lost: None,
+        out_of_memory: false,
     };
     let total = programs.len() as u32;
     for (idx, spec) in programs.iter().enumerate() {
@@ -3345,13 +3362,16 @@ fn run_benchmarks(
             }
             Err(e) => {
                 tracing::error!("{name}: {e:#}");
-                run.failed.push(format!("{name}: {e:#}"));
+                let message = format!("{name}: {e:#}");
+                run.out_of_memory |=
+                    matches!(classify_prove_error(&message), ErrorKind::ResourceExhausted);
+                run.failed.push(message);
                 if e.is::<ServerLost>() {
                     run.server_lost = Some(e);
                 }
             }
         }
-        if run.server_lost.is_some() {
+        if run.server_lost.is_some() || run.out_of_memory {
             break;
         }
     }

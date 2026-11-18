@@ -1568,6 +1568,11 @@ const SPILL_WINDOW: usize = 15;
 #[cfg(any(windows, test))]
 const SPILL_CONFIRM: usize = 3;
 
+/// How far other programs' memory on a card may rise during a benchmark or calibration run, in MiB,
+/// before the run is taken again (`SpillWatch::disturbed`): more than a browser tab or a desktop
+/// window's growth, well under what halved a risc0 benchmark on an RTX 4070 (6 GB).
+const DISTURBED_GROWTH_MIB: u64 = 512;
+
 /// What one evicted-memory sample makes of a running proof (`SpillDetector::observe`).
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1602,6 +1607,85 @@ impl SpillDetector {
     }
 }
 
+/// Runs of a benchmark or calibration on a slot (`WorkerPool::after_spills`) before another
+/// program's memory stops it for good: the first, and three more, 90 s of waiting in all.
+const SPILL_RUN_ATTEMPTS: u32 = 4;
+/// How long a benchmark or calibration run the spill watch stopped waits before it is measured again.
+/// (A moment in the unit tests, which take the retry.)
+const SPILL_RETRY_AFTER: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(30)
+};
+
+/// What an SP1 benchmark answers when its card was sized down after it ran out of GPU memory
+/// (`WorkerPool::finish_benchmark`): measure it again, at the new size.
+#[derive(Debug)]
+struct BenchmarkLowered {
+    slot_key: String,
+}
+
+impl std::fmt::Display for BenchmarkLowered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: the benchmark ran out of GPU memory, and the card was sized one shard size down",
+            self.slot_key
+        )
+    }
+}
+
+impl std::error::Error for BenchmarkLowered {}
+
+/// What a benchmark or calibration run answers when other programs' memory on its card grew while it
+/// ran (`SpillWatch::disturbed`): measure it again.
+#[derive(Debug)]
+struct MeasurementDisturbed {
+    slot_key: String,
+    grew_mib: u64,
+}
+
+impl std::fmt::Display for MeasurementDisturbed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: another program took {} MiB more of the card while it was being measured, so the \
+             rate is not this card's",
+            self.slot_key, self.grew_mib
+        )
+    }
+}
+
+impl std::error::Error for MeasurementDisturbed {}
+
+/// What an SP1 shard-size lowering made by a benchmark is recorded against, in place of a job's
+/// program (`lower_sp1_shard_cap`): the suite, which is the same on every run.
+const BENCHMARK_SUITE_PROGRAM: &[u8] = b"zkminer SP1 benchmark suite";
+
+/// A benchmark's out-of-memory, typed as a proof's is (`WorkerProofError`), so it is told apart
+/// from any other failure by its kind and never by its text.
+fn benchmark_out_of_memory(key: &str, kind: ErrorKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(zkminer_prover_protocol::types::WorkerProofError {
+        kind,
+        slot_key: key.to_string(),
+        message,
+    })
+}
+
+/// Whether `e` is a run refused before it started for lack of room beside another program's memory
+/// (not ours: that clears by itself, and is waited for where it arises).
+fn refused_for_another_programs_memory(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
+        .is_some_and(|s| s.evicted_bytes == 0 && !s.ours_in_the_way)
+}
+
+/// Whether `e` is a run the spill watch stopped (`GpuMemoryShortage::evicted_bytes`).
+fn stopped_by_a_spill(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
+        .is_some_and(|s| s.evicted_bytes > 0)
+        || e.is::<MeasurementDisturbed>()
+}
+
 /// A slot whose running proof Windows is paging off its card, for the dashboard
 /// (`WorkerPool::gpu_spills`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1626,6 +1710,8 @@ pub struct GpuSpill {
 struct SpillWatch {
     cancel: Arc<AtomicBool>,
     stopped_mib: Arc<AtomicU64>,
+    /// How far other programs' memory on the card rose above its first reading, in MiB (`disturbed`).
+    others_grew_mib: Arc<AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
     spills: Arc<Mutex<HashMap<String, GpuSpill>>>,
     slot_key: String,
@@ -1643,6 +1729,7 @@ impl SpillWatch {
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let stopped_mib = Arc::new(AtomicU64::new(0));
+        let others_grew_mib = Arc::new(AtomicU64::new(0));
         #[cfg(windows)]
         let thread = {
             let original_pid = pid_ref.load(Ordering::Acquire);
@@ -1657,6 +1744,7 @@ impl SpillWatch {
                         intentional_kill,
                         cancel: cancel.clone(),
                         stopped_mib: stopped_mib.clone(),
+                        others_grew_mib: others_grew_mib.clone(),
                         spills: spills.clone(),
                     };
                     std::thread::Builder::new()
@@ -1672,9 +1760,21 @@ impl SpillWatch {
         Self {
             cancel,
             stopped_mib,
+            others_grew_mib,
             thread,
             spills,
             slot_key,
+        }
+    }
+
+    /// How far other programs' memory on the card rose during the run, in MiB, if by more than
+    /// [`DISTURBED_GROWTH_MIB`]: a measurement taken then (`after_spills`) was taken on a card
+    /// that had less to give it partway through, and is taken again. A proof is not stopped for
+    /// it: it only runs slower.
+    fn disturbed(&self) -> Option<u64> {
+        match self.others_grew_mib.load(Ordering::Acquire) {
+            mib if mib > DISTURBED_GROWTH_MIB => Some(mib),
+            _ => None,
         }
     }
 
@@ -1699,6 +1799,7 @@ struct Watched {
     intentional_kill: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     stopped_mib: Arc<AtomicU64>,
+    others_grew_mib: Arc<AtomicU64>,
     spills: Arc<Mutex<HashMap<String, GpuSpill>>>,
 }
 
@@ -1714,9 +1815,11 @@ impl Watched {
             intentional_kill,
             cancel,
             stopped_mib,
+            others_grew_mib,
             spills,
         } = self;
         let mut detector = SpillDetector::default();
+        let mut others_at_start: Option<u64> = None;
         let mut reported = false;
         loop {
             // Waits in short steps, so a finished proof's Drop does not wait out a whole interval.
@@ -1738,9 +1841,12 @@ impl Watched {
                     .map(|(p, _)| p)
                     .collect();
             // No reading is no opinion: the proof goes on.
-            let Some(evicted) = crate::windows_gpu_memory::evicted_mib_on_card(&tree, &pci) else {
+            let Some(card) = crate::windows_gpu_memory::proof_card_use(&tree, &pci) else {
                 continue;
             };
+            let evicted = card.evicted_mib;
+            let first = *others_at_start.get_or_insert(card.others_mib);
+            others_grew_mib.fetch_max(card.others_mib.saturating_sub(first), Ordering::AcqRel);
             let verdict = detector.observe(evicted);
             let mut map = spills.lock().unwrap_or_else(|e| e.into_inner());
             match verdict {
@@ -5664,7 +5770,17 @@ impl WorkerPool {
     ///
     /// Callers must treat a sweep of these as advisory until it is validated —
     /// see `benchmark::calibration_is_usable`.
+    ///
+    /// Measured again after a pause when another program's memory paged the run off its card
+    /// (`after_spills`): a sample taken while paged would pick the segment size from a rate several
+    /// times too low.
     pub fn calibrate_slot_po2(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
+        self.after_spills(key, "calibration", || {
+            self.calibrate_slot_po2_once(key, po2)
+        })
+    }
+
+    fn calibrate_slot_po2_once(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
         // The per-card guard. A calibration run is a full proof swept upward through po2 — by this
         // module's own description the hungriest path in the program — so running it beside a proof on
         // the same card is the worst case of the double-booking the lock prevents. Bounded by
@@ -5772,6 +5888,8 @@ impl WorkerPool {
         }
         self.bail_if_closing(&mut slot, entry, key)?;
         entry.intentional_kill.store(false, Ordering::Release);
+        // Whether this slot proves on a GPU, for the spill watch (`SpillWatch`).
+        let on_gpu = matches!(slot.gpu_tag.as_str(), "cuda" | "rocm" | "intel");
 
         let handle = slot
             .handle
@@ -5795,7 +5913,34 @@ impl WorkerPool {
             )
         });
 
+        let spill_watch = SpillWatch::new(
+            entry.pid.clone(),
+            entry.pid_starttime.clone(),
+            entry
+                .pci_bus_id
+                .as_deref()
+                .filter(|_| on_gpu)
+                .map(crate::discovery::normalize_pci_bus_id),
+            key.to_string(),
+            entry.intentional_kill.clone(),
+            self.gpu_spills.clone(),
+        );
+
         let resp = handle.recv();
+        if let Some(evicted_mib) = spill_watch.stopped() {
+            Self::mark_slot_dead(&mut slot, entry);
+            return Err(self.spill_shortage(key, evicted_mib));
+        }
+        if let Some(grew_mib) = spill_watch.disturbed() {
+            if matches!(resp, Ok(WorkerResponse::CalibrationResult { .. })) {
+                let disturbed = MeasurementDisturbed {
+                    slot_key: key.to_string(),
+                    grew_mib,
+                };
+                tracing::warn!("{disturbed}");
+                return Err(anyhow::Error::new(disturbed));
+            }
+        }
         match resp {
             Ok(WorkerResponse::CalibrationResult {
                 po2,
@@ -6161,7 +6306,7 @@ impl WorkerPool {
                     broken: true,
                 }
             }
-            Ok(Err(message)) => tracing::warn!("{key}: the warm-up proof failed: {message}"),
+            Ok(Err((_, message))) => tracing::warn!("{key}: the warm-up proof failed: {message}"),
             Ok(Ok(_)) => {}
         }
         on_warmed();
@@ -6177,7 +6322,15 @@ impl WorkerPool {
                     broken: true,
                 }
             }
-            Ok(Err(message)) => {
+            // Out of GPU memory: typed, for `finish_benchmark` to size the card down and measure
+            // it again.
+            Ok(Err((kind @ ErrorKind::ResourceExhausted, message))) => {
+                return BenchmarkRequests {
+                    results: Err(benchmark_out_of_memory(key, kind, message)),
+                    broken: false,
+                }
+            }
+            Ok(Err((_, message))) => {
                 return BenchmarkRequests {
                     results: Err(anyhow::anyhow!("Benchmark error from {key}: {message}")),
                     broken: false,
@@ -6195,14 +6348,18 @@ impl WorkerPool {
         }
 
         let mut lost: Option<anyhow::Error> = None;
+        let mut out_of_memory: Option<String> = None;
         let scored = measure_zkop_mix(|iterations| {
             let rows = vec![zkop_mix_spec(iterations)];
             let answer = Self::benchmark_request(handle, rows, po2, &|_, _, _| {});
             progress();
             match answer {
                 Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
-                Ok(Err(message)) => {
+                Ok(Err((kind, message))) => {
                     tracing::error!("{key}: {BENCH_ZKOP_MIX}: {message}");
+                    if matches!(kind, ErrorKind::ResourceExhausted) {
+                        out_of_memory = Some(message);
+                    }
                     None
                 }
                 Err(e) => {
@@ -6216,7 +6373,8 @@ impl WorkerPool {
             // it only means anything for the program that count was measured on.
             Some(row) if backend == BACKEND_SP1 && row.cycles != ZKOP_MIX_SP1_CYCLES => {
                 tracing::error!(
-                    "{key}: {BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected;                      not reporting a zkOP/s score",
+                    "{key}: {BENCH_ZKOP_MIX}: {} cycles where {ZKOP_MIX_SP1_CYCLES} were expected; \
+                     not reporting a zkOP/s score",
                     row.cycles
                 );
             }
@@ -6230,6 +6388,17 @@ impl WorkerPool {
                 ),
                 None => tracing::error!("{key}: {BENCH_ZKOP_MIX} did not prove; no zkOP/s score"),
             },
+        }
+        // The scoring ran out where the programs did not: the size does not fit this card either.
+        if let Some(message) = out_of_memory {
+            return BenchmarkRequests {
+                results: Err(benchmark_out_of_memory(
+                    key,
+                    ErrorKind::ResourceExhausted,
+                    message,
+                )),
+                broken: lost.is_some(),
+            };
         }
         BenchmarkRequests {
             results: Ok(results),
@@ -6245,12 +6414,15 @@ impl WorkerPool {
         programs: Vec<zkminer_prover_protocol::BenchmarkProgramSpec>,
         po2: Option<u8>,
         on_progress: &dyn Fn(&BenchmarkEntry, u32, u32),
-    ) -> Result<std::result::Result<Vec<BenchmarkEntry>, String>> {
+    ) -> Result<std::result::Result<Vec<BenchmarkEntry>, (ErrorKind, String)>> {
         handle.send(&WorkerCommand::Benchmark { programs, po2 })?;
         Ok(match handle.recv_benchmark(on_progress)? {
             WorkerResponse::BenchmarkResult { results } => Ok(results),
-            WorkerResponse::Error { message, .. } => Err(message),
-            other => Err(format!("unexpected response {other:?}")),
+            WorkerResponse::Error { kind, message, .. } => Err((kind, message)),
+            other => Err((
+                ErrorKind::ProtocolError,
+                format!("unexpected response {other:?}"),
+            )),
         })
     }
 
@@ -6267,7 +6439,13 @@ impl WorkerPool {
         Some(crate::benchmark::risc0_benchmark_po2(vram, gpu_tag))
     }
 
+    /// [`benchmark_slot_once`](Self::benchmark_slot_once), measured again after a pause when
+    /// another program's memory paged it off its card (`after_spills`).
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
+        self.after_spills(key, "benchmark", || self.benchmark_slot_once(key))
+    }
+
+    fn benchmark_slot_once(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
         self.ensure_warmed(key, None)?;
 
@@ -6365,6 +6543,8 @@ impl WorkerPool {
         // Reset intentional_kill so a timeout doesn't inherit a stale flag
         entry.intentional_kill.store(false, Ordering::Release);
 
+        // Whether this slot proves on a GPU, for the spill watch (`SpillWatch`).
+        let on_gpu = matches!(slot.gpu_tag.as_str(), "cuda" | "rocm" | "intel");
         let handle = slot
             .handle
             .as_mut()
@@ -6383,6 +6563,21 @@ impl WorkerPool {
             )
         });
 
+        // What other programs held on the card as the benchmark started (`finish_benchmark`).
+        let admitted = self.read_card(key).map(|card| card.foreign());
+        let spill_watch = SpillWatch::new(
+            entry.pid.clone(),
+            entry.pid_starttime.clone(),
+            entry
+                .pci_bus_id
+                .as_deref()
+                .filter(|_| on_gpu)
+                .map(crate::discovery::normalize_pci_bus_id),
+            key.to_string(),
+            entry.intentional_kill.clone(),
+            self.gpu_spills.clone(),
+        );
+
         let po2 = self.benchmark_po2(key);
         let requests =
             Self::run_benchmark_requests(handle, key, po2, &|_, _, _| {}, &|| {}, &|| {
@@ -6396,7 +6591,19 @@ impl WorkerPool {
                 Self::mark_slot_failed(&mut slot, entry);
             }
         }
-        requests.results
+        // A rate measured while the card was paged would be saved and planned with: not kept.
+        if let Some(evicted_mib) = spill_watch.stopped() {
+            return Err(self.spill_shortage(key, evicted_mib));
+        }
+        if let Some(grew_mib) = spill_watch.disturbed() {
+            let disturbed = MeasurementDisturbed {
+                slot_key: key.to_string(),
+                grew_mib,
+            };
+            tracing::warn!("{disturbed}");
+            return Err(anyhow::Error::new(disturbed));
+        }
+        self.finish_benchmark(key, &mut slot, entry, requests.results, admitted)
     }
 
     /// Run benchmarks on a backend. Accepts logical name, vendor-level, or full compound key.
@@ -6678,7 +6885,19 @@ impl WorkerPool {
     }
 
     /// Run benchmarks on a specific worker slot with per-program progress streaming.
+    /// [`benchmark_slot_streaming_once`](Self::benchmark_slot_streaming_once), measured again
+    /// after a pause when another program's memory paged it off its card (`after_spills`).
     fn benchmark_slot_streaming(
+        &self,
+        key: &str,
+        on_progress: &dyn Fn(BenchmarkProgressEvent),
+    ) -> Result<Vec<BenchmarkEntry>> {
+        self.after_spills(key, "benchmark", || {
+            self.benchmark_slot_streaming_once(key, on_progress)
+        })
+    }
+
+    fn benchmark_slot_streaming_once(
         &self,
         key: &str,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
@@ -6785,6 +7004,8 @@ impl WorkerPool {
         // Reset intentional_kill so a timeout doesn't inherit a stale flag
         entry.intentional_kill.store(false, Ordering::Release);
 
+        // Whether this slot proves on a GPU, for the spill watch (`SpillWatch`).
+        let on_gpu = matches!(slot.gpu_tag.as_str(), "cuda" | "rocm" | "intel");
         let handle = slot
             .handle
             .as_mut()
@@ -6821,6 +7042,21 @@ impl WorkerPool {
         };
         let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
+        // What other programs held on the card as the benchmark started (`finish_benchmark`).
+        let admitted = self.read_card(key).map(|card| card.foreign());
+        let spill_watch = SpillWatch::new(
+            entry.pid.clone(),
+            entry.pid_starttime.clone(),
+            entry
+                .pci_bus_id
+                .as_deref()
+                .filter(|_| on_gpu)
+                .map(crate::discovery::normalize_pci_bus_id),
+            key.to_string(),
+            entry.intentional_kill.clone(),
+            self.gpu_spills.clone(),
+        );
+
         let po2 = self.benchmark_po2(key);
         let requests =
             Self::run_benchmark_requests(handle, key, po2, &cb, &warmed, &|| clock.touch());
@@ -6832,7 +7068,19 @@ impl WorkerPool {
                 Self::mark_slot_failed(&mut slot, entry);
             }
         }
-        requests.results
+        // A rate measured while the card was paged would be saved and planned with: not kept.
+        if let Some(evicted_mib) = spill_watch.stopped() {
+            return Err(self.spill_shortage(key, evicted_mib));
+        }
+        if let Some(grew_mib) = spill_watch.disturbed() {
+            let disturbed = MeasurementDisturbed {
+                slot_key: key.to_string(),
+                grew_mib,
+            };
+            tracing::warn!("{disturbed}");
+            return Err(anyhow::Error::new(disturbed));
+        }
+        self.finish_benchmark(key, &mut slot, entry, requests.results, admitted)
     }
 
     /// A progress event for `key`, carrying that slot's card details.
@@ -9291,6 +9539,120 @@ impl WorkerPool {
     ///
     /// Takes NO lock: see `WorkerEntry::pci_bus_id`. It is called from the proving progress
     /// callback, which runs on the thread that already holds that slot's guard.
+    /// The error a proof, benchmark or calibration run the spill watch stopped reports: a
+    /// `GpuMemoryShortage` with what was off the card (`evicted_mib`) and what the card holds now.
+    fn spill_shortage(&self, key: &str, evicted_mib: u64) -> anyhow::Error {
+        let card = self.read_card(key);
+        let shortage = zkminer_prover_protocol::types::GpuMemoryShortage {
+            slot_key: key.to_string(),
+            foreign_bytes: card.as_ref().map_or(0, CardOccupancy::foreign),
+            sibling_bytes: 0,
+            available_bytes: card.as_ref().map_or(0, |c| c.available_to(key)),
+            needed_bytes: None,
+            ours_in_the_way: false,
+            total_bytes: card.as_ref().map_or(0, |c| c.total),
+            evicted_bytes: evicted_mib.saturating_mul(1024 * 1024),
+        };
+        tracing::warn!("{shortage}");
+        anyhow::Error::new(shortage)
+    }
+
+    /// A finished benchmark run on `key`: its rows, or what to answer instead. An SP1 benchmark
+    /// that ran out of GPU memory lowers the card one measured shard size (`lower_sp1_shard_cap`,
+    /// recorded unless another program's memory grew meanwhile, from `admitted`) and has its worker
+    /// restarted at it, answering `BenchmarkLowered` for `after_spills` to measure again; one that
+    /// completed confirms a lowering it was measured at. A benchmark that could not be sized down
+    /// answers its out-of-memory: the card gets no row rather than a rate it cannot run at.
+    fn finish_benchmark(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        results: Result<Vec<BenchmarkEntry>>,
+        admitted: Option<u64>,
+    ) -> Result<Vec<BenchmarkEntry>> {
+        if slot.backend != zkminer_prover_protocol::BACKEND_SP1 {
+            return results;
+        }
+        let program = program_hash(BENCHMARK_SUITE_PROGRAM);
+        let out_of_memory = results.as_ref().err().is_some_and(|e| {
+            e.downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>()
+                .is_some_and(|w| matches!(w.kind, ErrorKind::ResourceExhausted))
+        });
+        if !out_of_memory {
+            if results.is_ok() {
+                self.confirm_sp1_shard_cap(key, slot, entry.vram_bytes, program);
+            }
+            return results;
+        }
+        let now = self.read_card(key).map(|card| card.foreign());
+        let lowered = self.lower_sp1_shard_cap(
+            key,
+            slot,
+            entry.vram_bytes,
+            program,
+            oom_may_be_recorded(admitted, now),
+        );
+        // A fresh worker at the new size, with clean VRAM.
+        entry.clear_pid();
+        if let Some(h) = slot.handle.as_mut() {
+            h.kill();
+        }
+        Self::mark_slot_dead(slot, entry);
+        if lowered {
+            tracing::warn!(
+                "{key}: the SP1 benchmark ran out of GPU memory; measuring it again one shard size \
+                 smaller"
+            );
+            return Err(anyhow::Error::new(BenchmarkLowered {
+                slot_key: key.to_string(),
+            }));
+        }
+        results
+    }
+
+    /// `run` (a benchmark or calibration run on `key`, `what` naming it), again after
+    /// [`SPILL_RETRY_AFTER`] each time another program's memory spoiled it (the spill watch stopped
+    /// it, or that memory grew while it ran), up to [`SPILL_RUN_ATTEMPTS`] runs in all. A
+    /// measurement is saved and planned with, so one taken then is not kept; the program is usually
+    /// gone (a game, a render, a model loaded for a moment) by a later try. Once it has been seen,
+    /// a run refused for lack of room beside another program's memory is waited out the same way
+    /// rather than ending the measurement. Not once the pool is closing.
+    fn after_spills<T>(
+        &self,
+        key: &str,
+        what: &str,
+        mut run: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let mut attempt = 1;
+        let mut disturbed = false;
+        loop {
+            match run() {
+                Err(e)
+                    if attempt < SPILL_RUN_ATTEMPTS
+                        && (stopped_by_a_spill(&e)
+                            || (disturbed && refused_for_another_programs_memory(&e)))
+                        && !self.closing.load(Ordering::Relaxed) =>
+                {
+                    disturbed = true;
+                    tracing::warn!(
+                        "{key}: another program's memory on the card got in the way of the {what}; \
+                         measuring it again in {}s (attempt {}/{SPILL_RUN_ATTEMPTS})",
+                        SPILL_RETRY_AFTER.as_secs(),
+                        attempt + 1
+                    );
+                    std::thread::sleep(SPILL_RETRY_AFTER);
+                    attempt += 1;
+                }
+                // Sized down after running out of memory: measured again at once, at the new size.
+                Err(e) if attempt < SPILL_RUN_ATTEMPTS && e.is::<BenchmarkLowered>() => {
+                    attempt += 1;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
     /// Slots whose running proof Windows is moving off its card for another program's memory,
     /// with how much is off it and whether it is being stopped (see `SpillWatch`). Empty except
     /// under Windows. Reads no slot's lock: a proof holds its slot's for its whole length.
@@ -11338,19 +11700,7 @@ impl WorkerPool {
             // shortage it is, so the job goes to a card where it fits (or waits for this one) rather
             // than spending an attempt; the slot was not counted a failure (an intentional kill).
             if let Some(evicted_mib) = spill_watch.stopped() {
-                let card = self.read_card(key);
-                let shortage = zkminer_prover_protocol::types::GpuMemoryShortage {
-                    slot_key: key.to_string(),
-                    foreign_bytes: card.as_ref().map_or(0, CardOccupancy::foreign),
-                    sibling_bytes: 0,
-                    available_bytes: card.as_ref().map_or(0, |c| c.available_to(key)),
-                    needed_bytes: None,
-                    ours_in_the_way: false,
-                    total_bytes: card.as_ref().map_or(0, |c| c.total),
-                    evicted_bytes: evicted_mib.saturating_mul(1024 * 1024),
-                };
-                tracing::warn!("{shortage}");
-                return Err(anyhow::Error::new(shortage));
+                return Err(self.spill_shortage(key, evicted_mib));
             }
 
             // Distinguish a DEADLINE-driven kill from a GPU wedge. When the deadline
@@ -14035,10 +14385,245 @@ mod tests {
             .find("// Distinguish a DEADLINE-driven kill from a GPU wedge.")
             .expect("the deadline arm");
         assert!(recv < stopped && stopped < deadline);
-        let report = &prove[stopped..deadline];
-        assert!(report.contains("GpuMemoryShortage {"));
-        assert!(report.contains("ours_in_the_way: false"));
-        assert!(report.contains("evicted_bytes: evicted_mib.saturating_mul(1024 * 1024)"));
+        assert!(
+            prove[stopped..deadline].contains("return Err(self.spill_shortage(key, evicted_mib));")
+        );
+        let shortage = src
+            .split_once("    fn spill_shortage(")
+            .expect("the shortage")
+            .1;
+        let shortage = &shortage[..shortage
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+        assert!(shortage.contains("GpuMemoryShortage {"));
+        assert!(shortage.contains("ours_in_the_way: false"));
+        assert!(shortage.contains("evicted_bytes: evicted_mib.saturating_mul(1024 * 1024)"));
+    }
+
+    /// A benchmark or calibration run the spill watch stopped is measured again, up to
+    /// SPILL_RUN_ATTEMPTS runs; any other outcome is returned at once, and none is retried once the
+    /// pool is closing.
+    #[test]
+    fn a_measurement_stopped_by_a_spill_is_taken_again() {
+        let pool = pool_with_keys(&["risc0:cuda:1"]);
+        let spilled = || {
+            anyhow::Error::new(zkminer_prover_protocol::types::GpuMemoryShortage {
+                slot_key: "risc0:cuda:1".into(),
+                foreign_bytes: 6 << 30,
+                sibling_bytes: 0,
+                available_bytes: 5 << 30,
+                needed_bytes: None,
+                ours_in_the_way: false,
+                total_bytes: 12 << 30,
+                evicted_bytes: 5 << 30,
+            })
+        };
+        let runs = std::cell::Cell::new(0);
+        let r = pool.after_spills("risc0:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            if runs.get() < 3 {
+                Err(spilled())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(runs.get(), 3);
+        // Still spilled at the last attempt: that error is the answer.
+        runs.set(0);
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            Err(spilled())
+        });
+        assert!(stopped_by_a_spill(&r.unwrap_err()));
+        assert_eq!(runs.get(), SPILL_RUN_ATTEMPTS);
+        // Any other failure, and an admission refusal (nothing evicted), is not measured again.
+        runs.set(0);
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            Err(anyhow::anyhow!("worker died"))
+        });
+        assert!(r.is_err());
+        assert_eq!(runs.get(), 1);
+        let refused = anyhow::Error::new(zkminer_prover_protocol::types::GpuMemoryShortage {
+            slot_key: "risc0:cuda:1".into(),
+            foreign_bytes: 6 << 30,
+            sibling_bytes: 0,
+            available_bytes: 5 << 30,
+            needed_bytes: Some(8 << 30),
+            ours_in_the_way: false,
+            total_bytes: 12 << 30,
+            evicted_bytes: 0,
+        });
+        assert!(!stopped_by_a_spill(&refused));
+        // A run refused for another program's memory is waited out once a disturbance was seen,
+        // but a refusal on the first run is the answer.
+        runs.set(0);
+        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            match runs.get() {
+                1 => Err(spilled()),
+                2 | 3 => Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::GpuMemoryShortage {
+                        slot_key: "risc0:cuda:1".into(),
+                        foreign_bytes: 6 << 30,
+                        sibling_bytes: 0,
+                        available_bytes: 5 << 30,
+                        needed_bytes: Some(8 << 30),
+                        ours_in_the_way: false,
+                        total_bytes: 12 << 30,
+                        evicted_bytes: 0,
+                    },
+                )),
+                _ => Ok(9),
+            }
+        });
+        assert_eq!(r.unwrap(), 9);
+        assert_eq!(runs.get(), 4);
+        runs.set(0);
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::GpuMemoryShortage {
+                    slot_key: "risc0:cuda:1".into(),
+                    foreign_bytes: 6 << 30,
+                    sibling_bytes: 0,
+                    available_bytes: 5 << 30,
+                    needed_bytes: Some(8 << 30),
+                    ours_in_the_way: false,
+                    total_bytes: 12 << 30,
+                    evicted_bytes: 0,
+                },
+            ))
+        });
+        assert!(r.is_err());
+        assert_eq!(runs.get(), 1, "a refusal on the first run is the answer");
+        // Nor once the pool is closing.
+        pool.closing.store(true, Ordering::Relaxed);
+        runs.set(0);
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            Err(spilled())
+        });
+        assert!(r.is_err());
+        assert_eq!(runs.get(), 1);
+    }
+
+    /// Every path that measures a rate the miner saves watches for spills and drops a run the
+    /// watch stopped, and is reached through the retry.
+    #[test]
+    fn every_measurement_is_watched_for_spills_and_taken_again() {
+        let src = include_str!("dispatcher.rs")
+            .split_once(
+                "
+#[cfg(test)]",
+            )
+            .unwrap()
+            .0;
+        let body = |header: &str| {
+            let start = src.find(header).unwrap_or_else(|| panic!("{header}"));
+            let rest = &src[start..];
+            &rest[..rest
+                .find(
+                    "
+    }
+",
+                )
+                .unwrap()]
+        };
+        for (wrapper, call) in [
+            (
+                "    fn benchmark_slot(&self",
+                "self.after_spills(key, \"benchmark\", || self.benchmark_slot_once(key))",
+            ),
+            (
+                "    fn benchmark_slot_streaming(
+",
+                "self.benchmark_slot_streaming_once(key, on_progress)",
+            ),
+            (
+                "    pub fn calibrate_slot_po2(",
+                "self.calibrate_slot_po2_once(key, po2)",
+            ),
+        ] {
+            assert!(body(wrapper).contains(call), "{wrapper}");
+        }
+        for once in [
+            "    fn benchmark_slot_once(",
+            "    fn benchmark_slot_streaming_once(",
+            "    fn calibrate_slot_po2_once(",
+        ] {
+            let b = body(once);
+            assert!(b.contains("let spill_watch = SpillWatch::new("), "{once}");
+            assert!(b.contains(".filter(|_| on_gpu)"), "{once}");
+            assert!(
+                b.contains("if let Some(evicted_mib) = spill_watch.stopped() {")
+                    && b.contains("return Err(self.spill_shortage(key, evicted_mib));"),
+                "{once}"
+            );
+            assert!(
+                b.contains("if let Some(grew_mib) = spill_watch.disturbed() {")
+                    && b.contains("return Err(anyhow::Error::new(disturbed));"),
+                "{once}"
+            );
+        }
+        // A benchmark that ran out of memory is sized down and measured again (SP1).
+        for once in [
+            "    fn benchmark_slot_once(",
+            "    fn benchmark_slot_streaming_once(",
+        ] {
+            assert!(
+                body(once).contains(
+                    "self.finish_benchmark(key, &mut slot, entry, requests.results, admitted)"
+                ),
+                "{once}"
+            );
+        }
+    }
+
+    /// A measurement during which other programs' memory on the card rose by more than
+    /// DISTURBED_GROWTH_MIB is taken again, as one the spill watch stopped is; less is noise.
+    #[test]
+    fn a_measurement_on_a_card_another_program_took_memory_from_is_taken_again() {
+        let watch = SpillWatch::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            "risc0:cuda:1".to_string(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::default(),
+        );
+        assert_eq!(watch.disturbed(), None);
+        watch
+            .others_grew_mib
+            .store(DISTURBED_GROWTH_MIB, Ordering::Release);
+        assert_eq!(watch.disturbed(), None);
+        watch
+            .others_grew_mib
+            .store(DISTURBED_GROWTH_MIB + 1, Ordering::Release);
+        assert_eq!(watch.disturbed(), Some(DISTURBED_GROWTH_MIB + 1));
+        let disturbed = anyhow::Error::new(MeasurementDisturbed {
+            slot_key: "risc0:cuda:1".to_string(),
+            grew_mib: 6_144,
+        });
+        assert!(stopped_by_a_spill(&disturbed));
+        assert!(disturbed.to_string().contains("6144 MiB more of the card"));
+        assert!(!disturbed.to_string().contains("  "));
+        // And a lowering is measured again at once, but only within the attempts.
+        let pool = pool_with_keys(&["sp1:cuda:1"]);
+        let runs = std::cell::Cell::new(0);
+        let r: Result<()> = pool.after_spills("sp1:cuda:1", "benchmark", || {
+            runs.set(runs.get() + 1);
+            Err(anyhow::Error::new(BenchmarkLowered {
+                slot_key: "sp1:cuda:1".to_string(),
+            }))
+        });
+        assert!(r.unwrap_err().is::<BenchmarkLowered>());
+        assert_eq!(runs.get(), SPILL_RUN_ATTEMPTS);
     }
 
     /// The second SP1 proof in a row to fail restarts its worker, and the count starts over; a
@@ -14366,9 +14951,9 @@ mod tests {
         let src = include_str!("dispatcher.rs");
         for f in [
             "fn prove_on_slot(",
-            "fn benchmark_slot(",
-            "fn benchmark_slot_streaming(",
-            "pub fn calibrate_slot_po2(",
+            "fn benchmark_slot_once(",
+            "fn benchmark_slot_streaming_once(",
+            "fn calibrate_slot_po2_once(",
         ] {
             // Bound the search to THIS function's body. `split_once` alone returns everything after
             // the name, so a later function's call satisfied the assertion for an earlier one — the
@@ -15720,9 +16305,9 @@ mod tests {
         let src = include_str!("dispatcher.rs");
         for f in [
             "fn prove_on_slot(",
-            "fn benchmark_slot(",
-            "fn benchmark_slot_streaming(",
-            "pub fn calibrate_slot_po2(",
+            "fn benchmark_slot_once(",
+            "fn benchmark_slot_streaming_once(",
+            "fn calibrate_slot_po2_once(",
         ] {
             // Bound the search to THIS function's body, or a later function's call satisfies the
             // assertion for an earlier one — the trap the guard assertion fell into.
@@ -17926,7 +18511,7 @@ mod spill_and_cap_tests {
             budget,
             "(floor.map(|f| f.saturating_sub(card.growth_margin)), floor)",
         );
-        let calibrate = body(src, "    pub fn calibrate_slot_po2(");
+        let calibrate = body(src, "    fn calibrate_slot_po2_once(");
         at(
             calibrate,
             "budget.available.saturating_add(budget.growth_margin),",
@@ -18096,7 +18681,10 @@ mod spill_and_cap_tests {
             3
         );
         assert_eq!(requests.matches(", po2, &").count(), 3);
-        for f in ["    fn benchmark_slot(", "    fn benchmark_slot_streaming("] {
+        for f in [
+            "    fn benchmark_slot_once(",
+            "    fn benchmark_slot_streaming_once(",
+        ] {
             at(body(dispatcher, f), "let po2 = self.benchmark_po2(key);");
         }
         let production = dispatcher.split_once("\n#[cfg(test)]").unwrap().0;
