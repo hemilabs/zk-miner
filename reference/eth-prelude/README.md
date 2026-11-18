@@ -35,15 +35,21 @@ only:
 - **`Authenticated<T>`**: a value a verifier produced (`Reader::block_header`, `parent_header`,
   `account`, `storage`, `receipt`, `transaction`, and the module-level `prove_*` functions), a
   pinned value (`Pinned::authenticated`), a guest constant (`constant!(T = expr)`, which only
-  compiles for a constant expression of an `AuthValue` type: byte arrays, integers, `bool` and this
-  crate's own types, nothing with interior mutability), a counter below an authenticated count
-  (`indices`), or a function of those (`map`, `derive`, `zip`, `try_map`, `into_items`). The
-  derivations take plain `fn` pointers, so a closure that captures a value from `W` does not
-  compile into one.
+  compiles for a constant expression), a counter below an authenticated count (`indices`), or a
+  function of those (`map`, `derive`, `zip`, `try_map`, `into_items`). The derivations take plain
+  `fn` pointers, so a closure that captures a value from `W` does not compile into one.
+
+Both hold only `PlainData`, and every derivation's result must be `PlainData` too: integers,
+`bool`, byte arrays, and arrays, `Vec`s, `Option`s and tuples of plain data, and this crate's own
+value types (each declared with every field checked). Nothing with interior mutability (`Cell`,
+`RefCell`, `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`, `RwLock`, the atomics), no
+reference or pointer, no function and no type of the guest's own: otherwise a guest could derive a
+cell into an `Authenticated`, set it from `W` through the shared borrow `get` gives, and map it back
+out.
 
 Neither type has a public constructor from a runtime value. Verifiers take their keys as
 `Authenticated` values, so a trie key cannot come from `W`; `JournalWriter::output` takes only
-`Authenticated` values of a `ToWord` type, after the whole header. `AuthValue` and `ToWord` are
+`Authenticated` values of a `ToWord` type, after the whole header. `PlainData` and `ToWord` are
 sealed: a guest cannot add a type that could be changed after the fact or write what it likes. The
 doc tests of `guard` (`compile_fail`) pin each of these. `Reader::finish(journal)` returns the journal bytes only when every
 header word was committed and every header, account, storage, receipt and transaction proof in `W`
@@ -54,12 +60,16 @@ guest turns into a panic: no journal, no proof (plan §8.2).
 magic `HPW`, scheme 1 and format version 1, and its header word 0 must be the scheme id 1, or
 nothing is read.
 
-What the types do not stop: a `fn` pointer does not capture, but it can still read a `static`, a
-`thread_local!` or a `Cell` the guest filled from `W` or from a host input, and a guest can
-deliberately call `map` with a function returning a constant it made up, or use `Pinned::word`
-bytes as data. The guest lints refuse `static`, `thread_local`, `Cell` and `RefCell` (with the host
-inputs) in a guest's sources (`reference/proxy-slots/methods/tests/guest_lints.rs`). The types make
-accidents hard, not malice; an audit of the guest still reads every derivation.
+What the types do not stop: a `fn` pointer does not capture, but it can still read a `static` or a
+`thread_local!` the guest filled from `W` or from a host input (through any interior-mutable type
+kept there), `unsafe` code can read memory the guest wrote, a guest can branch on an unverified
+value to choose which derivation runs, deliberately call `map` with a function returning a constant
+it made up, or use `Pinned::word` bytes as data. The guest lints refuse `static`, `thread_local`
+and every interior-mutable type (`Cell`, `RefCell`, `UnsafeCell`, `OnceCell`, `OnceLock`,
+`LazyCell`, `LazyLock`, `Mutex`, `RwLock`, `Atomic*`), with the host inputs, in a guest's sources
+(`reference/proxy-slots/methods/tests/guest_lints.rs`). The types make accidents hard, not malice;
+an audit of the guest still reads every derivation, every branch on a value from `W` and every
+`unsafe` block.
 
 ## The scheme-1 witness (`scheme1`)
 

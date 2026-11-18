@@ -8,23 +8,30 @@
 //!   by [`JournalWriter::commit_pinned`].
 //! - [`Authenticated<T>`]: a value a verifier produced (a header that hashes to a pinned hash, a
 //!   leaf a trie proof reaches from an authenticated root), a pinned value
-//!   ([`Pinned::authenticated`]), a guest constant ([`constant!`](crate::constant), plain data
-//!   only: [`AuthValue`]), or a function of those ([`Authenticated::map`], [`Authenticated::zip`]).
+//!   ([`Pinned::authenticated`]), a guest constant ([`constant!`](crate::constant)), or a function
+//!   of those ([`Authenticated::map`], [`Authenticated::zip`]).
 //!
 //! Nothing outside this crate can construct either from a runtime value: the constructors are
-//! private, and the one public way in, [`constant!`](crate::constant), takes a `const` item of an
-//! [`AuthValue`] type (byte arrays, integers, `bool` and this crate's own types: nothing with
-//! interior mutability, so a constant cannot be filled in later). [`ToWord`], what an output may be,
-//! is sealed the same way, so a guest cannot define an output type that writes what it likes. So a
-//! value read from `W` without verification cannot reach a trie key or the journal by accident.
+//! private, and the one public way in, [`constant!`](crate::constant), takes a `const` item.
+//! Both types hold only [`PlainData`] (integers, `bool`, byte arrays, and `Vec`s, `Option`s,
+//! arrays and tuples of plain data, and this crate's own value types), and every derivation's
+//! result must be plain data too: nothing with interior mutability (`Cell`, `RefCell`,
+//! `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`, `RwLock`, the atomics), no reference
+//! or pointer, no function and no type of the guest's own. So a value inside an `Authenticated`
+//! cannot be changed through the shared borrow [`Authenticated::get`] gives, and what a
+//! derivation made is what reaches the journal. [`ToWord`], what an output may be, is sealed the
+//! same way, so a guest cannot define an output type that writes what it likes. So a value read
+//! from `W` without verification cannot reach a trie key or the journal by accident.
 //!
 //! The derivations take plain `fn` pointers, so a closure that captures a value (from `W`, a
-//! counter) does not compile into one. That alone does **not** stop smuggling: a non-capturing
-//! function can still read a `static`, a `thread_local!` or a `Cell` the guest filled from `W` or
-//! from a host input. Those are what the guest lints refuse in a guest's sources
-//! (`reference/proxy-slots/methods/tests/guest_lints.rs`); the types make accidents hard, and the
-//! lints and an audit of every derivation catch the rest. [`indices`] gives the loop counters a
-//! pinned count allows.
+//! counter) does not compile into one. What the types do **not** stop, and the guest lints and an
+//! audit must: a non-capturing function that reads a `static` or a `thread_local!` the guest
+//! filled from `W` or from a host input (the lints refuse both, and every interior-mutable type, in
+//! a guest's sources: `reference/proxy-slots/methods/tests/guest_lints.rs`), `unsafe` code that
+//! reads memory the guest wrote, and control flow: a guest that branches on an unverified value to
+//! choose which derivation runs, or derives with a function that returns a constant it made up.
+//! The types make accidents hard; the lints and an audit of every derivation catch the rest.
+//! [`indices`] gives the loop counters a pinned count allows.
 //!
 //! What does not compile (each a way a guest once turned an unverified value into an output):
 //!
@@ -62,6 +69,121 @@
 //! let a = constant!(u64 = 1).map(|x| x + hint);
 //! ```
 //!
+//! An interior-mutable value derived into an `Authenticated`, written through `get` (a shared
+//! borrow) and mapped back out: a `OnceCell`,
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated};
+//! use std::cell::OnceCell;
+//! let hint = 7u64;
+//! let a: Authenticated<u64> = constant!(u64 = 1);
+//! let cell = a.derive(|_| OnceCell::<u64>::new());
+//! cell.get().set(hint).unwrap();
+//! let smuggled: Authenticated<u64> = cell.map(|c| c.into_inner().unwrap());
+//! ```
+//!
+//! a `Mutex`,
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated};
+//! use std::sync::Mutex;
+//! let hint = 7u64;
+//! let a: Authenticated<u64> = constant!(u64 = 1);
+//! let m = a.derive(|_| Mutex::new(0u64));
+//! *m.get().lock().unwrap() = hint;
+//! let smuggled: Authenticated<u64> = m.map(|m| m.into_inner().unwrap());
+//! ```
+//!
+//! an atomic,
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated};
+//! use std::sync::atomic::{AtomicU64, Ordering};
+//! let hint = 7u64;
+//! let a: Authenticated<u64> = constant!(u64 = 1);
+//! let at = a.derive(|_| AtomicU64::new(0));
+//! at.get().store(hint, Ordering::Relaxed);
+//! let smuggled: Authenticated<u64> = at.map(AtomicU64::into_inner);
+//! ```
+//!
+//! a `OnceLock`,
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated};
+//! use std::sync::OnceLock;
+//! let hint = 7u64;
+//! let a: Authenticated<u64> = constant!(u64 = 1);
+//! let ol = a.derive(|_| OnceLock::<u64>::new());
+//! ol.get().set(hint).unwrap();
+//! let smuggled: Authenticated<u64> = ol.map(|c| c.into_inner().unwrap());
+//! ```
+//!
+//! an atomic behind a leaked reference (a reference is no more plain data than the cell),
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated};
+//! use std::sync::atomic::{AtomicU64, Ordering};
+//! let hint = 7u64;
+//! let a: Authenticated<u64> = constant!(u64 = 1);
+//! let at = a.derive(|_| &*Box::leak(Box::new(AtomicU64::new(0))));
+//! at.get().store(hint, Ordering::Relaxed);
+//! let smuggled: Authenticated<u64> = at.map(|a| a.load(Ordering::Relaxed));
+//! ```
+//!
+//! a type of the guest's own, which could hold any of those,
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated};
+//! use std::cell::OnceCell;
+//! struct Mine(OnceCell<u64>);
+//! let hint = 7u64;
+//! let a: Authenticated<u64> = constant!(u64 = 1);
+//! let mine = a.derive(|_| Mine(OnceCell::new()));
+//! mine.get().0.set(hint).unwrap();
+//! let smuggled: Authenticated<u64> = mine.map(|m| m.0.into_inner().unwrap());
+//! ```
+//!
+//! which cannot be declared plain data either,
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::guard::PlainData;
+//! struct Mine(std::cell::OnceCell<u64>);
+//! impl PlainData for Mine {}
+//! ```
+//!
+//! and a pinned word parsed into a `OnceCell` (it is `Clone`, so it would pass
+//! [`Pinned::authenticated`] too):
+//!
+//! ```compile_fail
+//! use hemiprove_eth_prelude::scheme1::{scheme_word, Reader, Witness};
+//! use std::cell::OnceCell;
+//! let w = Witness { header_words: vec![scheme_word(), [7; 32]], headers: vec![], accounts: vec![], receipts: vec![], transactions: vec![] }
+//!     .encode()
+//!     .unwrap();
+//! let mut r = Reader::new(&w).unwrap();
+//! let _scheme = r.pin_scheme_id().unwrap();
+//! let pinned = r.pin_word().unwrap().try_map(|_| Ok::<_, ()>(OnceCell::<u64>::new())).unwrap();
+//! pinned.get().set(7).unwrap();
+//! let smuggled = pinned.authenticated().map(|c| c.into_inner().unwrap());
+//! ```
+//!
+//! The derivations a guest does make still compile: a header's field, a pair, a list's items, an
+//! optional account.
+//!
+//! ```
+//! use hemiprove_eth_prelude::{constant, guard::Authenticated, state::Account};
+//! let root: Authenticated<[u8; 32]> = constant!([u8; 32] = [3; 32]);
+//! let count: Authenticated<u64> = constant!(u64 = 2);
+//! let pair: Authenticated<([u8; 32], u64)> = root.zip(count);
+//! let slots: Authenticated<Vec<[u8; 32]>> = pair.map(|(r, k)| (0..k).map(|i| [r[0] + i as u8; 32]).collect());
+//! let items: Vec<Authenticated<[u8; 32]>> = slots.into_items().collect();
+//! assert_eq!(*items[1].get(), [4; 32]);
+//! let account: Authenticated<Option<Account>> = constant!(Option<Account> = Some(Account::ABSENT));
+//! let nonce: Authenticated<u64> = account.derive(|a| a.map_or(0, |a| a.nonce));
+//! let parsed: Result<Authenticated<u8>, ()> = nonce.try_map(|n| u8::try_from(n).map_err(|_| ()));
+//! assert_eq!(parsed.unwrap().into_inner(), 0);
+//! ```
+//!
 //! The journal ([`JournalWriter`]) is `prefix ‖ header ‖ outputs` (plan §7.2): the 64-byte
 //! `abi.encode(jobId, prover)` prefix copied from the guest input, every pinned word in order, then
 //! outputs, which accept only authenticated values. [`crate::scheme1::Reader::finish`] returns the
@@ -73,13 +195,13 @@ use core::fmt;
 /// A journal-header word read from `W`, with the value it encodes. Not `Clone`: each word exists
 /// once and is committed once.
 #[derive(Debug)]
-pub struct Pinned<T> {
+pub struct Pinned<T: PlainData> {
     index: usize,
     word: [u8; 32],
     value: T,
 }
 
-impl<T> Pinned<T> {
+impl<T: PlainData> Pinned<T> {
     pub(crate) fn new(index: usize, word: [u8; 32], value: T) -> Self {
         Self { index, word, value }
     }
@@ -99,15 +221,15 @@ impl<T> Pinned<T> {
     }
 }
 
-impl<T> Pinned<T> {
+impl<T: PlainData> Pinned<T> {
     /// The same word, its value parsed further (a rule id and parameter from a raw word); the word
     /// and its position stay as they were.
-    pub fn try_map<U, E>(self, f: fn(T) -> Result<U, E>) -> Result<Pinned<U>, E> {
+    pub fn try_map<U: PlainData, E>(self, f: fn(T) -> Result<U, E>) -> Result<Pinned<U>, E> {
         Ok(Pinned { index: self.index, word: self.word, value: f(self.value)? })
     }
 }
 
-impl<T: Clone> Pinned<T> {
+impl<T: PlainData + Clone> Pinned<T> {
     /// The value as an authenticated input: the binding fixes it to the requester's.
     pub fn authenticated(&self) -> Authenticated<T> {
         Authenticated(self.value.clone())
@@ -115,11 +237,11 @@ impl<T: Clone> Pinned<T> {
 }
 
 /// A value a verifier produced, or derived only from such values, pinned values and guest
-/// constants.
+/// constants. Always [`PlainData`], so nothing can change it through [`get`](Self::get).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Authenticated<T>(T);
+pub struct Authenticated<T: PlainData>(T);
 
-impl<T> Authenticated<T> {
+impl<T: PlainData> Authenticated<T> {
     /// Only this crate's verifiers construct authenticated values.
     pub(crate) fn new(value: T) -> Self {
         Self(value)
@@ -134,70 +256,120 @@ impl<T> Authenticated<T> {
     }
 
     /// A value derived from this one by a function that sees nothing else.
-    pub fn map<U>(self, f: fn(T) -> U) -> Authenticated<U> {
+    pub fn map<U: PlainData>(self, f: fn(T) -> U) -> Authenticated<U> {
         Authenticated(f(self.0))
     }
 
     /// A value derived from a borrow of this one by a function that sees nothing else.
-    pub fn derive<U>(&self, f: fn(&T) -> U) -> Authenticated<U> {
+    pub fn derive<U: PlainData>(&self, f: fn(&T) -> U) -> Authenticated<U> {
         Authenticated(f(&self.0))
     }
 
     /// Two authenticated values as one, for derivations with two inputs.
-    pub fn zip<U>(self, other: Authenticated<U>) -> Authenticated<(T, U)> {
+    pub fn zip<U: PlainData>(self, other: Authenticated<U>) -> Authenticated<(T, U)> {
         Authenticated((self.0, other.0))
     }
 
     /// A derivation that can fail (a fallible decode of an authenticated byte string).
-    pub fn try_map<U, E>(self, f: fn(T) -> Result<U, E>) -> Result<Authenticated<U>, E> {
+    pub fn try_map<U: PlainData, E>(self, f: fn(T) -> Result<U, E>) -> Result<Authenticated<U>, E> {
         f(self.0).map(Authenticated)
     }
-
 }
 
-impl<T: AuthValue> Authenticated<T> {
+impl<T: PlainData> Authenticated<T> {
     /// For [`constant!`](crate::constant): `C::VALUE` is an associated constant, evaluated when the
     /// guest is compiled, so no runtime value (and nothing from `W`) can pass through; a guest
-    /// constant is part of the image, so it is as fixed as the binding. `T` is plain data
-    /// ([`AuthValue`]), so the constant cannot be changed afterwards either.
+    /// constant is part of the image, so it is as fixed as the binding. `T` is [`PlainData`], so the
+    /// constant cannot be changed afterwards either.
     #[doc(hidden)]
     pub fn __constant<C: GuestConstant<Value = T>>() -> Self {
         Self(C::VALUE)
     }
 }
 
-mod sealed {
-    /// Implemented only in this crate: what [`super::AuthValue`] and [`super::ToWord`] require.
+pub(crate) mod sealed {
+    /// Implemented only in this crate: what [`super::PlainData`] and [`super::ToWord`] require.
     pub trait Sealed {}
 }
 
-/// What a guest constant may be: plain data, with no interior mutability (a `Cell` constant could be
-/// set at run time, from `W`). Byte arrays, integers, `bool` and this crate's own value types.
-/// Sealed: a guest cannot add a type.
-pub trait AuthValue: sealed::Sealed {}
+/// Plain data: what a [`Pinned`] or [`Authenticated`] value, every derivation's result and a guest
+/// constant may be. Integers, `bool`, `()`, and arrays, `Vec`s, `Option`s and tuples (up to six
+/// elements) of plain data, and this crate's own value types, each of whose fields is plain data
+/// (checked where the type is declared). Nothing with interior mutability (`Cell`, `RefCell`,
+/// `OnceCell`, `OnceLock`, `LazyCell`, `LazyLock`, `Mutex`, `RwLock`, the atomics): a guest could
+/// derive one into an `Authenticated`, set it from `W` through the shared borrow
+/// [`Authenticated::get`] gives, and map it back out. No reference or pointer either (a leaked
+/// `&'static AtomicU64` is as good as the cell), no function, and no type of the guest's own, which
+/// could hold any of those. Sealed: a guest cannot add a type.
+pub trait PlainData: sealed::Sealed {}
 
-macro_rules! auth_values {
+macro_rules! plain_data_primitives {
     ($($t:ty),*) => {$(
         impl sealed::Sealed for $t {}
-        impl AuthValue for $t {}
+        impl PlainData for $t {}
     )*};
 }
-auth_values!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool);
-auth_values!(crate::state::Account, crate::header::Header, crate::scheme1::ProofKind);
-impl<const N: usize> sealed::Sealed for [u8; N] {}
-impl<const N: usize> AuthValue for [u8; N] {}
+plain_data_primitives!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool, char, ());
+
+impl<T: PlainData, const N: usize> sealed::Sealed for [T; N] {}
+impl<T: PlainData, const N: usize> PlainData for [T; N] {}
+impl<T: PlainData> sealed::Sealed for Vec<T> {}
+impl<T: PlainData> PlainData for Vec<T> {}
+impl<T: PlainData> sealed::Sealed for Option<T> {}
+impl<T: PlainData> PlainData for Option<T> {}
+
+macro_rules! plain_data_tuples {
+    ($(($($t:ident),+)),*) => {$(
+        impl<$($t: PlainData),+> sealed::Sealed for ($($t,)+) {}
+        impl<$($t: PlainData),+> PlainData for ($($t,)+) {}
+    )*};
+}
+plain_data_tuples!((A, B), (A, B, C), (A, B, C, D), (A, B, C, D, E), (A, B, C, D, E, F));
+
+/// Declares one of this crate's own value types [`PlainData`], next to its definition. The pattern
+/// names every field (or every variant and its fields), so a field added later breaks the build
+/// until it is listed here, and each must be plain data itself.
+macro_rules! plain_data {
+    (struct $t:ident { $($f:ident),* $(,)? }) => {
+        impl $crate::guard::sealed::Sealed for $t {}
+        impl $crate::guard::PlainData for $t {}
+        const _: () = {
+            #[allow(dead_code)]
+            fn every_field_is_plain_data(v: &$t) {
+                let $t { $($f),* } = v;
+                $($crate::guard::is_plain_data($f);)*
+            }
+        };
+    };
+    (enum $t:ident { $($v:ident $(($($f:ident),*))?),* $(,)? }) => {
+        impl $crate::guard::sealed::Sealed for $t {}
+        impl $crate::guard::PlainData for $t {}
+        const _: () = {
+            #[allow(dead_code)]
+            fn every_field_is_plain_data(v: &$t) {
+                match v {
+                    $($t::$v $(($($f),*))? => { $($($crate::guard::is_plain_data($f);)*)? })*
+                }
+            }
+        };
+    };
+}
+pub(crate) use plain_data;
+
+/// Compiles only for plain data: [`plain_data!`]'s field check.
+pub(crate) fn is_plain_data<T: PlainData>(_: &T) {}
 
 /// A guest constant: [`constant!`](crate::constant) implements it for a type of its own, with the
 /// expression as `VALUE`.
 #[doc(hidden)]
 pub trait GuestConstant {
-    type Value: AuthValue;
+    type Value: PlainData;
     const VALUE: Self::Value;
 }
 
 /// A guest constant as an [`Authenticated`] value. The expression must be a constant expression
 /// (it is an associated `const`), so no runtime value, and nothing from `W`, can pass through; the
-/// type must be an [`AuthValue`].
+/// type must be [`PlainData`].
 ///
 /// ```
 /// use hemiprove_eth_prelude::{constant, guard::Authenticated};
@@ -224,7 +396,7 @@ macro_rules! constant {
     }};
 }
 
-impl<T> Authenticated<alloc::vec::Vec<T>> {
+impl<T: PlainData> Authenticated<alloc::vec::Vec<T>> {
     /// The elements of an authenticated list, each authenticated.
     pub fn into_items(self) -> impl Iterator<Item = Authenticated<T>> {
         self.0.into_iter().map(Authenticated)
@@ -239,7 +411,7 @@ pub fn indices(count: &Authenticated<u64>) -> impl Iterator<Item = Authenticated
 /// A value that fills one 32-byte journal word, big-endian and left-padded like `abi.encode`.
 /// Sealed: an output is one of these types, never a guest's own (whose `to_word` could read
 /// anything).
-pub trait ToWord: sealed::Sealed {
+pub trait ToWord: PlainData {
     fn to_word(&self) -> [u8; 32];
 }
 
@@ -344,7 +516,7 @@ impl JournalWriter {
     }
 
     /// Commits the next header word. Words go in header order, each once.
-    pub fn commit_pinned<T>(&mut self, p: &Pinned<T>) -> Result<(), GuardError> {
+    pub fn commit_pinned<T: PlainData>(&mut self, p: &Pinned<T>) -> Result<(), GuardError> {
         if p.index != self.next_pinned {
             return Err(GuardError::PinnedOutOfOrder { expected: self.next_pinned, found: p.index });
         }

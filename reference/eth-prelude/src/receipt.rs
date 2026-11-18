@@ -84,12 +84,21 @@ pub enum Outcome {
     PostState([u8; 32]),
 }
 
+crate::guard::plain_data!(
+    enum Outcome {
+        Status(status),
+        PostState(root),
+    }
+);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Log {
     pub address: [u8; 20],
     pub topics: Vec<[u8; 32]>,
     pub data: Vec<u8>,
 }
+
+crate::guard::plain_data!(struct Log { address, topics, data });
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
@@ -103,6 +112,10 @@ pub struct Receipt {
     /// Deposit receipts from Canyon.
     pub deposit_receipt_version: Option<u64>,
 }
+
+crate::guard::plain_data!(struct Receipt {
+    tx_type, outcome, cumulative_gas_used, logs_bloom, logs, deposit_nonce, deposit_receipt_version,
+});
 
 fn is_known_type(t: u8) -> bool {
     matches!(t, TYPE_ACCESS_LIST | TYPE_DYNAMIC_FEE | TYPE_BLOB | TYPE_SET_CODE | TYPE_DEPOSIT)

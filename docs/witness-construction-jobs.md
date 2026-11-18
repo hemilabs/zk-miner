@@ -576,11 +576,15 @@ validation is where soundness bugs hide.
 - **Commit what you checked.** The reference library enforces it with types: a `Pinned<T>` built
   only from `W`'s header words and committed exactly once, in header order; an `Authenticated<T>`
   produced only by verifiers, from pinned values, from guest constants (`constant!`: an associated
-  `const` of a sealed plain-data type, byte arrays, integers, `bool` or the prelude's own types), or
-  by `fn`-pointer derivations of those; outputs only of the sealed `ToWord` types; trie keys taken
-  only as `Authenticated` values; and a `finish()` that returns the journal only when every header
-  word was committed and every item of `W` read. A `fn` pointer captures nothing but can still read
-  a `static`, `thread_local!` or `Cell`: the guest lints refuse those in a guest's sources.
+  `const`), or by `fn`-pointer derivations of those; both holding only the sealed `PlainData` types
+  (integers, `bool`, byte arrays, `Vec`s, `Option`s, arrays and tuples of those, the prelude's own
+  types), so no derivation can put a cell, lock, atomic, reference or guest-defined type inside one
+  and set it through `get`; outputs only of the sealed `ToWord` types; trie keys taken only as
+  `Authenticated` values; and a `finish()` that returns the journal only when every header word was
+  committed and every item of `W` read. A `fn` pointer captures nothing but can still read a
+  `static` or `thread_local!`: the guest lints refuse those, and every interior-mutable type, in a
+  guest's sources. Left to an audit: `unsafe` code, and a branch on an unverified value that chooses
+  which derivation runs.
 
 ### 8.4 EVM state, receipts and transactions
 
