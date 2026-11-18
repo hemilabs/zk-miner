@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Tests assemble-macos.sh's minimum-macOS handling and check-macos-release.sh's BUILDINFO checks on
+# prebuilt binaries, without a build and without a GPU (the B9-PKG review finding: the revert knob
+# ZKMINER_MACOS_MIN=sdk produced no kit, and its BUILDINFO would have let install.sh accept a macOS
+# on which Metal does not load the kernels):
+#
+#   test-assemble-macos.sh <sdk worker> <sdk CLI> [<27.0 worker> <27.0 CLI>]
+#
+# <sdk ...>: a worker and CLI built with no deployment target (ZKMINER_MACOS_MIN=sdk, or a plain
+# `make -f Makefile.mac mac-build-worker`): minos 11.0, metallibs for the build SDK.
+# <27.0 ...>: optional, a default kit build (minos 27.0, metallibs for 27.0), e.g. from a kit tarball.
+#
+# It copies the files assemble-macos.sh reads into a scratch repo, puts the binaries in its
+# target/release, and runs assemble-macos.sh with ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none:
+# 1. sdk mode on the sdk build: a kit; BUILDINFO binaries_minos = the binaries' minos, metal_target =
+#    the metallibs' target, min_macos = the newer of the two (the SDK's version, not 11.0); the
+#    outer SHA256SUMS is written.
+# 2. default mode on the sdk build: refused (the build is not for 27.0).
+# 3. with a 27.0 build: default mode gives min_macos = binaries_minos = metal_target = 27.0, and sdk
+#    mode on it reads the same 27.0.
+# 4. check-macos-release.sh rejects the sdk kit with BUILDINFO edited (SHA256SUMS redone) to the
+#    old min_macos (the binaries' 11.0), to an older macOS than the metallibs', to a newer one than
+#    needed, and with a metal_target the worker does not embed.
+# 5. install.sh (--no-aot, scratch HOME and prefix, a sw_vers shim) refuses the sdk kit on a macOS
+#    older than the metallibs' target and accepts it on that version; with the old BUILDINFO
+#    (min_macos = 11.0) it would have accepted the older macOS.
+# 6. install.sh --with-groth16 takes the worker's lock file (RISC0_HOME/tmp/.risc0-groth16-<v>.lock):
+#    while another process holds it and completes the component, install.sh waits and then
+#    downloads nothing (the kit's groth16_url points at a closed port, so a download would fail).
+# 7. install.sh leaves no partial .<name>.tmp.<pid> file when a copy fails (a cp shim fails on the
+#    worker's copy, as on a full disk).
+# Needs about 1 GB in TMPDIR and a few minutes (each kit is gzip -9 packed).
+set -euo pipefail
+ci=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$ci/../.." && pwd)
+sdk_worker=${1:?usage: $0 <sdk worker> <sdk CLI> [<27.0 worker> <27.0 CLI>]}
+sdk_cli=${2:?usage: $0 <sdk worker> <sdk CLI> [<27.0 worker> <27.0 CLI>]}
+m27_worker=${3:-} m27_cli=${4:-}
+
+T=$(mktemp -d "${TMPDIR:-/tmp}/zkminer-test-assemble-macos.XXXXXX")
+trap 'rm -rf "$T"' EXIT
+pass=0 fails=0
+ok() { echo "PASS $*"; pass=$((pass + 1)); }
+no() { echo "FAIL $*"; fails=$((fails + 1)); }
+info() { sed -n "s/^$2=//p" "$1"; }
+
+# A scratch repo with what assemble-macos.sh reads (no git: its commit fields say "unknown").
+fake_repo() { # <dir> <worker> <cli>
+  local r=$1 f
+  mkdir -p "$r"
+  for f in Cargo.toml LICENSE scripts/ci scripts/mac packaging/macos crates/zkminer-prove-risc0/src/groth16_component.rs; do
+    mkdir -p "$r/$(dirname "$f")"
+    cp -R "$repo/$f" "$r/$f"
+  done
+  mkdir -p "$r/target/release"
+  cp "$2" "$r/target/release/zkminer-prove-risc0-metal"
+  cp "$3" "$r/target/release/zkminer"
+}
+assemble() { # <repo> <out> <ZKMINER_MACOS_MIN>
+  env -u MACOSX_DEPLOYMENT_TARGET -u RUSTFLAGS ENV_SH=/nonexistent ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none \
+    ZKMINER_MACOS_MIN="$3" "$1/scripts/ci/assemble-macos.sh" "$2"
+}
+kit_buildinfo() { # <tarball> <dest dir>: unpack, print the BUILDINFO path
+  mkdir -p "$2"; tar -xzf "$1" -C "$2"; echo "$2"/zkminer-*-macos-arm64/BUILDINFO
+}
+
+# Read independently of the scripts under test: minos by otool, the metallib target from the first
+# MTLB header (u16 os major, u16 os minor at +12).
+sdk_minos=$(otool -l "$sdk_worker" | awk '/LC_BUILD_VERSION/{f=1} f&&$1=="minos"{print $2; exit}')
+sdk_metal=$(python3 -I -c '
+import struct, sys
+d = open(sys.argv[1], "rb").read(); p = d.find(b"MTLB\x01\x80")
+print("%d.%d" % struct.unpack_from("<HH", d, p + 12) if p >= 0 else "none")' "$sdk_worker")
+echo "sdk build: minos $sdk_minos, metallibs for $sdk_metal"
+[ "$sdk_metal" != none ] || { echo "the sdk worker embeds no metallib" >&2; exit 2; }
+[ "$sdk_minos" != "$sdk_metal" ] || echo "note: the sdk build's minos equals its metallib target; case 1 then cannot tell the fix apart"
+
+# --- 1. sdk mode on the sdk build ---------------------------------------------------------------
+fake_repo "$T/r-sdk" "$sdk_worker" "$sdk_cli"
+if assemble "$T/r-sdk" "$T/out-sdk" sdk > "$T/sdk.log" 2>&1; then
+  ok "1: ZKMINER_MACOS_MIN=sdk assembles a kit"
+  tarball=$(ls "$T"/out-sdk/zkminer-*-macos-arm64.tar.gz)
+  bi=$(kit_buildinfo "$tarball" "$T/u-sdk")
+  [ "$(info "$bi" binaries_minos)" = "$sdk_minos" ] && ok "1: binaries_minos $sdk_minos" || no "1: binaries_minos $(info "$bi" binaries_minos), want $sdk_minos"
+  [ "$(info "$bi" metal_target)" = "$sdk_metal" ] && ok "1: metal_target $sdk_metal" || no "1: metal_target $(info "$bi" metal_target), want $sdk_metal"
+  want=$(printf '%s\n' "$sdk_minos" "$sdk_metal" | sort -t. -k1,1n -k2,2n | tail -1)
+  [ "$(info "$bi" min_macos)" = "$want" ] && ok "1: min_macos $want (the newer of the two)" || no "1: min_macos $(info "$bi" min_macos), want $want"
+  [ -s "$T/out-sdk/SHA256SUMS" ] && (cd "$T/out-sdk" && shasum -a 256 -c --quiet SHA256SUMS) \
+    && ok "1: outer SHA256SUMS written and holds" || no "1: no valid outer SHA256SUMS"
+else
+  no "1: ZKMINER_MACOS_MIN=sdk failed (log below)"; tail -20 "$T/sdk.log"
+  tarball=
+fi
+
+# --- 2. default mode on the sdk build -----------------------------------------------------------
+if assemble "$T/r-sdk" "$T/out-sdk-def" 27.0 > "$T/sdk-def.log" 2>&1; then
+  no "2: the default mode packaged a build that is not for 27.0"
+else
+  grep -q "the build is not for macOS 27.0" "$T/sdk-def.log" && ok "2: the default mode refuses the sdk build" \
+    || { no "2: the default mode failed for another reason"; tail -5 "$T/sdk-def.log"; }
+fi
+
+# --- 3. a 27.0 build ----------------------------------------------------------------------------
+if [ -n "$m27_worker" ]; then
+  fake_repo "$T/r-27" "$m27_worker" "$m27_cli"
+  for mode in 27.0 sdk; do
+    if assemble "$T/r-27" "$T/out-27-$mode" "$mode" > "$T/27-$mode.log" 2>&1; then
+      bi=$(kit_buildinfo "$(ls "$T"/out-27-$mode/zkminer-*-macos-arm64.tar.gz)" "$T/u-27-$mode")
+      got="$(info "$bi" min_macos) $(info "$bi" binaries_minos) $(info "$bi" metal_target)"
+      [ "$got" = "27.0 27.0 27.0" ] && ok "3: ZKMINER_MACOS_MIN=$mode on the 27.0 build: min_macos, binaries_minos, metal_target 27.0" \
+        || no "3: ZKMINER_MACOS_MIN=$mode on the 27.0 build: got '$got'"
+      rm -rf "$T/u-27-$mode" "$T/out-27-$mode"
+    else
+      no "3: ZKMINER_MACOS_MIN=$mode on the 27.0 build failed"; tail -10 "$T/27-$mode.log"
+    fi
+  done
+else
+  echo "SKIP 3: no 27.0 build given"
+fi
+
+# --- 4. check-macos-release.sh on edited BUILDINFOs ---------------------------------------------
+rekit() { # <field=value>...: the sdk kit with BUILDINFO fields replaced, repacked; prints the tarball
+  local d=$T/edit k e
+  rm -rf "$d"; mkdir -p "$d"; tar -xzf "$tarball" -C "$d"
+  k=$(echo "$d"/zkminer-*-macos-arm64)
+  for e in "$@"; do
+    sed -i '' "s|^${e%%=*}=.*|$e|" "$k/BUILDINFO"
+    grep -qxF "$e" "$k/BUILDINFO" || { echo "rekit: cannot set $e" >&2; exit 2; }
+  done
+  (cd "$k" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done > SHA256SUMS)
+  (cd "$d" && COPYFILE_DISABLE=1 tar --no-xattrs -cf - "$(basename "$k")" | gzip -1 > "$d.tar.gz")
+  rm -rf "$d"; echo "$d.tar.gz"
+}
+neg() { # <label> <expected FAIL text> <field=value>...
+  local label=$1 text=$2 t; shift 2
+  t=$(rekit "$@")
+  if "$ci/check-macos-release.sh" "$t" > "$T/neg.log" 2>&1; then
+    no "4: check-macos-release.sh accepted $label"
+  elif grep -q "$text" "$T/neg.log"; then
+    ok "4: check-macos-release.sh rejects $label"
+  else
+    no "4: $label rejected for another reason: $(grep FAIL "$T/neg.log" | head -2)"
+  fi
+  rm -f "$t"
+}
+if [ -n "$tarball" ]; then
+  older=$(awk -F. '{printf "%d.%d", $1, ($2 > 0 ? $2 - 1 : 0)}' <<<"$sdk_metal")
+  [ "$older" != "$sdk_metal" ] || older=$(( ${sdk_metal%%.*} - 1 )).0
+  neg "min_macos = the binaries' minos $sdk_minos (the old sdk BUILDINFO)" "is not the newer of" "min_macos=$sdk_minos"
+  neg "min_macos $older, older than the metallibs' $sdk_metal" "is not the newer of" "min_macos=$older"
+  neg "min_macos 99.0, newer than needed" "is not the newer of" "min_macos=99.0"
+  neg "metal_target $sdk_minos (min_macos $sdk_minos), which the worker does not embed" "embeds metallibs for another macOS" "metal_target=$sdk_minos" "min_macos=$sdk_minos"
+fi
+
+# --- 5. install.sh on the sdk kit, on a faked macOS version ---------------------------------------
+inst() { # <tarball> <macOS version>: install.sh --no-aot into scratch; prints its exit code
+  local d=$T/inst rc=0
+  rm -rf "$d"; mkdir -p "$d/bin" "$d/home" "$d/kit"
+  printf '#!/bin/sh\n[ "$1" = -productVersion ] && echo %s || /usr/bin/sw_vers "$@"\n' "$2" > "$d/bin/sw_vers"
+  chmod 0755 "$d/bin/sw_vers"
+  tar -xzf "$1" -C "$d/kit"
+  HOME=$d/home PATH="$d/bin:$PATH" "$(echo "$d"/kit/zkminer-*-macos-arm64)/install.sh" --no-aot --prefix "$d/home/.zkminer" > "$T/inst.log" 2>&1 || rc=$?
+  rm -rf "$d"; echo $rc
+}
+if [ -n "$tarball" ]; then
+  rc=$(inst "$tarball" "$older")
+  [ "$rc" != 0 ] && grep -q "needs macOS $sdk_metal or later" "$T/inst.log" \
+    && ok "5: install.sh refuses the sdk kit on macOS $older (its metallibs need $sdk_metal)" \
+    || no "5: install.sh on macOS $older: rc $rc: $(tail -1 "$T/inst.log")"
+  rc=$(inst "$tarball" "$sdk_metal")
+  [ "$rc" = 0 ] && ok "5: install.sh installs the sdk kit on macOS $sdk_metal" || no "5: install.sh on macOS $sdk_metal: rc $rc: $(tail -2 "$T/inst.log")"
+  t=$(rekit "min_macos=$sdk_minos")
+  rc=$(inst "$t" "$older")
+  [ "$rc" = 0 ] && echo "info 5: with the old BUILDINFO (min_macos $sdk_minos) install.sh would accept macOS $older, where Metal refuses the $sdk_metal kernels (the finding)" \
+    || echo "info 5: the old BUILDINFO on macOS $older: rc $rc"
+  rm -f "$t"
+fi
+
+# --- 6. install.sh and the worker's risc0-groth16 lock ------------------------------------------
+inst_env() { # <tarball> <dir> <install args>...: install.sh in <dir> (HOME, RISC0_HOME, bin shims); rc
+  local t=$1 d=$2 rc=0; shift 2
+  mkdir -p "$d/bin" "$d/home" "$d/kit"
+  printf '#!/bin/sh\n[ "$1" = -productVersion ] && echo %s || /usr/bin/sw_vers "$@"\n' "$sdk_metal" > "$d/bin/sw_vers"
+  chmod 0755 "$d/bin/sw_vers"
+  tar -xzf "$t" -C "$d/kit"
+  HOME=$d/home RISC0_HOME=$d/r0 PATH="$d/bin:$PATH" "$(echo "$d"/kit/zkminer-*-macos-arm64)/install.sh" \
+    --no-aot --prefix "$d/home/.zkminer" "$@" > "$d/log" 2>&1 || rc=$?
+  echo $rc
+}
+if [ -n "$tarball" ]; then
+  t=$(rekit "groth16_url=http://127.0.0.1:9/no-download")
+  # control: no lock holder, no component: install.sh tries the (closed) URL and fails
+  d=$T/g16-control; rc=$(inst_env "$t" "$d" --with-groth16)
+  [ "$rc" != 0 ] && grep -q "the download failed" "$d/log" && ok "6: control: without a component install.sh downloads (and the closed URL fails)" \
+    || no "6: control: rc $rc: $(tail -2 "$d/log")"
+  rm -rf "$d"
+  d=$T/g16-lock; mkdir -p "$d/r0/tmp"
+  lock=$d/r0/tmp/.risc0-groth16-$(sed -n 's/^groth16_version=//p' "$T/u-sdk"/*/BUILDINFO).lock
+  comp=$d/r0/extensions/v$(sed -n 's/^groth16_version=//p' "$T/u-sdk"/*/BUILDINFO)-risc0-groth16
+  perl -e 'use Fcntl qw(:flock); open(my $f, ">", $ARGV[0]) or die; flock($f, LOCK_EX) or die;
+    open(my $r, ">", "$ARGV[0].held"); close $r; sleep 4;
+    system("mkdir", "-p", $ARGV[1]);
+    for my $n (qw(stark_verify_graph.bin stark_verify_final.zkey fuzzed_msm_results.bin preprocessed_coeffs.bin)) {
+      open(my $o, ">", "$ARGV[1]/$n") or die; print $o "x"; close $o }
+    flock($f, LOCK_UN)' "$lock" "$comp" &
+  holder=$!
+  while [ ! -e "$lock.held" ]; do sleep 0.1; done
+  t0=$(perl -MTime::HiRes=time -e 'printf "%.1f", time')
+  rc=$(inst_env "$t" "$d" --with-groth16)
+  waited=$(perl -MTime::HiRes=time -e "printf '%.1f', time - $t0")
+  wait "$holder" || true
+  if [ "$rc" = 0 ] && grep -q "installed meanwhile" "$d/log" && ! grep -q downloading "$d/log"; then
+    ok "6: install.sh waited ${waited} s for the lock holder and downloaded nothing"
+  else
+    no "6: lock: rc $rc after ${waited} s: $(tail -3 "$d/log")"
+  fi
+  rm -rf "$d" "$t"
+fi
+
+# --- 7. install.sh cleans up a failed copy ------------------------------------------------------
+if [ -n "$tarball" ]; then
+  d=$T/cpfail; mkdir -p "$d/bin"
+  cat > "$d/bin/cp" <<'EOF'
+#!/bin/sh
+case "$2" in
+  */.zkminer-prove-risc0-metal.tmp.*) head -c 4096 "$1" > "$2"; echo "cp: $2: No space left on device" >&2; exit 1 ;;
+esac
+exec /bin/cp "$@"
+EOF
+  chmod 0755 "$d/bin/cp"
+  rc=$(inst_env "$tarball" "$d")
+  left=$(find "$d/home/.zkminer" -name '.*.tmp.*' 2>/dev/null)
+  [ "$rc" != 0 ] && [ -z "$left" ] && ok "7: a failed copy (rc $rc) leaves no partial file" || no "7: rc $rc, left: $left"
+  rm -rf "$d"
+fi
+
+echo "test-assemble-macos: $pass passed, $fails failed"
+[ $fails = 0 ]

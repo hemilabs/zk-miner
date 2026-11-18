@@ -218,6 +218,35 @@ for now: the rv32im witness generation and the last recursion step before the wr
 Docker nor a CUDA/ROCm toolkit is involved. SP1 and OpenVM have no Mac worker; the miner never gives an Apple
 GPU an SP1 slot.
 
+### Install the beta (prebuilt kit)
+
+The macOS beta ships as `zkminer-<version>-macos-arm64.tar.gz`, built by
+`scripts/ci/assemble-macos.sh`. It needs **macOS 27.0 or later** on an Apple Silicon Mac with
+**16 GB or more**. It contains the CLI, the Metal worker, the worker's offline GPU pipeline archives
+(GPU family `applegpu_g17s`, the M5 Max it was tested on), an installer and a README.
+
+```sh
+tar -xzf zkminer-<version>-macos-arm64.tar.gz
+cd zkminer-<version>-macos-arm64
+./install.sh                    # ~/.zkminer/zkminer and ~/.zkminer/provers/; --help for options
+export PATH="$HOME/.zkminer:$PATH"
+zkminer init && zkminer benchmark
+```
+
+- **Unsigned.** The kit has no Developer ID and is not notarized. `install.sh` checks the kit's
+  `SHA256SUMS` and removes `com.apple.quarantine` from the files it installs. To run a binary from the
+  kit directly, use `xattr -d com.apple.quarantine <file>`, or System Settings → Privacy & Security →
+  Open Anyway.
+- **Groth16 component.** It is not in the kit (2.4 GB). The worker downloads it at its first warm-up,
+  checked against its pinned SHA-256; `./install.sh --with-groth16` fetches it at install time instead.
+- **First start.** About 2.3 s on the M5 Max (`applegpu_g17s`; run the worker with `--metal-arch`
+  to see your Mac's family). Other families compile their GPU pipelines once,
+  about a minute on an M5 Max and longer on smaller chips.
+
+The kit's own `README.md` covers the details for users. Maintainers: see
+[docs/macos-beta.md](docs/macos-beta.md) for how the kit is built, why macOS 27, and which GPU
+families get archives.
+
 ### Supported Macs
 
 | Tier | Hardware | What to expect |
@@ -380,8 +409,9 @@ Read at run time by the worker (they pass through the miner's environment):
 - Under a 4 GiB budget every job wraps, keccak jobs included (since risc0 B9-4G the Groth16 prover
   plans 3885 MiB there and leaves ~150 MiB of headroom beside the worker's pipelines). It relies on
   the worker freeing the key after each proof; two wraps with the key kept do not fit.
-- **Beta.** The Mac build is a beta: unsigned (no Developer ID, not notarized), so macOS may ask
-  before running a downloaded binary; building it yourself avoids that.
+- **Beta.** The Mac build is a beta. It is unsigned (no Developer ID, not notarized), so Gatekeeper
+  blocks a downloaded binary until its quarantine flag is removed. The kit's `install.sh` removes it,
+  and building the worker yourself avoids it.
 - The rv32im GPU witness generation is disabled by default (see the knob above).
 - The six-program benchmark takes about 3 minutes at po2 20 on an M5 Max (177-180 s of wall time:
   169.6 s of STARK plus six wraps), longer on smaller Macs.
