@@ -381,9 +381,9 @@ pub enum WorkerResponse {
     ProgramIdResult {
         request_id: u64,
         /// risc0: the image id (`Digest::as_bytes`, the order the deployed adapter verifies against).
-        /// SP1: the verifying-key hash as `vk.bytes32()` writes it. The on-chain order of an SP1
-        /// programId is deployment-defined, so a caller compares it in either order, as the SP1
-        /// worker's prove-path gate does.
+        /// SP1: the verifying-key hash as `vk.bytes32()` writes it, the big-endian order the
+        /// on-chain verifier reads `programId` in. A caller compares it in that order only, as the
+        /// SP1 worker's prove-path gate does.
         program_id: [u8; 32],
         /// How long the derivation took.
         duration_secs: f64,

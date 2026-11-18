@@ -43,6 +43,15 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Whether an ELF whose verifying-key hash is `vk_hash` (as `decode_hex32` reads `bytes32()`) may be
+/// proven for a job whose on-chain `programId` is `program_id`. The canonical order only: the
+/// on-chain adapter passes `programId` straight into `verifyProof(programVKey, …)`, and the verifier
+/// reads it as `uint256(programVKey)`, the same big-endian bytes32 the SDK's `bytes32()` prints. Any
+/// other order only lets a decoy ELF through to a proof the chain then rejects.
+fn vkey_matches_program_id(vk_hash: &[u8; 32], program_id: &[u8; 32]) -> bool {
+    vk_hash == program_id
+}
+
 /// Largest number of distinct proving keys the worker keeps resident. Each entry is a large
 /// GPU-resident key, so without a bound the cache grows O(distinct ELFs a submitter sends) in host
 /// RAM and VRAM. LRU-evicted beyond this. Override with `ZKMINER_SP1_PK_CACHE_MAX`.
@@ -2970,9 +2979,8 @@ fn run_proof(
     // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
     // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
     // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
-    // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
-    // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
-    // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
+    // guaranteed revert. Reject BEFORE proving, in the order the chain reads it
+    // (`vkey_matches_program_id`). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
     if let Some(pid) = program_id {
         let skip = matches!(
             std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
@@ -2988,9 +2996,7 @@ fn run_proof(
             // via `format!("0x{:0>64}", …)` and never panics.
             match decode_hex32(&pk.verifying_key().bytes32()) {
                 Some(vk_hash) => {
-                    let matches =
-                        vk_hash == pid || vk_hash.iter().rev().copied().eq(pid.iter().copied());
-                    if !matches {
+                    if !vkey_matches_program_id(&vk_hash, &pid) {
                         anyhow::bail!(
                             "ELF vkey hash does not match job programId (served ELF is not the \
                              registered program) — refusing to prove"
@@ -4374,6 +4380,19 @@ mod pk_cache_tests {
         // Malformed inputs → None (never panic).
         assert!(super::decode_hex32("0x1234").is_none()); // too short
         assert!(super::decode_hex32(&("0x".to_owned() + &"zz".repeat(32))).is_none()); // non-hex
+    }
+
+    /// The programId bind takes the order the chain verifies in, and only that one: a reversed id
+    /// is a decoy whose proof the on-chain verifier rejects, so it must be refused before the proof.
+    #[test]
+    fn the_program_id_binds_in_the_canonical_order_only() {
+        let vk = super::decode_hex32(&format!("0x{}", "0123456789abcdef".repeat(4))).unwrap();
+        let mut reversed = vk;
+        reversed.reverse();
+        assert!(super::vkey_matches_program_id(&vk, &vk));
+        assert!(!super::vkey_matches_program_id(&vk, &reversed));
+        assert!(!super::vkey_matches_program_id(&reversed, &vk));
+        assert!(!super::vkey_matches_program_id(&vk, &[0u8; 32]));
     }
 
     #[test]
