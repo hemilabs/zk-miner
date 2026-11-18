@@ -3619,9 +3619,9 @@ mod threshold_tests {
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
         // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
-        assert_eq!(from_vram(16 * GIB, RTX4090), Some(SMALL));
+        assert_eq!(from_vram(18 * GIB, RTX4090), Some(SMALL));
         // Through the function the worker actually calls, not a re-implementation of it.
-        let combined = cap(1.0, Some(16 * GIB), RTX4090);
+        let combined = cap(1.0, Some(18 * GIB), RTX4090);
         assert_eq!(
             combined,
             Some(SMALL),
@@ -3799,16 +3799,17 @@ mod threshold_tests {
 
 #[cfg(test)]
 mod pin_tests {
-    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the fork's shard tiers and its
-    /// 402,653,184-element default) was measured against the pinned hemilabs `sp1`, whose circuit is
-    /// v6.0.0. Moving the pin must revisit it: v6.8.1's circuit is v6.1.0, and its tiers differ (a
-    /// 24 GB card defaults to 285,212,672 elements, and its Groth16 runs in a helper process with a
-    /// host-wide queue, which `warmup` and the dispatcher already handle).
+    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the server's shard tiers, the
+    /// cards it refuses, where it runs its memory savers, and the measured VRAM tables) was checked
+    /// against the pinned hemilabs `sp1` 6.8.1, whose circuit is v6.1.0, and both tables measured
+    /// under its server (2026-11-16 on an RTX 4070, 2026-11-17 on an RTX 5090). Moving the pin must
+    /// revisit them: the v6.0.0 server ran its savers on 24 GB cards too, and the larger card's
+    /// table it left was ~5 GiB short at 268M under this one.
     #[test]
     fn the_sizing_mirror_was_measured_for_the_pinned_sp1() {
         assert_eq!(
             sp1_sdk::SP1_CIRCUIT_VERSION,
-            "v6.0.0",
+            "v6.1.0",
             "the SP1 pin moved: re-measure and update the sizing mirror in \
              zkminer_prover_protocol::types, then update this test"
         );

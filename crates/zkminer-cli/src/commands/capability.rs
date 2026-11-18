@@ -156,13 +156,17 @@ fn running_verdict(
             }
         }
         BACKEND_SP1 => {
-            // The tables are CUDA measurements; another vendor's card is held to the larger one's.
+            // The tables are CUDA measurements; another vendor's card, or a 12-16 GB NVIDIA one with
+            // the server's memory savers off, is held to `SP1_OTHER_SERVER_TIERS` (no total). The
+            // dispatcher's `sizing_total` decides the same.
             let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| {
                 std::env::var(v).ok()
             });
-            let total = slot
-                .vram_bytes
-                .filter(|_| slot.gpu_tag == "cuda" && !savers_off);
+            let total = slot.vram_bytes.filter(|&v| {
+                slot.gpu_tag == "cuda"
+                    && !(savers_off
+                        && zkminer_prover_protocol::types::sp1_savers_are_the_default(v))
+            });
             let floor =
                 zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1, total);
             // What SP1's smallest measured configuration needs free, whatever the override.
@@ -340,7 +344,7 @@ pub fn rows(
     rows
 }
 
-/// One line per row, e.g. "  GPU 0: RTX 4090 (24.0 GiB) · SP1: ready — when 15.2 GiB … is free".
+/// One line per row, e.g. "  GPU 0: RTX 4090 (24.0 GiB) · SP1: ready — when 17.1 GiB … is free".
 pub fn lines(rows: &[Row]) -> Vec<String> {
     rows.iter()
         .map(|r| {
