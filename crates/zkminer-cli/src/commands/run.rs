@@ -2405,6 +2405,35 @@ fn fmt_hemi(wei: u128) -> String {
     format!("{whole}.{cents:02}")
 }
 
+/// The variable naming the share of total stake one job's collateral may lock.
+const MAX_JOB_COLLATERAL_FRACTION_ENV: &str = "ZKMINER_MAX_JOB_COLLATERAL_FRACTION";
+
+/// What [`MAX_JOB_COLLATERAL_FRACTION_ENV`] is when unset or unreadable.
+///
+/// The cap is checked against a job's collateral at its maximum price, the most its claim could
+/// lock, so it must clear an honest job on a rig staked for only a couple of concurrent ones, and
+/// still stop one job (whose `collateralBps`, up to 500%, and `minCollateral` its submitter chose)
+/// from locking most of the stake, where a forced release then burns a share of all of it.
+const DEFAULT_MAX_JOB_COLLATERAL_FRACTION: f64 = 0.5;
+
+/// The share of total stake one job's collateral may lock: `raw` (the variable's value) when it is a
+/// finite number from 0 up, else the default. `0` turns the cap off.
+fn max_job_collateral_fraction(raw: Option<&str>) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(DEFAULT_MAX_JOB_COLLATERAL_FRACTION)
+}
+
+/// The most collateral one job may lock, in wei: `fraction` of `total_staked`. `None` when the cap is
+/// off (`fraction` 0) or the stake is not known (0). A threshold, so f64 rounding at wei magnitudes
+/// does not matter.
+fn max_job_collateral(total_staked: u128, fraction: f64) -> Option<u128> {
+    if fraction <= 0.0 || total_staked == 0 {
+        return None;
+    }
+    Some(((total_staked as f64) * fraction) as u128)
+}
+
 /// Build the collateral-starvation warning.
 ///
 /// A FUNCTION, not two inline format! calls, because there are two output channels (the
@@ -6290,6 +6319,16 @@ async fn miner_brain(
         // a stranded lock is in `on_chain_locked` but not in `in_flight`, so max() dropped it.)
         let stake_read_block = stake_info.as_ref().and_then(|si| si.read_block);
         let lock_blocks = lock_blocks();
+        // The most one job may lock (`max_job_collateral`): a share of the total stake.
+        let job_collateral_fraction = max_job_collateral_fraction(
+            std::env::var(MAX_JOB_COLLATERAL_FRACTION_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let job_collateral_cap = max_job_collateral(
+            stake_info.as_ref().map_or(0, |si| si.total_staked),
+            job_collateral_fraction,
+        );
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
@@ -7126,6 +7165,20 @@ async fn miner_brain(
                 effective_bps,
                 job_min_collateral, // the job's snapshotted floor, not adapter.min_stake
             );
+            // No job may lock more than its share of the stake (`max_job_collateral`): one whose
+            // terms ask for more is set aside, not claimed. Its terms are fixed while it is Open.
+            if let Some(cap) = job_collateral_cap.filter(|cap| required_collateral > *cap) {
+                tracing::warn!(
+                    "job {} would lock up to {} HEMI of collateral, over the {} HEMI one job may \
+                     lock ({:.0}% of the stake; {MAX_JOB_COLLATERAL_FRACTION_ENV}) — setting it aside",
+                    short_id(jid),
+                    fmt_hemi(required_collateral),
+                    fmt_hemi(cap),
+                    job_collateral_fraction * 100.0,
+                );
+                set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                continue;
+            }
 
             let mut params = JobParams {
                 current_price: snapshot.current_price,
@@ -10415,6 +10468,12 @@ async fn process_job_lifecycle(
                     .await
                 {
                     Ok(false) => {
+                        // A per-program cooldown only, not the post-claim breaker: one such revert
+                        // is not reliably the submitter's doing (a governance read that raced, a
+                        // cause not modelled), and the known causes are refused earlier (SP1 public
+                        // values not committed under SHA-256 before the claim; an SP1 programId in
+                        // another byte order before the proof, as a program mismatch). The per-job
+                        // collateral cap bounds what one costs.
                         if fulfill_no_lever {
                             mark_program_sim_reverted(fulfill_program_id, fulfill_proof_system);
                         }
@@ -13621,6 +13680,48 @@ mod collateral_warning_tests {
                 "printed {printed} is short of {shortfall} wei"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod job_collateral_cap_tests {
+    use super::{max_job_collateral, max_job_collateral_fraction, ONE_HEMI_WEI};
+    use zkminer_chain::auction::compute_collateral;
+
+    #[test]
+    fn the_fraction_is_read_from_the_variable_or_defaults_to_half() {
+        assert_eq!(max_job_collateral_fraction(None), 0.5);
+        assert_eq!(max_job_collateral_fraction(Some("0.25")), 0.25);
+        assert_eq!(max_job_collateral_fraction(Some(" 1 ")), 1.0);
+        assert_eq!(max_job_collateral_fraction(Some("0")), 0.0);
+        for bad in ["", "half", "-0.5", "NaN", "inf"] {
+            assert_eq!(max_job_collateral_fraction(Some(bad)), 0.5, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn no_cap_without_a_stake_or_with_the_cap_off() {
+        assert_eq!(max_job_collateral(0, 0.5), None);
+        assert_eq!(max_job_collateral(1_000 * ONE_HEMI_WEI, 0.0), None);
+        assert_eq!(
+            max_job_collateral(1_000 * ONE_HEMI_WEI, 0.5),
+            Some(500 * ONE_HEMI_WEI)
+        );
+    }
+
+    /// The case the cap is for: a job whose terms its submitter chose (500% collateral at a high
+    /// maximum price) fits in the free stake, so the stake check alone would claim it and a forced
+    /// release would then burn a share of most of the stake. An honest job (the deployment's 100 HEMI
+    /// floor, a few HEMI of price at 150%) is far under the cap.
+    #[test]
+    fn a_job_asking_for_most_of_the_stake_is_over_the_cap_and_an_honest_one_is_not() {
+        let stake = 3_000 * ONE_HEMI_WEI;
+        let cap = max_job_collateral(stake, max_job_collateral_fraction(None)).unwrap();
+        let decoy = compute_collateral(500 * ONE_HEMI_WEI, 50_000, 100 * ONE_HEMI_WEI);
+        assert!(decoy <= stake, "the stake check alone would admit it");
+        assert!(decoy > cap);
+        let honest = compute_collateral(5 * ONE_HEMI_WEI, 15_000, 100 * ONE_HEMI_WEI);
+        assert!(honest <= cap);
     }
 }
 
