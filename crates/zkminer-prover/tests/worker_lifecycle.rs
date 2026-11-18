@@ -297,6 +297,8 @@ fn a_worker_that_lost_its_server_is_replaced_and_the_next_proof_succeeds() {
 /// What a preempted SP1 measurement staged goes with it. SIGKILL skips the executor's own cleanup, and
 /// the room is about to be given to the proof, so left there the two add up to a full tmpfs and a
 /// SIGBUS.
+// `/dev/shm` is Linux's.
+#[cfg(target_os = "linux")]
 #[test]
 fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
     let shm_name = format!("sp1_mocktest{}_t", std::process::id());
@@ -342,6 +344,7 @@ fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
 ///
 ///   ZKMINER_TEST_SP1_WORKER=<zkminer-prove-sp1> cargo test -p zkminer-prover --features testing \\
 ///     --test worker_lifecycle -- --ignored --test-threads=1 preempting_a_real_sp1_measurement
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs a real zkminer-prove-sp1, and no other SP1 execution on this host"]
 fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {

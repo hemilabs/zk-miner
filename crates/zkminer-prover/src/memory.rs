@@ -660,23 +660,50 @@ pub fn terminate_if_our_worker(pid: u32, expected_starttime: Option<u64>) -> boo
 /// parent its children recorded, so they are found from that start time.
 #[cfg(windows)]
 pub fn process_tree(root: u32, root_started: Option<u64>) -> Vec<(u32, u64)> {
-    let root_started = match (pid_starttime(root), root_started) {
-        (Some(now), Some(expected)) if now != expected => return Vec::new(),
-        (Some(now), _) => now,
-        (None, Some(expected)) => expected,
-        (None, None) => return Vec::new(),
+    let Some(root_started) = tree_root_started(pid_starttime(root), root_started) else {
+        return Vec::new();
     };
-    let parents = win32::recorded_parents();
+    tree_from(
+        root,
+        root_started,
+        &win32::recorded_parents(),
+        pid_starttime,
+    )
+}
+
+/// The start time `process_tree` walks a tree from: the live root's (`now`), unless it is not the
+/// `expected` one (a stranger given the number: no tree); else the expected one, for a root that
+/// has exited; `None` when neither is known.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tree_root_started(now: Option<u64>, expected: Option<u64>) -> Option<u64> {
+    match (now, expected) {
+        (Some(now), Some(expected)) if now != expected => None,
+        (Some(now), _) => Some(now),
+        (None, Some(expected)) => Some(expected),
+        (None, None) => None,
+    }
+}
+
+/// `process_tree`'s walk: from `root`, started at `root_started`, every process whose recorded
+/// parent (`parents`: pid, recorded parent pid) is in the tree and that started no earlier than
+/// that parent (`starttime`), with its start time.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tree_from(
+    root: u32,
+    root_started: u64,
+    parents: &[(u32, u32)],
+    starttime: impl Fn(u32) -> Option<u64>,
+) -> Vec<(u32, u64)> {
     let mut tree = vec![(root, root_started)];
     let mut next = 0;
     while next < tree.len() {
         let (parent, parent_started) = tree[next];
         next += 1;
-        for &(pid, recorded) in &parents {
+        for &(pid, recorded) in parents {
             if recorded != parent || pid == parent || tree.iter().any(|(p, _)| *p == pid) {
                 continue;
             }
-            if let Some(started) = pid_starttime(pid).filter(|s| *s >= parent_started) {
+            if let Some(started) = starttime(pid).filter(|s| *s >= parent_started) {
                 tree.push((pid, started));
             }
         }
@@ -2409,5 +2436,61 @@ mod budget_tests {
             plan_measure_preemption(18 * GIB, 0, 20 * GIB, 2 * GIB, total, reserve, &[]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod process_tree_tests {
+    use super::{tree_from, tree_root_started};
+
+    /// The root a retired worker's tree is walked from: the live process only if it is still the
+    /// worker (same start time), the worker's recorded start when it has already exited.
+    #[test]
+    fn a_tree_is_walked_from_the_worker_itself_or_not_at_all() {
+        assert_eq!(tree_root_started(Some(100), Some(100)), Some(100));
+        assert_eq!(tree_root_started(Some(100), None), Some(100));
+        // A stranger now has the number.
+        assert_eq!(tree_root_started(Some(200), Some(100)), None);
+        // The worker has exited: its children recorded it, and are found from its start.
+        assert_eq!(tree_root_started(None, Some(100)), Some(100));
+        assert_eq!(tree_root_started(None, None), None);
+    }
+
+    /// Children by recorded parent, each started no earlier than its parent (a recorded parent pid
+    /// may since belong to another process), transitively; one whose start cannot be read is left
+    /// out with what it started.
+    #[test]
+    fn a_tree_holds_what_the_worker_started_and_nothing_older() {
+        // pid: start time.
+        let started = |pid: u32| match pid {
+            10 => Some(100),
+            11 => Some(110), // the worker's server
+            12 => Some(120), // started by the server
+            13 => Some(90),  // records 10 as its parent, but is older: another process's child
+            14 => None,      // gone, or unreadable
+            15 => Some(150), // started by 14
+            20 => Some(105), // somebody else's
+            _ => None,
+        };
+        let parents = [
+            (11, 10),
+            (12, 11),
+            (13, 10),
+            (14, 10),
+            (15, 14),
+            (20, 1),
+            (10, 1),
+        ];
+        let mut tree = tree_from(10, 100, &parents, started);
+        tree.sort();
+        assert_eq!(tree, vec![(10, 100), (11, 110), (12, 120)]);
+        // From an exited worker's recorded start, its children are still found.
+        let gone = |pid: u32| if pid == 10 { None } else { started(pid) };
+        let mut tree = tree_from(10, 100, &parents, gone);
+        tree.sort();
+        assert_eq!(tree, vec![(10, 100), (11, 110), (12, 120)]);
+        // A cycle in the recorded parents (reused numbers) ends.
+        let cyclic = [(11, 10), (10, 11)];
+        assert_eq!(tree_from(10, 100, &cyclic, started).len(), 2);
     }
 }

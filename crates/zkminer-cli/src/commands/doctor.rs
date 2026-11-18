@@ -22,6 +22,9 @@ enum Level {
 struct Report {
     warnings: usize,
     failures: usize,
+    /// Tests only: every line said, as (level, what, detail).
+    #[cfg(test)]
+    lines: Vec<(Level, String, String)>,
 }
 
 impl Report {
@@ -38,6 +41,9 @@ impl Report {
             _ => {}
         }
         println!("[{tag}] {what}: {}", detail.as_ref());
+        #[cfg(test)]
+        self.lines
+            .push((level, what.to_string(), detail.as_ref().to_string()));
     }
 
     fn section(&self, title: &str) {
@@ -491,19 +497,28 @@ fn sp1_shard_caps_check(report: &mut Report, path: std::path::PathBuf) {
 #[cfg(windows)]
 fn sysmem_fallback_check(report: &mut Report) {
     use zkminer_prover::windows_nvapi::cuda_sysmem_fallback_policy;
-    const PROGRAMS: [&str; 3] = [
-        "zkminer-prove-risc0-cuda.exe",
-        "zkminer-prove-sp1.exe",
-        "sp1-gpu-server.exe",
-    ];
-    let what = "CUDA sysmem fallback";
-    let Some(policy) = cuda_sysmem_fallback_policy(&PROGRAMS) else {
-        report.say(
-            Level::Info,
-            what,
-            "unknown: the NVIDIA driver's settings could not be read",
-        );
-        return;
+    report.say(
+        Level::Info,
+        "CUDA sysmem fallback",
+        sysmem_fallback_detail(cuda_sysmem_fallback_policy(&SYSMEM_FALLBACK_PROGRAMS).as_ref()),
+    );
+}
+
+/// The programs that allocate on an NVIDIA card, whose sysmem fallback policy doctor reports.
+#[cfg(windows)]
+const SYSMEM_FALLBACK_PROGRAMS: [&str; 3] = [
+    "zkminer-prove-risc0-cuda.exe",
+    "zkminer-prove-sp1.exe",
+    "sp1-gpu-server.exe",
+];
+
+/// What `sysmem_fallback_check` says of `policy`, `None` when it could not be read.
+#[cfg(windows)]
+fn sysmem_fallback_detail(
+    policy: Option<&zkminer_prover::windows_nvapi::SysmemFallbackPolicy>,
+) -> String {
+    let Some(policy) = policy else {
+        return "unknown: the NVIDIA driver's settings could not be read".to_string();
     };
     let own: Vec<String> = policy
         .programs
@@ -521,7 +536,7 @@ fn sysmem_fallback_check(report: &mut Report) {
         .iter()
         .map(|(_, v)| v.falls_back())
         .collect();
-    let detail = if falls_back.contains(&None) {
+    if falls_back.contains(&None) {
         format!("{setting}: a value this build does not know, so what it does is not said here")
     } else if falls_back.contains(&Some(true)) {
         format!(
@@ -531,15 +546,14 @@ fn sysmem_fallback_check(report: &mut Report) {
              settings → CUDA - Sysmem Fallback Policy, globally or for {}) makes it fail at once, \
              and the job is retried or released (a release costs 5% of its collateral): which is \
              better depends on how much slack your jobs' deadlines leave",
-            PROGRAMS.join(", ")
+            SYSMEM_FALLBACK_PROGRAMS.join(", ")
         )
     } else {
         format!(
             "{setting}: a proof that outgrows its card fails at once and the job is retried or \
              released, rather than slowing down in system memory"
         )
-    };
-    report.say(Level::Info, what, detail);
+    }
 }
 
 pub async fn run(config_path: Option<&Path>) -> Result<()> {
@@ -646,5 +660,127 @@ mod tests {
     fn free_space_is_readable_here() {
         let here = std::env::temp_dir();
         assert!(free_bytes(&here).is_some_and(|b| b > 0));
+    }
+
+    /// A temporary directory, removed when dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("zkminer-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// doctor lists each capped card, qualified as "if it is still this card", says nothing when
+    /// there is no record, and warns on a record that cannot be read (no cap applies then).
+    #[test]
+    fn doctor_lists_each_capped_card_and_warns_on_an_unreadable_record() {
+        let dir = TempDir::new("doctor-caps");
+        let path = dir.0.join(zkminer_prover::sp1_shard_caps::FILE_NAME);
+        let said = |path: &Path| {
+            let mut report = Report::default();
+            sp1_shard_caps_check(&mut report, path.to_path_buf());
+            report
+        };
+        let none = said(&path);
+        assert!(none.lines.is_empty());
+        assert_eq!(none.warnings, 0);
+
+        let mut store = zkminer_prover::sp1_shard_caps::Store::load(path.clone());
+        store
+            .lower(
+                "0000:03:00.0",
+                "NVIDIA GeForce RTX 4070",
+                12_282 << 20,
+                134_217_728,
+                1,
+            )
+            .unwrap();
+        store
+            .lower(
+                "0000:04:00.0",
+                "NVIDIA GeForce RTX 4070",
+                12_282 << 20,
+                134_217_728,
+                2,
+            )
+            .unwrap();
+        let capped = said(&path);
+        assert_eq!(capped.lines.len(), 2);
+        for (level, what, detail) in &capped.lines {
+            assert_eq!(*level, Level::Info);
+            assert_eq!(what, "SP1 shard size");
+            assert!(detail.contains("if it is still this card"), "{detail}");
+            assert!(detail.contains("capped at 134217728 elements"), "{detail}");
+            assert!(detail.contains("stop the miner"), "{detail}");
+        }
+        assert!(capped.lines[0].2.contains("0000:03:00.0"));
+
+        std::fs::write(&path, "not a record").unwrap();
+        let unreadable = said(&path);
+        assert_eq!(unreadable.warnings, 1);
+        assert_eq!(unreadable.lines.len(), 1);
+        assert!(unreadable.lines[0].2.contains("no card's cap is applied"));
+    }
+
+    /// What doctor says of the driver's sysmem fallback policy: unknown when unreadable or for a
+    /// value this build does not know; for a policy that falls back, the cost of each choice (a
+    /// release costs 5% of the collateral); and which program's own setting differs from the global.
+    #[cfg(windows)]
+    #[test]
+    fn doctor_says_what_the_sysmem_fallback_policy_does() {
+        use zkminer_prover::windows_nvapi::{SysmemFallback, SysmemFallbackPolicy};
+        let policy = |global, sp1| SysmemFallbackPolicy {
+            global,
+            programs: SYSMEM_FALLBACK_PROGRAMS
+                .iter()
+                .map(|p| {
+                    let v = if *p == "zkminer-prove-sp1.exe" {
+                        sp1
+                    } else {
+                        global
+                    };
+                    (p.to_string(), v)
+                })
+                .collect(),
+        };
+        assert!(sysmem_fallback_detail(None).starts_with("unknown"));
+        let falls_back = sysmem_fallback_detail(Some(&policy(
+            SysmemFallback::NotSet,
+            SysmemFallback::NotSet,
+        )));
+        assert!(falls_back.contains("for the workers"), "{falls_back}");
+        assert!(falls_back.contains("5% of its collateral"), "{falls_back}");
+        assert!(falls_back.contains("deadline"), "{falls_back}");
+        let fails = sysmem_fallback_detail(Some(&policy(
+            SysmemFallback::PreferNoFallback,
+            SysmemFallback::PreferNoFallback,
+        )));
+        assert!(fails.contains("fails at once"), "{fails}");
+        assert!(!fails.contains("5%"), "{fails}");
+        let mixed = sysmem_fallback_detail(Some(&policy(
+            SysmemFallback::PreferNoFallback,
+            SysmemFallback::PreferFallback,
+        )));
+        assert!(mixed.contains("globally"), "{mixed}");
+        assert!(
+            mixed.contains("Prefer Sysmem Fallback for zkminer-prove-sp1.exe"),
+            "{mixed}"
+        );
+        assert!(mixed.contains("5% of its collateral"), "{mixed}");
+        let unknown = sysmem_fallback_detail(Some(&policy(
+            SysmemFallback::DriverDefault,
+            SysmemFallback::Other(7),
+        )));
+        assert!(unknown.contains("does not know"), "{unknown}");
     }
 }

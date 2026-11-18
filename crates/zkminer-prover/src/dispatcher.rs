@@ -802,7 +802,8 @@ fn spawn_refusal(
     // Unknown is not "cannot": a binary this cannot read, or a card whose compute capability
     // `nvidia-smi` did not report, is allowed through. `ZKMINER_ALLOW_BROKEN_GPU` overrides
     // it, as it does the gate above.
-    if let Some(cap) = compute_cap.filter(|_| std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err()) {
+    if let Some(cap) = compute_cap.filter(|_| crate::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_none())
+    {
         if let Some(binary) = crate::discovery::gpu_code_binary(backend, path) {
             match crate::gpu_code::EmbeddedGpuCode::read(&binary) {
                 Ok(Some(code)) if !code.runs_on(cap) => {
@@ -832,7 +833,7 @@ fn spawn_refusal(
     // fails every launch with "invalid device function". The card's target comes from the
     // kernel's KFD topology; the binary is the risc0 worker, or the HIP server the SP1 worker
     // runs. Unknown is again not "cannot".
-    if gpu_tag == "rocm" && std::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_err() {
+    if gpu_tag == "rocm" && crate::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_none() {
         if let (Some(gfx), Some(binary)) = (
             pci_bus_id.and_then(crate::discovery::amd_gfx_target),
             crate::discovery::hip_code_binary(backend, path),
@@ -879,8 +880,7 @@ fn spawn_refusal(
     // what it then takes (the 16 GB figures have them on, the larger card's run on a card with room
     // to spare), so no floor bounds it.
     if let Some(have) = vram_bytes {
-        let savers_off =
-            zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
+        let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(crate::env::var);
         if backend == zkminer_prover_protocol::BACKEND_SP1
             && gpu_tag == "cuda"
             && savers_off
@@ -1798,7 +1798,7 @@ fn worker_env_var(spawn_env: &HashMap<String, String>, name: &str) -> Option<Str
     spawn_env
         .get(name)
         .cloned()
-        .or_else(|| std::env::var(name).ok())
+        .or_else(|| crate::env::var(name))
 }
 
 /// The VRAM figure a worker spawned with `spawn_env` sized itself against, read the way the SP1 worker
@@ -2190,8 +2190,7 @@ fn sizing_total(key: &str, total: u64) -> Option<u64> {
 
 /// `sizing_total` for a card of vendor `gpu_tag`.
 fn sizing_total_for_tag(gpu_tag: &str, total: u64) -> Option<u64> {
-    let savers_off =
-        zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
+    let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(crate::env::var);
     (gpu_tag == "cuda" && !savers_off).then_some(total)
 }
 
@@ -2338,9 +2337,11 @@ pub struct WorkerPool {
     /// (`check_vram_budget`), to tell an out-of-memory the size caused from one another program's
     /// growth caused (`lower_sp1_shard_cap`).
     admitted_foreign: Mutex<HashMap<String, u64>>,
-    /// Tests only: card readings `read_card` returns instead of reading a card, by slot key.
-    #[cfg(test)]
-    test_cards: Mutex<HashMap<String, CardOccupancy>>,
+    /// Tests only: card readings `read_card` returns instead of reading a card, by slot key, in
+    /// order; the last one stands for every read after it, and `None` is an unreadable card. See
+    /// `test_set_cards`.
+    #[cfg(any(test, feature = "testing"))]
+    test_cards: Mutex<HashMap<String, std::collections::VecDeque<Option<CardOccupancy>>>>,
     /// Set by `close` when the process is exiting: from then on no worker is spawned and no room is
     /// made. Without it, a dispatch in flight could respawn a worker after `shutdown_all` had swept
     /// the slots — and that window is up to tens of seconds, because
@@ -2436,7 +2437,7 @@ impl WorkerPool {
             risc0_short: Mutex::new(HashMap::new()),
             sp1_slot_caps: Mutex::new(HashMap::new()),
             admitted_foreign: Mutex::new(HashMap::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             test_cards: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
@@ -2592,6 +2593,48 @@ impl WorkerPool {
             },
         );
         true
+    }
+
+    /// A new SP1 slot on a card with a recorded cap (`sp1_shard_cap_for`): its worker is spawned
+    /// with it (`env`), and the planner prices the card from when it was recorded (`sp1_slot_caps`).
+    /// Nothing for another backend, or a card without one.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_recorded_sp1_cap(
+        &self,
+        key: &str,
+        backend: &str,
+        pci_bus_id: Option<&str>,
+        gpu_name: Option<&str>,
+        vram_bytes: Option<u64>,
+        device_desc: &str,
+        env: &mut HashMap<String, String>,
+    ) {
+        if backend != zkminer_prover_protocol::BACKEND_SP1 {
+            return;
+        }
+        let Some(cap) = self.sp1_shard_cap_for(pci_bus_id, gpu_name, vram_bytes) else {
+            return;
+        };
+        tracing::info!(
+            "{key}{device_desc}: SP1 shard size capped at {}, recorded when a proof on this card ran \
+             out of GPU memory (with the miner stopped, remove the card's entry from {} to lift it)",
+            cap.0,
+            crate::sp1_shard_caps::FILE_NAME
+        );
+        env.insert(
+            zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV.to_string(),
+            cap.0.to_string(),
+        );
+        self.sp1_slot_caps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.to_string(),
+                SlotSp1Cap {
+                    cap: cap.0,
+                    since_unix_secs: cap.1,
+                },
+            );
     }
 
     /// Keep the planner's copy of a slot's SP1 cap (`sp1_slot_caps`), which it reads without the
@@ -3231,33 +3274,15 @@ impl WorkerPool {
                 self.slot_checks.push(check(SlotOutcome::Refused(why)));
                 continue;
             }
-            if backend == zkminer_prover_protocol::BACKEND_SP1 {
-                if let Some(cap) =
-                    self.sp1_shard_cap_for(pci_bus_id.as_deref(), gpu_name.as_deref(), vram_bytes)
-                {
-                    tracing::info!(
-                        "{key}{device_desc}: SP1 shard size capped at {}, recorded when a proof on \
-                         this card ran out of GPU memory (with the miner stopped, remove the card's \
-                         entry from {} to lift it)",
-                        cap.0,
-                        crate::sp1_shard_caps::FILE_NAME
-                    );
-                    env.insert(
-                        zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV.to_string(),
-                        cap.0.to_string(),
-                    );
-                    self.sp1_slot_caps
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(
-                            key.clone(),
-                            SlotSp1Cap {
-                                cap: cap.0,
-                                since_unix_secs: cap.1,
-                            },
-                        );
-                }
-            }
+            self.seed_recorded_sp1_cap(
+                &key,
+                &backend,
+                pci_bus_id.as_deref(),
+                gpu_name.as_deref(),
+                vram_bytes,
+                &device_desc,
+                &mut env,
+            );
 
             // NOTE: there is deliberately NO host-memory gate here, and the earlier one was
             // removed rather than repaired.
@@ -7724,7 +7749,7 @@ impl WorkerPool {
 
     /// One value from a slot's respawn environment. For assertions about what the next spawn will be
     /// told; `test_set_spawn_env` is the write side.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn spawn_env_value(&self, key: &str, name: &str) -> Option<String> {
         let entry = self.workers.get(key)?;
         let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -7818,15 +7843,9 @@ impl WorkerPool {
     /// with "ours, unattributed". It is never a candidate for recycling: only same-card siblings are,
     /// because only they are behind the guard we hold.
     fn read_card(&self, key: &str) -> Option<CardOccupancy> {
-        #[cfg(test)]
-        if let Some(card) = self
-            .test_cards
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(key)
-            .cloned()
-        {
-            return Some(card);
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(reading) = self.test_card_reading(key) {
+            return reading;
         }
         let slot_pids: HashMap<u32, String> = self
             .workers
@@ -9627,6 +9646,106 @@ impl WorkerPool {
         slot.consecutive_failures = 0;
         slot.last_failure = None;
     }
+
+    /// Have `read_card` return `readings` for `key`, in order, instead of reading its card: the last
+    /// one stands for every read after it, and `None` is a card that cannot be read. Replaces any
+    /// readings given before.
+    pub fn test_set_cards(&self, key: &str, readings: Vec<Option<TestCard>>) {
+        let readings = readings
+            .into_iter()
+            .map(|r| r.map(TestCard::occupancy))
+            .collect();
+        self.test_cards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), readings);
+    }
+
+    /// The next reading `test_set_cards` gave for `key`, or `None` when it gave none (the card is
+    /// then read as usual).
+    fn test_card_reading(&self, key: &str) -> Option<Option<CardOccupancy>> {
+        let mut cards = self.test_cards.lock().unwrap_or_else(|e| e.into_inner());
+        let readings = cards.get_mut(key)?;
+        if readings.len() > 1 {
+            readings.pop_front()
+        } else {
+            readings.front().cloned()
+        }
+    }
+
+    /// Give `key`'s slot the card a discovered one would have: its vendor tag, PCI bus id, name and
+    /// total VRAM.
+    pub fn test_set_card_identity(
+        &mut self,
+        key: &str,
+        gpu_tag: &str,
+        pci_bus_id: Option<&str>,
+        gpu_name: Option<&str>,
+        vram_bytes: Option<u64>,
+    ) {
+        let entry = self
+            .workers
+            .get_mut(key)
+            .unwrap_or_else(|| panic!("test_set_card_identity: key '{key}' not found in pool"));
+        entry.vram_bytes = vram_bytes;
+        entry.pci_bus_id = pci_bus_id.map(str::to_string);
+        let slot = entry.slot.get_mut().unwrap_or_else(|e| e.into_inner());
+        slot.gpu_tag = gpu_tag.to_string();
+        slot.pci_bus_id = pci_bus_id.map(str::to_string);
+        slot.gpu_name = gpu_name.map(str::to_string);
+    }
+
+    /// What another program held on `key`'s card when its last proof was admitted (see
+    /// `oom_may_be_recorded`).
+    pub fn test_admitted_foreign(&self, key: &str) -> Option<u64> {
+        self.admitted_foreign
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+    }
+}
+
+/// Tests only: a card reading for `WorkerPool::test_set_cards`, in MiB.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Default)]
+pub struct TestCard {
+    pub total_mib: u64,
+    /// The driver's own reservation (`memory.reserved`).
+    pub reserved_mib: u64,
+    /// Held by other programs.
+    pub foreign_mib: u64,
+    /// Held by our workers, by slot key.
+    pub held_mib: Vec<(String, u64)>,
+    /// Ours, on its way back from a retired worker.
+    pub draining_mib: u64,
+    /// Kept back for another program on the card to grow into (the Windows shared-card margin).
+    pub growth_margin_mib: u64,
+    /// The card's process list could not be read.
+    pub apps_unread: bool,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl TestCard {
+    fn occupancy(self) -> CardOccupancy {
+        const MIB: u64 = 1024 * 1024;
+        let held: u64 = self.held_mib.iter().map(|(_, m)| m).sum();
+        CardOccupancy {
+            total: self.total_mib * MIB,
+            reserved: self.reserved_mib * MIB,
+            used: (self.foreign_mib + held + self.draining_mib) * MIB,
+            by_slot: self
+                .held_mib
+                .into_iter()
+                .filter(|(_, m)| *m > 0)
+                .map(|(k, m)| (k, m * MIB))
+                .collect(),
+            unattributed: 0,
+            draining: self.draining_mib * MIB,
+            growth_margin: self.growth_margin_mib * MIB,
+            apps_unread: self.apps_unread,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9751,6 +9870,8 @@ mod tests {
 
     #[test]
     fn an_sp1_out_of_memory_lowers_the_card_and_records_it_once_the_job_proves() {
+        // Not the shell's SP1 or free-VRAM settings.
+        let _env = crate::env::Hermetic::new(&[]);
         use zkminer_prover_protocol::types as t;
         const MIB: u64 = 1 << 20;
         let dir = std::env::temp_dir().join(format!("zkminer-sp1-cap-{}", std::process::id()));
@@ -9852,6 +9973,8 @@ mod tests {
     #[test]
     fn a_smaller_sp1_size_that_does_not_help_is_undone_and_another_programs_growth_is_not_recorded()
     {
+        // Not the shell's SP1 or free-VRAM settings.
+        let _env = crate::env::Hermetic::new(&[]);
         use zkminer_prover_protocol::types as t;
         const MIB: u64 = 1 << 20;
         let dir = std::env::temp_dir().join(format!("zkminer-sp1-undo-{}", std::process::id()));
@@ -9908,6 +10031,8 @@ mod tests {
 
     #[test]
     fn a_risc0_proof_needs_what_its_size_takes_on_a_cuda_card_and_no_more() {
+        // Not the shell's SP1 or free-VRAM settings.
+        let _env = crate::env::Hermetic::new(&[]);
         const MIB: u64 = 1 << 20;
         let need = crate::discovery::risc0_proof_vram_bytes;
         // The measured peak: a 12 GB card at its own 19, a 16 GB one at 20. No margin on top: a
@@ -9966,6 +10091,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_windows_card_shared_with_another_program_keeps_room_for_it_to_grow() {
+        // Not the shell's SP1 or free-VRAM settings.
+        let _env = crate::env::Hermetic::new(&[]);
         const MIB: u64 = 1 << 20;
         let ours = |pid: u32| match pid {
             200 => PidOwner::Slot("risc0:cuda:1".into()),
@@ -12947,5 +13074,592 @@ mod preemption_tests {
             budget <= left - MIN_ABORT_START_BUDGET,
             "reclaim wait {budget:?} would eat the {MIN_ABORT_START_BUDGET:?} start floor of a {left:?} deadline"
         );
+    }
+}
+
+/// The 12 GB support, SP1 shard-size cap and VRAM-spill wiring, driven through card readings given
+/// in place of `nvidia-smi` (`WorkerPool::test_set_cards`) and a hermetic environment
+/// (`crate::env::Hermetic`): nothing here reads a card or the shell's variables.
+#[cfg(test)]
+mod spill_and_cap_tests {
+    use super::*;
+    use crate::env::Hermetic;
+    use zkminer_prover_protocol::types as t;
+
+    const MIB: u64 = 1024 * 1024;
+    /// An RTX 4070: 12,282 MiB, 272 of it reserved by the driver.
+    const TOTAL_MIB: u64 = 12_282;
+    const RESERVED_MIB: u64 = 272;
+
+    fn pool(keys: &[&str]) -> WorkerPool {
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        for &key in keys {
+            pool.workers.insert(
+                key.to_string(),
+                WorkerEntry {
+                    slot: Mutex::new(WorkerSlot {
+                        handle: None,
+                        path: PathBuf::from("/dev/null"),
+                        backend: key.split(':').next().unwrap_or(key).to_string(),
+                        gpu_tag: key.split(':').nth(1).unwrap_or("generic").to_string(),
+                        device_index: None,
+                        pci_bus_id: None,
+                        gpu_name: None,
+                        spawn_env: HashMap::new(),
+                        consecutive_failures: 0,
+                        last_failure: None,
+                        declined: None,
+                        proofs_since_spawn: 0,
+                    }),
+                    vram_bytes: None,
+                    pci_bus_id: None,
+                    pid: Arc::new(AtomicU32::new(0)),
+                    pid_starttime: Arc::new(AtomicU64::new(0)),
+                    intentional_kill: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        pool
+    }
+
+    /// The 4070 with `foreign_mib` held by another program and `margin_mib` kept back for it.
+    fn card(foreign_mib: u64, margin_mib: u64) -> TestCard {
+        TestCard {
+            total_mib: TOTAL_MIB,
+            reserved_mib: RESERVED_MIB,
+            foreign_mib,
+            growth_margin_mib: margin_mib,
+            ..Default::default()
+        }
+    }
+
+    fn shortage(e: &anyhow::Error) -> &t::GpuMemoryShortage {
+        e.downcast_ref::<t::GpuMemoryShortage>()
+            .unwrap_or_else(|| panic!("not a GpuMemoryShortage: {e:#}"))
+    }
+
+    /// A temporary directory, removed when dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "zkminer-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `f`'s body in `src`: up to the next `fn` or `pub fn` at impl or module depth.
+    fn body<'a>(src: &'a str, f: &str) -> &'a str {
+        let after = src
+            .split_once(f)
+            .unwrap_or_else(|| panic!("{f} moved; move this assertion with it"))
+            .1;
+        let end = after
+            .find("\n    fn ")
+            .into_iter()
+            .chain(after.find("\n    pub fn "))
+            .chain(after.find("\nfn "))
+            .chain(after.find("\npub fn "))
+            .min()
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    fn at(body: &str, needle: &str) -> usize {
+        body.find(needle)
+            .unwrap_or_else(|| panic!("no longer contains `{needle}`"))
+    }
+
+    /// A risc0 proof is refused only when what physically fits (the Windows margin added back) is
+    /// under what its size takes; such a refusal stops risc0 claims for the card, and an admission
+    /// lets them resume.
+    #[test]
+    fn a_risc0_proof_is_refused_only_when_its_size_cannot_physically_fit() {
+        let _env = Hermetic::new(&[]);
+        let key = "risc0:cuda:1";
+        let pool = pool(&[key]);
+        let need_mib = 8_179; // po2 19's measured peak on CUDA
+        let fits = TOTAL_MIB - RESERVED_MIB - need_mib; // the most another program may hold
+
+        pool.test_set_cards(key, vec![Some(card(fits + 1, 1024))]);
+        let e = pool
+            .check_vram_budget(key, None, Some(19))
+            .expect_err("1 MiB short");
+        let s = shortage(&e);
+        assert_eq!(s.needed_bytes, Some(need_mib * MIB));
+        assert_eq!(
+            s.available_bytes,
+            (need_mib - 1) * MIB,
+            "the margin is added back"
+        );
+        assert!(!s.ours_in_the_way);
+        assert!(pool.risc0_card_short(key, 19));
+
+        // Exactly what it takes, of which 1 GiB is the margin: admitted, and claims resume.
+        pool.test_set_cards(key, vec![Some(card(fits, 1024))]);
+        let budget = pool
+            .check_vram_budget(key, None, Some(19))
+            .expect("fits")
+            .expect("a reading");
+        assert_eq!(budget.available, (need_mib - 1024) * MIB);
+        assert_eq!(budget.growth_margin, 1024 * MIB);
+        assert!(!pool.risc0_card_short(key, 19));
+
+        // A benchmark or calibration names no size: no floor, and nothing is marked.
+        pool.test_set_cards(key, vec![Some(card(fits + 1_000, 1024))]);
+        assert!(pool.check_vram_budget(key, None, None).unwrap().is_some());
+        assert!(!pool.risc0_card_short(key, 19));
+    }
+
+    /// A refusal on a reading whose process list could not be read is still a refusal, but it is
+    /// no evidence for marking the card short: our own memory read as another program's.
+    #[test]
+    fn a_reading_without_its_process_list_refuses_but_marks_nothing() {
+        let _env = Hermetic::new(&[]);
+        let key = "risc0:cuda:2";
+        let pool = pool(&[key]);
+        let unread = TestCard {
+            apps_unread: true,
+            ..card(TOTAL_MIB - RESERVED_MIB - 8_179 + 1, 0)
+        };
+        pool.test_set_cards(key, vec![Some(unread)]);
+        assert!(pool.check_vram_budget(key, None, Some(19)).is_err());
+        assert!(!pool.risc0_card_short(key, 19));
+    }
+
+    /// SP1's floor is compared with what physically fits (the margin added back), and an admission
+    /// records what another program held then, for telling a size's out-of-memory from that
+    /// program's growth; every admission clears the last one's, an unreadable card included.
+    #[test]
+    fn an_sp1_admission_records_what_another_program_held_and_only_then() {
+        let _env = Hermetic::new(&[]);
+        let key = "sp1:cuda:1";
+        let pool = pool(&[key]);
+        let floor =
+            crate::discovery::min_available_vram_bytes_for_backend("sp1", Some(TOTAL_MIB * MIB))
+                .expect("SP1 needs free VRAM");
+        let floor_mib = floor.div_ceil(MIB);
+        let fits = TOTAL_MIB - RESERVED_MIB - floor_mib;
+        assert!(floor_mib > 1024, "the margin must matter here");
+
+        // Under the floor without the margin, at it with: admitted.
+        pool.test_set_cards(key, vec![Some(card(fits, 1024))]);
+        let budget = pool.check_vram_budget(key, None, None).unwrap().unwrap();
+        assert!(budget.available < floor);
+        assert_eq!(pool.test_admitted_foreign(key), Some(fits * MIB));
+
+        // 1 MiB more held elsewhere: refused, and the earlier admission's reading is gone.
+        pool.test_set_cards(key, vec![Some(card(fits + 1, 1024))]);
+        let e = pool.check_vram_budget(key, None, None).unwrap_err();
+        assert_eq!(shortage(&e).needed_bytes, Some(floor));
+        assert_eq!(pool.test_admitted_foreign(key), None);
+        // An SP1 refusal never marks a card short for risc0.
+        assert!(pool.risc0_short.lock().unwrap().is_empty());
+
+        // Admitted again, then a card that cannot be read: no opinion, and no stale reading.
+        pool.test_set_cards(key, vec![Some(card(0, 0))]);
+        pool.check_vram_budget(key, None, None).unwrap().unwrap();
+        assert_eq!(pool.test_admitted_foreign(key), Some(0));
+        pool.test_set_cards(key, vec![None]);
+        assert!(pool.check_vram_budget(key, None, None).unwrap().is_none());
+        assert_eq!(pool.test_admitted_foreign(key), None);
+    }
+
+    /// The readings given for a card are used in order, and the last one stands.
+    #[test]
+    fn test_card_readings_are_used_in_order_and_the_last_stands() {
+        let key = "sp1:cuda:9";
+        let pool = pool(&[key]);
+        pool.test_set_cards(key, vec![Some(card(1, 0)), None, Some(card(3, 0))]);
+        let foreign = || pool.read_card(key).map(|c| c.foreign() / MIB);
+        assert_eq!(foreign(), Some(1));
+        assert_eq!(foreign(), None);
+        assert_eq!(foreign(), Some(3));
+        assert_eq!(foreign(), Some(3));
+    }
+
+    /// `recheck_risc0_short` reads the card as room-making would leave it: a same-card sibling of
+    /// ours holding at least `MIN_EVICTABLE_HOLDING` would go, a smaller one or one on another card
+    /// would not. Still short: the window starts over and the check can be due again.
+    #[test]
+    fn a_short_card_is_rechecked_as_room_making_would_leave_it() {
+        let _env = Hermetic::new(&[]);
+        let key = "risc0:cuda:3";
+        let need = 8_179 * MIB;
+        let pool = pool(&[key, "sp1:cuda:3", "sp1:cuda:4"]);
+        pool.note_risc0_card_short(key, need, 19);
+        let with = |foreign_mib: u64, sibling: &str, held_mib: u64| TestCard {
+            held_mib: vec![(sibling.to_string(), held_mib)],
+            ..card(foreign_mib, 0)
+        };
+        // 8,610 MiB free with 3,400 held by another program: room, once ours is gone.
+        assert!((TOTAL_MIB - RESERVED_MIB - 3_400) * MIB >= need);
+
+        let still_short = |reading: TestCard| {
+            pool.test_set_cards(key, vec![Some(reading)]);
+            pool.recheck_risc0_short(key);
+            assert!(pool.risc0_card_short(key, 19));
+            // The window started over: not due again yet...
+            assert!(pool.risc0_short_due().is_empty());
+            // ...and due once it has passed (the check is no longer reading it).
+            pool.risc0_short.lock().unwrap().get_mut(key).unwrap().until =
+                Instant::now() - Duration::from_secs(1);
+            assert_eq!(pool.risc0_short_due(), vec![key.to_string()]);
+        };
+        // Another program alone leaves too little.
+        still_short(card(TOTAL_MIB - RESERVED_MIB - 8_179 + 1, 0));
+        // Ours, but under the size room-making recycles: it stays.
+        still_short(with(3_400, "sp1:cuda:3", 512));
+        // Ours, but on another card: not ours to move from this one.
+        still_short(with(3_400, "sp1:cuda:4", 2_048));
+        // Ours, on this card, and big enough to recycle: room, and claims resume.
+        pool.test_set_cards(key, vec![Some(with(3_400, "sp1:cuda:3", 2_048))]);
+        pool.recheck_risc0_short(key);
+        assert!(!pool.risc0_card_short(key, 19));
+    }
+
+    /// The planner's slower SP1 rate finds the capped card by its bus id however it is written
+    /// (nvidia-smi's 8-digit domain or the benchmark's 4), and stops once the card is
+    /// re-benchmarked at the cap.
+    #[test]
+    fn the_planned_sp1_rate_follows_the_card_by_bus_id() {
+        let _env = Hermetic::new(&[]);
+        let key = "sp1:cuda:5";
+        let mut pool = pool(&[key]);
+        let e = pool.workers.get_mut(key).unwrap();
+        e.pci_bus_id = Some("00000000:03:00.0".into());
+        e.vram_bytes = Some(TOTAL_MIB * MIB);
+        pool.set_slot_sp1_cap(
+            key,
+            Some(SlotSp1Cap {
+                cap: 134_217_728,
+                since_unix_secs: 1_000,
+            }),
+        );
+        let slower = t::sp1_rate_factor_for_cap(134_217_728, Some(TOTAL_MIB * MIB));
+        assert!(slower < 1.0);
+        assert_eq!(pool.sp1_rate_factor("0000:03:00.0", Some(999)), slower);
+        assert_eq!(pool.sp1_rate_factor("00000000:03:00.0", None), slower);
+        // Benchmarked at (or after) the cap: the benchmark ran at it.
+        assert_eq!(pool.sp1_rate_factor("0000:03:00.0", Some(1_000)), 1.0);
+        // Another card.
+        assert_eq!(pool.sp1_rate_factor("0000:04:00.0", Some(0)), 1.0);
+    }
+
+    /// A recorded cap reaches a new SP1 slot's spawn environment and the planner's copy, from when it
+    /// was recorded; nothing for risc0, another card, or a pool that keeps no caps. And discovery
+    /// applies it to every SP1 slot it starts, after the spawn checks and before the spawn.
+    #[test]
+    fn a_recorded_cap_is_applied_to_the_slot_discovery_starts() {
+        let dir = TempDir::new("seed-cap");
+        let path = dir.0.join(crate::sp1_shard_caps::FILE_NAME);
+        let (bus, name, total) = ("0000:03:00.0", "NVIDIA GeForce RTX 4070", TOTAL_MIB * MIB);
+        crate::sp1_shard_caps::Store::load(path.clone())
+            .lower(bus, name, total, 134_217_728, 1_234)
+            .unwrap();
+        let key = "sp1:cuda:6";
+        let mut keeps = pool(&[key]);
+        keeps.use_sp1_shard_caps(path);
+        let seed = |pool: &WorkerPool, backend: &str, name: &str| {
+            let mut env = HashMap::new();
+            pool.seed_recorded_sp1_cap(
+                key,
+                backend,
+                Some(bus),
+                Some(name),
+                Some(total),
+                "",
+                &mut env,
+            );
+            env.get(t::SP1_ELEMENT_THRESHOLD_CAP_ENV).cloned()
+        };
+        assert_eq!(seed(&keeps, "sp1", name).as_deref(), Some("134217728"));
+        let caps = keeps
+            .sp1_slot_caps
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .unwrap();
+        assert_eq!((caps.cap, caps.since_unix_secs), (134_217_728, 1_234));
+        keeps.sp1_slot_caps.lock().unwrap().clear();
+        assert_eq!(seed(&keeps, "risc0", name), None);
+        assert_eq!(seed(&keeps, "sp1", "NVIDIA GeForce RTX 4080"), None);
+        assert!(keeps.sp1_slot_caps.lock().unwrap().is_empty());
+        assert_eq!(seed(&pool(&[key]), "sp1", name), None);
+
+        let src = include_str!("dispatcher.rs");
+        let discover = body(src, "    pub fn discover_and_spawn(");
+        let refusal = at(discover, "spawn_refusal(");
+        let seeded = at(discover, "self.seed_recorded_sp1_cap(");
+        let spawned = at(discover, "WorkerHandle::spawn(&backend, &path, &env)");
+        assert!(refusal < seeded && seeded < spawned);
+    }
+
+    /// The margin a shared Windows card keeps is for sizing and room-making only: the resize compares
+    /// SP1's floor against what physically fits, and so do the refusal and calibration's clamp, in
+    /// the dispatcher and in the calibration sweep.
+    #[test]
+    fn floors_and_calibration_compare_against_what_physically_fits() {
+        let src = include_str!("dispatcher.rs");
+        let resize = body(src, "    fn resize_worker_if_vram_shrank(");
+        let floor = at(resize, ".map(|f| f.saturating_sub(growth_margin))");
+        assert!(
+            floor
+                < at(
+                    resize,
+                    "vram_tier_shrank(cap, backend, assumed, available, total, floor)"
+                )
+        );
+        let budget = body(src, "    fn check_vram_budget(");
+        let resized = at(budget, "self.resize_worker_if_vram_shrank(");
+        assert!(budget[resized..].starts_with(
+            "self.resize_worker_if_vram_shrank(\n            key,\n            backend,\n            \
+             budget.available,\n            budget.growth_margin,"
+        ));
+        at(
+            budget,
+            "let free = budget.available.saturating_add(budget.growth_margin);",
+        );
+        at(
+            budget,
+            "(floor.map(|f| f.saturating_sub(card.growth_margin)), floor)",
+        );
+        let calibrate = body(src, "    pub fn calibrate_slot_po2(");
+        at(
+            calibrate,
+            "budget.available.saturating_add(budget.growth_margin),",
+        );
+        let sweep = include_str!("benchmark.rs");
+        let clamp = at(
+            sweep,
+            "let free_po2 = match pool.vram_budget_for_slot(&key)",
+        );
+        let fits = at(&sweep[clamp..], "find_optimal_gpu_po2(");
+        assert!(sweep[clamp + fits..]
+            .starts_with("find_optimal_gpu_po2(\n                    budget.available.saturating_add(budget.growth_margin),"));
+    }
+
+    /// `prove_on_slot`'s out-of-memory arm and its success arm, as wired (driven end to end by
+    /// `tests/sp1_oom_cap.rs`): the card is lowered with what another program held at admission and
+    /// now, a lowering is no failure, and a proof that succeeds confirms the cap.
+    #[test]
+    fn a_proofs_out_of_memory_and_its_success_reach_the_cap() {
+        let src = include_str!("dispatcher.rs");
+        let prove = body(src, "    fn prove_on_slot(");
+        let ok = at(prove, "WorkerResponse::ProofResult {");
+        let confirm = at(
+            prove,
+            "self.confirm_sp1_shard_cap(key, &slot, entry.vram_bytes, program_hash(elf))",
+        );
+        let err = at(prove, "WorkerResponse::Error { kind, message, .. } =>");
+        assert!(
+            ok < confirm && confirm < err,
+            "the cap is confirmed on success only"
+        );
+        let oom = &prove[err..];
+        let admitted = at(oom, ".admitted_foreign");
+        let now = at(
+            oom,
+            "let now = self.read_card(key).map(|card| card.foreign());",
+        );
+        let lower = at(oom, "self.lower_sp1_shard_cap(");
+        let record = at(oom, "oom_may_be_recorded(admitted, now)");
+        assert!(admitted < lower && now < lower && lower < record);
+        let dead = at(
+            oom,
+            "if lowered {\n                        Self::mark_slot_dead(&mut slot, entry);",
+        );
+        assert!(dead > record);
+        assert!(oom[dead..].contains(
+            "} else {\n                        Self::mark_slot_failed(&mut slot, entry);"
+        ));
+    }
+
+    /// A lowering whose cause was another program's growth holds for the run but is neither
+    /// recorded nor pinned (that memory is likely still on the card); one on a slot that is not a
+    /// GPU's, or not sized, changes nothing; and a confirmation with nowhere to record (no record
+    /// kept, or an unknown bus id) still ends the pending lowering.
+    #[test]
+    fn a_lowering_without_evidence_is_neither_recorded_nor_pinned() {
+        let _env = Hermetic::new(&[]);
+        let dir = TempDir::new("lower-edges");
+        let path = dir.0.join(crate::sp1_shard_caps::FILE_NAME);
+        let key = "sp1:cuda:7";
+        let (bus, name, total) = ("0000:07:00.0", "NVIDIA GeForce RTX 4070", TOTAL_MIB * MIB);
+        let mut pool = pool(&[key, "sp1:generic", "risc0:cuda:7"]);
+        pool.use_sp1_shard_caps(path.clone());
+        let ready = |slot: &mut WorkerSlot, bus: Option<&str>| {
+            slot.gpu_tag = "cuda".into();
+            slot.pci_bus_id = bus.map(str::to_string);
+            slot.gpu_name = Some(name.into());
+            slot.spawn_env = HashMap::from([(
+                t::CUDA_VRAM_AVAILABLE_BYTES_ENV.to_string(),
+                (12_010 * MIB).to_string(),
+            )]);
+        };
+        let program = program_hash(b"squeezed");
+        {
+            let mut slot = pool.workers[key].slot.lock().unwrap();
+            ready(&mut slot, Some(bus));
+            assert!(pool.lower_sp1_shard_cap(key, &mut slot, Some(total), program, false));
+            assert_eq!(pool.take_sp1_retry_card(key), None, "not pinned");
+            pool.confirm_sp1_shard_cap(key, &slot, Some(total), program);
+            assert!(pool.sp1_caps_pending.lock().unwrap().is_empty());
+        }
+        assert!(!path.exists(), "nothing recorded");
+        // Not a GPU slot, and not a sized backend.
+        for other in ["sp1:generic", "risc0:cuda:7"] {
+            let mut slot = pool.workers[other].slot.lock().unwrap();
+            if other == "risc0:cuda:7" {
+                ready(&mut slot, Some(bus));
+            }
+            let before = slot.spawn_env.clone();
+            assert!(!pool.lower_sp1_shard_cap(other, &mut slot, Some(total), program, true));
+            assert_eq!(slot.spawn_env, before);
+        }
+        // An unknown bus id: lowered and pinned for the run, never recorded.
+        let heavy = program_hash(b"heavy");
+        {
+            let mut slot = pool.workers[key].slot.lock().unwrap();
+            ready(&mut slot, None);
+            assert!(pool.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy, true));
+            assert!(pool.take_sp1_retry_card(key).is_some());
+            pool.confirm_sp1_shard_cap(key, &slot, Some(total), heavy);
+            assert!(pool.sp1_caps_pending.lock().unwrap().is_empty());
+        }
+        assert!(!path.exists(), "nothing recorded");
+        // A pool that keeps no record: the same.
+        let unkept = super::spill_and_cap_tests::pool(&[key]);
+        let mut slot = unkept.workers[key].slot.lock().unwrap();
+        ready(&mut slot, Some(bus));
+        assert!(unkept.lower_sp1_shard_cap(key, &mut slot, Some(total), heavy, true));
+        unkept.confirm_sp1_shard_cap(key, &slot, Some(total), heavy);
+        assert!(unkept.sp1_caps_pending.lock().unwrap().is_empty());
+        assert!(!path.exists(), "nothing recorded");
+    }
+
+    /// SP1's spawn refusals: the server's own floor is more than 11 GiB, and a 12-16 GB NVIDIA card
+    /// with the server's memory savers switched off gets no slot; turning the free-VRAM checks off
+    /// lifts the "can never free enough" refusal, but not the server's floor.
+    #[test]
+    fn sp1_is_refused_only_cards_it_can_never_serve() {
+        let path = std::path::Path::new("zkminer-prove-sp1");
+        let refuse =
+            |tag: &str, mib: u64| spawn_refusal("sp1", tag, None, None, path, Some(mib * MIB));
+        {
+            let _env = Hermetic::new(&[]);
+            let why = refuse("cuda", 11 * 1024).expect("11 GiB is the server's to refuse");
+            assert!(why.contains("requires more than 11.0 GiB"), "{why}");
+            assert_eq!(refuse("cuda", 11 * 1024 + 1), None);
+            assert_eq!(refuse("cuda", 12_282), None);
+            assert!(refuse("intel", 12 * 1024).is_some());
+        }
+        for saver in ["SP1_GPU_DROP_LDES", "SP1_GPU_RECOMPUTE_FIRST_LAYER"] {
+            let _env = Hermetic::new(&[(saver, "0")]);
+            let why = refuse("cuda", 12_282).expect("unmeasured without the savers");
+            assert!(why.contains("memory savers"), "{why}");
+            // A larger card's figures were measured with them off.
+            assert_eq!(refuse("cuda", 24_564), None);
+        }
+        let _env = Hermetic::new(&[(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV, "0")]);
+        assert_eq!(refuse("intel", 12 * 1024), None);
+        assert!(refuse("intel", 11 * 1024).is_some());
+    }
+
+    /// The risc0 worker proves a benchmark at the size the host names, and refuses one outside the
+    /// job range, rather than at the size an uncalibrated card proves jobs at; and the dispatcher
+    /// names it on every request of a slot's benchmark and records it with the row.
+    #[test]
+    fn the_risc0_worker_benchmarks_at_the_size_it_is_sent() {
+        let src = include_str!("../../zkminer-prove-risc0/src/main.rs");
+        at(
+            src,
+            "WorkerCommand::Benchmark { programs, po2 } => match job_segment_po2(po2) {",
+        );
+        let stages = body(src, "\nfn benchmark_stages(");
+        at(stages, ".segment_limit_po2(po2 as u32)");
+        assert!(!stages.contains("RISC0_DEFAULT_JOB_PO2"));
+        let dispatcher = include_str!("dispatcher.rs");
+        let requests = body(dispatcher, "    fn run_benchmark_requests(");
+        assert_eq!(
+            requests.matches("Self::benchmark_request(handle, ").count(),
+            3
+        );
+        assert_eq!(requests.matches(", po2, &").count(), 3);
+        for f in ["    fn benchmark_slot(", "    fn benchmark_slot_streaming("] {
+            at(body(dispatcher, f), "let po2 = self.benchmark_po2(key);");
+        }
+        let production = dispatcher.split_once("\n#[cfg(test)]").unwrap().0;
+        assert_eq!(
+            production
+                .matches(".map(|p| crate::memory::peak_at_baseline(p, benchmark_po2)),")
+                .count(),
+            2
+        );
+    }
+
+    /// The Windows shared-card margin is latched only by a clean reading: none with memory of ours
+    /// on its way in or out, an unread process list, or a worker retired moments ago. Once latched
+    /// it holds through such readings, for `WINDOWS_SHARED_CARD_HOLD`, and never with the checks off.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_card_is_seen_shared_only_on_a_clean_reading() {
+        let owner = |pid: u32| match pid {
+            300 => PidOwner::Draining,
+            _ => PidOwner::Outside,
+        };
+        let margin = |card: CardOccupancy| card.growth_margin;
+        let _env = Hermetic::new(&[]);
+        // Device indices of their own: the latch is process-wide.
+        let shared = || CardOccupancy::from_readings(300, TOTAL_MIB, RESERVED_MIB, &[], owner);
+        let noise = || CardOccupancy::from_readings(40, TOTAL_MIB, RESERVED_MIB, &[], owner);
+        let draining =
+            || CardOccupancy::from_readings(1_300, TOTAL_MIB, RESERVED_MIB, &[(300, 1_000)], owner);
+        assert!(draining().foreign() > WINDOWS_SHARED_CARD_THRESHOLD);
+        // Ours draining: not seen shared, and nothing to hold after.
+        assert_eq!(margin(with_windows_growth_margin(draining(), 31, false)), 0);
+        assert_eq!(margin(with_windows_growth_margin(noise(), 31, false)), 0);
+        // An unread process list.
+        let mut unread = shared();
+        unread.apps_unread = true;
+        assert_eq!(margin(with_windows_growth_margin(unread, 32, false)), 0);
+        assert_eq!(margin(with_windows_growth_margin(noise(), 32, false)), 0);
+        // A worker retired within the window.
+        assert_eq!(margin(with_windows_growth_margin(shared(), 33, true)), 0);
+        assert_eq!(margin(with_windows_growth_margin(noise(), 33, false)), 0);
+        // Seen shared once, the margin holds through a draining reading...
+        assert_eq!(
+            margin(with_windows_growth_margin(shared(), 34, false)),
+            WINDOWS_SHARED_CARD_MARGIN
+        );
+        assert_eq!(
+            margin(with_windows_growth_margin(draining(), 34, true)),
+            WINDOWS_SHARED_CARD_MARGIN
+        );
+        // ...until the hold has passed.
+        WINDOWS_SHARED_SEEN.lock().unwrap().insert(
+            34,
+            Instant::now()
+                .checked_sub(WINDOWS_SHARED_CARD_HOLD + Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert_eq!(margin(with_windows_growth_margin(noise(), 34, false)), 0);
+        // With the free-VRAM checks off, never.
+        let _off = Hermetic::new(&[(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV, "0")]);
+        assert_eq!(margin(with_windows_growth_margin(shared(), 35, false)), 0);
+        assert_eq!(margin(with_windows_growth_margin(noise(), 35, false)), 0);
     }
 }

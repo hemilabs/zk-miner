@@ -197,6 +197,8 @@ mod tests {
     use super::*;
     use crate::warmup::TestDir;
 
+    // The release's link is a symlink, made here as on Linux, where the SYCL server ships.
+    #[cfg(unix)]
     #[test]
     fn the_shipped_lib_dir_is_used_in_place_unless_installing_is_off() {
         let root = TestDir::new();

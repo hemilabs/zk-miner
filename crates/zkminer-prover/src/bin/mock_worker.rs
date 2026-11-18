@@ -26,10 +26,20 @@
 //!   is held.
 //! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
 //!   `unknown` for `None`. Default: 0.
+//! - `MOCK_PROTOCOL_VERSION`: the protocol version HelloAck reports. Default: this build's.
+//! - `MOCK_PROVE_ERROR_KIND`: answer every Prove with a `WorkerResponse::Error` of this kind
+//!   (`resource_exhausted`, `proof_failed` or `invalid_input`), and `MOCK_PROVE_ERROR_MESSAGE` as
+//!   its message.
+//! - `MOCK_OOM_UNLESS_CAP_AT_MOST`: answer a Prove with a `ResourceExhausted` error unless
+//!   `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` (the SP1 shard-size cap the dispatcher spawns a worker
+//!   with) is set to at most this: a program that fits only at the smaller size.
+//! - `MOCK_RECORD_TO`: a file each Benchmark and Prove appends a line to, saying what it was sent
+//!   (`benchmark po2=<po2>`) or what it ran with (`prove cap=<ZKMINER_SP1_ELEMENT_THRESHOLD_CAP>`).
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
 
+use zkminer_prover_protocol::types::ErrorKind;
 use zkminer_prover_protocol::{
     read_message, write_message, FrameError, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
@@ -50,6 +60,18 @@ fn main() {
     let backend = std::env::var("MOCK_BACKEND").unwrap_or_else(|_| "mock".to_string());
     let journal = hex_env("MOCK_JOURNAL_HEX");
     let seal = hex_env("MOCK_SEAL_HEX");
+    let record = |line: String| {
+        if let Some(path) = std::env::var_os("MOCK_RECORD_TO") {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("MOCK_RECORD_TO");
+            writeln!(file, "{line}").expect("MOCK_RECORD_TO");
+        }
+    };
+    let cap = std::env::var("ZKMINER_SP1_ELEMENT_THRESHOLD_CAP").ok();
     let prove_delay = Duration::from_secs(
         std::env::var("MOCK_PROVE_DELAY_SECS")
             .ok()
@@ -72,7 +94,10 @@ fn main() {
                 protocol_version: _,
             } => {
                 let resp = WorkerResponse::HelloAck {
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: std::env::var("MOCK_PROTOCOL_VERSION")
+                        .ok()
+                        .map(|v| v.trim().parse().expect("MOCK_PROTOCOL_VERSION"))
+                        .unwrap_or(PROTOCOL_VERSION),
                     backend: backend.clone(),
                     sdk_version: "mock 0.1.0".to_string(),
                     worker_version: "0.1.0".to_string(),
@@ -91,7 +116,8 @@ fn main() {
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            WorkerCommand::Benchmark { .. } => {
+            WorkerCommand::Benchmark { po2, .. } => {
+                record(format!("benchmark po2={po2:?}"));
                 if crash_on == "benchmark" || crash_on == "both" {
                     std::process::exit(crash_code);
                 }
@@ -130,6 +156,36 @@ fn main() {
                     }
                 }
                 std::thread::sleep(prove_delay);
+                record(format!("prove cap={}", cap.as_deref().unwrap_or("none")));
+                let oom = std::env::var("MOCK_OOM_UNLESS_CAP_AT_MOST")
+                    .ok()
+                    .map(|most| {
+                        most.trim()
+                            .parse::<u64>()
+                            .expect("MOCK_OOM_UNLESS_CAP_AT_MOST")
+                    })
+                    .is_some_and(|most| {
+                        cap.as_deref()
+                            .and_then(|c| c.trim().parse::<u64>().ok())
+                            .is_none_or(|c| c > most)
+                    });
+                let error_kind = match std::env::var("MOCK_PROVE_ERROR_KIND").as_deref() {
+                    Ok("resource_exhausted") => Some(ErrorKind::ResourceExhausted),
+                    Ok("proof_failed") => Some(ErrorKind::ProofFailed),
+                    Ok("invalid_input") => Some(ErrorKind::InvalidInput),
+                    Ok(other) => panic!("MOCK_PROVE_ERROR_KIND={other}"),
+                    Err(_) => oom.then_some(ErrorKind::ResourceExhausted),
+                };
+                if let Some(kind) = error_kind {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind,
+                        message: std::env::var("MOCK_PROVE_ERROR_MESSAGE")
+                            .unwrap_or_else(|_| "mock: out of GPU memory".to_string()),
+                    };
+                    write_message(&mut stdout, &resp).unwrap();
+                    continue;
+                }
                 // 1,000 cycles, plus the segment size asked for, so a test can see which arrived.
                 let resp = WorkerResponse::ProofResult {
                     request_id,

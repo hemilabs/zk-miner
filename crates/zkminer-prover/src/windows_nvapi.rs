@@ -104,20 +104,45 @@ pub fn cuda_sysmem_fallback_policy(programs: &[&str]) -> Option<SysmemFallbackPo
         let rc = unsafe {
             (api.find_application_by_name)(session.0, wide.as_ptr(), &mut profile, &mut *app)
         };
-        let effective = match rc {
-            0 => match api.setting(session.0, profile)? {
-                SysmemFallback::NotSet => global,
-                set => set,
-            },
-            NVAPI_EXECUTABLE_NOT_FOUND => global,
-            _ => return None,
-        };
+        let effective = program_policy(rc, || api.setting(session.0, profile), global)?;
         out.push((name.to_string(), effective));
     }
     Some(SysmemFallbackPolicy {
         global,
         programs: out,
     })
+}
+
+/// What a program runs with, given `rc` from looking its profile up: its own profile's setting
+/// (`own`, read only when it has one) unless that does not set it, else the global one; `None` on a
+/// lookup or read that failed.
+fn program_policy(
+    rc: i32,
+    own: impl FnOnce() -> Option<SysmemFallback>,
+    global: SysmemFallback,
+) -> Option<SysmemFallback> {
+    match rc {
+        0 => match own()? {
+            SysmemFallback::NotSet => Some(global),
+            set => Some(set),
+        },
+        NVAPI_EXECUTABLE_NOT_FOUND => Some(global),
+        _ => None,
+    }
+}
+
+/// The policy a profile's setting record says, from `NvAPI_DRS_GetSetting`'s `rc` and the record's
+/// type (`kind`) and current value: `NotSet` when the profile does not set it, `None` on any other
+/// failure or a setting that is not a DWORD.
+fn setting_from(rc: i32, kind: u32, current: u32) -> Option<SysmemFallback> {
+    /// `NVDRS_DWORD_TYPE`.
+    const DWORD: u32 = 0;
+    match rc {
+        0 if kind == DWORD => Some(SysmemFallback::from_value(current)),
+        0 => None,
+        NVAPI_SETTING_NOT_FOUND => Some(SysmemFallback::NotSet),
+        _ => None,
+    }
 }
 
 const NVAPI_SETTING_NOT_FOUND: i32 = -160;
@@ -301,14 +326,7 @@ impl Nvapi {
                 &mut *setting,
             )
         };
-        /// `NVDRS_DWORD_TYPE`.
-        const DWORD: u32 = 0;
-        match rc {
-            0 if setting.kind == DWORD => Some(SysmemFallback::from_value(setting.current[0])),
-            0 => None,
-            NVAPI_SETTING_NOT_FOUND => Some(SysmemFallback::NotSet),
-            _ => None,
-        }
+        setting_from(rc, setting.kind, setting.current[0])
     }
 }
 
@@ -323,6 +341,68 @@ mod tests {
         assert_eq!(std::mem::size_of::<Application>(), 12_296);
         assert_eq!(Setting::new().version, 0x1_3020);
         assert_eq!(Application::new().version, 0x1_3008);
+    }
+
+    /// A profile's record: a DWORD reads as its value, a profile that does not set it as `NotSet`,
+    /// anything else (another type, a failed read) as unknown.
+    #[test]
+    fn a_setting_reads_only_as_a_dword() {
+        assert_eq!(
+            setting_from(0, 0, 1),
+            Some(SysmemFallback::PreferNoFallback)
+        );
+        assert_eq!(setting_from(0, 0, 0), Some(SysmemFallback::DriverDefault));
+        assert_eq!(setting_from(0, 0, 9), Some(SysmemFallback::Other(9)));
+        assert_eq!(setting_from(0, 1, 1), None, "a string setting");
+        assert_eq!(
+            setting_from(NVAPI_SETTING_NOT_FOUND, 0, 1),
+            Some(SysmemFallback::NotSet)
+        );
+        assert_eq!(setting_from(-1, 0, 1), None);
+    }
+
+    /// A program runs with its own profile's setting if that sets one, else the global one; a
+    /// program without a profile runs with the global one; a failed lookup or read is unknown.
+    #[test]
+    fn a_program_runs_with_its_own_setting_else_the_global_one() {
+        let global = SysmemFallback::DriverDefault;
+        let own = |s: Option<SysmemFallback>| move || s;
+        assert_eq!(
+            program_policy(0, own(Some(SysmemFallback::PreferNoFallback)), global),
+            Some(SysmemFallback::PreferNoFallback)
+        );
+        assert_eq!(
+            program_policy(0, own(Some(SysmemFallback::NotSet)), global),
+            Some(global)
+        );
+        assert_eq!(program_policy(0, own(None), global), None);
+        let never = || -> Option<SysmemFallback> { panic!("no profile to read") };
+        assert_eq!(
+            program_policy(NVAPI_EXECUTABLE_NOT_FOUND, never, global),
+            Some(global)
+        );
+        assert_eq!(program_policy(-1, never, global), None);
+    }
+
+    /// NVAPI is loaded from System32 only, never by the default search order (the executable's
+    /// directory, the current one, `PATH`), and reads the CUDA - Sysmem Fallback Policy's id.
+    #[test]
+    fn nvapi_is_loaded_from_system32_only() {
+        assert_eq!(LOAD_LIBRARY_SEARCH_SYSTEM32, 0x0000_0800);
+        assert_eq!(CUDA_SYSMEM_FALLBACK_POLICY_ID, 0x10EC_ECC9);
+        let src = include_str!("windows_nvapi.rs");
+        let production = src.split_once("\n#[cfg(test)]").unwrap().0;
+        assert_eq!(
+            production.matches("LoadLibraryExW(").count(),
+            2,
+            "declared, called once"
+        );
+        assert!(production.contains(
+            "LoadLibraryExW(\n                dll.as_ptr(),\n                std::ptr::null_mut(),\n                \
+             LOAD_LIBRARY_SEARCH_SYSTEM32,\n            )"
+        ));
+        assert!(!production.contains("LoadLibraryW"));
+        assert!(!production.contains("LoadLibraryA"));
     }
 
     /// On a host with an NVIDIA driver the policy reads; elsewhere it reads as nothing.

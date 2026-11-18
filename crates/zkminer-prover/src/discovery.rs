@@ -1753,10 +1753,10 @@ pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -
     if free_vram_checks_off() {
         return None;
     }
-    match std::env::var(MIN_AVAILABLE_VRAM_MB_ENV) {
+    match crate::env::var(MIN_AVAILABLE_VRAM_MB_ENV) {
         // 0 is an explicit opt-out, for an operator who knows the other occupant of their card is
         // harmless and would rather risk the work than have it refused.
-        Ok(v) => match v.trim().parse::<u64>() {
+        Some(v) => match v.trim().parse::<u64>() {
             Ok(0) => None,
             Ok(mb) => Some(mb * 1024 * 1024),
             Err(_) => {
@@ -1768,13 +1768,13 @@ pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -
                 Some(default)
             }
         },
-        Err(_) => Some(default),
+        None => Some(default),
     }
 }
 
 /// Whether the operator turned the free-VRAM checks off: [`MIN_AVAILABLE_VRAM_MB_ENV`] set to 0.
 pub fn free_vram_checks_off() -> bool {
-    std::env::var(MIN_AVAILABLE_VRAM_MB_ENV).is_ok_and(|v| v.trim().parse::<u64>() == Ok(0))
+    crate::env::var(MIN_AVAILABLE_VRAM_MB_ENV).is_some_and(|v| v.trim().parse::<u64>() == Ok(0))
 }
 
 /// What a risc0 proof at segment size `po2` takes on a CUDA card of `total` bytes, as measured

@@ -3,6 +3,7 @@ pub mod descriptor;
 pub mod discovery;
 pub mod dispatcher;
 pub mod engine;
+mod env;
 pub mod gpu_code;
 pub mod memory;
 pub mod registry;

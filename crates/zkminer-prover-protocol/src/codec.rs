@@ -286,6 +286,32 @@ mod tests {
         const _: () = assert!(PROTOCOL_VERSION >= 11);
     }
 
+    /// v13 gave `Benchmark` the segment size a risc0 card's suite is proved at: every value
+    /// round-trips, `None` included (the default size), and the programs keep their place.
+    #[test]
+    fn a_benchmark_carries_its_segment_size() {
+        for po2 in [None, Some(18), Some(19), Some(20)] {
+            let mut buf = Vec::new();
+            write_message(
+                &mut buf,
+                &WorkerCommand::Benchmark {
+                    programs: crate::benchmark_suite(crate::BACKEND_RISC0),
+                    po2,
+                },
+            )
+            .unwrap();
+            match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
+                WorkerCommand::Benchmark { programs, po2: got } => {
+                    assert_eq!(got, po2);
+                    assert_eq!(programs, crate::benchmark_suite(crate::BACKEND_RISC0));
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        // v14: an SP1 worker before it ignored the card's shard-size cap.
+        const _: () = assert!(PROTOCOL_VERSION >= 14);
+    }
+
     #[test]
     fn round_trip_response() {
         let resp = WorkerResponse::HelloAck {
