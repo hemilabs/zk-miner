@@ -1,4 +1,4 @@
-//! RISC Zero's `risc0-groth16` component: the Groth16 proving key and witness generator (~5 GB)
+//! RISC Zero's `risc0-groth16` component: the Groth16 proving key and witness generator (~5.8 GB)
 //! that the final wrap of every proof needs. risc0 looks for it (`risc0_groth16::prove::component`)
 //! in `RISC0_GROTH16_DIR`, else in rzup's install, `~/.risc0/extensions/v0.2.0-risc0-groth16`
 //! (`$RISC0_HOME` in place of `~/.risc0`), and fails every proof without it.
@@ -13,7 +13,8 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
@@ -21,7 +22,7 @@ use sha2::{Digest, Sha256};
 /// The version risc0 3.1's risc0-groth16 asks for (`risc0/groth16/src/prove/component.rs` pins
 /// 0.2.0: the 2026-10-20 ceremony of the GHSA-g6qg-9j8p-7j87 `stark_verify` circuit; its witness graph
 /// has sha256 887aa345d6adc257..., which risc0's `fast.rs` checks at load). risc0 3.0 used 0.1.0,
-/// whose proving key makes proofs the 3.1 verifier rejects.
+/// whose proving key makes proofs the 3.1 verifier rejects. 5.8 GB installed = 5,812,781,917 bytes.
 pub(crate) const VERSION: &str = "0.2.0";
 /// The first 16 hex digits of that version's `stark_verify_graph.bin` sha256, which risc0's
 /// `fast.rs` (`GRAPH_SHA256`) requires before it uses the graph: a log label here, not a check.
@@ -42,8 +43,9 @@ const FILES: [&str; 4] = [
 ];
 
 /// Makes sure the component is where risc0 will look for it, installing it if it is not. What was
-/// done, for the log.
-pub fn ensure_installed() -> Result<String> {
+/// done, for the log. `report(step, done bytes, total bytes)` is told before each long step, and every
+/// second during the download and the unpack.
+pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     if let Some(dir) = std::env::var_os("RISC0_GROTH16_DIR") {
         let dir = PathBuf::from(dir);
         ensure!(
@@ -77,19 +79,46 @@ pub fn ensure_installed() -> Result<String> {
 
     let start = Instant::now();
     tracing::info!(
-        "installing the risc0-groth16 component (a 2.4 GB download, 5.4 GB installed) into {}",
+        "installing the risc0-groth16 component (a 2.4 GB download, 5.8 GB installed) into {}",
         dir.display()
     );
     let archive = tmp.join(format!("risc0-groth16-{VERSION}.tar.xz"));
-    download(&archive)?;
+    let archive_bytes = AtomicU64::new(0);
+    report(DOWNLOADING, Some(0), None);
+    let part = archive.with_extension("xz.part");
+    with_progress(
+        report,
+        || {
+            let total = archive_bytes.load(Ordering::Relaxed);
+            (
+                DOWNLOADING,
+                Some(size_on_disk(&part)),
+                (total > 0).then_some(total),
+            )
+        },
+        || download(&archive, &archive_bytes),
+    )?;
+    report(UNPACKING, Some(0), Some(UNPACKED_BYTES));
     let staging = tmp.join(format!("risc0-groth16-{VERSION}.{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
-    let unpacked = File::open(&archive)
-        .map(BufReader::new)
-        .map(liblzma::bufread::XzDecoder::new_parallel)
-        .map(tar::Archive::new)
-        .and_then(|mut a| a.unpack(&staging));
+    let unpacked = with_progress(
+        report,
+        || {
+            (
+                UNPACKING,
+                Some(size_on_disk(&staging)),
+                Some(UNPACKED_BYTES),
+            )
+        },
+        || {
+            File::open(&archive)
+                .map(BufReader::new)
+                .map(liblzma::bufread::XzDecoder::new_parallel)
+                .map(tar::Archive::new)
+                .and_then(|mut a| a.unpack(&staging))
+        },
+    );
     let _ = fs::remove_file(&archive);
     unpacked.with_context(|| {
         format!(
@@ -164,7 +193,8 @@ fn risc0_home() -> Result<PathBuf> {
 }
 
 /// Downloads the archive to `to`, checking its SHA-256 on the way.
-fn download(to: &Path) -> Result<()> {
+/// `total` is set to the archive's size once the server says it.
+fn download(to: &Path, total: &AtomicU64) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(None)
@@ -174,6 +204,9 @@ fn download(to: &Path) -> Result<()> {
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .with_context(|| format!("cannot download {ARCHIVE_URL}"))?;
+    if let Some(bytes) = response.content_length() {
+        total.store(bytes, Ordering::Relaxed);
+    }
     let part = to.with_extension("xz.part");
     let mut out =
         File::create(&part).with_context(|| format!("cannot write {}", part.display()))?;
@@ -202,6 +235,53 @@ fn download(to: &Path) -> Result<()> {
     }
     fs::rename(&part, to)?;
     Ok(())
+}
+
+const DOWNLOADING: &str = "Downloading the Groth16 files (first run)";
+const UNPACKING: &str = "Unpacking the Groth16 files (first run)";
+/// What the pinned component unpacks to, for the unpack's progress bar.
+const UNPACKED_BYTES: u64 = 5_812_781_917;
+/// How often a long step's progress is reported.
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+
+/// Runs `step` on a thread of its own, passing `report` what `measure` says every second: the step
+/// and its bytes so far. For a download or an unpack whose library reports nothing itself.
+fn with_progress<T: Send>(
+    report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
+    measure: impl Fn() -> (&'static str, Option<u64>, Option<u64>),
+    step: impl FnOnce() -> T + Send,
+) -> T {
+    std::thread::scope(|scope| {
+        let running = scope.spawn(step);
+        let mut reported = Instant::now();
+        while !running.is_finished() {
+            std::thread::sleep(Duration::from_millis(250));
+            if reported.elapsed() >= PROGRESS_EVERY {
+                reported = Instant::now();
+                let (status, done, total) = measure();
+                report(status, done, total);
+            }
+        }
+        running
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Bytes in `path`, a file or a directory tree; what cannot be read counts as nothing.
+fn size_on_disk(path: &Path) -> u64 {
+    let Ok(meta) = fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| size_on_disk(&entry.path()))
+        .sum()
 }
 
 fn hex(bytes: &[u8]) -> String {

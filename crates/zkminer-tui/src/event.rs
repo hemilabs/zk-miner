@@ -27,6 +27,9 @@ pub fn spawn_event_reader(tick_rate: Duration) -> mpsc::Receiver<AppEvent> {
             // Check if there's a crossterm event within the tick interval
             if event::poll(tick_rate).unwrap_or(false) {
                 match event::read() {
+                    // Windows also reports each key's release, which would act a second time.
+                    #[cfg(windows)]
+                    Ok(Event::Key(key)) if key.kind == event::KeyEventKind::Release => {}
                     Ok(Event::Key(key)) => {
                         if tx.blocking_send(AppEvent::Key(key)).is_err() {
                             return;

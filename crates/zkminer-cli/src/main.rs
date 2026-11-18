@@ -103,12 +103,13 @@ enum Commands {
         #[arg(long = "job", value_name = "JOB_ID")]
         jobs: Vec<alloy::primitives::B256>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
-        /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…"} (the submitting tx saves the
-        /// descriptor's log scan; the fulfil's public values let the report say whether the measured
-        /// journal is the proven one).
+        /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…", "singleRun": true} (the submitting
+        /// tx saves the descriptor's log scan; the fulfil's public values let the report say whether
+        /// the measured journal is the proven one; `singleRun` measures a risc0 job once at `--po2`).
         #[arg(long)]
         stdin: bool,
-        /// The risc0 segment size to measure at (risc0 cycle counts are padded per segment).
+        /// The risc0 segment size run first, reported on a tie, and the only one for `singleRun`.
+        /// Otherwise a risc0 job runs at all seven sizes and the lowest figure is reported.
         #[arg(long, default_value_t = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)]
         po2: u8,
         /// Bound on one execution, in seconds: at least 60 (a lower value is raised to it), at most

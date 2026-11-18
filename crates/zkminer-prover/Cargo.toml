@@ -11,6 +11,7 @@ methods = [
     "guests/risc0/bigint-mul",
     "guests/risc0/memory-merkle",
     "guests/risc0/chacha-mix",
+    "guests/risc0/zkop-mix",
     "guests/risc0/rv32im-torture",
     "guests/risc0/edge-case-arith",
     "guests/risc0/memory-stress",
@@ -48,6 +49,10 @@ hex = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 bincode = "1"
+
+# Loads the GPU vendors' telemetry libraries, which ship with their drivers.
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

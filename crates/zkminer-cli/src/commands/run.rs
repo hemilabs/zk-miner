@@ -452,7 +452,9 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".zkminer");
     // Private to this user: anyone who can open the lock file can hold it (flock needs no write
-    // access), and a held lock keeps a restarted miner from recovering its locks.
+    // access), and a held lock keeps a restarted miner from recovering its locks. (On Windows the
+    // profile directory is already private to its user.)
+    #[cfg(unix)]
     {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
@@ -465,7 +467,10 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
     }
+    #[cfg(windows)]
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("miner.lock");
+    #[cfg(unix)]
     let file = {
         let mut options = std::fs::OpenOptions::new();
         options.create(true).truncate(false).write(true);
@@ -478,6 +483,13 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?
     };
+    #[cfg(windows)]
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
@@ -673,9 +685,8 @@ pub(crate) type MeasuredJournal = Option<(alloy::primitives::B256, std::sync::Ar
 /// ~3 GiB of them; past this bound other entries are evicted, and an evicted pair is re-measured.
 const MEASURED_JOURNAL_BYTES_CAP: usize = 64 * 1024 * 1024;
 
-/// How long a real measurement that came back without its journal (a worker that could not vouch
-/// for it, such as one seeding `sys_rand` with a key for its process alone) sizes jobs before the
-/// pair is re-measured. It never makes a journal-bound job claimable; this only bounds how long those
+/// How long a real measurement that came back without its journal sizes jobs before the pair is
+/// re-measured (defensive: a worker reports every journal within the size a fulfil could carry). It never makes a journal-bound job claimable; this only bounds how long those
 /// jobs wait for a measurement that does. Not submitter-reachable: an over-cap journal is a permanent
 /// infeasible verdict instead.
 const MEASURED_NO_JOURNAL_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1472,7 +1483,7 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
 /// Post-claim FAILURE breaker. A claimed job whose (program, input) measured clean and then failed
 /// after the lock — ANY terminal prove failure (a guest fault, a watchdog kill, a health failure, a
 /// budget run-out) or an over-cap journal — pays the release penalty, and a submitter can assign NONE
-/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (ELF, input), so
+/// jobs to us without our consent. The risc0 worker seeds the guest's `sys_rand` per (image id, input), so
 /// a guest's randomness no longer splits its measurement from its proof; but proving still runs paths
 /// a measurement doesn't (the GPU, another segment size, more memory). Worker error text can carry
 /// guest-chosen strings, so this is deliberately class-agnostic: it cannot be evaded by choosing how
@@ -2016,7 +2027,7 @@ fn descriptor_carries_revert_lever(d: &zkminer_contracts::bindings::JobDescripto
 /// The pre-claim verdict on a job's journal binding: does the journal its (program, input) measured
 /// satisfy it, for `prover`? `None` when no whole journal measured on exactly this descriptor's input
 /// is in hand — never a reason to claim. The journal is a deterministic function of (ELF, input) (the
-/// risc0 worker seeds `sys_rand` per (ELF, input)), so a mismatch here is the `JournalMismatch` the
+/// risc0 worker seeds `sys_rand` per (image id, input)), so a mismatch here is the `JournalMismatch` the
 /// fulfil would revert after the lock.
 pub(crate) fn measured_binding_verdict(
     d: &zkminer_contracts::bindings::JobDescriptor,
@@ -2391,6 +2402,15 @@ pub(crate) fn is_measure_preempted(e: &anyhow::Error) -> bool {
         .is_some()
 }
 
+/// Could the measure worker not be SET UP before the request ran (SP1's per-spawn CPU prover, built
+/// under its own bound; see the dispatcher's `set_up_measure_slot`)? No guest ran and the setup is
+/// the same for every program, so, like a preemption, it is transient: no strike, no
+/// negative-cache, no retry TTL. By the dispatcher-only TYPE, never by message.
+pub(crate) fn is_measure_setup_failed(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::MeasureSetupFailed>()
+        .is_some()
+}
+
 fn prove_sizing_cycles(declared: u64, measured: Option<u64>) -> u64 {
     match measured {
         Some(m) => declared.max(m),
@@ -2484,6 +2504,8 @@ pub async fn run(
     if watch.is_none() {
         hold_instance_lock()?;
     }
+    let splash = zkminer_tui::splash::Splash::start(!headless);
+    splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
     let client = match watch {
         Some(w) => {
@@ -2519,6 +2541,7 @@ pub async fn run(
         None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
     };
 
+    splash.status("Verifying the deployment contracts");
     // Before ANY transaction (handoff §13 tests 1-2): the configured stack must be the live
     // deployment for this chain, wired to itself (router.staking/registry/hemiToken), and running the
     // AUDITED code; and every proof system zkminer serves must be registered and wrap the audited
@@ -2565,12 +2588,13 @@ pub async fn run(
             alloy::hex::encode(risc0_groth16_default_selector())
         );
     }
-    // B9-ZK: a build whose seals have no audited verifier pin (risc0 3.1 until its verifier is
-    // deployed and pinned) says what is missing up front, whatever the chain answers below; the
-    // check itself then refuses the adapter with the same text on every re-check.
+    // B9-ZK: seals with no audited verifier pin (a 3.0 or other selector the override check let
+    // through) say why up front, whatever the chain answers below; the check itself then refuses the
+    // adapter with the same text on every re-check.
     if let Some(missing) = risc0_verifier_pin_startup_notice(risc0_seal_selector()) {
         tracing::error!("PAGE: risczero.groth16.v1 cannot be served yet — {missing}");
     }
+    splash.status("Verifying the RISC Zero verifier contract");
     // NOT fatal: a held lock must still be recovered (fulfilled, kept through a Disabled window, or
     // released) when the adapter is disabled, swapped, or fails a pin. Exiting here would leave every
     // lock to a 100% slash. Claims for the proof system stay off until a re-check passes.
@@ -2589,6 +2613,7 @@ pub async fn run(
              already held are still recovered and driven. Re-checked every few minutes."
         ),
     }
+    splash.status("Verifying the SP1 verifier contract");
     // Not a PAGE: a deployment need not register SP1 at all.
     match reverify_sp1(&client).await {
         Ok(adapter) => tracing::info!(
@@ -2608,13 +2633,7 @@ pub async fn run(
     let state = new_shared_state();
 
     // Initialize worker pool (before TUI, after config load)
-    let benchmark_timeout = if config.prover.benchmark_timeout_secs > 0 {
-        Some(std::time::Duration::from_secs(
-            config.prover.benchmark_timeout_secs,
-        ))
-    } else {
-        None
-    };
+    let benchmark_timeout = config.prover.benchmark_timeout();
     let mut pool = WorkerPool::new(
         config
             .prover
@@ -2630,26 +2649,15 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
-    // One `sys_rand` key for every risc0 worker this miner spawns, loaded once: a measured journal is
-    // only worth checking a binding against if the proof that follows, on whichever worker, seeds the
-    // guest alike — and the measurements live in this process, as long as the key does.
-    {
-        let (key, err) = zkminer_prover_protocol::sys_rand::host_key(dirs::home_dir().as_deref());
-        if let Some(e) = &err {
-            tracing::warn!(
-                "risc0 sys_rand key file unusable ({e}): using a key for this run only, so no \
-                 journal-bound job is claimed (its journal could change when a lock is re-proved \
-                 after a restart)"
-            );
-        }
-        zkminer_prover::worker::set_risc0_sys_rand_key(key, err.is_some());
-    }
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
     if watch_only() {
         pool.only_backends(served_backends());
     }
+    splash.status("Looking for GPUs and prover workers");
+    let status = splash.status_line();
+    pool.set_progress(move |text| status.set(text));
     // On a BLOCKING thread, like the hardware probe just below it and for the same reason.
     //
     // Per slot this blocks on `nvidia-smi` (up to VRAM_QUERY_TIMEOUT), then the serialised spawner
@@ -2665,14 +2673,39 @@ pub async fn run(
     if !connected.is_empty() {
         tracing::info!("Connected subprocess workers: {}", connected.join(", "));
     }
+    let found = zkminer_tui::splash::found_summary(&pool.started_provers());
+    let mut startup_problems = pool.startup_problems().to_vec();
     init_worker_pool(pool);
     // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
     // pre-claim gate), and everything else proceeds meanwhile. Not when watching: it proves on the
     // GPU, and a watch-only run proves nothing.
     if !watch_only() {
+        // On the splash, where a first run's downloads can be watched; headless, the background
+        // warm-up below does it while mining starts. It also retries what fails here.
+        if !headless {
+            let status = splash.status_line();
+            let backends = [
+                zkminer_prover_protocol::BACKEND_SP1,
+                zkminer_prover_protocol::BACKEND_RISC0,
+            ];
+            let failed = tokio::task::spawn_blocking(move || {
+                zkminer_tui::splash::run_setup(&status, &backends)
+            })
+            .await
+            .unwrap_or_default();
+            startup_problems.extend(failed);
+        }
         spawn_sp1_warmup();
     }
 
+    // Long enough to read: once the TUI opens the splash is gone.
+    if !headless {
+        for problem in &startup_problems {
+            splash.status(format!("Problem: {problem}"));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+    splash.status(format!("Reading GPU details (found {found})"));
     // Hardware probe — runs on a blocking thread to avoid freezing the system.
     // NVML init + device queries + sysfs reads can take seconds on idle GPUs.
     let (hw, tuning) = tokio::task::spawn_blocking(|| {
@@ -2715,13 +2748,16 @@ pub async fn run(
             })
             .collect();
 
+        s.note_startup_problems(&startup_problems);
+
         // Load cached benchmarks if available.
         // If no cache, benchmarks will run in the background after TUI starts.
         if let Some(suite) = load_cached_benchmark() {
-            tracing::info!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops);
+            let score = zkminer_prover::benchmark::format_mzkops(suite.zkops);
+            tracing::info!("Loaded cached benchmarks ({score})");
             s.add_log(
                 LogLevel::Info,
-                format!("Loaded cached benchmarks (zkOP/s: {:.0})", suite.zkops),
+                format!("Loaded cached benchmarks ({score})"),
             );
             s.benchmark_results = Some(suite);
         }
@@ -2761,6 +2797,7 @@ pub async fn run(
         // on a TOTAL failure, stake_info stays None → the collateral gate reads it as 0 and
         // blocks claims (never over-commits), and the +7s refresh loop re-hydrates before the
         // brain's first claim eval.
+        splash.status(format!("Reading your balance and stake (found {found})"));
         let hydrated;
         match client.get_refresh_batch().await {
             Ok(data) => {
@@ -3177,14 +3214,10 @@ pub async fn run(
         }
     });
 
-    // Benchmarks are user-triggered via [b] on the Benchmark screen.
-    // Auto-benchmark at startup is disabled because GPU proving in VMs with
-    // passthrough GPUs causes kernel time spikes that freeze the system.
-    {
-        let s = state.read().await;
-        if s.benchmark_results.is_none() {
-            tracing::info!("No cached benchmarks — press [b] on Benchmark screen to run");
-        }
+    // Before the brain starts, so it sees the claim hold. Not when watching: a watch-only run
+    // proves nothing.
+    if !watch_only() {
+        zkminer_tui::start_benchmark_if_incomplete(&state, !headless).await;
     }
 
     // The journal is the AUTHORITATIVE record of what we hold on-chain: a breadcrumb is
@@ -3418,6 +3451,7 @@ pub async fn run(
         // `run()`, leaving held jobs Locked on-chain with nothing alive to release them (they
         // then ride past the lock deadline, after which releaseJob reverts permanently) and
         // the SP1 gpu-server grandchild holding its VRAM. Log and fall through instead.
+        drop(splash);
         let tui_result = zkminer_tui::run_tui(state.clone(), Some(client.clone())).await;
         // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard —
         // release the signal handler so the drain below still has the abandon/force ladder.
@@ -4238,14 +4272,10 @@ fn synthetic_conservative_benchmark(
         .collect();
 
     BenchmarkSuite {
-        results: vec![
-            program("fibonacci", 500_000, 0.10, false),
-            program("sha256-chain", 2_000_000, 0.20, true),
-            program("ecdsa-verify", 5_000_000, 0.25, true),
-            program("bigint-mul", 1_000_000, 0.10, false),
-            program("memory-merkle", 3_000_000, 0.15, true),
-            program("chacha-mix", 34_000_000, 0.20, false),
-        ],
+        results: zkminer_prover::benchmark::BENCHMARK_PROGRAMS
+            .iter()
+            .map(|p| program(p.name, p.simulated_cycles, p.weight, p.precompile))
+            .collect(),
         device_benchmarks,
         zkops: throughput_cps,
         cpu_info: SYNTHETIC_SUITE_CPU.to_string(),
@@ -4891,6 +4921,27 @@ async fn miner_brain(
             .len();
         if n > 0 {
             tracing::info!("Loaded job journal with {n} claimed entries");
+        }
+    }
+    // A lock measured under another `sys_rand` rule re-proves under this one, and a guest whose journal
+    // or path follows its random bytes may then fail or commit something else: the binding check before
+    // the fulfil releases it rather than publish a proof that would revert. A held lock is the one
+    // thing that spans the rule, so say so while there is still time to look at it. (Run before
+    // recovery reconciles the journal, so an entry may turn out to be gone already.)
+    {
+        let stale = journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .measured_under_another_sys_rand_rule(zkminer_prover_protocol::sys_rand::SYS_RAND_RULE);
+        if !stale.is_empty() {
+            let ids: Vec<String> = stale.iter().map(|id| short_id(*id)).collect();
+            tracing::error!(
+                "PAGE: {} risc0 job(s) in the journal were measured under an older sys_rand rule ({}): a \
+                 guest whose journal or path depends on its random bytes may fail or commit something \
+                 else when re-proved, and is then released at the job's release penalty.",
+                stale.len(),
+                ids.join(", ")
+            );
         }
     }
     // Concurrency: run one job per detected GPU (bounded by max_concurrent_proofs).
@@ -6098,6 +6149,11 @@ async fn miner_brain(
             }
         }
 
+        // The startup benchmark has the cards. Held-lock recovery is not behind this.
+        if state.read().await.startup_benchmark_pending {
+            continue;
+        }
+
         let benchmarks = match benchmarks {
             Some(b) => b,
             // Cards are passed in, not read from the worker pool here: that read took a slot
@@ -6607,9 +6663,9 @@ async fn miner_brain(
                     // Not before the backend's one-time setup is done. SP1's first proof would
                     // otherwise download ~8 GB of circuit artifacts inside its 90 s watchdog, be
                     // killed mid-way, and leave an install that fails every later proof. See
-                    // `spawn_sp1_warmup`. Not when watching either: a watch-only run proves
-                    // nothing and never warms up (`spawn_sp1_warmup` is not started), so this gate
-                    // would hold every job's verdict forever (B9-CHAIN).
+                    // `spawn_sp1_warmup`. Not when watching: a watch-only run proves nothing, so it
+                    // never warms a backend up (see the startup warm-up), and this gate would hold
+                    // every risc0 and SP1 verdict short of the claim it is there to report.
                     if !sim_mode && !watch_only() {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
                             if !pool.backend_warmed(backend) {
@@ -8163,9 +8219,14 @@ async fn watch_inspector(
     const PASS_EVERY: Duration = Duration::from_secs(5);
     const SUMMARY_EVERY: Duration = Duration::from_secs(600);
     // How long a job may stay inconclusive (waiting on a measurement the brain runs, a busy measure
-    // pool, a slow source) before it is reported as such: a measurement's whole budget, and some.
-    const GIVE_UP_AFTER: Duration =
-        Duration::from_secs(MEASURE_TIMEOUT.as_secs() + 2 * MEASURE_FETCH_BUDGET.as_secs() + 60);
+    // pool, a slow source) before it is reported as such: a measurement's whole budget, and some. A
+    // spawn's first SP1 measurement first sets its worker up, under its own bound.
+    const GIVE_UP_AFTER: Duration = Duration::from_secs(
+        MEASURE_TIMEOUT.as_secs()
+            + 2 * MEASURE_FETCH_BUDGET.as_secs()
+            + zkminer_prover::dispatcher::SP1_MEASURE_SETUP_BOUND.as_secs()
+            + 60,
+    );
     const MAX_RETRY_GAP: Duration = Duration::from_secs(60);
     let started = std::time::Instant::now();
     let mut last_summary = started;
@@ -11230,8 +11291,10 @@ async fn measure_cycles(
                     peak_host_bytes,
                     duration_secs,
                     // Simulate's evidence rule; the miner's own measure-matches-prove guarantee is the
-                    // shared seed key, not this count.
+                    // public seed, not this count.
                     host_entropy_reads: _,
+                    user_cycles: _,
+                    keccak_cycles: _,
                 } = measurement;
                 if paces_claims {
                     clear_preclaim_strikes(job_id);
@@ -11420,6 +11483,15 @@ async fn measure_cycles(
                 if is_measure_preempted(&e) {
                     tracing::debug!(
                         "measure {}: preempted by a claimed proof, not sizing now (transient)",
+                        short_id(program_id)
+                    );
+                    continue;
+                }
+                // The worker could not be set up (its SP1 CPU prover) before the execute: nothing
+                // ran, and nothing about the program is known. The dispatcher has logged why.
+                if is_measure_setup_failed(&e) {
+                    tracing::debug!(
+                        "measure {}: the measure worker is not set up, not sizing now (transient)",
                         short_id(program_id)
                     );
                     continue;
@@ -12787,7 +12859,7 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
         s.benchmark_tracker = Some(BenchmarkTracker {
             devices: Vec::new(),
             all_complete: false,
-            started_at: Some(chrono::Utc::now()),
+            started_at: Some(std::time::Instant::now()),
             active_device_index: 0,
         });
         s.add_log(LogLevel::Info, "Starting GPU benchmarks...");
@@ -12808,26 +12880,23 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
             while let Some(event) = bridge_rx.recv().await {
                 let mut s = bridge_state.write().await;
                 if let Some(tracker) = s.benchmark_tracker.as_mut() {
-                    tracker.on_progress(
-                        &event.slot_key,
-                        event.gpu_name.as_deref(),
-                        event.device_index,
-                        event.pci_bus_id.as_deref(),
-                        &event.gpu_tag,
-                        &event.entry,
-                        event.program_index,
-                        event.total_programs,
+                    tracker.apply(&event);
+                }
+                if let zkminer_prover::dispatcher::BenchmarkProgressKind::ProgramDone {
+                    entry,
+                    ..
+                } = &event.kind
+                {
+                    s.add_log(
+                        LogLevel::Info,
+                        format!(
+                            "{}: {} done ({:.1}M c/s)",
+                            event.slot_key,
+                            entry.program_name,
+                            entry.throughput / 1_000_000.0
+                        ),
                     );
                 }
-                s.add_log(
-                    LogLevel::Info,
-                    format!(
-                        "{}: {} done ({:.1}M c/s)",
-                        event.slot_key,
-                        event.entry.program_name,
-                        event.entry.throughput / 1_000_000.0
-                    ),
-                );
             }
         });
 
@@ -12895,27 +12964,17 @@ mod tests {
         assert_eq!(parse_seal_selector("0xg71e6620"), None);
     }
 
-    /// B9-ZK: zkminer-chain's 3.1 selector constant is this build's derived selector, and until the
-    /// 3.1 verifier pin is filled the startup notice names what is missing (no address or hash is
-    /// invented: the pin is `None`).
+    /// B9-ZK: zkminer-chain's 3.1 selector constant is this build's derived selector, and with the
+    /// 3.1 verifier pinned (the 2026-11-16 deployment) the startup has nothing to report.
     #[test]
     fn the_3_1_verifier_pin_slot_matches_the_linked_risc0() {
         use zkminer_chain::deployment::pins;
         assert_eq!(pins::RISC0_V3_1_SELECTOR, risc0_groth16_default_selector());
-        let notice = risc0_verifier_pin_startup_notice(risc0_groth16_default_selector());
-        match pins::RISC0_V3_1_GROTH16_VERIFIER {
-            None if !zkminer_chain::deployment::code_pins_skipped()
-                && RISC0_SELECTOR_REFUSAL.get().is_none() =>
-            {
-                let notice = notice.expect("a notice while the 3.1 pin is empty");
-                assert!(
-                    notice.contains("RISC0_V3_1_GROTH16_VERIFIER") && notice.contains("0xe71e6620"),
-                    "{notice}"
-                );
-            }
-            None => {}
-            Some(_) => assert_eq!(notice, None),
-        }
+        assert_eq!(
+            zkminer_chain::deployment::risc0_verifier_pin(risc0_groth16_default_selector()),
+            Ok(pins::RISC0_V3_1_GROTH16_VERIFIER)
+        );
+        assert_eq!(risc0_verifier_pin_startup_notice(risc0_groth16_default_selector()), None);
     }
 
     /// The risc0 this CLI derives its selector from is the one the protocol makes a risc0 worker
@@ -14849,6 +14908,23 @@ mod r2_sizing_tests {
         // A guest-forged message does not win the transient treatment.
         let forged = anyhow::anyhow!("cycle measurement failed: Guest panicked: preempted (transient)");
         assert!(!is_measure_preempted(&forged));
+    }
+
+    /// A measure worker that could not be set up is its own typed transient: not a timeout (no
+    /// retry TTL, no strike), not a preemption, and not forgeable from guest text.
+    #[test]
+    fn a_setup_failure_is_classified_by_type_and_is_not_a_timeout() {
+        let real: anyhow::Error =
+            anyhow::Error::new(zkminer_prover_protocol::types::MeasureSetupFailed {
+                slot_key: "sp1:measure:0".to_string(),
+                message: "not set up within 600 s".to_string(),
+            });
+        assert!(is_measure_setup_failed(&real));
+        assert!(!is_measure_wall_clock_timeout(&real));
+        assert!(!is_measure_preempted(&real));
+        let forged =
+            anyhow::anyhow!("Guest panicked: measure worker could not be set up (transient)");
+        assert!(!is_measure_setup_failed(&forged));
     }
 
     /// A measured entry: `cycles`, a journal, the verified ELF keccak and the execute's seconds.
