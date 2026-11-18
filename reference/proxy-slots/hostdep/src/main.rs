@@ -7,6 +7,10 @@
 //!   default), then the user cycle count; at a small keccak po2 this makes two or more batches;
 //! - `0xA4`: permutations through the raw `sys_keccak` until its status says the host's batch is
 //!   full, and their count (depends on the keccak po2);
+//! - `0xA5`: a randomized spot check. `W = 0xA5 ‖ v (8 bytes) ‖ k (1 byte) ‖ k items of 8 bytes`,
+//!   the statement "every item is `v`", checked at one index drawn from `sys_rand`; the journal is
+//!   a header word of its own (0x78) and `v`. An honest `W` gives the same journal under any seed,
+//!   so only the guest's `sys_rand` call shows that a prover who picks the seed passes a forged `W`;
 //! - anything else: `W` itself (a statement as good as its source: two providers that disagree give
 //!   two journals).
 //!
@@ -77,6 +81,19 @@ fn main() {
                 }
             }
             out.extend_from_slice(&count.to_le_bytes());
+        }
+        0xA5 => {
+            assert!(w.len() >= 10, "malformed");
+            let v = &w[1..9];
+            let k = w[9] as usize;
+            assert!(k > 0 && w.len() == 10 + 8 * k, "malformed");
+            let mut r = [0u32; 1];
+            // SAFETY: a writable buffer of one word.
+            unsafe { sys_rand(r.as_mut_ptr(), 1) };
+            let i = r[0] as usize % k;
+            assert!(&w[10 + 8 * i..18 + 8 * i] == v, "spot check failed");
+            out[31] = 0x78;
+            out.extend_from_slice(v);
         }
         _ => out.extend_from_slice(&w),
     }

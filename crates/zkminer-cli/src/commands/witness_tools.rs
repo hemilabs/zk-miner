@@ -498,6 +498,11 @@ pub fn check_binding(c: &CheckInput<'_>) -> BindingReport {
         }
     }
     let header_bytes = c.header_bytes.or((!c.words.is_empty()).then_some(32 * c.words.len()));
+    if header_bytes == Some(0) {
+        // A header of no bytes has nothing to pin, so it would pass any binding.
+        ok = false;
+        warnings.push("a 0-byte header: every journal header starts with its 32-byte scheme word; give its length".into());
+    }
     let header_free = match header_bytes {
         Some(h) if h > len => {
             // The header is the start of the statement: one longer than it cannot have been checked.

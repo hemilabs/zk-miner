@@ -44,9 +44,18 @@ const SPOOL_READ_CHUNK: usize = 256 << 10;
 
 /// Where one of a job's capabilities is served from.
 pub(crate) enum JobSource {
-    /// `horizon`: [`crate::broker::pruning_horizon`] of `endpoints`.
-    EvmRpc { chain_id: u64, method_set: MethodSet, endpoints: Vec<Arc<Endpoint>>, horizon: u64 },
-    Blob { max_bytes: u64 },
+    /// `horizon`: [`crate::broker::pruning_horizon`] of `endpoints`; `head_fresh`: the smallest of
+    /// their `head_fresh_secs` (see [`crate::rpc_serve`]).
+    EvmRpc {
+        chain_id: u64,
+        method_set: MethodSet,
+        endpoints: Vec<Arc<Endpoint>>,
+        horizon: u64,
+        head_fresh: std::time::Duration,
+    },
+    Blob {
+        max_bytes: u64,
+    },
 }
 
 /// Why a fetch ended with status 2.
@@ -492,17 +501,14 @@ async fn serve_fetch(b: &Arc<Broker>, job: &Arc<Job>, payload: &[u8]) -> Outcome
                 method_set,
                 endpoints,
                 horizon,
+                head_fresh,
             } => {
-                crate::rpc_serve::serve(
-                    b,
-                    job,
-                    *chain_id,
-                    *method_set,
+                let source = crate::rpc_serve::Source {
                     endpoints,
-                    *horizon,
-                    request,
-                )
-                .await
+                    horizon: *horizon,
+                    head_fresh: *head_fresh,
+                };
+                crate::rpc_serve::serve(b, job, *chain_id, *method_set, &source, request).await
             }
             JobSource::Blob { max_bytes } => crate::blob::serve(b, job, *max_bytes, request).await,
         }

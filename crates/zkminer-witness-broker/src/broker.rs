@@ -157,12 +157,19 @@ impl Broker {
                         .iter()
                         .map(|e| (e.info.archive, e.info.max_proof_age)),
                 );
+                // The strictest of the entries' (one chain, one block time).
+                let head_fresh = serving
+                    .iter()
+                    .map(|e| e.info.head_fresh)
+                    .min()
+                    .unwrap_or_default();
                 let endpoints: Vec<_> = serving.iter().map(|e| e.ep.clone()).collect();
                 (!endpoints.is_empty()).then_some(JobSource::EvmRpc {
                     chain_id,
                     method_set,
                     endpoints,
                     horizon,
+                    head_fresh,
                 })
             }
             CapabilityKind::BlobV1 { max_bytes } => (!self.blob_mirrors.is_empty()).then_some(JobSource::Blob { max_bytes }),

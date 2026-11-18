@@ -132,9 +132,10 @@ enum Commands {
         /// Write the witness report here instead of stdout.
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         out: Option<std::path::PathBuf>,
-        /// Attack the witness: structured mutations of W, re-execution under two sys_rand seeds
-        /// (the public rule's and a random one), two po2s and two keccak po2s, and a differential
-        /// run against two evm-rpc providers. Exits non-zero unless the verdict is `pass`.
+        /// Attack the witness: re-execution under two sys_rand seeds (the public rule's and a random
+        /// one), two po2s and two keccak po2s, a differential run against two evm-rpc providers,
+        /// then structured and generic mutations of W, each with a share of the time left. Exits
+        /// non-zero unless the verdict is `pass`.
         #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
         adversarial: bool,
         /// The adversarial run's bound, in seconds.
@@ -143,18 +144,21 @@ enum Commands {
         /// Byte flips at sampled offsets of W.
         #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_FLIPS, requires = "adversarial")]
         flips: usize,
-        /// The most mutations executed: the scheme's structured ones first, then the generic ones.
+        /// The most mutations executed: the scheme's structured ones first, then the generic ones
+        /// (0 runs none, and the verdict is `incomplete`).
         #[arg(long, default_value_t = commands::simulate_witness::MAX_MUTATIONS, requires = "adversarial")]
         max_mutations: usize,
         /// The scheme id whose structured mutations apply (default: the journal header's first word).
         #[arg(long, requires = "adversarial")]
         scheme: Option<u64>,
         /// The two `[[evm_rpc]]` aliases of the broker configuration for the differential run
-        /// (default: the first two serving the job's chain).
+        /// (default: the first two serving the job's chain; with fewer than two the verdict is at
+        /// best `incomplete`).
         #[arg(long, value_delimiter = ',', requires = "adversarial")]
         providers: Option<Vec<String>>,
         /// The largest W --adversarial attacks, in bytes: it runs in this process, unsandboxed, and
-        /// holds W and a few copies of it.
+        /// its peak memory is about 4 × |W| for the generic mutations and up to about 32 × |W| for a
+        /// scheme-1 W of many small trie nodes.
         #[arg(long, default_value_t = commands::simulate_witness::DEFAULT_ADVERSARIAL_MAX_W_BYTES, requires = "adversarial")]
         adversarial_max_w_bytes: u64,
         /// With --descriptor, this host's maxGuestCycles maximum (over [witness] max_guest_cycles). A
@@ -164,7 +168,8 @@ enum Commands {
         max_guest_cycles: Option<u64>,
         /// With --descriptor, the journal header's length in bytes, which the binding must pin whole
         /// (a scheme-1 W declares it; give it for a W of another layout, or --adversarial fails).
-        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"])]
+        /// At least 1: a header starts with its scheme word.
+        #[arg(long, requires = "descriptor", conflicts_with_all = ["jobs", "stdin"], value_parser = header_bytes_arg)]
         header_bytes: Option<usize>,
         /// Then read requests from stdin until EOF, one per line: a job id, or
         /// {"jobId": "0x…", "submitTx": "0x…", "publicValues": "0x…", "singleRun": true} (the submitting
@@ -456,8 +461,9 @@ enum BindingCommand {
         /// The statement (the journal after any prefix): 0x hex or a file.
         #[arg(long)]
         statement: Option<String>,
-        /// The header's length in bytes (default: 32 × the words given).
-        #[arg(long)]
+        /// The header's length in bytes (default: 32 × the words given). At least 1: a header starts
+        /// with its scheme word.
+        #[arg(long, value_parser = header_bytes_arg)]
         header_bytes: Option<usize>,
         /// The job's assigned prover (default: the descriptor's): a NONE binding without one fails.
         #[arg(long)]
@@ -841,6 +847,16 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
 
 /// A `simulate` bound in seconds, clamped to `MIN_BOUND_SECS..=86400`: below the minimum a request's
 /// own overhead would fail every request; far above it, the watchdog's deadline arithmetic overflows.
+/// `--header-bytes`: a length of 0 would declare that the binding has no header to pin, which passes
+/// any binding; it is refused.
+fn header_bytes_arg(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("a journal header is never empty (it starts with its 32-byte scheme word): give its length".into()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn simulate_bound(flag: &str, secs: u64) -> std::time::Duration {
     const MAX_BOUND_SECS: u64 = 86_400;
     let min = commands::simulate::MIN_BOUND_SECS;
@@ -1033,5 +1049,40 @@ mod tests {
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--descriptor", "d.json", "--stdin"]).is_err());
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--stdin", "--builder", "b.wasm"]).is_err());
         assert!(Cli::try_parse_from(["zkminer", "simulate", "--descriptor", "d", "--flips", "3"]).is_err());
+        // A header of 0 bytes pins nothing: refused, by simulate and by `binding check`.
+        assert!(Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--descriptor",
+            "d",
+            "--header-bytes",
+            "0"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "zkminer",
+            "simulate",
+            "--descriptor",
+            "d",
+            "--header-bytes",
+            "32"
+        ])
+        .is_ok());
+        let check = |h: &str| {
+            Cli::try_parse_from([
+                "zkminer",
+                "witness",
+                "binding",
+                "check",
+                "--journal-fields",
+                &format!("0x{}", "00".repeat(32)),
+                "--statement",
+                "0x00",
+                "--header-bytes",
+                h,
+            ])
+        };
+        assert!(check("0").is_err());
+        assert!(check("160").is_ok());
     }
 }

@@ -8,9 +8,9 @@
 //!    same numbers. A request that names an explicit block number also resolves `latest`; a
 //!    number above the head (the highest `latest` of at most [`MAX_LAGGING_ATTEMPTS`] endpoints)
 //!    is refused, status 1, with no failover, once two independent endpoints (distinct host and
-//!    port) report heads below it; with fewer it is status 2 [`Failure::LaggingUnconfirmed`] (one
-//!    node behind the chain reports the same head). A refusal after resolution costs the one unit
-//!    of a refused request, not one per call.
+//!    port) report heads below it, or every endpoint that did has a fresh head (below); otherwise
+//!    it is status 2 [`Failure::LaggingUnconfirmed`] (one node behind the chain reports the same
+//!    head). A refusal after resolution costs the one unit of a refused request, not one per call.
 //! 5. Answer calls pinned to a block hash from the cache, charging the operator budget for them as
 //!    if they missed (status 2 when no endpoint can spend them, as for a miss). Send the rest (a
 //!    subset with the broker's own ids) through the endpoints in order:
@@ -19,21 +19,26 @@
 //!      operator's ([`Failure::Operator`]);
 //!    - a lagging answer (the lagging heuristics, `null` where an answer must exist, or a suspect
 //!      error on a pinned call that the endpoint's head or `eth_getBlockByHash` shows it lacks)
-//!      moves on too, but at most [`MAX_LAGGING_ATTEMPTS`] endpoints are asked per request: if they
-//!      all lag the fetch is status 2 [`Failure::Unanswerable`] when two independent endpoints
-//!      (distinct host and port) lagged, or the request's oldest explicit block is deeper than the
-//!      source's pruning horizon ([`crate::broker::pruning_horizon`]) below the head (a builder can
-//!      ask for an unknown hash on demand; that must not buy a blameless retry or cost every
-//!      endpoint); with fewer it is [`Failure::LaggingUnconfirmed`], since one node behind the chain
-//!      answers a valid request exactly so;
+//!      moves on too, to the next endpoint on another host or port (an alias of a node that lagged
+//!      would answer the same), but at most [`MAX_LAGGING_ATTEMPTS`] independent endpoints are asked
+//!      per request. If they all lag the fetch is status 2 [`Failure::Unanswerable`] when two
+//!      independent endpoints lagged, when every one that lagged has a **fresh head** (its `latest`
+//!      block's timestamp within the source's `head_fresh_secs` of now, a few block times: a node
+//!      at the chain's head that lacks a block or state shows the request names something not on
+//!      the chain), or when the request's oldest explicit block is deeper than the source's pruning
+//!      horizon ([`crate::broker::pruning_horizon`]) below the head. A builder can ask for an
+//!      unknown hash on demand: that must not buy a blameless retry or cost every endpoint. Only a
+//!      node whose head is stale (or could not be read) leaves it [`Failure::LaggingUnconfirmed`],
+//!      since one node behind the chain answers a valid request exactly so;
 //!    - a timeout once the request was sent is the request's own ([`Failure::Own`]).
 //!
-//!    Every attempt, tag queries and head checks included, is charged to that endpoint's operator
-//!    budget. Execution errors are answers. Errors are never cached.
+//!    Every attempt, tag queries, head checks and freshness probes included, is charged to that
+//!    endpoint's operator budget. Execution errors are answers. Errors are never cached.
 //! 6. Render, and charge the bytes delivered (status 3 past `maxResponseBytes` or `maxFetchBytes`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::B256;
 use zkminer_witness::envelope::MethodSet;
@@ -55,6 +60,16 @@ const TAG_RESPONSE_CAP: u64 = 4 << 20;
 pub(crate) const MAX_LAGGING_ATTEMPTS: usize = 2;
 /// The most distinct block hashes one answer's suspect errors are checked for.
 const MAX_HASH_PROBES: usize = 4;
+
+/// One `evm-rpc/v1` source, as a job's capability is served from it.
+pub(crate) struct Source<'a> {
+    /// In failover order.
+    pub endpoints: &'a [Arc<Endpoint>],
+    /// [`crate::broker::pruning_horizon`] of `endpoints`.
+    pub horizon: u64,
+    /// How recent a head must be to be the chain's (the smallest `head_fresh_secs` of `endpoints`).
+    pub head_fresh: Duration,
+}
 
 /// What an answer from one endpoint means.
 pub(crate) enum Attempt<T> {
@@ -78,30 +93,41 @@ pub(crate) enum TooLarge {
     Operator,
 }
 
+/// Two endpoints on one host and port: one node, whatever their aliases.
+fn same_node(a: &Endpoint, b: &Endpoint) -> bool {
+    a.spec.host == b.spec.host && a.spec.port == b.spec.port
+}
+
 /// Sends `body` to the endpoints in order until `accept` takes an answer; returns it and the index
 /// of the endpoint that gave it. `units` are charged to each attempted endpoint's operator budget.
-/// See the module doc for the failover rules and how a failure is classified.
+/// See the module doc for the failover rules and how a failure is classified; `head_fresh` is the
+/// source's (`None`: no freshness probe, for the broker's own head reads).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn failover<T>(
     b: &Broker,
     job: &Job,
     endpoints: &[Arc<Endpoint>],
+    head_fresh: Option<Duration>,
     body: &[u8],
     units: u64,
     cap: u64,
     too_large: TooLarge,
     mut accept: impl FnMut(&[u8]) -> Attempt<T>,
 ) -> Result<(T, usize), Outcome> {
-    let (mut lagging, mut operator, mut own) = (0usize, false, false);
-    // The endpoints that answered that they lack the block or state, by host and port.
-    let mut lagged: Vec<(&str, u16)> = Vec::new();
+    let (mut operator, mut own) = (false, false);
+    // The endpoints that answered that they lack the block or state: one per host and port.
+    let mut lagged: Vec<&Arc<Endpoint>> = Vec::new();
     let fault = |what: &str, ep: &Endpoint| {
         job.note_operator_fault();
         tracing::warn!(job = %job.tag(), endpoint = %ep.alias(), "{what}");
     };
     for (i, ep) in endpoints.iter().enumerate() {
-        if lagging >= MAX_LAGGING_ATTEMPTS {
+        if lagged.len() >= MAX_LAGGING_ATTEMPTS {
             break;
+        }
+        // Another alias of a node that lagged answers the same: the attempt goes to an independent one.
+        if lagged.iter().any(|l| same_node(l, ep)) {
+            continue;
         }
         if !ep.try_spend(units, job.held_lock) {
             operator = true;
@@ -115,8 +141,7 @@ pub(crate) async fn failover<T>(
                 Attempt::Check(t, pins) => match lacks_a_block(b, job, ep, &pins).await {
                     Ok(false) => return Ok((t, i)),
                     Ok(true) => {
-                        lagging += 1;
-                        lagged.push((&ep.spec.host, ep.spec.port));
+                        lagged.push(ep);
                         tracing::info!(job = %job.tag(), endpoint = %ep.alias(), "the node lacks a block the request is pinned to");
                     }
                     Err(e) => {
@@ -125,8 +150,7 @@ pub(crate) async fn failover<T>(
                     }
                 },
                 Attempt::Lagging => {
-                    lagging += 1;
-                    lagged.push((&ep.spec.host, ep.spec.port));
+                    lagged.push(ep);
                     tracing::info!(job = %job.tag(), endpoint = %ep.alias(), "the node lags or lacks the state");
                 }
                 Attempt::Bad(why) => {
@@ -150,8 +174,13 @@ pub(crate) async fn failover<T>(
     }
     let failure = if operator {
         Failure::Operator
-    } else if lagging > 0 && !own {
-        if independent(&lagged) >= 2 {
+    } else if !lagged.is_empty() && !own {
+        // `lagged` holds one endpoint per node.
+        let fresh = match head_fresh {
+            Some(fresh) if lagged.len() < 2 => heads_fresh(b, job, &lagged, fresh).await,
+            _ => false,
+        };
+        if lagged.len() >= 2 || fresh {
             Failure::Unanswerable
         } else {
             Failure::LaggingUnconfirmed
@@ -164,11 +193,48 @@ pub(crate) async fn failover<T>(
 
 /// How many independent endpoints `seen` names: distinct `(host, port)` (two aliases of one URL are
 /// one node).
-fn independent(seen: &[(&str, u16)]) -> usize {
-    let mut v = seen.to_vec();
+fn independent(seen: &[&Arc<Endpoint>]) -> usize {
+    let mut v: Vec<(&str, u16)> = seen
+        .iter()
+        .map(|e| (e.spec.host.as_str(), e.spec.port))
+        .collect();
     v.sort_unstable();
     v.dedup();
     v.len()
+}
+
+/// Whether every endpoint of `eps` (at least one) is at the chain's head: its `latest` block's
+/// timestamp within `fresh` of this host's clock (a head stamped ahead of it counts as fresh). Each
+/// probe is charged one unit of that endpoint's operator budget; one that cannot be spent, fails or
+/// answers no block, or a head older than `fresh`, is a node that may lag.
+async fn heads_fresh(b: &Broker, job: &Job, eps: &[&Arc<Endpoint>], fresh: Duration) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for ep in eps {
+        let ep: &Endpoint = ep;
+        if !ep.try_spend(1, job.held_lock) {
+            return false;
+        }
+        let rpc = RpcClient {
+            ep,
+            held: job.held_lock,
+            ids: &b.ids,
+            wait: &job.wait,
+        };
+        match rpc.latest_timestamp().await {
+            Ok(Some(ts)) if now.saturating_sub(ts) <= fresh.as_secs() => {}
+            Ok(ts) => {
+                tracing::info!(job = %job.tag(), endpoint = %ep.alias(), head_timestamp = ?ts, "the node's head is not fresh: it may lag");
+                return false;
+            }
+            Err(e) => {
+                tracing::info!(job = %job.tag(), endpoint = %ep.alias(), "reading the node's head failed: {}", ep.redact(&e.to_string()));
+                return false;
+            }
+        }
+    }
+    !eps.is_empty()
 }
 
 /// Asks `ep` whether it lacks any block in `pins`: its head against the highest number, and
@@ -238,7 +304,7 @@ async fn latest_of(b: &Broker, job: &Job, ep: &Arc<Endpoint>) -> Option<u64> {
     let codec = &b.hooks.codec;
     let id = b.next_ids(1);
     let body = codec.tag_query(BlockTag::Latest, id);
-    failover(b, job, std::slice::from_ref(ep), &body, 1, TAG_RESPONSE_CAP, TooLarge::Operator, |bytes| {
+    failover(b, job, std::slice::from_ref(ep), None, &body, 1, TAG_RESPONSE_CAP, TooLarge::Operator, |bytes| {
         match codec.parse_tag_answer(bytes, id) {
             Ok(n) => Attempt::Done(n),
             Err(_) => Attempt::Bad("tag answer"),
@@ -254,10 +320,14 @@ pub(crate) async fn serve(
     job: &Arc<Job>,
     chain_id: u64,
     method_set: MethodSet,
-    endpoints: &[Arc<Endpoint>],
-    horizon: u64,
+    source: &Source<'_>,
     request: &[u8],
 ) -> Outcome {
+    let Source {
+        endpoints,
+        horizon,
+        head_fresh,
+    } = *source;
     let codec = &b.hooks.codec;
     let req = match codec.parse(request, method_set) {
         Ok(r) => r,
@@ -296,7 +366,7 @@ pub(crate) async fn serve(
     for tag in wanted {
         let id = b.next_ids(1);
         let body = codec.tag_query(tag, id);
-        let got = failover(b, job, endpoints, &body, 1, TAG_RESPONSE_CAP, TooLarge::Operator, |bytes| {
+        let got = failover(b, job, endpoints, Some(head_fresh), &body, 1, TAG_RESPONSE_CAP, TooLarge::Operator, |bytes| {
             match codec.parse_tag_answer(bytes, id) {
                 Ok(n) => Attempt::Done(n),
                 Err(ResponseError::Lagging) => Attempt::Lagging,
@@ -316,24 +386,31 @@ pub(crate) async fn serve(
     }
     if let Some(n) = highest {
         let mut head = tags[&BlockTag::Latest];
-        let first = &endpoints[latest_from].spec;
-        let mut below: Vec<(&str, u16)> = vec![(&first.host, first.port)];
-        // The first answer may come from a node behind the others: ask one more before refusing.
+        let first = &endpoints[latest_from];
+        let mut below: Vec<&Arc<Endpoint>> = vec![first];
+        // The first answer may come from a node behind the others: ask one more, on another node,
+        // before refusing.
         if n > head {
-            for (i, ep) in endpoints.iter().enumerate().filter(|(i, _)| *i != latest_from).take(MAX_LAGGING_ATTEMPTS - 1) {
+            for (i, ep) in endpoints
+                .iter()
+                .enumerate()
+                .filter(|(i, ep)| *i != latest_from && !same_node(ep, first))
+                .take(MAX_LAGGING_ATTEMPTS - 1)
+            {
                 if let Some(h) = latest_of(b, job, ep).await {
                     tracing::debug!(job = %job.tag(), endpoint = i, head = h, "second head for an explicit block number");
                     head = head.max(h);
                     if h < n {
-                        below.push((&ep.spec.host, ep.spec.port));
+                        below.push(ep);
                     }
                 }
             }
         }
         if n > head {
-            // Above the heads of two independent endpoints: a block that does not exist yet. One
-            // node's head alone may be a node behind the chain.
-            if independent(&below) >= 2 {
+            // Above the heads of two independent endpoints, or of nodes at the chain's head: a
+            // block that does not exist yet. One stale node's head alone may be a node behind the
+            // chain.
+            if independent(&below) >= 2 || heads_fresh(b, job, &below, head_fresh).await {
                 tracing::debug!(job = %job.tag(), number = n, head, "evm-rpc request names a block above the head");
                 return refuse();
             }
@@ -376,7 +453,7 @@ pub(crate) async fn serve(
         };
         let first_id = b.next_ids(misses.len() as u64);
         let body = sub.outgoing(&resolve, first_id);
-        let got = failover(b, job, endpoints, &body, misses.len() as u64, raw_cap, too_large, |bytes| {
+        let got = failover(b, job, endpoints, Some(head_fresh), &body, misses.len() as u64, raw_cap, too_large, |bytes| {
             match sub.parse_answers(bytes, first_id, max_response) {
                 Ok(a) if a.len() == misses.len() => {
                     let pins: Vec<BlockPin> =

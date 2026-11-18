@@ -42,6 +42,7 @@
 //! archive = true
 //! max_proof_age = 100000
 //! method_sets = ["state-read"]
+//! head_fresh_secs = 6                           # a head this recent is at the chain's (default 36)
 //! key_file = "/etc/zkminer-broker/base.key"
 //! # key_header = "x-api-key"                    # ...or sent in this header instead
 //! cidrs = ["198.51.100.0/24"]                   # optional: the role entry (default: below)
@@ -154,6 +155,14 @@ use zkminer_witness::envelope::MethodSet;
 use crate::egress::{NetMode, Prefix, Role};
 
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1 << 20;
+/// The default `max_concurrency` of every endpoint.
+pub const DEFAULT_MAX_CONCURRENCY: u32 = 8;
+/// The default `[artifacts] max_requests_per_sec`.
+pub const DEFAULT_ARTIFACT_REQUESTS_PER_SEC: u32 = 2;
+/// The default `[[evm_rpc]] head_fresh_secs`: three block times of a 12-second chain.
+pub const DEFAULT_HEAD_FRESH_SECS: u64 = 36;
+/// The largest `head_fresh_secs` accepted: an hour-old head is no evidence of a healthy node.
+pub const MAX_HEAD_FRESH_SECS: u64 = 3600;
 pub const MAX_KEY_BYTES: u64 = 4096;
 const MAX_ALIAS_BYTES: usize = 64;
 
@@ -355,6 +364,8 @@ struct EvmRpcFile {
     #[serde(default)]
     max_proof_age: u64,
     method_sets: Vec<String>,
+    #[serde(default = "d_head_fresh")]
+    head_fresh_secs: u64,
     key_file: Option<PathBuf>,
     key_header: Option<String>,
     #[serde(default)]
@@ -438,10 +449,14 @@ fn d_charge() -> u64 {
     30
 }
 fn d_concurrency() -> u32 {
-    8
+    DEFAULT_MAX_CONCURRENCY
+}
+/// Three block times of a 12-second chain (Ethereum, Hemi).
+fn d_head_fresh() -> u64 {
+    DEFAULT_HEAD_FRESH_SECS
 }
 fn d_artifact_rps() -> u32 {
-    2
+    DEFAULT_ARTIFACT_REQUESTS_PER_SEC
 }
 fn d_max_builder_bytes() -> u64 {
     4 << 20
@@ -523,6 +538,10 @@ pub struct EvmRpcEndpoint {
     /// The deepest `head − block` at which it serves `eth_getProof`.
     pub max_proof_age: u64,
     pub method_sets: Vec<MethodSet>,
+    /// How recent its latest block's timestamp must be for the node to count as at the chain's head
+    /// (`head_fresh_secs`, a few of the chain's block times): such a node that lacks a block or state
+    /// shows the request names something not on the chain (`rpc_serve`).
+    pub head_fresh: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -819,12 +838,19 @@ fn validate(f: FileConfig, base: &Path, net_mode: NetMode, keys: Keys) -> Result
             net_mode,
             keys,
         )?;
+        if !(1..=MAX_HEAD_FRESH_SECS).contains(&e.head_fresh_secs) {
+            return invalid(format!(
+                "{}: head_fresh_secs must be within 1..={MAX_HEAD_FRESH_SECS}",
+                e.alias
+            ));
+        }
         evm_rpc.push(EvmRpcEndpoint {
             spec,
             chain_id: e.chain_id,
             archive: e.archive,
             max_proof_age: e.max_proof_age,
             method_sets,
+            head_fresh: Duration::from_secs(e.head_fresh_secs),
         });
     }
 
@@ -1224,6 +1250,7 @@ chain_id = 8453
 archive = true
 max_proof_age = 100000
 method_sets = ["state-read"]
+head_fresh_secs = 6
 key_file = "base.key"
 cidrs = ["198.51.100.0/24"]
 max_requests_per_sec = 50
@@ -1277,6 +1304,19 @@ url_template = "https://mirror.example/artifacts/{{type}}/{{id}}"
         assert!(value.is_sensitive());
         assert_eq!(h.spec.literal, Some("127.0.0.1".parse().unwrap()));
         assert_eq!(h.method_sets, vec![MethodSet::StateRead, MethodSet::StateTrace]);
+        // A head this recent is at the chain's: the entry's own, else three 12-second blocks.
+        assert_eq!(
+            (e.head_fresh, h.head_fresh),
+            (Duration::from_secs(6), Duration::from_secs(36))
+        );
+        let ep = "[[evm_rpc]]\nalias = \"a\"\nurl = \"https://x.example\"\nchain_id = 1\nmethod_sets = [\"state-read\"]\n";
+        for bad in ["0", "3601"] {
+            assert!(err(
+                &minimal(&format!("{ep}head_fresh_secs = {bad}")),
+                dir.path()
+            )
+            .contains("head_fresh_secs"));
+        }
         let a = c.artifacts.as_ref().unwrap();
         assert_eq!((a.chain_id, a.max_builder_bytes, a.spec.max_requests_per_sec), (743111, 4 << 20, Some(2)));
         assert_eq!(a.spec.cidrs, vec![host_prefix("10.0.0.5".parse().unwrap())]);

@@ -269,6 +269,18 @@ impl World {
     /// `job.toml` for `elf` (its image id) built by `wasm` with `params`, bound by `binding` (a
     /// `[binding]` body), encoded into the descriptor file `d.json`; the guest saved as `guest.elf`.
     fn job(&self, elf: &[u8], wasm: &[u8], binding: &str, params: &[u8]) {
+        self.job_with_cycles(elf, wasm, binding, params, 67108864)
+    }
+
+    /// [`World::job`] with `maxGuestCycles` of `max_guest_cycles`.
+    fn job_with_cycles(
+        &self,
+        elf: &[u8],
+        wasm: &[u8],
+        binding: &str,
+        params: &[u8],
+        max_guest_cycles: u64,
+    ) {
         let image_id = risc0_zkvm::compute_image_id(elf).unwrap();
         std::fs::write(
             self.path("job.toml"),
@@ -277,7 +289,7 @@ impl World {
                  [[envelope.sources]]\nclass = \"evm-rpc/v1\"\nchain_id = {ANVIL_CHAIN}\narchive = true\nmethod_set = \"state-read\"\n\
                  max_proof_age = 1000\n[envelope.limits]\nmax_fetches = 8\nmax_fetch_bytes = 4194304\nmax_request_bytes = 65536\n\
                  max_response_bytes = 1048576\nmax_builder_fuel = 5000000000\nmax_builder_memory_bytes = 67108864\n\
-                 max_builder_seconds = 60\nmax_witness_bytes = 1048576\nmax_guest_cycles = 67108864\n",
+                 max_builder_seconds = 60\nmax_witness_bytes = 1048576\nmax_guest_cycles = {max_guest_cycles}\n",
                 hex::encode(image_id.as_bytes()),
                 hex::encode(params)
             ),
@@ -319,6 +331,31 @@ impl World {
         ]);
         let report =
             serde_json::from_slice(&std::fs::read(self.path("report.json")).unwrap_or_default()).unwrap_or(Value::Null);
+        (out, report)
+    }
+
+    /// `zkminer simulate --descriptor d.json` with the job's builder and guest, no attacks, and
+    /// `extra` (no `--po2` unless it says so); the output and the report.
+    fn simulate_with(&self, extra: &[&str]) -> (Output, Value) {
+        let _ = std::fs::remove_file(self.path("report.json"));
+        let mut args = vec![
+            "simulate",
+            "--descriptor",
+            "d.json",
+            "--builder",
+            "builder.wasm",
+            "--elf",
+            "guest.elf",
+            "--cache-dir",
+            "cache",
+            "--out",
+            "report.json",
+        ];
+        args.extend_from_slice(extra);
+        let out = self.run(&args);
+        let report =
+            serde_json::from_slice(&std::fs::read(self.path("report.json")).unwrap_or_default())
+                .unwrap_or(Value::Null);
         (out, report)
     }
 
@@ -502,9 +539,10 @@ fn a_binding_that_leaves_header_words_free_fails() {
     );
 }
 
-/// The hostdep guest's journal follows the `sys_rand` seed (W = 0xA1) and the keccak po2 (W = 0xA4,
-/// the raw permutation's batch status): the reruns under a random seed beside the rule's and under
-/// another keccak po2 catch each, and nothing else is reported dependent.
+/// The hostdep guest's journal follows the keccak po2 (W = 0xA4, the raw permutation's batch
+/// status): the reruns under another keccak po2 catch it, and nothing else is reported dependent.
+/// One that follows the `sys_rand` seed (W = 0xA1) is refused before any attack: it draws from
+/// `sys_rand` (see `a_guest_that_draws_from_sys_rand_is_refused`).
 #[test]
 fn host_inputs_a_prover_controls_are_caught() {
     let _g = serial();
@@ -514,28 +552,147 @@ fn host_inputs_a_prover_controls_are_caught() {
     let anvil = Anvil::start();
     let w = World::new(zkminer(), &anvil, &anvil);
     let echo = sdk_wasm("params-echo", "params_echo.wasm");
-    for (mode, input) in [(0xa1u8, "sys_rand_seed"), (0xa4, "keccak_po2")] {
-        w.job(HOSTDEP_ELF, &echo, "prefix = false\nheader = [\"uint256:0x77\"]", &[mode]);
-        let (out, report) = w.attack(&["--flips", "1", "--max-mutations", "1", "--header-bytes", "32"]);
-        assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
-        let a = &report["adversarial"];
-        let hosts = a["hostInputs"].as_array().unwrap();
-        for h in hosts {
-            assert_eq!(h["dependent"], h["input"] == input, "mode {mode:#x}: {h:#}");
-        }
-        assert!(
-            a["soundnessFailures"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().starts_with(&format!(
-                "host input {}",
-                match input {
-                    "sys_rand_seed" => "SysRandSeed",
-                    _ => "KeccakPo2",
-                }
-            ))),
-            "{a:#}"
-        );
-        assert_eq!(a["verdict"], "fail");
-        assert!(!out.status.success());
+    w.job(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x77\"]",
+        &[0xa4],
+    );
+    let (out, report) = w.attack(&[
+        "--flips",
+        "1",
+        "--max-mutations",
+        "1",
+        "--header-bytes",
+        "32",
+    ]);
+    assert_eq!(
+        report["outcome"],
+        "simulated",
+        "{}\n{report:#}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let a = &report["adversarial"];
+    let hosts = a["hostInputs"].as_array().unwrap();
+    for h in hosts {
+        assert_eq!(h["dependent"], h["input"] == "keccak_po2", "{h:#}");
     }
+    assert!(
+        a["soundnessFailures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f.as_str().unwrap().starts_with("host input KeccakPo2")),
+        "{a:#}"
+    );
+    assert_eq!(a["verdict"], "fail");
+    assert!(!out.status.success());
+
+    w.job(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x77\"]",
+        &[0xa1],
+    );
+    let (out, report) = w.attack(&[
+        "--flips",
+        "1",
+        "--max-mutations",
+        "1",
+        "--header-bytes",
+        "32",
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(report["outcome"], "skipped", "{report:#}");
+    assert_eq!(
+        report["verdict"]["reason"], "GuestUsesSysRand",
+        "{report:#}"
+    );
+}
+
+/// A guest whose honest journal ignores the `sys_rand` seed while its check of `W` follows it
+/// (hostdep 0xA5: one of k items checked, at an index drawn from `sys_rand`). Its journals agree
+/// under every seed, so comparing journals passes it, while a prover who picks the seed proves a
+/// forged `W` (shown with the CPU executor). The execute counts the guest's own `sys_rand` call, and
+/// simulate refuses the job as a miner does: `GuestUsesSysRand` at the execute step, the caller's,
+/// never retried, with and without `--adversarial` (a job the miner skips is not attacked).
+#[test]
+fn a_guest_that_draws_from_sys_rand_is_refused() {
+    let _g = serial();
+    if !delegated("a_guest_that_draws_from_sys_rand_is_refused") {
+        return;
+    }
+    let anvil = Anvil::start();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    let echo = sdk_wasm("params-echo", "params_echo.wasm");
+    let k = 16u8;
+    let v = 1000u64.to_le_bytes();
+    let mut honest = vec![0xa5];
+    honest.extend_from_slice(&v);
+    honest.push(k);
+    for _ in 0..k {
+        honest.extend_from_slice(&v);
+    }
+    w.job(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x78\"]",
+        &honest,
+    );
+    for (name, (out, report)) in [
+        ("simulate", w.simulate()),
+        ("--adversarial", w.attack(&["--header-bytes", "32"])),
+    ] {
+        assert!(
+            !out.status.success(),
+            "{name}: a skipped job exits non-zero"
+        );
+        assert_eq!(report["outcome"], "skipped", "{name}: {report:#}");
+        let v = &report["verdict"];
+        assert_eq!(v["reason"], "GuestUsesSysRand", "{name}: {v:#}");
+        assert_eq!(v["step"], "execute");
+        assert_eq!(
+            (v["blamesCaller"].as_bool(), v["retry"].as_str()),
+            (Some(true), Some("never")),
+            "{v:#}"
+        );
+        assert!(
+            v["detail"]
+                .as_str()
+                .unwrap()
+                .contains("called sys_rand 1 time(s) past its runtime's own draw"),
+            "{v:#}"
+        );
+        assert!(report["adversarial"].is_null(), "{name}: not attacked");
+    }
+
+    // Why: W* claims v' with v' at one index only, and passes under a seed the prover picks.
+    let forged_v = 1_000_000u64.to_le_bytes();
+    let mut forged = vec![0xa5];
+    forged.extend_from_slice(&forged_v);
+    forged.push(k);
+    for i in 0..k {
+        forged.extend_from_slice(if i == 5 { &forged_v } else { &v });
+    }
+    let run = |seed: [u8; 32]| {
+        let mut b = risc0_zkvm::ExecutorEnv::builder();
+        b.write_slice(&forged);
+        b.random_seed(seed);
+        risc0_zkvm::default_executor()
+            .execute(b.build().unwrap(), HOSTDEP_ELF)
+            .ok()
+            .map(|s| s.journal.bytes)
+    };
+    let journal = (0u8..=255)
+        .find_map(|s| run([s; 32]))
+        .expect("a seed the spot check misses");
+    let mut header = [0u8; 32];
+    header[31] = 0x78;
+    assert_eq!(
+        (&journal[..32], &journal[32..]),
+        (&header[..], &forged_v[..]),
+        "the forged statement"
+    );
 }
 
 /// Two providers at different heads: the latest-block builder makes a different W from each, and the
@@ -609,4 +766,70 @@ fn a_guest_built_with_risc0_3_0_is_refused_by_name() {
     let (out, report) = w.simulate();
     assert_eq!(report["outcome"], "simulated", "{}\n{report:#}", String::from_utf8_lossy(&out.stderr));
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A job within `maxGuestCycles` at some sizes only (hostdep 0xA2, 600 keccak permutations, under a
+/// limit of 2,000,000 sized cycles: its last segment pads to 2^20 at the large sizes, so it fits at
+/// po2 18 and 19 and not at 20). Without `--po2` and without any card sizes (no benchmark cache: HOME
+/// is the work directory), simulate judges at po2 20, the size every uncalibrated card proves at, as a
+/// miner with such cards does: skipped, `GuestCyclesAboveLimit`, non-zero exit. `--po2 18` says the
+/// prover's cards prove at 18, where it fits.
+#[test]
+fn without_card_sizes_the_cycle_limit_is_judged_at_the_default_size() {
+    let _g = serial();
+    if !delegated("without_card_sizes_the_cycle_limit_is_judged_at_the_default_size") {
+        return;
+    }
+    let anvil = Anvil::start();
+    let w = World::new(zkminer(), &anvil, &anvil);
+    let echo = sdk_wasm("params-echo", "params_echo.wasm");
+    let mut a2 = vec![0xa2];
+    a2.extend_from_slice(&600u16.to_le_bytes());
+    w.job_with_cycles(
+        HOSTDEP_ELF,
+        &echo,
+        "prefix = false\nheader = [\"uint256:0x77\"]",
+        &a2,
+        2_000_000,
+    );
+    let (out, report) = w.simulate_with(&[]);
+    eprintln!(
+        "{:#}",
+        serde_json::json!({"po2Source": report["po2Source"], "cycleLimit": report["cycleLimit"]})
+    );
+    assert!(
+        !out.status.success(),
+        "a job a default miner skips exits non-zero"
+    );
+    assert_eq!(report["outcome"], "skipped", "{report:#}");
+    assert_eq!(
+        report["verdict"]["reason"], "GuestCyclesAboveLimit",
+        "{report:#}"
+    );
+    assert!(report["po2Source"]
+        .as_str()
+        .unwrap()
+        .starts_with("every job size, judged at po2 20"));
+    let limit = &report["cycleLimit"];
+    assert_eq!(limit["judgedAt"], serde_json::json!([20]));
+    assert!(
+        limit["overAt"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(20)),
+        "{limit:#}"
+    );
+    assert!(
+        !limit["withinAt"].as_array().unwrap().is_empty(),
+        "it fits at some size: {limit:#}"
+    );
+
+    let fits: u64 = limit["withinAt"][0].as_u64().unwrap();
+    let (out, report) = w.simulate_with(&["--po2", &fits.to_string()]);
+    assert_eq!(report["outcome"], "simulated", "{report:#}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

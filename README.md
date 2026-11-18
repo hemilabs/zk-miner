@@ -253,6 +253,13 @@ in its config file, which the miner reads itself — and admits the address with
 them) and the miner's `[dev] private_network`. So a broker an attacker took over still reaches
 only your configured endpoints. See SECURITY.md, "Witness jobs: the broker".
 
+Give each chain two `[[evm_rpc]]` endpoints on independent nodes (distinct host and port) if you
+can. When a builder asks for a block or state an endpoint lacks, two independent endpoints that
+both lack it make the answer final, and so does one whose head is fresh (its latest block stamped
+within `head_fresh_secs`, default 36 s; set a few of the chain's block times): the builder is then
+judged on its own exit. With one endpoint per chain whose head is stale, the lag is unconfirmed and
+the job is retried unblamed (up to 6 times) when its builder gave up or trapped.
+
 | key | default | meaning |
 |---|---|---|
 | `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet and, on a cloud host, your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route). Host bits must be zero. |
@@ -670,9 +677,9 @@ FIELDS without a hash, a range past the journal) does not load anywhere.
 **Simulate a job before submitting it.** `zkminer simulate --descriptor d.json` runs the job through
 the miner's own pre-claim pipeline: the static gates, the builder (from `--builder`, or fetched by
 the broker from the envelope's `hemi-code` locators exactly as a miner fetches it), the sandboxed
-builder and execute at every `--po2` (default `16..=22`; one size, a range or a list), the router's
-binding check, a bundle published to a throwaway retention store under `--cache-dir` (removed at
-the end; it must not be tmpfs), and the claim gate's DA check (the exact fulfil against `[witness]
+builder and execute at every `--po2` (one size, a range or a list), the router's binding check, a
+bundle published to a throwaway retention store under `--cache-dir` (removed at the end; it must
+not be tmpfs), and the claim gate's DA check (the exact fulfil against `[witness]
 fulfil_da_cap_bytes`). The guest ELF is `--elf`, else the ProgramRegistry's. The broker uses your own
 endpoints: `--broker-config` (the broker's TOML; default `[broker] config`), copied into the run's
 work directory with a spool of its own, so a simulation never shares a running miner's. The
@@ -680,7 +687,13 @@ configuration's `[witness]` limits apply, the miner's per-job artifact budget (b
 holds `hemi-code` reads, and `[witness] sandbox_mode = "rootless"` on a host without root; the
 sandbox and broker self-tests must pass first. A miner without `[witness] max_guest_cycles` derives
 its cycle maximum from its cards and proving timeout; give `--max-guest-cycles` to judge the job by
-one (else 2^34 applies, and the check is listed as not done). Run it in a delegated cgroup:
+one (else 2^34 applies, and the check is listed as not done). Without `--po2`, `maxGuestCycles` is
+judged at the sizes this configuration's risc0 cards prove at (its benchmark cache and
+`prover.risc0_job_po2`), else every job size is executed and judged at po2 20, the size every card
+without a calibration or an operator's size proves at (`po2Source` says which). The miner also sizes
+a card by its VRAM, which the benchmark cache does not record: a card under 14 GiB proves at its
+calibrated size, below 20 when 20 failed there, or no job at all uncalibrated. `po2Source` names
+the size each such card would have, and `--po2` judges at it. Run it in a delegated cgroup:
 
 ```bash
 systemd-run --user --scope -q -p Delegate=yes -- \
@@ -702,20 +715,30 @@ prove resources; the builder's availability through its URIs or a mirror with `-
 registry's ELF with `--elf`; a card-derived cycle maximum without `--max-guest-cycles`). The
 `sys_rand` seed is the public rule's, as a miner's (`sysRandRule`), and a journal-prefix job is
 reproduced exactly only with the real `jobId` (the file's `jobId`) and `--prover`. It exits non-zero
-when a miner with this configuration would skip the job. In `--job`/`--stdin` mode a witness job on
+when a miner with this configuration would skip the job: a journal the router's binding check
+refuses included (`BindingMismatch`). A binding the router accepts but that leaves header bytes
+free, or whose header's length is unknown, is reported (`binding.ok`, `binding.warnings`, and a
+line on stderr) with exit 0, since a miner serves it; `--adversarial` fails it. In `--job`/`--stdin` mode a witness job on
 chain is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
 
 **`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
-(default 600; every execute and broker start gets what is left of it and is killed there):
+(default 600; every execute and broker start gets what is left of it and is killed there). It
+checks the binding's coverage, then the host inputs and the providers (a few runs each), then
+spends what is left on the mutations, each execute getting a share of the time left (the time over
+the mutations still to run, and at least four times the unchanged `W`'s execute): one mutation that
+runs away cannot starve the others, and one cut at its share is inconclusive. Every re-execution
+runs under the attack's cycle cap: this host's maximum when one is configured (`--max-guest-cycles`,
+`[witness] max_guest_cycles`), else 4 × the job's `maxGuestCycles` (`attackCycleCap`):
 
 - **the binding's coverage** first: it must pin the whole journal header `[0, H)` with a non-zero
   `expectedJournalHash` (`H` from a scheme-1 `W`, or `--header-bytes`), else the verdict is `fail`.
   A free header word is exploitable only with a consistent change of `W` (another block and its
   header, another `k` and its proofs), which no mutation makes, so the mutations alone would pass it;
 - **mutations of `W`**, each made just before it runs (repeats recognised by their sha256) and
-  re-executed by the same sandboxed worker under this host's cycle maximum, not the job's (the
-  router does not check cycles: a run past `maxGuestCycles` is judged on its journal, and only one
-  stopped at the host's maximum is inconclusive, which under FULL decides nothing): byte flips at `--flips`
+  re-executed by the same sandboxed worker under the attack's cycle cap, not the job's (the router
+  does not check cycles: a run past `maxGuestCycles` is judged on its journal, and only one stopped
+  at the cap, cut at its share of the time, or that ends in an executor panic or a run no proof can
+  verify is inconclusive, which under FULL decides nothing): byte flips at `--flips`
   sampled offsets (default 32; the first and last byte always), truncations, trailing bytes, and
   the drop, duplication and reordering of items in every length-delimited framing `W` parses as
   (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus, first, the
@@ -732,15 +755,27 @@ chain is reported `not_served`: its proven input is the builder's `W`, not its `
   binds no seed, so a prover on other software can answer with anything), two po2s (the first
   `--po2` and the one farthest from it, else the far end of 16..22; one request each) and two keccak
   po2s; any journal change is a dependence on an input the prover controls (a run past the cycle
-  maximum is reported as such, not as a dependence);
+  maximum is reported as such, not as a dependence). These compare journals only, and a guest can
+  check `W` by the seed while its journal ignores it (a spot check at a drawn index passes an honest
+  `W` under every seed, and a forged one under the seed its prover picks). So every execute counts
+  the guest's own `sys_rand` calls (`perPo2[].sysRandDraws`, past the one its runtime makes before
+  `main`): a job whose guest makes any is skipped before any attack (`GuestUsesSysRand`, the
+  caller's, as a miner skips it), and a pair whose run draws is dependent. The count is of calls; a
+  guest that reads its runtime's own draw from memory is not caught by it;
 - **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
   (`--providers a,b`, default the first two serving the job's chain), each alone; different
-  journals that both satisfy the binding are a soundness failure.
+  journals that both satisfy the binding are a soundness failure. So a `pass` needs two `evm-rpc`
+  endpoints for the job's chain in the broker configuration (with fewer the differential is not run,
+  and the verdict is `incomplete`).
 
-`adversarial.verdict` is `pass`, `fail`, or `incomplete` (something not run in time or
-inconclusive); the command exits non-zero unless it is `pass`. A `W` above
-`--adversarial-max-w-bytes` (default 8 MiB) is not attacked (`refused`): the attack runs in this
-process, unsandboxed, and holds `W` and a few copies of it.
+`adversarial.verdict` is `pass`, `fail`, or `incomplete`: something not run in time or
+inconclusive, no mutation run (`--max-mutations 0`), or, unless the binding is FULL (which decides
+every journal), no structured mutations (the job's scheme is not registered, or `W` is not of it:
+the generic ones change bytes, never a consistent `W`). The command exits non-zero unless it is
+`pass`. A `W` above `--adversarial-max-w-bytes` (default 8 MiB) is not attacked (`refused`): the
+attack runs in this process, unsandboxed, and its peak memory grows with `W`: about 4 × `|W|` for
+the generic mutations, and up to about 32 × `|W|` for a scheme-1 `W` of many small trie nodes
+(the decoded proofs it rearranges), so set the bound by the memory you can give it.
 
 **Publish a builder.** `zkminer artifact publish FILE --kind builder|elf --rpc-url URL --chain-id N
 --keystore KEY.json` stores the file on the HemiProve chain as contract code (`hemi-code`): chunks

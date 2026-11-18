@@ -199,7 +199,13 @@ identical, and the bundle records each:
   The miner derives it and passes it to the sandboxed execute; a prove worker derives the same from
   the input it reads. The bundle records the rule (`sys_rand_rule`, the SHA-256 of its domain). No
   proof binds the seed — a prover on other software can answer `sys_rand` with anything — so a
-  journal that follows it depends on a prover-controlled input (§21.1).
+  journal that follows it depends on a prover-controlled input (§21.1). Nor does a journal that
+  ignores it show anything: a guest that spot-checks `W` at an index it draws commits the same
+  journal for an honest `W` under every seed, and a prover who picks the seed passes a forged one.
+  So the execute counts the guest's `sys_rand` calls past the one its runtime makes before `main`
+  (`WitnessExecutePo2::sys_rand_draws`, protocol 16), and the miner skips a job whose guest makes any
+  (`GuestUsesSysRand`, §16). The count is of calls: a guest that reads its runtime's own draw from
+  memory, or replaces risc0's runtime, is not caught by it (§8.2 forbids both all the same).
 - **Other host inputs:** empty environment and arguments (the executor answers `getenv`/`argv` only
   from its own empty maps); the keccak po2 (`RISC0_KECCAK_PO2`, guest-visible through
   `keccak_permute`); the executor build of every worker that may prove the job.
@@ -778,13 +784,18 @@ struct BuilderContextV1 {        // the input, as abi.encode(ctx) with its 0x20 
   answers as lagging or not found is *unanswerable*, which is the builder's question, not the operator's
   failure: a builder must not be able to buy a free retry by asking for a future block or an unknown
   hash (§16) — once **two independent endpoints** (distinct host and port) for that chain answered so,
-  or the block lies deeper below the head than the source's **pruning horizon** (unbounded when an
-  endpoint serving it is `archive`, else the largest `max_proof_age` of its endpoints, at least 128
-  blocks of recent state). With fewer, a node behind the chain answers a valid request exactly so (a
-  block it does not know yet, state it lacks at a recent block), so the run is *source-lagging*: retried
-  with backoff and never counted against the caller (§16). The price is a few retries a builder can
-  cause on a host with one endpoint per chain; a host with two independent endpoints per chain gives it
-  none. The runner writes a marker on its summary pipe once compilation succeeds and before
+  once every endpoint that answered so has a **fresh head** (its latest block stamped within the
+  source's `head_fresh_secs`, a few block times, of now: a node at the chain's head that lacks a block
+  or state shows the request names something not on the chain), or once the block lies deeper below
+  the head than the source's **pruning horizon** (unbounded when an endpoint serving it is `archive`,
+  else the largest `max_proof_age` of its endpoints, at least 128 blocks of recent state). Otherwise
+  (one node, whose head is stale or could not be read) a node behind the chain answers a valid request
+  exactly so (a block it does not know yet, state it lacks at a recent block), so the run is
+  *source-lagging*: retried with backoff and never counted against the caller (§16), but only when the
+  builder then gave up (a non-zero return) or trapped; running out of fuel, memory or the wall clock
+  is its own whatever its fetches met. The price is a few retries a builder can cause on a host with
+  one endpoint per chain while that node is behind; a host with two independent endpoints per chain
+  gives it none. The runner writes a marker on its summary pipe once compilation succeeds and before
   instantiation; a runner error reported after that marker is treated as a builder trap, since a
   builder that escaped wasmtime controls the runner process and could otherwise fake an internal
   error for a free retry.
@@ -1021,8 +1032,10 @@ only *for a configuration*: chain id, archive, served proof age, method sets.
   provider account or key as `chain.rpc_url`, never the same provider from the same egress IP, and
   never the same node process, database or host. zkminer refuses an endpoint whose host equals
   `chain.rpc_url`'s: the broker file's `chain_rpc_host` names that host, the broker refuses every
-  endpoint on it, and the miner refuses to start a broker whose file names another host (developer
-  mode only warns: a local test network runs its chain and endpoints on one host). Different
+  endpoint on it, and the miner refuses to start a broker whose file names another host, which
+  disables witness serving (`PAGE: WITNESS-DISABLED`; developer mode only warns: a local test network
+  runs its chain and endpoints on one host). Both checks compare host names, not the addresses they
+  resolve to: an endpoint under another name for the same node is not caught. Different
   providers may share the host's IP. If the miner's own Hemi node is its
   only Hemi node, a Hemi-chain class is not provisioned.
 - **Operator nodes reachable by the broker** must have globally routable addresses (a node on
@@ -1076,12 +1089,15 @@ only *for a configuration*: chain id, archive, served proof age, method sets.
   weighted cost units; exhausting an operator budget is status 2, so status 3 always means the job's
   own limits.
 - **Retries:** transport errors and 429 → failover to another endpoint; lagging-node errors ("header
-  not found", "missing trie node") → retry on another endpoint, at most two; execution errors (a
-  reverted call) are answers. When every endpoint asked lacks the block or state, the fetch is status 2
-  and final (*unanswerable*) only if two independent endpoints agreed or the block is beyond the
-  pruning horizon; otherwise it is *source-lagging* (§9.2). An explicit block number above the head is
-  refused (status 1) once two independent endpoints report heads below it; above one node's head only,
-  it is status 2, source-lagging.
+  not found", "missing trie node") → retry on another endpoint on another host or port (an alias of a
+  node that lagged is skipped: it would answer the same), at most two; execution errors (a reverted
+  call) are answers. When every endpoint asked lacks the block or state, the fetch is status 2 and
+  final (*unanswerable*) if two independent endpoints agreed, if every one that did has a fresh head
+  (its latest block stamped within `head_fresh_secs` of now; each probe is one operator-budget unit),
+  or if the block is beyond the pruning horizon; otherwise it is *source-lagging* (§9.2). An explicit
+  block number above the head is refused (status 1) once two independent endpoints, or every endpoint
+  asked with a fresh head, report heads below it; above one stale node's head only, it is status 2,
+  source-lagging.
 - **Keys:** key-bearing endpoints get no redirects, no Referer, no proxy; endpoints are logged by
   operator alias, errors with the URL stripped.
 
@@ -1722,7 +1738,7 @@ Witness serving stays disabled in code until the steps of its phase are in place
 | Static gate | envelope malformed or out of range; unsupported type, adapter or binding; submission form; capability not provisioned; limits above maxima; not claimable; not admitted | skip | none |
 | Artifact or ELF | per §13.4 / today's ELF rules | skip | none |
 | Builder | trap, fuel, memory, wall clock, non-zero return, unknown import, fetch denied or exhausted | skip | none |
-| Guest | fails; cycles above the limit; journals differ across po2 | skip | none |
+| Guest | fails; cycles above the limit; journals differ across po2; draws from `sys_rand` | skip | none |
 | Claim gate | journal cap, binding, DA size, gas, reservation, deadline margin, prove resources | skip | none |
 | After a lock — the job | anything the submitter does through the job | **nothing** (§5.5) | none |
 | After a lock — blockspace | DA stall fill; blockspace bought past the deadline | residual shared with inline jobs | release penalty or slash |
@@ -1738,9 +1754,10 @@ Witness serving stays disabled in code until the steps of its phase are in place
 | Builder artifact | per source (§13.4); permanent for the job once every source is bad |
 | Builder deterministic failure (trap, fuel, memory, non-zero return) with no status-2 fetch | permanent for the job |
 | Builder transient (an operator-side fetch failure, or the wall clock expiring while a fetch waited on the operator side; not an unanswerable request) | one jittered retry on other endpoints, then permanent; never counted against the caller |
-| Builder source-lagging (a fetch the job's source answered as lacking the block or state, or naming a block above its head, with fewer than two independent endpoints of that chain agreeing and the block within the pruning horizon, §9.2) | retried with backoff (6 attempts, about 16 minutes), then permanent; never counted against the caller |
+| Builder source-lagging (a fetch the job's source answered as lacking the block or state, or naming a block above its head, with fewer than two independent endpoints of that chain agreeing, the one that did behind the chain's head or unreadable, and the block within the pruning horizon, §9.2; then a non-zero return or a trap — never fuel, memory or the wall clock) | retried with backoff (6 attempts, about 16 minutes), then permanent; never counted against the caller |
 | Guest failure or binding mismatch | one jittered rebuild on other endpoints (a stale node can cause it), then permanent |
 | Journals differ across po2 | permanent |
+| The guest calls `sys_rand` past its runtime's own draw (`GuestUsesSysRand`, §5.4) | permanent; counted against the caller |
 | Operator-side (endpoint errors, 429s, operator budget exhaustion, artifact endpoint errors) | never counted against the caller; retried |
 | Post-lock witness failure | the job gets a verdict that lasts until it is terminal; tallies per caller and per (device, failure class) are persisted for 7 days from the latest; a failure counts against the caller only when an attempt of its guest ran on a device not quarantined then; a caller with 3 is not admitted; a device with failures of one class from ≥ 2 distinct callers is quarantined from new witness locks until they age out (`PAGE: WITNESS-DEVICE-QUARANTINED`), while locks already held keep proving, on another card when one can; every release of a witness lock (failure, the recovery room rule, shutdown) records the job's verdict; never feeds zkminer's host-wide stop on new programs; only same-device failures across ≥ 2 callers trigger a host-wide hold |
 | Measure workers busy (the image id cannot be derived now) | deferred; never final; never counted against the caller |
@@ -1760,10 +1777,12 @@ with a throwaway retention store. It prints one JSON report:
 - fuel, fetches, bytes, the builder's peak memory and `|W|`;
 - cycles in the `maxGuestCycles` unit and the journal per po2, judged against `maxGuestCycles` as a
   miner judges the po2s it may use (§7.1): by default at the sizes this configuration's cards prove at
-  (its benchmark cache and `prover.risc0_job_po2`); when it names none, at every job po2, each on its
-  own, so a job over the limit at some sizes only is reported with them (`cycleLimit`) and not
-  skipped, since whether a miner serves it depends on the segment size its cards prove at; `--po2`
-  names the sizes to judge at (`--po2 16..22`: every one);
+  (its benchmark cache and `prover.risc0_job_po2`); when it names none, every job po2 is executed,
+  each on its own and reported (`cycleLimit`), and the job is judged at po2 20, the size every card
+  without a calibration or an operator's size proves at; `--po2` names the sizes to judge at (`--po2
+  16..22`: every one). The benchmark cache does not record a card's VRAM, by which the miner sizes a
+  card under 14 GiB below 20 (or gives it no job): such a card is judged as a larger one would be,
+  and the report's `po2Source` names the size it would have;
 - the pinned bytes and the binding's mutation check;
 - the estimated fulfil DA size (from `GasPriceOracle`, else an upper bound) and this host's
   admission parameters;
@@ -2007,7 +2026,7 @@ key. The rows marked *(broker file)* below are keys of that file.
 | `cidrs` per endpoint, `[egress] deny_cidrs`, `[dns] servers` *(broker file)* | `[]` | Explicit operator endpoint ranges (needed for local or LAN nodes); extra denied ranges; the broker's resolvers |
 | `[budget] inflight_bytes`, `held_lock_share` *(broker file)* | 256 MiB, 0.25 | Global in-flight byte budget and the share reserved for held-lock work |
 | `chain_rpc_host` *(broker file)* | required | The host of the miner's `[chain] rpc_url` (§11.1): the broker refuses endpoints on it, and the miner refuses to start a broker whose file names another host (developer mode: a warning) |
-| `[[evm_rpc]]` *(broker file)* | — | Per endpoint: `alias`, `url`, `chain_id`, `archive`, `max_proof_age`, `method_sets`, rates, key file |
+| `[[evm_rpc]]` *(broker file)* | — | Per endpoint: `alias`, `url`, `chain_id`, `archive`, `max_proof_age`, `method_sets`, `head_fresh_secs` (36: a head this recent is the chain's, §11.2), rates, key file |
 | `[[blob_mirror]]` *(broker file)* | — | Mirror URL templates (`{sha256}`) |
 | `[chain] preclaim_read_share` | 0.25 | Share of the chain limiter for pre-claim reads |
 | `[dev] private_network` | `false` | Developer setting: lets job-influenced connections (ELF downloads, builder fetches, artifact reads, operator endpoints) reach non-public addresses. For local test networks only; needs `[dev] chain_id`; refused on Hemi mainnet; the miner passes it to the broker it launches (the broker file has no such key) |
@@ -2091,13 +2110,21 @@ provider units, retention bytes.
 
    Each mutation must fail in the guest, give a byte-identical journal, or change bytes the binding
    pins (the router refuses it). A changed journal that still satisfies the binding is reported as a
-   soundness failure naming the mutation. Each mutation runs under this host's cycle maximum, not
-   the job's `maxGuestCycles` (the router does not check cycles); a run stopped at the host maximum
-   is inconclusive (under FULL it decides nothing). Differential runs go against two providers, each
-   alone in its own broker; different journals that both satisfy the binding are a soundness
-   failure. Re-execution runs under two `sys_rand` seeds (the public rule's and a fresh random one), two po2s (each in a request of its own, the
+   soundness failure naming the mutation. Each mutation runs under the attack's cycle cap (this
+   host's configured maximum, else 4 × the job's `maxGuestCycles`), not `maxGuestCycles` itself (the
+   router does not check cycles), and within a share of the time left; a run stopped at the cap or
+   cut at its share, an executor panic and a run no proof can verify are inconclusive (under FULL
+   they decide nothing). A sweep that ran no mutation, or (unless the binding is FULL) none of a
+   registered scheme's structured ones, is `incomplete`. Differential runs go against two providers,
+   each alone in its own broker, so a `pass` needs two `evm-rpc` endpoints for the job's chain;
+   different journals that both satisfy the binding are a soundness failure. The host-input checks
+   and the differential run before the mutations, which share what time is left. Re-execution runs under two `sys_rand` seeds (the public rule's and a fresh random one), two po2s (each in a request of its own, the
    second from `--po2`, a cycle cap reported as such) and two keccak po2s, and any journal change is
-   reported as a dependence on a prover-controlled host input. All of this runs within a time bound
+   reported as a dependence on a prover-controlled host input. These checks compare journals only,
+   which cannot show a check of `W` that follows the seed while the journal does not (a spot check
+   at a drawn index); that is caught by the execute's count of the guest's `sys_rand` calls (§5.4),
+   which skips such a job before any attack and marks a host-input pair dependent wherever a run
+   draws. All of this runs within a time bound
    and writes a JSON report whose verdict is `pass`, `fail` or `incomplete`. Every execute and
    broker start gets what is left of the time bound and is killed there. A stale-proof swap is not
    made: a scheme-1 `W` names no keys to fetch. The last tool is `zkminer artifact publish`.

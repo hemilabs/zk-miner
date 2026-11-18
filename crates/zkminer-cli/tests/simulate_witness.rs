@@ -423,6 +423,65 @@ fn a_descriptor_job_runs_the_miners_pipeline_and_survives_the_attacks() {
     assert_eq!(a["differential"]["runs"][1]["alias"], "anvil-b");
 }
 
+/// The correctness review's PoC: no configured cycle maximum, and flipping n's high byte makes
+/// billions of iterations. Under 2^34 that one mutation took the whole bound (the host inputs and
+/// most mutations not run: `incomplete`). Now the host inputs and the providers run first, the
+/// attack's cycle cap is 4 × maxGuestCycles, and each mutation gets a share of the time left: the
+/// runaway is cut at its share or the cap, inconclusive (deciding nothing under FULL), and the rest
+/// of the attack runs.
+#[test]
+fn a_runaway_mutation_cannot_starve_the_attack() {
+    let _g = serial();
+    if unavailable("a_runaway_mutation_cannot_starve_the_attack") {
+        return;
+    }
+    let env = Env::new();
+    let d = env.descriptor("runaway", 10, &full_binding(10), &[], "");
+    let wasm = env.path("echo.wasm");
+    let (out, r) = env.simulate(
+        &d,
+        &[
+            "--builder",
+            wasm.to_str().unwrap(),
+            "--po2",
+            "20",
+            "--adversarial",
+            "--flips",
+            "8",
+            "--adversarial-secs",
+            "120",
+        ],
+    );
+    let a = &r["adversarial"];
+    assert_eq!(a["attackCycleCap"], (4u64 << 24).to_string(), "{a:#}");
+    assert!(a["attackCycleCapSource"]
+        .as_str()
+        .unwrap()
+        .starts_with("4 × the job's maxGuestCycles"));
+    assert!(
+        a["hostInputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["ran"] == true),
+        "{:#}",
+        a["hostInputs"]
+    );
+    assert_eq!(a["counts"]["notRun"], 0, "{:#}", a["counts"]);
+    assert!(
+        a["counts"]["inconclusive"].as_u64().unwrap() >= 1,
+        "the runaway flip: {:#}",
+        a["mutations"]
+    );
+    assert_eq!(a["differential"]["journalSame"], true);
+    assert_eq!(a["verdict"], "pass", "{a:#}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn a_none_bound_job_fails_the_attack_and_names_the_mutation() {
     let _g = serial();
@@ -492,9 +551,9 @@ fn a_job_the_miner_would_skip_reports_its_verdict() {
 }
 
 /// maxGuestCycles is judged over the po2s the prover may use (§7.1): a job over it at some segment
-/// sizes only is served by a miner whose cards prove at the others. Without card sizes the verdict
-/// names the sizes over it and says it depends on them; `--po2` and this configuration's card sizes
-/// judge as such a miner does.
+/// sizes only is served by a miner whose cards prove at the others. Without card sizes every size is
+/// executed and reported, and the job is judged at po2 20, the size every uncalibrated card proves
+/// at; `--po2` and this configuration's card sizes judge as such a miner does.
 #[test]
 fn a_cycle_limit_met_at_some_sizes_only_is_judged_at_the_provers_sizes() {
     let _g = serial();
@@ -546,16 +605,15 @@ fn a_cycle_limit_met_at_some_sizes_only_is_judged_at_the_provers_sizes() {
     let d = env.descriptor_capped("capped", n, &full_binding(n), &[], "", cap);
 
     // No card sizes known (no benchmark cache under this HOME, no prover.risc0_job_po2): every size
-    // runs, each judged on its own, and the job is servable at the sizes within the cap.
+    // runs and is reported, and the job is judged at po2 20, as a miner whose cards have no
+    // calibrated or configured size judges it.
     let (out, r) = env.simulate(&d, &["--builder", &builder]);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(out.status.success(), "{stderr}\n{r:#}");
-    assert_eq!(r["outcome"], "simulated");
     assert!(
         r["po2Source"]
             .as_str()
             .unwrap()
-            .starts_with("every job size"),
+            .starts_with("every job size, judged at po2 20"),
         "{}",
         r["po2Source"]
     );
@@ -569,20 +627,29 @@ fn a_cycle_limit_met_at_some_sizes_only_is_judged_at_the_provers_sizes() {
     };
     assert_eq!(list(&c["overAt"]), over, "{c:#}");
     assert_eq!(list(&c["withinAt"]), within, "{c:#}");
-    assert!(list(&c["judgedAt"]).is_empty());
+    assert_eq!(list(&c["judgedAt"]), vec![20]);
     assert_eq!(c["maxGuestCycles"], cap.to_string());
-    assert!(stderr.contains("depends on the segment size"), "{stderr}");
-    assert_eq!(
-        list(&Value::Array(
-            r["perPo2"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|p| p["po2"].clone())
-                .collect()
-        )),
-        within
-    );
+    if within.contains(&20) {
+        assert!(out.status.success(), "{stderr}\n{r:#}");
+        assert_eq!(r["outcome"], "simulated");
+        assert!(stderr.contains("depends on the segment size"), "{stderr}");
+        assert_eq!(
+            list(&Value::Array(
+                r["perPo2"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["po2"].clone())
+                    .collect()
+            )),
+            within
+        );
+    } else {
+        assert!(!out.status.success(), "{r:#}");
+        assert_eq!(r["outcome"], "skipped");
+        assert_eq!(r["verdict"]["reason"], "GuestCyclesAboveLimit");
+        assert!(stderr.contains("a miner proving at po2 20"), "{stderr}");
+    }
 
     // Every size, asked explicitly: judged at each, as a miner with a card at each would.
     let (out, r) = env.simulate(&d, &["--builder", &builder, "--po2", "16..22"]);

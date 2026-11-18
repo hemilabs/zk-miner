@@ -31,16 +31,20 @@
 //!
 //! **`--adversarial`** (see `zkminer_witness_host::adversarial`): first the binding's coverage, which
 //! must pin the whole journal header `[0, H)` with a non-zero `expectedJournalHash` (`H` from a
-//! scheme-1 `W`'s word count, or `--header-bytes`), else the verdict is `fail`; then the generic
-//! mutations of `W` and the job's scheme's own (by the scheme id in the journal header, or
-//! `--scheme`), each re-executed under this host's cycle maximum; re-execution under two `sys_rand`
-//! seeds (the public rule's, which every run uses, and a random one), two po2s and two keccak po2s;
-//! and a differential run of the whole pipeline against two `evm-rpc` providers of the broker
-//! configuration (`--providers`, default the first two serving the job's chain), each from a broker
-//! configuration holding only that provider. All within
+//! scheme-1 `W`'s word count, or `--header-bytes`), else the verdict is `fail`; then re-execution
+//! under two `sys_rand` seeds (the public rule's, which every run uses, and a random one), two po2s
+//! and two keccak po2s; a differential run of the whole pipeline against two `evm-rpc` providers of
+//! the broker configuration (`--providers`, default the first two serving the job's chain), each
+//! from a broker configuration holding only that provider; and last the job's scheme's mutations of
+//! `W` (by the scheme id in the journal header, or `--scheme`) and the generic ones, each with a
+//! share of the time left. Every re-execution runs under the attack's cycle cap: this host's
+//! configured maximum, else [`ATTACK_CYCLE_MULTIPLE`] × the job's `maxGuestCycles`. All within
 //! `--adversarial-secs`, every execute and broker start bounded by what is left of it; anything not
-//! run is reported, and makes the verdict `incomplete`. A `W` above `--adversarial-max-w-bytes` is
-//! refused: the mutations are made one at a time, but this process still holds `W` and a few copies.
+//! run, a sweep that ran no mutation, and (unless the binding is FULL) one without structured
+//! mutations make the verdict `incomplete`. A `W` above `--adversarial-max-w-bytes` is refused: the
+//! mutations are made one at a time, but this process holds `W`, one changed `W` and what making it
+//! takes: about 4 × `|W|` for the generic mutations, up to about 32 × `|W|` for a scheme-1 `W` of many
+//! small trie nodes (its decoded proofs).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -84,6 +88,13 @@ use super::witness_tools::{check_binding, BindingReport, CheckInput, DescriptorF
 
 /// The default `--adversarial-max-w-bytes`.
 pub const DEFAULT_ADVERSARIAL_MAX_W_BYTES: u64 = 8 << 20;
+/// Without a configured cycle maximum, the attack's cycle cap is this multiple of the job's
+/// `maxGuestCycles`.
+pub const ATTACK_CYCLE_MULTIPLE: u64 = 4;
+/// A mutation's execute gets at least this many times the unchanged `W`'s execute at one po2...
+const MUTATION_FLOOR_RUNS: u32 = 4;
+/// ...and at least this long (a worker's start).
+const MUTATION_FLOOR_MIN: Duration = Duration::from_secs(5);
 
 /// The witness report's schema version.
 pub const WITNESS_REPORT_SCHEMA: u32 = 1;
@@ -204,6 +215,9 @@ pub struct Po2Report {
     pub cycles: String,
     pub segment_bytes: u64,
     pub peak_host_bytes: u64,
+    /// The guest's `sys_rand` calls past its runtime's own draw (any is refused: no proof binds the
+    /// seed); `null` when no call was seen at all.
+    pub sys_rand_draws: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,6 +384,11 @@ pub struct AdversarialReport {
     pub refused: Option<String>,
     /// The binding's coverage of the journal header, checked first.
     pub binding_coverage: CoverageReport,
+    /// The sized-cycle cap every re-execution runs under (a decimal string), and where it came from:
+    /// this host's maximum when one is configured, else a bounded multiple of the job's
+    /// `maxGuestCycles`. Past it a run is inconclusive.
+    pub attack_cycle_cap: String,
+    pub attack_cycle_cap_source: String,
     pub budget_secs: u64,
     pub elapsed_secs: f64,
     pub run_seed: String,
@@ -515,6 +534,9 @@ struct SimHost {
     store: Arc<Store>,
     /// This run's `maxGuestCycles` maximum (see [`CyclesReport::host_max_source`]).
     max_guest_cycles: u64,
+    /// A running miner holds `~/.zkminer/miner.lock`: every broker of this run uses half of each
+    /// endpoint's rates and concurrency, so the two share the operator's endpoints.
+    beside_a_miner: bool,
 }
 
 impl Drop for SimHost {
@@ -598,6 +620,13 @@ impl SimHost {
             },
         )
         .map_err(|e| anyhow::anyhow!("opening the throwaway retention store: {e}"))?;
+        let beside_a_miner = miner_running();
+        if beside_a_miner {
+            tracing::warn!(
+                "simulate: a running miner holds ~/.zkminer/miner.lock: this simulation's broker uses half of each \
+                 endpoint's configured rates and concurrency, which it shares with the miner's"
+            );
+        }
         Ok(SimHost {
             spawner,
             root,
@@ -609,16 +638,33 @@ impl SimHost {
             work,
             store: Arc::new(store),
             max_guest_cycles: host_max_guest_cycles(config, opts).0,
+            beside_a_miner,
         })
     }
 
     /// `broker_config` as this run's own, written into the work directory: `spool_dir` moved there
     /// (a simulation never shares a running miner's spool, its quota or its held-lock reserve), and
     /// with `alias` only that `[[evm_rpc]]` entry (a differential run's provider).
-    fn own_broker_config(&self, broker_config: &toml::Value, name: &str, alias: Option<&str>) -> Result<PathBuf> {
+    fn own_broker_config(
+        &self,
+        broker_config: &BrokerToml,
+        name: &str,
+        alias: Option<&str>,
+    ) -> Result<PathBuf> {
         let dir = self.work.join(name);
-        std::fs::create_dir_all(dir.join("spool")).with_context(|| format!("creating {}", dir.display()))?;
-        let text = broker_config_for(broker_config, alias, &dir.join("spool"))?;
+        std::fs::create_dir_all(dir.join("spool"))
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let mut text = broker_config_for(
+            &broker_config.value,
+            &broker_config.dir,
+            alias,
+            &dir.join("spool"),
+        )?;
+        if self.beside_a_miner {
+            let mut v: toml::Value = toml::from_str(&text)?;
+            halve_endpoint_rates(&mut v);
+            text = toml::to_string(&v)?;
+        }
         let path = dir.join("broker.toml");
         write_private(&path, &text)?;
         Ok(path)
@@ -776,10 +822,39 @@ fn pick_providers(broker_config: &toml::Value, chain: Option<u64>, asked: Option
 }
 
 /// `broker_config` with a spool directory of its own and, given `alias`, only that `[[evm_rpc]]`
-/// entry.
-fn broker_config_for(broker_config: &toml::Value, alias: Option<&str>, spool: &Path) -> Result<String> {
+/// entry. The copy is written elsewhere, so every relative `key_file` (which the broker reads from
+/// the configuration's own directory) is made absolute against `dir`, the original's directory.
+fn broker_config_for(
+    broker_config: &toml::Value,
+    dir: &Path,
+    alias: Option<&str>,
+    spool: &Path,
+) -> Result<String> {
     let mut v = broker_config.clone();
     let t = v.as_table_mut().context("the broker configuration is not a table")?;
+    let absolute = |entry: &mut toml::Value| {
+        if let Some(k) = entry.get_mut("key_file") {
+            if let Some(p) = k.as_str().map(Path::new).filter(|p| p.is_relative()) {
+                *k = toml::Value::String(dir.join(p).display().to_string());
+            }
+        }
+    };
+    for table in ["evm_rpc", "blob_mirror"] {
+        for entry in t
+            .get_mut(table)
+            .and_then(|e| e.as_array_mut())
+            .into_iter()
+            .flatten()
+        {
+            absolute(entry);
+        }
+    }
+    if let Some(artifacts) = t.get_mut("artifacts") {
+        absolute(artifacts);
+        if let Some(mirror) = artifacts.get_mut("mirror") {
+            absolute(mirror);
+        }
+    }
     if let Some(alias) = alias {
         let kept: Vec<toml::Value> = t
             .get("evm_rpc")
@@ -790,6 +865,69 @@ fn broker_config_for(broker_config: &toml::Value, alias: Option<&str>, spool: &P
     }
     t.insert("spool_dir".into(), toml::Value::String(spool.display().to_string()));
     Ok(toml::to_string(&v)?)
+}
+
+/// Whether a running miner holds `~/.zkminer/miner.lock` (never created here).
+fn miner_running() -> bool {
+    dirs::home_dir().is_some_and(|h| lock_held(&h.join(".zkminer").join("miner.lock")))
+}
+
+/// Whether another open file holds an exclusive `flock` on `path` (a missing file is not held).
+fn lock_held(path: &Path) -> bool {
+    let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) else {
+        return false;
+    };
+    matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Halves every endpoint's rates and concurrency in a broker configuration: `max_concurrency` (from
+/// its default when unset), `max_requests_per_sec` (the artifact reader's from its default) and
+/// `max_units_per_minute`, each at least 1. An endpoint with no rate configured stays unpaced.
+fn halve_endpoint_rates(v: &mut toml::Value) {
+    use zkminer_witness_broker::config::{
+        DEFAULT_ARTIFACT_REQUESTS_PER_SEC, DEFAULT_MAX_CONCURRENCY,
+    };
+    let halve = |e: &mut toml::Value, key: &str, default: Option<u32>| {
+        if let Some(t) = e.as_table_mut() {
+            if let Some(n) = t
+                .get(key)
+                .and_then(|n| n.as_integer())
+                .or(default.map(i64::from))
+            {
+                t.insert(key.into(), toml::Value::Integer((n / 2).max(1)));
+            }
+        }
+    };
+    let Some(t) = v.as_table_mut() else { return };
+    for e in t
+        .get_mut("evm_rpc")
+        .and_then(|e| e.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        halve(e, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+        halve(e, "max_requests_per_sec", None);
+        halve(e, "max_units_per_minute", None);
+    }
+    for e in t
+        .get_mut("blob_mirror")
+        .and_then(|e| e.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        halve(e, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+    }
+    if let Some(a) = t.get_mut("artifacts") {
+        halve(a, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+        halve(
+            a,
+            "max_requests_per_sec",
+            Some(DEFAULT_ARTIFACT_REQUESTS_PER_SEC),
+        );
+        if let Some(m) = a.get_mut("mirror") {
+            halve(m, "max_concurrency", Some(DEFAULT_MAX_CONCURRENCY));
+        }
+    }
 }
 
 /// Writes `text` to a new file only this user can read (a broker configuration may carry endpoint
@@ -806,10 +944,22 @@ fn write_private(path: &Path, text: &str) -> Result<()> {
     f.write_all(text.as_bytes()).with_context(|| format!("writing {}", path.display()))
 }
 
+/// The broker configuration file, parsed, and the directory its relative `key_file`s are read from.
+struct BrokerToml {
+    value: toml::Value,
+    /// The file's directory, absolute.
+    dir: PathBuf,
+}
+
 /// The broker configuration file, parsed.
-fn read_broker_config(path: &Path) -> Result<toml::Value> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("{} is not a broker configuration", path.display()))
+fn read_broker_config(path: &Path) -> Result<BrokerToml> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value = toml::from_str(&text)
+        .with_context(|| format!("{} is not a broker configuration", path.display()))?;
+    let file = std::path::absolute(path).with_context(|| format!("{}", path.display()))?;
+    let dir = file.parent().unwrap_or(Path::new("/")).to_path_buf();
+    Ok(BrokerToml { value, dir })
 }
 
 /// This run's `maxGuestCycles` maximum and where it came from.
@@ -826,33 +976,43 @@ fn host_max_guest_cycles(config: &ZkMinerConfig, opts: &WitnessSimOptions) -> (u
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Po2Plan {
     pub po2s: Vec<u8>,
-    /// Over at one of these, the job is skipped. Empty: no prover's sizes are known, and only a job
-    /// over at every size is.
+    /// Over at one of these, the job is skipped (as it is when over at every size executed).
     pub required: Vec<u8>,
     pub source: String,
+    /// Who proves at `required`, in the report's words.
+    pub provers: &'static str,
 }
 
 /// `--po2`'s sizes, judged at every one; else the sizes this configuration's cards prove at
-/// ([`configured_card_po2s`]); else every job size, each judged on its own.
+/// ([`configured_card_po2s`]); else every job size, judged at [`RISC0_DEFAULT_JOB_PO2`]: the size
+/// every card without a calibration or an operator's size proves at, so a miner that names no sizes
+/// skips a job over the limit there.
+///
+/// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
 pub fn po2_plan(asked: Option<&[u8]>, cards: Option<(Vec<u8>, String)>) -> Po2Plan {
-    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    use zkminer_prover_protocol::{RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     match (asked, cards) {
         (Some(a), _) => Po2Plan {
             po2s: a.to_vec(),
             required: a.to_vec(),
             source: "--po2".into(),
+            provers: "--po2 says the prover",
         },
         (None, Some((c, source))) => Po2Plan {
             po2s: c.clone(),
             required: c,
             source,
+            provers: "this configuration",
         },
         (None, None) => Po2Plan {
             po2s: (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).collect(),
-            required: Vec::new(),
-            source:
-                "every job size: this configuration names no card sizes (--po2 gives a prover's)"
-                    .into(),
+            required: vec![RISC0_DEFAULT_JOB_PO2],
+            source: format!(
+                "every job size, judged at po2 {RISC0_DEFAULT_JOB_PO2}: this configuration names no card sizes, and \
+                 every card without a calibration or an operator's size proves at {RISC0_DEFAULT_JOB_PO2} (--po2 \
+                 gives a prover's sizes)"
+            ),
+            provers: "a miner whose cards have no calibrated or configured size",
         },
     }
 }
@@ -861,15 +1021,22 @@ pub fn po2_plan(asked: Option<&[u8]>, cards: Option<(Vec<u8>, String)>) -> Po2Pl
 /// (`benchmark::risc0_job_po2`): each risc0 row of `suite` (the benchmark cache, while this
 /// hardware still matches it) at its `prover.risc0_job_po2` size, else its calibration or the
 /// default size; and each other card `prover.risc0_job_po2` names. `None` when neither names a card.
-/// The cards' VRAM is not read here, so a card the miner gives no jobs (under 14 GiB, uncalibrated)
-/// counts at the default size; the source names every card and its size.
+///
+/// The miner also sizes a card by its VRAM, which the benchmark cache does not record and this does
+/// not read: a card under 14 GiB proves at its calibrated size (below the default when the default
+/// failed there), or no job at all uncalibrated. Such a row counts at the size a card of 14 GiB or
+/// more would prove at, and the source names, card by card, the size it would have under 14 GiB
+/// wherever that differs, so a reader with a smaller card knows to give its size with `--po2`.
 pub fn configured_card_po2s(
     config: &ZkMinerConfig,
     suite: Option<&zkminer_prover::benchmark::BenchmarkSuite>,
 ) -> Option<(Vec<u8>, String)> {
+    use zkminer_prover::benchmark::{risc0_job_po2, RISC0_JOB_MIN_VRAM_BYTES};
     use zkminer_prover_protocol::{BACKEND_RISC0, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let overrides = &config.prover.risc0_job_po2;
     let mut cards: Vec<(String, u8)> = Vec::new();
+    // Cards whose size would differ under 14 GiB of VRAM: (device, that size, None for no jobs).
+    let mut small: Vec<(String, Option<u8>)> = Vec::new();
     let mut from = Vec::new();
     for row in suite
         .iter()
@@ -877,9 +1044,14 @@ pub fn configured_card_po2s(
         .filter(|d| d.prover_backend == BACKEND_RISC0)
     {
         let over = overrides.get(&row.device_id).copied();
-        if let Some(po2) = zkminer_prover::benchmark::risc0_job_po2(over, Some(row), None) {
+        if let Some(po2) = risc0_job_po2(over, Some(row), None) {
             if !cards.iter().any(|(d, _)| *d == row.device_id) {
                 cards.push((row.device_id.clone(), po2));
+                // A CPU slot has no VRAM: the miner sizes it as one of unknown VRAM.
+                let under = risc0_job_po2(over, Some(row), Some(RISC0_JOB_MIN_VRAM_BYTES - 1));
+                if row.device_id != "cpu" && under != Some(po2) {
+                    small.push((row.device_id.clone(), under));
+                }
             }
         }
     }
@@ -906,13 +1078,24 @@ pub fn configured_card_po2s(
     po2s.dedup();
     let list = cards
         .iter()
-        .map(|(d, p)| format!("{d} at po2 {p}"))
+        .map(|(d, p)| match small.iter().find(|(s, _)| s == d) {
+            Some((_, Some(q))) => format!("{d} at po2 {p} ({q} if it has under 14 GiB of VRAM)"),
+            Some((_, None)) => format!("{d} at po2 {p} (no jobs if it has under 14 GiB of VRAM)"),
+            None => format!("{d} at po2 {p}"),
+        })
         .collect::<Vec<_>>()
         .join(", ");
+    let vram = if small.is_empty() {
+        String::new()
+    } else {
+        "; the benchmark cache does not record VRAM, which the miner also sizes a card by: give a smaller \
+         card's size with --po2"
+            .to_string()
+    };
     Some((
         po2s,
         format!(
-            "this configuration's cards: {list} (from {})",
+            "this configuration's cards: {list} (from {}){vram}",
             from.join(" and ")
         ),
     ))
@@ -965,7 +1148,7 @@ fn cycle_limit_report(
             format!(
                 "over maxGuestCycles at po2 {}, which {} proves at: a miner proving there skips this job",
                 po2_list(&required_over),
-                if plan.source == "--po2" { "--po2 says the prover" } else { "this configuration" }
+                plan.provers
             )
         } else {
             format!(
@@ -1045,7 +1228,13 @@ fn fill_success(r: &mut WitnessReport, s: &Simulated, d: &JobDescriptor, f: Succ
     r.per_po2 = s
         .per_po2
         .iter()
-        .map(|p| Po2Report { po2: p.po2, cycles: p.cycles.to_string(), segment_bytes: p.segment_bytes, peak_host_bytes: p.peak_host_bytes })
+        .map(|p| Po2Report {
+            po2: p.po2,
+            cycles: p.cycles.to_string(),
+            segment_bytes: p.segment_bytes,
+            peak_host_bytes: p.peak_host_bytes,
+            sys_rand_draws: p.sys_rand_draws,
+        })
         .collect();
     r.cycles = Some(CyclesReport {
         declared_max_guest_cycles: declared.maxGuestCycles.to_string(),
@@ -1137,9 +1326,41 @@ fn da_cap_check(cap_bytes: u64, estimated: u64) -> Option<String> {
     }
 }
 
-/// The verdict of an adversarial run.
+/// What the mutation sweep was set to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MutationsRan {
+    /// `--max-mutations` (capped at [`MAX_MUTATIONS`]).
+    max: usize,
+    /// The job's scheme had structured mutations, and they were made.
+    structured: bool,
+}
+
+/// Whether the scheme report says its structured mutations were made.
+fn scheme_ran(scheme: &SchemeReport) -> bool {
+    scheme.name.is_some() && scheme.status.starts_with("structured mutations first")
+}
+
+/// The attack's sized-cycle cap: this host's configured maximum (`--max-guest-cycles`, `[witness]
+/// max_guest_cycles`), else [`ATTACK_CYCLE_MULTIPLE`] times the job's `maxGuestCycles` (never past
+/// [`MAX_HOST_GUEST_CYCLES`]): without one, 2^34 let a single mutation that loops run for hours.
+fn attack_cycle_cap((host, source): (u64, &'static str), max_guest_cycles: u64) -> (u64, String) {
+    if source == "unset" {
+        let cap = max_guest_cycles
+            .saturating_mul(ATTACK_CYCLE_MULTIPLE)
+            .min(MAX_HOST_GUEST_CYCLES)
+            .max(1);
+        (cap, format!("{ATTACK_CYCLE_MULTIPLE} × the job's maxGuestCycles (no --max-guest-cycles or [witness] max_guest_cycles)"))
+    } else {
+        (host, source.to_string())
+    }
+}
+
+/// The verdict of an adversarial run. Under FULL the router refuses every journal but the honest
+/// one, so what the mutations could not decide leaves nothing undecided; under any other binding a
+/// sweep that ran no mutation, or none of the scheme's structured ones, is incomplete.
 fn adversarial_verdict(
     coverage: &CoverageReport,
+    ran: MutationsRan,
     mutations: &[MutationResult],
     host: &[HostInputResult],
     diff: &DifferentialReport,
@@ -1152,7 +1373,8 @@ fn adversarial_verdict(
         MutationOutcome::NotRun => true,
         MutationOutcome::Inconclusive { .. } => !coverage.whole_journal,
         _ => false,
-    })
+    }) || ran.max == 0
+        || (!ran.structured && !coverage.whole_journal)
         || host.iter().any(|h| !h.ran)
         || diff.runs.len() < 2
         || diff.runs.iter().any(|r| r.outcome != "simulated");
@@ -1191,6 +1413,10 @@ fn coverage(binding: &BindingReport, expected: B256, source: Option<String>) -> 
         Some("NONE: expectedJournalHash is 0, so nothing binds the statement; any prover may prove any".to_string())
     } else if binding.mode == "full" {
         None
+    } else if h == Some(0) {
+        Some(
+            "a 0-byte header: every journal header starts with its 32-byte scheme word".to_string(),
+        )
     } else if let Some(h) = h.filter(|&h| h > binding.statement_bytes) {
         Some(format!("the header is {h} bytes, longer than the {}-byte statement", binding.statement_bytes))
     } else if !binding.header_free.is_empty() {
@@ -1538,6 +1764,15 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
             _ => bail!("a miner with this configuration would skip this job: {v}"),
         }
     }
+    // The router's binding check passed (a mismatch is skipped above), but the binding may still
+    // leave header bytes free or its header's length unknown. A miner serves such a job; the
+    // requester should know, and --adversarial fails it.
+    if let Some(b) = report.binding.as_ref().filter(|b| !b.ok) {
+        eprintln!(
+            "zkminer simulate: the binding check failed (a miner serves the job all the same; --adversarial fails it): {}",
+            redact_urls(&b.warnings.join("; "))
+        );
+    }
     // Served at some sizes only: the verdict is the prover's segment size, so say so.
     if let Some(note) = report
         .cycle_limit
@@ -1573,7 +1808,7 @@ struct Adversary<'a> {
     client: Option<&'a ChainClient>,
     current_block: u64,
     /// The broker configuration, parsed: each provider run writes its own from it.
-    broker_toml: &'a toml::Value,
+    broker_toml: &'a BrokerToml,
 }
 
 /// A token that fires when `main` does or at `deadline`, whichever is first; the task watching for
@@ -1626,6 +1861,8 @@ impl Adversary<'_> {
                 verdict: if coverage.ok { "incomplete" } else { "fail" }.into(),
                 refused: Some(refused),
                 binding_coverage: coverage,
+                attack_cycle_cap: String::new(),
+                attack_cycle_cap_source: String::new(),
                 budget_secs: adv.budget.as_secs(),
                 elapsed_secs: started.elapsed().as_secs_f64(),
                 run_seed: String::new(),
@@ -1702,6 +1939,13 @@ impl Adversary<'_> {
             None => Box::new(generic.into_iter()),
         };
         let judge = Judge { descriptor: &p.descriptor, job_id: p.job_id, prover: p.prover, baseline_journal: &s.journal };
+        let (attack_cap, attack_cap_source) = attack_cycle_cap(
+            host_max_guest_cycles(&p.config, self.opts),
+            s.limits.maxGuestCycles,
+        );
+        // The unchanged W's execute at one po2, as the pipeline timed it: what a mutation that runs
+        // like it needs.
+        let per_po2 = s.timings.execute / u32::try_from(s.per_po2.len().max(1)).unwrap_or(1);
         let baseline = Baseline {
             ctx: self.ctx,
             token: self.token,
@@ -1712,12 +1956,18 @@ impl Adversary<'_> {
             po2: *self.po2s.first().expect("a po2 within the cap"),
             po2s: &self.po2s,
             keccak_po2: self.opts.keccak_po2,
-            cycles: CycleLimits { host: self.host.max_guest_cycles, job: s.limits.maxGuestCycles },
+            cycles: CycleLimits {
+                host: attack_cap,
+                job: s.limits.maxGuestCycles,
+            },
             deadline,
+            mutation_floor: (per_po2 * MUTATION_FLOOR_RUNS).max(MUTATION_FLOOR_MIN),
         };
-        let results = run_mutations(&baseline, plan, max).await;
+        // The host inputs and the providers first: a few runs each, and each a whole class of
+        // failure; the mutations then share what is left.
         let host_inputs = host_input_checks(&baseline, rand::random()).await;
         let differential = self.differential(adv, s, deadline).await;
+        let results = run_mutations(&baseline, plan, max).await;
 
         for m in &results {
             if let MutationOutcome::SoundnessFailure { first_difference, .. } = &m.outcome {
@@ -1752,8 +2002,18 @@ impl Adversary<'_> {
         if over > 0 {
             notes.push(format!(
                 "{over} mutation(s) ran past the job's maxGuestCycles ({}): a miner skips such a W, but the router does not \
-                 check cycles, so each was judged on its journal under this host's maximum ({})",
-                s.limits.maxGuestCycles, self.host.max_guest_cycles
+                 check cycles, so each was judged on its journal under the attack's cycle cap ({attack_cap})",
+                s.limits.maxGuestCycles
+            ));
+        }
+        let structured = scheme_ran(&scheme);
+        if max == 0 {
+            notes.push("--max-mutations 0: no mutation of W was run".to_string());
+        } else if !structured && !coverage.whole_journal {
+            notes.push(format!(
+                "no structured mutations ran ({}): the generic ones alone change bytes, not a consistent W (another \
+                 proof, another block), so the attack is incomplete under this binding",
+                scheme.status
             ));
         }
         let undecided = results.iter().filter(|m| matches!(m.outcome, MutationOutcome::Inconclusive { .. })).count();
@@ -1763,11 +2023,15 @@ impl Adversary<'_> {
                  honest one, so they leave nothing undecided"
             ));
         }
-        let verdict = adversarial_verdict(&coverage, &results, &host_inputs, &differential).to_string();
+        let ran = MutationsRan { max, structured };
+        let verdict =
+            adversarial_verdict(&coverage, ran, &results, &host_inputs, &differential).to_string();
         Ok(AdversarialReport {
             verdict,
             refused: None,
             binding_coverage: coverage,
+            attack_cycle_cap: attack_cap.to_string(),
+            attack_cycle_cap_source: attack_cap_source,
             budget_secs: adv.budget.as_secs(),
             elapsed_secs: started.elapsed().as_secs_f64(),
             run_seed: format!("{seed:#018x}"),
@@ -1804,7 +2068,7 @@ impl Adversary<'_> {
                 _ => None,
             })
         });
-        let providers = match pick_providers(self.broker_toml, chain, adv.providers.as_deref()) {
+        let providers = match pick_providers(&self.broker_toml.value, chain, adv.providers.as_deref()) {
             Ok(v) => v,
             Err(e) => {
                 report.note = Some(format!("not run: {e}"));
@@ -1925,13 +2189,77 @@ mod tests {
         // The cards' sizes, as the miner executes and judges them.
         let p = po2_plan(None, cards());
         assert_eq!((p.po2s, p.required), (vec![19, 20], vec![19, 20]));
-        // Neither: every job size, none required, so a job over at some sizes only is not skipped.
+        // Neither: every job size executed, judged at the default size every uncalibrated card
+        // proves at, as a miner without card sizes judges it.
         let p = po2_plan(None, None);
         assert_eq!(p.po2s, (16..=22).collect::<Vec<u8>>());
+        assert_eq!(
+            p.required,
+            vec![zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2]
+        );
         assert!(
-            p.required.is_empty() && p.source.starts_with("every job size"),
+            p.source.starts_with("every job size, judged at po2 20"),
             "{p:?}"
         );
+        let r = cycle_limit_report(100, &[(18, Some(90)), (20, None)], &p).unwrap();
+        assert!(r
+            .note
+            .unwrap()
+            .contains("over maxGuestCycles at po2 20, which a miner whose cards have no"));
+    }
+
+    /// The miner sizes a card under 14 GiB of VRAM below the default (or gives it no jobs); the
+    /// benchmark cache does not record VRAM, so the source says what such a card would prove at.
+    #[test]
+    fn a_card_size_that_depends_on_vram_is_named() {
+        use zkminer_prover::benchmark::{risc0_job_po2, BenchmarkSuite, DeviceBenchmark};
+        let gib = 1u64 << 30;
+        // Calibrated: po2 20 proved, 21 failed (ceiling 19).
+        let calibrated: DeviceBenchmark = serde_json::from_value(serde_json::json!({
+            "device_id": "gpu0", "device_label": "gpu0", "prover_backend": "risc0",
+            "throughput": 1.0, "power_watts": 1.0, "optimal_po2": 20, "max_feasible_po2": 19,
+            "po2_samples": [{"po2": 20, "total_cycles": 1, "segment_count": 1, "duration_secs": 1.0, "throughput": 1.0}],
+        }))
+        .unwrap();
+        let uncalibrated: DeviceBenchmark = serde_json::from_value(serde_json::json!({
+            "device_id": "gpu1", "device_label": "gpu1", "prover_backend": "risc0",
+            "throughput": 1.0, "power_watts": 1.0,
+        }))
+        .unwrap();
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated), Some(12 * gib)),
+            Some(19)
+        );
+        assert_eq!(
+            risc0_job_po2(None, Some(&uncalibrated), Some(12 * gib)),
+            None
+        );
+        let config = ZkMinerConfig::default();
+        let suite = BenchmarkSuite {
+            device_benchmarks: vec![calibrated, uncalibrated],
+            ..Default::default()
+        };
+        let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
+        assert_eq!(po2s, vec![20], "judged as cards of 14 GiB or more");
+        assert!(
+            source.contains("gpu0 at po2 20 (19 if it has under 14 GiB of VRAM)"),
+            "{source}"
+        );
+        assert!(
+            source.contains("gpu1 at po2 20 (no jobs if it has under 14 GiB of VRAM)"),
+            "{source}"
+        );
+        assert!(
+            source.contains("give a smaller card's size with --po2"),
+            "{source}"
+        );
+        // An operator's size is the card's whatever its VRAM: nothing to name.
+        let mut config = ZkMinerConfig::default();
+        config.prover.risc0_job_po2 =
+            std::collections::HashMap::from([("gpu0".into(), 18), ("gpu1".into(), 18)]);
+        let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
+        assert_eq!(po2s, vec![18]);
+        assert!(!source.contains("VRAM"), "{source}");
     }
 
     #[test]
@@ -1958,7 +2286,9 @@ mod tests {
         let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
         assert_eq!(po2s, vec![20]);
         assert!(
-            source.contains("cpu at po2 20, gpu0 at po2 20") && !source.contains("gpu1"),
+            source
+                .contains("cpu at po2 20, gpu0 at po2 20 (no jobs if it has under 14 GiB of VRAM)")
+                && !source.contains("gpu1"),
             "{source}"
         );
         // prover.risc0_job_po2 sizes its card, names one the cache lacks, and is held to 16..=22.
@@ -2027,6 +2357,21 @@ mod tests {
         let marker_only = zkminer_witness::binding::clear_marker(marker) ^ marker;
         let none = binding(marker_only, B256::ZERO, &statement, Some(160));
         assert!(coverage(&none, B256::ZERO, None).failure.unwrap().starts_with("NONE"));
+        // A 0-byte header pins nothing, whatever the binding: refused (the flag cannot be 0 either).
+        let zero = binding(
+            journal_fields_for_header(32, true).unwrap(),
+            keccak256(&header[..32]),
+            &statement,
+            Some(0),
+        );
+        assert!(
+            !zero.ok && zero.warnings.iter().any(|w| w.contains("0-byte header")),
+            "{zero:?}"
+        );
+        assert!(coverage(&zero, keccak256(&header[..32]), None)
+            .failure
+            .unwrap()
+            .contains("0-byte header"));
         // FULL pins everything, whatever H.
         let full = binding(B256::ZERO, B256::repeat_byte(3), &statement, None);
         assert!(coverage(&full, B256::repeat_byte(3), None).ok);
@@ -2038,7 +2383,20 @@ mod tests {
             soundness_failure: false,
             note: None,
         };
-        assert_eq!(adversarial_verdict(&coverage(&one, keccak256(&header[..32]), None), &[], &[], &diff), "fail");
+        let ran = MutationsRan {
+            max: 256,
+            structured: true,
+        };
+        assert_eq!(
+            adversarial_verdict(
+                &coverage(&one, keccak256(&header[..32]), None),
+                ran,
+                &[],
+                &[],
+                &diff
+            ),
+            "fail"
+        );
         // A mutation this host could not run to a journal decides nothing under FULL, and leaves
         // FIELDS incomplete.
         let host = HostInputResult {
@@ -2075,10 +2433,88 @@ mod tests {
         };
         let full_cov = coverage(&full, B256::repeat_byte(3), None);
         assert!(full_cov.whole_journal);
-        assert_eq!(adversarial_verdict(&full_cov, std::slice::from_ref(&capped), &hosts, &agreed), "pass");
+        assert_eq!(
+            adversarial_verdict(
+                &full_cov,
+                ran,
+                std::slice::from_ref(&capped),
+                &hosts,
+                &agreed
+            ),
+            "pass"
+        );
         let fields_cov = coverage(&all, keccak256(header), None);
-        assert_eq!(adversarial_verdict(&fields_cov, std::slice::from_ref(&capped), &hosts, &agreed), "incomplete");
-        assert_eq!(adversarial_verdict(&fields_cov, &[], &hosts, &agreed), "pass");
+        assert_eq!(
+            adversarial_verdict(
+                &fields_cov,
+                ran,
+                std::slice::from_ref(&capped),
+                &hosts,
+                &agreed
+            ),
+            "incomplete"
+        );
+        assert_eq!(
+            adversarial_verdict(&fields_cov, ran, &[], &hosts, &agreed),
+            "pass"
+        );
+        // No mutation run at all (--max-mutations 0) is never a pass, under any binding.
+        let none = MutationsRan {
+            max: 0,
+            structured: true,
+        };
+        assert_eq!(
+            adversarial_verdict(&fields_cov, none, &[], &hosts, &agreed),
+            "incomplete"
+        );
+        assert_eq!(
+            adversarial_verdict(&full_cov, none, &[], &hosts, &agreed),
+            "incomplete"
+        );
+        // Without the scheme's structured mutations (no scheme registered, or W not of it): incomplete,
+        // unless FULL decides every journal.
+        let generic = MutationsRan {
+            max: 256,
+            structured: false,
+        };
+        assert_eq!(
+            adversarial_verdict(&fields_cov, generic, &[], &hosts, &agreed),
+            "incomplete"
+        );
+        assert_eq!(
+            adversarial_verdict(&full_cov, generic, &[], &hosts, &agreed),
+            "pass"
+        );
+        assert!(scheme_ran(&SchemeReport {
+            id: Some(1),
+            name: Some("eth-block".into()),
+            status: "structured mutations first (2 of 2 fetched answers used)".into()
+        }));
+        assert!(!scheme_ran(&SchemeReport {
+            id: Some(0x77),
+            name: None,
+            status: "no structured mutations registered for this scheme".into()
+        }));
+        assert!(!scheme_ran(&SchemeReport {
+            id: Some(1),
+            name: Some("eth-block".into()),
+            status: "not a scheme-1 W".into()
+        }));
+        // A cycle maximum the operator set is the attack's; without one, a bounded multiple of the job's.
+        assert_eq!(
+            attack_cycle_cap((1 << 30, "--max-guest-cycles"), 1 << 20),
+            (1 << 30, "--max-guest-cycles".into())
+        );
+        let (cap, source) = attack_cycle_cap((MAX_HOST_GUEST_CYCLES, "unset"), 1 << 20);
+        assert_eq!(cap, ATTACK_CYCLE_MULTIPLE << 20);
+        assert!(
+            source.starts_with("4 × the job's maxGuestCycles"),
+            "{source}"
+        );
+        assert_eq!(
+            attack_cycle_cap((MAX_HOST_GUEST_CYCLES, "unset"), u64::MAX).0,
+            MAX_HOST_GUEST_CYCLES
+        );
     }
 
     #[test]
@@ -2106,12 +2542,28 @@ mod tests {
              [[evm_rpc]]\nalias = \"b\"\nurl = \"https://b.example\"\n",
         )
         .unwrap();
-        let main: toml::Value =
-            toml::from_str(&broker_config_for(&cfg, None, Path::new("/work/main/spool")).unwrap()).unwrap();
+        let main: toml::Value = toml::from_str(
+            &broker_config_for(
+                &cfg,
+                Path::new("/etc/b"),
+                None,
+                Path::new("/work/main/spool"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(main["spool_dir"].as_str(), Some("/work/main/spool"));
         assert_eq!(main["evm_rpc"].as_array().unwrap().len(), 2);
-        let one: toml::Value =
-            toml::from_str(&broker_config_for(&cfg, Some("b"), Path::new("/work/p1/spool")).unwrap()).unwrap();
+        let one: toml::Value = toml::from_str(
+            &broker_config_for(
+                &cfg,
+                Path::new("/etc/b"),
+                Some("b"),
+                Path::new("/work/p1/spool"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(one["spool_dir"].as_str(), Some("/work/p1/spool"));
         assert_eq!(one["evm_rpc"].as_array().unwrap().len(), 1);
         assert_eq!(one["evm_rpc"][0]["alias"].as_str(), Some("b"));
@@ -2122,6 +2574,111 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(write_private(&path, "y").is_err());
+    }
+
+    /// A broker configuration whose `key_file`s are relative to its own directory (as the broker
+    /// reads them) loads where it is, and still does once copied into a run's work directory: every
+    /// relative `key_file` of the copy is the original's, made absolute.
+    #[test]
+    fn a_relative_key_file_survives_the_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        use zkminer_witness_broker::config::BrokerConfig;
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for (name, key) in [("base.key", "secret-key"), ("art.key", "art-key")] {
+            let path = a.path().join(name);
+            std::fs::write(&path, format!("{key}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let text = format!(
+            "chain_rpc_host = \"rpc.example.org\"\nspool_dir = \"{}\"\n[[evm_rpc]]\nalias = \"base-own\"\n\
+             url = \"https://base.example.net/v2/{{key}}\"\nchain_id = 8453\narchive = true\nmax_proof_age = 100000\n\
+             method_sets = [\"state-read\"]\nkey_file = \"base.key\"\n[[evm_rpc]]\nalias = \"absolute\"\n\
+             url = \"https://abs.example.net/v2/{{key}}\"\nchain_id = 8453\nmethod_sets = [\"state-read\"]\n\
+             key_file = \"{}\"\n[artifacts]\nalias = \"hemi\"\nurl = \"https://hemi.example.net/\"\nchain_id = 743111\n\
+             key_file = \"./art.key\"\nkey_header = \"x-api-key\"\n",
+            a.path().join("spool").display(),
+            a.path().join("base.key").display(),
+        );
+        let original = a.path().join("broker.toml");
+        std::fs::write(&original, &text).unwrap();
+        let mode = zkminer_netguard::NetMode::Public;
+        BrokerConfig::load(&original, mode).expect("the operator's own file loads");
+        let parsed = read_broker_config(&original).unwrap();
+        assert_eq!(parsed.dir, a.path());
+        let copied = b.path().join("broker.toml");
+        write_private(
+            &copied,
+            &broker_config_for(&parsed.value, &parsed.dir, None, &b.path().join("spool")).unwrap(),
+        )
+        .unwrap();
+        let again = BrokerConfig::load(&copied, mode).map_err(|e| e.to_string());
+        assert!(again.is_ok(), "the copy loads too: {again:?}");
+        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&copied).unwrap()).unwrap();
+        let base = a.path().join("base.key").display().to_string();
+        assert_eq!(v["evm_rpc"][0]["key_file"].as_str(), Some(base.as_str()));
+        assert_eq!(
+            v["evm_rpc"][1]["key_file"].as_str(),
+            Some(base.as_str()),
+            "an absolute one is kept"
+        );
+        let art = a.path().join("./art.key").display().to_string();
+        assert_eq!(v["artifacts"]["key_file"].as_str(), Some(art.as_str()));
+    }
+
+    /// Beside a running miner (it holds `~/.zkminer/miner.lock`) simulate's broker takes half of
+    /// each endpoint's rates and concurrency, which it shares with the miner's own broker.
+    #[test]
+    fn beside_a_running_miner_each_endpoints_rates_are_halved() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("miner.lock");
+        assert!(!lock_held(&lock), "no file, no miner");
+        let held = std::fs::File::create(&lock).unwrap();
+        assert!(!lock_held(&lock), "a file nobody locks");
+        held.lock().unwrap();
+        assert!(lock_held(&lock), "the miner's exclusive lock");
+        drop(held);
+        assert!(!lock_held(&lock), "a miner that exited");
+
+        let mut v: toml::Value = toml::from_str(
+            "spool_dir = \"/s\"\n[[evm_rpc]]\nalias = \"a\"\nmax_concurrency = 6\nmax_requests_per_sec = 50\n\
+             max_units_per_minute = 6000\n[[evm_rpc]]\nalias = \"b\"\n[[blob_mirror]]\nalias = \"m\"\nmax_concurrency = 1\n\
+             [artifacts]\nalias = \"h\"\n[artifacts.mirror]\nalias = \"am\"\n",
+        )
+        .unwrap();
+        halve_endpoint_rates(&mut v);
+        let a = &v["evm_rpc"][0];
+        assert_eq!(
+            (
+                a["max_concurrency"].as_integer(),
+                a["max_requests_per_sec"].as_integer()
+            ),
+            (Some(3), Some(25))
+        );
+        assert_eq!(a["max_units_per_minute"].as_integer(), Some(3000));
+        let b = &v["evm_rpc"][1];
+        assert_eq!(
+            b["max_concurrency"].as_integer(),
+            Some(4),
+            "from the default of 8"
+        );
+        assert!(
+            b.get("max_requests_per_sec").is_none(),
+            "an unpaced endpoint stays unpaced"
+        );
+        assert_eq!(
+            v["blob_mirror"][0]["max_concurrency"].as_integer(),
+            Some(1),
+            "never below 1"
+        );
+        assert_eq!(
+            v["artifacts"]["max_requests_per_sec"].as_integer(),
+            Some(1),
+            "from the default of 2"
+        );
+        assert_eq!(
+            v["artifacts"]["mirror"]["max_concurrency"].as_integer(),
+            Some(4)
+        );
     }
 
     #[test]

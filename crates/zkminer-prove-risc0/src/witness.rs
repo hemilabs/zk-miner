@@ -543,7 +543,9 @@ mod execute {
         RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN, WITNESS_EXECUTE_BUILD_ARG, WITNESS_EXECUTE_W_FD,
     };
 
-    use super::super::{check_claim_output, dup_cloexec, GuestBuiltWithOldRisc0, KeccakAudit};
+    use super::super::{
+        check_claim_output, dup_cloexec, sys_rand_draws, GuestBuiltWithOldRisc0, KeccakAudit,
+    };
     use super::{exit_parts, journal_parts, read_prefixed, WitnessRefusal, PREFIX_BYTES};
 
     pub(crate) fn execute_main() -> ! {
@@ -577,15 +579,23 @@ mod execute {
                 std::process::exit(Failure::Internal.code());
             }
         };
-        // 3. Logs to fd 2, from this thread: the fmt subscriber starts no thread of its own.
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "warn".into()),
-            )
-            .init();
+        // 3. Logs to fd 2, from this thread: neither layer starts a thread of its own. Whatever
+        //    RUST_LOG says, the guest's `sys_rand` calls are counted, as an Execute's are.
+        {
+            use tracing_subscriber::prelude::*;
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::stderr)
+                        .with_ansi(false)
+                        .with_filter(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| "warn".into()),
+                        ),
+                )
+                .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()))
+                .init();
+        }
         // The build handshake: what this binary's responses name, before any guest runs in it.
         if std::env::args_os().nth(2).as_deref()
             == Some(std::ffi::OsStr::new(WITNESS_EXECUTE_BUILD_ARG))
@@ -871,6 +881,8 @@ mod execute {
         })?;
         let segment_bytes = AtomicU64::new(0);
         let segment_cycles = AtomicU64::new(0);
+        // The guest runs on this thread, which is where its `sys_rand` calls are counted.
+        sys_rand_draws::reset();
         // On the executor's segment thread: count each segment and drop it.
         let run = exec.run_with_callback(|segment| {
             segment_bytes.fetch_add(bincode::serialized_size(&segment)?, Ordering::SeqCst);
@@ -880,6 +892,7 @@ mod execute {
             Ok(Box::new(risc0_zkvm::NullSegmentRef) as Box<dyn risc0_zkvm::SegmentRef>)
         });
         drop(exec);
+        let sys_rand_draws = sys_rand_draws::host_entropy_reads(sys_rand_draws::take());
         let session = match run {
             Ok(session) => session,
             Err(_) if budget.exceeded() => {
@@ -927,6 +940,7 @@ mod execute {
             exit_code,
             segment_bytes: segment_bytes.load(Ordering::SeqCst),
             peak_host_bytes: peak_rss_bytes(),
+            sys_rand_draws,
         })
     }
 }
@@ -1341,6 +1355,35 @@ mod tests {
                 execute_po2(b"\x7fELF not really", &input, [1; 32], 16, None),
                 Err(WitnessExecuteFailure::InvalidElf)
             );
+        }
+
+        /// Each po2 reports the guest's `sys_rand` calls past its runtime's own draw, counted as
+        /// the execute worker's subscriber counts them: none for fibonacci, one for the echo guest,
+        /// whose journal is the seed's words. Without the count the miner could not tell a guest
+        /// whose journal ignores the seed but whose checks follow it.
+        #[test]
+        fn each_po2_reports_the_guests_own_sys_rand_draws() {
+            use tracing_subscriber::prelude::*;
+            if FIBONACCI_ELF.is_empty() || crate::SYS_RAND_ECHO_ELF.is_empty() {
+                return;
+            }
+            let _serial = crate::serial_guest_execution();
+            let counting = tracing_subscriber::registry()
+                .with(crate::sys_rand_draws::Counter.with_filter(crate::sys_rand_draws::filter()));
+            tracing::subscriber::with_default(counting, || {
+                let fib =
+                    execute_po2(FIBONACCI_ELF, &10u32.to_le_bytes(), [1; 32], 16, None).unwrap();
+                assert_eq!(fib.sys_rand_draws, Some(0), "only the runtime's draw");
+                for po2 in [16, 20] {
+                    let echo =
+                        execute_po2(crate::SYS_RAND_ECHO_ELF, &[], [7; 32], po2, None).unwrap();
+                    assert_eq!(echo.sys_rand_draws, Some(1), "po2 {po2}: its one draw");
+                    assert_eq!(echo.journal.len(), 32);
+                }
+            });
+            // With nothing counting there is no draw at all: unknown, never 0.
+            let uncounted = execute_po2(crate::SYS_RAND_ECHO_ELF, &[], [7; 32], 16, None).unwrap();
+            assert_eq!(uncounted.sys_rand_draws, None);
         }
     }
 }

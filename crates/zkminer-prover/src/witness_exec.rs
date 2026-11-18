@@ -488,6 +488,7 @@ mod tests {
             exit_code: 0,
             segment_bytes: 1,
             peak_host_bytes: 1,
+            sys_rand_draws: Some(0),
         }
     }
 

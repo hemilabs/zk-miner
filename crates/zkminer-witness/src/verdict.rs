@@ -86,9 +86,12 @@ pub enum SkipReason {
     /// unanswerable (unknown hashes, missing state), nor one in flight on its own cost.
     BuilderTransient,
     /// A fetch failed because the job's source answered that it lacks the block or state (or the
-    /// block is above its head), while fewer than two independent endpoints for that chain said so
-    /// and the block is within the source's pruning horizon (`JobStats.lagging_unconfirmed`): a
-    /// node behind the chain answers a valid request exactly so. Retried, never the caller's.
+    /// block is above its head), while fewer than two independent endpoints for that chain said so,
+    /// the one that did had a stale head (or one that could not be read) and the block is within
+    /// the source's pruning horizon (`JobStats.lagging_unconfirmed`): a node behind the chain
+    /// answers a valid request exactly so. It excuses only what a builder makes of a failed fetch,
+    /// a non-zero return or a trap; never fuel, memory or the wall clock. Retried, never the
+    /// caller's.
     BuilderSourceLagging,
     /// The wall clock expired with no fetch in flight.
     BuilderWallClock,
@@ -105,6 +108,11 @@ pub enum SkipReason {
     GuestCyclesAboveLimit,
     BindingMismatch,
     JournalsDifferAcrossPo2,
+    /// The guest called `sys_rand` past its runtime's own draw (`WitnessExecutePo2::sys_rand_draws`).
+    /// No proof binds the seed, so a prover picks what the guest draws: a randomized check of `W` is
+    /// one the prover passes with a seed of its choosing, whatever the journal. The guest's design,
+    /// the same for every `W`: permanent, the caller's.
+    GuestUsesSysRand,
     // Claim gate.
     JournalTooLarge,
     FulfilDaTooLarge,
@@ -133,7 +141,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    pub const ALL: [SkipReason; 46] = {
+    pub const ALL: [SkipReason; 47] = {
         use SkipReason::*;
         [
             EnvelopeMalformed, EnvelopeOutOfRange, UnsupportedBuilderType, UnsupportedProofSystem,
@@ -143,7 +151,7 @@ impl SkipReason {
             BuilderUnknownImport, BuilderTrap, BuilderFuelExhausted, BuilderMemoryExhausted,
             BuilderNonZeroReturn, BuilderWitnessTooLarge, BuilderTransient, BuilderSourceLagging, BuilderWallClock,
             BuilderClampedByProbation, RunnerInternal, BuilderCrashed, RunnerCrashed, GuestFailed, GuestCyclesAboveLimit,
-            BindingMismatch, JournalsDifferAcrossPo2, JournalTooLarge, FulfilDaTooLarge,
+            BindingMismatch, JournalsDifferAcrossPo2, GuestUsesSysRand, JournalTooLarge, FulfilDaTooLarge,
             BelowReservation, DeadlineMargin, ProveResources, VerifierSelectorMismatch,
             OperatorEndpoint, OperatorBudget, RetentionFull, HostInternal, HostBusy, PostLockFailure,
         ]
@@ -158,7 +166,7 @@ impl SkipReason {
             | BuilderInvalidModule | BuilderUnknownImport | BuilderTrap | BuilderFuelExhausted
             | BuilderMemoryExhausted | BuilderNonZeroReturn | BuilderWitnessTooLarge | BuilderWallClock
             | BuilderCrashed
-            | GuestCyclesAboveLimit | JournalsDifferAcrossPo2 | JournalTooLarge => (Never, true),
+            | GuestCyclesAboveLimit | JournalsDifferAcrossPo2 | GuestUsesSysRand | JournalTooLarge => (Never, true),
             // A stale node can cause these: one rebuild on other endpoints, then the caller's.
             GuestFailed | BindingMismatch => (OnceJittered, true),
             // Only operator-side failures (§11.2), so never the caller's.
@@ -240,22 +248,36 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
     if o.operator_failure || (deadline && o.fetch_in_flight_at_end && o.in_flight_operator_wait) {
         return Some(BuilderTransient);
     }
-    // Like an operator-side failure, a lagging source excuses any exit: the builder never got
-    // what it needed.
-    if o.source_lagging {
+    let own = own_verdict(o);
+    // A lagging source excuses what a builder makes of the fetch it never got: giving up (a
+    // non-zero return) or a trap. Never exhaustion or a crash: a failed fetch costs no fuel or
+    // memory, and the wall clock is the builder's own (one spent waiting on the operator's side is
+    // transient above). A builder that asks for an unknown hash cannot buy blameless retries of
+    // runs that exhaust their limits.
+    if o.source_lagging && matches!(own, BuilderNonZeroReturn | BuilderTrap) {
         return Some(BuilderSourceLagging);
     }
+    Some(own)
+}
+
+/// A failed builder run's own verdict, whatever its fetches met.
+fn own_verdict(o: &BuilderOutcome) -> SkipReason {
+    use SkipReason::*;
     if o.oom_killed {
-        return Some(BuilderMemoryExhausted);
+        return BuilderMemoryExhausted;
     }
     if o.wall_clock_hit {
-        return Some(BuilderWallClock);
+        return BuilderWallClock;
     }
     if o.exit.is_none() {
         // Killed by a signal that was neither the OOM killer nor the miner's own timeout.
-        return Some(if o.module_started { BuilderCrashed } else { RunnerCrashed });
+        return if o.module_started {
+            BuilderCrashed
+        } else {
+            RunnerCrashed
+        };
     }
-    Some(match o.exit {
+    match o.exit {
         Some(exit::INVALID_MODULE) => BuilderInvalidModule,
         Some(exit::UNKNOWN_IMPORT) => BuilderUnknownImport,
         Some(exit::FUEL) => BuilderFuelExhausted,
@@ -265,7 +287,7 @@ pub fn builder_verdict(o: &BuilderOutcome) -> Option<SkipReason> {
         Some(exit::WALL_CLOCK) => BuilderWallClock,
         // Includes INTERNAL once the module started.
         _ => BuilderTrap,
-    })
+    }
 }
 
 /// Keys scores and verdicts are recorded under (§16): never `builderId` or `programId` alone.
@@ -327,7 +349,7 @@ mod tests {
         let v = |r: SkipReason| r.verdict();
         // Permanent for the job, the caller's.
         for r in [EnvelopeMalformed, EnvelopeOutOfRange, BuilderUnknownImport, BuilderTrap, BuilderFuelExhausted,
-            BuilderMemoryExhausted, BuilderNonZeroReturn, BuilderWallClock, JournalsDifferAcrossPo2]
+            BuilderMemoryExhausted, BuilderNonZeroReturn, BuilderWallClock, JournalsDifferAcrossPo2, GuestUsesSysRand]
         {
             assert_eq!(v(r), Verdict { retry: Retry::Never, blames_caller: true }, "{r:?}");
         }
@@ -418,8 +440,8 @@ mod tests {
     }
 
     /// A source that lacked the block or state with no second independent endpoint to confirm it
-    /// may be a node behind the chain: the builder is retried with backoff and never blamed, after
-    /// any exit; an operator-side failure still reads as one.
+    /// may be a node behind the chain: a builder that then gave up or trapped is retried with
+    /// backoff and never blamed; an operator-side failure still reads as one.
     #[test]
     fn an_unconfirmed_lagging_source_is_retried_and_never_blamed() {
         let base = BuilderOutcome {
@@ -433,13 +455,16 @@ mod tests {
             ..base
         };
         assert_eq!(builder_verdict(&lagging), Some(BuilderSourceLagging));
-        assert_eq!(
-            builder_verdict(&BuilderOutcome {
-                exit: Some(exit::FUEL),
-                ..lagging
-            }),
-            Some(BuilderSourceLagging)
-        );
+        for trap in [exit::TRAP, exit::INTERNAL, -5] {
+            assert_eq!(
+                builder_verdict(&BuilderOutcome {
+                    exit: Some(trap),
+                    ..lagging
+                }),
+                Some(BuilderSourceLagging),
+                "{trap}"
+            );
+        }
         assert_eq!(
             builder_verdict(&BuilderOutcome {
                 operator_failure: true,
@@ -455,6 +480,75 @@ mod tests {
             }
         );
         assert_eq!(BuilderSourceLagging.verdict().retry.as_str(), "backoff");
+    }
+
+    /// One fetch of an unknown hash must not excuse whatever the run does after it: running out of
+    /// fuel, memory or the wall clock, overfilling W or a crash are the builder's own, and permanent.
+    #[test]
+    fn a_lagging_source_excuses_no_exhaustion() {
+        let lagging = BuilderOutcome {
+            source_lagging: true,
+            module_started: true,
+            ..Default::default()
+        };
+        let cases = [
+            (
+                BuilderOutcome {
+                    exit: Some(exit::FUEL),
+                    ..lagging
+                },
+                BuilderFuelExhausted,
+            ),
+            (
+                BuilderOutcome {
+                    exit: Some(exit::MEMORY),
+                    ..lagging
+                },
+                BuilderMemoryExhausted,
+            ),
+            (
+                BuilderOutcome {
+                    exit: Some(exit::WALL_CLOCK),
+                    ..lagging
+                },
+                BuilderWallClock,
+            ),
+            (
+                BuilderOutcome {
+                    exit: Some(exit::WITNESS_TOO_LARGE),
+                    ..lagging
+                },
+                BuilderWitnessTooLarge,
+            ),
+            (
+                BuilderOutcome {
+                    exit: None,
+                    wall_clock_hit: true,
+                    ..lagging
+                },
+                BuilderWallClock,
+            ),
+            (
+                BuilderOutcome {
+                    exit: None,
+                    oom_killed: true,
+                    ..lagging
+                },
+                BuilderMemoryExhausted,
+            ),
+            (
+                BuilderOutcome {
+                    exit: None,
+                    signal: Some(31),
+                    ..lagging
+                },
+                BuilderCrashed,
+            ),
+        ];
+        for (o, want) in cases {
+            assert_eq!(builder_verdict(&o), Some(want), "{o:?}");
+            assert!(want.verdict().blames_caller, "{want:?}");
+        }
     }
 
     /// The runner's "module started" marker: its own INTERNAL exit before the marker is the
