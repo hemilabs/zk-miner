@@ -30,6 +30,9 @@ mod witness;
 /// The collateral cap: what one job, and the unproven jobs of one program or submitter, may lock.
 mod collateral;
 
+/// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
+mod segment_disk;
+
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
@@ -2618,6 +2621,9 @@ pub async fn run(
     if let Some(r) = &config.retention {
         zkminer_prover::worker::set_risc0_witness_dirs(r.dir.clone(), r.segment_dir.clone());
     }
+    // And there its inline proofs' segments go too (else under `~/.zkminer`): where the claim gate
+    // reserves their disk.
+    segment_disk::set_inline_root(config.retention.as_ref().map(|r| r.segment_dir.as_path()));
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -5298,6 +5304,7 @@ async fn miner_brain(
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
             collateral::forget(jid);
+            segment_disk::release(jid);
             proved.remove(&jid);
             inflight_work.remove(&jid);
             queue_model.settle(&jid.0);
@@ -5308,8 +5315,9 @@ async fn miner_brain(
                 queue_model.settle(&jid.0);
             }
             // Proven (or never going to be): no longer counted against its program's and
-            // submitter's share of the stake.
+            // submitter's share of the stake, and its segments are gone.
             collateral::forget(jid);
+            segment_disk::release(jid);
         }
         // Only jobs still held. Every path that reaps one removes it here too, but an entry left
         // behind would read as one card fewer needed for as long as the miner ran: it did, from a
@@ -7635,6 +7643,19 @@ async fn miner_brain(
                     deadline_safety_margin,
                 );
             }
+            // A risc0 proof writes all its segments to disk first: claimed only while they fit beside
+            // every proof planned or running here, witness ones included (`segment_disk`). Reserved
+            // until its card is released.
+            if would_commit
+                && matches!(eval.recommendation, Recommendation::Claim)
+                && risc0_job
+                && !watch_only()
+            {
+                if let Err(why) = segment_disk::try_reserve_inline(jid, params.estimated_cycles) {
+                    tracing::debug!("job {}: its segments do not fit now ({why})", short_id(jid));
+                    continue;
+                }
+            }
             // The cap again, deciding and recording in one step: a witness claim may have taken the
             // program's or submitter's room since the check above.
             if would_commit
@@ -7642,6 +7663,7 @@ async fn miner_brain(
                 && collateral::admit(jid, exposure, job_collateral_cap)
                     != collateral::CapVerdict::Admit
             {
+                segment_disk::release(jid);
                 tracing::debug!(
                     "job {}: its program's or submitter's share of the stake is taken — not now",
                     short_id(jid)
@@ -9631,6 +9653,9 @@ async fn process_job_lifecycle(
         // job's guest, that its backend cannot run on this host. An environment fault, so if every
         // attempt then fails the program and submitter are not marked divergent.
         let mut env_declined = false;
+        // A risc0 attempt failed while this host's segment disk could not hold the job's segments
+        // (`segment_disk::inline_short`, read here, not from the worker): this host's failure.
+        let mut disk_short = false;
         let mut attempt = 0u32;
         // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
         // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
@@ -10172,6 +10197,20 @@ async fn process_job_lifecycle(
                         None => zkminer_prover_protocol::types::is_gpu_oom(&msg),
                     };
                     let health_fail = !invalid && !real_oom;
+                    // This host's segment disk, read now: a full disk (ENOSPC or a quota) is the
+                    // host's, whatever the worker said, and is not held against the job's program or
+                    // submitter below. The proof's own segments are gone by now, so only a disk short
+                    // without them reads so.
+                    if backend == zkminer_prover_protocol::BACKEND_RISC0
+                        && segment_disk::inline_short(job_id, sizing_cycles)
+                    {
+                        disk_short = true;
+                        tracing::warn!(
+                            "{}: this host's segment disk has too little room for the job's segments \
+                             (see README, risc0 segments): {msg}",
+                            short_id(job_id),
+                        );
+                    }
                     if attempt < MAX_PROVE_ATTEMPTS {
                         // BOTH non-invalid classes steer OFF the card that just failed.
                         //
@@ -10237,7 +10276,7 @@ async fn process_job_lifecycle(
                     }
                     // Every attempt failed on a job that measured clean. Class-agnostic on purpose: the
                     // worker's kind can follow guest-chosen text (see `note_post_claim_divergence`).
-                    if rode_measurement && !env_declined {
+                    if rode_measurement && !env_declined && !disk_short {
                         note_post_claim_divergence(program_id, backend, submitter, "all prove attempts failed");
                     }
                     return Err(anyhow::anyhow!(

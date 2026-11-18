@@ -311,7 +311,8 @@ executor:
   backend proves with (`~/.risc0` or `RISC0_HOME`, `~/.sp1`); for witness proofs, the retention
   store (read) and the segment directories (write). Write only a private temporary directory
   (`TMPDIR`, made per worker, mode 0700), a risc0 worker's own segment directory
-  (`~/.zkminer/risc0-segments/<pid>`, mode 0700, made before it confines itself), the GPU caches
+  (`~/.zkminer/risc0-segments/<pid>-<start>`, or `<segment_dir>/inline/<pid>-<start>` with
+  `[retention]`; mode 0700, made before it confines itself), the GPU caches
   the build needs (risc0's CUDA Groth16 cache; the Intel SYCL and compute-runtime kernel caches)
   and, for an SP1 server, its host-wide Groth16 queue (below). Nothing in `/dev/shm`: SP1's
   executor shares the guest's memory and trace

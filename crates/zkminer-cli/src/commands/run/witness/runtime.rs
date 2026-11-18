@@ -101,7 +101,7 @@ use super::policy::{
     device_tally_key, divergence_reusable, elf_image_id_outcome, estimate_prove_secs, fixed_allowance_secs,
     fulfils_besides, funds_cover, gate_refusal_reason, held_lock_prove_sizes, host_max_guest_cycles,
     is_witness_input, lasts_until_terminal, not_claimable_reason, parse_session_cap, pin_lock_gone,
-    pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, segments_fit, session_cap_admits, short,
+    pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, session_cap_admits, short,
     tally_count, verdict_expires_at, verdict_plan, verdict_set_aside, watchdog_admits, ArtifactBudget, Blame,
     PinFacts, PinRead, ProvePlan, ReservationInputs, POST_LOCK_CALLER_LIMIT, POST_LOCK_CLASSES,
     POST_LOCK_DEVICE_LIMIT, POST_LOCK_TALLY_TTL_SECS, RISC0_CPU_CONSERVATIVE_CPS, SERVING_OFF_SET_ASIDE,
@@ -463,8 +463,6 @@ pub(crate) struct WitnessRuntime {
     verdict_until: Mutex<HashMap<B256, u64>>,
     blame: Mutex<Blame>,
     image_ids: Arc<Mutex<HashMap<B256, B256>>>,
-    /// Segment bytes reserved per witness proof planned or running.
-    segment_reserved: Mutex<HashMap<B256, u64>>,
     brain: Mutex<Option<BrainLink>>,
     sim_slots: Arc<tokio::sync::Semaphore>,
     classify_slots: Arc<tokio::sync::Semaphore>,
@@ -629,7 +627,6 @@ impl WitnessRuntime {
             verdict_until: Mutex::new(HashMap::new()),
             blame: Mutex::new(Blame::default()),
             image_ids: Arc::new(Mutex::new(HashMap::new())),
-            segment_reserved: Mutex::new(HashMap::new()),
             brain: Mutex::new(None),
             sim_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SIMULATIONS)),
             classify_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CLASSIFICATIONS)),
@@ -1308,9 +1305,7 @@ impl WitnessRuntime {
             match locked {
                 Some(l) => rt.run_locked(l).await,
                 // Not locked: whatever the gate reserved for the proof goes.
-                None => {
-                    lock(&rt.segment_reserved).remove(&jid);
-                }
+                None => run::segment_disk::release(jid),
             }
         });
         Route::Witness
@@ -1985,23 +1980,11 @@ impl WitnessRuntime {
                 ));
             }
             // Prove resources: segment disk (reserved now, for this job, against every other proof
-            // planned or running), then host RAM through the dispatcher's ledger.
+            // planned or running, inline ones included: `run::segment_disk`), then host RAM through
+            // the dispatcher's ledger.
             let need = segment_need(c.per_po2.iter().map(|p| p.2));
             if let Some(dir) = self.retention.as_ref().map(|r| r.segment_dir.clone()) {
-                let mut reserved = lock(&self.segment_reserved);
-                let others: u64 = reserved.iter().filter(|(j, _)| **j != jid).map(|(_, b)| *b).sum();
-                match free_bytes(&dir) {
-                    Ok(free) if segments_fit(need, others, free) => {
-                        reserved.insert(jid, need);
-                    }
-                    Ok(free) => {
-                        return Err((
-                            SkipReason::ProveResources,
-                            format!("segments need {need} bytes beside {others} reserved; {free} free under {}", dir.display()),
-                        ))
-                    }
-                    Err(e) => return Err((SkipReason::ProveResources, format!("segment directory {}: {e}", dir.display()))),
-                }
+                run::segment_disk::try_reserve(jid, need, &dir).map_err(|e| (SkipReason::ProveResources, e))?;
             }
             if let (Some(pool), Some(available), Some(total)) = (
                 zkminer_prover::engine::worker_pool(),
@@ -2077,7 +2060,7 @@ impl WitnessRuntime {
     /// earlier claim of ours is unresolved (`prior`), both stay: that claim may have landed, and its
     /// lock would then be proven from this pin (recovery decides from the chain).
     async fn abandon_intent(&self, jid: B256, bundle: BundleRef, prior: bool) {
-        lock(&self.segment_reserved).remove(&jid);
+        run::segment_disk::release(jid);
         run::collateral::forget(jid);
         if prior {
             return;
@@ -2421,7 +2404,7 @@ impl WitnessRuntime {
             run::SlotGuard(jid, b.done)
         });
         let result = with_lane(Lane::HeldLock, self.prove_and_fulfil(&mut l)).await;
-        lock(&self.segment_reserved).remove(&jid);
+        run::segment_disk::release(jid);
         let bundle = l.bundle;
         match result {
             Ok(()) => {}
@@ -2754,7 +2737,7 @@ impl WitnessRuntime {
                 expect_journal_sha256: first.journal_sha256.0,
                 segment_dir: segment_dir.to_string_lossy().into_owned(),
             };
-            lock(&self.segment_reserved).insert(jid, segment_need(l.record.po2_results.iter().map(|r| r.segment_bytes)));
+            run::segment_disk::reserve(jid, segment_need(l.record.po2_results.iter().map(|r| r.segment_bytes)));
             // The configured cap (`prover.proving_timeout_secs`), not the inline path's tightened
             // estimate: a watchdog kill costs a witness lock its proof. The claim gate admitted the
             // lock only if its realistic estimate (the CPU wrap included) fits this cap; the deadline
@@ -3800,16 +3783,6 @@ fn cap_refusal(v: run::collateral::CapVerdict) -> Option<(SkipReason, String)> {
     Some((if v.is_final() { SkipReason::LimitsAboveHostMaxima } else { SkipReason::NotAdmitted }, why))
 }
 
-/// Bytes available to this user on the filesystem holding `dir`.
-fn free_bytes(dir: &Path) -> std::io::Result<u64> {
-    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| std::io::Error::other("path contains NUL"))?;
-    // SAFETY: statvfs fills a plain struct.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
-}
 
 /// What one [`WitnessRuntime::self_test_round`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

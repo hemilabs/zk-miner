@@ -911,7 +911,8 @@ Each property has a mechanism; none is assumed.
       since the executor's memory monitor reads its runner child's entries), the worker's own
       directory and SDK files, and the retention store;
     - write: a private `TMPDIR`, the segment directories (a witness proof's slot directory; for the
-      risc0 worker's other proofs, its own `~/.zkminer/risc0-segments/<pid>`), the GPU kernel caches,
+      risc0 worker's other proofs, its own `<segment_dir>/inline/<pid>-<start>`, or
+      `~/.zkminer/risc0-segments/<pid>-<start>` without `[retention]`), the GPU kernel caches,
       and, for an SP1 server, the user's Groth16 queue (`~/.zkminer/locks`, never in `/dev/shm`);
     - execute: only the loader and what the worker starts;
     - devices: the GPU nodes;

@@ -391,10 +391,21 @@ Worth knowing:
   Benchmarks saved by an older miner count SP1 instructions per second, which is close for code
   without precompiles; run `zkminer benchmark` (again with `--calibrate` if you calibrated) to
   record SP1 in gas.
-- **risc0 proofs write their segments to disk**, under `~/.zkminer/risc0-segments/<pid>` (mode
-  0700), not to the temporary directory: a long proof stages gigabytes there, which on a tmpfs
-  would be RAM the miner does not count. Keep room on the home filesystem. Each proof empties the
-  directory, and a worker that was killed has its directory removed when the next one starts.
+- **risc0 proofs write their segments to disk**, not to the temporary directory: a long proof
+  stages gigabytes there, which on a tmpfs would be RAM the miner does not count. Each worker has
+  a directory of its own (mode 0700): `<segment_dir>/inline/<pid>-<start>` when `[retention]` is
+  configured, beside the witness proofs', else `~/.zkminer/risc0-segments/<pid>-<start>`
+  (`~/.zkminer` may be a link of yours to a directory of yours, on another disk). Keep room there:
+  an inline risc0 job is claimed only while its segments (estimated at 4 bytes per sized cycle)
+  fit beside those of every proof planned or running, witness ones included, with 1 GiB to spare,
+  and a worker does not start a proof with under 1 GiB free. A proof that fails while the disk
+  has no room for its segments (a full disk or quota) is this host's failure: it is not held
+  against the job's program or submitter. Each proof empties its directory, and a worker that was
+  killed has its directory removed when the next one starts. That sweep tells a live worker by
+  its pid and start time in `/proc`. On another OS it cannot, and keeps every directory: remove a
+  killed worker's by hand. Workers that share one home from different pid namespaces (containers)
+  cannot see each other and would remove each other's: give each its own home, or its own
+  `[retention] segment_dir`.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for

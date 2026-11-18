@@ -199,6 +199,8 @@ fn main() {
             )
             .init();
     }
+    // Said on stderr before logging was up; again through it.
+    segments::log_fallback();
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -647,6 +649,15 @@ fn prove_panic_response(request_id: u64, panic: Box<dyn std::any::Any + Send>) -
 /// The answer to a Prove that failed with an error (inline and witness proofs alike).
 fn prove_error_response(request_id: u64, e: anyhow::Error) -> WorkerResponse {
     let msg = format!("{e:#}");
+    // A full segment filesystem (or quota) is this host's, not the job's: known by the error's type
+    // (an ENOSPC or EDQUOT in its chain, or the room check's refusal), never by its text.
+    if segments::storage_exhausted(&e) {
+        return WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!("this host's segment disk is full, not the job's fault: {msg}"),
+        };
+    }
     let lower = msg.to_ascii_lowercase();
     // A guest-execution fault must be classified BEFORE is_gpu_oom. risc0 wraps a
     // guest panic as "Guest panicked: <msg>" — a host-generated prefix followed by
@@ -1589,6 +1600,8 @@ fn run_proof_once(
         env_builder.session_limit(Some(limit));
     }
     let _segments = segments::spill_here(&mut env_builder);
+    // Not started on a disk it would fill part-way through its execution.
+    segments::check_room().context("the segment directory before a proof")?;
     let env = env_builder.build()?;
 
     // Use Groth16 receipt kind for on-chain verifiable proofs.
@@ -2358,5 +2371,34 @@ mod retry_tests {
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
         let err = run_execute(FIBONACCI_ELF, &[], Some(image), Some(po2)).unwrap_err();
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::{prove_error_response, ErrorKind, WorkerResponse};
+
+    fn kind(e: anyhow::Error) -> (ErrorKind, String) {
+        match prove_error_response(1, e) {
+            WorkerResponse::Error { kind, message, .. } => (kind, message),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A proof that failed because the segment filesystem (or this user's quota) is full is this
+    /// host's failure, not a failed proof of the job; a guest that only says so is still the job's.
+    #[test]
+    fn a_full_segment_disk_is_the_hosts_failure() {
+        for code in [libc::ENOSPC, libc::EDQUOT] {
+            let e = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
+                .context("writing segment 4095");
+            let (k, message) = kind(e);
+            assert!(matches!(k, ErrorKind::Internal), "{k:?}");
+            assert!(message.contains("segment disk is full"), "{message}");
+        }
+        let (k, _) = kind(anyhow::anyhow!(
+            "Guest panicked: No space left on device (os error 28)"
+        ));
+        assert!(matches!(k, ErrorKind::InvalidInput), "{k:?}");
     }
 }
