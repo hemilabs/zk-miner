@@ -174,8 +174,12 @@ enum Commands {
         stdin: bool,
         /// The risc0 segment size run first, reported on a tie, and the only one for `singleRun`.
         /// Otherwise a risc0 job runs at all seven sizes and the lowest figure is reported. With
-        /// --descriptor, the sizes to execute at, as one (`20`), a range (`16..22`) or a list
-        /// (`16,20`); default every job size, 16..=22.
+        /// --descriptor, the sizes to execute at and to judge maxGuestCycles at, as a miner whose
+        /// cards prove at them does: one (`20`), a range (`16..22`, every size) or a list (`16,20`).
+        /// Default: the sizes this configuration's cards prove at (its benchmark cache and
+        /// prover.risc0_job_po2), else every job size, 16..=22, each judged on its own: a job over
+        /// maxGuestCycles at some sizes only is reported with them, since whether a miner serves it
+        /// then depends on the size its cards prove at.
         #[arg(long)]
         po2: Option<String>,
         /// Bound on one execution, in seconds: at least 60 (a lower value is raised to it), at most
@@ -624,7 +628,12 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             cache_dir,
             ..
         } => {
-            let po2s = commands::simulate::parse_po2_set(po2.as_deref().unwrap_or("16..=22"))?;
+            // Without --po2: this configuration's cards' sizes when it names them, else every job size,
+            // each judged on its own (see `simulate_witness::po2_plan`).
+            let po2s = po2
+                .as_deref()
+                .map(commands::simulate::parse_po2_set)
+                .transpose()?;
             anyhow::ensure!((14..=18).contains(&keccak_po2), "--keccak-po2 must be within 14..=18");
             let opts = commands::simulate_witness::WitnessSimOptions {
                 descriptor,

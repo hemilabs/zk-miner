@@ -396,7 +396,8 @@ struct Limits {
   decide retention and proving); the builder-side limits → clamp (a builder that needed more fails).
 - **`maxGuestCycles`** is in the unit every prover computes the same way: the maximum, over the po2s
   the prover may use, of Σ over segments of 2^po2 plus 2^(keccak po2 + 3) per keccak request (2^20
-  at the default keccak po2 17). `zkminer simulate` prints it per po2.
+  at the default keccak po2 17). `zkminer simulate` prints it per po2, and says at which po2s a job
+  goes over it (§16).
 - **Versioning.** Any change to the struct or a field's meaning is a new tag; a tag a miner does not
   know makes the job look inline, and it fails its binding in simulation, harmlessly. A new
   `builderURIs` scheme is not a new tag; a known scheme's format changes only under a new scheme
@@ -1743,7 +1744,12 @@ with a throwaway retention store. It prints one JSON report:
 
 - the outcome; for a skipped job, the verdict, its step and its retry class;
 - fuel, fetches, bytes, the builder's peak memory and `|W|`;
-- cycles in the `maxGuestCycles` unit and the journal per po2 (by default every job po2);
+- cycles in the `maxGuestCycles` unit and the journal per po2, judged against `maxGuestCycles` as a
+  miner judges the po2s it may use (§7.1): by default at the sizes this configuration's cards prove at
+  (its benchmark cache and `prover.risc0_job_po2`); when it names none, at every job po2, each on its
+  own, so a job over the limit at some sizes only is reported with them (`cycleLimit`) and not
+  skipped, since whether a miner serves it depends on the segment size its cards prove at; `--po2`
+  names the sizes to judge at (`--po2 16..22`: every one);
 - the pinned bytes and the binding's mutation check;
 - the estimated fulfil DA size (from `GasPriceOracle`, else an upper bound) and this host's
   admission parameters;

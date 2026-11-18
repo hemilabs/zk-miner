@@ -143,6 +143,8 @@ pub struct HostContext {
     pub host_maxima: HostMaxima,
     /// The po2 of every card that may prove a witness job: each is executed (§5.1 rule 2).
     pub po2s: Vec<u8>,
+    /// How `maxGuestCycles` is judged over `po2s` (the miner: [`CycleJudging::EveryPo2`]).
+    pub cycle_judging: CycleJudging,
     /// `RISC0_KECCAK_PO2` of the provers (guest-visible, §5.4).
     pub keccak_po2: u8,
     /// The build id of every prove worker that may prove a bundle (§15.1), as
@@ -164,6 +166,20 @@ pub struct HostContext {
     pub image_id_fn: ImageIdFn,
     /// Which unpinned bundles go first when the store needs room for a new one.
     pub eviction_value: EvictionValueFn,
+}
+
+/// How the execute step judges `maxGuestCycles` (§7.1: over the po2s the prover may use).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CycleJudging {
+    /// The miner: any card of [`HostContext::po2s`] may prove the job, so it is skipped when the
+    /// guest goes over the cap at one of them. One execute runs every po2 and stops at the cap.
+    EveryPo2,
+    /// `zkminer simulate --descriptor`, which must say at which sizes a job fits: each po2 is
+    /// executed on its own under the cap (within one `execute_timeout`), and
+    /// [`PipelineHooks::executed_po2`] hears every outcome. The job is skipped when the guest goes
+    /// over at a po2 of `required` (the sizes its prover's cards prove at, when known) or at every
+    /// po2; otherwise the po2s within the cap go on, and the bundle records those.
+    PerPo2 { required: Vec<u8> },
 }
 
 /// The default eviction value: the block a bundle was created at (oldest first).
@@ -222,6 +238,11 @@ pub trait PipelineHooks: Send + Sync {
     fn guest_elf(&self) -> HookFuture<'_, Result<Vec<u8>, (SkipReason, String)>> {
         Box::pin(async { Err((SkipReason::HostInternal, "no guest ELF source".to_string())) })
     }
+
+    /// Under [`CycleJudging::PerPo2`], one po2's execute against `maxGuestCycles`: its sized cycles
+    /// when the guest halted within the cap, `None` when it went over. Called for every po2 that ran
+    /// to either outcome, before the verdict.
+    fn executed_po2(&self, _po2: u8, _cycles: Option<u64>) {}
 }
 
 /// The build id a witness bundle records for a risc0 worker: its SDK and worker versions as its
@@ -892,6 +913,125 @@ async fn execute(
     result.map_err(|e| Skip::new(execute_reason(&e), S, execute_detail(&e)))
 }
 
+/// [`CycleJudging::PerPo2`]: `req` executed at each of `po2s` on its own, under the job's cap
+/// `max_cycles`, all within one `execute_timeout`. Returns the merged response of the po2s within the
+/// cap, and those po2s; skips when the guest went over at a po2 of `required` or at every po2, and on
+/// any other execute verdict.
+#[allow(clippy::too_many_arguments)]
+async fn execute_per_po2(
+    ctx: &HostContext,
+    hooks: &dyn PipelineHooks,
+    req: &WitnessExecuteRequest,
+    w: &File,
+    job_key: B256,
+    po2s: &[u8],
+    required: &[u8],
+    max_cycles: u64,
+) -> Result<(WitnessExecuteResponse, Vec<u8>), Skip> {
+    const E: Step = Step::Execute;
+    let token = hooks.abort_token();
+    let deadline = Instant::now() + ctx.execute_timeout;
+    let mut merged: Option<WitnessExecuteResponse> = None;
+    let (mut within, mut over) = (Vec::new(), Vec::new());
+    for &po2 in po2s {
+        let file = w.try_clone().map_err(|e| {
+            Skip::new(
+                SkipReason::HostInternal,
+                E,
+                format!("reopening the sealed W: {e}"),
+            )
+        })?;
+        let one = WitnessExecuteRequest {
+            po2s: vec![po2],
+            ..req.clone()
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let r = match execute(
+            ctx,
+            token,
+            one,
+            file,
+            format!("wexec-{}-{po2}", short(job_key)),
+            remaining,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(s) if s.reason() == Some(SkipReason::GuestCyclesAboveLimit) => {
+                hooks.executed_po2(po2, None);
+                over.push(po2);
+                continue;
+            }
+            Err(s) => return Err(s),
+        };
+        let cycles = match r.results.as_slice() {
+            [one] if one.po2 == po2 => one.cycles,
+            _ => {
+                return Err(Skip::new(
+                    SkipReason::HostInternal,
+                    E,
+                    format!("po2 {po2}: the execute answered for other po2s"),
+                ))
+            }
+        };
+        // The worker stops at the cap, so this is the cap's own check, as `check_execution`'s.
+        if !cycles::within_limit([cycles], max_cycles) {
+            hooks.executed_po2(po2, None);
+            over.push(po2);
+            continue;
+        }
+        hooks.executed_po2(po2, Some(cycles));
+        within.push(po2);
+        match &mut merged {
+            None => merged = Some(r),
+            Some(m) => {
+                if (m.image_id, &m.sdk_version, &m.worker_version)
+                    != (r.image_id, &r.sdk_version, &r.worker_version)
+                {
+                    return Err(Skip::new(
+                        SkipReason::HostInternal,
+                        E,
+                        "the execute worker's answers differ across po2s",
+                    ));
+                }
+                m.results.extend(r.results);
+            }
+        }
+    }
+    let required_over: Vec<u8> = over
+        .iter()
+        .copied()
+        .filter(|p| required.contains(p))
+        .collect();
+    match merged {
+        Some(m) if required_over.is_empty() => Ok((m, within)),
+        _ => Err(Skip::new(
+            SkipReason::GuestCyclesAboveLimit,
+            E,
+            format!(
+                "over maxGuestCycles {max_cycles} at po2 {}{}",
+                po2_list(&over),
+                if required_over.is_empty() {
+                    " (every po2 executed)".to_string()
+                } else {
+                    format!(
+                        ", which the prover's cards prove at ({})",
+                        po2_list(required)
+                    )
+                }
+            ),
+        )),
+    }
+}
+
+/// `16, 17, 20`.
+pub fn po2_list(po2s: &[u8]) -> String {
+    po2s.iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// `bytes` in a write-sealed memfd, as the execute worker takes `W` (fd 3: a read-only regular file
 /// or a sealed memfd, read with `pread`).
 pub fn sealed_memfd(name: &str, bytes: &[u8]) -> io::Result<File> {
@@ -1115,7 +1255,33 @@ pub async fn simulate_witness_job(
         keccak_po2: ctx.keccak_po2,
         max_cycles: Some(limits.maxGuestCycles),
     };
-    let resp = execute(ctx, token, req, w_file, format!("wexec-{}", short(job_key)), ctx.execute_timeout).await?;
+    let (resp, po2s) = match &ctx.cycle_judging {
+        CycleJudging::EveryPo2 => {
+            let resp = execute(
+                ctx,
+                token,
+                req,
+                w_file,
+                format!("wexec-{}", short(job_key)),
+                ctx.execute_timeout,
+            )
+            .await?;
+            (resp, po2s)
+        }
+        CycleJudging::PerPo2 { required } => {
+            execute_per_po2(
+                ctx,
+                hooks,
+                &req,
+                &w_file,
+                job_key,
+                &po2s,
+                required,
+                limits.maxGuestCycles,
+            )
+            .await?
+        }
+    };
     let journal = check_execution(&resp, &po2s, program_id, limits.maxGuestCycles).map_err(|(r, d)| Skip::new(r, E, d))?;
     timings.execute = t.elapsed();
     // The build recorded is the handshake's, never what the process that ran the guest says of itself.

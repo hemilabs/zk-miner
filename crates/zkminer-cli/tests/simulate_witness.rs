@@ -255,6 +255,17 @@ impl Env {
         std::fs::write(&path, text.replace(at, &format!("{at}{lines}\n"))).unwrap();
     }
 
+    /// The miner's configuration with a `[prover]` table naming its cards' job sizes.
+    fn card_sizes(&self, table: &str) {
+        let path = self.path("config.toml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        if let Some(at) = text.find("\n[prover]\n") {
+            text.truncate(at + 1);
+        }
+        text.push_str(&format!("[prover]\nrisc0_job_po2 = {table}\n"));
+        std::fs::write(&path, text).unwrap();
+    }
+
     fn zkminer(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_zkminer"));
         c.arg("-c").arg(self.path("config.toml")).args(args).env("HOME", self.dir.path());
@@ -263,7 +274,27 @@ impl Env {
 
     /// A job spec for the fibonacci guest built by params-echo with `n`, under `binding` (a TOML
     /// `[binding]` body), encoded by `zkminer witness envelope encode` into a descriptor file.
-    fn descriptor(&self, name: &str, n: u32, binding: &str, uris: &[String], extra: &str) -> PathBuf {
+    fn descriptor(
+        &self,
+        name: &str,
+        n: u32,
+        binding: &str,
+        uris: &[String],
+        extra: &str,
+    ) -> PathBuf {
+        self.descriptor_capped(name, n, binding, uris, extra, 1 << 24)
+    }
+
+    /// [`Env::descriptor`] with the envelope's `maxGuestCycles`.
+    fn descriptor_capped(
+        &self,
+        name: &str,
+        n: u32,
+        binding: &str,
+        uris: &[String],
+        extra: &str,
+        cycles: u64,
+    ) -> PathBuf {
         let (_, image_id) = setup();
         let spec = self.path(&format!("{name}.toml"));
         std::fs::write(
@@ -274,7 +305,7 @@ impl Env {
                  archive = true\nmethod_set = \"state-read\"\nmax_proof_age = 0\n[envelope.limits]\nmax_fetches = 4\n\
                  max_fetch_bytes = 1048576\nmax_request_bytes = 65536\nmax_response_bytes = 1048576\n\
                  max_builder_fuel = 1000000000\nmax_builder_memory_bytes = 67108864\nmax_builder_seconds = 30\n\
-                 max_witness_bytes = 65536\nmax_guest_cycles = 16777216\n",
+                 max_witness_bytes = 65536\nmax_guest_cycles = {cycles}\n",
                 params = alloy::hex::encode(n.to_le_bytes())
             ),
         )
@@ -458,6 +489,143 @@ fn a_job_the_miner_would_skip_reports_its_verdict() {
     let (out, r) = env.simulate(&d, &["--builder", other.to_str().unwrap(), "--po2", "20"]);
     assert!(!out.status.success());
     assert_eq!(r["verdict"]["reason"], "ArtifactAllSourcesBad");
+}
+
+/// maxGuestCycles is judged over the po2s the prover may use (§7.1): a job over it at some segment
+/// sizes only is served by a miner whose cards prove at the others. Without card sizes the verdict
+/// names the sizes over it and says it depends on them; `--po2` and this configuration's card sizes
+/// judge as such a miner does.
+#[test]
+fn a_cycle_limit_met_at_some_sizes_only_is_judged_at_the_provers_sizes() {
+    let _g = serial();
+    if unavailable("a_cycle_limit_met_at_some_sizes_only_is_judged_at_the_provers_sizes") {
+        return;
+    }
+    let env = Env::new();
+    let wasm = env.path("echo.wasm");
+    let builder = wasm.to_str().unwrap().to_string();
+    // Enough iterations for many segments at po2 16: the sized count differs across sizes.
+    let n = 300_000;
+    let d = env.descriptor("sizes", n, &full_binding(n), &[], "");
+    let (out, r) = env.simulate(
+        &d,
+        &[
+            "--builder",
+            &builder,
+            "--po2",
+            "16..22",
+            "--max-guest-cycles",
+            "67108864",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}\n{r:#}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let counts: Vec<(u8, u64)> = r["perPo2"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["po2"].as_u64().unwrap() as u8,
+                p["cycles"].as_str().unwrap().parse().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(counts.len(), 7, "{counts:?}");
+    // The job's cap: the smallest count, so the sizes above it go over.
+    let cap = counts.iter().map(|c| c.1).min().unwrap();
+    let within: Vec<u8> = counts.iter().filter(|c| c.1 <= cap).map(|c| c.0).collect();
+    let over: Vec<u8> = counts.iter().filter(|c| c.1 > cap).map(|c| c.0).collect();
+    assert!(
+        !over.is_empty(),
+        "every size counts {cap}: raise n ({counts:?})"
+    );
+    let d = env.descriptor_capped("capped", n, &full_binding(n), &[], "", cap);
+
+    // No card sizes known (no benchmark cache under this HOME, no prover.risc0_job_po2): every size
+    // runs, each judged on its own, and the job is servable at the sizes within the cap.
+    let (out, r) = env.simulate(&d, &["--builder", &builder]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{stderr}\n{r:#}");
+    assert_eq!(r["outcome"], "simulated");
+    assert!(
+        r["po2Source"]
+            .as_str()
+            .unwrap()
+            .starts_with("every job size"),
+        "{}",
+        r["po2Source"]
+    );
+    let c = &r["cycleLimit"];
+    let list = |v: &Value| -> Vec<u8> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u8)
+            .collect()
+    };
+    assert_eq!(list(&c["overAt"]), over, "{c:#}");
+    assert_eq!(list(&c["withinAt"]), within, "{c:#}");
+    assert!(list(&c["judgedAt"]).is_empty());
+    assert_eq!(c["maxGuestCycles"], cap.to_string());
+    assert!(stderr.contains("depends on the segment size"), "{stderr}");
+    assert_eq!(
+        list(&Value::Array(
+            r["perPo2"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["po2"].clone())
+                .collect()
+        )),
+        within
+    );
+
+    // Every size, asked explicitly: judged at each, as a miner with a card at each would.
+    let (out, r) = env.simulate(&d, &["--builder", &builder, "--po2", "16..22"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success());
+    assert_eq!(r["outcome"], "skipped");
+    assert_eq!(r["verdict"]["reason"], "GuestCyclesAboveLimit");
+    assert_eq!(r["verdict"]["step"], "execute");
+    assert_eq!(list(&r["cycleLimit"]["overAt"]), over);
+    assert!(stderr.contains("would skip this job"), "{stderr}");
+
+    // This configuration's card proves at a size within the cap: served, at that size only.
+    let (ok, bad) = (within[0], over[0]);
+    env.card_sizes(&format!("{{ gpu0 = {ok} }}"));
+    let (out, r) = env.simulate(&d, &["--builder", &builder]);
+    assert!(
+        out.status.success(),
+        "{}\n{r:#}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(r["outcome"], "simulated");
+    assert_eq!(list(&r["po2s"]), vec![ok]);
+    assert!(
+        r["po2Source"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("gpu0 at po2 {ok}")),
+        "{}",
+        r["po2Source"]
+    );
+    assert!(list(&r["cycleLimit"]["overAt"]).is_empty());
+
+    // ... and at a size over it: skipped, as that miner skips it.
+    env.card_sizes(&format!("{{ gpu0 = {bad} }}"));
+    let (out, r) = env.simulate(&d, &["--builder", &builder]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success());
+    assert_eq!(r["verdict"]["reason"], "GuestCyclesAboveLimit");
+    assert_eq!(list(&r["cycleLimit"]["judgedAt"]), vec![bad]);
+    assert!(
+        stderr.contains(&format!("a miner proving at po2 {bad}")),
+        "{stderr}"
+    );
 }
 
 #[test]

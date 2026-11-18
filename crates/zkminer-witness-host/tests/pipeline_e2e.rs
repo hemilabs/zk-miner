@@ -45,8 +45,9 @@ use zkminer_witness_broker::client::ArtifactCharge;
 use zkminer_witness_host::abort::{AbortReason, AbortToken};
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::pipeline::{
-    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, simulate_witness_job, sys_rand_rule,
-    ArtifactOrigin, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip, Step,
+    descriptor_hash_of_abi, eviction_by_age, execute_worker_build, simulate_witness_job,
+    sys_rand_rule, ArtifactOrigin, CycleJudging, HookFuture, HostContext, ImageIdFn, JobInput,
+    PipelineHooks, Simulated, Skip, Step,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_sandbox::{delegated_root, landlock_abi, SandboxError, MIN_LANDLOCK_ABI};
@@ -434,6 +435,7 @@ impl Env {
             execute_binary: bins.worker.clone(),
             host_maxima: host_maxima(),
             po2s: PO2S.to_vec(),
+            cycle_judging: CycleJudging::EveryPo2,
             keccak_po2: 17,
             worker_builds: vec!["test-worker-build".into()],
             execute_build,

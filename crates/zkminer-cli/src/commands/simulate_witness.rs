@@ -72,9 +72,9 @@ use zkminer_witness_host::adversarial::{
 use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
-    eviction_by_age, execute_worker_build, host_maxima, simulate_witness_job, ArtifactOrigin,
-    HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks, Simulated, Skip,
-    DEFAULT_MAX_ARTIFACT_BYTES, MAX_HOST_GUEST_CYCLES,
+    eviction_by_age, execute_worker_build, host_maxima, po2_list, simulate_witness_job,
+    ArtifactOrigin, CycleJudging, HookFuture, HostContext, ImageIdFn, JobInput, PipelineHooks,
+    Simulated, Skip, DEFAULT_MAX_ARTIFACT_BYTES, MAX_HOST_GUEST_CYCLES,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_store::{ExpectedIdentity, Store, StoreIdentityInit, StoreOptions};
@@ -124,7 +124,9 @@ pub struct WitnessSimOptions {
     pub builder: Option<PathBuf>,
     pub elf: Option<PathBuf>,
     pub prover: Option<Address>,
-    pub po2s: Vec<u8>,
+    /// `--po2`: the sizes to execute at, each judged as a miner judges its cards' sizes. `None`:
+    /// [`po2_plan`]'s.
+    pub po2s: Option<Vec<u8>>,
     pub keccak_po2: u8,
     pub broker_config: Option<PathBuf>,
     pub execute_worker: Option<PathBuf>,
@@ -259,6 +261,23 @@ pub struct CyclesReport {
     pub host_max_source: &'static str,
 }
 
+/// `maxGuestCycles` at each executed po2 (§7.1: judged over the po2s the prover may use).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CycleLimitReport {
+    /// The job's `maxGuestCycles` (a decimal string).
+    pub max_guest_cycles: String,
+    /// The po2s the guest halted within it at, and those it went over it at.
+    pub within_at: Vec<u8>,
+    pub over_at: Vec<u8>,
+    /// The po2s it is judged at, as a miner judges its cards' sizes: `--po2`'s, or this
+    /// configuration's cards'. Empty when neither names one: a job over at some po2s only is then
+    /// served by a miner whose cards prove at the others, and skipped by one proving at those.
+    pub judged_at: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Timings {
@@ -383,7 +402,10 @@ pub struct WitnessReport {
     pub outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<VerdictReport>,
+    /// The po2s executed, and where they came from: `--po2`, this configuration's cards, or every
+    /// job size.
     pub po2s: Vec<u8>,
+    pub po2_source: String,
     pub keccak_po2: u8,
     /// The `sys_rand` rule the executions were seeded by, as `zkminer simulate`'s other reports
     /// name it: a miner's own executions and proofs are seeded alike.
@@ -396,6 +418,8 @@ pub struct WitnessReport {
     pub per_po2: Vec<Po2Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cycles: Option<CyclesReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle_limit: Option<CycleLimitReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal: Option<JournalReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -622,6 +646,7 @@ impl SimHost {
         broker: &BrokerProcess,
         config: &ZkMinerConfig,
         po2s: Vec<u8>,
+        cycle_judging: CycleJudging,
         keccak_po2: u8,
         execute_timeout: Duration,
     ) -> HostContext {
@@ -636,6 +661,7 @@ impl SimHost {
             execute_binary: self.execute_binary.clone(),
             host_maxima: host_maxima(w, self.max_guest_cycles),
             po2s,
+            cycle_judging,
             keccak_po2,
             worker_builds: vec![self.execute_build.clone()],
             execute_build: self.execute_build.clone(),
@@ -662,6 +688,8 @@ struct SimHooks {
     program_id: B256,
     /// The ELF the run executes: `--elf`'s, or what [`PipelineHooks::guest_elf`] fetched.
     fetched_elf: Arc<Mutex<Option<Vec<u8>>>>,
+    /// Each executed po2 against `maxGuestCycles` ([`PipelineHooks::executed_po2`]).
+    executed: Mutex<Vec<(u8, Option<u64>)>>,
 }
 
 impl PipelineHooks for SimHooks {
@@ -679,6 +707,13 @@ impl PipelineHooks for SimHooks {
 
     fn abort_token(&self) -> &AbortToken {
         &self.token
+    }
+
+    fn executed_po2(&self, po2: u8, cycles: Option<u64>) {
+        self.executed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((po2, cycles));
     }
 
     /// The miner's ELF path: the registry entry, then the bytes its `elf_hash` names from any URI
@@ -784,6 +819,171 @@ fn host_max_guest_cycles(config: &ZkMinerConfig, opts: &WitnessSimOptions) -> (u
         (None, Some(c)) => (c, "[witness] max_guest_cycles"),
         (None, None) => (MAX_HOST_GUEST_CYCLES, "unset"),
     }
+}
+
+/// The po2s a simulation executes, and those `maxGuestCycles` is judged at as a miner judges its
+/// cards' sizes (§7.1: over the po2s the prover may use).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Po2Plan {
+    pub po2s: Vec<u8>,
+    /// Over at one of these, the job is skipped. Empty: no prover's sizes are known, and only a job
+    /// over at every size is.
+    pub required: Vec<u8>,
+    pub source: String,
+}
+
+/// `--po2`'s sizes, judged at every one; else the sizes this configuration's cards prove at
+/// ([`configured_card_po2s`]); else every job size, each judged on its own.
+pub fn po2_plan(asked: Option<&[u8]>, cards: Option<(Vec<u8>, String)>) -> Po2Plan {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    match (asked, cards) {
+        (Some(a), _) => Po2Plan {
+            po2s: a.to_vec(),
+            required: a.to_vec(),
+            source: "--po2".into(),
+        },
+        (None, Some((c, source))) => Po2Plan {
+            po2s: c.clone(),
+            required: c,
+            source,
+        },
+        (None, None) => Po2Plan {
+            po2s: (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).collect(),
+            required: Vec::new(),
+            source:
+                "every job size: this configuration names no card sizes (--po2 gives a prover's)"
+                    .into(),
+        },
+    }
+}
+
+/// The sizes this configuration's risc0 cards prove jobs at, sized as the miner sizes them
+/// (`benchmark::risc0_job_po2`): each risc0 row of `suite` (the benchmark cache, while this
+/// hardware still matches it) at its `prover.risc0_job_po2` size, else its calibration or the
+/// default size; and each other card `prover.risc0_job_po2` names. `None` when neither names a card.
+/// The cards' VRAM is not read here, so a card the miner gives no jobs (under 14 GiB, uncalibrated)
+/// counts at the default size; the source names every card and its size.
+pub fn configured_card_po2s(
+    config: &ZkMinerConfig,
+    suite: Option<&zkminer_prover::benchmark::BenchmarkSuite>,
+) -> Option<(Vec<u8>, String)> {
+    use zkminer_prover_protocol::{BACKEND_RISC0, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let overrides = &config.prover.risc0_job_po2;
+    let mut cards: Vec<(String, u8)> = Vec::new();
+    let mut from = Vec::new();
+    for row in suite
+        .iter()
+        .flat_map(|s| &s.device_benchmarks)
+        .filter(|d| d.prover_backend == BACKEND_RISC0)
+    {
+        let over = overrides.get(&row.device_id).copied();
+        if let Some(po2) = zkminer_prover::benchmark::risc0_job_po2(over, Some(row), None) {
+            if !cards.iter().any(|(d, _)| *d == row.device_id) {
+                cards.push((row.device_id.clone(), po2));
+            }
+        }
+    }
+    if !cards.is_empty() {
+        from.push("the benchmark cache");
+    }
+    for (device, po2) in overrides {
+        if !cards.iter().any(|(d, _)| d == device) {
+            cards.push((
+                device.clone(),
+                (*po2).clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX),
+            ));
+        }
+    }
+    if !overrides.is_empty() {
+        from.push("prover.risc0_job_po2");
+    }
+    if cards.is_empty() {
+        return None;
+    }
+    cards.sort();
+    let mut po2s: Vec<u8> = cards.iter().map(|(_, p)| *p).collect();
+    po2s.sort_unstable();
+    po2s.dedup();
+    let list = cards
+        .iter()
+        .map(|(d, p)| format!("{d} at po2 {p}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((
+        po2s,
+        format!(
+            "this configuration's cards: {list} (from {})",
+            from.join(" and ")
+        ),
+    ))
+}
+
+/// The benchmark cache `zkminer run` sizes its cards by, when there is one (read without probing
+/// the GPUs when there is not).
+fn cached_benchmark() -> Option<zkminer_prover::benchmark::BenchmarkSuite> {
+    zkminer_prover::benchmark::benchmark_cache_path()
+        .is_file()
+        .then(zkminer_prover::benchmark::load_cached_benchmark)
+        .flatten()
+}
+
+/// The `maxGuestCycles` part of the report, from each executed po2's outcome.
+fn cycle_limit_report(
+    max_guest_cycles: u64,
+    executed: &[(u8, Option<u64>)],
+    plan: &Po2Plan,
+) -> Option<CycleLimitReport> {
+    if executed.is_empty() {
+        return None;
+    }
+    let mut within_at: Vec<u8> = executed
+        .iter()
+        .filter(|(_, c)| c.is_some())
+        .map(|(p, _)| *p)
+        .collect();
+    let mut over_at: Vec<u8> = executed
+        .iter()
+        .filter(|(_, c)| c.is_none())
+        .map(|(p, _)| *p)
+        .collect();
+    within_at.sort_unstable();
+    over_at.sort_unstable();
+    let note = if over_at.is_empty() {
+        None
+    } else if within_at.is_empty() {
+        Some(format!(
+            "over maxGuestCycles at every po2 executed ({}): a miner skips this job",
+            po2_list(&over_at)
+        ))
+    } else {
+        let required_over: Vec<u8> = over_at
+            .iter()
+            .copied()
+            .filter(|p| plan.required.contains(p))
+            .collect();
+        Some(if !required_over.is_empty() {
+            format!(
+                "over maxGuestCycles at po2 {}, which {} proves at: a miner proving there skips this job",
+                po2_list(&required_over),
+                if plan.source == "--po2" { "--po2 says the prover" } else { "this configuration" }
+            )
+        } else {
+            format!(
+                "over maxGuestCycles at po2 {} and within it at po2 {}: whether a miner serves this job depends on \
+                 the segment size its cards prove at (one proving at po2 {} skips it); --po2 judges at given sizes",
+                po2_list(&over_at),
+                po2_list(&within_at),
+                po2_list(&over_at)
+            )
+        })
+    };
+    Some(CycleLimitReport {
+        max_guest_cycles: max_guest_cycles.to_string(),
+        within_at,
+        over_at,
+        judged_at: plan.required.clone(),
+        note,
+    })
 }
 
 /// The journal header's length the binding must pin: a registered scheme's `W` declares it (read
@@ -1109,6 +1309,7 @@ fn hooks_and_context(
     client: Option<ChainClient>,
     token: &AbortToken,
     po2s: Vec<u8>,
+    cycle_judging: CycleJudging,
     keccak_po2: u8,
     execute_timeout: Duration,
 ) -> (SimHooks, HostContext) {
@@ -1120,8 +1321,16 @@ fn hooks_and_context(
         client,
         program_id: p.descriptor.programId,
         fetched_elf: slot.clone(),
+        executed: Mutex::new(Vec::new()),
     };
-    let mut ctx = host.context(broker, &p.config, po2s, keccak_po2, execute_timeout);
+    let mut ctx = host.context(
+        broker,
+        &p.config,
+        po2s,
+        cycle_judging,
+        keccak_po2,
+        execute_timeout,
+    );
     let id = p.descriptor.programId;
     ctx.image_id_fn = Arc::new(move |b: &[u8]| {
         slot.lock().unwrap_or_else(|e| e.into_inner()).as_deref().filter(|e| *e == b).map(|_| id)
@@ -1161,6 +1370,13 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
     }
     let w = &p.config.witness;
     let (host_max_cycles, host_max_source) = host_max_guest_cycles(&p.config, &opts);
+    let plan = match &opts.po2s {
+        Some(asked) => po2_plan(Some(asked), None),
+        None => po2_plan(
+            None,
+            configured_card_po2s(&p.config, cached_benchmark().as_ref()),
+        ),
+    };
     let mut not_checked = NOT_CHECKED.to_vec();
     if opts.builder.is_some() {
         not_checked.push(NOT_CHECKED_BUILDER);
@@ -1183,7 +1399,8 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         router: p.router,
         outcome: "skipped",
         verdict: None,
-        po2s: opts.po2s.clone(),
+        po2s: plan.po2s.clone(),
+        po2_source: plan.source.clone(),
         keccak_po2: opts.keccak_po2,
         sys_rand_rule: zkminer_prover_protocol::sys_rand::SYS_RAND_RULE,
         execute_build: host.execute_build.clone(),
@@ -1191,6 +1408,7 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         witness: None,
         per_po2: Vec::new(),
         cycles: None,
+        cycle_limit: None,
         journal: None,
         binding: None,
         fulfil: None,
@@ -1209,12 +1427,24 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
         &broker,
         client.clone(),
         &token,
-        opts.po2s.clone(),
+        plan.po2s.clone(),
+        // Each po2 on its own, so the report names every one over maxGuestCycles.
+        CycleJudging::PerPo2 {
+            required: plan.required.clone(),
+        },
         opts.keccak_po2,
         opts.execute_timeout,
     );
     let result = run_pipeline(&p, &ctx, &hooks, current_block).await;
     let declared = decode(&p.descriptor.inputData).map(|e| e.job.limits).ok();
+    if let Some(declared) = &declared {
+        let executed = hooks
+            .executed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        report.cycle_limit = cycle_limit_report(declared.maxGuestCycles, &executed, &plan);
+    }
     let mut header_source = None;
     let simulated = match result {
         Ok(s) => {
@@ -1263,6 +1493,7 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
                     ctx: &ctx,
                     token: &token,
                     opts: &opts,
+                    po2s: s.per_po2.iter().map(|x| x.po2 as u8).collect(),
                     client: client.as_ref(),
                     current_block,
                     broker_toml: &broker_toml,
@@ -1284,7 +1515,37 @@ pub async fn run(config_path: Option<&Path>, opts: WitnessSimOptions) -> Result<
     drop(host);
     if report.outcome != "simulated" {
         let v = report.verdict.as_ref().map(|v| format!("{:?} at {}", v.reason, v.step)).unwrap_or_else(|| report.outcome.into());
-        bail!("a miner with this configuration would skip this job: {v}");
+        let over_cap = report
+            .verdict
+            .as_ref()
+            .is_some_and(|v| v.reason == SkipReason::GuestCyclesAboveLimit);
+        match (&report.cycle_limit, over_cap) {
+            (Some(c), true) if !plan.required.is_empty() => {
+                let over: Vec<u8> = c.over_at.iter().copied().filter(|p| plan.required.contains(p)).collect();
+                bail!(
+                    "a miner proving at po2 {} ({}) would skip this job: {v}, over maxGuestCycles {} at po2 {}",
+                    po2_list(&plan.required),
+                    plan.source,
+                    c.max_guest_cycles,
+                    po2_list(&over)
+                );
+            }
+            (Some(c), true) => bail!(
+                "every po2 executed ({}) is over maxGuestCycles {}: a miner would skip this job: {v}",
+                po2_list(&c.over_at),
+                c.max_guest_cycles
+            ),
+            _ => bail!("a miner with this configuration would skip this job: {v}"),
+        }
+    }
+    // Served at some sizes only: the verdict is the prover's segment size, so say so.
+    if let Some(note) = report
+        .cycle_limit
+        .as_ref()
+        .filter(|c| !c.over_at.is_empty())
+        .and_then(|c| c.note.as_ref())
+    {
+        eprintln!("zkminer simulate: {note}");
     }
     if let Some(a) = &report.adversarial {
         if a.verdict != "pass" {
@@ -1307,6 +1568,8 @@ struct Adversary<'a> {
     ctx: &'a HostContext,
     token: &'a AbortToken,
     opts: &'a WitnessSimOptions,
+    /// The po2s the simulation ran within `maxGuestCycles` at: every attack executes at these.
+    po2s: Vec<u8>,
     client: Option<&'a ChainClient>,
     current_block: u64,
     /// The broker configuration, parsed: each provider run writes its own from it.
@@ -1446,8 +1709,8 @@ impl Adversary<'_> {
             judge,
             prefix,
             w: &w,
-            po2: *self.opts.po2s.first().expect("a po2"),
-            po2s: &self.opts.po2s,
+            po2: *self.po2s.first().expect("a po2 within the cap"),
+            po2s: &self.po2s,
             keccak_po2: self.opts.keccak_po2,
             cycles: CycleLimits { host: self.host.max_guest_cycles, job: s.limits.maxGuestCycles },
             deadline,
@@ -1574,7 +1837,8 @@ impl Adversary<'_> {
                     &broker,
                     self.client.cloned(),
                     &token,
-                    vec![*self.opts.po2s.first().expect("a po2")],
+                    vec![*self.po2s.first().expect("a po2 within the cap")],
+                    CycleJudging::EveryPo2,
                     self.opts.keccak_po2,
                     self.opts.execute_timeout.min(remaining),
                 );
@@ -1647,6 +1911,97 @@ mod tests {
             words: &[],
             assigned_prover: Address::repeat_byte(0xb0),
         })
+    }
+
+    #[test]
+    fn the_po2_plan_judges_at_the_provers_sizes_when_known() {
+        let cards = || Some((vec![19, 20], "this configuration's cards: …".to_string()));
+        // --po2: executed and judged at every one, whatever the cards.
+        let p = po2_plan(Some(&[16, 22]), cards());
+        assert_eq!(
+            (p.po2s, p.required, p.source.as_str()),
+            (vec![16, 22], vec![16, 22], "--po2")
+        );
+        // The cards' sizes, as the miner executes and judges them.
+        let p = po2_plan(None, cards());
+        assert_eq!((p.po2s, p.required), (vec![19, 20], vec![19, 20]));
+        // Neither: every job size, none required, so a job over at some sizes only is not skipped.
+        let p = po2_plan(None, None);
+        assert_eq!(p.po2s, (16..=22).collect::<Vec<u8>>());
+        assert!(
+            p.required.is_empty() && p.source.starts_with("every job size"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn card_sizes_come_from_the_benchmark_cache_and_the_configured_sizes() {
+        use zkminer_prover::benchmark::{BenchmarkSuite, DeviceBenchmark};
+        let mut config = ZkMinerConfig::default();
+        assert_eq!(configured_card_po2s(&config, None), None);
+        let row = |device: &str, backend: &str| -> DeviceBenchmark {
+            serde_json::from_value(serde_json::json!({
+                "device_id": device, "device_label": device, "prover_backend": backend,
+                "throughput": 1.0, "power_watts": 1.0,
+            }))
+            .unwrap()
+        };
+        let suite = BenchmarkSuite {
+            device_benchmarks: vec![
+                row("gpu0", "risc0"),
+                row("gpu1", "sp1"),
+                row("cpu", "risc0"),
+            ],
+            ..Default::default()
+        };
+        // Uncalibrated risc0 rows prove at the default size; an SP1 row is no risc0 card.
+        let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
+        assert_eq!(po2s, vec![20]);
+        assert!(
+            source.contains("cpu at po2 20, gpu0 at po2 20") && !source.contains("gpu1"),
+            "{source}"
+        );
+        // prover.risc0_job_po2 sizes its card, names one the cache lacks, and is held to 16..=22.
+        config.prover.risc0_job_po2 =
+            std::collections::HashMap::from([("gpu0".into(), 19), ("gpu-rocm0".into(), 23)]);
+        let (po2s, source) = configured_card_po2s(&config, Some(&suite)).unwrap();
+        assert_eq!(po2s, vec![19, 20, 22]);
+        assert!(
+            source.contains("gpu0 at po2 19") && source.contains("gpu-rocm0 at po2 22"),
+            "{source}"
+        );
+        assert!(
+            source.ends_with("(from the benchmark cache and prover.risc0_job_po2)"),
+            "{source}"
+        );
+        let (po2s, _) = configured_card_po2s(&config, None).unwrap();
+        assert_eq!(po2s, vec![19, 22]);
+    }
+
+    #[test]
+    fn the_cycle_limit_note_says_what_the_verdict_depends_on() {
+        let unknown = po2_plan(None, None);
+        let r = cycle_limit_report(100, &[(20, Some(90)), (16, None)], &unknown).unwrap();
+        assert_eq!(
+            (r.over_at.clone(), r.within_at.clone()),
+            (vec![16], vec![20])
+        );
+        let note = r.note.unwrap();
+        assert!(
+            note.contains("po2 16") && note.contains("depends on the segment size"),
+            "{note}"
+        );
+        let all = cycle_limit_report(100, &[(16, None), (20, None)], &unknown).unwrap();
+        assert!(all.note.unwrap().contains("every po2"));
+        assert!(cycle_limit_report(100, &[(20, Some(1))], &unknown)
+            .unwrap()
+            .note
+            .is_none());
+        assert!(cycle_limit_report(100, &[], &unknown).is_none());
+        let asked = po2_plan(Some(&[16, 20]), None);
+        let r = cycle_limit_report(100, &[(16, None), (20, Some(9))], &asked).unwrap();
+        assert_eq!(r.judged_at, vec![16, 20]);
+        assert!(r.note.unwrap().contains("skips this job"));
     }
 
     #[test]

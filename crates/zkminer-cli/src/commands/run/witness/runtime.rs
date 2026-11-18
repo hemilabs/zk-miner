@@ -86,8 +86,8 @@ use zkminer_witness_host::broker_proc::BrokerProcess;
 use zkminer_witness_host::paths;
 use zkminer_witness_host::pipeline::{
     descriptor_hash_of_abi, eviction_by_age, execute_worker_build, risc0_build_id,
-    simulate_witness_job, sys_rand_rule, HookFuture, HostContext, ImageIdFn, JobInput,
-    PipelineHooks, Simulated, Skip,
+    simulate_witness_job, sys_rand_rule, CycleJudging, HookFuture, HostContext, ImageIdFn,
+    JobInput, PipelineHooks, Simulated, Skip,
 };
 use zkminer_witness_host::spawner::Spawner;
 use zkminer_witness_host::store_open::open_store;
@@ -1497,6 +1497,8 @@ impl WitnessRuntime {
                 w.max_guest_cycles.unwrap_or_else(|| host_max_guest_cycles(plan, self.proving_timeout.as_secs())),
             ),
             po2s,
+            // Any of its cards may prove the job: over the cap at one is a skip.
+            cycle_judging: CycleJudging::EveryPo2,
             keccak_po2: self.keccak_po2,
             worker_builds,
             execute_build,

@@ -24,7 +24,7 @@ pub struct WitnessSimOptions {
     pub builder: Option<PathBuf>,
     pub elf: Option<PathBuf>,
     pub prover: Option<alloy::primitives::Address>,
-    pub po2s: Vec<u8>,
+    pub po2s: Option<Vec<u8>>,
     pub keccak_po2: u8,
     pub broker_config: Option<PathBuf>,
     pub execute_worker: Option<PathBuf>,
