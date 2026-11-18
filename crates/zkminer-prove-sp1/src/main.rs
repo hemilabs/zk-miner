@@ -2890,6 +2890,7 @@ fn run_execute_sp1(
     let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
     let (public_values, report) =
         run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
+    refuse_unprovable_exit(report.exit_code)?;
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
@@ -2902,6 +2903,19 @@ fn run_execute_sp1(
         started.elapsed().as_secs_f64(),
         peak_host_bytes,
     ))
+}
+
+/// A measured guest that halted with a non-zero exit code (its own `exit(n)`, or a panic) runs to
+/// the end like one that succeeded, but no proof of it is accepted: the SDK's `verify` refuses an
+/// exit code other than 0, and so does the on-chain verifier. Without this it would be measured
+/// clean, claimed, and fail every proof attempt. Refused at measurement, as the risc0 worker refuses
+/// a session that did not halt with 0.
+fn refuse_unprovable_exit(exit_code: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exit_code == 0,
+        "the guest halted with exit code {exit_code}: no proof of it verifies"
+    );
+    Ok(())
 }
 
 /// True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
@@ -4478,6 +4492,12 @@ mod pk_cache_tests {
         assert!(!transient.to_lowercase().contains("exceeded cycle limit"));
     }
 
+    /// One CPU prover for the tests that execute guests: a debug build takes minutes to make one.
+    fn test_cpu_prover() -> &'static sp1_sdk::blocking::CpuProver {
+        static CPU: std::sync::OnceLock<sp1_sdk::blocking::CpuProver> = std::sync::OnceLock::new();
+        CPU.get_or_init(|| sp1_sdk::blocking::ProverClient::builder().cpu().build())
+    }
+
     // End-to-end guard against a critical failure mode: with
     // `.calculate_gas(false)` the pinned SP1 build returns Err("Failed to extract public value
     // digest") for EVERY guest, so NO SP1 job was ever claimable. Runs a REAL CPU execution of the
@@ -4491,13 +4511,30 @@ mod pk_cache_tests {
         }
         let elf = super::FIBONACCI_SP1_GUEST_ELF;
         let input = 1000u32.to_le_bytes(); // the known-good benchmark input
-        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        let cpu = test_cpu_prover();
 
         // Gas calculation left at its default (enabled) → a real guest returns a POSITIVE instruction
         // count. `.calculate_gas(false)` would make this return Err for every guest.
-        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(&cpu, elf, &input)
+        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(cpu, elf, &input)
             .expect("executing a valid guest must succeed and yield a cycle count");
         assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
+    }
+
+    /// A guest that halts with a non-zero exit code is refused at measurement, before any claim: no
+    /// proof of it verifies. Fibonacci given no `u32` to read panics in its first `io::read`.
+    #[test]
+    fn a_guest_that_exits_non_zero_is_refused_at_measurement() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let err = super::run_execute_sp1(test_cpu_prover(), super::FIBONACCI_SP1_GUEST_ELF, &[])
+            .expect_err("a guest that panicked was measured clean");
+        assert!(
+            err.to_string().contains("exit code"),
+            "refused for another reason: {err:#}"
+        );
+        assert!(super::refuse_unprovable_exit(0).is_ok());
     }
 }
 
