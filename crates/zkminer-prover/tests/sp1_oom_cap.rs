@@ -260,6 +260,27 @@ fn an_sp1_proof_failure_lowers_nothing() {
         None
     );
     assert_eq!(pool.take_sp1_retry_card(SP1_KEY), None);
+
+    // A second in a row restarts the worker, and so its GPU server, which may be what can no
+    // longer prove; still not counted as a failure.
+    prove(&pool, b"broken").expect_err("fails again");
+    assert_eq!(pool.test_has_handle(SP1_KEY), Some(false), "restarted");
+    assert_eq!(pool.test_consecutive_failures(SP1_KEY), Some(0));
+    // The next proof starts a fresh worker, and the count over.
+    prove(&pool, b"broken").expect_err("fails on the fresh worker");
+    assert_eq!(pool.test_has_handle(SP1_KEY), Some(true));
+}
+
+/// A job's own input or program failing says nothing about the server: never a restart.
+#[test]
+fn an_sp1_job_rejected_for_its_input_never_restarts_the_worker() {
+    let dir = TempDir::new("sp1-invalid");
+    let pool = sp1_pool(&dir, &[("MOCK_PROVE_ERROR_KIND", "invalid_input")]);
+    for _ in 0..3 {
+        let e = prove(&pool, b"bad input").expect_err("rejected");
+        assert!(matches!(worker_error_kind(&e), ErrorKind::InvalidInput));
+        assert_eq!(pool.test_has_handle(SP1_KEY), Some(true));
+    }
 }
 
 /// A worker from before this protocol (one that would ignore the card cap and miss sp1-gpu's own

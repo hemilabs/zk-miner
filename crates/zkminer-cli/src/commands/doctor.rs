@@ -491,70 +491,25 @@ fn sp1_shard_caps_check(report: &mut Report, path: std::path::PathBuf) {
     }
 }
 
-/// What the NVIDIA driver does, under Windows, when a CUDA worker's allocation finds its card full:
-/// its CUDA - Sysmem Fallback Policy, for the programs that allocate on the card. Information, not a
-/// verdict: falling back keeps a proof going, slowly, where failing ends it at once.
+/// What happens, under Windows, when an SP1 proof on an NVIDIA card runs short of video memory, and
+/// what NVIDIA's CUDA - Sysmem Fallback Policy changes. Measured on an RTX 4070 (driver 621.24): at
+/// the default, an SP1 server that outgrew the card spilled into system memory (408 s instead of
+/// 33); with "Prefer No Sysmem Fallback" it ran out at once and the proof was retried one shard
+/// size smaller. Memory another program took mid-proof slowed it either way (336 s), as Windows
+/// pages between the two. The setting's value is hidden from NVAPI's reads (only the driver's own
+/// export shows it), so doctor states what it does rather than a value it cannot see.
 #[cfg(windows)]
 fn sysmem_fallback_check(report: &mut Report) {
-    use zkminer_prover::windows_nvapi::cuda_sysmem_fallback_policy;
-    report.say(
-        Level::Info,
-        "CUDA sysmem fallback",
-        sysmem_fallback_detail(cuda_sysmem_fallback_policy(&SYSMEM_FALLBACK_PROGRAMS).as_ref()),
-    );
+    report.say(Level::Info, "CUDA sysmem fallback", SYSMEM_BEHAVIOUR);
 }
 
-/// The programs that allocate on an NVIDIA card, whose sysmem fallback policy doctor reports.
 #[cfg(windows)]
-const SYSMEM_FALLBACK_PROGRAMS: [&str; 3] = [
-    "zkminer-prove-risc0-cuda.exe",
-    "zkminer-prove-sp1.exe",
-    "sp1-gpu-server.exe",
-];
-
-/// What `sysmem_fallback_check` says of `policy`, `None` when it could not be read.
-#[cfg(windows)]
-fn sysmem_fallback_detail(
-    policy: Option<&zkminer_prover::windows_nvapi::SysmemFallbackPolicy>,
-) -> String {
-    let Some(policy) = policy else {
-        return "unknown: the NVIDIA driver's settings could not be read".to_string();
-    };
-    let own: Vec<String> = policy
-        .programs
-        .iter()
-        .filter(|(_, v)| *v != policy.global)
-        .map(|(name, v)| format!("{v} for {name}"))
-        .collect();
-    let setting = if own.is_empty() {
-        format!("{} for the workers", policy.global)
-    } else {
-        format!("{} globally, {}", policy.global, own.join(", "))
-    };
-    let falls_back: Vec<Option<bool>> = policy
-        .programs
-        .iter()
-        .map(|(_, v)| v.falls_back())
-        .collect();
-    if falls_back.contains(&None) {
-        format!("{setting}: a value this build does not know, so what it does is not said here")
-    } else if falls_back.contains(&Some(true)) {
-        format!(
-            "{setting}. A proof that outgrows its card (something took VRAM after it started) then \
-             moves into system memory and runs several times slower: it may still finish, or miss \
-             its deadline. \"Prefer No Sysmem Fallback\" (NVIDIA Control Panel → Manage 3D \
-             settings → CUDA - Sysmem Fallback Policy, globally or for {}) makes it fail at once, \
-             and the job is retried or released (a release costs 5% of its collateral): which is \
-             better depends on how much slack your jobs' deadlines leave",
-            SYSMEM_FALLBACK_PROGRAMS.join(", ")
-        )
-    } else {
-        format!(
-            "{setting}: a proof that outgrows its card fails at once and the job is retried or \
-             released, rather than slowing down in system memory"
-        )
-    }
-}
+const SYSMEM_BEHAVIOUR: &str = "not readable here (the NVIDIA driver hides its CUDA - Sysmem \
+     Fallback Policy). At the default, an SP1 proof that outgrows its card moves into system memory \
+     and runs many times slower (408 s instead of 33 on an RTX 4070), which can cost a lock; with \
+     \"Prefer No Sysmem Fallback\" (NVIDIA Control Panel → Manage 3D settings, globally or for \
+     sp1-gpu-server.exe) it fails at once and is retried one shard size smaller. Memory another \
+     program takes while a proof runs only slows it, whatever the setting";
 
 pub async fn run(config_path: Option<&Path>) -> Result<()> {
     let mut report = Report::default();
@@ -732,55 +687,16 @@ mod tests {
         assert!(unreadable.lines[0].2.contains("no card's cap is applied"));
     }
 
-    /// What doctor says of the driver's sysmem fallback policy: unknown when unreadable or for a
-    /// value this build does not know; for a policy that falls back, the cost of each choice (a
-    /// release costs 5% of the collateral); and which program's own setting differs from the global.
+    /// What doctor says of GPU memory under Windows: the measured behaviour, not a driver setting
+    /// it cannot read.
     #[cfg(windows)]
     #[test]
-    fn doctor_says_what_the_sysmem_fallback_policy_does() {
-        use zkminer_prover::windows_nvapi::{SysmemFallback, SysmemFallbackPolicy};
-        let policy = |global, sp1| SysmemFallbackPolicy {
-            global,
-            programs: SYSMEM_FALLBACK_PROGRAMS
-                .iter()
-                .map(|p| {
-                    let v = if *p == "zkminer-prove-sp1.exe" {
-                        sp1
-                    } else {
-                        global
-                    };
-                    (p.to_string(), v)
-                })
-                .collect(),
-        };
-        assert!(sysmem_fallback_detail(None).starts_with("unknown"));
-        let falls_back = sysmem_fallback_detail(Some(&policy(
-            SysmemFallback::NotSet,
-            SysmemFallback::NotSet,
-        )));
-        assert!(falls_back.contains("for the workers"), "{falls_back}");
-        assert!(falls_back.contains("5% of its collateral"), "{falls_back}");
-        assert!(falls_back.contains("deadline"), "{falls_back}");
-        let fails = sysmem_fallback_detail(Some(&policy(
-            SysmemFallback::PreferNoFallback,
-            SysmemFallback::PreferNoFallback,
-        )));
-        assert!(fails.contains("fails at once"), "{fails}");
-        assert!(!fails.contains("5%"), "{fails}");
-        let mixed = sysmem_fallback_detail(Some(&policy(
-            SysmemFallback::PreferNoFallback,
-            SysmemFallback::PreferFallback,
-        )));
-        assert!(mixed.contains("globally"), "{mixed}");
-        assert!(
-            mixed.contains("Prefer Sysmem Fallback for zkminer-prove-sp1.exe"),
-            "{mixed}"
-        );
-        assert!(mixed.contains("5% of its collateral"), "{mixed}");
-        let unknown = sysmem_fallback_detail(Some(&policy(
-            SysmemFallback::DriverDefault,
-            SysmemFallback::Other(7),
-        )));
-        assert!(unknown.contains("does not know"), "{unknown}");
+    fn doctor_says_how_windows_handles_a_proof_short_of_gpu_memory() {
+        assert!(SYSMEM_BEHAVIOUR.starts_with("not readable here"));
+        assert!(SYSMEM_BEHAVIOUR.contains("system memory"));
+        assert!(SYSMEM_BEHAVIOUR.contains("\"Prefer No Sysmem Fallback\""));
+        assert!(SYSMEM_BEHAVIOUR.contains("retried one shard size smaller"));
+        assert!(SYSMEM_BEHAVIOUR.contains("another program"));
+        assert!(!SYSMEM_BEHAVIOUR.contains("  "), "{SYSMEM_BEHAVIOUR}");
     }
 }
