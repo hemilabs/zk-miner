@@ -1,406 +1,377 @@
 # macOS beta, release candidate 3 (integrated branch: GitHub main + the macOS beta, RISC Zero 3.1)
 
-2026-11-19. This is the first release-candidate round of Wave 10 (the merge wave). It checks the
-**integrated** `metal-3.1`, which now contains GitHub zk-miner `main`, and is pinned to a risc0 fork
-rev that contains upstream hemilabs/risc0 `release-3.1`. The kit was built the way the CI job builds
-it, then installed and used as a new user would. It ships **unsigned**: no Developer ID and no
-notarization. Evidence and scripts are in `/Users/user/zkminer/scratch/w10/rc1/` (`ci/`, `logs/`,
-`out/`, `live/`, `scripts/`).
+2026-11-19, round 2. This round re-checks the **integrated** `metal-3.1` after the beta fix round.
+`metal-3.1` contains GitHub zk-miner `main`. It is pinned to a risc0 fork rev that contains upstream
+hemilabs/risc0 `release-3.1`.
 
-RC1 (commit `ca07773`, kit `54296dc6…`) and RC2 (commit `6e7a1c1`, kit `02e5ca12…`) are in this file's
-history. They checked the pre-merge beta (risc0 `d94ef6501`). RC3 replaces them.
+The kit was built the way the CI job builds it, from a fresh clone, then installed and used as a new
+user would. It ships **unsigned**: no Developer ID and no notarization. Evidence and scripts are in
+`/Users/user/zkminer/scratch/w10/rc2/`: `ci/` (harness, per-step logs, `report.md`), `logs/`,
+`out/`, `live/`, `scripts/`, `dist/`.
 
-**Verdict (updated after step 0, 2026-11-19).**
-- RC3 found one failing check: when the worker died at start-up, or its warm-up failed, `zkminer
-  benchmark` printed a table of *simulated* numbers and exited 0.
-- **Step 0 is done** (section 3.6 and "Step 0" below). W10-BENCH, W10-DOC and the BETA-FIX
-  startup-error fix are merged (`f9f535b`). The kit was rebuilt from `f9f535b`, and both forced
-  failures now exit 1 with `BENCHMARK FAILED`, the worker's error and no table, while a working
-  `zkminer benchmark` exits 0 with real numbers.
-- The candidate is now the `f9f535b` kit below. Sections 1-5 below are RC3's record of `8b448a0`;
-  only the zk-miner CLI-side code, the worker's benchmark exit codes and docs changed since (no risc0,
-  kernel, metallib or compiler change).
+History:
+- RC1 (`ca07773`, kit `54296dc6…`) and RC2 (`6e7a1c1`, kit `02e5ca12…`) checked the pre-merge beta
+  (risc0 `d94ef6501`).
+- RC3 round 1 (`8b448a0`, kit `d0099a51…`) found one failing check: a worker failure made `zkminer
+  benchmark` print a simulated table and exit 0.
+- Step 0 (`f9f535b`, kit `5153fac0…`) fixed that.
+
+All of them are in this file's history.
+
+**Verdict: every check passed. Nothing blocks the push.** What is left is the user checklist (section
+6): push, CI on the real runners, a real macOS 26 Mac, and the funded-key tests.
+- The kit is **`6ec9411e…`**, built from `f539d5c`. It contains W10-BENCH, W10-DOC and the BETA-FIX
+  startup-error fix.
+- Both forced worker failures make `zkminer benchmark` exit 1, with the worker's own error and no
+  table.
+- A working `zkminer benchmark` exits 0 with real numbers.
+- The six-program STARK total is 170.56 s, which is +0.59 % against BASELINES '3.1' and inside the
+  1.5 % threshold.
 
 ## The candidate
 
-**After step 0:** `zkminer-0.1.0-macos-arm64.tar.gz`, 121,308,198 bytes (192 MB unpacked), **sha256
-`5153fac0e4ba59388133771ffd8c6dd47e85fa1a3dbbec4cdd9b51aaa624b49e`**, in
-`/Users/user/zkminer/scratch/w10/BETA-FIX/dist/`. BUILDINFO commit
-`f9f535b800f8652072f3164a3372a209712130f6` (`commit_dirty=no`), risc0 `37b434755…`, min_macos 26.0,
-compiler 32023.922 validated, no archives, the same 5 metallib digests. RC3's kit (below) is superseded.
-
 | | |
 |---|---|
-| kit | `zkminer-0.1.0-macos-arm64.tar.gz`, 121,281,859 bytes (192 MB unpacked) |
-| **sha256** | **`d0099a51dc6186ea0092e51798168e00702bcdb913ccc6b2e5ffbbad6238eb6d`** |
-| where | `/Users/user/zkminer/scratch/w10/rc1/dist/` (the tarball and its `SHA256SUMS`) |
-| zk-miner | `metal-3.1` @ `8b448a08b665e8ba53e01be74e36e3eb8dbfe878` (`BUILDINFO commit`, `commit_dirty=no`) |
+| kit | `zkminer-0.1.0-macos-arm64.tar.gz`, 121,315,795 bytes (201.5 MB = 192 MiB unpacked, 10 files) |
+| **sha256** | **`6ec9411eb14b9d5310cfba92b6635c407484ca8a68bc77219f66a561f05c4cb3`** |
+| where | `/Users/user/zkminer/scratch/w10/rc2/dist/` (the tarball and its `SHA256SUMS`) |
+| zk-miner | `metal-3.1` @ `f539d5cc0a41ddf46b353ed37fbd1580e2b03ae7` (`BUILDINFO commit`, `commit_dirty=no`) |
 | risc0 | hemilabs/risc0 `zkminer/metal-3.1` @ `37b434755ce77dd1354d957a7b61912aa4359423` (`BUILDINFO risc0_rev`, `risc0_src=git`) |
-| minimum macOS | 26.0: binaries minos 26.0, metallibs target 26.0 (`check-macos-release.sh`: "a self-contained arm64 kit for macOS 26.0 and later") |
-| Metal compiler | `Apple metal version 32023.922 (metalfe-32023.922.4)` (27B47, pinned, `metal_compiler_validated=yes`), SDK 27.2 |
+| minimum macOS | 26.0: binaries minos 26.0, metallibs target 26.0. `check-macos-release.sh`: "a self-contained arm64 kit for macOS 26.0 and later" |
+| Metal compiler | `Apple metal version 32023.922 (metalfe-32023.922.4)` (27B47, pinned, `metal_compiler_validated=yes`), SDK 27.2, built on macOS 27.2.1 (26B131) |
 | offline archives | none (`aot_arches=`; CI builds with `AOT_ARCHES=none`) |
-| Groth16 component | not bundled; v0.2.0, sha256 `173354ab…57e5`, fetched by the worker or `install.sh --with-groth16` |
-| worker metallib digests | `261571a7…`, `62805de6…`, `c934c282…`, `cf978db9…`, `f42fd572…`: the same 5 as RC1, RC2 and B9-M26 |
+| Groth16 component | not bundled; v0.2.0, sha256 `173354ab…57e5`, fetched by the worker or by `install.sh --with-groth16` |
+| worker metallib digests | `build-metal-aot.sh --worker-digests`: `261571a7…`, `62805de6…`, `c934c282…`, `cf978db9…`, `f42fd572…`. These are the same 5 as RC1, RC2, RC3 and B9-M26 |
 
 - The commit that adds this file changes only `docs/release/BETA_RC.md`, which is not an input of the
-  kit.
-- A kit built by CI for a tag differs in its `BUILDINFO commit`, and so in its sha256. On the runner's
-  Xcode 26 SDK, `metal_sdk` and the metallib digests also change (B9-M26, B9-CI).
+  kit. A kit built from that commit differs only in `BUILDINFO commit`, and so in its sha256.
+- A kit that CI builds for a tag also differs in `BUILDINFO commit`. On the runner's Xcode 26 SDK,
+  `metal_sdk` and the metallib digests change too (B9-M26, B9-CI).
 
 ## 0. Integration facts (all hold)
 
 | fact | check | result |
 |---|---|---|
-| pushing `metal-3.1` to `main` is a fast-forward | `git merge-base --is-ancestor origin/main metal-3.1` | **yes**. `origin/main` = `c030355`; `metal-3.1` is 66 commits ahead and 0 behind |
+| pushing `metal-3.1` to `main` is a fast-forward | `git merge-base --is-ancestor origin/main metal-3.1` | **yes**. `origin/main` = `c030355`. `metal-3.1` (`f539d5c`) is 78 commits ahead and 0 behind, or 79 with this file's commit |
 | the pin contains upstream `release-3.1` | `git -C deps/risc0-3.1 merge-base --is-ancestor origin/release-3.1 37b434755` | **yes** (`origin/release-3.1` = `5beab26b5`) |
-| the pin is the fork's HEAD | `deps/risc0-3.1` HEAD | **`37b434755`** (`Merge metal/W10-GATE`), clean tree. Its tree equals W10-GATE's `404ae8dcf` |
-| `Cargo.toml` / `Cargo.lock` | grep | 17 `[patch]` revs and 18 lock `source` lines = `37b434755…`. No other hemilabs/risc0 rev. sppark stays `5f68eb3e…` |
-| the mirror has it | `scratch/w9/mirror/risc0.git` fetched from `deps/risc0-3.1` | `zkminer/metal-3.1` = `37b434755…` |
-| non-Metal code = release-3.1 in effect | W10-GATE (`deps/risc0-3.1/docs/metal-port/notes/W10-GATE.md`) and RELEASE-DEPS.md's table | every fork change off Metal is gated to its release-3.1 default. Not re-checked here, and no Linux or Windows build was run (open issue 2) |
-| workflows | `actionlint` 1.7.12 (with shellcheck) on all 5 workflows | clean once the self-hosted labels (`zkminer-gpu`, `zk-runner-mac-new`) are declared in a config. Without that config the only finding is `release.yml:168` "label zkminer-gpu is unknown", which comes from main. `scripts/ci/test-workflow-expressions.py`: 425 passed |
+| the pin is the fork's HEAD | `deps/risc0-3.1` HEAD | **`37b434755`** (`Merge metal/W10-GATE`), clean tree |
+| `Cargo.toml` and `Cargo.lock` | grep | 17 `[patch]` revs and 18 lock `source` lines are `37b434755…`, and no other hemilabs/risc0 rev appears. sppark stays at `5f68eb3e…` |
+| the mirror has it | `scratch/w9/mirror/risc0.git`, refreshed from `deps/risc0-3.1` | `zkminer/metal-3.1` = `37b434755…` |
+| non-Metal code = `release-3.1` in effect | W10-GATE (`deps/risc0-3.1/docs/metal-port/notes/W10-GATE.md`) and RELEASE-DEPS.md's table | Unchanged since round 1, because there is no risc0 change. Every fork change off Metal is gated to its `release-3.1` default. No Linux or Windows build was run (open issue 1) |
+| workflows | `actionlint` 1.7.12 (with shellcheck) on all 5 workflows | Clean once the self-hosted labels (`zkminer-gpu`, `zk-runner-mac-new`) are declared in a config (`rc2/actionlint.yaml`). Without that config the only finding is `release.yml:168` "label zkminer-gpu is unknown", which comes from main. `scripts/ci/test-workflow-expressions.py`: 425 passed |
 
 ## 1. CI build (`build-macos.yml`, all three jobs, run locally)
 
-**How it was run.** B9-CI's harness (`ci/sim.py`, with only its paths changed) ran every step of
-`.github/workflows/build-macos.yml` at `8b448a0`, in order, exactly as written:
-- a fresh clone of `metal-3.1`, inside a 14 GB APFS disk image (`hdiutil`, 13.79 GB usable; detached
-  and deleted afterwards);
-- a fresh `HOME` and `CARGO_HOME` inside the image, and `CARGO_BUILD_JOBS=5`;
-- the hemilabs/risc0 URL sent to the mirror (`CARGO_NET_GIT_FETCH_WITH_CLI=true` and RELEASE-DEPS.md's
-  two `GIT_CONFIG_*` rules).
+**How it was run.** B9-CI's harness (`ci/sim.py`; only its paths differ from round 1) ran every step
+of `.github/workflows/build-macos.yml` at `f539d5c`, in order and exactly as written:
+- on a fresh clone of `metal-3.1`, inside a 14 GB APFS disk image (`hdiutil`, 13.79 GB usable),
+  which was detached and deleted afterwards;
+- with a fresh `HOME` and `CARGO_HOME` inside the image, and `CARGO_BUILD_JOBS=5`;
+- with the hemilabs/risc0 URL sent to the mirror (`CARGO_NET_GIT_FETCH_WITH_CLI=true` and
+  RELEASE-DEPS.md's two `GIT_CONFIG_*` rules).
 
-The workflow file is byte-identical to RC2's.
+The workflow file is byte-identical to round 1's.
 
 | job / step | rc | wall | disk (of 13.79 GB) |
 |---|---|---|---|
 | build: Metal toolchain (27B47, pinned) | 0 | 18 s | |
-| build: Rust, rzup guest toolchain, protoc | 0 | 60 s | |
-| build: Metal worker and CLI (`ASSEMBLE_BUILD_ONLY=1 assemble-macos.sh`) | 0 | 314 s | peak used 12.57 GB, **min free 1.22 GB** (RC2: 2.05 GB) |
-| build: delete intermediates | 0 | 3 s | 12.55 -> 4.83 GB |
+| build: Rust, rzup guest toolchain, protoc | 0 | 57 s | |
+| build: Metal worker and CLI (`ASSEMBLE_BUILD_ONLY=1 assemble-macos.sh`) | 0 | 316 s | peak used 12.57 GB, **min free 1.22 GB** (round 1: 1.22 GB) |
+| build: delete intermediates | 0 | 3 s | 12.55 -> 4.84 GB |
 | build: package and check (`check-macos-kit.py` ok with 0 archives; `test-check-macos-kit.sh` **16/16**) | 0 | 60 s | |
-| cpu-tests: tests that need no GPU (2 suites, **62 + 131 passed**; `test-metal-tc` 18/18) | 0 | 283 s | min free 2.07 GB |
-| metal-probe: install, probe, Groth16 download (158 s), one fibonacci proof (verified, wrap 1.75 s) | 0 | 165 s | min free 3.18 GB |
+| cpu-tests: tests that need no GPU (2 suites, **65 + 135 passed**; `test-metal-tc` 18/18) | 0 | 298 s | min free 1.90 GB (round 1: 2.07) |
+| metal-probe: install, probe, Groth16 download (67 s), one fibonacci proof (verified, wrap 1.75 s) | 0 | 74 s | min free 3.18 GB |
 
-- **Disk margin.** The integrated build needs 0.83 GB more disk than RC2 (main's crates), which leaves
-  1.22 GB free at the build job's peak on a 14 GB runner (open issue 4).
-- **Checks on the uploaded kit.** `check-macos-release.sh` on the tarball: rc 0. `check-macos-kit.py
-  --version 0.1.0 --commit 8b448a0… --require-validated`: ok.
+- **The suites grew.** cpu-tests now has 65 + 135 tests, against 62 + 131 in round 1: the tests
+  merged since then (W10-BENCH, BETA-FIX).
+- **First probe attempt.** The Groth16 download ran at about 10 MB/s and hit the harness's 420 s
+  step limit. The resumed step then skipped the proof for lack of disk, because the partial download
+  was still in its `RUNNER_TEMP`. That is a harness artifact: a runner has no step limit and starts
+  each job with a fresh `RUNNER_TEMP`. The job was re-run from its first step (`ci/logs/rc2bmetal-*`)
+  and passed. Its first log is kept as `ci/logs/rc2metal-probe-03.attempt1.log`.
+- **Checks on the uploaded kit:**
+  - `check-macos-release.sh` on the tarball: rc 0.
+  - `check-macos-kit.py --version 0.1.0 --commit f539d5c… --require-validated`: ok ("every macOS
+    program links only system libraries, is arm64, signed, with the kit's minimum macOS").
 
 ## 2. Install as a new user (sandbox HOME, quarantined download)
 
-**Setup.** Sandbox `HOME=scratch/w10/rc1/home`, entered through `env -i` with the system `PATH` plus
-`~/.zkminer` (the README's `export PATH`). The tarball was put in `~/Downloads` and marked as a Safari
-download (`com.apple.quarantine 0083;…;Safari;…`).
+**Setup.**
+- The sandbox is `HOME=scratch/w10/rc2/home`, entered through `env -i` with the system `PATH` plus
+  `~/.zkminer` (the README's `export PATH`).
+- The tarball and the CI run's `SHA256SUMS` were put in `~/Downloads`. The tarball was marked as a
+  Safari download (`com.apple.quarantine 0083;…;Safari;…`).
 
-The kit README (`packaging/macos/README.md`), followed literally:
-- **Checksums.** `shasum -a 256` of the tarball equals its `SHA256SUMS` line. `shasum -a 256 -c` of the
-  kit's own `SHA256SUMS`: OK for all 9 files.
+The kit README (`packaging/macos/README.md`), followed literally (`logs/install.log`):
+- **Checksums.** `shasum -a 256 -c --ignore-missing SHA256SUMS` printed `zkminer-0.1.0-macos-arm64.tar.gz: OK`.
 - **Unpack.** `tar -xzf` passes the quarantine flag to every file, and `spctl --assess` rejects
-  `zkminer`.
-- **`./install.sh --with-groth16`:** rc 0 in 80 s.
-  - It checked the kit (commit `8b448a08b665`) and installed both binaries without the quarantine flag
-    (`xattr -l` is empty).
-  - It said the kit has no offline archives, so the first start compiles the pipelines, and
-    downloaded and installed Groth16 v0.2.0 (5.4 GB).
-  - Its "Next" list: `init`, `benchmark`, `run`, and where `BUILDINFO` is.
-- **`zkminer help`:** ok.
-- **`zkminer init`:** rc 0. It wrote `config.toml` for 743111: router `0xD931…Ed58`, token
-  `0x4695…36cc`.
-- **`zkminer benchmark`:** rc 0, real numbers (section 3.6).
+  `zkminer` (rc 3).
+- **`./install.sh --with-groth16`:** rc 0 in 74 s.
+  - It checked the kit (commit `f539d5cc0a41`) and installed both binaries without the quarantine
+    flag (`xattr -l` is empty).
+  - It said that the kit has no offline archives, so the first start compiles the pipelines.
+  - It downloaded and installed Groth16 v0.2.0 (`du`: 5.4G).
+  - Its "Next" list: `init`, `stake 100`, `benchmark`, `run`, and where `BUILDINFO` is.
+- **`zkminer help`:** ok. **`zkminer init`:** rc 0. It wrote `config.toml` for 743111 (router
+  `0xD931…Ed58`, token `0x4695…36cc`). Its next steps are key, tHEMI and ETH, `zkminer stake 100`,
+  `status`, `run`.
+- **`zkminer status`** with no key: rc 1, "Environment variable 'ZKMINER_PRIVATE_KEY' not set". This is
+  the README's order: the key comes first.
+- **First start** (section 3.4), **`zkminer benchmark`**: rc 0 with real numbers (section 3.6).
 - **`tools/macos-smoke.sh` from the kit:** `RESULT: ok (exit 0)`.
-- **`./install.sh --warm`:** rc 0, warm-up 2 s.
-- **`./install.sh --uninstall`:** removed the CLI and the worker. It left `config.toml`, `~/.risc0` and
-  the pipeline cache, as documented.
+- **`./install.sh --warm`:** rc 0 in 4.3 s.
+- **`./install.sh --uninstall`:** rc 0. It removed the CLI and the worker. It left `config.toml`,
+  `~/.risc0` and the pipeline cache, as documented.
 
-**Where the docs are wrong or unclear.** These are RC2's items. None was fixed, because W10-DOC (which
-fixes most of them) is stacked on the unmerged W10-BENCH. None blocks an install.
-1. **`docs/macos-beta.md` describes a kit that is not the release kit** (maintainer doc).
-   - "Build the kit" defaults to `AOT_ARCHES=applegpu_g17s`.
-   - "Offline archives" says the kit "ships a `macos27` set".
-   - The "CI" section is the pre-B9-CI sketch ("The workflow files are not part of this item",
-     `--no-aot`).
-   - `RELEASE-DEPS.md`'s runner recipe still uses `xcodebuild -downloadComponent`.
-2. **`release.yml`'s notes say `sha256sum -c SHA256SUMS`.** On a Mac that only downloaded the macOS
-   tarball, this exits 1 because the other platforms' files are missing. Use `--ignore-missing`.
-3. **Gatekeeper in a terminal without a GUI session** (not retested). Over SSH, a quarantined binary
-   hangs with no output. The README describes only the desktop dialog.
-4. **`zkminer init` step 3 says "Stake it (via the Wallet screen)"**, but `zkminer stake` exists. The
-   README's "Then:" stops at `zkminer run`, which needs a key, gas, tHEMI and a stake first.
-5. **`zkminer benchmark` on a Mac:**
-   - It takes 261 s on the M5 Max (main's warm-up plus zkop-mix scoring), and the README gives no
-     duration.
-   - It prints Linux and NVIDIA advice: `nvidia-smi did not answer`, "CPU power monitoring
-     unavailable. To enable, run: sudo chmod o+r /dev/cpu/0/msr".
-   - New since the merge: "GPU power unavailable for the proving cards — device rows will carry the
-     300W fallback, which feeds the profitability model directly". The profitability figure for a Mac
-     therefore assumes 300 W (open issue 6).
-   - It re-logs the worker's INFO lines at WARN.
-   - Its failure path is in section 3.6.
-6. The README's first-start figure is "60.3 s measured". This RC measured 57.8 s, which is consistent.
+**Doc errors found: none that would stop a new user.** Round 1's doc items are all fixed by W10-DOC:
+- `--ignore-missing` in the README and in `release.yml`'s notes;
+- Gatekeeper over SSH;
+- `zkminer stake` in `init` and the README;
+- the benchmark's duration;
+- the Troubleshooting section.
+
+Minor points, none blocking:
+1. The README gives `zkminer benchmark` as "about 4.5 to 5 minutes … (262-314 s measured)". This
+   round measured 261 s.
+2. The README's first start is "60.3 s measured". This round measured 61.7 s (round 1: 57.8 s).
+3. `zkminer benchmark` still prints Linux and NVIDIA advice on a Mac (`nvidia-smi did not answer`)
+   and re-logs the worker's INFO lines at WARN (open issue 4).
+4. `install.sh --uninstall` also leaves `~/.zkminer/miner.lock`, an empty file that the README does
+   not mention.
 
 ## 3. The installed worker on this Mac (M5 Max, 36 GB, macOS 27.2.1)
 
-All GPU runs went through `gpu-run` (heavy). Each used the sandbox's installed
-`~/.zkminer/provers/zkminer-prove-risc0-metal` with `env -i`, so budgets were passed explicitly as
-`RISC0_METAL_MAX_WORKING_SET_BYTES`. Load average was 0.5-3.5, and no other GPU work ran.
+- Every GPU run went through `gpu-run` (heavy, exclusive).
+- Each run used the sandbox's installed `~/.zkminer/provers/zkminer-prove-risc0-metal` under `env
+  -i`, so budgets were passed explicitly as `RISC0_METAL_MAX_WORKING_SET_BYTES`.
+- The load average was 1.2-4.1, and no other GPU work ran.
 
 ### 3.1 Full `--benchmark`, default budget (one run)
 
 | program | cycles | STARK | c/s | wrap |
 |---|---|---|---|---|
-| fibonacci (main's discarded warm-up) | 32,768 | 0.28 s | | 1.61 s |
-| sha256-chain | 46,137,344 | 50.97 s | 905K | 1.59 s |
-| ecdsa-verify | 65,011,712 | 71.77 s | 906K | 1.58 s |
-| bigint-mul | 27,525,120 | 30.73 s | 896K | 1.60 s |
-| memory-merkle | 7,340,032 | 8.33 s | 881K | 1.59 s |
-| chacha-mix | 8,404,992 | 9.80 s | 857K | 1.59 s |
-| **all six** | 154,451,968 | **171.88 s, 898.6K c/s** | | |
-| zkop-mix scoring (main; no wrap) | 4,194,304 + 61,865,984 | 4.98 + 68.73 s | | |
+| fibonacci (main's discarded warm-up) | 32,768 | 0.27 s | | 1.60 s |
+| sha256-chain | 46,137,344 | 50.72 s | 910K | 1.58 s |
+| ecdsa-verify | 65,011,712 | 71.16 s | 914K | 1.59 s |
+| bigint-mul | 27,525,120 | 30.61 s | 899K | 1.61 s |
+| memory-merkle | 7,340,032 | 8.35 s | 879K | 1.60 s |
+| chacha-mix | 8,404,992 | 9.72 s | 865K | 1.61 s |
+| **all six** | 154,451,968 | **170.56 s, 905.6K c/s** | | |
+| zkop-mix scoring (main; no wrap) | 4,194,304 + 61,865,984 | 4.89 + 68.33 s | | |
 
-- **Against RC2** (169.92 s, 909.0K c/s): **+1.15 %**. **Against BASELINES '3.1'** (169.56 s): **+1.37 %**.
-  Both are below the 1.5 % threshold.
-- The same code measured 170.82 s in W10-PIN and 170.66-171.06 s in W10-INT. W10-INT's like-for-like
-  A/B of the full suite (old vs merged binary, same session) showed no change. The run started at a
-  load of 3.4, just after the cold-start compile.
-- **Peak footprint 14.72 GB** (baseline 14.69, RC2 14.68). Wraps 1.58-1.61 s. Wall 268 s, which now
-  includes the warm-up and the zkop-mix proofs.
+- **Against BASELINES '3.1'** (169.56 s, 910.9K c/s): **+0.59 %**. **Against RC2** (169.92 s):
+  +0.38 %. Round 1 measured 171.88 s and step 0 171.41 s.
+- This is below the 1.5 % threshold, so no A/B was required and none was run. Round 1's interleaved
+  `BENCH_ONLY=memory-merkle` A/B at three budgets is in this file's history.
+- Peak footprint 14.72 GB (baseline 14.69 GB). Wraps took 1.58-1.61 s. Wall time was 267 s, which
+  includes the warm-up and the zkop-mix proofs. Load at the start was 2.96.
 
-### 3.2 Interleaved A/B, `BENCH_ONLY=memory-merkle --benchmark`, 5 pairs per budget
+### 3.2 Budgets, sequences, hosts
 
-- A = the reference 3.1 worker in `~/.zkminer/provers` (sha256 `9161605e…`, as in RC2). B = the
-  installed kit worker.
-- The order was A B A B …, one `gpu-run` per arm, in one session.
-
-| budget | A STARK median [min-max] | B STARK median [min-max] | B-A per pair, median [range] | A-vs-A spread | wrap A / B | peak footprint A / B |
-|---|---|---|---|---|---|---|
-| default (po2 20) | 8.38 [8.37-8.41] s | 8.43 [8.42-8.43] s | +0.04 [+0.02, +0.06] s | 0.04 s | 1.59 / 1.58-1.59 s | 13.19 / 13.95-13.96 GB |
-| 8 GiB (po2 19) | 10.38 [10.29-10.41] s | 10.44 [10.40-10.50] s | +0.06 [+0.01, +0.16] s | 0.12 s | 1.74 / 1.72-1.73 s | 7.32 / 8.31 GB |
-| 4 GiB (po2 18) | 14.07 [14.07-14.18] s | 14.22 [14.22-14.27] s | +0.15 [+0.04, +0.16] s | 0.11 s | 1.73-1.74 / 1.71-1.72 s | 5.01-5.05 / 5.78-5.79 GB |
-
-- **The arms are not like for like.** Since the merge, B's `BENCH_ONLY` first proves main's discarded
-  fibonacci warm-up, with its Groth16 wrap. A's memory-merkle is its process's first proof. This
-  matches W10-INT's open issue 6 and its `BENCH_ONLY` A/B (+0.05 / +0.08 s, +0.8-1.0 GB). That item's
-  like-for-like full-suite A/B showed every program unchanged.
-- **Default and 8 GiB:** inside the A-vs-A spread.
-- **4 GiB:** +1.1 %, slightly above the spread (0.15 vs 0.11 s). It is the same order effect, measured
-  larger here than in W10-INT. It does not show in the full-suite numbers (W10-INT 4 GiB full suite:
-  291.83 vs 291.67 s).
-- **The higher B peaks** are the warm-up's wrap and stay inside each budget's plan. 8.31 GB = 7.74 GiB.
-- **Against BASELINES** (8 GiB ~767K c/s, 4 GiB ~603K c/s): `c/s` is not comparable, because po2 now
-  changes the memory-merkle cycle count. RC2's own runs were 10.23 s / 13.93 s; A here is 10.38 / 14.07 s.
-- 15 A-arm receipts and all B receipts verified (section 3.5).
-
-### 3.3 Budgets, sequences, hosts
-
-- **memory-merkle at 8 GiB** (po2 19, 7,864,320 cycles), 3 runs: STARK 10.39 / 10.40 / 10.41 s,
-  755-757K c/s, wrap 1.72 s. Peak footprint 7.60-8.31 GB. W10-PIN measured 10.43 s.
-- **memory-merkle at 4 GiB** (po2 18, 8,388,608 cycles), 3 runs: STARK 14.18 / 14.22 / 14.23 s,
-  590-591K c/s, wrap 1.71-1.72 s. Peak footprint 5.79 GB. W10-PIN measured 14.21 s.
-- **4 GiB, Groth16 after keccak.** The test
-  `a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs` was built from this commit and
-  pointed at the installed worker (`ZKMINER_B9_WORKER`, keccak guest from `deps/risc0-3.1`). It ran
-  twice:
-  - rc 0 both times. The warm-up, fibonacci, keccak, memory-merkle and fibonacci were all wrapped
-    (256-byte seals).
-  - 5 of 5 key releases per run, each "3882.3 MiB freed (prover layout split_h + tw_lent)".
-  - keccak took 4.95 s and 4.93 s.
-- **20 sequential jobs in one worker at 4 GiB.** Test `m9_proofs_in_one_worker`: installed worker,
-  Warmup first, fibonacci 4,587,520 cycles, 9.55-9.72 s each.
-  - Idle footprint after proof 1: 4834 MiB. Proofs 2-20: 4387-4781 MiB. The last one, 4764 MiB, is
-    below the first.
-  - Lifetime peak 6206 MiB (RC2 6208), 21 key releases. **No footprint growth.**
-- **Simulated 16 GB host.** Settings: `ZKMINER_METAL_HOST_RAM_BYTES=16 GiB`, HAL limit 10.67 GiB,
-  `ZKMINER_CUDA_VRAM_BYTES=8 GiB`. The worker planned 8 GiB at po2 19.
-  - memory-merkle: 10.31 s, wrap 1.73 s, footprint 8.37 GB.
-  - **Full suite: 206.49 s** (six programs; W10-INT 206.49 s), plus zkop-mix 6.10 + 86.47 s. Every
-    program was wrapped (1.73-1.74 s) and verified.
-  - **Peak footprint 9.39 GB.** RC2 measured 9.34 GB. W10-INT's no-wrap release keeps the scoring proof
-    from raising it to 10.99 GB. This is inside a 16 GB Mac's 11.5 GiB allowance.
+- **memory-merkle at 8 GiB** (po2 19, 7,864,320 cycles), 2 runs:
+  - STARK 10.29 / 10.39 s, 765K / 757K c/s, wrap 1.72 s;
+  - peak footprint 7.60 / 8.31 GB;
+  - round 1 measured 10.39-10.41 s.
+- **memory-merkle at 4 GiB** (po2 18, 8,388,608 cycles), 2 runs:
+  - STARK 14.15 / 14.17 s, 593K / 592K c/s, wrap 1.72 s;
+  - peak footprint 5.79 GB;
+  - round 1 measured 14.18-14.23 s.
+- **BASELINES '3.1'** gives memory-merkle ~767K c/s at 8 GiB and ~603K c/s at 4 GiB. These `c/s`
+  figures are not directly comparable, because since the merge po2 changes memory-merkle's cycle
+  count. RC2's own runs were 10.23 s and 13.93 s.
+- **4 GiB, Groth16 after keccak.**
+  - Test: `a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs`, built from
+    `f539d5c` and pointed at the installed worker (`ZKMINER_B9_WORKER`; keccak guest
+    `multi_test.bin` from `deps/risc0-3.1`). It ran twice.
+  - **rc 0 both times.** The warm-up, fibonacci, keccak, memory-merkle and fibonacci again were all
+    wrapped (256-byte seals).
+  - Each run had 5 of 5 key releases, each "3882.3 MiB freed". keccak took 4.99 s and 4.96 s.
+- **20 sequential jobs in one worker at 4 GiB.**
+  - Test: `m9_proofs_in_one_worker` with the installed worker, a Warmup first, and fibonacci at
+    4,587,520 cycles, 9.59-9.75 s each.
+  - The idle footprint was 4836 MiB after proof 1 and 4303-4794 MiB after proofs 2-20. The last
+    one, 4712 MiB, is below the first.
+  - The lifetime peak was 6207 MiB from proof 2 on (round 1: 6206 MiB), with 21 key releases.
+    **No footprint growth.**
+- **Simulated 16 GB host.**
+  - Settings: `ZKMINER_METAL_HOST_RAM_BYTES=16 GiB`, HAL limit 10.67 GiB,
+    `ZKMINER_CUDA_VRAM_BYTES=8 GiB`. The worker planned 8 GiB at po2 19.
+  - **Full suite: 206.12 s** for the six programs (round 1: 206.49 s), plus zkop-mix 6.04 + 85.97 s.
+    Every program was wrapped (1.73-1.75 s) and verified.
+  - **Peak footprint 9.36 GB** (round 1: 9.39 GB). That is inside a 16 GB Mac's 11.5 GiB allowance.
 - These are all simulated budgets on this Mac. No real 16 GB Mac has been measured.
+
+### 3.3 Peak memory
+
+This round raised no peak:
+- default budget: 14.72 GB;
+- 8 GiB: at most 8.31 GB;
+- 4 GiB: 5.79 GB, and 6207 MiB in the 20-job run;
+- simulated 16 GB host: 9.36 GB.
+
+All of these equal round 1's figures within 0.03 GB.
 
 ### 3.4 First start
 
-`BENCH_ONLY=fibonacci --benchmark` (now the warm-up alone), timed as process wall:
+`BENCH_ONLY=fibonacci --benchmark` (the warm-up alone), timed as process wall time:
 
 | case | wall | pipelines |
 |---|---|---|
-| **cold first start** (first run in the new HOME, `MTL_SHADER_CACHE_SIZE=0`, no archives) | **57.8 s** | built in 55.5 s (cold): rv32im+zkp 55.4, recursion 31.3, keccak 20.5, groth16 31.3 (in parallel); zkp 72 PSOs 17.7 s, rv32im 13 PSOs 37.8 s |
-| second start (runtime archive kept) | 2.48 s | 72 + 13 hits |
-| third start, cold OS shader cache | 2.54 s | 72 + 13 hits |
+| **cold first start** (first run in the new HOME, `MTL_SHADER_CACHE_SIZE=0`, no archives) | **61.7 s** | built in 59.3 s (cold): rv32im+zkp 59.3, recursion 28.8, keccak 16.4, groth16 28.8 (in parallel). zkp: 72 PSOs in 28.8 s. rv32im: 13 PSOs in 30.5 s |
+| second start (runtime archive kept) | 2.46 s | 72 + 13 hits |
+| third start, cold OS shader cache | 2.47 s | 72 + 13 hits |
 
-- The macOS 26 fallback (a `macos26`-keyed archive set misses cleanly, then everything compiles) was
-  shown in RC2 with the same 5 metallib digests, and was not repeated.
+The cold start ran at a load of 1.95. Round 1 measured 57.8 s, and the README says 60.3 s.
 
 ### 3.5 Correctness
 
-- **Stock crates.io risc0-zkvm 3.1.0 verifier** (`tools/stock_verify31`, RC2's build; selector
-  `e71e6620`).
-  - **74 of 74** Groth16 receipts pass `STOCK 3.1 VERIFY: OK`. They come from the full suite, every
-    memory-merkle run at the default, 8 and 4 GiB budgets, the A/B (including 15 A-arm receipts), the 16
-    GB host and the three starts. By program: fibonacci 27, memory-merkle 39, and the other four 2 each.
-  - **Receipt types.** The worker returns Groth16 receipts only. Composite and succinct receipts stay
-    inside it, and it verifies them there (zkop-mix's no-wrap path, the keccak and M9 tests).
-  - For this risc0 tree (`37b434755` = W10-GATE's `404ae8dcf`, the same tree), W10-GATE's
-    `run_matrix.sh` judged composite, succinct and Groth16 receipts at the default, 8 and 4 GiB
-    budgets: **30/30 OK**.
-- **3.0 receipts are rejected.** B9-M26's 30 receipts from the 3.0 producer (composite, succinct and
-  Groth16; fibonacci, merkle, keccak, compose; default, 8 and 4 GiB) are all **REJECTED**, plain and
-  with `--relabel-as-31`: **60 of 60**.
-- **CLI end to end on a local chain.** Test binary `crates/zkminer-cli/tests/localnet.rs`, built from
-  this commit, with `ZKMINER_LOCALNET_ZKMINER` set to the installed CLI and
-  `ZKMINER_LOCALNET_RISC0_WORKER` to the installed worker. Anvil forked live 743111.
-  - **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`): **rc 0 in 137 s.** 4 claimable risc0
-    jobs (Full, Fields, NoneForUs, FullForAnother) were each claimed, proved on Metal with a Groth16 wrap,
-    fulfilled, and paid 4.95 tHEMI (5 tHEMI minus the 1 % fee). The 8 non-claimable jobs were not
-    claimed.
-  - **`refuses_to_claim_without_a_matching_verifier`** (the 3.0 selector): rc 0, 53 s.
-  - **`fulfils_with_a_replayed_receipt`** (mock worker): rc 0, 107 s.
-- **B9-CHAIN live read-only checks** against `https://testnet.rpc.hemi.network/rpc`, head 7248536:
-  - **handoff section 13 tests 1-4** (`live/checks.log`):
-    - chain 743111;
-    - the router, staking, registry and token wiring;
-    - `getAdapter` for the three ids: status 1, ratio 15,000, min stake 1e20, fee 100;
-    - the risc0 verifier: `SELECTOR 0xe71e6620`, `VERSION "3.1.0"`;
-    - live `getProofNonce`;
-    - 345 `JobSubmitted` logs.
-  - **`live_743111`, built from this commit: 4/4.**
-    - `the_live_deployment_verifies`: `verify_deployment` passes on "Hemi testnet (743111,
-      2026-11-16)".
+- **Stock crates.io risc0-zkvm 3.1.0 verifier** (`tools/stock_verify31`, the RC2 build, selector
+  `e71e6620`):
+  - **23 of 23** Groth16 receipts from this round pass with `STOCK 3.1 VERIFY: OK`. They come from
+    the full suite, every memory-merkle budget run, the simulated 16 GB host and the three starts:
+    fibonacci 9, memory-merkle 6, and 2 each for the other four.
+  - A fibonacci receipt checked against memory-merkle's image id is rejected ("claim digest does not
+    match").
+- **Receipt types.** The worker returns Groth16 receipts only. Composite and succinct receipts stay
+  inside the worker, which verifies them there: zkop-mix's no-wrap path and the keccak and M9 tests.
+- **The fork's verifier matrix.** For this risc0 tree (`37b434755`, unchanged since round 1),
+  W10-GATE's `run_matrix.sh` judged composite, succinct and Groth16 receipts at the default, 8 and 4
+  GiB budgets: 30/30 OK.
+- **3.0 receipts are rejected.** All 30 of B9-M26's receipts from the 3.0 producer are **REJECTED**,
+  plain and with `--relabel-as-31`: **60 of 60** (`out/sv/r30.log`).
+  - They cover composite, succinct and Groth16 receipts of fibonacci, merkle, keccak and compose.
+  - They were made at the default, 8 and 4 GiB budgets, including the `_wpso` sets.
+- **CLI end to end on a local chain.**
+  - Setup: the test binary `crates/zkminer-cli/tests/localnet.rs`, built from `f539d5c`.
+    `ZKMINER_LOCALNET_ZKMINER` and `ZKMINER_LOCALNET_RISC0_WORKER` point at the installed CLI and
+    worker. Anvil forked live 743111 at block 7,234,420.
+  - **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`): **rc 0 in 180 s.**
+    - The 4 claimable risc0 jobs (Full, Fields, NoneForUs, FullForAnother) were each claimed, proved
+      on Metal and fulfilled.
+    - Each paid 4.95 tHEMI (5 tHEMI minus the 1 % fee).
+    - The 8 non-claimable jobs were not claimed.
+  - **`refuses_to_claim_without_a_matching_verifier`** (the 3.0 selector): rc 0 in 58 s.
+  - **`fulfils_with_a_replayed_receipt`** (mock worker): rc 0 in 121 s.
+- **B9-CHAIN live read-only checks** against `https://testnet.rpc.hemi.network/rpc`, head 7249407:
+  - **Handoff section 13, tests 1-4** (`live/checks.log`):
+    - the chain id is 743111;
+    - the router, staking, registry and token wiring is as expected, and nothing is paused;
+    - `getAdapter` for the three ids gives status 1, ratio 15,000, min stake 1e20 and fee 100;
+    - the risc0 verifier gives `SELECTOR 0xe71e6620` and `VERSION "3.1.0"`;
+    - `getProofNonce` answers live;
+    - there are 453 `JobSubmitted` logs.
+    - The script's `version()` decode error on the adapters is a mismatch in the script's return
+      type and was the same in round 1.
+  - **`live_743111`, built from `f539d5c`: 4/4.**
+    - `the_live_deployment_verifies`: on "Hemi testnet (743111, 2026-11-16)".
     - `the_proof_nonce_matches_the_live_router`.
-    - `every_live_job_descriptor_decodes`: 345 logs.
+    - `every_live_job_descriptor_decodes`: 454 logs.
     - `the_abandoned_stack_is_refused_live`.
-  - **`abi_pins`: 3/3.** The cross-check against a hemiprove-contracts checkout
-    (`ZKMINER_CONTRACTS_REPO`) was not run, because no checkout is on this Mac.
-  - **The decisive check** (`scripts/verify_live.sh`, `eth_call` only), with this kit's fibonacci and
-    memory-merkle receipts:
+  - **`abi_pins`: 3/3.** The cross-check against a hemiprove-contracts checkout was not run, because
+    there is none on this Mac.
+  - **The decisive check** (`scripts/verify_live.sh`, `eth_call` only), using this kit's fibonacci
+    and memory-merkle receipts (`dump31`, a 260-byte seal with prefix `0xe71e6620`):
     - `Registry.verifyProof` and the native verifier both accept them.
-    - A flipped seal nibble and a journal one byte too long revert `0x439cc0cd`.
+    - A flipped seal nibble, and a journal one byte too long, revert with `0x439cc0cd`.
     - The 3.0 fixture (`73c457ba`) and a 3.1 seal relabelled `73c457ba` revert with the
       selector-mismatch error `0xb8b38d4c`.
 
-### 3.6 `zkminer benchmark` through the CLI
-
-- **Working worker:** `zkminer benchmark` in the sandbox gives **rc 0 in 261 s, with real numbers.**
-  - 2.71 MzkOP/s.
-  - Device row: po2 20, 892.6K c/s, Groth16 1.6 s.
-  - Per program: sha256-chain 50.97 s, ecdsa-verify 71.27 s, bigint-mul 30.63 s, memory-merkle 8.32 s,
-    chacha-mix 9.72 s, zkop-mix 68.36 s.
-  - It cached nothing simulated.
-- **Forced worker failure (RC3, `8b448a0`): FAIL.** Each case used its own HOME with the same config
-  and CLI:
+### 3.6 `zkminer benchmark` through the CLI (`out/cli/`)
 
 | case | expected | got |
 |---|---|---|
-| the worker exits 3 at start-up (a script printing "forced failure") | non-zero exit, the worker's error, no table | **rc 0**. Header "Workers: none — install prover binaries in ~/.zkminer/provers (CPU/simulated only)". The table is all **`simulated`** (e.g. chacha-mix 23,734,729,494 c/s), followed by "-0.00 MzkOP/s". The log has "Benchmark failed for risc0:metal:0: Backoff: waiting 4.78s before respawning" |
-| the real worker, warm-up fails (`RISC0_METAL_MAX_WORKING_SET_BYTES=1 GiB`: "Metal working-set budget exceeded") | the same | **rc 0**. Header "Workers: risc0:metal:0", then the same simulated table, and "ERROR Benchmark failed for risc0:metal:0: Worker risc0 process died (EOF)" |
+| working worker | rc 0, real numbers | **rc 0 in 261 s.** 2.72 MzkOP/s. Device row: po2 20, 892.3K c/s, Groth16 1.6 s. Per program: sha256-chain 51.04 s, ecdsa-verify 71.27 s, bigint-mul 30.65 s, memory-merkle 8.30 s, chacha-mix 9.73 s, zkop-mix 68.27 s. A plain `zkminer benchmark` saves nothing (by design; only `--calibrate` writes `benchmarks.json`) |
+| the worker exits 3 at start-up (a script that prints "forced failure"; own HOME, same CLI and config) | non-zero exit, the worker's error, no table | **rc 1 in 4 s, no table.** Header `Workers: risc0:metal:0 (failed to start; see below)`. Then `BENCHMARK FAILED: nothing was measured or saved.` and `risc0:metal:0 (Apple M5 Max): could not start: Handshake with worker risc0 failed (timeout=10s): Worker risc0 process died (EOF) (the worker's last output: forced failure) (then, … Backoff …)`, followed by the smoke and quarantine advice |
+| the real worker, warm-up fails (`RISC0_METAL_MAX_WORKING_SET_BYTES=1 GiB`) | the same | **rc 1 in 4 s, no table.** `risc0:metal:0 (Apple M5 Max): Worker risc0 process died (EOF) (the worker's last output: Metal working-set budget exceeded: allocating 536870912 bytes … limit of 1073741824 bytes …)` and the smoke advice |
 
-- This is RC2's section 2 item 5 and open issue 6. The fix is W10-BENCH:
-  - non-zero exit and no simulated table;
-  - the slot's last spawn or handshake error goes into the failure line and the header;
-  - a `benchmark_cli.rs` test.
-- W10-BENCH was not merged. Its last review reproduced the remaining defect, and the branch and its
-  worktree are kept for the next round.
-- Nothing from the failed runs reached the config, so `zkminer run` would not use those numbers. Even
-  so, a user is told the benchmark worked. This blocked the tag.
-
-**Step 0 (kit from `f9f535b`, sandbox `HOME`, quarantined download; logs in
-`scratch/w10/BETA-FIX/out/rc5-*`, details in `docs/metal-port-notes/BETA-FIX.md`):**
-
-| case | result |
-|---|---|
-| the worker exits 3 at start-up | **rc 1**, no table. Header `Workers: risc0:metal:0 (failed to start; see below)`. `BENCHMARK FAILED: nothing was measured or saved.` and `risc0:metal:0 (Apple M5 Max): could not start: Handshake ... process died (EOF) (the worker's last output: forced failure) ...`, the smoke and quarantine advice. No `benchmarks.json` |
-| the real worker, `RISC0_METAL_MAX_WORKING_SET_BYTES=1 GiB` | **rc 1**, no table. `Worker risc0 process died (EOF) (the worker's last output: Metal working-set budget exceeded: ...)`. No `benchmarks.json` |
-| working `zkminer benchmark` | **rc 0** in 271.5 s: 2.72 MzkOP/s, device row po2 20, 891.6K c/s, Groth16 1.6 s |
-| install (README steps), `init`, `help`, `macos-smoke.sh`, `install.sh --warm`, `--uninstall` | all rc 0; `spctl` rejects the quarantined download, the installed copies are unquarantined |
-| `check-macos-release.sh`, `check-macos-kit.py --require-validated`, `test-check-macos-kit.sh` (16/16), `test-assemble-macos.sh` (44/44) | ok |
-| full worker `--benchmark` (installed worker, default budget) | six programs **171.41 s, 901.1K c/s** (+1.09 % vs 169.56 s; RC3 171.88 s), wraps 1.59-1.60 s, peak footprint 14.73 GB |
-| stock crates.io 3.1.0 verifier on its 6 Groth16 receipts | **6/6 OK**; a receipt against another image id is rejected |
+**This closes RC3 round 1's failing check.**
 
 ### 3.7 Not run here
 
-Each item says why:
-- A real macOS 26 Mac, a real 16 GB Mac, and GPU families other than `applegpu_g17s`: none is
+- **The interleaved A/B.** The full suite came in at +0.59 %, below the 1.5 % threshold that requires
+  one. This round changed no risc0, kernel, metallib or compiler input, and the worker's commits since
+  round 1 change only its benchmark exit codes and error text.
+- **A real macOS 26 Mac, a real 16 GB Mac, and GPU families other than `applegpu_g17s`.** None is
   available.
-- The R17 audit, the stress run and the fork's Metal suites: there is no kernel or risc0 change since
-  W10-GATE's gates, which ran on this tree. The 5 metallib digests are unchanged, and so is the
-  compiler (27B47).
-- A Linux or Windows build of the integrated branch: there is no such host. CI on `main` will be the
-  first one (open issue 2).
-- The macOS 26 AOT fallback and the 3.0 producer: unchanged inputs, covered by RC2 and B9-M26.
-- Live-chain transactions: forbidden here (see the checklist).
+- **The R17 audit, the stress run and the fork's Metal suites.** There has been no kernel or risc0
+  change since W10-GATE's gates ran on this tree. The 5 metallib digests and the compiler (27B47) are
+  unchanged.
+- **A Linux or Windows build of the integrated branch.** There is no such host. CI on `main` will be
+  the first (open issue 1).
+- **The macOS 26 AOT fallback and the 3.0 producer.** Their inputs are unchanged, and RC2 and B9-M26
+  cover them.
+- **Live-chain transactions.** They are forbidden here (see the checklist).
 
 ## 4. macOS 26: what is validated
 
-Unchanged since RC2. No kernel, metallib or compiler change has gone in since.
-- **B9-M26 on this Mac:** 26.0-target AIR 2.8 kernels, `ir_scan` A=0 S=0, stress clean, suites ×2,
-  stock-verifier matrix, A/B, API audit.
-- **Two macOS 26.6.2 VM sessions** (`scratch/w9/B9-M26/vm/out-gui/RESULTS.md`, `…/out-rc1/RESULTS.md`)
-  passed:
+Unchanged since RC2, because no kernel, metallib or compiler change has gone in since.
+- **B9-M26 on this Mac:**
+  - the 26.0-target AIR 2.8 kernels;
+  - `ir_scan` A=0 S=0, and a clean stress run;
+  - the suites twice, the stock-verifier matrix, the A/B and the API audit.
+- **Two macOS 26.6.2 VM sessions** passed (`scratch/w9/B9-M26/vm/out-gui/RESULTS.md` and
+  `…/out-rc1/RESULTS.md`):
   - install, quarantine and `spctl`;
-  - `install.sh`, the Groth16 download, `init`;
-  - the clear missing-key error, the 8 GiB / po2 19 plan, and loading of all 5 metallibs.
-- The VMs' paravirtual GPU is inconclusive for proving. It is how the benchmark failure in section 3.6
-  was found.
-- **Still required:** a real Apple Silicon Mac on macOS 26 with at least 16 GB (checklist step 6).
+  - `install.sh`, the Groth16 download and `init`;
+  - the clear missing-key error, the 8 GiB / po2 19 plan, and the loading of all 5 metallibs.
+- **The VMs' paravirtual GPU says nothing about proving.** The VM run is how the benchmark failure,
+  now fixed, was found.
+- **Still required:** a real Apple Silicon Mac on macOS 26 with at least 16 GB (checklist step 5).
 
 ## 5. Open issues
 
-1. **Closed by step 0:** W10-BENCH and W10-DOC are merged with the BETA-FIX startup-error fix
-   (`f9f535b`, via `item/W10-BFIX`; no conflicts). Section 2's doc items 1-5 are W10-DOC's fixes.
-2. **Linux (CUDA, ROCm, Intel) and Windows have not been built against the fork pin.**
+1. **Linux (CUDA, ROCm, Intel) and Windows have not been built against the fork pin.**
    - W10-GATE makes every fork change behave like `release-3.1` off Metal by default, and the prover
      crate type-checks for Linux.
-   - Main's CI will be the first real build: after the push, watch `build-docker.yml`,
+   - Main's CI will be the first real build. After the push, watch `build-docker.yml`,
      `build-windows.yml` and `e2e.yml` on `main`.
-3. **Neither repository has these commits on GitHub yet.** `https://github.com/hemilabs/risc0` has no
-   `37b434755` until step 1 of the checklist.
-4. **Disk on the 14 GB runner.** The build job's minimum free space fell from 2.05 GB (RC2) to 1.22 GB.
-   Main's crates are the likely cause.
-   - Watch `macos-disk.sh "after the build"` on the real runner.
-   - If it fails, prune more before packaging or give the runner more disk.
-5. **The 4 GiB `BENCH_ONLY` A/B is +1.1 %** (section 3.2): the warm-up-order effect, and not a change
-   in the suite.
-6. **Mac messages in `zkminer benchmark`** (from main):
-   - the 300 W GPU power fallback "feeds the profitability model directly";
-   - the `nvidia-smi` and `/dev/cpu/0/msr` warnings.
-
-   A Mac's profitability estimate therefore uses 300 W, not a measured or Apple-typical figure. This
-   needs a decision or a fix.
-7. **Carried over from RC2:**
-   - every Mac has a ~1-minute first start (no AOT archives);
-   - B9-CI's runner items (nothing has run on the real runner; its SDK changes the metallib digests;
-     the `xcode` toolchain mode is untested);
+2. **Neither repository has these commits on GitHub yet.** `https://github.com/hemilabs/risc0` has no
+   `37b434755` until checklist step 1.
+3. **Disk on the 14 GB runner.**
+   - The build job's minimum free space is 1.22 GB, the same as round 1 (RC2: 2.05 GB).
+   - cpu-tests has 1.90 GB free at its peak (round 1: 2.07 GB).
+   - Watch `macos-disk.sh` on the real runner. If it fails, prune more before packaging or give the
+     runner more disk.
+4. **Mac messages in `zkminer benchmark`** (from main):
+   - the 300 W GPU power fallback "feeds the profitability model directly", so a Mac's profitability
+     estimate uses 300 W. This needs a decision or a fix;
+   - the `nvidia-smi` warning;
+   - the worker's INFO lines re-logged at WARN.
+5. **From W10-BENCH and BETA-FIX, not fixed:**
+   - A worker file that is present but not executable is not discovered, so `zkminer benchmark` runs
+     the labelled SIMULATED path and exits 0. This is not a kit path, because `install.sh` sets the
+     mode.
+   - The TUI drops a whole run when one card fails and another measures.
+   - A simulated `--json` run exits 0.
+   - `benchmark_targets()` ignores Metal.
+   - The 150 ms proc test bound fails under load.
+   - The quoted worker line in errors can come from guest stdout. It is sanitized, capped at 300
+     characters, and only local.
+   - The security reviewer's optional one-line warning for `RISC0_VERBOSE` and
+     `RISC0_METAL_REC_CAPTURE` was not added.
+6. **Carried over from RC2:**
+   - every Mac has a first start of about a minute (no AOT archives);
+   - B9-CI's runner items: nothing has run on the real runner, its SDK changes the metallib
+     digests, and the `xcode` toolchain mode is untested;
    - B9-FX (the fixture symlink guard) is unmerged;
-   - `worker --benchmark` exits 0 when a program fails (documented in the README);
-   - no kit-aware missing-Groth16 message;
-   - the unpinned `Jimver/cuda-toolkit` tag in `build-windows.yml`;
-   - the release notes' checksum command;
-   - the `w7` dispatcher table and debug-only knobs (B9-G1, B9-ZK).
-8. Not measured: a real 16 GB Mac (including its cold first start on an M1-M4), other GPU families, a
-   real macOS 26 runtime, and `build-macos.yml` on the real runner.
+   - there is no kit-aware missing-Groth16 message from the worker itself;
+   - the `Jimver/cuda-toolkit` tag in `build-windows.yml` is unpinned;
+   - the `w7` dispatcher table and the debug-only knobs (B9-G1, B9-ZK) remain.
+7. **Not measured:** a real 16 GB Mac (including its cold first start on an M1-M4), other GPU
+   families, a real macOS 26 runtime, and `build-macos.yml` on the real runner.
 
 ## 6. User checklist
 
-Nothing below was executed. The local checkouts' push URLs are disabled on purpose, so each command
-names its URL.
-
-0. **Done (2026-11-19, `f9f535b`; section 3.6 "Step 0").** Before pushing: merge W10-BENCH, then
-   W10-DOC, then repeat the short RC. This changes the zk-miner sha, not the risc0 pin.
-   - Rebuild the kit with `build-macos.yml`'s steps (`scripts/ci/assemble-macos.sh`, `AOT_ARCHES=none`).
-   - Re-run the checks for what changed:
-     - section 3.6, both forced failures: non-zero exit, the worker's error, no table;
-     - `zkminer benchmark` with a working worker: rc 0;
-     - the kit README steps (section 2);
-     - `check-macos-release.sh`;
-     - one full `--benchmark`;
-     - the stock verifier on its receipts.
-   - Then update this file's sha256 and commit.
+Nothing below was executed. The push URLs of the local checkouts are disabled on purpose, so each
+command names its URL. Steps 0 and the RC are done: W10-BENCH, W10-DOC and the BETA-FIX fix are
+merged (`f9f535b`), and this round checked `f539d5c`.
 
 1. **Push the risc0 fork unchanged.** `Cargo.lock` pins this exact sha:
 
    ```sh
    cd /Users/user/zkminer/deps/risc0-3.1
    git rev-parse zkminer/metal-3.1      # must print 37b434755ce77dd1354d957a7b61912aa4359423
+   git merge-base --is-ancestor origin/release-3.1 37b434755ce77dd1354d957a7b61912aa4359423 && echo contains-release-3.1
    git push git@github.com:hemilabs/risc0.git 37b434755ce77dd1354d957a7b61912aa4359423:refs/heads/zkminer/metal-3.1
    git ls-remote https://github.com/hemilabs/risc0 refs/heads/zkminer/metal-3.1   # must print 37b434755…
    ```
@@ -410,20 +381,20 @@ names its URL.
    ```sh
    cd /Users/user/zkminer/zk-miner-3.1
    git fetch https://github.com/hemilabs/zk-miner main && git merge-base --is-ancestor FETCH_HEAD metal-3.1 && echo fast-forward
-   git log --oneline -1 metal-3.1        # this file's commit (or the one after step 0)
+   git log --oneline -1 metal-3.1        # this file's commit (its parent is f539d5c)
    git push git@github.com:hemilabs/zk-miner.git metal-3.1:refs/heads/metal-3.1     # keep the branch
    git push git@github.com:hemilabs/zk-miner.git metal-3.1:main                     # fast-forward main
    ```
 
-   If `main` is protected, open a PR and merge it with a merge that keeps the history. A squash or
-   rebase merge changes the shas and breaks the fast-forward relationship.
+   If `main` is protected, open a PR and merge it with a merge commit, or with a fast-forward if the
+   repository allows one. A squash or rebase merge changes the shas.
 
    ```sh
    gh pr create --repo hemilabs/zk-miner --base main --head metal-3.1 --title "macOS (Metal) beta on RISC Zero 3.1"
    ```
 
 3. **Repository variable** (optional). The workflow falls back to `zk-runner-mac-new`, so set the
-   variable only for a different runner label. Never register this Mac as a runner.
+   variable only to use a different runner label. Never register this Mac as a runner.
 
    ```sh
    gh variable set ZKMINER_MACOS_RUNNER --repo hemilabs/zk-miner --body zk-runner-mac-new
@@ -432,10 +403,13 @@ names its URL.
 4. **CI on the real runners.**
    - The push to `main` triggers `build-macos.yml`, `build-docker.yml` and `e2e.yml` (by path). Run
      `build-windows.yml` by hand.
-   - `build-macos.yml` needs build, cpu-tests and metal-probe to pass (metal-probe is informational).
-     Compare its kit's `BUILDINFO` with "The candidate": `min_macos=26.0`, `metal_compiler … 32023.922`,
-     `risc0_rev 37b434755…`, no archives. Watch the build job's disk line (open issue 4).
-   - The Linux and Windows builds are the first builds of the fork pin there (open issue 2).
+   - `build-macos.yml` needs its build, cpu-tests and metal-probe jobs to pass; metal-probe is
+     informational.
+   - Compare the CI kit's `BUILDINFO` with "The candidate": `min_macos=26.0`, `metal_compiler …
+     32023.922`, `risc0_rev 37b434755…`, no archives.
+   - Watch the build job's disk line (open issue 3).
+   - The Linux and Windows builds are the first builds of the fork pin on those platforms (open
+     issue 1).
 
    ```sh
    gh workflow run build-macos.yml   --repo hemilabs/zk-miner --ref main -f metal_toolchain=pinned
@@ -443,53 +417,60 @@ names its URL.
    gh run list --repo hemilabs/zk-miner --branch main --limit 10
    ```
 
-5. **HemiProve deployment of 2026-11-16 on 743111** (handoff `/Users/user/zkminer/zkminer-handoff-743111.md`).
-   - Main's own update (`deployment.rs`, ABIs re-vendored from hemiprove-contracts `3bc441d`) is now the
-     code path. `3bc441d` equals B9-CHAIN's `8e1808b` except for `LICENSE`.
-   - This RC re-ran, against the live chain, read-only:
-     - handoff tests 1-4;
-     - `live_743111` 4/4;
-     - `abi_pins` 3/3;
-     - `Registry.verifyProof` with this kit's receipts.
-   - On a fork it re-ran test 6 (section 3.5).
-   - After the governance handoff, check that `zkminer run` still passes its deployment checks. If you
-     have a hemiprove-contracts checkout at `3bc441d`, also run
-     `ZKMINER_CONTRACTS_REPO=<checkout> cargo test -p zkminer-chain --lib`.
-
-6. **macOS 26 on real hardware (user decision: supported).**
-   - **Before tagging**, on a real Apple Silicon Mac with macOS 26 and at least 16 GB: ideally a 16 GB
-     M1-M4, plus other GPU families (an M1/M2 `applegpu_g13*`/`g14*` and an M3/M4 `g15*`/`g16*`) if you
-     can.
-   - In the extracted CI kit:
+5. **macOS 26 on real hardware (user decision: supported).**
+   - **Before tagging**, test on a real Apple Silicon Mac with macOS 26 and at least 16 GB: ideally a
+     16 GB M1-M4.
+   - If you can, also test other GPU families: an M1/M2 (`applegpu_g13*`/`g14*`) and an M3/M4
+     (`g15*`/`g16*`).
+   - In the extracted CI kit (downloaded with a browser, so that the quarantine path is covered too):
 
      ```sh
-     shasum -a 256 zkminer-0.1.0-macos-arm64.tar.gz      # against the CI run's SHA256SUMS
+     shasum -a 256 -c --ignore-missing SHA256SUMS        # the CI run's SHA256SUMS beside the tarball
      tar -xzf zkminer-0.1.0-macos-arm64.tar.gz && cd zkminer-0.1.0-macos-arm64
      ./install.sh --with-groth16
      tools/macos-smoke.sh                                # scripts/ci/macos-smoke.sh in the repository
      ~/.zkminer/provers/zkminer-prove-risc0-metal --metal-arch
      ~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark
-     ~/.zkminer/zkminer init && ~/.zkminer/zkminer benchmark
+     export PATH="$HOME/.zkminer:$PATH"; zkminer init && zkminer benchmark
      ```
 
-   - Expect the first start to compile the pipelines for a minute or more. Then expect every program
-     "verified", the smoke script's `RESULT: ok`, and `zkminer benchmark` exiting 0 with real numbers.
-   - Keep the logs, and note the chip, RAM, macOS build and first-start time.
+   - Expect the first start to compile the pipelines, which takes a minute or more. Then expect:
+     - every program "verified";
+     - the smoke script's `RESULT: ok`;
+     - `zkminer benchmark` exiting 0 with real numbers.
+   - Keep the logs. Note the chip, the RAM, the macOS build and the first-start time.
+
+6. **HemiProve deployment of 2026-11-16 on 743111** (handoff `/Users/user/zkminer/zkminer-handoff-743111.md`).
+   - Main's own update is now the code path: `deployment.rs`, with ABIs re-vendored from
+     hemiprove-contracts `3bc441d`. `3bc441d` equals B9-CHAIN's `8e1808b` except for `LICENSE`.
+   - This round re-ran these read-only checks against the live chain:
+     - handoff tests 1-4;
+     - `live_743111` 4/4;
+     - `abi_pins` 3/3;
+     - `Registry.verifyProof` with this kit's receipts.
+   - It also re-ran test 6 on a fork (section 3.5).
+   - After the governance handoff, check that `zkminer run` still passes its deployment checks.
+   - With a hemiprove-contracts checkout at `3bc441d`, also run
+     `ZKMINER_CONTRACTS_REPO=<checkout> cargo test -p zkminer-chain --lib`.
 
 7. **Funded-key acceptance tests** (handoff section 13), live on 743111:
-   - Use a staked prover key, with tHEMI from the HemiProve team: at least 100 per lock, and 1,000 for
-     custom-verifier jobs. You also need testnet ETH. Keep the transaction hashes.
-   - Tests for the Mac beta: **5, 6, 10, 11, 13, 14, 15, 16, 17, 18, 19**.
+   - **What you need:**
+     - a staked prover key;
+     - tHEMI from the HemiProve team: at least 100 per lock, and 1,000 for custom-verifier jobs;
+     - testnet ETH.
+   - Keep the transaction hashes.
+   - **Tests for the Mac beta: 5, 6, 10, 11, 13, 14, 15, 16, 17, 18, 19.**
      - Schedule 19 (the pause drill) with the team.
      - For 14, expect `InsufficientFreeStake`, not `Panic(0x01)` (B9-CHAIN).
-   - Not applicable to this build: **7, 8, 9, 12** (SP1 nonce marker, PLONK, `claimAndFulfillAssigned`).
+   - **Not applicable to this build: 7, 8, 9, 12** (the SP1 nonce marker, PLONK,
+     `claimAndFulfillAssigned`).
 
-8. **Cut v0.1.0** once steps 0-7 are done.
+8. **Cut v0.1.0** once steps 1-7 are done.
    - `release.yml` requires the tag to equal `[workspace.package].version` (`0.1.0`).
    - It builds Linux, Windows and the macOS kit (`build-macos.yml`, pinned 27B47) from the tagged
      commit.
-   - Fix the release notes' checksum line first (`--ignore-missing`). Recommended.
-   - Run a dry run on `main` first (it publishes nothing), check its assets, then tag:
+   - The release notes already say `--ignore-missing`.
+   - Do a dry run on `main` first, which publishes nothing. Check its assets, then tag:
 
    ```sh
    gh workflow run release.yml --repo hemilabs/zk-miner --ref main -f dry_run=true -f gpu_validation=true
@@ -498,4 +479,5 @@ names its URL.
    git -C <checkout of main> push git@github.com:hemilabs/zk-miner.git v0.1.0
    ```
 
-   Compare the release's macOS kit `BUILDINFO` with this RC. Its sha256 will differ (commit, SDK).
+   Compare the release's macOS kit `BUILDINFO` with this RC. Its sha256 will differ (the commit and
+   the SDK).
