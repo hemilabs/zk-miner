@@ -16,7 +16,9 @@
 //! `<start>` is the process's start time, so the directory of a killed worker whose pid this one
 //! reuses is never taken for this one's. A worker that was killed cannot empty its own: the next
 //! worker to start removes the directories of workers that are gone, told by their pid and start
-//! time in `/proc`. On another OS every directory is kept. Workers sharing the directory from
+//! time in `/proc`. On macOS a directory is named by the pid alone and removed once no process has
+//! that pid (a killed Metal worker's segments would otherwise stay under `~/.zkminer` for good; a
+//! reused pid keeps it until that process is gone too). On another OS every directory is kept. Workers sharing the directory from
 //! different pid namespaces cannot see each other, and would remove each other's.
 //!
 //! Without a directory (no home directory, or a directory on the way that is not this user's
@@ -382,8 +384,25 @@ fn running(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// macOS: whether any process has `pid` (`kill(pid, 0)`; `EPERM` is another user's process). No start
+/// time is read here, so a directory is named `<pid>` and a reused pid keeps it.
+#[cfg(target_os = "macos")]
+fn running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists and may be signalled.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
 /// Where a pid's liveness cannot be read, every directory is kept.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn running(_pid: u32) -> bool {
     true
 }
@@ -613,5 +632,37 @@ mod tests {
         drop(session);
         drop(emptied);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+}
+
+/// W11-ON37: on macOS the segment directories of workers that are gone are removed by pid.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    /// Above macOS's largest pid (99999).
+    const GONE: u32 = 4_194_311;
+
+    #[test]
+    fn a_gone_workers_directory_is_removed_and_a_live_ones_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(BASE);
+        let me = std::process::id();
+        assert_eq!(start_time(me), None);
+        assert_eq!(dir_name(me, start_time(me)), me.to_string());
+        let gone = base.join(GONE.to_string());
+        let launchd = base.join("1");
+        let other = base.join("not-a-pid");
+        for d in [&gone, &launchd, &other] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+            std::fs::write(d.join("0.segment"), b"x").unwrap();
+        }
+        assert!(running(me) && running(1) && !running(GONE));
+        let dir = prepare_in(Some(home.path()), None, me, None).unwrap();
+        assert_eq!(dir, base.join(me.to_string()));
+        assert!(!gone.exists(), "a gone worker's directory is removed");
+        assert!(launchd.exists(), "a running pid's directory is kept");
+        assert!(other.exists(), "a directory no worker names is kept");
+        assert!(dir.is_dir());
     }
 }
