@@ -11610,6 +11610,8 @@ impl WorkerPool {
         let proof_response = handle.recv_proof(request_id, &on_progress);
         slot.note_used(UseKind::Proof);
 
+        // How a worker that died mid-proof ended and what it said last, added to the error (below).
+        let mut death_note: Option<String> = None;
         // If recv_proof failed (EOF, stream corruption, protocol desync),
         // kill the worker to prevent reusing a corrupted IPC stream.
         if let Err(ref e) = proof_response {
@@ -11657,6 +11659,15 @@ impl WorkerPool {
                     .unwrap_or(false);
             #[cfg(not(unix))]
             let host_oom = false;
+
+            // Before the slot is cleared: the handle holds the exit and the output. A crash otherwise
+            // reads only "process died (EOF)", and the dashboard does not forward worker output.
+            if is_eof && !entry.intentional_kill.load(Ordering::Acquire) {
+                death_note = slot
+                    .handle
+                    .as_mut()
+                    .map(|h| h.death_note(Duration::from_secs(1)));
+            }
 
             if !is_eof {
                 tracing::error!("Stream corruption detected for {key}, killing worker");
@@ -11730,6 +11741,12 @@ impl WorkerPool {
                 }
             }
         }
+
+        // Context, not a new error: callers still find the `WorkerDied` underneath.
+        let proof_response = match death_note {
+            Some(note) => proof_response.map_err(|e| e.context(format!("{key}: {note}"))),
+            None => proof_response,
+        };
 
         // Count a completed proof toward the recycle threshold. Only on
         // success — a failed/killed worker is respawned, which resets the counter.

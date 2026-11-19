@@ -142,6 +142,23 @@ fn worker_env(
     env
 }
 
+/// A worker's last lines of output, kept whether or not they are forwarded: the dashboard suppresses
+/// forwarding, and a worker that crashed otherwise said only "process died (EOF)".
+type RecentOutput = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// How many of a worker's last lines are kept, and how much of each: bounded, as a guest's own output
+/// reaches the worker's stderr.
+const RECENT_OUTPUT_LINES: usize = 12;
+const RECENT_OUTPUT_LINE_CHARS: usize = 240;
+
+fn remember_output(recent: &RecentOutput, line: &str) {
+    let mut lines = recent.lock().unwrap_or_else(|p| p.into_inner());
+    if lines.len() == RECENT_OUTPUT_LINES {
+        lines.pop_front();
+    }
+    lines.push_back(line.chars().take(RECENT_OUTPUT_LINE_CHARS).collect());
+}
+
 /// When true, worker stderr forwarding is suppressed (TUI mode).
 static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
 
@@ -705,6 +722,8 @@ pub struct WorkerHandle {
     /// forwarding is suppressed. A worker that dies before its handshake usually says why there
     /// ("dyld: Library not loaded"), and the spawn error carries it to the operator (W10-BFIX).
     last_stderr: Arc<Mutex<Option<String>>>,
+    /// The worker's last lines of output (see [`WorkerHandle::recent_output`]).
+    recent_output: RecentOutput,
     /// True once this handle has reaped its child. Every `kill(-pgid, …)` is gated on
     /// this: after the reap the pid number is free and may name an unrelated group.
     reaped: bool,
@@ -1008,6 +1027,8 @@ impl WorkerHandle {
         let backend_name = backend.to_string();
         let last_stderr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_stderr_w = last_stderr.clone();
+        let recent_output = RecentOutput::default();
+        let recent_for_drain = recent_output.clone();
         let stderr_task = child_stderr.map(|stderr| {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
@@ -1060,6 +1081,8 @@ impl WorkerHandle {
                         // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
                         // tracing::warn would flood the rolling log file. The pipe is still drained (we
                         // read every byte), so the worker never blocks on a full pipe regardless.
+                        // Kept even when not forwarded, for a failed proof to report.
+                        remember_output(&recent_for_drain, &line);
                         if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
                             return;
                         }
@@ -1229,6 +1252,7 @@ impl WorkerHandle {
             writer,
             stderr_task,
             last_stderr,
+            recent_output,
             reaped: false,
             oom_kills_at_spawn,
             may_lack_network: false,
@@ -1600,7 +1624,11 @@ impl WorkerHandle {
         #[cfg(not(unix))]
         {
             match self.child.try_wait() {
-                Ok(Some(st)) => format!("exited with code {:?}", st.code()),
+                // A crash's code is an NTSTATUS, e.g. 0xC0000005, which says more in hex.
+                Ok(Some(st)) => match st.code() {
+                    Some(c) if c < 0 => format!("exited with code {c} (0x{:08X})", c as u32),
+                    c => format!("exited with code {c:?}"),
+                },
                 Ok(None) => "still running (spurious)".to_string(),
                 Err(e) => format!("try_wait ERROR: {e}"),
             }
@@ -1668,6 +1696,38 @@ impl WorkerHandle {
             return;
         }
         await_exit_visible_of(self.child.id(), budget);
+    }
+
+    /// The worker's last lines of output, oldest first (at most `RECENT_OUTPUT_LINES`).
+    pub fn recent_output(&self) -> Vec<String> {
+        self.recent_output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// How a worker whose output pipe closed ended, and what it said last, in one line for a failed
+    /// proof's error. Waits up to `budget` for the exit to show and for its last output to drain.
+    pub fn death_note(&mut self, budget: Duration) -> String {
+        let started = Instant::now();
+        #[cfg(unix)]
+        self.await_exit_visible(budget);
+        #[cfg(not(unix))]
+        while matches!(self.child.try_wait(), Ok(None)) && started.elapsed() < budget {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Its stderr may hold a last line or two after its stdout closed.
+        let drain = Duration::from_millis(200).min(budget.saturating_sub(started.elapsed()));
+        std::thread::sleep(drain);
+        let reason = self.exit_reason();
+        let lines = self.recent_output();
+        if lines.is_empty() {
+            format!("worker {reason}, with no output")
+        } else {
+            format!("worker {reason}; its last output: {}", lines.join(" | "))
+        }
     }
 
     /// Get the worker's PID.
