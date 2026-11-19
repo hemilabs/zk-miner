@@ -4305,7 +4305,9 @@ pub async fn run(
     .await;
     monitor_handle.abort();
     event_handle.abort();
-    hw_handle.abort();
+    // `hw_handle` is NOT aborted here: the dashboard stays open through the drain, and the cards'
+    // figures (load, clocks, temperature, power) are what shows the proofs still running. Stopping
+    // it froze every card at the moment the drain began. Aborted at the end, with the brain.
     // brain_handle is NOT aborted here. The claim of "per-job lifecycles are
     // independent spawned tasks" holds for the normal and batch paths (spawn_lifecycle_task)
     // but NOT for recovery: `recover_claimed_jobs` awaits `process_job_lifecycle` INLINE
@@ -5285,6 +5287,7 @@ pub async fn run(
     }
     brain_handle.abort();
     refresh_handle.abort();
+    hw_handle.abort();
 
     // Close the dashboard, then print what the shutdown reported on it, so the verdict stays in
     // the terminal's scrollback.
