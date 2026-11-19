@@ -170,7 +170,7 @@ fn main() {
 
 fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    // Shared, so a proof's progress hook can report from inside the proof (see `report_progress`).
+    // Shared, so a proof's progress hook can report from inside the proof (see `report_stage`).
     let shared: IpcOut =
         std::sync::Arc::new(std::sync::Mutex::new(Box::new(BufWriter::new(ipc_stdout))));
     let _ = IPC_OUT.set(shared.clone());
@@ -269,7 +269,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 // to every GPU crashing each, and the program is never classed bad — so it is cheaply
                 // repeatable and drives a release-penalty/slash. Contain it here and answer with an
                 // error (typed by what panicked, below) instead of dying.
-                // The proof's progress reports carry this request (see `report_progress`).
+                // The proof's progress reports carry this request (see `report_stage`).
                 *PROVING.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some((request_id, Instant::now()));
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1267,35 +1267,30 @@ impl io::Write for SharedOut {
     }
 }
 
-/// The share of a job proof's time the segments take: the rest is the lift/join tail, the keccak
-/// proofs and the Groth16 wrap, which report nothing. Segments are 55-75% of a multi-segment proof;
-/// the host carries the bar through the rest on time.
-const SEGMENT_SHARE: f64 = 0.85;
-
-/// The fraction done when `done` of `total` segments are proven.
-fn segment_fraction(done: u32, total: u32) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    SEGMENT_SHARE * f64::from(done.min(total)) / f64::from(total)
-}
-
-/// Sends the host a `Progress` for the job proof in flight, if any. Best effort: a failed write
+/// Sends the host a message about the job proof in flight, if any. Best effort: a failed write
 /// shows up as the next message's failure, not here.
-fn report_progress(done: u32, total: u32) {
-    let Some((request_id, started)) = *PROVING.lock().unwrap_or_else(|p| p.into_inner()) else {
+fn send_to_host(msg: impl FnOnce(u64) -> WorkerResponse) {
+    let Some((request_id, _)) = *PROVING.lock().unwrap_or_else(|p| p.into_inner()) else {
         return;
     };
     let Some(out) = IPC_OUT.get() else {
         return;
     };
-    let msg = WorkerResponse::Progress {
+    let _ = write_message(&mut SharedOut(out.clone()), &msg(request_id));
+}
+
+/// Tells the host which stage the job proof is in (protocol 16). The host weighs the stages by the
+/// job's measured cycles and the card's benchmark; the worker only says where it is.
+fn report_stage(stage: zkminer_prover_protocol::ProveStage, done: u32, total: u32) {
+    send_to_host(|request_id| WorkerResponse::ProveStage {
         request_id,
-        fraction: segment_fraction(done, total),
-        elapsed_secs: started.elapsed().as_secs_f64(),
-        segments: Some((done, total)),
-    };
-    let _ = write_message(&mut SharedOut(out.clone()), &msg);
+        report: zkminer_prover_protocol::StageReport {
+            stage,
+            done,
+            total,
+            total_final: true,
+        },
+    });
 }
 
 /// Reports each proven segment of the session it is hooked onto.
@@ -1305,7 +1300,12 @@ struct SegmentProgress {
 
 impl risc0_zkvm::SessionEvents for SegmentProgress {
     fn on_post_prove_segment(&self, segment: &risc0_zkvm::Segment) {
-        report_progress(segment.index + 1, self.total);
+        let done = (segment.index + 1).min(self.total);
+        report_stage(zkminer_prover_protocol::ProveStage::Prove, done, self.total);
+        // After the last segment: the lift/join and keccak tail, then the Groth16 wrap.
+        if done == self.total {
+            report_stage(zkminer_prover_protocol::ProveStage::Finish, 0, 0);
+        }
     }
 }
 
@@ -1320,9 +1320,17 @@ fn prove_reporting_segments(
     opts: &risc0_zkvm::ProverOpts,
 ) -> Result<risc0_zkvm::ProveInfo> {
     let server = risc0_zkvm::get_prover_server(opts)?;
+    // A start, also on a retry inside this worker (`run_proof`): the host starts its progress over.
+    send_to_host(|request_id| WorkerResponse::Progress {
+        request_id,
+        fraction: 0.0,
+        elapsed_secs: 0.0,
+        segments: None,
+    });
+    report_stage(zkminer_prover_protocol::ProveStage::Execute, 0, 0);
     let mut session = risc0_zkvm::ExecutorImpl::from_elf(env, elf)?.run()?;
     let total = u32::try_from(session.segments.len()).unwrap_or(u32::MAX);
-    report_progress(0, total);
+    report_stage(zkminer_prover_protocol::ProveStage::Prove, 0, total);
     session.add_hook(SegmentProgress { total });
     let ctx = risc0_zkvm::VerifierContext::default().with_dev_mode(opts.dev_mode());
     server.prove_session(&ctx, &session)
@@ -1864,26 +1872,6 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
         total_cycles,
         prove_duration_secs: duration.as_secs_f64(),
     })
-}
-
-#[cfg(test)]
-mod progress_tests {
-    use super::*;
-
-    /// Segments take the bar to SEGMENT_SHARE and no further: the tail after them reports nothing,
-    /// so a bar at 100% would sit there through it.
-    #[test]
-    fn segment_progress_stops_short_of_the_tail() {
-        assert_eq!(segment_fraction(0, 12), 0.0);
-        assert!((segment_fraction(6, 12) - SEGMENT_SHARE / 2.0).abs() < 1e-12);
-        assert_eq!(segment_fraction(12, 12), SEGMENT_SHARE);
-        assert_eq!(
-            segment_fraction(13, 12),
-            SEGMENT_SHARE,
-            "never past the segments' share"
-        );
-        assert_eq!(segment_fraction(0, 0), 0.0);
-    }
 }
 
 #[cfg(test)]

@@ -190,14 +190,17 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     f.render_widget(econ, chunks[2]);
 
     // Progress (if proving)
-    if let MinerJobStatus::Proving { progress, .. } = &job.status {
+    if let MinerJobStatus::Proving { .. } = &job.status {
         let secs = format_duration(state.proving_secs(job));
-        let label = if *progress > 0.0 {
-            format!("{:.1}% ({secs})", progress * 100.0)
-        } else {
-            // No progress reported (SP1 today): how long, not a bar stuck at 0%.
-            format!("proving for {secs}; this prover reports no progress")
+        let stage = state.proving_stage_label(job).unwrap_or_default();
+        let fraction = state.proving_fraction(job);
+        let label = match fraction {
+            Some(f) => format!("{:.1}% ({secs}, {stage})", f * 100.0),
+            None => {
+                format!("proving for {secs} ({stage}); no measurement or benchmark to estimate by")
+            }
         };
+        let progress = fraction.unwrap_or(0.0);
         let gauge = Gauge::default()
             .block(
                 Block::default()
@@ -207,7 +210,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                     .border_type(theme::border_type()),
             )
             .gauge_style(Style::default().fg(theme::green()))
-            .percent((*progress * 100.0).clamp(0.0, 100.0) as u16)
+            .percent((progress * 100.0).clamp(0.0, 100.0) as u16)
             .label(label);
         f.render_widget(gauge, chunks[4]);
     }

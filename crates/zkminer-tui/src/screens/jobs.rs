@@ -138,15 +138,18 @@ pub(crate) fn claimed_status_text(job: &TrackedJob, state: &MinerState, now: u64
     });
     let stage = match &job.status {
         MinerJobStatus::Queued => "queued, waiting for a GPU".to_string(),
-        MinerJobStatus::Proving { progress, .. } => {
+        MinerJobStatus::Proving { .. } => {
             let on = card.map(|c| format!(" on {c}")).unwrap_or_default();
             let secs = format_duration(state.proving_secs(job));
-            // A worker that reports no progress (SP1 today) would read 0% throughout: say only how
-            // long it has run.
-            if *progress > 0.0 {
-                format!("proving{on}, {:.0}% after {secs}", progress * 100.0)
-            } else {
-                format!("proving{on} for {secs}")
+            let stage = state
+                .proving_stage_label(job)
+                .map(|l| format!(" ({l})"))
+                .unwrap_or_default();
+            // With nothing to weigh the stages by (no measurement, no benchmark row), only how long
+            // it has run, not a made-up percentage.
+            match state.proving_fraction(job) {
+                Some(f) => format!("proving{on}, {:.0}% after {secs}{stage}", f * 100.0),
+                None => format!("proving{on} for {secs}{stage}"),
             }
         }
         MinerJobStatus::Submitting => "proved, submitting".to_string(),
@@ -275,9 +278,11 @@ mod tests {
             claimed_status_text(&silent, &state, 1_000),
             "Claimed: proving for 1m 15s"
         );
+        // The status's own fraction is not shown: with no measurement and no benchmark to weigh the
+        // worker's stages by, there is no honest percentage.
         assert_eq!(
             claimed_status_text(&proving, &state, 1_000),
-            "Claimed: proving, 42% after 1m 15s"
+            "Claimed: proving for 1m 15s"
         );
         let mut late = job(3, MinerJobStatus::Submitting);
         late.info.lock_deadline = 900;

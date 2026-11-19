@@ -41,7 +41,9 @@ use serde::{Deserialize, Serialize};
 /// (`SP1_ELEMENT_THRESHOLD_CAP_ENV`) and reports sp1-gpu's own out-of-memory wordings as
 /// `ResourceExhausted`. A v14 worker would run larger than the dispatcher plans for, and a cap
 /// recorded after it proved would be one that was never in force.
-pub const PROTOCOL_VERSION: u32 = 15;
+/// 16: `WorkerResponse::ProveStage`, appended last: what part of a proof a worker is in, with its
+/// counts, from which the host works out how far the proof is (`Progress` still marks the start).
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -396,6 +398,50 @@ pub enum WorkerResponse {
         /// What `done_bytes` is heading for, where it is known.
         total_bytes: Option<u64>,
     },
+    /// What part of a proof the worker is in, sent as it moves (protocol 16). Raw facts, not a
+    /// fraction: the host weighs each stage by what it knows of the job and the card (the job's
+    /// measured cycles over the card's benchmarked STARK rate, the card's measured wrap time).
+    /// Appended last, so every earlier variant keeps its bincode index.
+    ProveStage {
+        request_id: u64,
+        report: StageReport,
+    },
+}
+
+/// A stage of a proof, in the order a proof goes through them (`WorkerResponse::ProveStage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProveStage {
+    /// SP1: starting the server's proof (the proving key for a new program, the first shards).
+    Setup,
+    /// risc0: executing the guest before proving it.
+    Execute,
+    /// The STARK: risc0 segments, SP1 core shards. Counted.
+    Prove,
+    /// After the STARK: risc0's lift/join and keccak proofs then the Groth16 wrap; SP1's shrink and
+    /// Groth16 wrap. Reports nothing until it ends.
+    Finish,
+}
+
+/// Where a proof is (`WorkerResponse::ProveStage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageReport {
+    pub stage: ProveStage,
+    /// Units of the stage done (segments, shards); 0 for a stage that is not counted.
+    pub done: u32,
+    /// Units the stage has so far; 0 for a stage that is not counted.
+    pub total: u32,
+    /// Whether `total` is final. SP1 learns its shard count only once execution ends.
+    pub total_final: bool,
+}
+
+/// What a proof's progress callback receives from the dispatcher: that an attempt started on a
+/// card, and each stage report after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProveEvent {
+    /// An attempt started. A retry sends this again: its progress starts over.
+    Started,
+    /// The attempt's worker reported where it is.
+    Stage(StageReport),
 }
 
 /// What a worker's one-time setup is doing (`WorkerResponse::SetupProgress`), for display.

@@ -2669,6 +2669,10 @@ const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 
 /// Which build of `sp1-gpu-server` the SP1 SDK runs (`~/.sp1/bin/<name>`, socket
 /// `/tmp/<name>-<device>.sock`); see `discovery::sp1_server_name`.
+/// A proof's progress callback with the slot it runs on: an attempt's start, then each stage its
+/// worker reports.
+pub type SlotProgress = Box<dyn Fn(zkminer_prover_protocol::ProveEvent, &str) + Send>;
+
 const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
@@ -5990,7 +5994,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
+        on_progress: Option<SlotProgress>,
     ) -> Result<ProofOutput> {
         // Never leave a prove unbounded: if the caller didn't set a deadline, arm a
         // generous backstop watchdog so a wedged worker can't hang forever. (The
@@ -6736,7 +6740,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
+        on_progress: Option<SlotProgress>,
         min_vram_bytes: Option<u64>,
         exclude: &[String],
         // Slots the OPERATOR switched off. A HARD filter, unlike `exclude`.
@@ -9229,7 +9233,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
+        on_progress: Option<SlotProgress>,
         abort_at: Option<Instant>,
         // A job's segment size on each slot; see `prove_min_vram`.
         job_po2: Option<SlotPo2<'_>>,
@@ -9680,8 +9684,11 @@ impl WorkerPool {
         // without it the TUI could not attribute a running job to a GPU row at all,
         // and every proof rendered as "CPU" on an idle-looking card.
         let key_for_cb = key.to_string();
-        let on_progress: Option<Box<dyn Fn(f64) + Send>> = on_progress
-            .map(|cb| Box::new(move |f: f64| cb(f, &key_for_cb)) as Box<dyn Fn(f64) + Send>);
+        let on_progress: Option<Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>> =
+            on_progress.map(|cb| {
+                Box::new(move |e: zkminer_prover_protocol::ProveEvent| cb(e, &key_for_cb))
+                    as Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>
+            });
         let proof_response = handle.recv_proof(request_id, &on_progress);
 
         // If recv_proof failed (EOF, stream corruption, protocol desync),
