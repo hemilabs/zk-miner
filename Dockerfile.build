@@ -239,8 +239,10 @@ RUN rzup install --help
 # rzup asks GitHub's API for the latest release. Unauthenticated, that is limited per IP, which CI
 # runners share, and it failed builds. CI passes its token as the `github_token` secret, which rzup
 # reads as GITHUB_TOKEN, and which never goes into a layer or the cache. Without the secret (a local
-# build) it runs unauthenticated, as before.
-RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN rzup install -f
+# build) BuildKit still sets GITHUB_TOKEN, to an empty string, which rzup sends and GitHub refuses
+# (401), so an empty one is unset first and rzup runs unauthenticated, as before.
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    { [ -n "$GITHUB_TOKEN" ] || unset GITHUB_TOKEN; } && rzup install -f
 
 WORKDIR /build
 
@@ -274,6 +276,31 @@ ENV NVCC_APPEND_FLAGS="--threads ${NVCC_THREADS} \
     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
     -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 \
     -gencode arch=compute_120,code=[sm_120,compute_120]"
+
+# One file is the exception: risc0-circuit-recursion-sys's step_exec.cu (release-3.1). CUDA 12.8's
+# front end (cicc) needs 29.4 GB to compile it for one target, so at four targets at a time it ran
+# the large runner out of memory (a 54 GiB, 16-CPU reproduction was OOM-killed at four and at two,
+# 2026-11-18). nvcc-zkminer compiles the files NVCC_ONE_TARGET_FILES names (basenames) one target
+# at a time and leaves every other file at NVCC_THREADS. It sits beside nvcc because cc-rs finds the
+# CUDA libraries from the compiler's directory; cc-rs takes the compiler from NVCC.
+COPY --chmod=0755 <<'EOF' /usr/local/cuda/bin/nvcc-zkminer
+#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+    *.cu)
+        for one in $NVCC_ONE_TARGET_FILES; do
+            if [ "${arg##*/}" = "$one" ]; then
+                NVCC_APPEND_FLAGS=$(printf '%s' "$NVCC_APPEND_FLAGS" | sed 's/--threads [0-9][0-9]*/--threads 1/')
+                export NVCC_APPEND_FLAGS
+            fi
+        done
+        ;;
+    esac
+done
+exec /usr/local/cuda/bin/nvcc "$@"
+EOF
+ENV NVCC=/usr/local/cuda/bin/nvcc-zkminer \
+    NVCC_ONE_TARGET_FILES="step_exec.cu"
 
 RUN cargo install cargo-chef --locked --version ${CARGO_CHEF_VERSION}
 COPY --from=planner /recipe.json recipe.json
@@ -497,6 +524,7 @@ ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+adx"
 
 # rzup: see cuda-base (GITHUB_TOKEN).
 RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    { [ -n "$GITHUB_TOKEN" ] || unset GITHUB_TOKEN; } && \
     curl -fsSL https://risczero.com/install | bash && rzup install -f
 
 WORKDIR /build
@@ -639,6 +667,7 @@ RUN icpx --version | head -n 1 && ocloc -version 2>/dev/null | head -n 2 || true
 
 # rzup: see cuda-base (GITHUB_TOKEN).
 RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    { [ -n "$GITHUB_TOKEN" ] || unset GITHUB_TOKEN; } && \
     curl -fsSL https://risczero.com/install | bash && rzup install -f
 
 # ===========================================================================
