@@ -10,17 +10,24 @@ notarization. Evidence and scripts are in `/Users/user/zkminer/scratch/w10/rc1/`
 RC1 (commit `ca07773`, kit `54296dc6…`) and RC2 (commit `6e7a1c1`, kit `02e5ca12…`) are in this file's
 history. They checked the pre-merge beta (risc0 `d94ef6501`). RC3 replaces them.
 
-**Verdict.**
-- Every check passes except one: **the forced-failure check of `zkminer benchmark` fails**.
-  - When the worker dies at start-up, or its warm-up fails, the command still prints a table of
-    *simulated* numbers and exits 0 (section 3.6).
-  - This is the bug found in the macOS 26 VM run. Its fix (item W10-BENCH, branch `item/W10-BENCH`)
-    was not merged in Wave 10 because review found one more blocking defect in it.
-- **Do not tag v0.1.0 from this commit.** First merge W10-BENCH (then W10-DOC, which is stacked on
-  it), rebuild the kit and re-run the short list in section 6, step 0.
-- Everything else, including the integration facts, is ready for the push.
+**Verdict (updated after step 0, 2026-11-19).**
+- RC3 found one failing check: when the worker died at start-up, or its warm-up failed, `zkminer
+  benchmark` printed a table of *simulated* numbers and exited 0.
+- **Step 0 is done** (section 3.6 and "Step 0" below). W10-BENCH, W10-DOC and the BETA-FIX
+  startup-error fix are merged (`f9f535b`). The kit was rebuilt from `f9f535b`, and both forced
+  failures now exit 1 with `BENCHMARK FAILED`, the worker's error and no table, while a working
+  `zkminer benchmark` exits 0 with real numbers.
+- The candidate is now the `f9f535b` kit below. Sections 1-5 below are RC3's record of `8b448a0`;
+  only the zk-miner CLI-side code, the worker's benchmark exit codes and docs changed since (no risc0,
+  kernel, metallib or compiler change).
 
 ## The candidate
+
+**After step 0:** `zkminer-0.1.0-macos-arm64.tar.gz`, 121,308,198 bytes (192 MB unpacked), **sha256
+`5153fac0e4ba59388133771ffd8c6dd47e85fa1a3dbbec4cdd9b51aaa624b49e`**, in
+`/Users/user/zkminer/scratch/w10/BETA-FIX/dist/`. BUILDINFO commit
+`f9f535b800f8652072f3164a3372a209712130f6` (`commit_dirty=no`), risc0 `37b434755…`, min_macos 26.0,
+compiler 32023.922 validated, no archives, the same 5 metallib digests. RC3's kit (below) is superseded.
 
 | | |
 |---|---|
@@ -279,7 +286,8 @@ All GPU runs went through `gpu-run` (heavy). Each used the sandbox's installed
   - Per program: sha256-chain 50.97 s, ecdsa-verify 71.27 s, bigint-mul 30.63 s, memory-merkle 8.32 s,
     chacha-mix 9.72 s, zkop-mix 68.36 s.
   - It cached nothing simulated.
-- **Forced worker failure: FAIL.** Each case used its own HOME with the same config and CLI:
+- **Forced worker failure (RC3, `8b448a0`): FAIL.** Each case used its own HOME with the same config
+  and CLI:
 
 | case | expected | got |
 |---|---|---|
@@ -293,7 +301,20 @@ All GPU runs went through `gpu-run` (heavy). Each used the sandbox's installed
 - W10-BENCH was not merged. Its last review reproduced the remaining defect, and the branch and its
   worktree are kept for the next round.
 - Nothing from the failed runs reached the config, so `zkminer run` would not use those numbers. Even
-  so, a user is told the benchmark worked. **This blocks the tag.**
+  so, a user is told the benchmark worked. This blocked the tag.
+
+**Step 0 (kit from `f9f535b`, sandbox `HOME`, quarantined download; logs in
+`scratch/w10/BETA-FIX/out/rc5-*`, details in `docs/metal-port-notes/BETA-FIX.md`):**
+
+| case | result |
+|---|---|
+| the worker exits 3 at start-up | **rc 1**, no table. Header `Workers: risc0:metal:0 (failed to start; see below)`. `BENCHMARK FAILED: nothing was measured or saved.` and `risc0:metal:0 (Apple M5 Max): could not start: Handshake ... process died (EOF) (the worker's last output: forced failure) ...`, the smoke and quarantine advice. No `benchmarks.json` |
+| the real worker, `RISC0_METAL_MAX_WORKING_SET_BYTES=1 GiB` | **rc 1**, no table. `Worker risc0 process died (EOF) (the worker's last output: Metal working-set budget exceeded: ...)`. No `benchmarks.json` |
+| working `zkminer benchmark` | **rc 0** in 271.5 s: 2.72 MzkOP/s, device row po2 20, 891.6K c/s, Groth16 1.6 s |
+| install (README steps), `init`, `help`, `macos-smoke.sh`, `install.sh --warm`, `--uninstall` | all rc 0; `spctl` rejects the quarantined download, the installed copies are unquarantined |
+| `check-macos-release.sh`, `check-macos-kit.py --require-validated`, `test-check-macos-kit.sh` (16/16), `test-assemble-macos.sh` (44/44) | ok |
+| full worker `--benchmark` (installed worker, default budget) | six programs **171.41 s, 901.1K c/s** (+1.09 % vs 169.56 s; RC3 171.88 s), wraps 1.59-1.60 s, peak footprint 14.73 GB |
+| stock crates.io 3.1.0 verifier on its 6 Groth16 receipts | **6/6 OK**; a receipt against another image id is rejected |
 
 ### 3.7 Not run here
 
@@ -324,12 +345,8 @@ Unchanged since RC2. No kernel, metallib or compiler change has gone in since.
 
 ## 5. Open issues
 
-1. **W10-BENCH is not merged** (section 3.6; blocks the tag), and **W10-DOC is not merged**.
-   - W10-DOC's base is `bcb0376`, so it is stacked on W10-BENCH: merge it after, as its 2 commits
-     `4d421db` and `06a2277`.
-   - It fixes most of section 2's doc items. Expect a text conflict in `RELEASE-DEPS.md`: keep W10-PIN's
-     pin, its W10-GATE section and its first paragraph.
-   - Branches `item/W10-BENCH` and `item/W10-DOC`, worktrees `zk-miner-3.1-wt-W10-BENCH` and `-wt-W10-DOC`.
+1. **Closed by step 0:** W10-BENCH and W10-DOC are merged with the BETA-FIX startup-error fix
+   (`f9f535b`, via `item/W10-BFIX`; no conflicts). Section 2's doc items 1-5 are W10-DOC's fixes.
 2. **Linux (CUDA, ROCm, Intel) and Windows have not been built against the fork pin.**
    - W10-GATE makes every fork change behave like `release-3.1` off Metal by default, and the prover
      crate type-checks for Linux.
@@ -367,8 +384,8 @@ Unchanged since RC2. No kernel, metallib or compiler change has gone in since.
 Nothing below was executed. The local checkouts' push URLs are disabled on purpose, so each command
 names its URL.
 
-0. **Before pushing: merge W10-BENCH, then W10-DOC, then repeat the short RC.** This changes the
-   zk-miner sha, not the risc0 pin.
+0. **Done (2026-11-19, `f9f535b`; section 3.6 "Step 0").** Before pushing: merge W10-BENCH, then
+   W10-DOC, then repeat the short RC. This changes the zk-miner sha, not the risc0 pin.
    - Rebuild the kit with `build-macos.yml`'s steps (`scripts/ci/assemble-macos.sh`, `AOT_ARCHES=none`).
    - Re-run the checks for what changed:
      - section 3.6, both forced failures: non-zero exit, the worker's error, no table;
