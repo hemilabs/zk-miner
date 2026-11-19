@@ -31,6 +31,9 @@ permissions:
 
 jobs:
   build:
+    # TEMPORARY: no automatic CI on PRs from metal-3.1 while it is tested by hand on the other
+    # platforms; run it with workflow_dispatch instead. Remove this line to re-enable.
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'metal-3.1' }}
     # One job per shippable artifact, each on its own runner, all at once: the
     # build takes as long as its slowest target, not the sum of them.
     # release.yml collects the artifacts and assembles the release from them.

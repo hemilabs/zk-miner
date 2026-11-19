@@ -95,7 +95,9 @@ jobs:
   build:
     name: macOS kit (build, package, check)
     # A self-hosted runner never runs a pull request from a fork.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # TEMPORARY: no automatic CI on PRs from metal-3.1 while it is tested by hand on the other
+    # platforms; run it with workflow_dispatch instead. To re-enable, drop "&& github.head_ref != 'metal-3.1'".
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.head_ref != 'metal-3.1' }}
     runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
     timeout-minutes: 240
     concurrency:
@@ -199,7 +201,9 @@ jobs:
   # ---------------------------------------------------------------------------
   cpu-tests:
     name: macOS tests (no GPU)
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # TEMPORARY: no automatic CI on PRs from metal-3.1 while it is tested by hand on the other
+    # platforms; run it with workflow_dispatch instead. To re-enable, drop "&& github.head_ref != 'metal-3.1'".
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.head_ref != 'metal-3.1' }}
     runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
     timeout-minutes: 240
     concurrency:
