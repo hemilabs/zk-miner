@@ -104,6 +104,11 @@ pub struct JournalEntry {
     /// inline job and in every format-1 entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<WitnessBundleRef>,
+    /// The cycles the job measured at before it was claimed, and how long that execution took in
+    /// seconds, so a restart still shows how far its proof is. `None` in a breadcrumb written before
+    /// they were recorded.
+    pub measured_cycles: Option<u64>,
+    pub measured_execute_secs: Option<u64>,
 }
 
 impl Default for JournalEntry {
@@ -120,6 +125,8 @@ impl Default for JournalEntry {
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
             witness: None,
+            measured_cycles: None,
+            measured_execute_secs: None,
         }
     }
 }
@@ -390,6 +397,8 @@ impl JobJournal {
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
             witness: None,
+            measured_cycles: None,
+            measured_execute_secs: None,
         });
         // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
         // read showing the new claim pending, at a higher reopen count, would look like proof that
@@ -432,6 +441,8 @@ impl JobJournal {
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
             witness: None,
+            measured_cycles: None,
+            measured_execute_secs: None,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -476,6 +487,22 @@ impl JobJournal {
     }
 
     /// The sizes recorded for a job (see [`JournalEntry::measured_po2s`]).
+    /// Record the cycles a claim about to be sent measured at, and how long measuring took (see
+    /// [`JournalEntry::measured_cycles`]). Kept when there is none to record.
+    pub fn note_measured_cycles(
+        &mut self,
+        job_id: B256,
+        cycles: Option<u64>,
+        execute_secs: Option<u64>,
+    ) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            if cycles.is_some() {
+                e.measured_cycles = cycles;
+                e.measured_execute_secs = execute_secs;
+            }
+        }
+    }
+
     pub fn measured_po2s(&self, job_id: B256) -> Vec<u8> {
         self.entries
             .get(&job_id)
@@ -799,5 +826,27 @@ mod tests {
         // A breadcrumb written before sizes were recorded loads with none.
         let old: JournalEntry = serde_json::from_str(r#"{"job_id":"0x0505050505050505050505050505050505050505050505050505050505050505","claimed_at":1,"lock_deadline":9,"state":"Claimed"}"#).unwrap();
         assert!(old.measured_po2s.is_empty());
+    }
+
+    #[test]
+    fn a_claims_measured_cycles_are_kept_across_a_restart() {
+        let path = tmp_path("cycles");
+        let _ = std::fs::remove_file(&path);
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x08);
+        j.record_claim_intent(jid, 100, None);
+        j.note_measured_cycles(jid, Some(85_000_000), Some(4));
+        // A later claim without a measurement keeps the one recorded.
+        j.note_measured_cycles(jid, None, None);
+        j.save_to(&path).unwrap();
+        let e = JobJournal::load_from(&path).entries[&jid].clone();
+        assert_eq!(
+            (e.measured_cycles, e.measured_execute_secs),
+            (Some(85_000_000), Some(4))
+        );
+        std::fs::remove_file(&path).unwrap();
+        // A breadcrumb written before cycles were recorded loads with none.
+        let old: JournalEntry = serde_json::from_str(r#"{"job_id":"0x0505050505050505050505050505050505050505050505050505050505050505","claimed_at":1,"lock_deadline":9,"state":"Claimed"}"#).unwrap();
+        assert_eq!(old.measured_cycles, None);
     }
 }
