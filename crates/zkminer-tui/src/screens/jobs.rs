@@ -51,7 +51,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                 style = style.bg(theme::overlay());
             }
             let status_cell = if ours {
-                Cell::from(status).style(theme::accent())
+                Cell::from(status).style(claimed_status_style(job, now))
             } else {
                 Cell::from(status)
             };
@@ -104,6 +104,19 @@ pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The colour of a claimed job's status: green while it is proving or being submitted, blue while it
+/// waits for a card, red only once it is past its deadline, the one claimed state that needs the
+/// operator. (It was the theme's accent, a red-pink, for every claimed job.)
+pub(crate) fn claimed_status_style(job: &TrackedJob, now: u64) -> ratatui::style::Style {
+    if job.info.lock_deadline != 0 && job.info.lock_deadline <= now {
+        return ratatui::style::Style::default().fg(theme::red());
+    }
+    match job.status {
+        MinerJobStatus::Queued => theme::identifier(),
+        _ => theme::positive(),
+    }
 }
 
 /// The Status column of a job this miner has claimed: where it is (waiting for a card, proving on
@@ -213,6 +226,24 @@ mod tests {
             .map(|j| j.info.job_id[0])
             .collect();
         assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    /// Claimed jobs read green while proving, blue while queued, and red only past their deadline.
+    #[test]
+    fn claimed_status_colours_follow_the_stage() {
+        let mut queued = job(1, MinerJobStatus::Queued);
+        queued.info.lock_deadline = 2_000;
+        let mut proving = job(
+            2,
+            MinerJobStatus::Proving {
+                progress: 0.5,
+                elapsed_secs: 10,
+            },
+        );
+        proving.info.lock_deadline = 2_000;
+        assert_eq!(claimed_status_style(&queued, 1_000), theme::identifier());
+        assert_eq!(claimed_status_style(&proving, 1_000), theme::positive());
+        assert_eq!(claimed_status_style(&proving, 2_000).fg, Some(theme::red()));
     }
 
     /// The status of a claimed job names its stage and its deadline.
