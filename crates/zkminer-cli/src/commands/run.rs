@@ -8236,6 +8236,8 @@ async fn miner_brain(
         // Why each job looked at this pass was not claimed (see `DeclineTally`), starting with the
         // ones this filter sets aside before the loop.
         let mut declines = DeclineTally::default();
+        // Each job's measurement as this pass resolved it, for the Job Detail screen.
+        let mut measured_now: Vec<(B256, zkminer_tui::state::JobMeasurement)> = Vec::new();
         let mut candidates: Vec<_> = open_jobs
             .iter()
             .filter(|j| !in_flight.contains_key(&j.info.job_id))
@@ -8893,6 +8895,16 @@ async fn miner_brain(
                 snapshot.descriptor_hash,
             ) {
                 Some(r) => {
+                    let risc0 = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
+                    measured_now.push((
+                        jid,
+                        zkminer_tui::state::JobMeasurement {
+                            cycles: (r.cycles < UNMEASURABLE_CYCLES).then_some(r.cycles),
+                            backend: backend_opt.unwrap_or("").to_string(),
+                            po2s: if risc0 { job_sizes.clone() } else { Vec::new() },
+                            execute_secs: r.execute_secs as f64,
+                        },
+                    ));
                     snapshot.verified_elf_hash = r.verified_elf_hash;
                     // The journal the lifecycle checks a bound job's binding against before the
                     // claim, from the same entries as the cycles.
@@ -9730,6 +9742,21 @@ async fn miner_brain(
             }
         }
 
+        // Each job's measurement, kept while the job is open or ours (a claimed job's detail still
+        // shows what it was sized on).
+        {
+            let mut s = state.write().await;
+            for (jid, m) in measured_now {
+                s.job_measurements.insert(jid, m);
+            }
+            let live: std::collections::HashSet<B256> = s
+                .open_jobs
+                .iter()
+                .chain(s.active_jobs.iter())
+                .map(|j| j.info.job_id)
+                .collect();
+            s.job_measurements.retain(|jid, _| live.contains(jid));
+        }
         // Why each job looked at this pass was not claimed, for the dashboard and the headless log.
         {
             let claimed: Vec<B256> = batch.iter().map(|(j, _, _)| j.info.job_id).collect();

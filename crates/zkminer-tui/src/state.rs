@@ -335,6 +335,21 @@ pub enum MinerJobStatus {
     Skipped { reason: String },
 }
 
+/// A job's measured cycle count: what the miner executed the guest at and sized the job on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobMeasurement {
+    /// The count the job is sized on: for risc0 the most across the sizes it was run at. `None`: it
+    /// was executed and could not be measured (over the execute cycle cap, out of time, or a
+    /// different journal at each size), so it is never claimed.
+    pub cycles: Option<u64>,
+    /// "risc0" or "sp1".
+    pub backend: String,
+    /// risc0: the segment sizes (po2) it was executed at; empty for SP1.
+    pub po2s: Vec<u8>,
+    /// How long the measuring execution took, in seconds.
+    pub execute_secs: f64,
+}
+
 /// A job tracked by the miner.
 #[derive(Debug, Clone)]
 pub struct TrackedJob {
@@ -540,6 +555,9 @@ pub struct MinerState {
     /// Why each open job was not claimed when the brain last evaluated it (see [`ClaimOutlook`]).
     /// Jobs it has not evaluated yet have no entry.
     pub job_why: std::collections::HashMap<alloy_primitives::B256, String>,
+    /// The cycle count each job was measured at, once it has been, for open and claimed jobs alike
+    /// (the Job Detail screen). A job with no entry has not been measured: its `job_why` says why.
+    pub job_measurements: std::collections::HashMap<alloy_primitives::B256, JobMeasurement>,
     /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
     pub claim_outlook: ClaimOutlook,
 
@@ -1056,6 +1074,7 @@ impl Default for MinerState {
             selected_job_index: 0,
             selected_job_id: None,
             job_why: std::collections::HashMap::new(),
+            job_measurements: std::collections::HashMap::new(),
             claim_outlook: ClaimOutlook::default(),
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
