@@ -125,16 +125,16 @@ pub(crate) fn claimed_status_text(job: &TrackedJob, state: &MinerState, now: u64
     });
     let stage = match &job.status {
         MinerJobStatus::Queued => "queued, waiting for a GPU".to_string(),
-        MinerJobStatus::Proving {
-            progress,
-            elapsed_secs,
-        } => {
+        MinerJobStatus::Proving { progress, .. } => {
             let on = card.map(|c| format!(" on {c}")).unwrap_or_default();
-            format!(
-                "proving{on}, {:.0}% after {}",
-                progress * 100.0,
-                format_duration(*elapsed_secs)
-            )
+            let secs = format_duration(state.proving_secs(job));
+            // A worker that reports no progress (SP1 today) would read 0% throughout: say only how
+            // long it has run.
+            if *progress > 0.0 {
+                format!("proving{on}, {:.0}% after {secs}", progress * 100.0)
+            } else {
+                format!("proving{on} for {secs}")
+            }
         }
         MinerJobStatus::Submitting => "proved, submitting".to_string(),
         other => job_status_text(
@@ -231,6 +231,18 @@ mod tests {
                 progress: 0.42,
                 elapsed_secs: 75,
             },
+        );
+        // A worker that reports no progress: how long it has run, not a stuck 0%.
+        let silent = job(
+            4,
+            MinerJobStatus::Proving {
+                progress: 0.0,
+                elapsed_secs: 75,
+            },
+        );
+        assert_eq!(
+            claimed_status_text(&silent, &state, 1_000),
+            "Claimed: proving for 1m 15s"
         );
         assert_eq!(
             claimed_status_text(&proving, &state, 1_000),

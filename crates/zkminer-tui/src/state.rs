@@ -558,6 +558,9 @@ pub struct MinerState {
     /// The cycle count each job was measured at, once it has been, for open and claimed jobs alike
     /// (the Job Detail screen). A job with no entry has not been measured: its `job_why` says why.
     pub job_measurements: std::collections::HashMap<alloy_primitives::B256, JobMeasurement>,
+    /// When each claimed job started proving (its first attempt's start), so its elapsed time counts
+    /// up between the worker's progress reports, and for a worker that sends none.
+    pub proving_since: std::collections::HashMap<alloy_primitives::B256, std::time::Instant>,
     /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
     pub claim_outlook: ClaimOutlook,
 
@@ -1075,6 +1078,7 @@ impl Default for MinerState {
             selected_job_id: None,
             job_why: std::collections::HashMap::new(),
             job_measurements: std::collections::HashMap::new(),
+            proving_since: std::collections::HashMap::new(),
             claim_outlook: ClaimOutlook::default(),
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
@@ -1147,6 +1151,18 @@ impl TuiContext {
 }
 
 impl MinerState {
+    /// How long a proving job has been proving, in seconds: live from when it started, or what its
+    /// status last carried when the start was not seen.
+    pub fn proving_secs(&self, job: &TrackedJob) -> u64 {
+        match self.proving_since.get(&job.info.job_id) {
+            Some(since) => since.elapsed().as_secs(),
+            None => match job.status {
+                MinerJobStatus::Proving { elapsed_secs, .. } => elapsed_secs,
+                _ => 0,
+            },
+        }
+    }
+
     /// The Jobs page's rows, in order: the jobs this miner has claimed, then the open market less
     /// any job also among them (a claim the market list has not caught up with yet). Its selection
     /// (`selected_job_index`) indexes this list.
