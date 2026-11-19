@@ -6294,18 +6294,69 @@ fn prove_watchdog(cycles: u64, planning_cps: Option<f64>, fixed: u64, cap: Durat
 }
 
 /// Whether a job may be admitted without look-ahead: fewer jobs in flight than `max_concurrent`, and
-/// for a risc0 job fewer risc0 jobs (all in flight but `other_backend` ones) than `risc0_cards`. A job
-/// is admitted to start now, one per card, and automatic concurrency counts every GPU, so a card with
-/// no risc0 size would otherwise queue a second risc0 job behind the first's card.
+/// for a risc0 job fewer risc0 jobs (all in flight but `other_backend` ones) than `risc0_cards`, or a
+/// risc0 card none of them can go to (`card_left_free`, see `risc0_card_left_free`). A job is admitted
+/// to start now, one per card, and automatic concurrency counts every GPU, so a card with no risc0
+/// size would otherwise queue a second risc0 job behind the first's card.
 fn risc0_bypass_room(
     in_flight: usize,
     other_backend: usize,
     max_concurrent: usize,
     risc0_job: bool,
     risc0_cards: usize,
+    card_left_free: bool,
 ) -> bool {
     in_flight < max_concurrent
-        && (!risc0_job || in_flight.saturating_sub(other_backend) < risc0_cards)
+        && (!risc0_job || in_flight.saturating_sub(other_backend) < risc0_cards || card_left_free)
+}
+
+/// Where a risc0 job in its prove loop can go: the slot its attempt runs on, or while it waits, the
+/// slots it is kept off (one it just failed on, one switched off, one it cannot finish on inside the
+/// proving timeout). Set by the prove loop at each attempt and removed when the loop ends, for the
+/// claim gate's count of free risc0 cards (`risc0_card_left_free`).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Risc0Placement {
+    proving_on: Option<String>,
+    barred: Vec<String>,
+}
+
+static RISC0_PLACEMENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<B256, Risc0Placement>>> =
+    std::sync::OnceLock::new();
+
+fn risc0_placements() -> std::sync::MutexGuard<'static, HashMap<B256, Risc0Placement>> {
+    RISC0_PLACEMENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Removes a job's placement when its prove loop ends, however it ends.
+struct Risc0PlacementGuard(B256);
+
+impl Drop for Risc0PlacementGuard {
+    fn drop(&mut self) {
+        risc0_placements().remove(&self.0);
+    }
+}
+
+/// Whether one of the risc0 `cards` (slots) is a card no risc0 job in flight can go to, so a new one
+/// would start there now rather than queue: a job proving is on its own card; one waiting can take any
+/// card it is not kept off (every card, when it is kept off all of them, as the dispatcher then
+/// restores them); and one not yet at its prove loop (`None`) any card. A job kept off a card after
+/// failing there counted as that card's otherwise, and the card sat idle while it waited for another.
+fn risc0_card_left_free(cards: &[String], jobs: &[Option<Risc0Placement>]) -> bool {
+    cards.iter().any(|card| {
+        !jobs.iter().any(|job| match job {
+            None => true,
+            Some(Risc0Placement {
+                proving_on: Some(on),
+                ..
+            }) => on == card,
+            Some(Risc0Placement { barred, .. }) => {
+                !barred.contains(card) || cards.iter().all(|c| barred.contains(c))
+            }
+        })
+    })
 }
 
 /// A risc0 card that proves jobs but has no usable row in `rows` (its benchmark failed at po2 20, or
@@ -9308,6 +9359,16 @@ async fn miner_brain(
             // counts every GPU, and one with no risc0 size would queue a second job behind the first's
             // card).
             let risc0_job = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
+            let card_left_free = risc0_job && {
+                let placements = risc0_placements();
+                let jobs: Vec<Option<Risc0Placement>> = in_flight
+                    .keys()
+                    .filter(|j| !proved.contains(*j) && !other_backend_in_flight.contains(*j))
+                    .map(|j| placements.get(j).cloned())
+                    .collect();
+                let slots: Vec<String> = risc0_cards.iter().map(|c| c.slot.clone()).collect();
+                risc0_card_left_free(&slots, &jobs)
+            };
             let bypass_room = risc0_bypass_room(
                 needing_card(&in_flight, &proved),
                 other_backend_in_flight
@@ -9317,6 +9378,7 @@ async fn miner_brain(
                 max_concurrent,
                 risc0_job,
                 risc0_cards.len(),
+                card_left_free,
             );
             let would_commit = admission.is_some() || (queue_bypass && measurable && bypass_room);
             tally.note(Candidate {
@@ -9447,11 +9509,14 @@ async fn miner_brain(
             for (jid, m) in measured_now {
                 s.job_measurements.insert(jid, m);
             }
+            // In flight too: a claim takes a job off the open list at once, but it joins the claimed
+            // ones only once the claim lands, and its measurement must outlast the gap.
             let live: std::collections::HashSet<B256> = s
                 .open_jobs
                 .iter()
                 .chain(s.active_jobs.iter())
                 .map(|j| j.info.job_id)
+                .chain(in_flight.keys().copied())
                 .collect();
             s.job_measurements.retain(|jid, _| live.contains(jid));
             s.proving.retain(|jid, _| live.contains(jid));
@@ -11397,6 +11462,9 @@ async fn process_job_lifecycle(
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
         let mut attempt = 0u32;
+        // Where this risc0 job can go, for the claim gate's free-card count; removed when proving ends.
+        let _placement = (backend == zkminer_prover_protocol::BACKEND_RISC0)
+            .then(|| Risc0PlacementGuard(job_id));
         // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
         // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
         // dispatcher would re-pin the un-admittable cold preferred card every retry while the warm
@@ -11583,6 +11651,17 @@ async fn process_job_lifecycle(
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
+            if backend == zkminer_prover_protocol::BACKEND_RISC0 {
+                let mut barred = excluded.clone();
+                barred.extend(disabled_slots.iter().cloned());
+                risc0_placements().insert(
+                    job_id,
+                    Risc0Placement {
+                        proving_on: None,
+                        barred,
+                    },
+                );
+            }
             // The card this job was planned for (benchmark id, e.g. "gpu1"), preferred at dispatch.
             // Kept until an attempt actually runs there: one refused before it starts (memory
             // short a moment) must not send the next to a card still at the size that ran out.
@@ -11676,6 +11755,11 @@ async fn process_job_lifecycle(
                 });
                 let mark_started = move |event: zkminer_prover_protocol::ProveEvent,
                                          slot_key: &str| {
+                    if matches!(event, zkminer_prover_protocol::ProveEvent::Started) {
+                        if let Some(p) = risc0_placements().get_mut(&job_id) {
+                            p.proving_on = Some(slot_key.to_string());
+                        }
+                    }
                     let _ = events_tx.send((event, slot_key.to_string()));
                 };
                 let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
@@ -12015,7 +12099,7 @@ async fn process_job_lifecycle(
                         );
                         // invalid ⇒ just re-prove (round-robin may pick another worker).
                         tracing::warn!(
-                            "Proof attempt {attempt}/{} for {} failed ({}); retrying{}",
+                            "Proof attempt {attempt}/{} for {} failed ({}); retrying{}. Error: {msg}",
                             MAX_PROVE_ATTEMPTS,
                             short_id(job_id),
                             if invalid {
@@ -18214,20 +18298,70 @@ mod r2_sizing_tests {
     #[test]
     fn a_risc0_job_is_held_to_the_risc0_cards_without_look_ahead() {
         // Two GPUs, one with no risc0 size: one risc0 job at a time...
-        assert!(risc0_bypass_room(0, 0, 2, true, 1));
-        assert!(!risc0_bypass_room(1, 0, 2, true, 1));
+        assert!(risc0_bypass_room(0, 0, 2, true, 1, false));
+        assert!(!risc0_bypass_room(1, 0, 2, true, 1, false));
         // ...but an SP1 job in flight on the other card takes no risc0 room.
-        assert!(risc0_bypass_room(1, 1, 2, true, 1));
+        assert!(risc0_bypass_room(1, 1, 2, true, 1, false));
         assert!(
-            !risc0_bypass_room(2, 1, 2, true, 1),
+            !risc0_bypass_room(2, 1, 2, true, 1, false),
             "the total cap still holds"
         );
         // Another backend's job is held to the total alone.
-        assert!(risc0_bypass_room(1, 0, 2, false, 1));
+        assert!(risc0_bypass_room(1, 0, 2, false, 1, false));
         assert!(
-            !risc0_bypass_room(0, 0, 2, true, 0),
+            !risc0_bypass_room(0, 0, 2, true, 0, false),
             "no risc0 card, no risc0 job"
         );
+        // A risc0 card no job in flight can go to takes one more, within the total.
+        assert!(risc0_bypass_room(2, 0, 4, true, 2, true));
+        assert!(!risc0_bypass_room(4, 0, 4, true, 2, true));
+    }
+
+    /// A job kept off the card it failed on waits for the other: the card it left is free for a new
+    /// job, unless another can still go there.
+    #[test]
+    fn a_card_a_waiting_job_is_kept_off_is_free_for_another() {
+        let cards = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let proving = |s: &str| {
+            Some(Risc0Placement {
+                proving_on: Some(s.to_string()),
+                barred: Vec::new(),
+            })
+        };
+        let waiting = |barred: &[&str]| {
+            Some(Risc0Placement {
+                proving_on: None,
+                barred: barred.iter().map(|s| s.to_string()).collect(),
+            })
+        };
+        // One on the 4070, one waiting for it after failing on the 5090: the 5090 is free.
+        assert!(risc0_card_left_free(
+            &cards,
+            &[proving("risc0:cuda:1"), waiting(&["risc0:cuda:0"])]
+        ));
+        // A waiting job that may go anywhere takes the free card.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &[proving("risc0:cuda:1"), waiting(&[])]
+        ));
+        // Kept off every card, it may go anywhere (the dispatcher restores them).
+        assert!(!risc0_card_left_free(
+            &cards,
+            &[
+                proving("risc0:cuda:1"),
+                waiting(&["risc0:cuda:0", "risc0:cuda:1"])
+            ]
+        ));
+        // A job not yet at its prove loop may go anywhere.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &[proving("risc0:cuda:1"), None]
+        ));
+        // Both cards proving: none free.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &[proving("risc0:cuda:0"), proving("risc0:cuda:1")]
+        ));
     }
 
     #[test]
