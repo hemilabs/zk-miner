@@ -2573,6 +2573,66 @@ fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
 const TOO_LONG_FOR_PROVING_TIMEOUT: &str =
     "too long for the proving timeout (raise it in Settings)";
 
+/// Splits a job's cards into those that can prove an attempt of `cycles` inside `timeout_secs` and
+/// those that cannot, each as (device, cycles/s, estimated seconds). `rows` are the cards' rates for
+/// the job's backend; the estimate is the claim gate's: cycles over the rate times `margin`, plus
+/// `fixed_secs` (the backend's fixed allowance and the guest's execution).
+fn cards_within_timeout(
+    rows: &[(String, f64)],
+    cycles: u64,
+    margin: f64,
+    fixed_secs: u64,
+    timeout_secs: f64,
+) -> (Vec<(String, f64, f64)>, Vec<(String, f64, f64)>) {
+    rows.iter()
+        .map(|(device, rate)| {
+            let est = cycles as f64 / rate * margin + fixed_secs as f64;
+            (device.clone(), *rate, est)
+        })
+        .partition(|(_, _, est)| *est < timeout_secs)
+}
+
+/// Jobs whose split by the proving timeout has been logged in this run: once each, not every pass.
+static TIMEOUT_SPLIT_REPORTED: std::sync::Mutex<Option<std::collections::HashMap<B256, ()>>> =
+    std::sync::Mutex::new(None);
+
+fn first_timeout_split_report(job_id: B256) -> bool {
+    let mut g = TIMEOUT_SPLIT_REPORTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    if m.contains_key(&job_id) {
+        return false;
+    }
+    bounded_insert(m, job_id, (), MEASURED_CYCLES_CAP);
+    true
+}
+
+/// The slots a job may not be dispatched to: the operator's switched-off ones, and the cards the
+/// claim gate found it cannot prove inside the proving timeout (`unfit_devices`).
+async fn job_disabled_slots(
+    state: &zkminer_tui::state::SharedState,
+    backend: &str,
+    unfit_devices: &[String],
+) -> Vec<String> {
+    let mut slots = operator_disabled_slots(state).await;
+    if unfit_devices.is_empty() {
+        return slots;
+    }
+    if let Some(pool) = zkminer_prover::engine::worker_pool() {
+        let pairs: std::collections::HashSet<(String, String)> = unfit_devices
+            .iter()
+            .map(|d| (d.clone(), backend.to_string()))
+            .collect();
+        for slot in pool.slots_disabled_by(&std::collections::HashSet::new(), &pairs) {
+            if !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    }
+    slots
+}
+
 /// Ends the back-off (and set-aside) of every job backed off for `why`; returns how many. For a
 /// verdict a setting decides, once the setting changes.
 fn release_set_aside_for(why: &'static str) -> usize {
@@ -8637,6 +8697,64 @@ async fn miner_brain(
             } else {
                 genuine_throughputs.iter().copied().fold(f64::INFINITY, f64::min)
             };
+            // Per card, for a measured job: it may go only to the cards that can finish an attempt
+            // inside the proving timeout, and is sized on the slowest of THOSE. Sizing on the slowest
+            // card overall refused a 1B-cycle job that a 5090 proves in three minutes because a 4070
+            // would need longer than the timeout. The cards it cannot finish on are kept from it at
+            // dispatch (`unfit_devices`).
+            snapshot.unfit_devices.clear();
+            let slowest_eligible = match measured_for_job {
+                Some(cycles) if !genuine_throughputs.is_empty() => {
+                    let rows: Vec<(String, f64)> = device_backend_throughputs
+                        .iter()
+                        .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
+                        .map(|(d, _, t)| (d.clone(), *t))
+                        .collect();
+                    let fixed = backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0)
+                        + execute_allowance;
+                    let (fit, unfit) = cards_within_timeout(
+                        &rows,
+                        cycles,
+                        deadline_safety_margin,
+                        fixed,
+                        proving_timeout.as_secs_f64(),
+                    );
+                    if !unfit.is_empty() && first_timeout_split_report(jid) {
+                        let show = |cards: &[(String, f64, f64)]| {
+                            cards
+                                .iter()
+                                .map(|(d, _, est)| format!("{d} ~{est:.0}s"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        if fit.is_empty() {
+                            tracing::info!(
+                                "{}: {cycles} cycles, no card can prove it inside the {}s proving \
+                                 timeout ({}); not claimed",
+                                short_id(jid),
+                                proving_timeout.as_secs(),
+                                show(&unfit)
+                            );
+                        } else {
+                            tracing::info!(
+                                "{}: {cycles} cycles, only {} can prove it inside the {}s proving \
+                                 timeout ({} cannot); it goes only there",
+                                short_id(jid),
+                                show(&fit),
+                                proving_timeout.as_secs(),
+                                show(&unfit)
+                            );
+                        }
+                    }
+                    if fit.is_empty() {
+                        slowest_eligible
+                    } else {
+                        snapshot.unfit_devices = unfit.into_iter().map(|(d, _, _)| d).collect();
+                        fit.iter().map(|(_, r, _)| *r).fold(f64::INFINITY, f64::min)
+                    }
+                }
+                _ => slowest_eligible,
+            };
             snapshot.preferred_device = device_backend_throughputs
                 .iter()
                 .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
@@ -9652,6 +9770,9 @@ struct JobStatusSnapshot {
     /// The slowest rate (cycles/s) the claim gate sized this job's proof at, on the slowest card that may
     /// take it; the prove watchdog never assumes a faster one. `None` on recovery.
     planning_cps: Option<f64>,
+    /// The cards (benchmark device ids) this job may NOT go to: an attempt there would outlast the
+    /// proving timeout, while one on another card would not. Empty when every card can take it.
+    unfit_devices: Vec<String>,
     /// The segment sizes a risc0 job measured clean at (every card size here, when it was claimed):
     /// it is proven only on a card at one of them. Empty for other backends and on recovery, which
     /// reads them from the job's breadcrumb (see [`risc0_prove_sizes`]).
@@ -9694,6 +9815,7 @@ impl JobStatusSnapshot {
             measured_execute_secs: None,
             measured_po2s: Vec::new(),
             planning_cps: None,
+            unfit_devices: Vec::new(),
             estimated_prove_secs: None,
             current_bidder: v.currentBidder,
             bid_deadline: u64::try_from(v.bidDeadline).unwrap_or(u64::MAX),
@@ -11187,7 +11309,7 @@ async fn process_job_lifecycle(
     // strand a job; routing the Settings toggles through it left them decorative exactly where it
     // matters most — on a single-GPU rig, disabling the only card restored it and proved on it anyway.
     // Read live; a risc0 job reads it again at every attempt (see the prove loop).
-    let mut disabled_slots = operator_disabled_slots(state).await;
+    let mut disabled_slots = job_disabled_slots(state, backend, &snapshot.unfit_devices).await;
     if !disabled_slots.is_empty() {
         tracing::debug!(
             "operator-disabled slots for {}: {}",
@@ -11320,7 +11442,7 @@ async fn process_job_lifecycle(
             // (below) rather than fail, so a card switched back on can take it. Other backends keep
             // the list they started with: their dispatch fails at once with every card switched off.
             if risc0_job {
-                disabled_slots = operator_disabled_slots(state).await;
+                disabled_slots = job_disabled_slots(state, backend, &snapshot.unfit_devices).await;
             }
             let job_sizes: Option<HashMap<String, u8>> = if risc0_job {
                 let measured = if snapshot.measured_po2s.is_empty() {
@@ -14793,6 +14915,36 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    /// A job is held to the cards that can finish it inside the proving timeout, not refused because
+    /// the slowest card cannot: the 5090 and 4070 rates of this session against a 1.07B-cycle risc0 job.
+    #[test]
+    fn the_proving_timeout_is_judged_per_card() {
+        let rows = vec![("gpu0".to_string(), 4.08e6), ("gpu1".to_string(), 1.19e6)];
+        let (fit, unfit) = cards_within_timeout(&rows, 1_068_236_800, 1.5, 30, 600.0);
+        assert_eq!(
+            fit.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            ["gpu0"]
+        );
+        assert_eq!(
+            unfit.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            ["gpu1"]
+        );
+        assert!((fit[0].2 - (1_068_236_800.0 / 4.08e6 * 1.5 + 30.0)).abs() < 1e-6);
+        // An hour fits both; nothing is held back.
+        let (fit, unfit) = cards_within_timeout(&rows, 1_068_236_800, 1.5, 30, 3600.0);
+        assert_eq!((fit.len(), unfit.len()), (2, 0));
+        // Too long for every card: no card to send it to, so the gate still refuses it.
+        let (fit, unfit) = cards_within_timeout(&rows, 20_000_000_000, 1.5, 30, 3600.0);
+        assert_eq!((fit.len(), unfit.len()), (0, 2));
+    }
+
+    #[test]
+    fn a_jobs_timeout_split_is_logged_once() {
+        let id = B256::repeat_byte(0x73);
+        assert!(first_timeout_split_report(id));
+        assert!(!first_timeout_split_report(id));
+    }
 
     /// Raising the proving timeout brings back the jobs skipped as too long for the old one at once,
     /// and only those: a job set aside for another reason stays aside.
