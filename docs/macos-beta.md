@@ -7,13 +7,26 @@ build dependencies (the pinned hemilabs/risc0 rev, the toolchains) are in `RELEA
 
 ## Build the kit
 
-On an Apple Silicon Mac with the toolchains of `RELEASE-DEPS.md` (Metal toolchain incl. `metal-tt`,
+**The release kit has no offline GPU pipeline archives.** CI builds it: `.github/workflows/build-macos.yml`
+job `build` (`docs/ci-macos.md`), which `release.yml` calls, so a release ships the kit that workflow
+built and checked. On the runner the job runs `assemble-macos.sh` twice, `ASSEMBLE_BUILD_ONLY=1` (build
+and its checks) and, after `macos-prune-target.sh`, `ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none` (package and
+check), then `check-macos-kit.py` and `test-check-macos-kit.sh` on the tarball.
+
+The same kit on an Apple Silicon Mac with the toolchains of `RELEASE-DEPS.md` (the Metal toolchain,
 the rzup Rust guest toolchain, protoc, python3), from a clean checkout:
 
 ```sh
-scripts/ci/assemble-macos.sh dist/macos
+AOT_ARCHES=none scripts/ci/assemble-macos.sh dist/macos
 # -> dist/macos/zkminer-<version>-macos-arm64.tar.gz and dist/macos/SHA256SUMS
+python3 -I scripts/ci/check-macos-kit.py --version <version> --commit "$(git rev-parse HEAD)" \
+    dist/macos/zkminer-<version>-macos-arm64.tar.gz
 ```
+
+Pass `AOT_ARCHES=none`. The script's own default, `applegpu_g17s`, adds an archive set, and
+`check-macos-kit.py` (which `release.yml` runs) then fails the kit: its README says "This kit has no
+offline GPU pipeline archives" and only describes a kit without them (BETA-FIX). A kit with archives
+needs that README text back first ("Offline archives" below).
 
 The script runs these steps in order:
 
@@ -23,8 +36,9 @@ The script runs these steps in order:
    link only system libraries, and carry a valid signature. Every metallib the worker embeds must
    target the minimum. (With `ZKMINER_MACOS_MIN=sdk` the script instead reads the binaries' minos
    and the metallibs' target, which must each be one value, and takes the newer as the minimum.)
-3. **Archive set.** `make mac-build-aot` builds the offline Metal archive set for `AOT_ARCHES`, with
-   macOS key `macos<major of the minimum>`.
+3. **Archive set.** Skipped with `AOT_ARCHES=none` (the release kit): `metal-aot/` stays empty.
+   Otherwise `make mac-build-aot` builds the offline Metal archive set for `AOT_ARCHES`, keyed
+   `macos<N>` for each of `AOT_OS_MAJORS` (it needs a Metal device for risc0's dump tests).
 4. **Stage.** It lays out `zkminer-<version>-macos-arm64/` (layout below), writes `BUILDINFO` and the
    kit's `SHA256SUMS`, normalizes modes and mtimes, and strips xattrs. It then packs a gzip tarball
    with `COPYFILE_DISABLE=1 tar --no-xattrs` (no `._` entries, no quarantine flag from the build
@@ -37,7 +51,7 @@ Settings (environment):
 | variable | default | |
 |---|---|---|
 | `ZKMINER_MACOS_MIN` | `26.0` | minimum macOS; `27.0` = B9-PKG's kit (revert knob); `sdk` = no target flags (revert knob): minos 11.0 and metallibs for the build SDK, so the kit's `min_macos` is the SDK's version (27.2 here) |
-| `AOT_ARCHES` | `applegpu_g17s` | GPU families of the archive set; `none` = no set |
+| `AOT_ARCHES` | `applegpu_g17s` | GPU families of the archive set; `none` = no set, **what the release kit and CI use** (the kit README describes a kit without archives) |
 | `AOT_OS_MAJORS` | the validated majors (`27`, `scripts/ci/macos-validated.sh`), whatever macOS the build host runs | macOS major versions the set has archives for (key `macos<N>`, built with `metal-tt -macos-version-min <N>.0`); `26 27` adds an unvalidated `macos26` set (below), and needs `AOT_ALLOW_UNVALIDATED_OS=1` |
 | `AOT_ALLOW_UNVALIDATED_OS=1` | | opt-in for an archive key outside `VALIDATED_AOT_OS_MAJORS` (assemble and the check refuse it otherwise; `BUILDINFO` `aot_os_unvalidated` lists it) |
 | `METAL_COMPILER_UNVALIDATED=1` | | opt-in for metallibs from another compiler than `VALIDATED_METAL_COMPILER` (`BUILDINFO` `metal_compiler_validated=no`) |
@@ -47,7 +61,10 @@ Settings (environment):
 | `ZKMINER_VERSION` | `[workspace.package].version` | |
 | `ASSEMBLE_SKIP_BUILD=1` | | package `target/release` as it is (the checks still apply) |
 
-Wall time on the M5 Max: about 8 min for the build from a fresh clone with an empty kernel cache, then 215 s for the rest (cargo no-op, the dump tests, 11 archives in 113 s, packing; B9-PKG note).
+Wall time on the M5 Max (W10-DOC, `AOT_ARCHES=none`, risc0 through the local mirror, warm risc0 kernel
+cache): 69 s for the CLI and 194 s for the worker from an empty `target/`, then 71 s for
+`assemble-macos.sh` itself (cargo no-op, checks, packing). The kit is 121 MB packed and 192 MB
+unpacked. A kit with an archive set adds the dump tests and 11 archives (113 s, B9-PKG note).
 
 ## Kit layout
 
@@ -55,11 +72,13 @@ Wall time on the M5 Max: about 8 min for the build from a fresh clone with an em
 zkminer-<version>-macos-arm64/
 ├── zkminer                              CLI            -> ~/.zkminer/zkminer
 ├── provers/zkminer-prove-risc0-metal    Metal worker   -> ~/.zkminer/provers/
-├── metal-aot/                           archive set (*.binarchive, manifest.jsonl, SHA256SUMS, WORKER)
+├── metal-aot/                           empty in the release kit; with an archive set: *.binarchive,
+│                                        manifest.jsonl, SHA256SUMS, WORKER
 │                                                       -> ~/.zkminer/provers/metal-aot (validated family only)
 ├── install.sh                           packaging/macos/install.sh
 ├── tools/install-metal-aot.sh           scripts/mac (install.sh uses it)
 ├── tools/build-metal-aot.sh             scripts/mac (its --worker-digests)
+├── tools/macos-smoke.sh                 scripts/ci (launch, device probe, one proof)
 ├── README.md                            packaging/macos/README.md (says "This kit has no offline GPU
 │                                        pipeline archives" exactly when metal-aot/ has none, and
 │                                        "About <x> GB for the kit"; check-macos-kit.py checks both)
@@ -203,6 +222,12 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
 
 ## Offline archives: which families
 
+**The release kit ships none** (`AOT_ARCHES=none`, above): every Mac compiles its pipelines once at
+first start, about a minute on an M5 Max (kit README, "First start"). CI cannot build a set (no Apple
+GPU on the runner, and a set must match the build's own metallibs; `docs/ci-macos.md`). This section is
+what a kit with archives would ship, if one is built on a Mac. Shipping one is a user decision, and
+`packaging/macos/README.md` must then say so (`check-macos-kit.py` enforces it both ways).
+
 - **Ship `applegpu_g17s` only** (the M5 Max here reports it; the M5 Pro's family was not checked). It is the only family validated on hardware (risc0
   `tools/metal_aot/README.md`: unit suites, seal equality, stress). `metal-tt` can build g13g-g17g as
   well, but no GPU of those families has run their output, and a GPU binary from the offline compiler
@@ -214,9 +239,9 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
   its macOS key, and it checks every file's checksum before Metal reads it. A file it cannot use is a
   clean miss, and that pipeline is compiled at runtime. B9-PKG tested this by forcing a family
   mismatch (note).
-- **Which macOS.** The runtime opens only files keyed `os<its build>` or `macos<its major>`. The kit
-  ships a `macos27` set; `install.sh` installs the archives of the running macOS's major only
-  (`BUILDINFO` `aot_os_keys`), so macOS 26 installs none.
+- **Which macOS.** The runtime opens only files keyed `os<its build>` or `macos<its major>`. A kit
+  with archives has a `macos27` set by default; `install.sh` installs the archives of the running
+  macOS's major only (`BUILDINFO` `aot_os_keys`), so macOS 26 installs none.
 - **macOS 26 compiles at first start: 51-60 s on the M5 Max, once.** Measured here by running the
   kit worker with only a set it never opens (cold OS shader cache, empty runtime archive dir): a clean
   miss (`no offline archive ... <os26B131|macos27>`), every pipeline compiled, the receipts verified;
@@ -238,8 +263,11 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
 
 ## Groth16 component
 
-- **Never bundled** (2.4 GB). `check-macos-release.sh` fails if a component file or a tarball over
-  1 GiB shows up.
+- **Never bundled** (a 2.4 GB download, 5.8 GB = 5,812,781,917 bytes installed, 5.4 GiB in `du -h`).
+  `check-macos-release.sh` fails if a component file or a tarball over 1 GiB shows up. While it
+  installs, the archive and the unpacked staging directory coexist (`groth16_component.rs` and
+  `install.sh` delete the archive after the unpack): 8.2 GB, so the kit README asks for about 8.3 GB
+  free.
 - **The worker gets it** (`groth16_component.rs`), as on Linux: at its first Warmup (the miner and
   `zkminer benchmark` send it), from RISC Zero's artifact store, SHA-256 pinned. It unpacks into a
   staging directory and renames that into `~/.risc0/extensions/v0.2.0-risc0-groth16` under rzup's
@@ -261,6 +289,13 @@ Only a 36 GB M5 Max has been measured. The smaller rows come from runs on it und
   from the installed `metal-aot`), and fails if one still has it.
 - **Manual steps.** The README documents `xattr -d com.apple.quarantine` and System Settings → Privacy
   & Security → Open Anyway.
+- **Without a desktop session (SSH).** A quarantined unsigned binary hangs before it starts and
+  prints nothing; Ctrl-C ends it. Reproduced on this Mac over SSH with Gatekeeper assessments on
+  (W10-DOC): the kit's own `zkminer help` and a one-line ad hoc signed test program both printed
+  nothing for 25-40 s until stopped, and `spctl -a -t exec` says `rejected`. (B9-M26 noted that SSH
+  sessions in its macOS 26 VM were not blocked; that image ships with assessments off, and the note
+  does not say which state those runs had.) The kit README says so;
+  `macos-smoke.sh` checks the flag first (exit 8) and never launches such a binary.
 - **Signing.** No Developer ID signing or notarization in the beta. The binaries carry the linker's
   ad hoc signature, which arm64 macOS requires, and the check script verifies it.
 - **Who made the kit.** The kit's `SHA256SUMS` travels inside the tarball, so it catches damage and
@@ -291,35 +326,29 @@ own data or local checks only.
 
 ## CI
 
-The workflow files are not part of this item (B9-CI). A macOS job would run:
+`docs/ci-macos.md` describes the workflows, the runner, the disk budget and the pins; the B9-CI note has
+the evidence. In short:
 
-```yaml
-  macos:
-    runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
-    steps:
-      - uses: actions/checkout@<pinned sha>
-      # The validated compiler (27B47), not the runner's Xcode 26 one ("Metal compiler" above).
-      - run: echo "METAL_TC=$(scripts/ci/fetch-metal-toolchain.sh "$RUNNER_TEMP/metal-tc")" >> "$GITHUB_ENV"
-      - run: scripts/ci/assemble-macos.sh dist/macos
-        env: { AOT_SRC: ... }   # see below; leave AOT_OS_MAJORS unset (= 27, the validated key)
-      - uses: actions/upload-artifact@<pinned sha>
-        with: { name: dist-macos, path: dist/macos }
-  metal-probe:     # opt-in: what the runner's GPU can do
-    runs-on: ${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}
-    steps:
-      - run: tar -xzf zkminer-*-macos-arm64.tar.gz && cd zkminer-*-macos-arm64 && ./install.sh --no-aot
-      - run: ~/.zkminer/zkminer --help && tools/macos-smoke.sh --no-proof   # in the kit dir; exit 4 = paravirtual
-```
+- `.github/workflows/build-macos.yml` runs on the repository's self-hosted macOS runner,
+  `${{ vars.ZKMINER_MACOS_RUNNER || 'zk-runner-mac-new' }}` (never a developer's Mac), on push and
+  same-repository pull requests to `main` that touch the kit's sources, by hand, and from
+  `release.yml`. Jobs: `build` (required: the kit, as in "Build the kit" above, with the pinned
+  compiler from `scripts/ci/macos-metal-toolchain.sh`), `cpu-tests` (required: the tests that need
+  no GPU, `scripts/ci/macos-cpu-tests.sh`) and `metal-probe` (informational:
+  `scripts/ci/macos-probe.sh`, which installs the kit under a temporary prefix and runs
+  `tools/macos-smoke.sh`).
+- `release.yml` calls it as job `macos` (`metal_probe: false`); its `assemble` job checks the kit
+  again with `check-macos-kit.py --require-validated` on Linux and puts it in the release.
 
-Pins for B9-CI:
+Pins (`docs/ci-macos.md` has the actions, rustup, protoc and rzup pins):
 
 | what | value |
 |---|---|
-| Metal toolchain | build **27B47** (Xcode 27.2), `Apple metal version 32023.922 (metalfe-32023.922.4)`; `fetch-metal-toolchain.sh` pins the `.aar` (SHA-256 `fcea0f3c…6513d9`) and the disk image (SHA-256 `9a7f6186…3b6265`) |
+| Metal toolchain | build **27B47** (Xcode 27.2), `Apple metal version 32023.922 (metalfe-32023.922.4)`; `fetch-metal-toolchain.sh` pins the `.aar` (SHA-256 `fcea0f3c…6513d9`) and the disk image (SHA-256 `9a7f6186…3b6265`). The workflow input `metal_toolchain: xcode` uses the runner's Xcode compiler instead (unvalidated, refused on a tag) |
 | kernel target | `-mmacosx-version-min=26.0` (AIR 2.8), MSL 3.2 (`metal-tc.sh` wrapper, `assemble-macos.sh`) |
 | binaries | minos 26.0 (`-C link-arg=-mmacosx-version-min=26.0`, `-C strip=none`, `-Wl,-S`) |
-| offline archives | `metal-tt` of the same toolchain, `-macos-version-min 27.0`, key `macos27`, family `applegpu_g17s`; `AOT_OS_MAJORS` unset (default `27`); never `AOT_ALLOW_UNVALIDATED_OS` or `METAL_COMPILER_UNVALIDATED` in a release job |
-| SDK | the release kit was built with the CLT 27.2 SDK (`BUILDINFO` `metal_sdk`); the runner's Xcode 26 SDK changes only the AIR `"SDK Version"` flag (above) |
+| offline archives | none (`AOT_ARCHES=none`); never `AOT_ALLOW_UNVALIDATED_OS` or `METAL_COMPILER_UNVALIDATED` in a release job |
+| SDK | the RC kits were built here with the CLT 27.2 SDK (`BUILDINFO` `metal_sdk`); the runner's Xcode 26 SDK changes only the AIR `"SDK Version"` flag ("Metal compiler" above) |
 
 `scripts/ci/test-assemble-macos.sh <sdk worker> <sdk CLI> [<kit worker> <kit CLI>]` tests the
 script's minimum-macOS handling (26.0, 27.0 and sdk), the kit checks and `install.sh` (the macOS
@@ -336,21 +365,21 @@ its Groth16 wrap, verified by the worker (and by `STOCK_VERIFY=<stock-verify31>`
 ok, 1 proof failed, 3 no Metal device, **4 paravirtual or non-Apple-Silicon device** (proof skipped;
 `--try-paravirtual` tries it, informational), 5 the worker refuses this Mac, 6 a binary did not
 launch, 7 no Groth16 component, **8 quarantined** (the chosen worker or CLI carries
-`com.apple.quarantine`; nothing launched). By default it takes the first of the kit's own binaries,
+`com.apple.quarantine`; nothing launched), 9 run from a kit, the installed copy it would use is
+another build (nothing launched). By default it takes the first of the kit's own binaries,
 the installed ones (`--prefix`, default `~/.zkminer`) and `target/release` that is not quarantined,
 so in a browser-downloaded kit it uses the installed copies once `install.sh` has run, and says so
 when they are from another build. Exit 6 is only for a binary that was launched and failed.
 
-Caveats for that runner (macOS 26, 5 cores, 14 GB, 14 GB disk, likely a VM):
+The runner (macOS 26, 5 cores, 14 GB of RAM, 14 GB of disk, likely a VM), in brief
+(`docs/ci-macos.md`, "The runner"):
 
 - **Probably a paravirtual Metal device.** A macOS guest of Apple's Virtualization framework gets
-  Apple's paravirtualized GPU, not an `applegpu_*` family: `macos-smoke.sh` reports it and exits 4.
-  The AOT dump tests load each metallib on a Metal device and `--metal-arch` needs one: on such a
-  runner build with `AOT_ARCHES=none`, or pass a set built on a Mac for that exact worker as
-  `AOT_SRC` (it must match the worker's metallib digests, so it has to come from the same build).
-  The worker's own refusal checks (`metal_host.rs`) look at the device name's `Apple` prefix, unified
-  memory and RAM; a paravirtual device may pass the first two, so do not treat a proof there as a
-  GPU validation.
-- **Not its own compiler.** Use `fetch-metal-toolchain.sh` (above); never the runner's `xcrun metal`.
-- **Disk.** 14 GB is tight: the release target is ~7 GB, plus ~5 GB transient for the dump tests,
-  plus 0.9 GB for the toolchain image.
+  Apple's paravirtualized GPU, not an `applegpu_*` family: `macos-smoke.sh` reports it and exits 4,
+  which `metal-probe` passes. The worker's own refusal checks (`metal_host.rs`) look at the device
+  name's `Apple` prefix, unified memory and RAM; a paravirtual device may pass the first two, so a
+  proof there is not a GPU validation.
+- **Not its own compiler.** The pinned 27B47 toolchain (above); never the runner's `xcrun metal` for a
+  release.
+- **Disk.** 14 GB is tight: `docs/ci-macos.md` has the measured budget per job (the build peaks at
+  about 11.8 GB used).

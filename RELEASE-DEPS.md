@@ -68,34 +68,36 @@ uses it from cargo's checkout (see below).
 
 ## Building on a clean macOS machine (CI)
 
-Tested on this Mac with a fresh `HOME` and `CARGO_HOME`, no `env.sh`, no Homebrew on `PATH`, no
-`~/.risc0/bin` and no RISC Zero C++ toolchain (the B9-DEP note has the exact environment). A GitHub
-macOS 26 runner with Xcode needs:
+CI does this with the repository's scripts, each pinned and checked (`docs/ci-macos.md` has the jobs,
+the runner and every pin; `.github/workflows/build-macos.yml` runs them). On a clean Apple Silicon Mac
+(Command Line Tools or Xcode, python3; no sudo and no Homebrew needed), from a checkout:
 
 ```sh
-# 1. Xcode's Metal toolchain. Since Xcode 26 it is a separate download; the build calls
-#    `xcrun --sdk macosx metal` and `metallib` (and mac-build-aot calls `metal-tt`).
-sudo xcode-select -s /Applications/Xcode.app        # whichever Xcode the runner has
-xcodebuild -downloadComponent MetalToolchain
-xcrun --sdk macosx metal --version                  # must print "Apple metal version ..."
+# 1. The validated Metal compiler: Metal Toolchain 27B47 (`Apple metal version 32023.922`), downloaded
+#    from Apple's CDN, SHA-256 checked twice, mounted read-only (no Xcode, Apple ID or sudo). Never the
+#    runner's own Xcode compiler for a release: another compiler build is unvalidated GPU code
+#    (docs/macos-beta.md, "Metal compiler"). In a workflow it writes METAL_TC to $GITHUB_ENV;
+#    elsewhere it prints the export line: run that line before step 3.
+scripts/ci/macos-metal-toolchain.sh "$TMPDIR/metal-tc" pinned
 
-# 2. Rust: rustup reads rust-toolchain.toml (1.97.1) on the first cargo call.
-curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+# 2. rustup 1.29.3 (rustup-init, SHA-256 pinned) and the toolchain rust-toolchain.toml names (1.97.1);
+#    rzup built --locked from the hemilabs/risc0 rev Cargo.toml pins, then the RISC Zero Rust guest
+#    toolchain 1.97.0 through it (risc0-build compiles the 13 benchmark guests; 1.97.0 is what they were
+#    built and measured with); protoc 36.2 (the official zip, SHA-256 pinned) for risc0-groth16's
+#    circom-witnesscalc build script. No C++ guest toolchain and no Docker. Prints the PATH and
+#    PROTOC lines to export outside a workflow.
+scripts/ci/macos-toolchains.sh "$TMPDIR/tools"
 
-# 3. The RISC Zero Rust guest toolchain (risc0-build compiles the 13 benchmark guests at build time).
-#    1.97.0 is the version these guests were built and measured with. No C++ toolchain (rzup install
-#    cpp) and no Docker are needed.
-curl -L https://risczero.com/install | bash          # installs rzup into ~/.risc0/bin
-~/.risc0/bin/rzup install rust 1.97.0
-
-# 4. protoc, for risc0-groth16's circom-witnesscalc build script.
-brew install protobuf                                # or: export PROTOC=/path/to/protoc
-
-# 5. Build (no risc0 checkout: RISC0_SRC=git, the default when ../deps/risc0-3.1 does not exist).
-make -f Makefile.mac RISC0_SRC=git mac-build-worker
-#    = cargo build --locked --release -p zkminer-prove-risc0 --features metal --bin zkminer-prove-risc0-metal
-#      cargo build --locked --release -p zkminer-cli
+# 3. The kit (RISC0_SRC=git, the rev Cargo.toml pins): Makefile.mac mac-build-worker with the kit's
+#    settings (minimum macOS 26.0, the compiler wrapper), its checks, the package and
+#    check-macos-release.sh. AOT_ARCHES=none: the release kit has no offline archives.
+AOT_ARCHES=none scripts/ci/assemble-macos.sh dist/macos
+#    mac-build-worker = cargo build --locked --release -p zkminer-prove-risc0 --features metal --bin zkminer-prove-risc0-metal
+#                       cargo build --locked --release -p zkminer-cli
 ```
+
+The workflow splits step 3 (`ASSEMBLE_BUILD_ONLY=1`, prune, then `ASSEMBLE_SKIP_BUILD=1 AOT_ARCHES=none`)
+to fit the runner's 14 GB disk, and runs `scripts/ci/macos-cpu-tests.sh` in a second job.
 
 Notes:
 
@@ -110,9 +112,10 @@ Notes:
   `HOME`. Nothing compares these ids to a fixed value (they are benchmark and test programs; mining
   jobs bring their own ELFs), and receipts from either build verify.
 - The Metal compiler version is part of the kernel cache key and of what the GPU runs. The validated
-  binaries were built with Metal toolchain 27B47 (`Apple metal version 32023.922`). A runner's Xcode 26
-  compiler is a different build: see the open issue in the B9-DEP note before shipping a CI-built
-  binary without an on-hardware check.
+  binaries were built with Metal toolchain 27B47 (`Apple metal version 32023.922`), which step 1
+  fetches; `assemble-macos.sh` refuses metallibs from any other compiler unless
+  `METAL_COMPILER_UNVALIDATED=1` (then `BUILDINFO` says `metal_compiler_validated=no`, which
+  `release.yml` refuses).
 - The runner most likely has no usable Metal GPU, so it can build but not run the worker's GPU tests,
   the benchmark, or the AOT archive build (whose dump tests load the kernels on the device).
 

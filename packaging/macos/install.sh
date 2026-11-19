@@ -5,10 +5,11 @@
 #   ./install.sh --uninstall [--prefix DIR]
 #
 #   --prefix DIR     install into DIR instead of ~/.zkminer (the miner looks for its workers in
-#                    ~/.zkminer/provers; another prefix needs a [workers] search_dirs entry)
+#                    ~/.zkminer/provers; for another prefix, name DIR/provers (an absolute path) in
+#                    ~/.zkminer/config.toml: [prover] worker_search_paths = ["DIR/provers"])
 #   --no-aot         do not install the offline Metal archives (the first start compiles the GPU
 #                    pipelines, about a minute on an M5 Max, longer on smaller Macs)
-#   --with-groth16   download RISC Zero's risc0-groth16 component now (2.4 GB download, 5.4 GB on
+#   --with-groth16   download RISC Zero's risc0-groth16 component now (2.4 GB download, 5.8 GB on
 #                    disk, checked against its pinned SHA-256) instead of at the worker's first warm-up
 #   --warm           afterwards prove one small program with the worker (builds its GPU pipelines;
 #                    needs the risc0-groth16 component, so it implies --with-groth16)
@@ -56,7 +57,7 @@ if [ $uninstall = 1 ]; then
   for f in "$prefix/zkminer" "$worker" "$provers/metal-aot"; do
     [ -e "$f" ] && rm -rf "$f" && say "removed $f"
   done
-  say "Left in place: $prefix/config.toml and keys, ~/.risc0 (the risc0-groth16 component, 5.4 GB),"
+  say "Left in place: ~/.zkminer/config.toml and keys, ~/.risc0 (the risc0-groth16 component, 5.8 GB),"
   say "~/Library/Caches/com.risczero.RISC-Zero.risc0 (compiled GPU pipelines). Remove them by hand if wanted."
   exit 0
 fi
@@ -227,6 +228,8 @@ say ""
 say "Done. Next:"
 case ":$PATH:" in *":$prefix:"*) ;; *) say "  add the CLI to your PATH:  echo 'export PATH=\"$prefix:\$PATH\"' >> ~/.zshrc" ;; esac
 say "  $prefix/zkminer init           # writes ~/.zkminer/config.toml (first install only; keeps an existing one)"
+say "  then the steps init lists: your key (ZKMINER_PRIVATE_KEY), testnet ETH and tHEMI from the"
+say "  HemiProve team, $prefix/zkminer stake 100"
 if [ $groth16 = 1 ]; then
   say "  $prefix/zkminer benchmark      # the risc0-groth16 component is already installed"
 else

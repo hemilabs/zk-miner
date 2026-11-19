@@ -14,7 +14,7 @@ quarantines a downloaded copy, and Gatekeeper blocks the programs until the quar
 |---|---|
 | macOS | **26.0 (Tahoe) or later** (`BUILDINFO` `min_macos`). The GPU kernels are Metal Shading Language 3.2 libraries built for macOS 26, and the binaries refuse to start on an older macOS. `install.sh` checks this first. |
 | Mac | Apple Silicon (M1 or later) with **16 GB of RAM or more**. Not supported: Intel Macs, Macs with 8 GB, and a Terminal running under Rosetta. The prover refuses them and says why. |
-| Disk | About 0.2 GB for the kit, plus 5.4 GB for RISC Zero's Groth16 component (downloaded once, see below). While the component downloads and unpacks, about 7.8 GB must be free. |
+| Disk | About 0.2 GB for the kit, plus 5.8 GB for RISC Zero's Groth16 component (downloaded once, see below; `du -h` shows it as 5.4G, in GiB). While the component installs, its 2.4 GB archive and the unpacked 5.8 GB are on disk together: about 8.3 GB must be free. |
 | Network | The first warm-up downloads the 2.4 GB Groth16 component from RISC Zero's artifact store. |
 
 ### Memory tiers
@@ -46,11 +46,17 @@ GPU cores is slower.
 ## Install
 
 This beta has no signature. Download it only from the hemilabs/zk-miner release page on GitHub,
-over HTTPS, and compare the tarball's SHA-256 with the release's `SHA256SUMS` before you unpack it:
+over HTTPS, and check the tarball against the release's `SHA256SUMS` before you unpack it. Put
+both files in one folder and run, in that folder:
 
 ```sh
-shasum -a 256 zkminer-<version>-macos-arm64.tar.gz   # must equal the line in the release's SHA256SUMS
+shasum -a 256 -c --ignore-missing SHA256SUMS   # must print: zkminer-<version>-macos-arm64.tar.gz: OK
 ```
+
+`--ignore-missing` skips the release's Linux and Windows files, which you did not download; without
+it the check reports them as missing and fails. If it prints `no file was verified`, the tarball is
+not in that folder. (`shasum -a 256 zkminer-<version>-macos-arm64.tar.gz` prints the hash to compare
+by eye.)
 
 The `SHA256SUMS` inside the kit, which `install.sh` checks, catches a damaged file but says nothing
 about who made the kit.
@@ -76,14 +82,28 @@ Options: `--prefix DIR`, `--no-aot` (no effect in this beta), `--with-groth16` (
 Groth16 component now), `--warm` (prove one small program now), `--uninstall`. `./install.sh --help`
 explains each one.
 
-Then:
+Then, to mine on Hemi testnet (chain 743111, the HemiProve deployment of 2026-11-16):
 
 ```sh
 export PATH="$HOME/.zkminer:$PATH"       # add to ~/.zshrc to keep it
-zkminer init                            # ~/.zkminer/config.toml (and a key with --generate-key)
-zkminer benchmark                       # measures this Mac the way the miner does
+zkminer init                            # writes ~/.zkminer/config.toml for testnet, lists these steps
+export ZKMINER_PRIVATE_KEY=0x...        # the prover's key: a new key of your own for this miner
+zkminer stake 100                       # approve and stake 100 tHEMI (needs the tHEMI and ETH below)
+zkminer status                          # balance, stake, collateral
+zkminer benchmark                       # optional: measures this Mac the way the miner does
 zkminer run
 ```
+
+- **The key.** zkminer reads it from `ZKMINER_PRIVATE_KEY` (the config's `[wallet]` can name
+  another variable, or a key file). It does not make one: `init --generate-key` is not implemented.
+  Use a key that holds nothing else.
+- **tHEMI and gas.** Before `zkminer stake`, ask the HemiProve team for testnet ETH (gas; a Hemi
+  testnet faucet also works) and tHEMI for the key's address. tHEMI is minted only by its owner.
+  Each job the miner holds at once locks at least 100 tHEMI of stake, so stake about 100 tHEMI per
+  job you want in flight. The first claim can come one block after the first stake.
+- **`zkminer benchmark`** takes about 4.5 to 5 minutes on an M5 Max (262-314 s measured, the first
+  pipeline compile not included) and longer on a Mac with fewer GPU cores. `zkminer run` benchmarks
+  by itself when no saved results cover this Mac, and claims no jobs until that is done.
 
 Run `zkminer init` once, on the first install (with or without `--with-groth16`). It leaves an
 existing `~/.zkminer/config.toml` alone, so an update needs no `init`. Do not run
@@ -112,7 +132,7 @@ warm-up an hour): it is not a hang.
 ### The Groth16 component
 
 Every proof ends in a Groth16 wrap, which needs RISC Zero's `risc0-groth16` component **v0.2.0**
-(2.4 GB download, 5.4 GB installed in `~/.risc0/extensions/v0.2.0-risc0-groth16`). It is not in this
+(2.4 GB download, 5.8 GB installed in `~/.risc0/extensions/v0.2.0-risc0-groth16`). It is not in this
 kit. You get it in one of two ways:
 
 - The prover downloads it at its first warm-up. The miner and `zkminer benchmark` start that warm-up
@@ -177,6 +197,11 @@ When a browser downloads the tarball, macOS marks it with the `com.apple.quarant
   with your password or Touch ID, and run the program again. (Since macOS 15 the old Control-click
   → Open shortcut no longer works for this.)
 - **Downloading with `curl -LO`** sets no quarantine mark.
+- **Over SSH, or in any shell outside a desktop session:** a quarantined program from the kit
+  hangs before it starts and prints nothing. Gatekeeper blocks it, and there is no window to say so.
+  Press Ctrl-C, then run `./install.sh` (it runs, because the shell reads it) and use the installed
+  copies, or clear the mark with `xattr -d com.apple.quarantine <file>`. `tools/macos-smoke.sh`
+  checks for the mark first and stops with exit 8 instead of hanging.
 
 Check that a file is clear with `xattr -l <file>`: no `com.apple.quarantine` line should be listed.
 
