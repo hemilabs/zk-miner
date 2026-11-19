@@ -58,7 +58,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
     let backend_count = BACKENDS.len();
     let grid_device_count = enabled_device_count(state);
     let grid_backend_count = enabled_backend_count(state);
-    let param_count = 8;
+    let param_count = PARAMETER_ROWS;
     let advanced_count = advanced_row_count(state);
 
     let dev_h = (device_count as u16 + 2).max(3);
@@ -1868,8 +1868,9 @@ fn toggle_grid_cell(state: &mut MinerState) {
 // Parameter adjustment
 // ---------------------------------------------------------------------------
 
-/// Rows in the Parameters section; `render_parameters` lists exactly this many. It was a bare 8
-/// while the section listed 9, so the last row (Gas Cost) could never be selected.
+/// Rows in the Parameters section; `render_parameters` lists exactly this many, and both the box's
+/// height and the selection use it. Each was a bare 8 while the section listed 9, so the last row
+/// (Gas Cost) was cut off the bottom of the box and could never be selected.
 const PARAMETER_ROWS: usize = 10;
 
 /// The Proving Timeout row's step and range, in seconds: 10 minutes to 4 hours.
@@ -2012,6 +2013,29 @@ mod param_row_tests {
             st.runtime_settings.proving_timeout_secs, 14_400,
             "ceiling 4 h"
         );
+    }
+
+    /// Every parameter is DRAWN, not just selectable: the box's height was a second bare 8, so the
+    /// last rows (Gas Cost, Proving Timeout) were cut off even once they could be selected.
+    #[test]
+    fn every_parameter_row_is_drawn() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let st = MinerState::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 60)).unwrap();
+        terminal.draw(|f| render(f, f.area(), &st)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for label in ["Gas Cost", "Proving Timeout", "1h 0m per attempt"] {
+            assert!(
+                screen.contains(label),
+                "{label} is not on the Settings screen"
+            );
+        }
     }
 
     /// Every listed parameter can be selected: the count was 8 for 9 rows, so Gas Cost, the last,
