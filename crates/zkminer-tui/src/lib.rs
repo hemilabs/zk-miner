@@ -3,6 +3,7 @@ pub mod event;
 pub mod gpu_tuning;
 pub mod hardware;
 pub mod nvml;
+pub mod progress;
 pub mod screens;
 pub mod splash;
 pub mod state;

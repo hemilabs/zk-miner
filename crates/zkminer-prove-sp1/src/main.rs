@@ -1907,34 +1907,32 @@ fn parse_progress_line(line: &str) -> Option<KindCounts> {
     Some(counts)
 }
 
-/// How far a Groth16 proof is from its task counts, and (shards proven, shards submitted). The
-/// shards and the reduce tree take the bar to 85%; the shrink wrap 88-90%; the Groth16 (or PLONK)
-/// wrap starts at 92%, a fixed ~15 s that dominates a small proof. Until execution ends the shard
-/// total is not final, so shard progress counts for at most 60% of its share.
-fn progress_fraction(counts: &KindCounts) -> (f64, Option<(u32, u32)>) {
+/// Where a proof is, from the server's task counts (protocol 16): `Prove` with the shards proven
+/// and submitted (the total final once execution is done) until the wrap starts, then `Finish`,
+/// from the shrink's submission (the benchmark's wrap time covers the shrink and the Groth16 or
+/// PLONK wrap). The host weighs the stages by the job and the card; the worker only says where it
+/// is.
+fn stage_report(counts: &KindCounts) -> zkminer_prover_protocol::StageReport {
+    use zkminer_prover_protocol::{ProveStage, StageReport};
     let get = |k: &str| counts.get(k).copied().unwrap_or((0, 0));
-    let ratio = |(done, submitted): (u32, u32)| {
-        if submitted == 0 {
-            0.0
-        } else {
-            f64::from(done.min(submitted)) / f64::from(submitted)
-        }
-    };
-    let shards = get("PROVE_SHARD");
-    let segments = (shards.1 > 0).then_some(shards);
-    let (groth16, plonk) = (get("GROTH16_WRAP"), get("PLONK_WRAP"));
-    let snark = (groth16.0 + plonk.0, groth16.1 + plonk.1);
-    if snark.1 > 0 {
-        return (if snark.0 > 0 { 0.99 } else { 0.92 }, segments);
+    let wrapping = ["SHRINK_WRAP", "GROTH16_WRAP", "PLONK_WRAP"]
+        .iter()
+        .any(|k| get(k).1 > 0);
+    if wrapping {
+        return StageReport {
+            stage: ProveStage::Finish,
+            done: 0,
+            total: 0,
+            total_final: true,
+        };
     }
-    let shrink = get("SHRINK_WRAP");
-    if shrink.1 > 0 {
-        return (if shrink.0 > 0 { 0.90 } else { 0.88 }, segments);
+    let (done, submitted) = get("PROVE_SHARD");
+    StageReport {
+        stage: ProveStage::Prove,
+        done: done.min(submitted),
+        total: submitted,
+        total_final: get("CORE_EXECUTE").0 > 0,
     }
-    let executed = get("CORE_EXECUTE").0 > 0;
-    let core = ratio(shards) * if executed { 1.0 } else { 0.6 };
-    let reduce = ratio(get("RECURSION_REDUCE"));
-    (0.85 * (0.8 * core + 0.2 * reduce), segments)
 }
 
 /// Reads the server's progress file while a proof runs and sends the host a `Progress` when it
@@ -1957,8 +1955,18 @@ impl ProgressPoller {
         let thread = std::thread::Builder::new()
             .name("sp1-progress".into())
             .spawn(move || {
-                let started = Instant::now();
-                let mut last = 0.0f64;
+                let send = |report: zkminer_prover_protocol::StageReport| {
+                    let msg = WorkerResponse::ProveStage { request_id, report };
+                    let _ = write_message(&mut SharedOut(out.clone()), &msg);
+                };
+                // Until the server writes its first counts: the proving key, the first tasks.
+                let mut last = zkminer_prover_protocol::StageReport {
+                    stage: zkminer_prover_protocol::ProveStage::Setup,
+                    done: 0,
+                    total: 0,
+                    total_final: true,
+                };
+                send(last);
                 while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(500));
                     let Some(counts) = std::fs::read_to_string(&path)
@@ -1967,21 +1975,12 @@ impl ProgressPoller {
                     else {
                         continue;
                     };
-                    let (fraction, segments) = progress_fraction(&counts);
-                    if fraction <= last {
+                    let report = stage_report(&counts);
+                    if report == last || flag.load(std::sync::atomic::Ordering::Relaxed) {
                         continue;
                     }
-                    last = fraction;
-                    let msg = WorkerResponse::Progress {
-                        request_id,
-                        fraction,
-                        elapsed_secs: started.elapsed().as_secs_f64(),
-                        segments,
-                    };
-                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    let _ = write_message(&mut SharedOut(out.clone()), &msg);
+                    last = report;
+                    send(report);
                 }
             })
             .ok();
@@ -5281,26 +5280,26 @@ mod progress_tests {
         assert!(parse_progress_line("").is_none());
     }
 
-    /// The bar only rises through the stages, the shards short of their share until the total is
-    /// known, and never reaches 100% before the proof is in.
+    /// Shards while the STARK runs (the total final once execution is done), then the wrap from
+    /// the shrink's submission.
     #[test]
-    fn fraction_follows_the_stages() {
-        let at = |line: &str| progress_fraction(&parse_progress_line(line).unwrap()).0;
+    fn stage_reports_follow_the_servers_counts() {
+        use zkminer_prover_protocol::ProveStage;
+        let at = |line: &str| stage_report(&parse_progress_line(line).unwrap());
         let executing = at("proof=a CORE_EXECUTE=0/1 PROVE_SHARD=5/10");
-        let executed = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=5/10");
-        let shards_done = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/10 RECURSION_REDUCE=9/9");
-        let shrink = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/10 SHRINK_WRAP=0/1");
-        let wrap =
-            at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/10 SHRINK_WRAP=1/1 GROTH16_WRAP=0/1");
-        assert!(
-            executing < executed && executed < shards_done,
-            "{executing} {executed} {shards_done}"
-        );
-        assert!((shards_done - 0.85).abs() < 1e-9);
-        assert!(shards_done < shrink && shrink < wrap && wrap < 1.0);
+        assert_eq!(executing.stage, ProveStage::Prove);
+        assert_eq!((executing.done, executing.total), (5, 10));
+        assert!(!executing.total_final);
+        let executed = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/40 RECURSION_REDUCE=3/9");
+        assert_eq!((executed.done, executed.total), (10, 40));
+        assert!(executed.total_final);
         assert_eq!(
-            progress_fraction(&parse_progress_line("proof=a PROVE_SHARD=3/7").unwrap()).1,
-            Some((3, 7))
+            at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=40/40 SHRINK_WRAP=0/1").stage,
+            ProveStage::Finish
+        );
+        assert_eq!(
+            at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=40/40 SHRINK_WRAP=1/1 GROTH16_WRAP=0/1").stage,
+            ProveStage::Finish
         );
     }
 }

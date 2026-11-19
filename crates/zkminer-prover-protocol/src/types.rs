@@ -81,12 +81,14 @@ use serde::{Deserialize, Serialize};
 /// instead of a decoder failing mid-benchmark or mid-job.
 /// 18: the two 17s together (the macOS beta merged with max/usability). The macOS beta's 17 is
 /// above. max/usability's 17: `Benchmark` gained `po2`, the segment size a risc0 worker proves the
-/// suite at: the card's own job size, so its rate describes the jobs it proves (a 12 GB card
-/// benchmarked at 20 spills into shared memory and records a rate several times too low). An SP1
-/// worker applies the card's shard-size cap (`SP1_ELEMENT_THRESHOLD_CAP_ENV`) and reports sp1-gpu's
-/// own out-of-memory wordings as `ResourceExhausted`. A v16 worker would prove the suite at 20 and
-/// run larger than the dispatcher plans for. Either 17 is a different wire from 18: the beta's lacks
-/// `Benchmark.po2`, max/usability's lacks `BenchmarkEntry.power_state`.
+/// suite at: the card's own job size, so its rate describes the jobs it proves (a 12 GB card benchmarked at 20 spills
+/// into shared memory and records a rate several times too low). An SP1 worker applies the card's
+/// shard-size cap (`SP1_ELEMENT_THRESHOLD_CAP_ENV`) and reports sp1-gpu's own out-of-memory wordings
+/// as `ResourceExhausted`. And `WorkerResponse::ProveStage`, appended last: what part of a proof a
+/// worker is in, with its counts, from which the host works out how far the proof is (`Progress`
+/// still marks the start). A v16 worker would prove the suite at 20, run larger than the dispatcher
+/// plans for, and report no stages. Either 17 is a different wire from 18: the beta's lacks
+/// `Benchmark.po2` and `ProveStage`, max/usability's lacks `BenchmarkEntry.power_state`.
 pub const PROTOCOL_VERSION: u32 = 18;
 
 /// The risc0-zkvm `major.minor` a risc0 worker must report (`HelloAck.sdk_version`, "risc0-zkvm
@@ -496,6 +498,51 @@ pub enum WorkerResponse {
         /// of two, plus each keccak request).
         cycles: u64,
     },
+    /// What part of a proof the worker is in, sent as it moves (protocol 16). Raw facts, not a
+    /// fraction: the host weighs each stage by what it knows of the job and the card (the job's
+    /// measured cycles over the card's benchmarked STARK rate, the card's measured wrap time).
+    /// Appended last (v17), after `JournalDiverged`, so every earlier variant keeps its bincode
+    /// index.
+    ProveStage {
+        request_id: u64,
+        report: StageReport,
+    },
+}
+
+/// A stage of a proof, in the order a proof goes through them (`WorkerResponse::ProveStage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProveStage {
+    /// SP1: starting the server's proof (the proving key for a new program, the first shards).
+    Setup,
+    /// risc0: executing the guest before proving it.
+    Execute,
+    /// The STARK: risc0 segments, SP1 core shards. Counted.
+    Prove,
+    /// After the STARK: risc0's lift/join and keccak proofs then the Groth16 wrap; SP1's shrink and
+    /// Groth16 wrap. Reports nothing until it ends.
+    Finish,
+}
+
+/// Where a proof is (`WorkerResponse::ProveStage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageReport {
+    pub stage: ProveStage,
+    /// Units of the stage done (segments, shards); 0 for a stage that is not counted.
+    pub done: u32,
+    /// Units the stage has so far; 0 for a stage that is not counted.
+    pub total: u32,
+    /// Whether `total` is final. SP1 learns its shard count only once execution ends.
+    pub total_final: bool,
+}
+
+/// What a proof's progress callback receives from the dispatcher: that an attempt started on a
+/// card, and each stage report after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProveEvent {
+    /// An attempt started. A retry sends this again: its progress starts over.
+    Started,
+    /// The attempt's worker reported where it is.
+    Stage(StageReport),
 }
 
 /// The input of a witness-construction job's proof (`WorkerCommand::Prove::witness`, protocol v14).

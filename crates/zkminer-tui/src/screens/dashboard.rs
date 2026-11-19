@@ -501,13 +501,16 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
                 spill.map(spill_text).unwrap_or_default(),
                 theme::warning(),
             ),
-            MinerJobStatus::Proving { progress, .. } => {
-                let (filled, empty) = theme::progress_bar(*progress, 12);
-                (
-                    id_short,
-                    format!("{}{} {:.0}%", filled, empty, progress * 100.0),
-                    Style::default().fg(theme::green()),
-                )
+            MinerJobStatus::Proving { .. } => {
+                let text = match state.proving_fraction(job) {
+                    Some(f) => {
+                        let (filled, empty) = theme::progress_bar(f, 12);
+                        format!("{}{} {:.0}%", filled, empty, f * 100.0)
+                    }
+                    // Nothing to weigh the stages by: how long it has run, not a bar at 0%.
+                    None => format!("proving {}", format_duration(state.proving_secs(job))),
+                };
+                (id_short, text, Style::default().fg(theme::green()))
             }
             // Explicit, not the `_ => "Pending"` catch-all: a queued job holds collateral
             // and is waiting for a card, which an operator must be able to tell apart from
@@ -871,14 +874,16 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
             let cycles_str = format_compact(job.estimated_cycles as f64);
 
             let status_str = match &job.status {
-                MinerJobStatus::Proving { progress, .. } => {
+                MinerJobStatus::Proving { .. } => {
                     let secs = format_duration(state.proving_secs(job));
-                    if *progress > 0.0 {
-                        let (filled, empty) = theme::progress_bar(*progress, 15);
-                        format!("{}{} {:.0}% {secs}", filled, empty, progress * 100.0)
-                    } else {
-                        // No progress reported (SP1 today): how long, not a bar stuck at 0%.
-                        format!("Proving for {secs}")
+                    let stage = state.proving_stage_label(job).unwrap_or_default();
+                    match state.proving_fraction(job) {
+                        Some(f) => {
+                            let (filled, empty) = theme::progress_bar(f, 15);
+                            format!("{}{} {:.0}% {secs} {stage}", filled, empty, f * 100.0)
+                        }
+                        // Nothing to weigh the stages by: how long, not a bar stuck at 0%.
+                        None => format!("Proving for {secs} {stage}"),
                     }
                 }
                 // Queued jobs hold collateral but are not on a card yet — say so plainly
@@ -1318,7 +1323,9 @@ mod card_job_tests {
                 .join("\n")
         };
         let shown = screen(&state);
-        assert!(shown.contains("40%"), "{shown}");
+        // No measurement or benchmark to estimate by in this state: the row says how long it has
+        // been proving (the status's own fraction is no longer shown).
+        assert!(shown.contains("proving 30s"), "{shown}");
         assert!(!shown.contains("paged to RAM"), "{shown}");
         state.gpu_spills.insert(
             card.to_string(),
@@ -1329,7 +1336,7 @@ mod card_job_tests {
         );
         let shown = screen(&state);
         assert!(shown.contains("⚠ 9.6 GiB paged to RAM"), "{shown}");
-        assert!(!shown.contains("40%"), "{shown}");
+        assert!(!shown.contains("proving 30s"), "{shown}");
         state.gpu_spills.insert(
             card.to_string(),
             zkminer_prover::dispatcher::GpuSpill {
@@ -1347,7 +1354,7 @@ mod card_job_tests {
                 stopping: false,
             },
         );
-        assert!(screen(&state).contains("40%"));
+        assert!(screen(&state).contains("proving 30s"));
     }
 
     /// The Temp cell names the hottest VRAM sensor beside the core when there is one, and the name

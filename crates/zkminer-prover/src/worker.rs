@@ -1466,7 +1466,7 @@ impl WorkerHandle {
     pub fn recv_proof(
         &mut self,
         expected_request_id: u64,
-        on_progress: &Option<Box<dyn Fn(f64) + Send>>,
+        on_progress: &Option<Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>>,
     ) -> Result<WorkerResponse> {
         const MAX_STALE_DISCARDS: u32 = 16;
         let mut stale_count: u32 = 0;
@@ -1474,17 +1474,22 @@ impl WorkerHandle {
         loop {
             let resp = self.recv()?;
             match &resp {
-                WorkerResponse::Progress {
-                    request_id,
-                    fraction,
-                    ..
-                } => {
+                // The start of an attempt (`Progress`; its fraction is no longer read) and each
+                // stage report after it.
+                WorkerResponse::Progress { request_id, .. } => {
                     if *request_id == expected_request_id {
                         if let Some(cb) = on_progress {
-                            cb(*fraction);
+                            cb(zkminer_prover_protocol::ProveEvent::Started);
                         }
                     }
                     // Continue reading (don't count progress toward stale limit)
+                }
+                WorkerResponse::ProveStage { request_id, report } => {
+                    if *request_id == expected_request_id {
+                        if let Some(cb) = on_progress {
+                            cb(zkminer_prover_protocol::ProveEvent::Stage(*report));
+                        }
+                    }
                 }
                 WorkerResponse::ProofResult { request_id, .. }
                 | WorkerResponse::JournalDiverged { request_id, .. }

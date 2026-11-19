@@ -274,7 +274,7 @@ pub async fn prove_async(
     input_data: Vec<u8>,
     po2: Option<u8>,
     timeout: Option<Duration>,
-    on_progress: Option<Box<dyn Fn(f64) + Send>>,
+    on_progress: Option<Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>>,
 ) -> Result<ProofOutput> {
     let backend = backend.to_string();
     tokio::task::spawn_blocking(move || {
@@ -292,10 +292,10 @@ pub async fn prove_async(
         if let Some(ref backend_name) = prover.backend {
             if let Some(pool) = worker_pool() {
                 if pool.is_backend_healthy(backend_name) {
-                    // engine's public callback is Fn(f64); the pool now also reports
-                    // the slot key. Drop it here rather than widening this API.
-                    let cb: Option<Box<dyn Fn(f64, &str) + Send>> = on_progress.map(|f| {
-                        Box::new(move |p: f64, _slot: &str| f(p)) as Box<dyn Fn(f64, &str) + Send>
+                    // The pool also reports the slot key; this API drops it.
+                    let cb: Option<crate::dispatcher::SlotProgress> = on_progress.map(|f| {
+                        Box::new(move |e: zkminer_prover_protocol::ProveEvent, _slot: &str| f(e))
+                            as crate::dispatcher::SlotProgress
                     });
                     return pool.prove(backend_name, &elf, &input_data, po2, timeout, cb);
                 }

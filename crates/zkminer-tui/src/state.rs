@@ -558,9 +558,10 @@ pub struct MinerState {
     /// The cycle count each job was measured at, once it has been, for open and claimed jobs alike
     /// (the Job Detail screen). A job with no entry has not been measured: its `job_why` says why.
     pub job_measurements: std::collections::HashMap<alloy_primitives::B256, JobMeasurement>,
-    /// When each claimed job started proving (its first attempt's start), so its elapsed time counts
-    /// up between the worker's progress reports, and for a worker that sends none.
-    pub proving_since: std::collections::HashMap<alloy_primitives::B256, std::time::Instant>,
+    /// Each proving job's current attempt: when it started, on which slot, the worker's latest stage
+    /// report (see `crate::progress`). A retry replaces it, so its progress and time start over.
+    pub proving:
+        std::collections::HashMap<alloy_primitives::B256, crate::progress::AttemptProgress>,
     /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
     pub claim_outlook: ClaimOutlook,
 
@@ -1078,7 +1079,7 @@ impl Default for MinerState {
             selected_job_id: None,
             job_why: std::collections::HashMap::new(),
             job_measurements: std::collections::HashMap::new(),
-            proving_since: std::collections::HashMap::new(),
+            proving: std::collections::HashMap::new(),
             claim_outlook: ClaimOutlook::default(),
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
@@ -1154,13 +1155,82 @@ impl MinerState {
     /// How long a proving job has been proving, in seconds: live from when it started, or what its
     /// status last carried when the start was not seen.
     pub fn proving_secs(&self, job: &TrackedJob) -> u64 {
-        match self.proving_since.get(&job.info.job_id) {
-            Some(since) => since.elapsed().as_secs(),
+        match self.proving.get(&job.info.job_id) {
+            Some(attempt) => attempt.started.elapsed().as_secs(),
             None => match job.status {
                 MinerJobStatus::Proving { elapsed_secs, .. } => elapsed_secs,
                 _ => 0,
             },
         }
+    }
+
+    /// How far a proving job's current attempt is, in [0, 0.99], from its worker's stage reports
+    /// weighed by the job's measured cycles and its card's benchmark (`crate::progress`). `None`
+    /// when there is nothing to weigh them by: no measurement, or no benchmark row for the backend.
+    pub fn proving_fraction(&self, job: &TrackedJob) -> Option<f64> {
+        let attempt = self.proving.get(&job.info.job_id)?;
+        let exp = self.expected_stage_secs(job, attempt)?;
+        Some(crate::progress::attempt_fraction(
+            attempt,
+            &exp,
+            std::time::Instant::now(),
+        ))
+    }
+
+    /// The stage a proving job's current attempt is in, with its counts, e.g. "segment 40/91".
+    pub fn proving_stage_label(&self, job: &TrackedJob) -> Option<String> {
+        let attempt = self.proving.get(&job.info.job_id)?;
+        let backend = attempt.slot.split(':').next().unwrap_or("");
+        Some(crate::progress::stage_label(backend, attempt.report))
+    }
+
+    /// Raises each attempt's floor to what it shows now, so the bar never moves back between the
+    /// worker's reports. Called as the dashboard refreshes.
+    pub fn refresh_proving_floors(&mut self) {
+        let now = std::time::Instant::now();
+        let floors: Vec<(alloy_primitives::B256, f64)> = self
+            .active_jobs
+            .iter()
+            .filter_map(|job| {
+                let attempt = self.proving.get(&job.info.job_id)?;
+                let exp = self.expected_stage_secs(job, attempt)?;
+                Some((
+                    job.info.job_id,
+                    crate::progress::attempt_fraction(attempt, &exp, now),
+                ))
+            })
+            .collect();
+        for (id, f) in floors {
+            if let Some(attempt) = self.proving.get_mut(&id) {
+                attempt.floor = attempt.floor.max(f);
+            }
+        }
+    }
+
+    /// The expected seconds of each stage of `job` on the card of `attempt`: from the job's measured
+    /// cycles, and the card's benchmark row for the backend, else the slowest row of that backend.
+    fn expected_stage_secs(
+        &self,
+        job: &TrackedJob,
+        attempt: &crate::progress::AttemptProgress,
+    ) -> Option<crate::progress::StageSecs> {
+        let mut parts = attempt.slot.split(':');
+        let (backend, tag, index) = (parts.next()?, parts.next()?, parts.next()?);
+        let measurement = self.job_measurements.get(&job.info.job_id)?;
+        let cycles = measurement.cycles?;
+        let device = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(tag, index);
+        let rows = &self.benchmark_results.as_ref()?.device_benchmarks;
+        let of_backend = || rows.iter().filter(|r| r.prover_backend == backend);
+        let row = of_backend().find(|r| r.device_id == device).or_else(|| {
+            of_backend()
+                .filter(|r| r.stark_rate().is_some())
+                .min_by(|a, b| {
+                    a.stark_rate()
+                        .partial_cmp(&b.stark_rate())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })?;
+        crate::progress::expected_stage_secs(backend, cycles, Some(measurement.execute_secs), row)
     }
 
     /// The Jobs page's rows, in order: the jobs this miner has claimed, then the open market less

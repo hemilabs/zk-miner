@@ -4190,6 +4190,8 @@ pub async fn run(
         while let Some(output) = rx.recv().await {
             let mut s = state_hw.write().await;
             zkminer_tui::hardware::apply_hw_snapshot(&mut s, output);
+            // On the same 2 s beat: a proof's bar never moves back between its worker's reports.
+            s.refresh_proving_floors();
         }
     });
 
@@ -9768,7 +9770,7 @@ async fn miner_brain(
                 .map(|j| j.info.job_id)
                 .collect();
             s.job_measurements.retain(|jid, _| live.contains(jid));
-            s.proving_since.retain(|jid, _| live.contains(jid));
+            s.proving.retain(|jid, _| live.contains(jid));
         }
         // Why each job looked at this pass was not claimed, for the dashboard and the headless log.
         {
@@ -11751,8 +11753,22 @@ async fn process_job_lifecycle(
         let mut warned_no_card = false;
         // Whether the last look found no card to take it (see the wait below).
         let mut waiting_for_card = false;
+        // Whether an attempt (or a wait for a card or memory) came before this pass.
+        let mut retrying = false;
         loop {
             attempt += 1;
+            // Between attempts the job is not proving: back to Queued until a worker takes it again,
+            // and the last attempt's progress dropped, so the dashboard shows no stale bar or time.
+            if retrying {
+                let mut s = state.write().await;
+                s.proving.remove(&job_id);
+                if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
+                    if matches!(j.status, zkminer_tui::state::MinerJobStatus::Proving { .. }) {
+                        j.status = zkminer_tui::state::MinerJobStatus::Queued;
+                    }
+                }
+            }
+            retrying = true;
             // The EFFECTIVE deadline moves out while the protocol is paused or a Disabled window
             // lasts (and on a downtime extension): refresh it each attempt, so a proof is never cut
             // short — and its lock released — at a stale pre-pause cutoff.
@@ -11947,59 +11963,66 @@ async fn process_job_lifecycle(
                 // read "Idle", the jobs never attributed to it.
                 let started_pool = pool;
                 let started_runtime = runtime_for_prove_progress;
-                // Called on every Progress the worker sends: the start (0.0), then, from a worker that
-                // reports it (risc0, per proven segment), how far the proof is.
-                let mark_started = move |p: f64, slot_key: &str| {
-                    // Which physical card took this job. Resolved through the pool
-                    // rather than any index, so the dashboard can attribute the job
-                    // to the right GPU row on a mixed-vendor box.
-                    let bus = started_pool.bus_id_for_slot(slot_key);
-                    let slot_key = slot_key.to_string();
-                    let started_state = started_state.clone();
-                    started_runtime.spawn(async move {
+                // Called on the proving thread for each event: an attempt's start on a card, then each
+                // stage its worker reports. Sent to ONE task that applies them in order (a task per
+                // event could land a retry's start after its first report); the task ends when the
+                // proof does and this closure is dropped.
+                let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                    zkminer_prover_protocol::ProveEvent,
+                    String,
+                )>();
+                started_runtime.spawn(async move {
+                    while let Some((event, slot_key)) = events_rx.recv().await {
+                        // Which physical card took this attempt. Resolved through the pool rather
+                        // than any index, so the dashboard can attribute the job to the right GPU
+                        // row on a mixed-vendor box.
+                        let bus = started_pool.bus_id_for_slot(&slot_key);
+                        let now = std::time::Instant::now();
                         let mut st = started_state.write().await;
-                        if let Some(j) = st
+                        match event {
+                            // A new attempt: its progress and time start over.
+                            zkminer_prover_protocol::ProveEvent::Started => {
+                                st.proving.insert(
+                                    started_id,
+                                    zkminer_tui::progress::AttemptProgress::new(&slot_key, now),
+                                );
+                            }
+                            zkminer_prover_protocol::ProveEvent::Stage(report) => {
+                                st.proving
+                                    .entry(started_id)
+                                    .or_insert_with(|| {
+                                        zkminer_tui::progress::AttemptProgress::new(&slot_key, now)
+                                    })
+                                    .record(report, now);
+                            }
+                        }
+                        let Some(j) = st
                             .active_jobs
                             .iter_mut()
                             .find(|j| j.info.job_id == started_id)
-                        {
-                            let p = if p.is_finite() { p.clamp(0.0, 1.0) } else { 0.0 };
-                            match &mut j.status {
-                                zkminer_tui::state::MinerJobStatus::Queued => {
-                                    j.status = zkminer_tui::state::MinerJobStatus::Proving {
-                                        progress: p,
-                                        elapsed_secs: 0,
-                                    };
-                                }
-                                // Never backwards: each report is applied on its own task, and
-                                // they can land out of order.
-                                zkminer_tui::state::MinerJobStatus::Proving { progress, .. } => {
-                                    *progress = progress.max(p);
-                                }
-                                _ => {}
-                            }
-                            st.proving_since
-                                .entry(started_id)
-                                .or_insert_with(std::time::Instant::now);
-                            let Some(j) = st
-                                .active_jobs
-                                .iter_mut()
-                                .find(|j| j.info.job_id == started_id)
-                            else {
-                                return;
+                        else {
+                            continue;
+                        };
+                        if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
+                            j.status = zkminer_tui::state::MinerJobStatus::Proving {
+                                progress: 0.0,
+                                elapsed_secs: 0,
                             };
-                            // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after the GPU-OOM arm
-                            // rerouted a job to a bigger card the dashboard kept naming the card it had failed on — and this
-                            // is the only signal an operator has for which card a job is on. The callback carries the
-                            // authoritative slot key for the attempt that is actually starting.
-                            j.gpu_bus_id = bus;
-                            // And WHICH SLOT. `prover_backend` was set only after a proof
-                            // succeeded, so while work was running the dashboard showed the card
-                            // but not the backend — and with two slots per card that is the one
-                            // thing an operator checking their routing needs to see.
-                            j.prover_backend = slot_key;
                         }
-                    });
+                        // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after
+                        // the GPU-OOM arm rerouted a job to a bigger card the dashboard kept naming the
+                        // card it had failed on — and this is the only signal an operator has for which
+                        // card a job is on. The event carries the slot of the attempt actually running.
+                        j.gpu_bus_id = bus;
+                        // And WHICH SLOT: with two slots per card, the one thing an operator checking
+                        // their routing needs to see.
+                        j.prover_backend = slot_key;
+                        st.refresh_proving_floors();
+                    }
+                });
+                let mark_started = move |event: zkminer_prover_protocol::ProveEvent,
+                                         slot_key: &str| {
+                    let _ = events_tx.send((event, slot_key.to_string()));
                 };
                 let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
                 let r = pool.prove_min_vram(
