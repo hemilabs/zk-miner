@@ -144,6 +144,23 @@ fn main() {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
+        // W10-BENCH round 1: a BENCH_ONLY that names no program (a typo) ran only the warm-up and
+        // exited 0 with an empty table, so a script read it as success. Refused before any GPU work.
+        if let Some(only) = std::env::var("BENCH_ONLY").ok().filter(|o| !o.is_empty()) {
+            if !bench_only_is_known(&only) {
+                eprintln!(
+                    "BENCH_ONLY={only} names no benchmark program; use one of: {}",
+                    bench_only_names().join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+        if let Some(knob) = force_fail_knob() {
+            eprintln!(
+                "WARNING: ZKMINER_TEST_FORCE_FAIL={knob} is set: the named steps fail on purpose \
+                 (a test aid; unset it)"
+            );
+        }
         #[cfg(feature = "metal")]
         {
             metal_start::log_qos(&qos);
@@ -1955,6 +1972,22 @@ fn run_benchmarks() -> (Vec<BenchmarkEntry>, Vec<String>) {
     )
 }
 
+/// The names `BENCH_ONLY` accepts: the warm-up's program, the suite's and the zkOP/s score's.
+fn bench_only_names() -> Vec<String> {
+    use zkminer_prover_protocol::{benchmark_suite, BENCH_WARMUP, BENCH_ZKOP_MIX};
+    let mut names = vec![BENCH_WARMUP.to_string()];
+    names.extend(benchmark_suite(BACKEND_RISC0).into_iter().map(|p| p.name));
+    names.push(BENCH_ZKOP_MIX.to_string());
+    names
+}
+
+/// Whether `BENCH_ONLY=<only>` names something `--benchmark` runs (case-insensitive, as it matches).
+fn bench_only_is_known(only: &str) -> bool {
+    bench_only_names()
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(only))
+}
+
 /// `run_benchmarks` with `BENCH_ONLY` and `ZKMINER_TEST_FORCE_FAIL` passed in.
 fn run_benchmarks_with(
     only: Option<&str>,
@@ -3229,5 +3262,22 @@ mod bench_exit_tests {
         // BENCH_ONLY narrows the suite, but a failed warm-up still fails the run.
         let (_, failed) = run_benchmarks_with(Some(BENCH_ZKOP_MIX), Some(&knob));
         assert_eq!(failed.len(), 2, "{failed:?}");
+    }
+
+    /// A BENCH_ONLY typo is refused (exit 2) rather than read as a passing, empty run.
+    #[test]
+    fn bench_only_names_are_checked() {
+        for name in [
+            "fibonacci",
+            "memory-merkle",
+            "Memory-Merkle",
+            "zkop-mix",
+            "sha256-chain",
+        ] {
+            assert!(bench_only_is_known(name), "{name}");
+        }
+        for name in ["memroy-merkle", "warmup", "all"] {
+            assert!(!bench_only_is_known(name), "{name}");
+        }
     }
 }

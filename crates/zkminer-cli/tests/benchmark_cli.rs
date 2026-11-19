@@ -24,21 +24,31 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn mock_worker() -> PathBuf {
+/// The mock worker, or `None` (with a message) when it is not built: `cargo test -p zkminer-cli`
+/// does not build it (it is another package's binary, behind its `testing` feature), so a test that
+/// needs one skips rather than fails.
+fn mock_worker() -> Option<PathBuf> {
     let path = std::env::var("ZKMINER_TEST_MOCK_WORKER")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target/debug/mock-worker"));
-    assert!(
-        path.is_file(),
-        "no mock worker at {}: build it (cargo build -p zkminer-prover --features testing --bin \
-         mock-worker) or set ZKMINER_TEST_MOCK_WORKER",
+    if path.is_file() {
+        return Some(path);
+    }
+    eprintln!(
+        "SKIPPED: no mock worker at {}: build it (cargo build -p zkminer-prover --features testing \
+         --bin mock-worker) or set ZKMINER_TEST_MOCK_WORKER",
         path.display()
     );
-    path
+    None
 }
 
-/// A fresh `HOME` with `~/.zkminer/provers/<worker>` linked to the mock, or no worker at all.
-fn sandbox(tag: &str, worker: Option<&str>) -> PathBuf {
+/// A fresh `HOME` with `~/.zkminer/provers/<worker>` linked to the mock, or no worker at all. `None`
+/// when a worker is wanted and the mock is not built (the test is skipped).
+fn sandbox(tag: &str, worker: Option<&str>) -> Option<PathBuf> {
+    let mock = match worker {
+        Some(_) => Some(mock_worker()?),
+        None => None,
+    };
     let home = std::env::temp_dir().join(format!(
         "zkminer-bench-cli-{tag}-{}-{}",
         std::process::id(),
@@ -49,8 +59,8 @@ fn sandbox(tag: &str, worker: Option<&str>) -> PathBuf {
     ));
     let provers = home.join(".zkminer/provers");
     std::fs::create_dir_all(&provers).unwrap();
-    if let Some(name) = worker {
-        std::os::unix::fs::symlink(mock_worker(), provers.join(name)).unwrap();
+    if let (Some(name), Some(mock)) = (worker, mock) {
+        std::os::unix::fs::symlink(mock, provers.join(name)).unwrap();
     }
     let bin = home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -59,7 +69,7 @@ fn sandbox(tag: &str, worker: Option<&str>) -> PathBuf {
     if std::fs::hard_link(built, &cli).is_err() {
         std::fs::copy(built, &cli).unwrap();
     }
-    home
+    Some(home)
 }
 
 fn zkminer_benchmark(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -111,7 +121,9 @@ fn assert_failed_without_a_table(out: &Output, worker: &str, advice: &str) {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_metal_warm_up_failure_fails_the_benchmark() {
-    let home = sandbox("metal", Some("zkminer-prove-risc0-metal"));
+    let Some(home) = sandbox("metal", Some("zkminer-prove-risc0-metal")) else {
+        return;
+    };
     let env = [
         ("MOCK_FAIL_ON", "warmup"),
         ("MOCK_FAIL_MESSAGE", STEP_ACCUM),
@@ -136,7 +148,9 @@ fn a_metal_warm_up_failure_fails_the_benchmark() {
 /// The same with a CPU (generic) risc0 worker: a failure, with the generic advice.
 #[test]
 fn a_cpu_worker_failure_fails_the_benchmark() {
-    let home = sandbox("cpu", Some("zkminer-prove-risc0"));
+    let Some(home) = sandbox("cpu", Some("zkminer-prove-risc0")) else {
+        return;
+    };
     let env = [
         ("MOCK_FAIL_ON", "warmup"),
         ("MOCK_FAIL_MESSAGE", STEP_ACCUM),
@@ -151,7 +165,7 @@ fn a_cpu_worker_failure_fails_the_benchmark() {
 /// nothing is saved, even with --calibrate.
 #[test]
 fn with_no_worker_every_line_says_simulated() {
-    let home = sandbox("none", None);
+    let home = sandbox("none", None).expect("no worker needed");
     let out = zkminer_benchmark(&home, &["--calibrate"], &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -173,5 +187,63 @@ fn with_no_worker_every_line_says_simulated() {
         "a score from a simulated run:\n{stdout}"
     );
     assert!(!home.join(".zkminer/benchmarks.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// W10-BENCH round 1: a Metal worker whose suite comes back short (four programs and the zkOP/s score
+/// did not prove) fails the benchmark: the rows that proved are shown as incomplete, the exit is
+/// non-zero, and --calibrate saves nothing. Before round 1 this printed a normal table with exit 0
+/// and saved it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_short_metal_suite_fails_the_benchmark_and_saves_nothing() {
+    let Some(home) = sandbox("short", Some("zkminer-prove-risc0-metal")) else {
+        return;
+    };
+    let env = [
+        ("MOCK_BENCH_ROWS", "all"),
+        (
+            "MOCK_BENCH_DROP",
+            "sha256-chain,ecdsa-verify,bigint-mul,chacha-mix,zkop-mix",
+        ),
+    ];
+    let out = zkminer_benchmark(&home, &["--calibrate"], &env);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a short suite exited 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains("BENCHMARK FAILED"), "{stderr}");
+    assert!(stderr.contains("incomplete"), "{stderr}");
+    for program in ["sha256-chain", "chacha-mix", "zkop-mix"] {
+        assert!(stderr.contains(program), "{program} not named:\n{stderr}");
+    }
+    assert!(
+        stdout.contains("memory-merkle"),
+        "the proved row is not shown:\n{stdout}"
+    );
+    assert!(!home.join(".zkminer/benchmarks.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The control for the test above: the same mock with every program proved is a normal benchmark,
+/// exit 0, with a table and no failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_complete_metal_suite_is_a_normal_benchmark() {
+    let Some(home) = sandbox("complete", Some("zkminer-prove-risc0-metal")) else {
+        return;
+    };
+    let out = zkminer_benchmark(&home, &[], &[("MOCK_BENCH_ROWS", "all")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(!stderr.contains("BENCHMARK FAILED"), "{stderr}");
+    assert!(
+        stdout.contains("memory-merkle") && stdout.contains("MzkOP/s"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("SIMULATED"), "{stdout}");
     let _ = std::fs::remove_dir_all(&home);
 }

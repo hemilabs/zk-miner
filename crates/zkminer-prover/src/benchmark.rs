@@ -555,6 +555,11 @@ pub struct BenchmarkSuite {
     /// every caller must report it as a failure rather than show or price its rows.
     #[serde(skip)]
     pub failures: Vec<crate::dispatcher::SlotBenchmarkFailure>,
+    /// Slots that were down when this run started (declined at startup, or could not be started) in
+    /// a run where another slot measured: reported to the operator, but they do not fail the run
+    /// (`dispatcher::BenchmarkRun::not_benchmarked`). Never cached.
+    #[serde(skip)]
+    pub not_benchmarked: Vec<crate::dispatcher::SlotBenchmarkFailure>,
 }
 
 /// The three supported prover backends.
@@ -863,7 +868,8 @@ pub fn machine_zkops(devices: &[DeviceBenchmark]) -> f64 {
 
 /// A GPU's or machine's score for display, e.g. "13.83 MzkOP/s".
 pub fn format_mzkops(zkops: f64) -> String {
-    format!("{:.2} MzkOP/s", zkops / 1e6)
+    // `+ 0.0` turns a -0.0 (no score) into 0.00, not "-0.00".
+    format!("{:.2} MzkOP/s", zkops / 1e6 + 0.0)
 }
 
 /// Get CPU info string.
@@ -1580,6 +1586,7 @@ pub fn run_benchmark() -> BenchmarkSuite {
     let crate::dispatcher::BenchmarkRun {
         results: worker_device_results,
         mut failures,
+        not_benchmarked,
     } = if let Some(pool) = pool {
         let run = pool.benchmark_all_with_device_info();
         if !run.results.is_empty() {
@@ -1674,6 +1681,7 @@ pub fn run_benchmark() -> BenchmarkSuite {
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
         failures,
+        not_benchmarked,
     }
 }
 
@@ -1703,7 +1711,14 @@ fn note_unexplained_empty_run(failures: &mut Vec<crate::dispatcher::SlotBenchmar
         failures.push(crate::dispatcher::SlotBenchmarkFailure {
             slot_key: "workers".to_string(),
             gpu_name: None,
-            gpu_tag: "generic".to_string(),
+            // The advice follows the tag: on a Mac the prover is the Metal worker, whose advice is
+            // macos-smoke.sh and the kit README, not a generic `--benchmark` line.
+            gpu_tag: if cfg!(target_os = "macos") {
+                "metal"
+            } else {
+                "generic"
+            }
+            .to_string(),
             error: NO_PROVING_WORKER.to_string(),
         });
     }
@@ -1747,6 +1762,22 @@ pub fn describe_failures(failures: &[crate::dispatcher::SlotBenchmarkFailure]) -
     lines
 }
 
+/// The slots a successful run could not benchmark (they were down when it started), one line each,
+/// for the CLI and the TUI (W10-BENCH round 1).
+pub fn describe_not_benchmarked(slots: &[crate::dispatcher::SlotBenchmarkFailure]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|f| {
+            let on = f
+                .gpu_name
+                .as_deref()
+                .map(|g| format!(" ({g})"))
+                .unwrap_or_default();
+            format!("{}{on} was not benchmarked: {}", f.slot_key, f.error)
+        })
+        .collect()
+}
+
 /// Run only GPU worker benchmarks, skipping CPU proof programs.
 ///
 /// This is much faster than `run_benchmark()` and is used at startup to avoid
@@ -1779,6 +1810,7 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
     });
     let worker_device_results = run.results;
     let mut failures = run.failures;
+    let not_benchmarked = run.not_benchmarked;
     if worker_device_results.is_empty()
         && crate::engine::worker_pool().is_some_and(|p| p.has_any_worker())
     {
@@ -1808,6 +1840,7 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
         failures,
+        not_benchmarked,
     }
 }
 
@@ -1839,6 +1872,7 @@ pub fn run_benchmark_gpu_only_streaming(
     });
     let worker_device_results = run.results;
     let mut failures = run.failures;
+    let not_benchmarked = run.not_benchmarked;
     if worker_device_results.is_empty()
         && crate::engine::worker_pool().is_some_and(|p| p.has_any_worker())
     {
@@ -1866,6 +1900,7 @@ pub fn run_benchmark_gpu_only_streaming(
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
         failures,
+        not_benchmarked,
     }
 }
 
@@ -3401,6 +3436,11 @@ mod zkop_score_tests {
         // Shown per zkVM in its own cycles per second.
         assert_eq!(devices[0].scoring_cycles_per_sec(), Some(c / 5.0));
         assert_eq!(format_mzkops(13_830_000.0), "13.83 MzkOP/s");
+        assert_eq!(
+            format_mzkops(-0.0),
+            "0.00 MzkOP/s",
+            "no score is not \"-0.00\""
+        );
     }
 
     #[test]

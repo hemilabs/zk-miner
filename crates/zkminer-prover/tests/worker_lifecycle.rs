@@ -1336,3 +1336,185 @@ fn an_empty_pool_has_no_worker() {
     let run = pool.benchmark_all_with_device_info();
     assert!(run.results.is_empty() && run.failures.is_empty());
 }
+
+// ---- W10-BENCH round 1: declined siblings and short suites ----
+
+/// A Metal-tagged risc0 mock that answers every program with a row, except those in `drop`.
+fn measuring_metal_pool(drop: &str) -> WorkerPool {
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+    env.insert(
+        "MOCK_SDK_VERSION".to_string(),
+        format!(
+            "risc0-zkvm {}.0",
+            zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+        ),
+    );
+    env.insert("MOCK_BENCH_ROWS".to_string(), "all".to_string());
+    env.insert("MOCK_BENCH_DROP".to_string(), drop.to_string());
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(30)));
+    pool.insert_test_worker("risc0:metal:0", "risc0", mock_worker_path(), env)
+        .expect("mock risc0 worker");
+    pool.test_set_gpu_tag("risc0:metal:0", "metal");
+    pool
+}
+
+/// Both entry points, so each check covers `zkminer benchmark` and the TUI/miner's streaming path.
+fn both_runs(pool: &WorkerPool) -> Vec<(&'static str, zkminer_prover::dispatcher::BenchmarkRun)> {
+    vec![
+        ("with_device_info", pool.benchmark_all_with_device_info()),
+        ("streaming", pool.benchmark_all_streaming(&|_| {})),
+    ]
+}
+
+/// The control: a worker on which every program and the score proved gives a clean run.
+#[test]
+fn a_complete_suite_is_a_clean_run() {
+    let pool = measuring_metal_pool("");
+    for (name, run) in both_runs(&pool) {
+        assert!(run.failures.is_empty(), "{name}: {:?}", run.failures);
+        assert!(run.not_benchmarked.is_empty(), "{name}");
+        assert_eq!(run.results.len(), 1, "{name}");
+        assert!(
+            zkminer_prover::dispatcher::missing_benchmark_rows("risc0", &run.results[0].entries)
+                .is_empty(),
+            "{name}: {:?}",
+            run.results[0].entries
+        );
+    }
+    pool.close();
+}
+
+/// A worker leaves out a program that did not prove and verify, and the dispatcher leaves out a
+/// score that failed. Either makes the slot's benchmark a failure that names what is missing; the
+/// rows that did prove are kept, to be shown (reviewer's repro: only memory-merkle came back, and
+/// `zkminer benchmark` printed a normal table, exit 0, and saved it under --calibrate).
+#[test]
+fn a_short_suite_is_the_slots_failure() {
+    for (drop, named) in [
+        (
+            "sha256-chain,ecdsa-verify,bigint-mul,chacha-mix,zkop-mix",
+            vec![
+                "sha256-chain",
+                "ecdsa-verify",
+                "bigint-mul",
+                "chacha-mix",
+                "zkop-mix",
+            ],
+        ),
+        ("memory-merkle", vec!["memory-merkle"]),
+        ("zkop-mix", vec!["zkop-mix"]),
+    ] {
+        let pool = measuring_metal_pool(drop);
+        let finished = std::sync::Mutex::new(Vec::new());
+        let streamed = pool.benchmark_all_streaming(&|event| {
+            if let zkminer_prover::dispatcher::BenchmarkProgressKind::Finished { succeeded } =
+                event.kind
+            {
+                finished.lock().unwrap().push(succeeded);
+            }
+        });
+        assert_eq!(*finished.lock().unwrap(), vec![false], "{drop}");
+        for (name, run) in [
+            ("with_device_info", pool.benchmark_all_with_device_info()),
+            ("streaming", streamed),
+        ] {
+            assert_eq!(
+                run.results.len(),
+                1,
+                "{drop}/{name}: the proved rows are kept"
+            );
+            assert_eq!(run.failures.len(), 1, "{drop}/{name}: {:?}", run.failures);
+            let error = &run.failures[0].error;
+            assert!(
+                error.contains(zkminer_prover::dispatcher::INCOMPLETE_BENCHMARK),
+                "{drop}/{name}: {error}"
+            );
+            for program in &named {
+                assert!(
+                    error.contains(program),
+                    "{drop}/{name}: {program} not named: {error}"
+                );
+            }
+        }
+        pool.close();
+    }
+}
+
+/// A worker that DECLINED at startup (`sp1 unavailable: libcudart.so.12 not found`), and one that
+/// could not be started, beside a working card: the working card's benchmark is a clean run, and the
+/// two are reported as not benchmarked. Before round 1 they failed the whole run, so `zkminer
+/// benchmark --calibrate` exited 1 and the TUI never saved the working card's rows.
+#[test]
+fn a_declined_or_unstartable_sibling_does_not_fail_a_working_card() {
+    let mut pool = measuring_metal_pool("");
+    pool.insert_test_down_worker(
+        "sp1:cuda:0",
+        "sp1",
+        "cuda",
+        mock_worker_path(),
+        Some("sp1 unavailable: libcudart.so.12 not found"),
+    );
+    pool.insert_test_down_worker(
+        "openvm:cuda:1",
+        "openvm",
+        "cuda",
+        PathBuf::from("/nonexistent/zkminer-prove-openvm"),
+        None,
+    );
+    for (name, run) in both_runs(&pool) {
+        assert!(run.failures.is_empty(), "{name}: {:?}", run.failures);
+        assert_eq!(run.results.len(), 1, "{name}");
+        assert_eq!(run.results[0].slot_key, "risc0:metal:0");
+        let mut down: Vec<&str> = run
+            .not_benchmarked
+            .iter()
+            .map(|f| f.slot_key.as_str())
+            .collect();
+        down.sort();
+        assert_eq!(down, ["openvm:cuda:1", "sp1:cuda:0"], "{name}");
+        let declined = run
+            .not_benchmarked
+            .iter()
+            .find(|f| f.slot_key == "sp1:cuda:0")
+            .unwrap();
+        assert!(declined.error.contains("libcudart"), "{}", declined.error);
+    }
+    // A declined slot is not a benchmark target either, so a start with saved results for every
+    // other card does not re-run the benchmark for a row that cannot come.
+    let targets: Vec<String> = pool
+        .benchmark_targets()
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    assert!(
+        pool.benchmark_targets().iter().all(|(_, b)| b != "sp1"),
+        "{targets:?}"
+    );
+    assert!(
+        pool.benchmark_targets().iter().any(|(_, b)| b == "openvm"),
+        "a slot that may still start stays a target: {targets:?}"
+    );
+    pool.close();
+}
+
+/// With nothing measured, the slots that could not be benchmarked are the run's failures, with their
+/// reasons: a lone worker that declined or never started fails the benchmark.
+#[test]
+fn only_down_slots_fail_the_run() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(5)));
+    pool.insert_test_down_worker(
+        "risc0:metal:0",
+        "risc0",
+        "metal",
+        mock_worker_path(),
+        Some("risc0 unavailable: no Metal device"),
+    );
+    for (name, run) in both_runs(&pool) {
+        assert!(run.results.is_empty(), "{name}");
+        assert!(run.not_benchmarked.is_empty(), "{name}");
+        assert_eq!(run.failures.len(), 1, "{name}: {:?}", run.failures);
+        assert!(run.failures[0].error.contains("no Metal device"), "{name}");
+    }
+    pool.close();
+}

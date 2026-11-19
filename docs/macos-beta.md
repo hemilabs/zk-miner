@@ -280,6 +280,12 @@ own data or local checks only.
 - `RISC0_METAL_REC_SEAL_CHECK=1` re-proves every recursion proof on the CPU with the same noise and
   requires identical seals (a validation aid, slow). The noise is keyed from a 256-bit OS seed
   (B9-SEC), so ZK holds.
+- `ZKMINER_TEST_FORCE_FAIL=<step>[,<step>...]` (W10-BENCH test aid) makes the named benchmark steps
+  fail on purpose without touching the GPU: `warmup` (the IPC warm-up and the `--benchmark` warm-up
+  proof) or a program name (`memory-merkle`, `zkop-mix`, ...). It is read only on the warm-up and
+  benchmark paths, never on a job's proof. A leftover value shows as "forced failure
+  (ZKMINER_TEST_FORCE_FAIL=...)" in the failure `zkminer benchmark` reports, and `--benchmark` warns
+  at start; unset it.
 - `RISC0_METAL=0`, `RISC0_METAL_SKIP=groth16` and `RISC0_GROTH16_METAL_PROVER=docker` fall back to the
   stock CPU or Docker paths (slow; Docker is not part of the beta).
 

@@ -175,6 +175,11 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         anyhow::bail!("the benchmark failed on {}", slots.join(", "));
     }
     let simulated = results.is_simulated();
+    // Slots that were down from the start (a declined SP1 beside a working card) do not fail a run in
+    // which another slot measured, but the operator is told (W10-BENCH round 1).
+    for line in benchmark::describe_not_benchmarked(&results.not_benchmarked) {
+        eprintln!("WARNING: {line}");
+    }
 
     // Persist only when calibration was requested. A calibration sweep is expensive
     // and useless unless the miner can load it (`load_cached_benchmark`), whereas a

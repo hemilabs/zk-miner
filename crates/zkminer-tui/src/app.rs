@@ -452,6 +452,13 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
         return;
     }
 
+    // W10-BENCH round 1: slots that were down from the start (declined, or never started) do not
+    // fail a run in which another card measured; say which.
+    for line in benchmark::describe_not_benchmarked(&suite.not_benchmarked) {
+        tracing::warn!("{line}");
+        s.add_log(LogLevel::Warn, line);
+    }
+
     // A run that produced no GPU rows must not overwrite ones that had them, and must never be
     // saved. The suite arrives from `spawn_blocking(..).await.unwrap_or_default()`, so a panicked
     // task yields `BenchmarkSuite::default()` — and a wedged driver or VRAM starvation yields a
@@ -627,6 +634,10 @@ async fn run_full_benchmark(state: SharedState) {
             s.benchmark_tracker = None;
             s.benchmark_device_in_progress = None;
             return;
+        }
+        for line in benchmark::describe_not_benchmarked(&suite.not_benchmarked) {
+            tracing::warn!("{line}");
+            s.add_log(LogLevel::Warn, line);
         }
         benchmark::save_benchmark(&suite);
         s.add_log(

@@ -105,18 +105,123 @@ from the sandbox.
 The proving path did not change, and peak memory is unchanged at the default, 8 GiB and 4 GiB budgets (table above).
 The CLI's failure path allocates nothing.
 
+## Fix round 1 (review findings)
+
+Logs: `/Users/user/zkminer/scratch/w10/W10-BENCH/r1-*`.
+
+### Finding A: a declined or unstartable sibling failed every benchmark
+
+`discover_and_spawn` keeps a slot whose worker DECLINED (`sp1 unavailable: libcudart.so.12 not found`) or could not
+start, with no handle. Neither benchmark loop skipped it. Its `benchmark_slot` re-declined or hit the respawn backoff,
+and since the first round that error was a `SlotBenchmarkFailure`. So on a multi-backend rig `zkminer benchmark
+--calibrate` exited 1, the TUI's streaming benchmark never saved the working card's rows, and `benchmark_targets` kept
+listing the declined slot, which re-ran the startup benchmark on every start.
+
+Fix (`dispatcher.rs`):
+- `BenchmarkRun.not_benchmarked`: slots that were down when the run started and stayed down. A declined slot is not
+  tried at all (it is never respawned, so trying only re-declines) and is recorded with its decline reason. A slot
+  with no worker is still tried, because a respawn may bring it up. If it is still down afterwards, its error goes
+  here rather than into `failures`.
+- `BenchmarkRun::finish`: when no slot measured, these become the run's failures with their own reasons, so a lone
+  Metal worker that never started still fails the benchmark.
+- `benchmark_targets` leaves out declined slots (`try_lock`, so it never waits on a proof).
+- The streaming queue does not announce declined slots.
+- `BenchmarkSuite.not_benchmarked` (`serde(skip)`): the CLI prints `WARNING: <slot> was not benchmarked: <reason>`,
+  and the TUI logs it at Warn. The run is saved as usual.
+
+### Findings B and C: a short suite was a successful, cached benchmark
+
+`run_benchmark_requests` returned whatever rows came back. A worker leaves out a program that fails to prove and
+verify, and a failed zkop-mix score was only logged. So the reviewer's repro on the real worker,
+`ZKMINER_TEST_FORCE_FAIL=sha256-chain,ecdsa-verify,bigint-mul,chacha-mix,zkop-mix zkminer benchmark`, printed a
+normal table and exited 0, and `--calibrate` or the TUI would have saved it. I checked this before the fix: mutation
+runs with the round-1 logic disabled fail all 5 new tests (`mutation.log` in the log directory).
+
+Fix: `missing_benchmark_rows(backend, entries)` lists every program of `benchmark_suite(backend)` that has no row,
+plus `zkop-mix` on risc0 and SP1 (the zkVMs a score is defined for; OpenVM's stub worker never returns one). The SP1
+cycle-mismatch case drops the score row, so it is covered too. When anything is missing, `BenchmarkRun::record`
+keeps the rows in `results` (so the CLI can show them) and adds a failure:
+`the benchmark is incomplete: no result for programs: ... (the worker's own log lines above say why)`. The suite is
+then `failed()`. The CLI shows the rows under `BENCHMARK FAILED: the results above are incomplete; nothing was saved
+or used for pricing.` and exits 1. `save_benchmark_to` refuses the suite, and the streaming `Finished` event reports
+`succeeded: false`. `zkminer benchmark` and the worker's own `--benchmark` now agree: both exit 1 when any program or
+the score fails. This closes the first round's open issue 1.
+
+Both loops now share `BenchmarkRun::record`, which replaced the two copies of the outcome match.
+
+### Non-blocking items also done
+
+- `benchmark_cli.rs` skips with `SKIPPED: no mock worker at ...` when the mock is not built, rather than failing.
+- Worker `--benchmark` with a `BENCH_ONLY` that names nothing (`memroy-merkle`) exits **2** before any GPU work, and
+  lists the valid names. Before, it ran the warm-up, printed an empty table and exited 0.
+- When `ZKMINER_TEST_FORCE_FAIL` is set, `--benchmark` warns at start. The knob is documented in
+  `docs/macos-beta.md` (debug-only environment variables). In IPC mode the failure text names it.
+- The synthetic `workers` failure (only measure workers came up) carries the `metal` tag on macOS, so it gives the
+  macos-smoke.sh advice.
+- `format_mzkops(-0.0)` prints `0.00`, not `-0.00`.
+
+New test aids: in the mock worker, `MOCK_BENCH_ROWS=all` returns one row per requested program and
+`MOCK_BENCH_DROP=<names>` leaves some out. `WorkerPool::insert_test_down_worker` registers a declined or unstartable
+slot (`testing` feature only).
+
+### Round-1 tests
+
+| test | checks |
+|---|---|
+| `worker_lifecycle::a_complete_suite_is_a_clean_run` | control: every program + score, both entry points, no failure |
+| `worker_lifecycle::a_short_suite_is_the_slots_failure` | 4 programs + score dropped / only memory-merkle dropped / only zkop-mix dropped: rows kept, one failure naming each missing name, streaming `Finished{succeeded:false}` |
+| `worker_lifecycle::a_declined_or_unstartable_sibling_does_not_fail_a_working_card` | a working metal mock + declined `sp1:cuda:0` + unstartable `openvm:cuda:1`: no failure, both in `not_benchmarked` (decline reason kept), `benchmark_targets` drops the sp1 slot and keeps the openvm one |
+| `worker_lifecycle::only_down_slots_fail_the_run` | a lone declined slot is the run's failure, with its reason |
+| new `benchmark_partial` (own binary: global pool) | `run_benchmark`, `run_benchmark_gpu_only`, `run_benchmark_gpu_only_streaming` with a short suite + declined sibling: failed, memory-merkle row kept, zkop-mix named, sibling only in `not_benchmarked`, cache refuses it |
+| new `benchmark_declined_sibling` (own binary) | a working card beside a declined one: not failed, device rows present, `not_cacheable() == None`, saved |
+| CLI `a_short_metal_suite_fails_the_benchmark_and_saves_nothing` | the real CLI binary with a short mock suite under `--calibrate`: rc ≠ 0, BENCHMARK FAILED / incomplete, missing names, memory-merkle row shown, no `benchmarks.json` |
+| CLI `a_complete_metal_suite_is_a_normal_benchmark` | control: rc 0, table with MzkOP/s, no SIMULATED, no failure |
+| worker `bench_exit_tests::bench_only_names_are_checked` | valid names accepted (case-insensitive), typos refused |
+
+### Round-1 gates
+
+| gate | result |
+|---|---|
+| `ZKVM_ALLOW_SKIP=1 gpu-run -- cargo test --locked -p zkminer-prover --features testing --tests`, ×2 | **398 passed / 0 failed / 21 ignored**, both runs. Lib 296; `worker_lifecycle` 34 passed / 3 ignored (+4); `benchmark_failure`, `benchmark_partial` and `benchmark_declined_sibling` 1/1 each |
+| `gpu-run -- cargo test --locked --workspace --exclude zkminer-prove-sp1 --exclude zkminer-prover`, ×2 | **504 passed / 18 ignored**, both runs (+2 CLI tests) |
+| `gpu-run -- cargo test --locked -p zkminer-prove-risc0 --features metal`, ×2 | **69 passed**, 4 ignored, both runs (+1) |
+| release build (`make -f Makefile.mac RISC0_SRC=git JOBS=6 mac-build-worker`) | rc 0, worker 184,537,568 B, CLI 16,005,168 B |
+| **real `zkminer benchmark`** (release CLI + worker, sandbox `HOME` `rhome`, gpu-run on the real `HOME`) | **rc 0**, 2.67 MzkOP/s (risc0 0.89M c/s), STARK 52.18 / 72.65 / 31.13 / 8.52 / 10.04 s (sum 174.52 s), zkop-mix 69.60 s, Groth16 1.77-1.81 s. Load average 14.5 at the start and 3.2 at the end, from other sessions' work. This is a functional gate, not a speed claim. This round changed no proving code: dispatcher bookkeeping after the rows arrive, and an argument check in the worker before any GPU work. The first round's interleaved A/B covers the worker binary. (`r1-real.out`) |
+| **real worker, reviewer's partial repro**, `ZKMINER_TEST_FORCE_FAIL=sha256-chain,ecdsa-verify,bigint-mul,chacha-mix,zkop-mix zkminer benchmark --calibrate` | **rc 1**. The memory-merkle row (8.53 s) is shown under `BENCHMARK FAILED: the results above are incomplete; nothing was saved or used for pricing.`, then `risc0:metal:0 (Apple M5 Max): the benchmark is incomplete: no result for programs: sha256-chain, ecdsa-verify, bigint-mul, chacha-mix, zkop-mix ...` and the macos-smoke.sh advice. No `benchmarks.json`. `0.00 MzkOP/s` (was `-0.00`). (`r1-partial.*`; before the fix this gave rc 0 and a normal table, per the reviewer's `scratch/w10/W10-BENCH-rev1/partial.log`) |
+| real worker, `ZKMINER_TEST_FORCE_FAIL=warmup zkminer benchmark` | **rc 1**, no table, BENCHMARK FAILED with the worker, its error and the advice (`r1-warm.*`) |
+| worker `BENCH_ONLY=memroy-merkle --benchmark` | **rc 2**, `BENCH_ONLY=memroy-merkle names no benchmark program; use one of: fibonacci, sha256-chain, ...` |
+| worker `BENCH_ONLY=fibonacci --benchmark` | rc 0, `fibonacci: 32768 cycles — ... verified` |
+| `scripts/ci/test-assemble-macos.sh <release worker> <release CLI>` | 17/17 (sdk mode) |
+| clippy / rustfmt | nothing new on the changed lines. A `cargo fmt` run touched unrelated files; those changes were reverted and only this item's hunks were kept |
+
+Lock hygiene: the first round's sandbox `rhome` contained `zkminer/.gpulock`, which means at least one first-round
+gpu-run was started with `HOME` set to the sandbox and so took a private lock. I removed that directory. Every
+round-1 command ran gpu-run with the real `HOME`, and set the sandbox `HOME` only for the child (`env HOME=...`).
+
 ## Open issues
 
-1. **A slot whose zkOP/s scoring proof fails is not a failure in the CLI.** Its program rows are real, so it is
-   reported as a successful run with `0.00 MzkOP/s` for that GPU ("no zkOP/s score" is logged). The worker's own
-   `--benchmark` counts it as a failure (exit 1). If the score must always exist, `run_benchmark_requests` could
-   return an error for it. I left this out of scope: the dispatcher's behaviour here is main's.
-2. **A partial run in the TUI is now dropped whole** (one card failed, another measured): nothing is merged or saved,
-   and the previous results stay, so a fixed card needs a new full run. Before this change, the measured card's rows
-   replaced every GPU row and the failed card lost its saved row.
-3. `docs/release/BETA_RC.md` still lists these as open findings (section 2 item 5, lines 118-122 and 295-296). The RC
-   round of this wave should record them as fixed by this item.
+1. ~~A slot whose zkOP/s scoring proof fails is not a failure in the CLI.~~ Fixed in round 1: a missing score (or any
+   missing suite program) fails the run, and nothing is cached.
+2. **A run where one card fails and another measures is dropped whole in the TUI**: nothing is merged or saved, and
+   the previous results stay, so a fixed card needs a new full run. A card that was down from the start (declined,
+   or never started) no longer counts as failed (round 1): only a card whose worker ran and failed drops the run.
+3. `docs/release/BETA_RC.md` still lists these as open findings (section 2 item 5, lines 118-122 and 295-296). This
+   wave's RC round should record them as fixed by this item.
 4. `cfg(target_os = "linux")` / Windows branches (the RAPL line) compile only for macOS here, as in W10-INT open
    issue 2. A Linux and Windows CI build is still needed.
-5. Simulated mode still exits 0: there is no worker to blame. Every line says SIMULATED. Change it if the release
-   wants `zkminer benchmark` to fail on a machine with no prover at all.
+5. Simulated mode still exits 0: there is no worker to blame. Every line says SIMULATED. Its `--json` output marks it
+   only with `prover_backend: "simulated"` and `zkops: 0`, and `failures` is not serialized: a `--json` consumer of a
+   failed partial run sees the rows, and only the exit code says it failed.
+6. A slot that was down at the start and then came up and failed (for example a respawned worker whose warm-up
+   fails and which is retired again) counts as "not benchmarked", not as failed, when another slot measured. With a
+   single worker (every Mac) it is still the run's failure.
+7. `ZKMINER_TEST_FORCE_FAIL` is still read by the release worker, on the warm-up and benchmark paths only. It is
+   documented, and `--benchmark` warns when it is set. It is not behind a cfg: the real forced-failure gate needs it in
+   the release build.
+8. `crates/zkminer-cli/tests/benchmark_cli.rs` needs `target/debug/mock-worker`, which
+   `cargo build -p zkminer-prover --features testing --bin mock-worker` builds (it now skips with a message when the
+   mock is missing). CI should build the mock explicitly if it runs these tests. The workflows run `--lib --bins`
+   today.
+9. Not this item: `zkminer-prover-protocol proc::tests::a_healthy_child_is_fast_and_successful` has a 150 ms bound
+   that fails under load, and its panic poisons the test lock for 7 sibling tests (reviewer's observation). It did
+   not recur in this round's runs. It is a W10-INT follow-up (PLAN 8.7).

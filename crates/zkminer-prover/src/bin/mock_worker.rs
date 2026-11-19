@@ -12,6 +12,10 @@
 //! - `MOCK_FAIL_ON`: `"warmup"` or `"benchmark"` — answers that command with an `Error` (the worker
 //!   stays up), as a real worker does when its GPU pipelines fail to build (W10-BENCH). The message is
 //!   `MOCK_FAIL_MESSAGE` (default "mock: forced failure").
+//! - `MOCK_BENCH_ROWS`: `"all"` answers each `Benchmark` request with one made-up row per requested
+//!   program (1M cycles in 1 s), as a worker on which everything proved; unset = no rows (W10-BENCH).
+//!   `MOCK_BENCH_DROP`: comma-separated program names left out of those rows, as a real worker leaves
+//!   out a program that failed to prove and verify (`zkop-mix` drops the score).
 //! - `MOCK_CRASH_CODE`: the exit code for `MOCK_CRASH_ON` on `"prove"` and `"benchmark"`. Default: 1.
 //! - `MOCK_SERVER_OOM`: set to anything to have a child, standing in for a prover's server, allocate
 //!   until the kernel kills it, before `MOCK_CRASH_ON` applies on `"prove"`: a host OOM killing a
@@ -119,7 +123,7 @@ fn main() {
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            WorkerCommand::Benchmark { .. } => {
+            WorkerCommand::Benchmark { programs } => {
                 if crash_on == "benchmark" || crash_on == "both" {
                     std::process::exit(crash_code);
                 }
@@ -136,7 +140,9 @@ fn main() {
                         message: fail_message.clone(),
                     }
                 } else {
-                    WorkerResponse::BenchmarkResult { results: vec![] }
+                    WorkerResponse::BenchmarkResult {
+                        results: mock_benchmark_rows(&backend, &programs),
+                    }
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
@@ -364,6 +370,33 @@ fn hex_env(name: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&v[i..i + 2], 16).unwrap_or_else(|_| panic!("{name} is not hex"))
+        })
+        .collect()
+}
+
+/// The rows `MOCK_BENCH_ROWS` / `MOCK_BENCH_DROP` ask for (see the module docs).
+fn mock_benchmark_rows(
+    backend: &str,
+    programs: &[zkminer_prover_protocol::BenchmarkProgramSpec],
+) -> Vec<zkminer_prover_protocol::BenchmarkEntry> {
+    if std::env::var("MOCK_BENCH_ROWS").as_deref() != Ok("all") {
+        return Vec::new();
+    }
+    let drop = std::env::var("MOCK_BENCH_DROP").unwrap_or_default();
+    let dropped: Vec<&str> = drop.split(',').map(str::trim).collect();
+    programs
+        .iter()
+        .filter(|p| !dropped.contains(&p.name.as_str()))
+        .map(|p| zkminer_prover_protocol::BenchmarkEntry {
+            program_name: p.name.clone(),
+            prover_backend: backend.to_string(),
+            cycles: 1_000_000,
+            duration_secs: 1.0,
+            throughput: 1_000_000.0,
+            weight: p.weight,
+            precompile: p.precompile,
+            wrap_secs: p.measure_wrap.then_some(0.5),
+            power_state: None,
         })
         .collect()
 }
