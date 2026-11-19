@@ -9,8 +9,7 @@ use zkminer_chain::auction::{self, CurveType};
 use zkminer_chain::jobs::JobInfo;
 use zkminer_chain::staking::{ProverStatistics, StakeInfo};
 use zkminer_prover::benchmark::{
-    load_cached_benchmark, run_benchmark_gpu_only_streaming, save_benchmark, BenchmarkSuite,
-    DeviceBenchmark, PROVER_BACKENDS,
+    load_cached_benchmark, BenchmarkSuite, DeviceBenchmark, PROVER_BACKENDS,
 };
 use zkminer_strategy::cost_model::CostParams;
 use zkminer_strategy::evaluator::{self, JobParams, Recommendation};
@@ -899,89 +898,4 @@ fn estimate_job_cycles(job: &TrackedJob) -> u64 {
     let hash_factor = (h[0] as u64 + h[1] as u64 * 256) % 200 + 50; // 50–249
 
     (base_cycles * hash_factor / 100).clamp(500_000, 50_000_000)
-}
-
-async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
-    use zkminer_tui::state::{BenchmarkTracker, LogLevel};
-
-    {
-        let mut s = state.write().await;
-        s.benchmark_running = true;
-        s.benchmark_tracker = Some(BenchmarkTracker {
-            devices: Vec::new(),
-            all_complete: false,
-            started_at: Some(std::time::Instant::now()),
-            active_device_index: 0,
-        });
-        s.add_log(LogLevel::Info, "Starting GPU benchmarks...");
-    }
-
-    let state_for_progress = state.clone();
-    let suite = tokio::task::spawn_blocking(move || {
-        let (sync_tx, sync_rx) =
-            std::sync::mpsc::channel::<zkminer_prover::dispatcher::BenchmarkProgressEvent>();
-
-        // Bridge thread: forwards benchmark progress events to TUI state.
-        // Uses a tokio mpsc channel to avoid block_on deadlocks with limited
-        // worker threads (block_on inside std::thread from spawn_blocking can
-        // deadlock when all tokio workers are busy).
-        let (bridge_tx, mut bridge_rx) =
-            tokio::sync::mpsc::channel::<zkminer_prover::dispatcher::BenchmarkProgressEvent>(32);
-        let bridge_state = state_for_progress.clone();
-
-        // Async task to receive events and update state
-        tokio::spawn(async move {
-            while let Some(event) = bridge_rx.recv().await {
-                let mut s = bridge_state.write().await;
-                if let Some(tracker) = s.benchmark_tracker.as_mut() {
-                    tracker.apply(&event);
-                }
-                if let zkminer_prover::dispatcher::BenchmarkProgressKind::ProgramDone {
-                    entry,
-                    ..
-                } = &event.kind
-                {
-                    s.add_log(
-                        LogLevel::Info,
-                        format!(
-                            "{}: {} done ({:.1}M c/s)",
-                            event.slot_key,
-                            entry.program_name,
-                            entry.throughput / 1_000_000.0
-                        ),
-                    );
-                }
-            }
-        });
-
-        // Sync-side bridge: forward from std::sync::mpsc to tokio::sync::mpsc
-        let bridge = std::thread::spawn(move || {
-            while let Ok(event) = sync_rx.recv() {
-                if bridge_tx.blocking_send(event).is_err() {
-                    break; // receiver dropped
-                }
-            }
-        });
-
-        let on_progress = move |event: zkminer_prover::dispatcher::BenchmarkProgressEvent| {
-            let _ = sync_tx.send(event);
-        };
-        let suite = run_benchmark_gpu_only_streaming(&on_progress);
-        drop(on_progress);
-        let _ = bridge.join();
-        suite
-    })
-    .await
-    .unwrap_or_default();
-
-    let mut s = state.write().await;
-    save_benchmark(&suite);
-    let gpu_count = suite.device_benchmarks.len();
-    s.benchmark_results = Some(suite);
-    s.benchmark_running = false;
-    s.benchmark_tracker = None;
-    s.add_log(
-        LogLevel::Success,
-        format!("GPU benchmarks complete ({gpu_count} device entries)"),
-    );
 }

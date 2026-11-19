@@ -42,6 +42,32 @@ pub struct SlotBenchmarkResult {
     pub host_peak_bytes: Option<u64>,
 }
 
+/// The failure of a slot that answered its benchmark but proved none of the programs.
+pub const NO_BENCHMARK_ROWS: &str =
+    "the worker proved none of the benchmark programs (its own log lines above say why)";
+
+/// A worker slot whose benchmark produced no result, and why (W10-BENCH).
+///
+/// Reported, not only logged: a caller that sees no rows must be able to tell "this slot failed"
+/// from "there was nothing to benchmark", or it shows made-up numbers as a benchmark (the simulated
+/// table `zkminer benchmark` printed, with exit 0, after a Metal warm-up failed).
+#[derive(Debug, Clone)]
+pub struct SlotBenchmarkFailure {
+    pub slot_key: String,
+    pub gpu_name: Option<String>,
+    /// "cuda", "rocm", "intel", "metal" or "generic".
+    pub gpu_tag: String,
+    /// The error, with its causes (`{:#}`).
+    pub error: String,
+}
+
+/// What a benchmark of every slot produced: the slots that measured, and the slots that failed.
+#[derive(Debug, Clone, Default)]
+pub struct BenchmarkRun {
+    pub results: Vec<SlotBenchmarkResult>,
+    pub failures: Vec<SlotBenchmarkFailure>,
+}
+
 /// A streaming benchmark progress update from a specific worker slot.
 #[derive(Debug, Clone)]
 pub struct BenchmarkProgressEvent {
@@ -3572,6 +3598,13 @@ impl WorkerPool {
         connected
     }
 
+    /// Whether any worker was started at all: a proving slot or a measure worker (W10-BENCH). When
+    /// one was, a benchmark that produced nothing FAILED; only a pool with none may fall back to the
+    /// simulated suite.
+    pub fn has_any_worker(&self) -> bool {
+        !self.workers.is_empty() || self.measure_workers.values().any(|pool| !pool.is_empty())
+    }
+
     /// Get all compound keys that have registered worker slots.
     pub fn registered_backends(&self) -> Vec<String> {
         self.workers.keys().cloned().collect()
@@ -4597,8 +4630,9 @@ impl WorkerPool {
 
     /// Run benchmarks on all connected workers, returning device metadata alongside results.
     /// This allows callers to build per-device benchmark records with real GPU identification.
-    pub fn benchmark_all_with_device_info(&self) -> Vec<SlotBenchmarkResult> {
+    pub fn benchmark_all_with_device_info(&self) -> BenchmarkRun {
         let mut results = Vec::new();
+        let mut failures = Vec::new();
         let mut keys: Vec<String> = self.registered_backends();
 
         // Sort keys so GPU workers (cuda/rocm) run first. This ensures the GPU
@@ -4693,9 +4727,24 @@ impl WorkerPool {
                         host_peak_bytes: self.host_peak_for_slot(&key),
                     });
                 }
-                Ok(_) => {} // empty results, skip
+                Ok(_) => {
+                    let error = NO_BENCHMARK_ROWS.to_string();
+                    tracing::error!("Benchmark failed for {key}: {error}");
+                    failures.push(SlotBenchmarkFailure {
+                        slot_key: key.clone(),
+                        gpu_name: gpu_name.clone(),
+                        gpu_tag: gpu_tag.clone(),
+                        error,
+                    });
+                }
                 Err(e) => {
                     tracing::error!("Benchmark failed for {key}: {e:#}");
+                    failures.push(SlotBenchmarkFailure {
+                        slot_key: key.clone(),
+                        gpu_name: gpu_name.clone(),
+                        gpu_tag: gpu_tag.clone(),
+                        error: format!("{e:#}"),
+                    });
                 }
             }
 
@@ -4823,7 +4872,7 @@ impl WorkerPool {
             }
         }
 
-        results
+        BenchmarkRun { results, failures }
     }
 
     /// Run benchmarks on a specific worker slot with per-program progress streaming.
@@ -5035,8 +5084,9 @@ impl WorkerPool {
     pub fn benchmark_all_streaming(
         &self,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
-    ) -> Vec<SlotBenchmarkResult> {
+    ) -> BenchmarkRun {
         let mut results = Vec::new();
+        let mut failures = Vec::new();
         let mut keys: Vec<String> = self.registered_backends();
 
         keys.sort_by(|a, b| {
@@ -5139,9 +5189,24 @@ impl WorkerPool {
                         host_peak_bytes: self.host_peak_for_slot(&key),
                     });
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    let error = NO_BENCHMARK_ROWS.to_string();
+                    tracing::error!("Benchmark failed for {key}: {error}");
+                    failures.push(SlotBenchmarkFailure {
+                        slot_key: key.clone(),
+                        gpu_name: gpu_name.clone(),
+                        gpu_tag: gpu_tag.clone(),
+                        error,
+                    });
+                }
                 Err(e) => {
                     tracing::error!("Benchmark failed for {key}: {e:#}");
+                    failures.push(SlotBenchmarkFailure {
+                        slot_key: key.clone(),
+                        gpu_name: gpu_name.clone(),
+                        gpu_tag: gpu_tag.clone(),
+                        error: format!("{e:#}"),
+                    });
                 }
             }
 
@@ -5260,7 +5325,7 @@ impl WorkerPool {
             }
         }
 
-        results
+        BenchmarkRun { results, failures }
     }
 
     /// Submit a proof to a backend worker.

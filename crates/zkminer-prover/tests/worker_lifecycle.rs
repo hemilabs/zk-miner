@@ -1245,3 +1245,94 @@ fn m10_recycled_first_prove() {
     pool.close();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- W10-BENCH: a failed benchmark is reported, never silently dropped ----
+
+/// A Metal-tagged risc0 worker whose warm-up answers with an error, as a Mac whose GPU pipelines do
+/// not build does (the macOS 26 VM: "compute pipeline for stepAccumA: Compilation failed").
+fn failing_metal_pool(fail_on: &str) -> WorkerPool {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(30)));
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+    env.insert(
+        "MOCK_SDK_VERSION".to_string(),
+        format!(
+            "risc0-zkvm {}.0",
+            zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+        ),
+    );
+    env.insert("MOCK_FAIL_ON".to_string(), fail_on.to_string());
+    env.insert(
+        "MOCK_FAIL_MESSAGE".to_string(),
+        "warm-up failed: compute pipeline for stepAccumA: Compilation failed".to_string(),
+    );
+    pool.insert_test_worker("risc0:metal:0", "risc0", mock_worker_path(), env)
+        .expect("mock risc0 worker");
+    pool.test_set_gpu_tag("risc0:metal:0", "metal");
+    pool
+}
+
+#[test]
+fn a_failed_warm_up_is_reported_as_the_slots_failure() {
+    let pool = failing_metal_pool("warmup");
+    assert!(pool.has_any_worker());
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty(), "{:?}", run.results);
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    let f = &run.failures[0];
+    assert_eq!(f.slot_key, "risc0:metal:0");
+    assert_eq!(f.gpu_tag, "metal");
+    assert!(
+        f.error.contains("warm-up of risc0:metal:0 failed") && f.error.contains("stepAccumA"),
+        "{}",
+        f.error
+    );
+
+    // The streaming path (the TUI's and the miner's) reports it the same way, and its progress events
+    // mark the slot finished without success.
+    let finished = std::sync::Mutex::new(Vec::new());
+    let run = pool.benchmark_all_streaming(&|event| {
+        if let zkminer_prover::dispatcher::BenchmarkProgressKind::Finished { succeeded } =
+            event.kind
+        {
+            finished.lock().unwrap().push(succeeded);
+        }
+    });
+    assert!(run.results.is_empty());
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert!(run.failures[0].error.contains("stepAccumA"));
+    assert_eq!(*finished.lock().unwrap(), vec![false]);
+}
+
+/// A worker that answers its benchmark with an error, and one that answers with no rows (it proved
+/// none of the programs), are failures too.
+#[test]
+fn a_benchmark_error_or_an_empty_answer_is_the_slots_failure() {
+    let pool = failing_metal_pool("benchmark");
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty());
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert!(
+        run.failures[0].error.contains("stepAccumA"),
+        "{}",
+        run.failures[0].error
+    );
+
+    // The plain mock answers every Benchmark with zero rows.
+    let pool = failing_metal_pool("");
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty());
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert_eq!(
+        run.failures[0].error,
+        zkminer_prover::dispatcher::NO_BENCHMARK_ROWS
+    );
+}
+
+#[test]
+fn an_empty_pool_has_no_worker() {
+    let pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(5)));
+    assert!(!pool.has_any_worker());
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty() && run.failures.is_empty());
+}

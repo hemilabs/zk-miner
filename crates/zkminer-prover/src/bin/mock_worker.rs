@@ -9,6 +9,9 @@
 //!   empty = respond normally. `"execute"` holds a measurement in flight until it is SIGKILLed.
 //! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
 //!   immediately with code 1 on the specified command type, simulating a worker crash.
+//! - `MOCK_FAIL_ON`: `"warmup"` or `"benchmark"` — answers that command with an `Error` (the worker
+//!   stays up), as a real worker does when its GPU pipelines fail to build (W10-BENCH). The message is
+//!   `MOCK_FAIL_MESSAGE` (default "mock: forced failure").
 //! - `MOCK_CRASH_CODE`: the exit code for `MOCK_CRASH_ON` on `"prove"` and `"benchmark"`. Default: 1.
 //! - `MOCK_SERVER_OOM`: set to anything to have a child, standing in for a prover's server, allocate
 //!   until the kernel kills it, before `MOCK_CRASH_ON` applies on `"prove"`: a host OOM killing a
@@ -53,6 +56,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    let fail_on = std::env::var("MOCK_FAIL_ON").unwrap_or_default();
+    let fail_message =
+        std::env::var("MOCK_FAIL_MESSAGE").unwrap_or_else(|_| "mock: forced failure".to_string());
     let backend = std::env::var("MOCK_BACKEND").unwrap_or_else(|_| "mock".to_string());
     let journal = hex_env("MOCK_JOURNAL_HEX");
     let seal = hex_env("MOCK_SEAL_HEX");
@@ -123,7 +129,15 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
-                let resp = WorkerResponse::BenchmarkResult { results: vec![] };
+                let resp = if fail_on == "benchmark" {
+                    WorkerResponse::Error {
+                        request_id: 0,
+                        kind: zkminer_prover_protocol::types::ErrorKind::ProofFailed,
+                        message: fail_message.clone(),
+                    }
+                } else {
+                    WorkerResponse::BenchmarkResult { results: vec![] }
+                };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
@@ -241,10 +255,18 @@ fn main() {
                     }
                 }
                 set_up();
-                let resp = WorkerResponse::WarmupDone {
-                    request_id,
-                    summary: "nothing to warm up".to_string(),
-                    groth16_helper: false,
+                let resp = if fail_on == "warmup" {
+                    WorkerResponse::Error {
+                        request_id,
+                        kind: zkminer_prover_protocol::types::ErrorKind::ProofFailed,
+                        message: fail_message.clone(),
+                    }
+                } else {
+                    WorkerResponse::WarmupDone {
+                        request_id,
+                        summary: "nothing to warm up".to_string(),
+                        groth16_helper: false,
+                    }
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

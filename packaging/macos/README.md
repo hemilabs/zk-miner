@@ -92,8 +92,9 @@ existing `~/.zkminer/config.toml` alone, so an update needs no `init`. Do not ru
 Neither `zkminer` nor the worker has a `--version` flag: the kit's version, commit and risc0
 revision are in its `BUILDINFO` file, and `zkminer help` lists the commands.
 
-`~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark` exits with status 0 even when a program
-fails. Judge it by its `... verified` lines, or run `tools/macos-smoke.sh`, which checks the proof.
+`~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark` exits with status 1 when any program
+(the warm-up included) does not prove and verify, after printing the rows of those that did.
+`tools/macos-smoke.sh` checks one proof end to end. See [Troubleshooting](#troubleshooting).
 
 ### First start
 
@@ -128,6 +129,31 @@ risc0-groth16", run `./install.sh --with-groth16` from the kit instead (the kit 
 
 The download prints one line when it starts and nothing more until it is done: 82 s were measured
 on a fast link, and a slow link takes minutes. Let it run.
+
+## Troubleshooting
+
+**`zkminer benchmark` says `BENCHMARK FAILED` (exit status 1).** The prover started but could not
+prove: the line under it names the prover (`risc0:metal:0`) and its error, for example a warm-up
+that failed because a GPU pipeline did not compile. Nothing was measured, and nothing was saved, so
+`zkminer run` does not price jobs from it. Then:
+
+1. Run `tools/macos-smoke.sh` from the kit folder. It proves and verifies one small proof and ends
+   with `RESULT:` and an exit status: 1 means the proof failed (send its log with your report), 4
+   that this is a virtual machine's GPU (results there say nothing about a real Mac), 5 that the
+   prover refuses this Mac, 7 that the Groth16 component is missing (`./install.sh --with-groth16`),
+   8 that the kit is quarantined (run `./install.sh`).
+2. Check the prover's own lines above the failure in the `zkminer benchmark` output (prefixed
+   `[worker:risc0]`): a missing component, a memory refusal or a pipeline that failed to compile is
+   named there.
+3. After a macOS update, run the benchmark again: the first start after an update recompiles the GPU
+   pipelines (see [First start](#first-start)).
+
+**`zkminer benchmark` prints a `SIMULATED` table.** No prover was found in `~/.zkminer/provers`, so
+nothing was proved. The table is CPU stand-ins, has no zkOP/s score and is not saved. Run
+`./install.sh` from the kit.
+
+**`install.sh --warm` says the warm-up proof failed.** The kit is installed; the prover could not
+prove on this Mac. Run `tools/macos-smoke.sh` as above.
 
 ## Gatekeeper (unsigned beta)
 

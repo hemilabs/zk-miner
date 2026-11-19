@@ -201,12 +201,21 @@ fn main() {
                 metal_start::prewarm_before_benchmark(default_job_po2())
             );
         }
-        let results = run_benchmarks();
+        let (results, failed) = run_benchmarks();
         for r in &results {
             println!(
                 "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
                 r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
             );
+        }
+        // W10-BENCH: a program that did not prove and verify fails the run (exit 1), after the
+        // table of the ones that did, so a script can trust the exit status.
+        if !failed.is_empty() {
+            eprintln!(
+                "BENCHMARK FAILED: {} did not prove and verify (see the errors above)",
+                failed.join(", ")
+            );
+            std::process::exit(1);
         }
         return;
     }
@@ -629,7 +638,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                let resp = match warm_up(&mut |status, done_bytes, total_bytes| {
+                let resp = match forced_failure("warmup").map_or_else(
+                    || {
+                        warm_up(&mut |status, done_bytes, total_bytes| {
                     // A closed pipe is reported by the final answer's write below.
                     let _ = write_message(
                         &mut stdout,
@@ -640,7 +651,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             total_bytes,
                         },
                     );
-                }) {
+                        })
+                    },
+                    |forced| Err(anyhow::anyhow!(forced)),
+                ) {
                     Ok(summary) => WorkerResponse::WarmupDone {
                         request_id,
                         summary,
@@ -1884,8 +1898,37 @@ fn run_benchmarks_streaming<W: std::io::Write>(
     Ok(results)
 }
 
+/// Test aid (W10-BENCH): `ZKMINER_TEST_FORCE_FAIL=<what>[,<what>...]` makes the named step fail without
+/// touching the GPU, so the miner's handling of a broken worker can be checked on a working Mac.
+/// `warmup` fails the IPC `Warmup` (as a GPU whose pipelines do not build does) and the `--benchmark`
+/// warm-up proof; a program name (`memory-merkle`, `zkop-mix`, ...) fails that benchmark program.
+/// Unset in production: nothing reads it on the proving path.
+fn forced_failure(what: &str) -> Option<String> {
+    forced_failure_in(force_fail_knob().as_deref(), what)
+}
+
+fn force_fail_knob() -> Option<String> {
+    std::env::var("ZKMINER_TEST_FORCE_FAIL").ok()
+}
+
+fn forced_failure_in(knob: Option<&str>, what: &str) -> Option<String> {
+    knob?
+        .split(',')
+        .any(|w| w.trim().eq_ignore_ascii_case(what))
+        .then(|| format!("forced failure (ZKMINER_TEST_FORCE_FAIL={what})"))
+}
+
 /// Prove one requested program, if this build has its guest.
 fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
+    benchmark_spec_with(spec, force_fail_knob().as_deref())
+}
+
+/// `benchmark_spec` with the `ZKMINER_TEST_FORCE_FAIL` value passed in.
+fn benchmark_spec_with(spec: &BenchmarkProgramSpec, knob: Option<&str>) -> Option<BenchmarkEntry> {
+    if let Some(forced) = forced_failure_in(knob, &spec.name) {
+        tracing::error!("{}: {forced}", spec.name);
+        return None;
+    }
     let Some(elf) = benchmark_guest(&spec.name) else {
         tracing::warn!("{}: no guest for it in this build; skipped", spec.name);
         return None;
@@ -1902,26 +1945,58 @@ fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
 
 /// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
 /// program of it (or only the score, for `zkop-mix`).
-fn run_benchmarks() -> Vec<BenchmarkEntry> {
+///
+/// Returns the programs that proved and verified, and the names of those that did not (the warm-up
+/// included: `BENCH_ONLY=fibonacci` is the smoke test's one proof).
+fn run_benchmarks() -> (Vec<BenchmarkEntry>, Vec<String>) {
+    run_benchmarks_with(
+        std::env::var("BENCH_ONLY").ok().as_deref(),
+        force_fail_knob().as_deref(),
+    )
+}
+
+/// `run_benchmarks` with `BENCH_ONLY` and `ZKMINER_TEST_FORCE_FAIL` passed in.
+fn run_benchmarks_with(
+    only: Option<&str>,
+    knob: Option<&str>,
+) -> (Vec<BenchmarkEntry>, Vec<String>) {
     use zkminer_prover_protocol::{
         benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
     };
-    // Discarded, as under a host: see `warmup_spec`.
-    benchmark_spec(&warmup_spec(BACKEND_RISC0));
-    let only = std::env::var("BENCH_ONLY").ok();
-    let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
-    let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)
+    let mut failed = Vec::new();
+    // Discarded, as under a host: see `warmup_spec`. Its failure still fails the run.
+    let warmup = warmup_spec(BACKEND_RISC0);
+    let warmed = match forced_failure_in(knob, "warmup") {
+        Some(forced) => {
+            tracing::error!("warm-up: {forced}");
+            false
+        }
+        None => benchmark_spec_with(&warmup, knob).is_some(),
+    };
+    if !warmed {
+        failed.push(format!("{} (warm-up)", warmup.name));
+    }
+    let wanted = |name: &str| only.map_or(true, |o| name.eq_ignore_ascii_case(o));
+    let mut results = Vec::new();
+    for spec in benchmark_suite(BACKEND_RISC0)
         .iter()
         .filter(|spec| wanted(&spec.name))
-        .filter_map(benchmark_spec)
-        .collect();
-    if wanted(BENCH_ZKOP_MIX) {
-        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations))) {
+    {
+        match benchmark_spec_with(spec, knob) {
             Some(entry) => results.push(entry),
-            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score"),
+            None => failed.push(spec.name.clone()),
         }
     }
-    results
+    if wanted(BENCH_ZKOP_MIX) {
+        match measure_zkop_mix(|iterations| benchmark_spec_with(&zkop_mix_spec(iterations), knob)) {
+            Some(entry) => results.push(entry),
+            None => {
+                tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score");
+                failed.push(BENCH_ZKOP_MIX.to_string());
+            }
+        }
+    }
+    (results, failed)
 }
 
 /// Prove `elf`, timing each stage. Without `measure_wrap` it stops at the constant-size STARK, whose
@@ -3116,5 +3191,43 @@ mod sdk_version_tests {
     fn the_handshake_sdk_version_is_the_hosts_risc0() {
         let sdk = format!("risc0-zkvm {}", risc0_zkvm::VERSION);
         assert_eq!(zkminer_prover_protocol::risc0_sdk_mismatch(&sdk), None, "{sdk}");
+    }
+}
+
+/// W10-BENCH: `--benchmark` reports every program that did not prove and verify, so it can exit 1.
+#[cfg(test)]
+mod bench_exit_tests {
+    use super::*;
+
+    #[test]
+    fn the_force_fail_knob_names_steps() {
+        assert_eq!(forced_failure_in(None, "warmup"), None);
+        assert_eq!(forced_failure_in(Some(""), "warmup"), None);
+        assert_eq!(forced_failure_in(Some("memory-merkle"), "warmup"), None);
+        assert!(forced_failure_in(Some("warmup"), "warmup").is_some());
+        assert!(forced_failure_in(Some("x, Memory-Merkle"), "memory-merkle")
+            .unwrap()
+            .contains("ZKMINER_TEST_FORCE_FAIL=memory-merkle"));
+    }
+
+    /// Every step forced to fail: nothing is proved (no GPU touched) and every step is reported, the
+    /// warm-up and the zkOP/s score included, so `--benchmark` exits 1.
+    #[test]
+    fn a_run_whose_programs_fail_reports_each_of_them() {
+        use zkminer_prover_protocol::{benchmark_suite, BENCH_ZKOP_MIX};
+        let suite: Vec<String> = benchmark_suite(BACKEND_RISC0)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let knob = format!("warmup,{},{BENCH_ZKOP_MIX}", suite.join(","));
+        let (results, failed) = run_benchmarks_with(None, Some(&knob));
+        assert!(results.is_empty());
+        assert_eq!(failed.len(), suite.len() + 2, "{failed:?}");
+        assert!(failed[0].ends_with("(warm-up)"), "{failed:?}");
+        assert_eq!(failed.last().unwrap(), BENCH_ZKOP_MIX);
+
+        // BENCH_ONLY narrows the suite, but a failed warm-up still fails the run.
+        let (_, failed) = run_benchmarks_with(Some(BENCH_ZKOP_MIX), Some(&knob));
+        assert_eq!(failed.len(), 2, "{failed:?}");
     }
 }

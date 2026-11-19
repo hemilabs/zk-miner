@@ -212,8 +212,15 @@ fi
 if [ $warm = 1 ]; then
   say "warming the GPU pipelines (BENCH_ONLY=fibonacci $worker --benchmark)"
   t0=$(date +%s)
-  BENCH_ONLY=fibonacci "$worker" --benchmark
-  say "warm-up done in $(( $(date +%s) - t0 )) s"
+  # The worker exits 1 when the proof fails (W10-BENCH). The install itself is done by now, so it is
+  # reported, not fatal under set -e.
+  if BENCH_ONLY=fibonacci "$worker" --benchmark; then
+    say "warm-up done in $(( $(date +%s) - t0 )) s"
+  else
+    say "WARNING: the warm-up proof failed (exit $?, after $(( $(date +%s) - t0 )) s): the kit is installed,"
+    say "  but the prover could not prove on this Mac. Run tools/macos-smoke.sh from the kit folder and"
+    say "  see Troubleshooting in README.md."
+  fi
 fi
 
 say ""
