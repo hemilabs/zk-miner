@@ -990,6 +990,25 @@ fn is_pause_kept(job_id: B256) -> bool {
     g.as_ref().is_some_and(|s| s.contains(&job_id))
 }
 
+/// Locks already reported as stranded (past their deadline, so only a keeper's slash frees the
+/// collateral) in this run. Every recovery pass meets them again until that slash, which can take
+/// hours, and the operator can do nothing about them: they are paged once, not every few minutes.
+/// Bounded by the journal (only held locks are ever inserted).
+static STRANDED_REPORTED: std::sync::Mutex<Option<std::collections::HashSet<B256>>> =
+    std::sync::Mutex::new(None);
+
+/// Records `job_id` as reported stranded; `true` the first time in this run.
+fn first_stranded_report(job_id: B256) -> bool {
+    let mut g = STRANDED_REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(Default::default).insert(job_id)
+}
+
+/// Whether `job_id` was already reported stranded in this run.
+fn stranded_reported(job_id: B256) -> bool {
+    let g = STRANDED_REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref().is_some_and(|s| s.contains(&job_id))
+}
+
 /// Whether the risczero.groth16.v1 proof system passed verification (adapter registered and
 /// claimable, audited code, SELECTOR equal to our seal prefix), and the adapter it verified. New
 /// claims for it are refused while false; locks we already hold are still driven (fulfilled, kept or
@@ -13826,13 +13845,18 @@ async fn release_and_clean_with_nonce(
             });
         }
         if lock_deadline != 0 && now >= lock_deadline {
-            tracing::error!(
-                "PAGE: LOCK-LATE: {} is past its deadline ({} >= {}) — releaseJob would revert; \
-                 retaining breadcrumb (collateral stranded until a keeper slash)",
-                short_id(job_id),
-                now,
-                lock_deadline,
-            );
+            let first = first_stranded_report(job_id);
+            if first {
+                tracing::error!(
+                    "PAGE: LOCK-LATE: {} is past its deadline ({} >= {}) — releaseJob would revert; \
+                     retaining breadcrumb (collateral stranded until a keeper slash)",
+                    short_id(job_id),
+                    now,
+                    lock_deadline,
+                );
+            } else {
+                tracing::debug!("{} still stranded past its deadline", short_id(job_id));
+            }
             // Past-deadline SKIPS release_job — drain the fulfill stash so a stashed
             // nonce can't wedge the signer. (The stuck fulfill may still be pending at N;
             // recycling it lets a reuser evict/replace it, self-healing via "nonce too low"
@@ -13845,13 +13869,15 @@ async fn release_and_clean_with_nonce(
             }
             let mut s = state.write().await;
             s.active_jobs.retain(|j| j.info.job_id != job_id);
-            s.add_log(
-                LogLevel::Warn,
-                format!(
-                    "Job {} past deadline — cannot release (stranded until slash)",
-                    short_id(job_id)
-                ),
-            );
+            if first {
+                s.add_log(
+                    LogLevel::Warn,
+                    format!(
+                        "Job {} past deadline — cannot release (stranded until slash)",
+                        short_id(job_id)
+                    ),
+                );
+            }
             return;
         }
     }
@@ -14356,13 +14382,21 @@ async fn recover_claimed_jobs(
         // inside a resume grace has its job-local clock frozen, but the lifecycle's pre-prove fetches
         // are budgeted on the view's room alone, so driving it would only release it there instead.)
         if lock_deadline > 0 && now + recovery_margin >= lock_deadline {
-            tracing::warn!(
-                "recover: {} past deadline room (now={} deadline={} margin={}s) — releasing",
-                jid,
-                now,
-                lock_deadline,
-                recovery_margin,
-            );
+            // A lock already reported stranded comes back every pass until its slash: once is enough.
+            if now >= lock_deadline && stranded_reported(jid) {
+                tracing::debug!(
+                    "recover: {} still stranded past its deadline",
+                    short_id(jid)
+                );
+            } else {
+                tracing::warn!(
+                    "recover: {} past deadline room (now={} deadline={} margin={}s) — releasing",
+                    jid,
+                    now,
+                    lock_deadline,
+                    recovery_margin,
+                );
+            }
             actions.push((jid, RecoveryAction::Release(jid)));
             continue;
         }
@@ -14612,6 +14646,20 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    /// A lock past its deadline meets every recovery pass until a keeper slashes it: it is paged
+    /// the first time only, per job.
+    #[test]
+    fn a_stranded_lock_is_reported_once() {
+        let a = B256::repeat_byte(0xa7);
+        let b = B256::repeat_byte(0xb8);
+        assert!(!stranded_reported(a));
+        assert!(first_stranded_report(a));
+        assert!(stranded_reported(a));
+        assert!(!first_stranded_report(a));
+        assert!(!stranded_reported(b));
+        assert!(first_stranded_report(b));
+    }
 
     #[test]
     fn an_sp1_retry_pin_holds_until_an_attempt_runs_on_its_card() {
