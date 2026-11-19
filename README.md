@@ -367,7 +367,7 @@ make -f Makefile.mac mac-bench BENCH_ONLY=fibonacci
 | `mac-install-worker` | copies the worker into `PROVERS_DIR` (default `~/.zkminer/provers`; copy then rename, so a running worker is never modified in place), then proves fibonacci once with it to warm the pipelines (`WARM=0` skips) | ~1 min warm; add the cold warm-up below on a new machine |
 | `mac-test-miner` | the worker's unit tests, `zkminer-prover` `discovery::`/`dispatcher::`, and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
 | `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal`, `risc0-circuit-rv32im` `prove::`, `risc0-circuit-recursion`, `risc0-circuit-keccak`, `risc0-groth16-sys` and `risc0-groth16`; each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
-| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (the miner's suite: a discarded fibonacci warm-up, the five programs, then the zkOP/s scoring proofs; about 4.5 min at po2 20; `BENCH_ONLY=<program>` runs the warm-up and that program) | ~1 min for fibonacci (the warm-up alone) |
+| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (the miner's suite: a discarded fibonacci warm-up, the five programs, then the zkOP/s scoring proofs; about 4.2 min (254 s) at po2 20; `BENCH_ONLY=<program>` runs the warm-up and that program) | ~1 min for fibonacci (the warm-up alone) |
 
 Every target sources `env.sh`, sets `NVCC=off HIPCC=off`, passes `--locked` (never `cargo update`,
 see [Layout](#layout)), and builds with `-j` = `CARGO_BUILD_JOBS` if set, else the number of
@@ -434,9 +434,9 @@ Read at run time by the worker (they pass through the miner's environment):
   blocks a downloaded binary until its quarantine flag is removed. The kit's `install.sh` removes it,
   and building the worker yourself avoids it.
 - The rv32im GPU witness generation is disabled by default (see the knob above).
-- The benchmark (`--benchmark`, `zkminer benchmark`) takes about 4.5 minutes at po2 20 on an M5 Max
-  (254 s of wall time for `--benchmark`, 262-314 s for `zkminer benchmark` with its warm-up),
-  longer on smaller Macs.
+- The benchmark takes about 4.2 minutes at po2 20 on an M5 Max for `--benchmark` (254 s of wall
+  time) and 4.4-5.2 minutes for `zkminer benchmark` with its warm-up (262-314 s), longer on smaller
+  Macs.
 - GPU power is not read on macOS; the miner's cost model assumes its 300 W default.
 
 ## Configure

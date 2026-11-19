@@ -68,8 +68,8 @@ The CLI (69 s) and the worker (194 s) were built first with `assemble-macos.sh`'
 | gate | result |
 |---|---|
 | `check-macos-release.sh <kit>` (also run inside assemble) | ok: minos 26.0, 7 metallibs for 26.0, compiler 32023.922, no archives, Groth16 not bundled |
-| `check-macos-kit.py --require-validated --version 0.1.0 --commit 4d421db… <kit>` | ok (README archive sentence and "About 0.2 GB" accepted against 192 MB) |
-| `scripts/ci/test-check-macos-kit.sh <kit> 4d421db…` | 16 passed, 0 failed (incl. 2m wrong README size, 2n README vs archives) |
+| `check-macos-kit.py --require-validated --version 0.1.0 --commit 4d421dbd2c0edfcc74ad7ca9afb3d8e22f610442 <kit>` | ok (README archive sentence and "About 0.2 GB" accepted against 192 MB) |
+| `scripts/ci/test-check-macos-kit.sh <kit> 4d421dbd2c0edfcc74ad7ca9afb3d8e22f610442` | 16 passed, 0 failed (incl. 2m wrong README size, 2n README vs archives) |
 | `scripts/ci/test-assemble-macos.sh <sdk worker> <sdk CLI> <kit worker> <kit CLI>` (sdk = W10-BENCH's plain release build, minos 11.0; kit = this kit's binaries; `gpu-run --light`, cases 8 and 12 run `--metal-arch`) | 44 passed, 0 failed (140 s) |
 | `scripts/ci/lint-workflows.sh` (actionlint 1.7.12, shellcheck 0.11.0, repo config) | ok; expression tests 425/425 |
 | `cargo test -p zkminer-cli` (mock worker built), twice, under `gpu-run --light` | 150 unit, `benchmark_cli` 5, `first_run_cli` 3, `localnet` 1 (+12 ignored): all pass both runs |
