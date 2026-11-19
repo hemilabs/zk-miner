@@ -2573,6 +2573,9 @@ fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
 const TOO_LONG_FOR_PROVING_TIMEOUT: &str =
     "too long for the proving timeout (raise it in Settings)";
 
+/// A card's estimate for one job: (benchmark device id, cycles/s, estimated seconds per attempt).
+type CardEstimate = (String, f64, f64);
+
 /// Splits a job's cards into those that can prove an attempt of `cycles` inside `timeout_secs` and
 /// those that cannot, each as (device, cycles/s, estimated seconds). `rows` are the cards' rates for
 /// the job's backend; the estimate is the claim gate's: cycles over the rate times `margin`, plus
@@ -2583,7 +2586,7 @@ fn cards_within_timeout(
     margin: f64,
     fixed_secs: u64,
     timeout_secs: f64,
-) -> (Vec<(String, f64, f64)>, Vec<(String, f64, f64)>) {
+) -> (Vec<CardEstimate>, Vec<CardEstimate>) {
     rows.iter()
         .map(|(device, rate)| {
             let est = cycles as f64 / rate * margin + fixed_secs as f64;
@@ -8720,7 +8723,7 @@ async fn miner_brain(
                         proving_timeout.as_secs_f64(),
                     );
                     if !unfit.is_empty() && first_timeout_split_report(jid) {
-                        let show = |cards: &[(String, f64, f64)]| {
+                        let show = |cards: &[CardEstimate]| {
                             cards
                                 .iter()
                                 .map(|(d, _, est)| format!("{d} ~{est:.0}s"))
