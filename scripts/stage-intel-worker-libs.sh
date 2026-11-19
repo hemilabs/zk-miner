@@ -59,7 +59,53 @@ stage() { # <ldd output of one object>
     esac
   done < <(awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' <<<"$1")
 }
-stage "$(LD_LIBRARY_PATH="$search" ldd "$bin")"
+# Resolved before anything is staged: the binary's RPATH names the staging directory, and an RPATH
+# outranks LD_LIBRARY_PATH, so a later ldd would find the staged copies instead of the target dir.
+linked=$(LD_LIBRARY_PATH="$search" ldd "$bin")
+stage "$linked"
+
+# Kernel libraries loaded at run time from the directory of the library that loads them, so ldd does not
+# list them either. On an Intel GPU without Xe2's matrix units (Arc A-series, Alchemist),
+# librisc0_rv32im_intel.so loads librisc0_rv32im_intel_noxmx.so from its own directory, and the worker's
+# first proof on such a card fails without it. Each one beside a kernel library ldd resolved from the
+# target dir is staged, unless it is older than that library: the build makes them together, so an
+# older one is left over from an earlier build of different code, and would give wrong values.
+while read -r dir; do
+  for lib in "$dir"/lib*_noxmx.so; do
+    [ -f "$lib" ] || continue
+    loader=${lib%_noxmx.so}.so
+    if [ -f "$loader" ] && [ "$loader" -nt "$lib" ]; then
+      echo "warning: not staging $lib: it is older than $loader, so it is from an earlier build" >&2
+      continue
+    fi
+    cp -L "$lib" "$out/$(basename "$lib")"; n=$((n + 1))
+    stage "$(LD_LIBRARY_PATH="$search" ldd "$lib")"
+  done
+done < <(awk -v t="$target/" '$2 == "=>" && index($3, t) == 1 {sub(/\/[^\/]*$/, "", $3); print $3}' \
+  <<<"$linked" | sort -u)
+
+# Whether risc0-circuit-rv32im-sys's build made librisc0_rv32im_intel_noxmx.so, decided as its build.rs
+# does (intel_non_xmx_targets): when eval_check uses XMX (RISC0_INTEL_EVAL_FAST and RISC0_INTEL_EVAL_XMX
+# are not off) and a target is not Battlemage or Lunar Lake. Its default targets include spir64.
+noxmx_expected() {
+  case "${RISC0_INTEL_EVAL_FAST:-}" in 0|false|off|OFF) return 1 ;; esac
+  case "${RISC0_INTEL_EVAL_XMX:-}" in 0|false|off|OFF) return 1 ;; esac
+  [ -z "${RISC0_INTEL_SYCL_TARGETS:-}" ] && return 0
+  local targets t
+  IFS=, read -ra targets <<<"$RISC0_INTEL_SYCL_TARGETS"
+  for t in "${targets[@]}"; do
+    t=${t//[[:space:]]/}
+    case $t in ''|*bmg*|*lnl*) ;; *) return 0 ;; esac
+  done
+  return 1
+}
+if [ -e "$out/librisc0_rv32im_intel.so" ] && [ ! -e "$out/librisc0_rv32im_intel_noxmx.so" ] &&
+  noxmx_expected; then
+  echo "librisc0_rv32im_intel_noxmx.so is not beside librisc0_rv32im_intel.so in the target dir," \
+    "though the targets (${RISC0_INTEL_SYCL_TARGETS:-the default}) include a GPU without Xe2's" \
+    "matrix units, which needs it: the worker's first proof on such a card would fail" >&2
+  exit 1
+fi
 
 # dlopen()ed, so ldd does not list them: the Unified Runtime's Level Zero adapters, and their own deps.
 for lib in "$oneapi"/compiler/latest/lib/libur_adapter_level_zero*.so.[0-9]; do
