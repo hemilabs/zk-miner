@@ -127,13 +127,8 @@ const MAX_CLAIM_BATCH: usize = 10;
 const MIN_EARLY_PASS_SPACING: Duration = Duration::from_secs(1);
 
 
-/// Committed-cycle count above which a job is treated as "large" and proactively
-/// pinned to a high-VRAM GPU (only takes effect when the job commits a cycle
-/// count; uncommitted jobs still get the reactive OOM→high-VRAM retry).
-const LARGE_JOB_CYCLES: u64 = 150_000_000;
-
-/// VRAM floor (30 GiB) for large jobs — includes 32 GB cards, excludes 24 GB
-/// ones, keeping OOM-prone multi-segment proofs off the smaller GPUs.
+/// VRAM floor (30 GiB) for the retry of a job that ran out of GPU memory on a card whose VRAM is
+/// unknown (non-CUDA, or nvidia-smi unavailable); with it known, the retry asks for more than it.
 const LARGE_JOB_MIN_VRAM_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 /// Default blocks to scan on startup for locked-but-unfulfilled jobs (recovery; floored at the
@@ -11535,11 +11530,13 @@ async fn process_job_lifecycle(
     // MEASURED count — not the adversarial declared `expected_cycles`. See `prove_sizing_cycles`.
     let sizing_cycles: u64 = prove_sizing_cycles(snapshot.expected_cycles, snapshot.measured_cycles);
 
-    // Proactive routing: a job that commits a large cycle count starts pinned to
-    // a high-VRAM GPU (0 = uncommitted → no floor; the reactive path below still
-    // catches an OOM on the first attempt).
-    let mut min_vram: Option<u64> =
-        (sizing_cycles >= LARGE_JOB_CYCLES).then_some(LARGE_JOB_MIN_VRAM_BYTES);
+    // No VRAM floor up front, however long the job: both zkVMs prove in fixed-size pieces (risc0
+    // segments at the card's po2, SP1 shards at its threshold), so a card's VRAM need does not grow
+    // with the cycle count, and the dispatcher already gates each card on the room its size needs.
+    // A long job prefers the fastest card (`preferred_device`) and takes another when that one is
+    // busy. Pinning it to a >= 30 GiB card instead made it wait on a busy 5090 while a 12 GB 4070
+    // sat idle. Only an out-of-memory retry sets a floor (`steer_after_failure`).
+    let mut min_vram: Option<u64> = None;
     // Slot keys of workers that wedged/timed out on this job, so a retry
     // is steered to a *different* GPU instead of being re-pinned to a flaky one.
     // The slots the operator switched off in Settings. Those toggles were honoured by mock mode and
