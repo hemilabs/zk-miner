@@ -9150,7 +9150,17 @@ async fn miner_brain(
                     decline_reason(&eval.recommendation)
                 } else if !measurable {
                     if backend_measurable {
-                        "measuring its cycles"
+                        // Running, or waiting in line: the measure pool runs a couple of executes per
+                        // backend at a time, so on a busy market most unmeasured jobs are waiting, and
+                        // calling them all "measuring" overstated what the miner was doing.
+                        let running = measuring
+                            .lock()
+                            .is_ok_and(|m| m.contains_key(&snapshot.descriptor_hash));
+                        if running {
+                            "measuring its cycles"
+                        } else {
+                            "waiting to be measured"
+                        }
                     } else {
                         "its cycles cannot be measured here"
                     }
