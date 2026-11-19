@@ -2568,6 +2568,10 @@ fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
     );
 }
 
+/// The reason given for a job the miner executed and could not measure: never claimed.
+const COULD_NOT_BE_MEASURED: &str =
+    "could not be measured (over the execute cycle cap, out of time, or a different journal at each size)";
+
 /// The reason given for a job whose proof attempt would outlast the per-attempt cap on the slowest
 /// card it could go to. Names where to raise it.
 const TOO_LONG_FOR_PROVING_TIMEOUT: &str =
@@ -8631,6 +8635,15 @@ async fn miner_brain(
             snapshot.measured_cycles = measured_for_job;
             // The execute PEAK (same merged entry) for the RH2 prove reservation; carried on the snapshot.
             snapshot.measured_peak = measured_peak_for_job;
+            // An unmeasurable verdict (over the execute cycle cap, past the measuring time limit, or a
+            // different journal at each size) is never claimed, and says so. Its cycle count is the
+            // UNMEASURABLE_CYCLES marker, which only the proving-timeout gate below used to catch, so
+            // every such job read "too long for the proving timeout": no timeout could fit it.
+            if measured_for_job.is_some_and(|c| c >= UNMEASURABLE_CYCLES) {
+                set_job_aside(jid, UNMEASURABLE_RETRY_TTL, COULD_NOT_BE_MEASURED);
+                declines.note(jid, COULD_NOT_BE_MEASURED);
+                continue;
+            }
             // The proof executes the guest again, which its cycles do not size: out of the window,
             // into the watchdog gate and the planner's backlog below.
             let execute_allowance =
