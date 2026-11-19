@@ -30,7 +30,7 @@ rand = { workspace = true }
 dirs = { workspace = true }
 # Only needed by the optional `sp1-demo` command; made optional so the `zkminer`
 # binary (and the RISC0 prover path) builds without the SP1 native toolchain.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "c130a33d3c8032e38bb43c388b68f63256092f67", default-features = false, features = ["blocking"], optional = true }
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "820d55ef6fc30e83dea5fec1bf4c15b86bc989a9", default-features = false, features = ["blocking"], optional = true }
 
 [dev-dependencies]
 # The localnet test: signals and parent-death signals for the processes it starts.
