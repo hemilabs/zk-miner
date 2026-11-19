@@ -99,13 +99,27 @@ use zkminer_prover_protocol::{
 #[derive(Debug)]
 pub struct WorkerDied {
     pub backend: String,
+    /// The worker's last stderr line, which usually says why it died (W10-BFIX: "Metal
+    /// working-set budget exceeded ..." rather than a bare EOF in `zkminer benchmark`'s failure).
+    pub last_output: Option<String>,
 }
 
 impl std::fmt::Display for WorkerDied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Worker {} process died (EOF)", self.backend)
+        write!(f, "Worker {} process died (EOF)", self.backend)?;
+        if let Some(said) = &self.last_output {
+            write!(f, " ({LAST_OUTPUT}{said})")?;
+        }
+        Ok(())
     }
 }
+
+/// How an error quotes the worker's last stderr line (W10-BFIX).
+const LAST_OUTPUT: &str = "the worker's last output: ";
+
+/// The line Rust's panic handler prints after a panic message ("note: run with `RUST_BACKTRACE=1`
+/// environment variable to display a backtrace"): never quoted as the worker's last output.
+const PANIC_BACKTRACE_NOTE: &str = "note: run with `RUST_BACKTRACE";
 
 impl std::error::Error for WorkerDied {}
 
@@ -918,8 +932,13 @@ impl WorkerHandle {
                         if line.is_empty() {
                             return;
                         }
-                        // Kept for a failed handshake's error (W10-BFIX), whatever is forwarded.
-                        *last_stderr_w.lock().unwrap_or_else(|e| e.into_inner()) = Some(line.clone());
+                        // Kept for a failed handshake's or a dead worker's error (W10-BFIX), whatever
+                        // is forwarded. Not the panic handler's backtrace hint, which follows the
+                        // panic message and would replace the reason.
+                        if !line.starts_with(PANIC_BACKTRACE_NOTE) {
+                            *last_stderr_w.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(line.clone());
+                        }
                         // TUI mode suppresses forwarding to BOTH sinks: the eprintln would corrupt the
                         // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
                         // tracing::warn would flood the rolling log file. The pipe is still drained (we
@@ -1048,9 +1067,10 @@ impl WorkerHandle {
         // before the handshake) has usually said why on stderr: carry its last line in the error, or
         // the operator sees only "process died (EOF)" (W10-BFIX).
         if let Err(e) = handle.handshake() {
+            let quoted = format!("{e:#}").contains(LAST_OUTPUT); // a `WorkerDied` already has it
             return Err(match handle.last_stderr_line(STDERR_DRAIN_WAIT) {
-                Some(said) => anyhow::anyhow!("{e:#} (the worker's last output: {said})"),
-                None => e,
+                Some(said) if !quoted => anyhow::anyhow!("{e:#} ({LAST_OUTPUT}{said})"),
+                _ => e,
             });
         }
 
@@ -1066,10 +1086,18 @@ impl WorkerHandle {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        self.last_stderr
+        // Shorter than a forwarded line: it is quoted inside an error the TUI shows on one line.
+        const MAX_QUOTED: usize = 300;
+        let line = self
+            .last_stderr
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone()?;
+        Some(if line.chars().count() > MAX_QUOTED {
+            line.chars().take(MAX_QUOTED).chain("…".chars()).collect()
+        } else {
+            line
+        })
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -1230,6 +1258,7 @@ impl WorkerHandle {
         read_message(&mut self.reader).map_err(|e| match e {
             FrameError::UnexpectedEof => WorkerDied {
                 backend: self.backend.clone(),
+                last_output: self.last_stderr_line(STDERR_DRAIN_WAIT),
             }
             .into(),
             other => anyhow::anyhow!("Recv error from {}: {other}", self.backend),

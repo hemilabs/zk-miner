@@ -335,3 +335,33 @@ fn a_worker_that_writes_garbage_is_named_with_its_error() {
     assert!(!home.join(".zkminer/benchmarks.json").exists());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A Metal worker that dies during its warm-up (as the real one does when a Metal working-set
+/// budget is exceeded): the failure quotes its last output, not only "process died (EOF)"
+/// (W10-BFIX; RC4's `RISC0_METAL_MAX_WORKING_SET_BYTES=1 GiB` case).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_that_dies_in_its_warm_up_is_quoted() {
+    let Some(home) = sandbox("warmdeath", Some("zkminer-prove-risc0-metal")) else {
+        return;
+    };
+    let out = zkminer_benchmark(&home, &[], &[("MOCK_CRASH_ON", "warmup")]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("c/s"), "{stdout}");
+    let line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("risc0:metal:0"))
+        .unwrap_or_else(|| panic!("no failure line for risc0:metal:0:\n{stderr}"));
+    assert!(
+        line.contains(
+            "process died (EOF) (the worker's last output: mock worker: crashing on warmup)"
+        ),
+        "{line:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

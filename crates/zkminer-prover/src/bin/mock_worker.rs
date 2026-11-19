@@ -243,6 +243,13 @@ fn main() {
 
             WorkerCommand::Warmup { request_id } => {
                 if crash_on == "warmup" {
+                    // A dying worker's last words, which the dispatcher quotes (W10-BFIX).
+                    eprintln!("mock worker: crashing on warmup");
+                    // What Rust's panic handler prints last, which is not the reason.
+                    eprintln!(
+                        "note: run with `RUST_BACKTRACE=1` environment variable to display a \
+                         backtrace"
+                    );
                     std::process::exit(1);
                 }
                 if let Some(log) = std::env::var_os("MOCK_WARMUP_LOG") {
