@@ -7,6 +7,11 @@ Evidence and scripts are in `/Users/user/zkminer/scratch/w9/rc2/` (`ci/`, `logs/
 candidate 1 (kit `54296dc6…`, commit `39978cd`) is in this file's history (commit `ca07773`); RC2 replaces
 it, and nothing in RC1's results changed except where this file says so.
 
+> **Superseded pin (Wave 10).** This file records RC2 as built. Since then GitHub main was merged in
+> (W10-INT) and the risc0 pin moved to `zkminer/metal-3.1` @ `37b434755ce77dd1354d957a7b61912aa4359423`
+> (W10-PIN, `docs/metal-port-notes/W10-PIN.md`; RELEASE-DEPS.md has the current pin). The shas in the
+> checklist below (section 6) are RC2's: use the current ones, and redo the RC on them, before pushing.
+
 ## The candidate
 
 | | |
