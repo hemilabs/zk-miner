@@ -242,6 +242,10 @@ pub struct RuntimeSettings {
     pub deadline_safety_margin: f64,
     pub token_price_usd: f64,
     pub gas_cost_usd: f64,
+    /// The cap on one proof attempt, in seconds: a job whose attempt would take longer on the
+    /// slowest card it could go to is not claimed. Read by the miner every pass; an attempt keeps
+    /// the cap it started with.
+    pub proving_timeout_secs: u64,
     /// Whether to claim journal-bound jobs (a non-zero `expectedJournalHash`). Each is claimed only
     /// when the journal its (program, input) measured satisfies its binding. Default TRUE; `false`
     /// claims only NONE jobs assigned to this prover.
@@ -266,6 +270,7 @@ impl Default for RuntimeSettings {
             deadline_safety_margin: 1.5,
             token_price_usd: 0.80,
             gas_cost_usd: 0.01,
+            proving_timeout_secs: 3600,
             claim_predicate_jobs: true,
         }
     }

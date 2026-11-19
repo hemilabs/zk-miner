@@ -375,7 +375,15 @@ fn render_parameters(f: &mut Frame, area: Rect, state: &MinerState, focused: boo
         ),
         ("Token Price", format!("${:.2}", rs.token_price_usd)),
         ("Gas Cost", format!("${:.3}", rs.gas_cost_usd)),
+        (
+            "Proving Timeout",
+            format!(
+                "{} per attempt",
+                super::dashboard::format_duration(rs.proving_timeout_secs)
+            ),
+        ),
     ];
+    debug_assert_eq!(params.len(), PARAMETER_ROWS);
 
     let mut lines: Vec<Line> = Vec::new();
     for (i, (label, value)) in params.iter().enumerate() {
@@ -1331,7 +1339,7 @@ fn section_row_count(state: &MinerState, section: SettingsSection) -> usize {
         SettingsSection::Devices => 1 + state.hardware.gpus.len(),
         SettingsSection::Backends => BACKENDS.len(),
         SettingsSection::DeviceGrid => enabled_device_count(state),
-        SettingsSection::Parameters => 8,
+        SettingsSection::Parameters => PARAMETER_ROWS,
         SettingsSection::Advanced => advanced_row_count(state),
         SettingsSection::GpuTuning => gpu_tuning_row_count(state),
     }
@@ -1860,6 +1868,14 @@ fn toggle_grid_cell(state: &mut MinerState) {
 // Parameter adjustment
 // ---------------------------------------------------------------------------
 
+/// Rows in the Parameters section; `render_parameters` lists exactly this many. It was a bare 8
+/// while the section listed 9, so the last row (Gas Cost) could never be selected.
+const PARAMETER_ROWS: usize = 10;
+
+/// The Proving Timeout row's step and range, in seconds: 10 minutes to 4 hours.
+const PROVING_TIMEOUT_STEP_SECS: u64 = 600;
+const PROVING_TIMEOUT_RANGE_SECS: (u64, u64) = (600, 14_400);
+
 fn adjust_param(state: &mut MinerState, dir: i32) {
     let rs = &mut state.runtime_settings;
     match state.settings_ui.row_index {
@@ -1911,6 +1927,20 @@ fn adjust_param(state: &mut MinerState, dir: i32) {
             rs.gas_cost_usd = ((rs.gas_cost_usd + dir as f64 * 0.005) * 1000.0).round() / 1000.0;
             rs.gas_cost_usd = rs.gas_cost_usd.clamp(0.0, 10.0);
         }
+        9 => {
+            // Onto the 10-minute grid first, so a configured 900 steps to 1200 or 600, not 1500.
+            let (lo, hi) = PROVING_TIMEOUT_RANGE_SECS;
+            let step = PROVING_TIMEOUT_STEP_SECS as i64;
+            let on_grid = rs.proving_timeout_secs as i64 / step * step;
+            let v = if dir > 0 {
+                on_grid + step
+            } else if on_grid < rs.proving_timeout_secs as i64 {
+                on_grid
+            } else {
+                on_grid - step
+            };
+            rs.proving_timeout_secs = (v.max(0) as u64).clamp(lo, hi);
+        }
         _ => {}
     }
 }
@@ -1951,6 +1981,55 @@ fn adjust_po2(state: &mut MinerState, dir: i32) {
 mod param_row_tests {
     use super::*;
     use crate::state::MinerState;
+
+    /// Row 9 moves the proving timeout and nothing else, on a 10-minute grid within 10 min to 4 h;
+    /// a configured value off the grid steps onto it.
+    #[test]
+    fn the_proving_timeout_row_steps_on_its_grid() {
+        let mut st = MinerState::default();
+        let before = st.runtime_settings.clone();
+        st.settings_ui.row_index = 9;
+        adjust_param(&mut st, 1);
+        assert_eq!(st.runtime_settings.proving_timeout_secs, 4200);
+        assert_eq!(st.runtime_settings.gas_cost_usd, before.gas_cost_usd);
+        adjust_param(&mut st, -1);
+        adjust_param(&mut st, -1);
+        assert_eq!(st.runtime_settings.proving_timeout_secs, 3000);
+        st.runtime_settings.proving_timeout_secs = 900;
+        adjust_param(&mut st, 1);
+        assert_eq!(st.runtime_settings.proving_timeout_secs, 1200);
+        st.runtime_settings.proving_timeout_secs = 900;
+        adjust_param(&mut st, -1);
+        assert_eq!(st.runtime_settings.proving_timeout_secs, 600);
+        adjust_param(&mut st, -1);
+        assert_eq!(
+            st.runtime_settings.proving_timeout_secs, 600,
+            "floor 10 min"
+        );
+        st.runtime_settings.proving_timeout_secs = 14_400;
+        adjust_param(&mut st, 1);
+        assert_eq!(
+            st.runtime_settings.proving_timeout_secs, 14_400,
+            "ceiling 4 h"
+        );
+    }
+
+    /// Every listed parameter can be selected: the count was 8 for 9 rows, so Gas Cost, the last,
+    /// could not be reached.
+    #[test]
+    fn every_parameter_row_can_be_selected() {
+        let mut st = MinerState::default();
+        st.settings_ui.active_section = SettingsSection::Parameters;
+        st.settings_ui.row_index = 0;
+        for _ in 0..PARAMETER_ROWS - 1 {
+            settings_navigate_down(&mut st);
+        }
+        assert_eq!(st.settings_ui.active_section, SettingsSection::Parameters);
+        assert_eq!(st.settings_ui.row_index, PARAMETER_ROWS - 1);
+        let before = st.runtime_settings.proving_timeout_secs;
+        adjust_param(&mut st, 1);
+        assert_ne!(st.runtime_settings.proving_timeout_secs, before);
+    }
 
     /// `adjust_param` dispatches on the row INDEX of the parameter list, so inserting a row
     /// silently re-points every arm below it at the wrong setting — and the symptom is that
