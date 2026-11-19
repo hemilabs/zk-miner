@@ -9439,6 +9439,7 @@ async fn miner_brain(
                 .map(|j| j.info.job_id)
                 .collect();
             s.job_measurements.retain(|jid, _| live.contains(jid));
+            s.proving_since.retain(|jid, _| live.contains(jid));
         }
         // Why each job looked at this pass was not claimed, for the dashboard and the headless log.
         {
@@ -11561,7 +11562,9 @@ async fn process_job_lifecycle(
                 // read "Idle", the jobs never attributed to it.
                 let started_pool = pool;
                 let started_runtime = runtime_for_prove_progress;
-                let mark_started = move |_p: f64, slot_key: &str| {
+                // Called on every Progress the worker sends: the start (0.0), then, from a worker that
+                // reports it (risc0, per proven segment), how far the proof is.
+                let mark_started = move |p: f64, slot_key: &str| {
                     // Which physical card took this job. Resolved through the pool
                     // rather than any index, so the dashboard can attribute the job
                     // to the right GPU row on a mixed-vendor box.
@@ -11575,12 +11578,31 @@ async fn process_job_lifecycle(
                             .iter_mut()
                             .find(|j| j.info.job_id == started_id)
                         {
-                            if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
-                                j.status = zkminer_tui::state::MinerJobStatus::Proving {
-                                    progress: 0.0,
-                                    elapsed_secs: 0,
-                                };
+                            let p = if p.is_finite() { p.clamp(0.0, 1.0) } else { 0.0 };
+                            match &mut j.status {
+                                zkminer_tui::state::MinerJobStatus::Queued => {
+                                    j.status = zkminer_tui::state::MinerJobStatus::Proving {
+                                        progress: p,
+                                        elapsed_secs: 0,
+                                    };
+                                }
+                                // Never backwards: each report is applied on its own task, and
+                                // they can land out of order.
+                                zkminer_tui::state::MinerJobStatus::Proving { progress, .. } => {
+                                    *progress = progress.max(p);
+                                }
+                                _ => {}
                             }
+                            st.proving_since
+                                .entry(started_id)
+                                .or_insert_with(std::time::Instant::now);
+                            let Some(j) = st
+                                .active_jobs
+                                .iter_mut()
+                                .find(|j| j.info.job_id == started_id)
+                            else {
+                                return;
+                            };
                             // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after the GPU-OOM arm
                             // rerouted a job to a bigger card the dashboard kept naming the card it had failed on — and this
                             // is the only signal an operator has for which card a job is on. The callback carries the

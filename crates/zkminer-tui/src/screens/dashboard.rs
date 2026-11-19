@@ -872,8 +872,14 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
 
             let status_str = match &job.status {
                 MinerJobStatus::Proving { progress, .. } => {
-                    let (filled, empty) = theme::progress_bar(*progress, 15);
-                    format!("{}{} {:.0}%", filled, empty, progress * 100.0)
+                    let secs = format_duration(state.proving_secs(job));
+                    if *progress > 0.0 {
+                        let (filled, empty) = theme::progress_bar(*progress, 15);
+                        format!("{}{} {:.0}% {secs}", filled, empty, progress * 100.0)
+                    } else {
+                        // No progress reported (SP1 today): how long, not a bar stuck at 0%.
+                        format!("Proving for {secs}")
+                    }
                 }
                 // Queued jobs hold collateral but are not on a card yet — say so plainly
                 // rather than falling through to a generic label.

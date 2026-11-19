@@ -168,9 +168,13 @@ fn main() {
     }
 }
 
-fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
+fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(ipc_stdout);
+    // Shared, so a proof's progress hook can report from inside the proof (see `report_progress`).
+    let shared: IpcOut =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(BufWriter::new(ipc_stdout))));
+    let _ = IPC_OUT.set(shared.clone());
+    let mut stdout = SharedOut(shared);
 
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
@@ -265,9 +269,13 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // to every GPU crashing each, and the program is never classed bad — so it is cheaply
                 // repeatable and drives a release-penalty/slash. Contain it here and answer with an
                 // error (typed by what panicked, below) instead of dying.
+                // The proof's progress reports carry this request (see `report_progress`).
+                *PROVING.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((request_id, Instant::now()));
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_proof(&elf, &input_data, po2, program_id)
                 }));
+                *PROVING.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
@@ -1238,6 +1246,88 @@ fn local_prover() -> risc0_zkvm::LocalProver {
     risc0_zkvm::LocalProver::new("local")
 }
 
+/// The IPC writer, shared between the worker loop and a proof's progress hook.
+type IpcOut = std::sync::Arc<std::sync::Mutex<Box<dyn io::Write + Send>>>;
+
+static IPC_OUT: std::sync::OnceLock<IpcOut> = std::sync::OnceLock::new();
+
+/// The job proof in flight: its request id and when it started, for its progress reports.
+static PROVING: std::sync::Mutex<Option<(u64, Instant)>> = std::sync::Mutex::new(None);
+
+/// A handle on the shared IPC writer. A message is written under one lock per write call, but only
+/// one thread writes at a time: the loop is inside the proof while the hook reports.
+struct SharedOut(IpcOut);
+
+impl io::Write for SharedOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).flush()
+    }
+}
+
+/// The share of a job proof's time the segments take: the rest is the lift/join tail, the keccak
+/// proofs and the Groth16 wrap, which report nothing. Segments are 55-75% of a multi-segment proof;
+/// the host carries the bar through the rest on time.
+const SEGMENT_SHARE: f64 = 0.85;
+
+/// The fraction done when `done` of `total` segments are proven.
+fn segment_fraction(done: u32, total: u32) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    SEGMENT_SHARE * f64::from(done.min(total)) / f64::from(total)
+}
+
+/// Sends the host a `Progress` for the job proof in flight, if any. Best effort: a failed write
+/// shows up as the next message's failure, not here.
+fn report_progress(done: u32, total: u32) {
+    let Some((request_id, started)) = *PROVING.lock().unwrap_or_else(|p| p.into_inner()) else {
+        return;
+    };
+    let Some(out) = IPC_OUT.get() else {
+        return;
+    };
+    let msg = WorkerResponse::Progress {
+        request_id,
+        fraction: segment_fraction(done, total),
+        elapsed_secs: started.elapsed().as_secs_f64(),
+        segments: Some((done, total)),
+    };
+    let _ = write_message(&mut SharedOut(out.clone()), &msg);
+}
+
+/// Reports each proven segment of the session it is hooked onto.
+struct SegmentProgress {
+    total: u32,
+}
+
+impl risc0_zkvm::SessionEvents for SegmentProgress {
+    fn on_post_prove_segment(&self, segment: &risc0_zkvm::Segment) {
+        report_progress(segment.index + 1, self.total);
+    }
+}
+
+/// `prove_with_opts` for a job, reporting each proven segment to the host. The same calls it makes
+/// (`LocalProver::prove_with_ctx` → `ProverServer::prove_with_ctx`), taken one level down so the
+/// session can carry a hook: the prover server first (its GPU warm-up and Groth16 key load overlap
+/// the execution), then the execution, then `prove_session`. The segment size is always set here,
+/// so the server's own choice of one, the only other thing `prove_with_ctx` does, never applies.
+fn prove_reporting_segments(
+    env: risc0_zkvm::ExecutorEnv<'_>,
+    elf: &[u8],
+    opts: &risc0_zkvm::ProverOpts,
+) -> Result<risc0_zkvm::ProveInfo> {
+    let server = risc0_zkvm::get_prover_server(opts)?;
+    let mut session = risc0_zkvm::ExecutorImpl::from_elf(env, elf)?.run()?;
+    let total = u32::try_from(session.segments.len()).unwrap_or(u32::MAX);
+    report_progress(0, total);
+    session.add_hook(SegmentProgress { total });
+    let ctx = risc0_zkvm::VerifierContext::default().with_dev_mode(opts.dev_mode());
+    server.prove_session(&ctx, &session)
+}
+
 fn run_proof(
     elf: &[u8],
     input_data: &[u8],
@@ -1374,10 +1464,9 @@ fn run_proof_once(
     // This performs STARK proving followed by Groth16 SNARK compression,
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
-    let prover = local_prover();
     let opts = ProverOpts::groth16().with_dev_mode(false);
     let start = Instant::now();
-    let proved = prover.prove_with_opts(env, elf, &opts);
+    let proved = prove_reporting_segments(env, elf, &opts);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
     let duration_secs = start.elapsed().as_secs_f64();
@@ -1775,6 +1864,26 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
         total_cycles,
         prove_duration_secs: duration.as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    /// Segments take the bar to SEGMENT_SHARE and no further: the tail after them reports nothing,
+    /// so a bar at 100% would sit there through it.
+    #[test]
+    fn segment_progress_stops_short_of_the_tail() {
+        assert_eq!(segment_fraction(0, 12), 0.0);
+        assert!((segment_fraction(6, 12) - SEGMENT_SHARE / 2.0).abs() < 1e-12);
+        assert_eq!(segment_fraction(12, 12), SEGMENT_SHARE);
+        assert_eq!(
+            segment_fraction(13, 12),
+            SEGMENT_SHARE,
+            "never past the segments' share"
+        );
+        assert_eq!(segment_fraction(0, 0), 0.0);
+    }
 }
 
 #[cfg(test)]
