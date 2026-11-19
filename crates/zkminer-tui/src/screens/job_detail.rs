@@ -25,9 +25,9 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     let selected = match state.selected_job_id {
         Some(id) => by_id(id),
         None => state
-            .open_jobs
+            .jobs_page_rows()
             .get(state.selected_job_index)
-            .or_else(|| state.active_jobs.first()),
+            .copied(),
     };
     if selected.is_none() && state.selected_job_id.is_some() {
         let paragraph = Paragraph::new(Span::styled(

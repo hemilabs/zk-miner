@@ -384,7 +384,7 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         },
         KeyCode::Down | KeyCode::Char('j') => match state.current_screen {
             Screen::Jobs => {
-                let max = state.open_jobs.len().saturating_sub(1);
+                let max = state.jobs_page_rows().len().saturating_sub(1);
                 state.selected_job_index = (state.selected_job_index + 1).min(max);
                 state.selected_job_id = None;
             }
@@ -402,8 +402,12 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         KeyCode::Enter | KeyCode::Char(' ') => match state.current_screen {
             Screen::Jobs => {
                 if key.code == KeyCode::Enter {
-                    if let Some(job) = state.open_jobs.get(state.selected_job_index) {
-                        state.selected_job_id = Some(job.info.job_id);
+                    let picked = state
+                        .jobs_page_rows()
+                        .get(state.selected_job_index)
+                        .map(|job| job.info.job_id);
+                    if let Some(id) = picked {
+                        state.selected_job_id = Some(id);
                         state.current_screen = Screen::JobDetail;
                     }
                 }

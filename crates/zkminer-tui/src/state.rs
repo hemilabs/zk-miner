@@ -1123,6 +1123,20 @@ impl TuiContext {
 }
 
 impl MinerState {
+    /// The Jobs page's rows, in order: the jobs this miner has claimed, then the open market less
+    /// any job also among them (a claim the market list has not caught up with yet). Its selection
+    /// (`selected_job_index`) indexes this list.
+    pub fn jobs_page_rows(&self) -> Vec<&TrackedJob> {
+        let claimed = self.active_jobs.iter();
+        let open = self.open_jobs.iter().filter(|o| {
+            !self
+                .active_jobs
+                .iter()
+                .any(|a| a.info.job_id == o.info.job_id)
+        });
+        claimed.chain(open).collect()
+    }
+
     /// Map a GPU-tuning device id (see `gpu_tuning::tuning_device_id`) to the
     /// benchmark `device_id` for the same physical card.
     ///
