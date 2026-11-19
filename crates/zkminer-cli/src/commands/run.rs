@@ -2200,13 +2200,15 @@ fn program_sim_reverted_recently(
 /// jobId -> `Instant` before which a claim refused for a TEMPORARY reason is not re-attempted: a live
 /// price below our high-water floor or a live bid (`Wait`), a router/Registry pause (`Paused`), or a
 /// free-stake shortfall (`StakeShort`). Keeps the job a candidate without re-quoting it every tick.
-static CLAIM_RETRY_AFTER: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>,
-> = std::sync::OnceLock::new();
+/// Per job: until when it is not claimed, and why (what the Jobs page and the claims summary say
+/// for it meanwhile).
+type RetryAfter =
+    std::collections::HashMap<alloy::primitives::B256, (std::time::Instant, &'static str)>;
 
-fn claim_retry_after_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>
-{
+static CLAIM_RETRY_AFTER: std::sync::OnceLock<std::sync::Mutex<RetryAfter>> =
+    std::sync::OnceLock::new();
+
+fn claim_retry_after_map() -> &'static std::sync::Mutex<RetryAfter> {
     CLAIM_RETRY_AFTER.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -2220,7 +2222,7 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
         ClaimClass::StakeShort => 60,
         _ => 30,
     };
-    note_preclaim_strike(job_id, base);
+    note_preclaim_strike(job_id, base, "backing off after a refused claim");
 }
 /// Post-claim FAILURE breaker. A claimed job whose (program, input) measured clean and then failed
 /// after the lock — ANY terminal prove failure (a guest fault, a watchdog kill, a health failure, a
@@ -2586,15 +2588,16 @@ fn program_has_no_elf_source(program_id: B256) -> bool {
 }
 
 /// Back a job off for `wait`: the candidate loop skips it (measurement included) until then.
-fn note_job_retry_after(job_id: alloy::primitives::B256, wait: Duration) {
+/// Back `job_id` off for `wait`; `why` is what is said for it until then.
+fn note_job_retry_after(job_id: alloy::primitives::B256, wait: Duration, why: &'static str) {
     if let Ok(mut m) = claim_retry_after_map().lock() {
         let now = std::time::Instant::now();
         // Full: drop the expired first, so the bound evicts a live back-off (re-admitting a decoy
         // early) only when every entry is live.
         if m.len() >= MEASURED_CYCLES_CAP {
-            m.retain(|_, until| *until > now);
+            m.retain(|_, (until, _)| *until > now);
         }
-        bounded_insert(&mut m, job_id, now + wait, MEASURED_CYCLES_CAP);
+        bounded_insert(&mut m, job_id, (now + wait, why), MEASURED_CYCLES_CAP);
     }
 }
 
@@ -2607,10 +2610,10 @@ static PRECLAIM_STRIKES: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn note_transient_preclaim_failure(job_id: alloy::primitives::B256) -> u32 {
-    note_preclaim_strike(job_id, 30)
+    note_preclaim_strike(job_id, 30, "backing off after a failed pre-claim step")
 }
 
-fn note_preclaim_strike(job_id: alloy::primitives::B256, base_secs: u64) -> u32 {
+fn note_preclaim_strike(job_id: alloy::primitives::B256, base_secs: u64, why: &'static str) -> u32 {
     let strikes = PRECLAIM_STRIKES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let k = match strikes.lock() {
         Ok(mut m) => {
@@ -2621,7 +2624,7 @@ fn note_preclaim_strike(job_id: alloy::primitives::B256, base_secs: u64) -> u32 
         Err(_) => 1,
     };
     let wait = Duration::from_secs(base_secs << (k - 1).min(6)).min(Duration::from_secs(1800));
-    note_job_retry_after(job_id, wait);
+    note_job_retry_after(job_id, wait, why);
     k
 }
 
@@ -2678,8 +2681,8 @@ static SET_ASIDE: std::sync::Mutex<Option<std::collections::HashMap<B256, std::t
 
 /// Back a job off for `wait` (see [`note_job_retry_after`]) on a verdict that lasts, so it also
 /// ranks last in the Open set (see [`open_rank`]).
-fn set_job_aside(job_id: B256, wait: Duration) {
-    note_job_retry_after(job_id, wait);
+fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
+    note_job_retry_after(job_id, wait, why);
     let mut g = SET_ASIDE.lock().unwrap_or_else(|p| p.into_inner());
     let m = g.get_or_insert_with(Default::default);
     if m.len() >= MEASURED_CYCLES_CAP {
@@ -2721,15 +2724,23 @@ fn job_set_aside(job_id: B256) -> bool {
 }
 
 fn claim_backing_off(job_id: alloy::primitives::B256) -> bool {
+    claim_backoff_reason(job_id).is_some()
+}
+
+/// Why `job_id` is backed off, while it is: the reason given when it was, not a generic "refused".
+/// Most back-offs are not refused claims at all (a verdict that lasts, a measurement of the same
+/// input in flight, a live bid), and showing every one as a refused claim told the operator nothing
+/// true about it.
+fn claim_backoff_reason(job_id: alloy::primitives::B256) -> Option<&'static str> {
     if let Ok(mut m) = claim_retry_after_map().lock() {
-        if let Some(&until) = m.get(&job_id) {
+        if let Some(&(until, why)) = m.get(&job_id) {
             if std::time::Instant::now() < until {
-                return true;
+                return Some(why);
             }
             m.remove(&job_id);
         }
     }
-    false
+    None
 }
 
 /// Journal bindings that a real fulfil showed unsatisfiable (`JournalMismatch`): the job's WHOLE
@@ -8173,8 +8184,8 @@ async fn miner_brain(
             .filter(|j| !undecodable_now.contains(&j.info.job_id))
             .filter(|j| {
                 let jid = j.info.job_id;
-                let why = if claim_backing_off(jid) {
-                    Some("backing off after a refused claim")
+                let why = if let Some(why) = claim_backoff_reason(jid) {
+                    Some(why)
                 } else if !claim_predicate_now && job_is_bound(jid) {
                     Some("bound job (claim_predicate_jobs is off)")
                 } else if program_has_no_elf_source(j.info.program_id) {
@@ -8280,7 +8291,11 @@ async fn miner_brain(
                     .bid_deadline
                     .saturating_sub(zkminer_chain::client::chain_now_floor());
                 tracing::debug!("Skipping {}: a bid is live for {left}s more", short_id(jid));
-                note_job_retry_after(jid, Duration::from_secs(left.clamp(30, 3600)));
+                note_job_retry_after(
+                    jid,
+                    Duration::from_secs(left.clamp(30, 3600)),
+                    "a bid is live",
+                );
                 declines.note(jid, "a bid is live");
                 continue;
             }
@@ -8396,8 +8411,8 @@ async fn miner_brain(
             // SKIP (not evict) a job whose last claim was refused for a TEMPORARY reason (a live price
             // below our high-water floor, a live bid, a pause, a free-stake shortfall): re-quote it after
             // a short back-off rather than every tick.
-            if claim_backing_off(jid) {
-                declines.note(jid, "backing off after a refused claim");
+            if let Some(why) = claim_backoff_reason(jid) {
+                declines.note(jid, why);
                 continue;
             }
             // A submitter whose job measured clean and then faulted after the claim, or the global
@@ -9150,7 +9165,15 @@ async fn miner_brain(
                 && (measured_for_job.is_some()
                     || snapshot.expected_cycles >= FALLBACK_ESTIMATED_CYCLES)
             {
-                set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                set_job_aside(
+                    jid,
+                    DETERMINISTIC_SKIP_TTL,
+                    if eval.deadline_feasible {
+                        "set aside: too risky to claim"
+                    } else {
+                        "set aside: cannot be proved by its deadline"
+                    },
+                );
             }
             // Count + remember the cheapest job blocked SOLELY by collateral —
             // i.e. under-collateralized but otherwise on-time. Requiring
@@ -9241,7 +9264,11 @@ async fn miner_brain(
                         // Deterministic for this (program, input) — an unmeasurable guest lands here
                         // too — so set the job aside rather than let it hold a slot of the per-tick
                         // candidate cut on every tick.
-                        set_job_aside(jid, UNMEASURABLE_RETRY_TTL);
+                        set_job_aside(
+                            jid,
+                            UNMEASURABLE_RETRY_TTL,
+                            "too large for proving_timeout_secs",
+                        );
                         declines.note(jid, "too large for proving_timeout_secs");
                         continue;
                     }
@@ -10816,7 +10843,11 @@ async fn process_job_lifecycle(
              holds claims — nothing locked",
             short_id(job_id)
         );
-        note_job_retry_after(job_id, Duration::from_secs(300));
+        note_job_retry_after(
+            job_id,
+            Duration::from_secs(300),
+            "held: a claim gate is closed",
+        );
         requeue_open_job(state, requeue_job.clone()).await;
         return Ok(());
     }
@@ -11046,7 +11077,11 @@ async fn process_job_lifecycle(
             "Not claiming {} now: a claim gate closed during its pre-claim fetches — nothing locked",
             short_id(job_id)
         );
-        note_job_retry_after(job_id, Duration::from_secs(300));
+        note_job_retry_after(
+            job_id,
+            Duration::from_secs(300),
+            "held: a claim gate is closed",
+        );
         requeue_open_job(state, requeue_job.clone()).await;
         return Ok(());
     }
@@ -13185,7 +13220,7 @@ async fn measure_cycles(
                 );
                 mark_assigned_elsewhere(assigned_elsewhere, job_id, wait);
                 if paces_claims {
-                    set_job_aside(job_id, wait);
+                    set_job_aside(job_id, wait, "assigned to another prover");
                 }
                 return;
             }
@@ -13288,7 +13323,11 @@ async fn measure_cycles(
         // The winner decides for this descriptor too (its resolver is recorded): no need to take a
         // measure slot again until it has.
         if paces_claims {
-            note_job_retry_after(job_id, Duration::from_secs(15));
+            note_job_retry_after(
+                job_id,
+                Duration::from_secs(15),
+                "waiting on a measurement of the same input",
+            );
         }
         return;
     }
@@ -13971,14 +14010,7 @@ pub(crate) async fn fetch_or_download_elf(
     }
     {
         let mut s = state.write().await;
-        s.add_log(
-            LogLevel::Info,
-            format!(
-                "Downloading ELF '{}' ({} URIs)",
-                zkminer_chain::programs::sanitize_log(&info.name),
-                info.storage_uris.len()
-            ),
-        );
+        s.add_log(LogLevel::Info, elf_download_note(program_id, &info));
     }
     // Through the network guard built from this config (`client.elf_fetcher()`): every storage URI
     // and redirect is submitter-controlled, so only public destinations are reached unless
@@ -14006,6 +14038,30 @@ pub(crate) async fn fetch_or_download_elf(
     .await
     .map_err(|e| anyhow::anyhow!("ELF cache-write task failed: {e}"))?;
     Ok(elf)
+}
+
+/// The dashboard's line for an ELF fetch. A program with no download address is not fetched at all
+/// (its jobs are skipped for `NO_ELF_SOURCE_TTL`): it read "Downloading ELF '' (0 URIs)", an
+/// unregistered program's empty name and empty list, which looked like a fault of ours.
+fn elf_download_note(
+    program_id: alloy::primitives::B256,
+    info: &zkminer_chain::programs::ProgramInfo,
+) -> String {
+    let name = zkminer_chain::programs::sanitize_log(&info.name);
+    let program = if name.is_empty() {
+        format!("program {}", short_id(program_id))
+    } else {
+        format!("'{name}' ({})", short_id(program_id))
+    };
+    match info.storage_uris.len() {
+        0 => format!(
+            "No ELF download for {program}: the ProgramRegistry lists no address for it (not \
+             registered, or registered without one). Its jobs are skipped for {} min.",
+            NO_ELF_SOURCE_TTL.as_secs() / 60
+        ),
+        1 => format!("Downloading ELF for {program}"),
+        n => format!("Downloading ELF for {program} ({n} sources)"),
+    }
 }
 
 /// The ProgramRegistry could not be read (and no cached ELF stood in): an RPC failure, which says
@@ -15419,6 +15475,36 @@ mod tests {
         // No rate, no card.
         assert!(!fits(1, 0.0, 3000));
         assert!(!fits(1, f64::NAN, 3000));
+    }
+
+    /// The dashboard says plainly that a program has nothing to download, naming it by id when the
+    /// registry has no name for it, instead of "Downloading ELF '' (0 URIs)".
+    #[test]
+    fn an_elf_fetch_names_the_program_and_says_when_there_is_nothing_to_fetch() {
+        use zkminer_chain::programs::{ProgramInfo, ResolvedURI, StorageKind};
+        let id = B256::repeat_byte(0x5e);
+        let mut info = ProgramInfo {
+            program_id: id,
+            proof_system_id: B256::ZERO,
+            name: String::new(),
+            status: 0,
+            estimated_cycles: 0,
+            storage_uris: Vec::new(),
+            elf_hash: None,
+        };
+        let none = elf_download_note(id, &info);
+        assert!(none.starts_with("No ELF download for program 0x5e5e5e5e"), "{none}");
+        assert!(none.contains("skipped for 10 min"), "{none}");
+        info.name = "fibonacci".into();
+        info.storage_uris.push(ResolvedURI {
+            storage_type: StorageKind::HTTP,
+            uri: "http://example.invalid/f.bin".into(),
+            content_hash: B256::ZERO,
+        });
+        assert_eq!(
+            elf_download_note(id, &info),
+            "Downloading ELF for 'fibonacci' (0x5e5e5e5e)"
+        );
     }
 
     /// A lock past its deadline meets every recovery pass until a keeper slashes it: it is paged
@@ -17000,16 +17086,33 @@ mod r2_sizing_tests {
         // A temporary refusal backs a job off, and it is then put back: it keeps its price, or a full
         // Open set would evict exactly the job just requeued.
         let backing_off = job(0xB2);
-        note_job_retry_after(backing_off.info.job_id, Duration::from_secs(60));
+        note_job_retry_after(
+            backing_off.info.job_id,
+            Duration::from_secs(60),
+            "a bid is live",
+        );
         assert!(claim_backing_off(backing_off.info.job_id));
         assert_eq!(open_rank(&backing_off), 1_000);
         // A lasting verdict (assigned elsewhere, too slow) ranks it last, and backs it off too.
         let aside = job(0xB3);
-        set_job_aside(aside.info.job_id, Duration::from_secs(60));
+        set_job_aside(
+            aside.info.job_id,
+            Duration::from_secs(60),
+            "assigned to another prover",
+        );
+        assert_eq!(
+            claim_backoff_reason(aside.info.job_id),
+            Some("assigned to another prover"),
+            "a set-aside job keeps saying why, not that a claim was refused"
+        );
         assert!(claim_backing_off(aside.info.job_id));
         assert_eq!(open_rank(&aside), 0);
         let expired = job(0xB4);
-        set_job_aside(expired.info.job_id, Duration::ZERO);
+        set_job_aside(
+            expired.info.job_id,
+            Duration::ZERO,
+            "assigned to another prover",
+        );
         assert_eq!(open_rank(&expired), 1_000, "only while it lasts");
     }
 
