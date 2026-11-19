@@ -5650,6 +5650,8 @@ mod power_state_tests {
     }
 
     /// A read-only cache directory changes nothing: the load needs no write.
+    /// Unix only: it sets the directory's mode bits.
+    #[cfg(unix)]
     #[test]
     fn a_read_only_cache_still_loads_with_advice() {
         let (dir, path) = scratch_cache("ro");

@@ -17,6 +17,9 @@
 //! from its own directory: discovery also searches the CLI's own directory, and cargo's
 //! `target/debug` can hold a real worker (zkminer-prove-risc0-metal), which must not be started.
 
+// The mock workers are installed with Unix symlinks and mode bits.
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
