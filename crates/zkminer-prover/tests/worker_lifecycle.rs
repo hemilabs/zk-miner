@@ -684,6 +684,98 @@ fn a_lost_server_after_a_host_oom_is_a_memory_shortage() {
     );
 }
 
+// ---- Windows: a failure for want of host memory is not the card's ----
+
+/// A worker that exits with `STATUS_COMMITMENT_LIMIT` died because the host's commit ran out, not
+/// because its card failed: a memory shortage that costs the attempt and is not charged to the slot.
+#[cfg(windows)]
+#[test]
+fn a_worker_that_died_out_of_commit_is_a_host_memory_shortage() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "prove");
+    env.insert(
+        "MOCK_CRASH_CODE".to_string(),
+        (0xC000_012Du32 as i32).to_string(),
+    );
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+
+    let e = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None)
+        .expect_err("this worker exits on the proof");
+    let shortage = e
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .unwrap_or_else(|| panic!("not read as a host shortage: {e:#}"));
+    assert!(shortage.attempted);
+    assert_eq!(
+        pool.test_consecutive_failures("mock:generic"),
+        Some(0),
+        "a host shortage is not charged to the slot"
+    );
+}
+
+/// The same death with another code, and the host not short, is the worker's own failure.
+#[cfg(windows)]
+#[test]
+fn a_worker_that_crashed_otherwise_is_its_own_failure() {
+    let roomy = zkminer_prover::memory::mem_available_bytes().unwrap_or(0)
+        > 2 * zkminer_prover::memory::HOST_SHORT_LOW_WATER_BYTES;
+    if !roomy {
+        eprintln!("skipped: this host is short of memory now, which is the other case");
+        return;
+    }
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "prove");
+    env.insert(
+        "MOCK_CRASH_CODE".to_string(),
+        (0xC000_0005u32 as i32).to_string(),
+    );
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+
+    let e = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None)
+        .expect_err("this worker exits on the proof");
+    assert!(e
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .is_none());
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(1));
+    // Its exit code is in the error.
+    assert!(format!("{e:#}").contains("0xC0000005"), "{e:#}");
+}
+
+/// A worker reporting that it ran out of memory while the host had plenty ran out on its CARD: that
+/// stays the typed GPU out-of-memory.
+#[cfg(windows)]
+#[test]
+fn an_out_of_memory_with_room_on_the_host_is_the_cards() {
+    let roomy = zkminer_prover::memory::mem_available_bytes().unwrap_or(0)
+        > 2 * zkminer_prover::memory::HOST_SHORT_LOW_WATER_BYTES;
+    if !roomy {
+        eprintln!("skipped: this host is short of memory now, which is the other case");
+        return;
+    }
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    let mut env = mock_env("", "");
+    env.insert(
+        "MOCK_PROVE_ERROR_KIND".to_string(),
+        "resource_exhausted".to_string(),
+    );
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+
+    let e = pool
+        .prove("mock", &[], &[], None, Some(Duration::from_secs(30)), None)
+        .expect_err("this worker reports an out-of-memory");
+    assert!(e
+        .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+        .is_none());
+    let worker = e
+        .downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>()
+        .unwrap_or_else(|| panic!("not the worker's typed error: {e:#}"));
+    assert!(worker.is_gpu_oom());
+}
+
 // ---- Normal operation (no timeout, no crash) ----
 
 #[test]

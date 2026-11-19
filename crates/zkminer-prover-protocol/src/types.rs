@@ -1368,7 +1368,16 @@ impl std::fmt::Display for HostMemoryShortage {
             self.needed as f64 / GIB,
             self.reserved as f64 / GIB,
             self.available as f64 / GIB,
-        )
+        )?;
+        // Under Windows the figures are COMMIT (RAM plus page file), which is what runs out there,
+        // and what a larger page file raises.
+        if cfg!(windows) {
+            write!(
+                f,
+                " (Windows: committed memory, RAM plus page file; a larger page file raises it)"
+            )?;
+        }
+        Ok(())
     }
 }
 

@@ -3869,6 +3869,9 @@ pub struct WorkerPool {
     /// is charged `unmeasured_peak_for(backend)`, so forgetting to publish errs toward refusing work
     /// rather than toward over-committing the host.
     expected_peaks: Mutex<HashMap<String, u64>>,
+    /// Slot key -> the host memory its real proofs reached, by po2 (`memory::learned_host_peak`).
+    /// Windows only: filled after each proof there (`learn_host_peak`), empty elsewhere.
+    learned_peaks: Mutex<HashMap<String, crate::memory::LearnedPeaks>>,
     /// Host memory in-flight proofs have laid claim to. See `memory::MemoryLedger`.
     memory_ledger: crate::memory::MemoryLedger,
     /// Backends whose one-time setup has completed on this host; see `warm_up`.
@@ -4040,6 +4043,7 @@ impl WorkerPool {
     ) -> Self {
         Self {
             expected_peaks: Mutex::new(HashMap::new()),
+            learned_peaks: Mutex::new(HashMap::new()),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
             measure_warm_pids: Mutex::new(HashMap::new()),
@@ -5232,8 +5236,8 @@ impl WorkerPool {
             // measure worker's `MEMORY_LIMIT` below so SP1's own 100 ms RSS monitor turns a ballooning
             // guest into a clean in-band `TooMuchMemory` decline instead of a host-OOM. The SAME value
             // is charged to the host ledger at the measure gate (charge == enforced cap) and set on the
-            // SP1 prove worker (measurable ⇔ provable). `mem_total_bytes()` is static; `None` → fall
-            // back to SP1's 24 GiB default.
+            // SP1 prove worker (measurable ⇔ provable). The cap is taken from physical memory, which
+            // is static (`sp1_measure_cap_bytes`); `None` → fall back to SP1's 24 GiB default.
             let measure_cap = crate::memory::sp1_measure_cap_bytes(
                 crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
             );
@@ -5864,8 +5868,10 @@ impl WorkerPool {
         // sweep to po2 22 from a baseline of 20 is ~4x the baseline cost.
         let _memory_reservation = {
             let backend_of_slot = key.split(':').next().unwrap_or(key);
+            // The published figure: it is a measurement doubled, and halving it is what that
+            // assumes. A card's learned figure (Windows) is a real proof's.
             let baseline = self
-                .expected_host_peak(backend_of_slot)
+                .published_host_peak(backend_of_slot)
                 .div_ceil(crate::memory::MEASUREMENT_SAFETY_FACTOR);
             let want = crate::memory::peak_for_po2(baseline, po2);
             match self.reserve_host_memory(want, key) {
@@ -6738,7 +6744,7 @@ impl WorkerPool {
             };
             let benchmark_po2 = self.benchmark_po2(&key);
             let host_peak_bytes = self
-                .host_peak_for_slot(&key)
+                .benchmark_host_peak(&key)
                 .map(|p| crate::memory::peak_at_baseline(p, benchmark_po2));
             run.record(
                 &key,
@@ -7242,7 +7248,7 @@ impl WorkerPool {
             };
             let benchmark_po2 = self.benchmark_po2(&key);
             let host_peak_bytes = self
-                .host_peak_for_slot(&key)
+                .benchmark_host_peak(&key)
                 .map(|p| crate::memory::peak_at_baseline(p, benchmark_po2));
             run.record(
                 &key,
@@ -8669,7 +8675,16 @@ impl WorkerPool {
     /// Per-backend, not one blunt figure: charging risc0 the SP1 default needs ~21 GiB free before
     /// anything is admitted, so an unbenchmarked 2-GPU box would sit idle reporting only that it
     /// "cannot fit it right now". Same reason `unmeasured_peak_for` exists at all.
+    ///
+    /// Where this backend's cards have learned what their proofs take (`learned_peaks`, Windows), the
+    /// most any of its cards is charged (`slot_host_peak`), so a figure with no card in mind covers
+    /// whichever card the proof lands on.
     pub fn expected_host_peak(&self, backend: &str) -> u64 {
+        self.backend_host_peak(backend, None)
+    }
+
+    /// The published figure for `backend`: the benchmark suite's, else the unmeasured default.
+    fn published_host_peak(&self, backend: &str) -> u64 {
         self.expected_peaks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -8683,6 +8698,103 @@ impl WorkerPool {
             })
     }
 
+    /// The published figure at `po2` (`expected_host_peak_at_po2`'s scaling).
+    fn published_host_peak_at_po2(&self, backend: &str, po2: Option<u8>) -> u64 {
+        let base = self.published_host_peak(backend);
+        match po2 {
+            Some(p) => crate::memory::peak_for_po2(base, p),
+            None => base,
+        }
+    }
+
+    /// What a proof at `po2` on the slot `key` is charged in host memory: what that card's real
+    /// proofs at this po2 or above reached (`memory::learned_host_peak`), else the published figure.
+    fn slot_host_peak(&self, key: &str, po2: Option<u8>) -> u64 {
+        let backend = key.split(':').next().unwrap_or(key);
+        let learned = self
+            .learned_peaks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .and_then(|learned| {
+                crate::memory::learned_host_peak(
+                    learned,
+                    po2,
+                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
+                )
+            });
+        learned.unwrap_or_else(|| self.published_host_peak_at_po2(backend, po2))
+    }
+
+    /// The most a proof at `po2` is charged on any of `backend`'s cards (`slot_host_peak`), or the
+    /// published figure when it has none.
+    fn backend_host_peak(&self, backend: &str, po2: Option<u8>) -> u64 {
+        self.workers
+            .keys()
+            .filter(|key| key.split(':').next() == Some(backend))
+            .map(|key| self.slot_host_peak(key, po2))
+            .max()
+            .unwrap_or_else(|| self.published_host_peak_at_po2(backend, po2))
+    }
+
+    /// Drop what `key`'s proofs were learned to take: one ran the host out of memory, so the figure
+    /// did not cover it, and its next proofs are charged the published one until one succeeds.
+    fn forget_learned_host_peak(&self, key: &str) {
+        self.learned_peaks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// Host memory the IDLE workers hold, which a proof that needs it recycles them for
+    /// (`make_host_room`): for the pressure check, which must not brake on memory dispatch would
+    /// give back. Windows only, where an idle worker keeps tens of GB committed; 0 elsewhere,
+    /// where an idle worker's resident memory is small and the check stays as it was.
+    pub fn idle_reclaimable_host_bytes(&self) -> u64 {
+        if !cfg!(windows) {
+            return 0;
+        }
+        self.idle_prove_holdings()
+            .iter()
+            .fold(0u64, |sum, (_, held)| sum.saturating_add(*held))
+    }
+
+    /// Windows: note `peak`, the most `key`'s worker and what it started held at once during a proof
+    /// at `po2` that succeeded (`memory::LowWater::tree_peak`), so its next proofs are charged what
+    /// this card's proofs take (`slot_host_peak`) rather than a default measured on another machine.
+    ///
+    /// Not on Linux, where the benchmark's figure stands.
+    fn learn_host_peak(&self, key: &str, po2: Option<u8>, peak: Option<u64>) {
+        if !cfg!(windows) {
+            return;
+        }
+        let Some(peak) = peak else {
+            return;
+        };
+        let before = self.slot_host_peak(key, po2);
+        let rose = crate::memory::note_learned_peak(
+            self.learned_peaks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key.to_string())
+                .or_default(),
+            po2,
+            peak,
+        );
+        let after = self.slot_host_peak(key, po2);
+        if rose && after != before {
+            const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+            tracing::info!(
+                "{key}: its proofs{} have committed up to {:.1} GiB of host memory; they are now \
+                 charged {:.1} GiB (was {:.1} GiB)",
+                po2.map(|p| format!(" at po2 {p}")).unwrap_or_default(),
+                peak as f64 / GIB,
+                after as f64 / GIB,
+                before as f64 / GIB,
+            );
+        }
+    }
+
     /// As `expected_host_peak`, scaled to the segment size the proof will actually use.
     ///
     /// The budget is stored per backend and is otherwise po2-BLIND, while host memory doubles per po2
@@ -8691,11 +8803,7 @@ impl WorkerPool {
     /// lowering po2 as the remedy for a number po2 did not affect. `None` means the resolver had no
     /// opinion, in which case the stored figure already describes the default.
     pub fn expected_host_peak_at_po2(&self, backend: &str, po2: Option<u8>) -> u64 {
-        let base = self.expected_host_peak(backend);
-        match po2 {
-            Some(p) => crate::memory::peak_for_po2(base, p),
-            None => base,
-        }
+        self.backend_host_peak(backend, po2)
     }
 
     /// Reserve host memory for a proof about to start, or refuse it.
@@ -8737,12 +8845,45 @@ impl WorkerPool {
         // the full peak on top would count the same pages twice — see `can_admit`'s `resident`.
         // Zero when unreadable, which is the conservative reading.
         let resident = self.current_host_bytes_for_slot(slot_key).unwrap_or(0);
+        // Windows: a proof's commit grows as it goes, so one admitted a moment ago has not shown in
+        // free commit yet. Its growth still to come is held back from the next admission
+        // (`MemoryLedger::try_reserve_tracked`): without it, two proofs admitted back to back each
+        // saw the other's share as free. Only where the slot's worker can be read: a reservation
+        // whose growth cannot be seen (a measurement, a warm-up) would be held back in full while
+        // free commit already shows what it allocated, counting it twice.
+        if cfg!(windows) && self.current_host_bytes_for_slot(slot_key).is_some() {
+            return self.memory_ledger.try_reserve_tracked(
+                expected_peak,
+                resident,
+                available,
+                total,
+                crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+                slot_key,
+                |slot| self.current_host_bytes_for_slot(slot),
+            );
+        }
         self.memory_ledger.try_reserve(
             expected_peak,
             resident,
             available,
             total,
             crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+        )
+    }
+
+    /// Live headroom for an admission decision: `mem_available_bytes`, less (Windows) what proofs
+    /// admitted already have still to allocate (`MemoryLedger::pending_growth`), as
+    /// `reserve_host_memory` takes it.
+    fn admission_available(&self) -> Option<u64> {
+        let available = crate::memory::mem_available_bytes()?;
+        if !cfg!(windows) {
+            return Some(available);
+        }
+        Some(
+            available.saturating_sub(
+                self.memory_ledger
+                    .pending_growth(|slot| self.current_host_bytes_for_slot(slot)),
+            ),
         )
     }
 
@@ -8765,7 +8906,21 @@ impl WorkerPool {
         )
     }
 
-    #[cfg(not(unix))]
+    /// Windows: what the worker and every process it started have COMMITTED
+    /// (`memory::tree_commit_bytes`), the figure `mem_available_bytes` is net of there. An idle
+    /// worker keeps what its last proof committed: tens of GB for a CUDA prover.
+    #[cfg(windows)]
+    pub fn current_host_bytes_for_slot(&self, slot_key: &str) -> Option<u64> {
+        let entry = self.workers.get(slot_key)?;
+        let pid = entry.pid.load(Ordering::Acquire);
+        let started = entry.pid_starttime.load(Ordering::Acquire);
+        if pid == 0 || started == 0 {
+            return None;
+        }
+        crate::memory::tree_commit_bytes(pid, Some(started)).map(|(now, _)| now)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn current_host_bytes_for_slot(&self, _slot_key: &str) -> Option<u64> {
         None
     }
@@ -8803,7 +8958,7 @@ impl WorkerPool {
     /// portable executor) leaves the estimate as it is.
     fn host_want(&self, key: &str, po2: Option<u8>, execute_peak_bytes: u64) -> u64 {
         let backend = key.split(':').next().unwrap_or(key);
-        let want = self.expected_host_peak_at_po2(backend, po2);
+        let want = self.slot_host_peak(key, po2);
         if backend == zkminer_prover_protocol::BACKEND_SP1 && execute_peak_bytes > 0 {
             let server_resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
             return want.max(execute_peak_bytes.saturating_add(server_resident));
@@ -9000,7 +9155,7 @@ impl WorkerPool {
         {
             return None;
         }
-        let available = crate::memory::mem_available_bytes()?;
+        let available = self.admission_available()?;
         let total = crate::memory::mem_total_bytes()?;
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         let reserved = self.reserved_host_memory();
@@ -9083,7 +9238,6 @@ impl WorkerPool {
     /// cursor — so it reaches the warm slot within a pass or two, and the free waits are capped
     /// independently of the deadline. Latency, not an outage. `prove_min_vram` also now prefers a slot
     /// whose worker is already warm, which closes most of the gap directly.
-    #[cfg(unix)]
     fn resident_host_bytes_for_backend(&self, backend: &str) -> u64 {
         self.workers
             .keys()
@@ -9099,21 +9253,10 @@ impl WorkerPool {
     /// only the difference between its resident set and the expected peak, so it is both the fastest
     /// choice (no CUDA re-init, warm `pk_cache`) and the one most likely to be admitted — which is
     /// what keeps the claim gate's optimistic MAX credit honest.
-    #[cfg(unix)]
     fn resident_bytes_by_slot(&self, keys: &[String]) -> Vec<(String, u64)> {
         keys.iter()
             .map(|k| (k.clone(), self.current_host_bytes_for_slot(k).unwrap_or(0)))
             .collect()
-    }
-
-    #[cfg(not(unix))]
-    fn resident_bytes_by_slot(&self, keys: &[String]) -> Vec<(String, u64)> {
-        keys.iter().map(|k| (k.clone(), 0)).collect()
-    }
-
-    #[cfg(not(unix))]
-    fn resident_host_bytes_for_backend(&self, _backend: &str) -> u64 {
-        0
     }
 
     /// The SUM of resident sets across ALL this backend's live workers, in bytes (finding RH3).
@@ -9126,7 +9269,6 @@ impl WorkerPool {
     /// undercounts the multi-GPU server footprint and could admit a job the host cannot actually
     /// prove. Identical to the MAX on a single-GPU host (a one-element sum), so single-GPU is
     /// unchanged.
-    #[cfg(unix)]
     fn resident_host_bytes_sum_for_backend(&self, backend: &str) -> u64 {
         self.workers
             .keys()
@@ -9135,15 +9277,9 @@ impl WorkerPool {
             .fold(0u64, |acc, r| acc.saturating_add(r))
     }
 
-    #[cfg(not(unix))]
-    fn resident_host_bytes_sum_for_backend(&self, _backend: &str) -> u64 {
-        0
-    }
-
     /// Host RAM held by each IDLE worker of a backend other than `backend`: a live worker whose slot
     /// is free right now, so nothing is running on it. What `make_host_room` may recycle, and so what
     /// the claim gate may count on getting back.
-    #[cfg(unix)]
     fn idle_host_holdings_except(&self, backend: &str) -> Vec<(String, u64)> {
         self.workers
             .iter()
@@ -9158,11 +9294,6 @@ impl WorkerPool {
             .collect()
     }
 
-    #[cfg(not(unix))]
-    fn idle_host_holdings_except(&self, _backend: &str) -> Vec<(String, u64)> {
-        Vec::new()
-    }
-
     /// Host RAM held by every IDLE PROVE worker, ANY backend — what `make_measure_room` may recycle to
     /// fit a cycle MEASUREMENT. A CPU measurement (SP1 on its CpuProver, risc0 on its default executor)
     /// needs NONE of the GPU provers' resident state, so any idle prove worker of any backend is fair
@@ -9171,11 +9302,12 @@ impl WorkerPool {
     /// on a co-hosted box), exactly as a risc0 PROOF already does via `make_host_room`. Was previously
     /// same-backend-only, which wedged risc0 claiming on a warm-SP1 host: the risc0 measure slot has no
     /// resident credit and could not evict the SP1 server, so it was refused forever once SP1 warmed.
-    /// `make_measure_room` filters by `MIN_EVICTABLE_HOLDING`, so small idle workers (an idle risc0
-    /// prover holds MB, not GB) are never torn down for a measurement. This is distinct from
+    /// `make_measure_room` filters by `MIN_EVICTABLE_HOLDING`, so small idle workers (on Linux an
+    /// idle risc0 prover holds MB, not GB) are never torn down for a measurement. On Windows an idle
+    /// risc0 prover keeps tens of GB COMMITTED, and a measurement that cannot otherwise fit may
+    /// recycle it: that commit is what the measurement is short of. This is distinct from
     /// `idle_host_holdings_except`, which the PROVE path uses and which EXCLUDES the proof's own backend
     /// (a prove must never destroy a warm sibling it would route to) — a measure routes to neither.
-    #[cfg(unix)]
     fn idle_prove_holdings(&self) -> Vec<(String, u64)> {
         self.workers
             .iter()
@@ -9187,11 +9319,6 @@ impl WorkerPool {
             })
             .filter_map(|(key, _)| Some((key.clone(), self.current_host_bytes_for_slot(key)?)))
             .collect()
-    }
-
-    #[cfg(not(unix))]
-    fn idle_prove_holdings(&self) -> Vec<(String, u64)> {
-        Vec::new()
     }
 
     /// Would an SP1 job whose pre-claim execute peaked at `measured_peak_bytes` (measured server-less
@@ -9264,7 +9391,7 @@ impl WorkerPool {
         if self.closing.load(Ordering::Acquire) {
             return None;
         }
-        let available = crate::memory::mem_available_bytes()?;
+        let available = self.admission_available()?;
         let total = crate::memory::mem_total_bytes()?;
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         let reserved = self.reserved_host_memory();
@@ -9277,7 +9404,15 @@ impl WorkerPool {
         // than one is deliberate: a single eviction cannot free enough on a multi-idle-server host, and
         // "at most one" would wedge there forever (nothing else recycles a server) — so the cooldown
         // bounds eviction EVENTS, each freeing the minimal necessary set.
-        let mut holdings = self.idle_prove_holdings();
+        // Windows, while proofs run: none. Its idle GPU workers keep tens of GB committed, so a
+        // measurement (pre-claim, no collateral) short of commit would recycle a warm worker each
+        // cooldown while the cards are busy, and the next proof there starts cold. It waits for a
+        // proof to end instead; with none in flight, recycling is the only way it ever runs.
+        let mut holdings = if cfg!(windows) && self.memory_ledger.tracked_count() > 0 {
+            Vec::new()
+        } else {
+            self.idle_prove_holdings()
+        };
         holdings.retain(|(_, held)| *held >= MIN_EVICTABLE_HOLDING);
         holdings.sort_by_key(|(_, held)| std::cmp::Reverse(*held));
         let mut victims: Vec<String> = Vec::new();
@@ -9362,10 +9497,9 @@ impl WorkerPool {
         abort_at: Option<Instant>,
     ) -> Option<crate::memory::MemoryReservation<'_>> {
         let backend = key.split(':').next().unwrap_or(key);
-        let (Some(available), Some(total)) = (
-            crate::memory::mem_available_bytes(),
-            crate::memory::mem_total_bytes(),
-        ) else {
+        let (Some(available), Some(total)) =
+            (self.admission_available(), crate::memory::mem_total_bytes())
+        else {
             return None;
         };
         let resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
@@ -9429,10 +9563,9 @@ impl WorkerPool {
         outstanding: usize,
         max_concurrent: usize,
     ) -> bool {
-        let (Some(available), Some(total)) = (
-            crate::memory::mem_available_bytes(),
-            crate::memory::mem_total_bytes(),
-        ) else {
+        let (Some(available), Some(total)) =
+            (self.admission_available(), crate::memory::mem_total_bytes())
+        else {
             // Fail OPEN, matching `reserve_host_memory`. See the note there.
             return true;
         };
@@ -9498,6 +9631,17 @@ impl WorkerPool {
         )
     }
 
+    /// The host peak a benchmark records for `key` (`host_peak_for_slot`), which the suite doubles
+    /// into a backend's budget (`budget_from_measurement`). Not on Windows: there the reading is
+    /// commit, which a real proof's measures without doubling, per card (`learn_host_peak`), and a
+    /// doubled one would stand for every card that had not proved yet.
+    fn benchmark_host_peak(&self, key: &str) -> Option<u64> {
+        if cfg!(windows) {
+            return None;
+        }
+        self.host_peak_for_slot(key)
+    }
+
     /// Peak host memory this slot's worker has reached, in bytes.
     ///
     /// Must be called while the worker is ALIVE: the counter lives in the worker's transient cgroup,
@@ -9510,6 +9654,22 @@ impl WorkerPool {
             return None;
         }
         let backend = key.split(':').next().unwrap_or(key);
+        // Windows: the worker's process tree's peak commit (`memory::tree_commit_bytes`). The SP1
+        // Groth16 helper's has to be added for the same reason as below.
+        #[cfg(windows)]
+        {
+            let started = entry.pid_starttime.load(Ordering::Acquire);
+            let started = Some(started).filter(|s| *s != 0);
+            let (_, peak) = crate::memory::tree_commit_bytes(pid, started)?;
+            let helper = backend == zkminer_prover_protocol::BACKEND_SP1
+                && self.sp1_groth16_helper.load(Ordering::Acquire);
+            Some(if helper {
+                peak.saturating_add(crate::memory::SP1_GROTH16_HELPER_PEAK_BYTES)
+            } else {
+                peak
+            })
+        }
+        #[cfg(not(windows))]
         if let Some(cgroup_peak) = crate::memory::peak_memory_of_pid(
             pid,
             Some(&crate::memory::worker_cgroup_leaf(backend, pid)),
@@ -9527,16 +9687,20 @@ impl WorkerPool {
         // the SP1 SDK forks `sp1-gpu-server` into our group, and it is the grandchild that holds the
         // memory. Less accurate than the cgroup counter — high-water marks do not necessarily
         // coincide, so the sum can overstate — and overstating is the safe direction.
+        #[cfg(not(windows))]
         let live =
             crate::memory::process_group_peak_bytes(std::path::Path::new("/proc"), pid as i32)?;
         // Except for a process that has already exited, whose high-water mark went with it: SP1's
         // Groth16 helper, where its server runs one (see `warm_up`). Its typical peak stands in.
-        if backend == zkminer_prover_protocol::BACKEND_SP1
-            && self.sp1_groth16_helper.load(Ordering::Acquire)
+        #[cfg(not(windows))]
         {
-            return Some(live.saturating_add(crate::memory::SP1_GROTH16_HELPER_PEAK_BYTES));
+            if backend == zkminer_prover_protocol::BACKEND_SP1
+                && self.sp1_groth16_helper.load(Ordering::Acquire)
+            {
+                return Some(live.saturating_add(crate::memory::SP1_GROTH16_HELPER_PEAK_BYTES));
+            }
+            Some(live)
         }
-        Some(live)
     }
 
     /// Canonical PCI bus id of the card behind a slot key, if it is a GPU slot.
@@ -11607,6 +11771,12 @@ impl WorkerPool {
                 Box::new(move |e: zkminer_prover_protocol::ProveEvent| cb(e, &key_for_cb))
                     as Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>
             });
+        // Windows: how low host memory fell during the proof, to tell a failure for want of host
+        // memory from the card's or the prover's (`memory::windows_failure_is_host_shortage`).
+        let low_water = crate::memory::LowWater::start(Some((
+            entry.pid.load(Ordering::Acquire),
+            entry.pid_starttime.load(Ordering::Acquire),
+        )));
         let proof_response = handle.recv_proof(request_id, &on_progress);
         slot.note_used(UseKind::Proof);
 
@@ -11657,7 +11827,25 @@ impl WorkerPool {
                     .as_mut()
                     .and_then(|h| h.died_of_host_oom())
                     .unwrap_or(false);
-            #[cfg(not(unix))]
+            // Windows has no OOM killer to ask: an allocation past the commit limit fails, and the
+            // worker dies of it. Its exit code, or how low host memory fell meanwhile, says so.
+            #[cfg(windows)]
+            let host_oom = !entry.intentional_kill.load(Ordering::Acquire) && {
+                low_water.sample();
+                let code = if is_eof {
+                    slot.handle
+                        .as_mut()
+                        .and_then(|h| h.exit_code(Duration::from_secs(1)))
+                } else {
+                    None
+                };
+                crate::memory::windows_failure_is_host_shortage(
+                    code,
+                    low_water.started_at(),
+                    low_water.lowest(),
+                )
+            };
+            #[cfg(not(any(unix, windows)))]
             let host_oom = false;
 
             // Before the slot is cleared: the handle holds the exit and the output. A crash otherwise
@@ -11687,13 +11875,29 @@ impl WorkerPool {
                 );
                 Self::mark_slot_dead(&mut slot, entry);
             } else if host_oom {
-                tracing::error!(
-                    "Worker {key} was killed because the HOST RAN OUT OF MEMORY. This is an \
-                     environmental limit, not a prover fault, and it is not counted against this \
-                     GPU: the box does not have enough RAM for this workload at this concurrency. \
-                     Check `journalctl -k | grep -i oom` and MemAvailable before investigating the \
-                     prover."
-                );
+                if cfg!(windows) {
+                    tracing::error!(
+                        "Worker {key} died while the HOST WAS OUT OF MEMORY ({} available at the \
+                         lowest). This is an environmental limit, not a prover fault, and it is not \
+                         counted against this GPU. On Windows the limit is usually COMMIT (RAM plus \
+                         page file: Task Manager, Performance, Memory, \"Committed\"), not RAM: a \
+                         larger fixed page file raises it. Free commit at the lowest:",
+                        low_water
+                            .lowest()
+                            .map(|b| format!("{:.1} GiB", b as f64 / 1024.0 / 1024.0 / 1024.0))
+                            .unwrap_or_else(|| "unknown".to_string()),
+                    );
+                } else {
+                    tracing::error!(
+                        "Worker {key} was killed because the HOST RAN OUT OF MEMORY. This is an \
+                         environmental limit, not a prover fault, and it is not counted against \
+                         this GPU: the box does not have enough RAM for this workload at this \
+                         concurrency. Check `journalctl -k | grep -i oom` and MemAvailable before \
+                         investigating the prover."
+                    );
+                }
+                // As below: the card's learned figure did not cover this job.
+                self.forget_learned_host_peak(key);
                 Self::mark_slot_dead(&mut slot, entry);
             } else {
                 Self::mark_slot_failed(&mut slot, entry);
@@ -11785,6 +11989,8 @@ impl WorkerPool {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(key);
                 }
+                low_water.sample();
+                self.learn_host_peak(key, po2, low_water.tree_peak());
                 if let Some((tier, _)) = ran_tier {
                     let i = usize::from(tier == crate::metal_sizing::OwnerTier::Active);
                     self.metal_tier_jobs[i].fetch_add(1, Ordering::Relaxed);
@@ -11835,6 +12041,44 @@ impl WorkerPool {
                     slot_key: key.to_string(),
                     message: message.clone(),
                 };
+                // Windows: out of memory while the HOST was out of it is not the card's doing, and
+                // must not exclude the card or lower what it proves at
+                // (`memory::windows_failure_is_host_shortage`). The worker is restarted all the
+                // same, its allocations having failed part-way.
+                low_water.sample();
+                if cfg!(windows)
+                    && matches!(kind, ErrorKind::ResourceExhausted)
+                    && crate::memory::windows_failure_is_host_shortage(
+                        None,
+                        low_water.started_at(),
+                        low_water.lowest(),
+                    )
+                {
+                    tracing::error!(
+                        "Worker {key} ran out of memory while the HOST was out of it ({:.1} GiB \
+                         available at the lowest): not counted against this GPU. On Windows the \
+                         limit is usually commit (RAM plus page file), not RAM. Restarting the \
+                         worker.",
+                        low_water.lowest().unwrap_or(0) as f64 / 1024.0 / 1024.0 / 1024.0,
+                    );
+                    // The card's figure did not cover this job: charge its next proofs the
+                    // published one until a proof there succeeds again.
+                    self.forget_learned_host_peak(key);
+                    entry.clear_pid();
+                    if let Some(h) = slot.handle.as_mut() {
+                        h.kill();
+                    }
+                    Self::mark_slot_dead(&mut slot, entry);
+                    return Err(anyhow::Error::new(
+                        zkminer_prover_protocol::types::HostMemoryShortage {
+                            attempted: true,
+                            slot_key: key.to_string(),
+                            needed: want,
+                            reserved: self.reserved_host_memory(),
+                            available: crate::memory::mem_available_bytes().unwrap_or(0),
+                        },
+                    ));
+                }
                 if matches!(kind, ErrorKind::ResourceExhausted) {
                     tracing::warn!("Worker {key} OOM — killing for respawn with clean GPU state");
                     // SP1: respawn one shard size smaller for the retry (and, once it proves
@@ -18770,5 +19014,216 @@ mod spill_and_cap_tests {
         let _off = Hermetic::new(&[(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV, "0")]);
         assert_eq!(margin(with_windows_growth_margin(shared(), 35, false)), 0);
         assert_eq!(margin(with_windows_growth_margin(noise(), 35, false)), 0);
+    }
+}
+
+#[cfg(test)]
+mod learned_host_peak_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn entry(backend: &str, pid: u32, started: u64) -> WorkerEntry {
+        WorkerEntry {
+            slot: Mutex::new(WorkerSlot {
+                handle: None,
+                path: PathBuf::from("/nonexistent"),
+                backend: backend.to_string(),
+                gpu_tag: "cuda".to_string(),
+                device_index: Some(0),
+                pci_bus_id: None,
+                gpu_name: None,
+                spawn_env: HashMap::new(),
+                consecutive_failures: 0,
+                last_failure: None,
+                declined: None,
+                proofs_since_spawn: 0,
+            }),
+            vram_bytes: None,
+            pci_bus_id: None,
+            pid: Arc::new(AtomicU32::new(pid)),
+            pid_starttime: Arc::new(AtomicU64::new(started)),
+            intentional_kill: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn pool(keys: &[&str]) -> WorkerPool {
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        for key in keys {
+            let backend = key.split(':').next().unwrap();
+            pool.workers.insert(key.to_string(), entry(backend, 0, 0));
+        }
+        pool
+    }
+
+    /// Each card is charged what its own proofs reached; a card with none, and a figure with no
+    /// card in mind, the most any card of the backend may need.
+    #[test]
+    fn each_card_is_charged_its_own_learned_peak() {
+        let pool = pool(&["risc0:cuda:0", "risc0:cuda:1", "sp1:cuda:0"]);
+        let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+        let published = |po2| pool.published_host_peak_at_po2("risc0", po2);
+        // Nothing learned: everything is the published figure, as before.
+        assert_eq!(
+            pool.slot_host_peak("risc0:cuda:0", Some(20)),
+            published(Some(20))
+        );
+        assert_eq!(
+            pool.expected_host_peak_at_po2("risc0", Some(20)),
+            published(Some(20))
+        );
+        assert_eq!(pool.expected_host_peak("risc0"), published(None));
+
+        // Card 0 learns 8 GiB at po2 20; card 1 nothing yet.
+        crate::memory::note_learned_peak(
+            pool.learned_peaks
+                .lock()
+                .unwrap()
+                .entry("risc0:cuda:0".to_string())
+                .or_default(),
+            Some(20),
+            8 * GIB,
+        );
+        let learned = crate::memory::learned_host_peak(
+            &pool.learned_peaks.lock().unwrap()["risc0:cuda:0"],
+            Some(20),
+            total,
+        )
+        .unwrap();
+        assert_eq!(
+            learned,
+            (9 * GIB).min(crate::memory::max_admissible_budget(total))
+        );
+        assert_eq!(pool.slot_host_peak("risc0:cuda:0", Some(20)), learned);
+        assert_eq!(pool.slot_host_peak("risc0:cuda:0", Some(19)), learned);
+        // Above what it proved at, the published figure.
+        assert_eq!(
+            pool.slot_host_peak("risc0:cuda:0", Some(21)),
+            published(Some(21))
+        );
+        assert_eq!(
+            pool.slot_host_peak("risc0:cuda:1", Some(20)),
+            published(Some(20))
+        );
+        // With card 1 unlearned, the backend figure is the larger of the two.
+        assert_eq!(
+            pool.expected_host_peak_at_po2("risc0", Some(20)),
+            learned.max(published(Some(20)))
+        );
+        // Once card 1 learns too, the backend figure is the larger learned one.
+        crate::memory::note_learned_peak(
+            pool.learned_peaks
+                .lock()
+                .unwrap()
+                .entry("risc0:cuda:1".to_string())
+                .or_default(),
+            Some(20),
+            12 * GIB,
+        );
+        assert_eq!(
+            pool.expected_host_peak_at_po2("risc0", Some(20)),
+            (27 * GIB / 2).min(crate::memory::max_admissible_budget(total))
+        );
+        // A proof on card 0 is still charged card 0's, through `host_want`.
+        assert_eq!(pool.host_want("risc0:cuda:0", Some(20), 0), learned);
+        // Another backend is untouched.
+        assert_eq!(
+            pool.expected_host_peak("sp1"),
+            pool.published_host_peak_at_po2("sp1", None)
+        );
+    }
+
+    /// The prove path: host memory is watched from before the proof is awaited; a success teaches
+    /// the card its figure; a failure is asked whether the host ran short before anything blames
+    /// the card (the exclusion and SP1's shard lowering come after).
+    #[test]
+    fn the_prove_path_watches_learns_and_asks_the_host_first() {
+        let src = include_str!("dispatcher.rs");
+        let prove = src
+            .split_once("    fn prove_on_slot(")
+            .expect("prove_on_slot")
+            .1;
+        let prove = &prove[..prove.find("\n    fn ").expect("the next fn")];
+        let watch = prove
+            .find("let low_water = crate::memory::LowWater::start(Some((")
+            .expect("the low water");
+        let recv = prove
+            .find("let proof_response = handle.recv_proof(")
+            .expect("the proof");
+        assert!(watch < recv);
+        let died = prove
+            .find("crate::memory::windows_failure_is_host_shortage(\n                    code,")
+            .expect("a death is asked");
+        // The death's own failure branch comes after the question.
+        assert!(recv < died);
+        assert!(prove[died..].contains("} else if host_oom {"));
+        assert!(prove[died..].contains("Self::mark_slot_failed(&mut slot, entry);"));
+        let reported = prove
+            .find("crate::memory::windows_failure_is_host_shortage(\n                        None,")
+            .expect("a reported out-of-memory is asked");
+        let lowered = prove
+            .find("self.lower_sp1_shard_cap(")
+            .expect("the lowering");
+        assert!(reported < lowered);
+        let learned = prove
+            .find("self.learn_host_peak(key, po2, low_water.tree_peak());")
+            .expect("a success is learned from");
+        assert!(learned < prove.find("Ok(ProofOutput {").unwrap());
+        // And each slot is charged its own figure.
+        let want = src.split_once("    fn host_want(").unwrap().1;
+        assert!(want[..want.find("\n    }\n").unwrap()].contains("self.slot_host_peak(key, po2)"));
+    }
+
+    /// A slot with no live worker has nothing to learn from (and off Windows nothing is learned).
+    #[test]
+    fn nothing_is_learned_without_a_live_worker() {
+        let pool = pool(&["risc0:cuda:0"]);
+        pool.learn_host_peak("risc0:cuda:0", Some(20), None);
+        assert!(pool.learned_peaks.lock().unwrap().is_empty());
+    }
+
+    /// Windows: what a slot's worker holds is its process tree's commit, read under the worker's
+    /// own start time, and its peak is at least that; a stale start time reads nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_slots_worker_commit_is_read_on_windows() {
+        let me = std::process::id();
+        let started = crate::memory::pid_starttime(me).unwrap();
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        pool.workers
+            .insert("risc0:cuda:0".to_string(), entry("risc0", me, started));
+        pool.workers
+            .insert("risc0:cuda:1".to_string(), entry("risc0", me, started + 1));
+        // The pool stops its workers when dropped, and this "worker" is the test itself: forget
+        // it first, on a failed assertion too.
+        struct Forget<'a>(&'a WorkerPool);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                for entry in self.0.workers.values() {
+                    entry.pid.store(0, Ordering::Release);
+                    entry.pid_starttime.store(0, Ordering::Release);
+                }
+            }
+        }
+        let _forget = Forget(&pool);
+        let held = vec![1u8; 128 * 1024 * 1024];
+        let now = pool.current_host_bytes_for_slot("risc0:cuda:0").unwrap();
+        assert!(now >= 128 * 1024 * 1024);
+        assert!(pool.host_peak_for_slot("risc0:cuda:0").unwrap() >= now);
+        drop(held);
+        assert_eq!(pool.current_host_bytes_for_slot("risc0:cuda:1"), None);
+        assert_eq!(pool.current_host_bytes_for_slot("risc0:cuda:9"), None);
+        // And it is learned from.
+        pool.learn_host_peak("risc0:cuda:0", Some(20), Some(now));
+        assert!(pool
+            .learned_peaks
+            .lock()
+            .unwrap()
+            .contains_key("risc0:cuda:0"));
+        assert!(!pool
+            .learned_peaks
+            .lock()
+            .unwrap()
+            .contains_key("risc0:cuda:1"));
     }
 }

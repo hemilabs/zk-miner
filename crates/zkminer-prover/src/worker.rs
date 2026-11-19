@@ -1635,6 +1635,22 @@ impl WorkerHandle {
         }
     }
 
+    /// Windows: the worker's exit code, waiting up to `budget` for it to exit; `None` if it has
+    /// not, or cannot be asked. An NTSTATUS such as `0xC000012D` reads as a negative number.
+    #[cfg(not(unix))]
+    pub fn exit_code(&mut self, budget: Duration) -> Option<i32> {
+        let started = Instant::now();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.code(),
+                Ok(None) if started.elapsed() < budget => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => return None,
+            }
+        }
+    }
+
     /// Was this worker killed because the HOST ran out of memory, rather than failing on its own?
     ///
     /// Only meaningful once the worker is dead. Two conditions must hold: it died in a way a host OOM
