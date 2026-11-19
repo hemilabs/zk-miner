@@ -1587,6 +1587,7 @@ pub fn run_benchmark() -> BenchmarkSuite {
         results: worker_device_results,
         mut failures,
         not_benchmarked,
+        ..
     } = if let Some(pool) = pool {
         let run = pool.benchmark_all_with_device_info();
         if !run.results.is_empty() {
@@ -1762,8 +1763,9 @@ pub fn describe_failures(failures: &[crate::dispatcher::SlotBenchmarkFailure]) -
     lines
 }
 
-/// The slots a successful run could not benchmark (they were down when it started), one line each,
-/// for the CLI and the TUI (W10-BENCH round 1).
+/// The slots a successful run could not benchmark, one line each, for the CLI and the TUI: declined
+/// at startup, down beside a measured GPU of their own backend, or a worker that only simulates
+/// (W10-BENCH rounds 1 and 2; see `dispatcher::BenchmarkRun::not_benchmarked`).
 pub fn describe_not_benchmarked(slots: &[crate::dispatcher::SlotBenchmarkFailure]) -> Vec<String> {
     slots
         .iter()

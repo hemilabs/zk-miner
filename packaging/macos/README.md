@@ -134,8 +134,9 @@ on a fast link, and a slow link takes minutes. Let it run.
 
 **`zkminer benchmark` says `BENCHMARK FAILED` (exit status 1).** The prover started but could not
 prove: the line under it names the prover (`risc0:metal:0`) and its error, for example a warm-up
-that failed because a GPU pipeline did not compile. Nothing was measured, and nothing was saved, so
-`zkminer run` does not price jobs from it. Then:
+that failed because a GPU pipeline did not compile. Rows printed above it under `the results above
+are incomplete` are the programs that did prove; nothing was saved or used for pricing, so `zkminer
+run` does not price jobs from it. Then:
 
 1. Run `tools/macos-smoke.sh` from the kit folder. It proves and verifies one small proof and ends
    with `RESULT:` and an exit status: 1 means the proof failed (send its log with your report), 4

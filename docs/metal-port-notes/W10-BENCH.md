@@ -198,6 +198,112 @@ Lock hygiene: the first round's sandbox `rhome` contained `zkminer/.gpulock`, wh
 gpu-run was started with `HOME` set to the sandbox and so took a private lock. I removed that directory. Every
 round-1 command ran gpu-run with the real `HOME`, and set the sandbox `HOME` only for the child (`env HOME=...`).
 
+## Fix round 2 (review findings)
+
+### Finding: a failed GPU worker was a warning when a CPU worker or the OpenVM stub measured
+
+Round 1's `was_down` rule made a slot that was down at the start (crash or backoff, not a decline) "not
+benchmarked" whenever ANY other slot returned rows. Two shapes the reviewer reproduced with mock workers
+(`scratch/w10/W10-BENCH-review2/probe{1,2}.log`) were then clean runs: exit 0, a normal table, cached under
+`--calibrate`, priced by `zkminer run`:
+
+1. `risc0:metal:0` (or `risc0:cuda:0`) down, plus a `risc0:generic` CPU worker. `gpu_backends` counted only GPU slots
+   with a running worker, so the CPU worker was benchmarked in the GPU's place, and the GPU's error was a warning.
+2. `risc0:cuda:0` down, plus the OpenVM worker (shipped in the Linux release layout by `assemble-release.sh` and
+   `unpack-provers.sh`). `zkminer-prove-openvm` cannot prove (every `Prove` is an error); its `Benchmark` answer times
+   a busy loop and labels the rows `openvm`. `is_simulated()` only knows the `simulated` label, and
+   `missing_benchmark_rows` exempts OpenVM from `zkop-mix`, so a host whose only real prover failed to start showed,
+   cached and priced simulated OpenVM numbers: the item's original defect by another route.
+
+Fixed at the root, in `dispatcher::BenchmarkRun` (both loops share it):
+
+* A down, non-declined slot's error is held until `finish()`. It becomes "not benchmarked" only if a GPU slot
+  (cuda/rocm/intel/metal) of the SAME backend measured a complete suite (one card of a multi-card rig is down).
+  Otherwise it is a failure. A CPU `generic` worker, another backend, or a same-backend GPU whose own suite came
+  back short never covers for it. This also makes a down slot of another backend (for example `sp1:cuda:0` that
+  crashed at start beside a working risc0 card) a failure again, as in `cd6143a`. A slot that DECLINED at startup
+  is still only reported (round 1, Finding A): it said it cannot prove here.
+* `gpu_backends`, the rule that skips a backend's CPU worker when it has a GPU worker, now counts GPU slots that are
+  down but not declined, too. They are still tried (a respawn may bring them up), and if they stay down the run fails,
+  so benchmarking the CPU worker would only add a very long CPU risc0 run to a failed benchmark. A declined GPU slot
+  still lets the CPU worker run: the host does prove on the CPU then.
+* New `simulated_benchmark_reason(backend, entries)`: a backend in `SIMULATED_BENCHMARK_BACKENDS` (OpenVM) or any row
+  labelled `simulated`. Such a slot is never run (OpenVM: skipped like a declined slot, not announced in the
+  streaming queue) or, if rows labelled `simulated` come back, its rows are discarded. Either way it goes into
+  `not_benchmarked` with `not measured (SIMULATED): ...`. Nothing from it reaches `results`, so nothing is shown,
+  cached or priced (`average_throughput`, `device_benchmarks`), and it never counts as a slot that measured: with
+  nothing else measured, `finish()` makes it the run's failure. The streaming `Finished` event says
+  `succeeded: false` for it.
+* `benchmark_targets()` leaves OpenVM slots out. Their rows can never be saved, so counting them made every TUI start
+  re-run the startup benchmark.
+
+I did not change the OpenVM worker's labels. The dispatcher decides by backend, so an old or third-party stub
+cannot get around it. When OpenVM proving is implemented, remove it from `SIMULATED_BENCHMARK_BACKENDS`.
+
+Behaviour changes to record for the RC round:
+* On a multi-backend Linux rig, a worker of another backend that crashes at start now fails `zkminer benchmark`
+  (exit 1, nothing cached). This is the `cd6143a` behaviour. Round 1 had made it a warning. A worker that declined is
+  still a warning.
+* A Linux host with only the OpenVM stub and no working prover now fails the benchmark with the SIMULATED reason.
+  Before, it showed and cached OpenVM's busy-loop numbers.
+* SP1 (reviewer's note): `run_benchmark_requests` drops SP1's `zkop-mix` row when its cycle count is not
+  `ZKOP_MIX_SP1_CYCLES`, and since round 1 the missing row fails the whole SP1 benchmark. That error says
+  `no result for programs: zkop-mix (the worker's own log lines above say why)`, and the WARN line above it gives the
+  cycle mismatch.
+
+Also (reviewer's non-blocking note): in `packaging/macos/README.md` Troubleshooting, "Nothing was measured, and
+nothing was saved" now reads: rows printed under `the results above are incomplete` did prove, and nothing was saved
+or used for pricing.
+
+### Round-2 tests (each fails with the round-2 logic disabled)
+
+Mutation run (`scratch/w10/W10-BENCH/r2/mutation.log`): `finish()` always files a down slot as not benchmarked,
+`simulated_benchmark_reason` always returns `None`, and `gpu_backends` uses the old `handle.is_some()`. With these
+mutations, all 5 new tests fail. The updated round-1 test still passes, as it should, because it covers the
+declined and same-backend cases.
+
+| test | shape |
+|---|---|
+| `worker_lifecycle::a_down_gpu_slot_is_not_covered_by_a_cpu_worker` | reviewer's probe 1: `risc0:generic` mock with all rows, plus a down `risc0:metal:0`, then a down `risc0:cuda:0`. Both loops: the GPU slot is in `failures` and the CPU worker is not benchmarked |
+| `worker_lifecycle::openvm_stub_rows_are_never_measurements` | reviewer's probe 2: an `openvm:generic` mock with all rows, plus a down `risc0:cuda:0`. No results, and both are failures (OpenVM's says SIMULATED). Beside a working Metal card: a clean run, OpenVM not announced, not run and not a target |
+| `worker_lifecycle::a_down_slot_of_another_backend_fails_the_run` | a working Metal card plus a down `sp1:cuda:0`: a failure |
+| `dispatcher::benchmark_run_tests::only_a_same_backend_gpu_covers_for_a_down_slot` | bookkeeping only: CPU stand-in and other backend give a failure; a same-backend GPU, in either order, gives not benchmarked; a same-backend GPU with a short suite gives two failures |
+| `dispatcher::benchmark_run_tests::simulated_rows_are_never_results` | rows labelled `simulated` never become a result; alone they are a failure; an OpenVM slot covers for no down OpenVM slot |
+| `worker_lifecycle::a_declined_or_unstartable_sibling_does_not_fail_a_working_card` (updated) | the unstartable sibling is now `risc0:cuda:1` (same backend as the working card). An unstartable sibling of another backend is the new test above |
+
+### Round-2 gates (logs in `scratch/w10/W10-BENCH/r2/`)
+
+| gate | result |
+|---|---|
+| `ZKVM_ALLOW_SKIP=1 gpu-run -- cargo test --locked -p zkminer-prover --features testing --tests` x2 | both rc 0: **403 passed**, 0 failed, 21 ignored (+5 new) (`prover-{1,2}.log`) |
+| `gpu-run -- cargo test --locked --workspace --exclude zkminer-prove-sp1 --exclude zkminer-prover` x2 | both rc 0: 504 passed / 18 ignored (`ws-{1,2}.log`) |
+| `gpu-run -- cargo test --locked -p zkminer-prove-risc0 --features metal` x2 | both rc 0: 69 passed / 4 ignored (`r0metal-{1,2}.log`) |
+| `make -f Makefile.mac RISC0_SRC=git JOBS=6 mac-build-worker` | rc 0. Worker 184,537,568 B (unchanged; no worker code changed this round), CLI 16,007,104 B |
+| **real `zkminer benchmark`** (release CLI + worker, sandbox `HOME`) | **rc 0**: 2.70 MzkOP/s (risc0 0.90M c/s). STARK 51.21 / 72.01 / 30.90 / 8.38 / 9.77 s (sum 172.27 s), zkop-mix 68.82 s, Groth16 1.73-1.74 s. Load average 11.7 at the start, 1.0 at the end. A functional gate, not a speed claim (`real.out`) |
+| real worker, `ZKMINER_TEST_FORCE_FAIL=warmup zkminer benchmark --calibrate` | **rc 1** with no table: `BENCHMARK FAILED: nothing was measured or saved.`, the worker, its error and the macos-smoke.sh advice. No `benchmarks.json` (`warm.*`) |
+| real worker, reviewer's partial repro (`ZKMINER_TEST_FORCE_FAIL=sha256-chain,ecdsa-verify,bigint-mul,chacha-mix,zkop-mix ... --calibrate`) | **rc 1**: only the memory-merkle row, under `BENCHMARK FAILED: the results above are incomplete; nothing was saved or used for pricing.`, followed by the missing programs. No `benchmarks.json` (`partial.*`) |
+| rustfmt / clippy | nothing new on the changed lines (the files' existing rustfmt drift was left alone) |
+
+### Round-2 A/B (the reviewer's lens, re-run to completion)
+
+A is the base `item/W10-INT` `29488c2` release worker (built by the reviewer in
+`scratch/w10/W10-BENCH-verify/base`). B is this branch's release worker. Each run is
+`BENCH_ONLY=memory-merkle RUST_LOG=info RISC0_METAL_ARCHIVE_GC=0 /usr/bin/time -l <worker> --benchmark`, alone under
+`gpu-run --no-budget`, in the order A B A B ... (`r2/ab/ab_pair.sh`). All runs exited 0.
+
+| budget | pairs | A STARK median [min-max] | B STARK median [min-max] | A / B peak footprint median [range] | load |
+|---|---|---|---|---|---|
+| default (po2 20) | 8 | 8.63 [8.47-8.82] s | 8.69 [8.46-8.86] s | 13.972 [13.967-14.614] / 13.971 [13.963-13.978] GB | 6.2-17.1 |
+| 4 GiB (po2 18) | 8 | 14.20 [14.15-14.24] s | 14.23 [14.17-14.29] s | 5.796 [5.795-5.797] / 5.817 [5.808-5.839] GB | 1.0-5.3 |
+
+The time differences are within the A-vs-A spread, so there is no change. At 4 GiB, B's peak footprint was 21 MB
+(0.36 %) higher in AB order. The worker's own breakdown puts it before the first proof ("start" 4178 vs 4164 MiB).
+GPU memory was identical (segments 2404, recursion 2199, wrap 3944 MiB). To see whether it follows the binary, I ran 4
+more pairs in BA order (`r2/ab/BA-4294967296`). The second run of each pair was the higher one again: B 4163-4164 MiB
+and A 4178-4181 MiB at start, with peaks of B 5.796-5.830 and A 5.810-5.830 GB. So the difference is an order effect
+of back-to-back runs, not the code: peak memory is unchanged at both budgets. This round changed no worker code. The
+worker diff against the base is round 1's: a `BENCH_ONLY` name check and a warning, both before any GPU work.
+
 ## Open issues
 
 1. ~~A slot whose zkOP/s scoring proof fails is not a failure in the CLI.~~ Fixed in round 1: a missing score (or any
@@ -206,15 +312,24 @@ round-1 command ran gpu-run with the real `HOME`, and set the sandbox `HOME` onl
    the previous results stay, so a fixed card needs a new full run. A card that was down from the start (declined,
    or never started) no longer counts as failed (round 1): only a card whose worker ran and failed drops the run.
 3. `docs/release/BETA_RC.md` still lists these as open findings (section 2 item 5, lines 118-122 and 295-296). This
-   wave's RC round should record them as fixed by this item.
+   wave's RC round should record them as fixed by this item (`cd6143a`, `95009c1` and the round-2 commit), along with
+   the round-2 behaviour changes listed above.
 4. `cfg(target_os = "linux")` / Windows branches (the RAPL line) compile only for macOS here, as in W10-INT open
    issue 2. A Linux and Windows CI build is still needed.
 5. Simulated mode still exits 0: there is no worker to blame. Every line says SIMULATED. Its `--json` output marks it
    only with `prover_backend: "simulated"` and `zkops: 0`, and `failures` is not serialized: a `--json` consumer of a
    failed partial run sees the rows, and only the exit code says it failed.
-6. A slot that was down at the start and then came up and failed (for example a respawned worker whose warm-up
-   fails and which is retired again) counts as "not benchmarked", not as failed, when another slot measured. With a
-   single worker (every Mac) it is still the run's failure.
+6. A slot that was down at the start, then came up and failed (for example a respawned worker whose warm-up
+   fails and which is retired again), counts as "not benchmarked" rather than failed. Since round 2 that happens only
+   when a GPU of its own backend measured a complete suite, as with a second card on a multi-card rig. With a single
+   worker (every Mac) it is still the run's failure.
+10. OpenVM is excluded from benchmarks by backend (`SIMULATED_BENCHMARK_BACKENDS`) until its worker can prove.
+    Implementing OpenVM proving must remove it there, or OpenVM will never be benchmarked or priced.
+11. `benchmark_targets()` matches only cuda/rocm/intel, so the TUI's startup "re-benchmark when a card has no saved
+    row" logic does not see a Metal card (reviewer's note; not introduced here). Worth checking in the RC round.
+12. The reviewer's base worktree `scratch/w10/W10-BENCH-verify/base` (detached at `29488c2`, a worktree of the main
+    checkout) was used as A in the round-2 A/B. I left it in place: removing it means `git worktree remove` on the main
+    checkout's metadata, which is not this item's to edit.
 7. `ZKMINER_TEST_FORCE_FAIL` is still read by the release worker, on the warm-up and benchmark paths only. It is
    documented, and `--benchmark` warns when it is set. It is not behind a cfg: the real forced-failure gate needs it in
    the release build.
