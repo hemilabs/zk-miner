@@ -2568,6 +2568,36 @@ fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
     );
 }
 
+/// The reason given for a job whose proof attempt would outlast the per-attempt cap on the slowest
+/// card it could go to. Names where to raise it.
+const TOO_LONG_FOR_PROVING_TIMEOUT: &str =
+    "too long for the proving timeout (raise it in Settings)";
+
+/// Ends the back-off (and set-aside) of every job backed off for `why`; returns how many. For a
+/// verdict a setting decides, once the setting changes.
+fn release_set_aside_for(why: &'static str) -> usize {
+    let released: Vec<B256> = match claim_retry_after_map().lock() {
+        Ok(mut m) => {
+            let ids: Vec<B256> = m
+                .iter()
+                .filter(|(_, (_, w))| *w == why)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &ids {
+                m.remove(id);
+            }
+            ids
+        }
+        Err(_) => Vec::new(),
+    };
+    if let Some(m) = SET_ASIDE.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        for id in &released {
+            m.remove(id);
+        }
+    }
+    released.len()
+}
+
 fn job_set_aside(job_id: B256) -> bool {
     SET_ASIDE
         .lock()
@@ -3517,6 +3547,7 @@ pub async fn run(
         s.runtime_settings.system_power_watts = config.prover.system_power_watts;
         s.runtime_settings.token_price_usd = config.prover.token_price_usd;
         s.runtime_settings.gas_cost_usd = config.prover.gas_cost_usd;
+        s.runtime_settings.proving_timeout_secs = config.prover.proving_timeout_secs();
         s.runtime_settings.risc0_job_po2_config = config.prover.risc0_job_po2.clone();
         // Default TRUE: every open-market job is journal-bound, and each is claimed only when the
         // journal its (program, input) measured satisfies its binding.
@@ -3974,7 +4005,8 @@ pub async fn run(
         JobJournal::load()
     }));
     let brain_journal = journal.clone();
-    let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
+    // The startup value; the brain re-reads the Settings screen's every pass.
+    let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs().max(60));
     let cost_params = CostParams {
         electricity_cost_kwh: config.prover.electricity_cost_kwh,
         // The OVERHEAD only; `evaluate_job` adds the measured CPU and card.
@@ -6303,7 +6335,8 @@ fn spawn_sp1_warmup() {
 async fn miner_brain(
     client: ChainClient,
     state: zkminer_tui::state::SharedState,
-    proving_timeout: Duration,
+    // The startup value: re-read from the Settings screen's every pass (see the loop).
+    mut proving_timeout: Duration,
     // Startup snapshot of the COST COMPOSITION only. The three figures the Settings screen
     // edits — `min_profit_threshold`, `deadline_safety_margin`, `token_price_usd`, plus the
     // three inside `CostParams` — are deliberately NOT parameters: the loop re-reads them
@@ -7167,6 +7200,31 @@ async fn miner_brain(
                 s.runtime_settings.token_price_usd,
             )
         };
+        // The per-attempt proving cap, live from the Settings screen too: the claim gate's "too
+        // large" check and each new lifecycle's watchdog use this pass's value. An attempt already
+        // running keeps the cap it started with. Assigned, not shadowed, so the recovery drive at
+        // the top of the next pass takes it too.
+        let previous_timeout = proving_timeout;
+        proving_timeout = Duration::from_secs(
+            state
+                .read()
+                .await
+                .runtime_settings
+                .proving_timeout_secs
+                .max(60),
+        );
+        // Raised: the jobs set aside as too long for the old cap are looked at again now, not when
+        // their set-aside runs out half an hour later.
+        if proving_timeout > previous_timeout {
+            let released = release_set_aside_for(TOO_LONG_FOR_PROVING_TIMEOUT);
+            if released > 0 {
+                tracing::info!(
+                    "proving timeout raised to {}s: looking again at {released} job(s) skipped as \
+                     too long for the old one",
+                    proving_timeout.as_secs()
+                );
+            }
+        }
         // Live, like the rest of them. See the claim gate below for why this one was load-bearing.
         let (disabled_backends, disabled_slots_by_backend) = {
             let st = state.read().await;
@@ -8853,12 +8911,8 @@ async fn miner_brain(
                         // Deterministic for this (program, input) — an unmeasurable guest lands here
                         // too — so set the job aside rather than let it hold a slot of the per-tick
                         // candidate cut on every tick.
-                        set_job_aside(
-                            jid,
-                            UNMEASURABLE_RETRY_TTL,
-                            "too large for proving_timeout_secs",
-                        );
-                        declines.note(jid, "too large for proving_timeout_secs");
+                        set_job_aside(jid, UNMEASURABLE_RETRY_TTL, TOO_LONG_FOR_PROVING_TIMEOUT);
+                        declines.note(jid, TOO_LONG_FOR_PROVING_TIMEOUT);
                         continue;
                     }
                 }
@@ -14712,6 +14766,28 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    /// Raising the proving timeout brings back the jobs skipped as too long for the old one at once,
+    /// and only those: a job set aside for another reason stays aside.
+    #[test]
+    fn raising_the_proving_timeout_releases_only_the_jobs_it_set_aside() {
+        let too_long = B256::repeat_byte(0x71);
+        let elsewhere = B256::repeat_byte(0x72);
+        set_job_aside(
+            too_long,
+            Duration::from_secs(600),
+            TOO_LONG_FOR_PROVING_TIMEOUT,
+        );
+        set_job_aside(elsewhere, Duration::from_secs(600), "assigned to another prover");
+        assert!(release_set_aside_for(TOO_LONG_FOR_PROVING_TIMEOUT) >= 1);
+        assert!(!claim_backing_off(too_long));
+        assert!(!job_set_aside(too_long));
+        assert_eq!(
+            claim_backoff_reason(elsewhere),
+            Some("assigned to another prover")
+        );
+        assert!(job_set_aside(elsewhere));
+    }
 
     /// The dashboard says plainly that a program has nothing to download, naming it by id when the
     /// registry has no name for it, instead of "Downloading ELF '' (0 URIs)".

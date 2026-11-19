@@ -285,13 +285,17 @@ fn default_system_watts() -> f64 {
     75.0
 }
 fn default_proving_timeout() -> u64 {
-    // Watchdog cap for a WEDGED GPU (kernel that never returns). 10 min comfortably
-    // covers the slowest realistic single proof on these cards (~150M cycles at
-    // ~1.25M cps ≈ 2 min + Groth16), while catching a wedge far sooner than the old
-    // 30 min. Committed-cycle jobs are scaled tighter still (see run.rs). Lower this
-    // for a small-job-only workload if you want wedges caught faster.
-    600
+    PROVING_TIMEOUT_DEFAULT_SECS
 }
+
+/// The cap on one proof attempt. A measured job's watchdog is already sized on the job (four times
+/// its expected time on the slowest card it was planned for), which is what catches a wedged GPU;
+/// this cap bounds that, and the miner skips any job whose attempt would need longer. The old 600
+/// assumed proofs of about 150M cycles; open-market jobs of 500M+ cycles take longer than that on a
+/// 12 GB card and were all skipped as "too large", whatever their fulfilment window.
+const PROVING_TIMEOUT_DEFAULT_SECS: u64 = 3600;
+/// The default before it was raised, which `zkminer init` wrote into config files.
+const PROVING_TIMEOUT_OLD_DEFAULT_SECS: u64 = 600;
 fn default_benchmark_timeout() -> u64 {
     // The suite plus the zkOP/s proofs is about 10 minutes on an Arc A770's RISC Zero worker.
     BENCHMARK_TIMEOUT_DEFAULT_SECS
@@ -313,6 +317,16 @@ impl ProverConfig {
                 BENCHMARK_TIMEOUT_DEFAULT_SECS,
             )),
             secs => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
+
+    /// The per-attempt proving cap in seconds, as the miner starts with it (the Settings screen can
+    /// change it for the session). A config still carrying the old default gets the new one: that
+    /// value was never a choice, and it made every job above about 500M cycles unclaimable.
+    pub fn proving_timeout_secs(&self) -> u64 {
+        match self.proving_timeout_secs {
+            PROVING_TIMEOUT_OLD_DEFAULT_SECS => PROVING_TIMEOUT_DEFAULT_SECS,
+            secs => secs,
         }
     }
 }
@@ -498,5 +512,17 @@ mod validation_tests {
                 );
             }
         }
+    }
+
+    /// A config `zkminer init` wrote with the old 600 s default gets the new one; any other value,
+    /// including one the operator chose, stands.
+    #[test]
+    fn the_old_proving_timeout_default_is_upgraded() {
+        let mut p = ProverConfig::default();
+        assert_eq!(p.proving_timeout_secs(), 3600);
+        p.proving_timeout_secs = 600;
+        assert_eq!(p.proving_timeout_secs(), 3600);
+        p.proving_timeout_secs = 900;
+        assert_eq!(p.proving_timeout_secs(), 900);
     }
 }
