@@ -384,7 +384,7 @@ fn main() {
     // which would corrupt the bincode IPC stream. We dup stdout for IPC,
     // then redirect FD 1 to stderr so any stray prints go to the log.
     #[cfg(unix)]
-    let mut ipc_stdout = {
+    let ipc_stdout = {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let stdout_fd = io::stdout().as_raw_fd(); // FD 1
         let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
@@ -393,7 +393,7 @@ fn main() {
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
     #[cfg(windows)]
-    let mut ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -401,6 +401,12 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Where sp1-gpu-server writes a proof's task counts, for `ProgressPoller`. Set before any server
+    // is started: it inherits this process's environment. A server without the feature ignores it.
+    if std::env::var_os(SP1_PROGRESS_FILE_ENV).is_none() {
+        std::env::set_var(SP1_PROGRESS_FILE_ENV, progress_file_path());
+    }
 
     // Which card this worker drives, set by the dispatcher. Read here as well as in the worker loop
     // because the orphan reaping below must be scoped to it: there is one SP1 worker per card now,
@@ -490,10 +496,11 @@ fn main() {
         std::process::exit(run_benchmarks_by_hand(our_cuda_device));
     }
 
-    // By reference, so the descriptor closes with the process and not before. The host reads the EOF
-    // as this worker having died and asks at once how it died (`died_of_host_oom`), so a descriptor
-    // closed while it is still exiting gets the answer "still running".
-    if let Err(e) = run_worker_loop(&mut ipc_stdout) {
+    // The descriptor must close with the process and not before: the host reads the EOF as this
+    // worker having died and asks at once how it died (`died_of_host_oom`), so a descriptor closed
+    // while it is still exiting gets the answer "still running". The loop keeps it in `IPC_OUT`, a
+    // static, which is never dropped.
+    if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(if e.is::<ServerLost>() {
             zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST
@@ -1854,9 +1861,150 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
     };
 }
 
-fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
+/// The environment variable sp1-gpu-server reads for its progress file (`sp1_prover::worker`'s
+/// `PROGRESS_FILE_ENV`). A string here: the server is a separate binary of the fork, which may not
+/// have it, and then nothing is written.
+const SP1_PROGRESS_FILE_ENV: &str = "SP1_PROGRESS_FILE";
+
+/// This worker's progress file: one per worker process, so two cards' servers never share one.
+fn progress_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("zkminer-sp1-progress-{}.txt", std::process::id()))
+}
+
+/// The IPC writer, shared between the worker loop and the progress poller.
+type IpcOut = std::sync::Arc<std::sync::Mutex<Box<dyn io::Write + Send>>>;
+
+static IPC_OUT: std::sync::OnceLock<IpcOut> = std::sync::OnceLock::new();
+
+/// A handle on the shared IPC writer. Each message is written under its own lock: the poller holds
+/// it for a whole message (`write_message` through `report`), and the loop writes nothing while a
+/// poller runs.
+struct SharedOut(IpcOut);
+
+impl io::Write for SharedOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).flush()
+    }
+}
+
+/// One kind's task counts in the server's progress file: (done, submitted).
+type KindCounts = HashMap<String, (u32, u32)>;
+
+/// Parses the server's progress line (`proof=<id> KIND=done/submitted ...`). `None` for a line it
+/// cannot read, e.g. one caught half written.
+fn parse_progress_line(line: &str) -> Option<KindCounts> {
+    let mut words = line.split_whitespace();
+    words.next()?.strip_prefix("proof=")?;
+    let mut counts = HashMap::new();
+    for word in words {
+        let (kind, ratio) = word.split_once('=')?;
+        let (done, submitted) = ratio.split_once('/')?;
+        counts.insert(kind.to_string(), (done.parse().ok()?, submitted.parse().ok()?));
+    }
+    Some(counts)
+}
+
+/// How far a Groth16 proof is from its task counts, and (shards proven, shards submitted). The
+/// shards and the reduce tree take the bar to 85%; the shrink wrap 88-90%; the Groth16 (or PLONK)
+/// wrap starts at 92%, a fixed ~15 s that dominates a small proof. Until execution ends the shard
+/// total is not final, so shard progress counts for at most 60% of its share.
+fn progress_fraction(counts: &KindCounts) -> (f64, Option<(u32, u32)>) {
+    let get = |k: &str| counts.get(k).copied().unwrap_or((0, 0));
+    let ratio = |(done, submitted): (u32, u32)| {
+        if submitted == 0 {
+            0.0
+        } else {
+            f64::from(done.min(submitted)) / f64::from(submitted)
+        }
+    };
+    let shards = get("PROVE_SHARD");
+    let segments = (shards.1 > 0).then_some(shards);
+    let (groth16, plonk) = (get("GROTH16_WRAP"), get("PLONK_WRAP"));
+    let snark = (groth16.0 + plonk.0, groth16.1 + plonk.1);
+    if snark.1 > 0 {
+        return (if snark.0 > 0 { 0.99 } else { 0.92 }, segments);
+    }
+    let shrink = get("SHRINK_WRAP");
+    if shrink.1 > 0 {
+        return (if shrink.0 > 0 { 0.90 } else { 0.88 }, segments);
+    }
+    let executed = get("CORE_EXECUTE").0 > 0;
+    let core = ratio(shards) * if executed { 1.0 } else { 0.6 };
+    let reduce = ratio(get("RECURSION_REDUCE"));
+    (0.85 * (0.8 * core + 0.2 * reduce), segments)
+}
+
+/// Reads the server's progress file while a proof runs and sends the host a `Progress` when it
+/// moves. Stopped and joined on drop.
+struct ProgressPoller {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPoller {
+    fn start(request_id: u64) -> Self {
+        let path = std::env::var_os(SP1_PROGRESS_FILE_ENV).map(std::path::PathBuf::from);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (Some(path), Some(out)) = (path, IPC_OUT.get().cloned()) else {
+            return Self { stop, thread: None };
+        };
+        // A previous proof's counts must not read as this one's.
+        let _ = std::fs::remove_file(&path);
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("sp1-progress".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let mut last = 0.0f64;
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let Some(counts) = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|line| parse_progress_line(&line))
+                    else {
+                        continue;
+                    };
+                    let (fraction, segments) = progress_fraction(&counts);
+                    if fraction <= last {
+                        continue;
+                    }
+                    last = fraction;
+                    let msg = WorkerResponse::Progress {
+                        request_id,
+                        fraction,
+                        elapsed_secs: started.elapsed().as_secs_f64(),
+                        segments,
+                    };
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = write_message(&mut SharedOut(out.clone()), &msg);
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for ProgressPoller {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(ipc_stdout);
+    // Shared, so the progress poller can report while a proof runs (see `ProgressPoller`).
+    let shared: IpcOut =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(BufWriter::new(ipc_stdout))));
+    let _ = IPC_OUT.set(shared.clone());
+    let mut stdout = SharedOut(shared);
 
     // Lazy-init the CUDA prover on first Prove/Benchmark command, not at startup.
     // CudaProver initialization is expensive (spawns sp1-gpu-server, CUDA context)
@@ -2307,6 +2455,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // SDK calls in catch_unwind for exactly this reason; the Prove arm must too, or the
                 // worker dies on a CLAIMED job, the dispatcher charges a healthy slot, the retry loop
                 // crashes every GPU, and the program is never classed bad. A caught panic is a bad job.
+                // Reports the server's task counts while the proof runs; stopped (and joined) before
+                // the answer is written.
+                let poller = ProgressPoller::start(request_id);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_proof(
                         prover_for_proof,
@@ -2316,6 +2467,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         program_id,
                     )
                 }));
+                drop(poller);
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
@@ -5107,5 +5259,48 @@ mod shm_reaper_tests {
         assert!(!is_sp1_executor_runner_comm("sp1-gpu-server"));
         assert!(!is_sp1_executor_runner_comm("zkminer-prove-s"));
         assert!(!is_sp1_executor_runner_comm(""));
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_servers_progress_line() {
+        let counts = parse_progress_line(
+            "proof=abc CORE_EXECUTE=1/1 PROVE_SHARD=12/40 RECURSION_REDUCE=3/9",
+        )
+        .unwrap();
+        assert_eq!(counts["PROVE_SHARD"], (12, 40));
+        assert_eq!(counts["CORE_EXECUTE"], (1, 1));
+        assert!(
+            parse_progress_line("proof=abc PROVE_SHARD=12/").is_none(),
+            "half written"
+        );
+        assert!(parse_progress_line("").is_none());
+    }
+
+    /// The bar only rises through the stages, the shards short of their share until the total is
+    /// known, and never reaches 100% before the proof is in.
+    #[test]
+    fn fraction_follows_the_stages() {
+        let at = |line: &str| progress_fraction(&parse_progress_line(line).unwrap()).0;
+        let executing = at("proof=a CORE_EXECUTE=0/1 PROVE_SHARD=5/10");
+        let executed = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=5/10");
+        let shards_done = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/10 RECURSION_REDUCE=9/9");
+        let shrink = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/10 SHRINK_WRAP=0/1");
+        let wrap =
+            at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/10 SHRINK_WRAP=1/1 GROTH16_WRAP=0/1");
+        assert!(
+            executing < executed && executed < shards_done,
+            "{executing} {executed} {shards_done}"
+        );
+        assert!((shards_done - 0.85).abs() < 1e-9);
+        assert!(shards_done < shrink && shrink < wrap && wrap < 1.0);
+        assert_eq!(
+            progress_fraction(&parse_progress_line("proof=a PROVE_SHARD=3/7").unwrap()).1,
+            Some((3, 7))
+        );
     }
 }
