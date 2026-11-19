@@ -1743,6 +1743,13 @@ pub fn benchmark_failure_advice(gpu_tag: &str) -> &'static str {
     }
 }
 
+/// What to try when a Metal worker could not start (W10-BFIX).
+pub const METAL_START_ADVICE: &str =
+    "The prover could not start. If it was copied out of the kit by hand, or macOS blocked it, run \
+     ./install.sh from the kit folder again: the installed copies have no com.apple.quarantine \
+     mark (see Gatekeeper in the kit's README.md; check with `xattr -l \
+     ~/.zkminer/provers/zkminer-prove-risc0-metal`).";
+
 /// The failures of a run, one line each, with what to try: for the CLI and the TUI (W10-BENCH).
 pub fn describe_failures(failures: &[crate::dispatcher::SlotBenchmarkFailure]) -> Vec<String> {
     let mut lines = Vec::new();
@@ -1757,6 +1764,14 @@ pub fn describe_failures(failures: &[crate::dispatcher::SlotBenchmarkFailure]) -
         let a = benchmark_failure_advice(&f.gpu_tag);
         if !advice.contains(&a) {
             advice.push(a);
+        }
+        // A Metal worker that never started: the likeliest cause on an unsigned beta is a copy that
+        // still carries the browser's quarantine mark, which Gatekeeper kills at exec (W10-BFIX).
+        if f.gpu_tag == "metal"
+            && f.error.starts_with(crate::dispatcher::COULD_NOT_START)
+            && !advice.contains(&METAL_START_ADVICE)
+        {
+            advice.push(METAL_START_ADVICE);
         }
     }
     lines.extend(advice.into_iter().map(str::to_string));

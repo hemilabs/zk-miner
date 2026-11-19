@@ -169,6 +169,12 @@ run` does not price jobs from it. Then:
 3. After a macOS update, run the benchmark again: the first start after an update recompiles the GPU
    pipelines (see [First start](#first-start)).
 
+**The header says `Workers: risc0:metal:0 (failed to start; see below)`.** The prover is installed
+but died before it answered: the failure line says `could not start:` with its error and, when it
+printed one, its last output (for example a `dyld:` line for a missing library). A copy that still
+carries the browser's quarantine mark is killed by macOS at start: run `./install.sh` from the kit
+again (see [Gatekeeper](#gatekeeper-unsigned-beta)), then `tools/macos-smoke.sh`.
+
 **`zkminer benchmark` prints a `SIMULATED` table.** No prover was found in `~/.zkminer/provers`, so
 nothing was proved. The table is CPU stand-ins, has no zkOP/s score and is not saved. Run
 `./install.sh` from the kit.

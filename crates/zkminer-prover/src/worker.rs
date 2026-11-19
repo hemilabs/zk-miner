@@ -7,7 +7,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Environment-variable names that must NEVER be passed to a prover worker or the sp1-gpu-server it
@@ -114,6 +114,10 @@ impl std::error::Error for WorkerDied {}
 /// Defined in the protocol crate so the workers that must fit inside it can assert that they
 /// do, instead of hard-coding a copy of a number they cannot see.
 use zkminer_prover_protocol::proc::HANDSHAKE_TIMEOUT;
+
+/// How long a failed handshake waits for the worker's stderr to drain before reading its last line
+/// for the error (W10-BFIX). A worker that died closes it at once; a live one costs this wait.
+const STDERR_DRAIN_WAIT: Duration = Duration::from_millis(300);
 
 /// Outcome of a NON-REAPING exit check. See `probe_exit_nowait`.
 #[cfg(unix)]
@@ -606,6 +610,10 @@ pub struct WorkerHandle {
     reader: BufReader<ChildStdout>,
     writer: BufWriter<ChildStdin>,
     stderr_task: Option<std::thread::JoinHandle<()>>,
+    /// The last non-empty line the worker wrote on stderr (sanitized, capped), recorded even when
+    /// forwarding is suppressed. A worker that dies before its handshake usually says why there
+    /// ("dyld: Library not loaded"), and the spawn error carries it to the operator (W10-BFIX).
+    last_stderr: Arc<Mutex<Option<String>>>,
     /// True once this handle has reaped its child. Every `kill(-pgid, …)` is gated on
     /// this: after the reap the pid number is free and may name an unrelated group.
     reaped: bool,
@@ -867,6 +875,8 @@ impl WorkerHandle {
 
         // Spawn stderr reader thread that forwards to tracing
         let backend_name = backend.to_string();
+        let last_stderr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_stderr_w = last_stderr.clone();
         let stderr_task = child_stderr.map(|stderr| {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
@@ -902,17 +912,19 @@ impl WorkerHandle {
                         if raw.is_empty() {
                             return;
                         }
+                        // Sanitize (strip control/escape bytes, cap length) before it can reach the
+                        // operator's console or log file.
+                        let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
+                        if line.is_empty() {
+                            return;
+                        }
+                        // Kept for a failed handshake's error (W10-BFIX), whatever is forwarded.
+                        *last_stderr_w.lock().unwrap_or_else(|e| e.into_inner()) = Some(line.clone());
                         // TUI mode suppresses forwarding to BOTH sinks: the eprintln would corrupt the
                         // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
                         // tracing::warn would flood the rolling log file. The pipe is still drained (we
                         // read every byte), so the worker never blocks on a full pipe regardless.
                         if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        // Sanitize (strip control/escape bytes, cap length) before it can reach the
-                        // operator's console or log file.
-                        let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
-                        if line.is_empty() {
                             return;
                         }
                         // Refill the bucket for the time since the last forward, then spend one token.
@@ -1027,14 +1039,37 @@ impl WorkerHandle {
             reader,
             writer,
             stderr_task,
+            last_stderr,
             reaped: false,
             oom_kills_at_spawn,
         };
 
-        // Perform Hello handshake
-        handle.handshake()?;
+        // Perform Hello handshake. A worker that fails it (died at exec, a missing dylib, a crash
+        // before the handshake) has usually said why on stderr: carry its last line in the error, or
+        // the operator sees only "process died (EOF)" (W10-BFIX).
+        if let Err(e) = handle.handshake() {
+            return Err(match handle.last_stderr_line(STDERR_DRAIN_WAIT) {
+                Some(said) => anyhow::anyhow!("{e:#} (the worker's last output: {said})"),
+                None => e,
+            });
+        }
 
         Ok(handle)
+    }
+
+    /// The worker's last stderr line, after waiting up to `wait` for its stderr to be drained (a
+    /// worker that died has closed it; one that is still running is not waited for longer).
+    fn last_stderr_line(&self, wait: Duration) -> Option<String> {
+        if let Some(task) = &self.stderr_task {
+            let deadline = Instant::now() + wait;
+            while !task.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.last_stderr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn handshake(&mut self) -> Result<()> {

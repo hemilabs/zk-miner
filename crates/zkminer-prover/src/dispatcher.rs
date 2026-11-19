@@ -241,11 +241,7 @@ impl BenchmarkRun {
                 );
                 self.not_benchmarked.push(down);
             } else {
-                tracing::error!(
-                    "Benchmark failed for {}: it was not running and could not be started: {}",
-                    down.slot_key,
-                    down.error
-                );
+                tracing::error!("Benchmark failed for {}: {}", down.slot_key, down.error);
                 self.failures.push(down);
             }
         }
@@ -253,6 +249,21 @@ impl BenchmarkRun {
             self.failures.append(&mut self.not_benchmarked);
         }
         self
+    }
+}
+
+/// The start of the failure of a slot that had no worker during the benchmark (W10-BFIX).
+pub const COULD_NOT_START: &str = "could not start: ";
+
+/// The failure of a down slot: its last spawn error, or failing that the benchmark's own attempt,
+/// which is only context when it differs (see [`WorkerPool::down_slot_error`]).
+fn down_slot_message(last_spawn_error: Option<&str>, attempt: &str) -> String {
+    match last_spawn_error {
+        Some(last) if last != attempt => {
+            format!("{COULD_NOT_START}{last} (then, when the benchmark tried it: {attempt})")
+        }
+        Some(last) => format!("{COULD_NOT_START}{last}"),
+        None => format!("{COULD_NOT_START}{attempt}"),
     }
 }
 
@@ -1133,6 +1144,10 @@ struct WorkerSlot {
     /// the worker had just said it could not prove -- and every ~RETIRE_COOLDOWN the
     /// counter reset re-opened the window for the life of the process.
     declined: Option<String>,
+    /// The error of this slot's last failed spawn or respawn (the handshake error, with the
+    /// worker's last stderr line), cleared when a worker starts. A benchmark of a slot that never
+    /// came up reports THIS, not the respawn backoff its own retry ran into (W10-BFIX).
+    last_spawn_error: Option<String>,
     /// Number of proofs this worker instance has completed since it was (re)spawned.
     /// When it reaches `recycle_after_proofs()`, the worker is killed + respawned so
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
@@ -2784,6 +2799,8 @@ pub struct WorkerPool {
     metal_tier_jobs: [AtomicU64; 2],
     /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
     startup_problems: Vec<String>,
+    /// The slots `discover_and_spawn` found but could not start, and whether each declined (W10-BFIX).
+    not_started: Vec<(String, bool)>,
     /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
     setup_status: Mutex<HashMap<String, zkminer_prover_protocol::SetupStep>>,
 }
@@ -2868,6 +2885,7 @@ impl WorkerPool {
             recycle_override: Mutex::new(HashMap::new()),
             metal_tier_jobs: [AtomicU64::new(0), AtomicU64::new(0)],
             startup_problems: Vec::new(),
+            not_started: Vec::new(),
             setup_status: Mutex::new(HashMap::new()),
         }
     }
@@ -2879,6 +2897,12 @@ impl WorkerPool {
 
     /// Why workers could not start in `discover_and_spawn`, in words for the operator: without
     /// this a card missing a zkVM has no explanation outside the log file.
+    /// The workers `discover_and_spawn` found but could not start, as `(slot key, declined)`: the
+    /// CLI names them instead of saying there is no worker (W10-BFIX).
+    pub fn not_started(&self) -> &[(String, bool)] {
+        &self.not_started
+    }
+
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
     }
@@ -3464,6 +3488,7 @@ impl WorkerPool {
                                 consecutive_failures: 0,
                                 last_failure: None,
                                 declined: None,
+                                last_spawn_error: None,
                                 proofs_since_spawn: 0,
                                 last_use: None,
                             }),
@@ -3506,6 +3531,7 @@ impl WorkerPool {
                     ));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
+                    self.not_started.push((key.clone(), declined.is_some()));
                     self.workers.insert(
                         key,
                         WorkerEntry {
@@ -3521,6 +3547,7 @@ impl WorkerPool {
                                 consecutive_failures: 1,
                                 last_failure: Some(Instant::now()),
                                 declined,
+                                last_spawn_error: Some(msg),
                                 proofs_since_spawn: 0,
                                 last_use: None,
                             }),
@@ -3627,6 +3654,7 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        last_spawn_error: None,
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -3792,6 +3820,7 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        last_spawn_error: None,
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -3825,6 +3854,25 @@ impl WorkerPool {
     }
 
     /// Whether `key` has no worker running now.
+    /// The benchmark error of a slot that had no worker and still has none: "could not start: "
+    /// and the error of its last failed spawn (a handshake that died, with the worker's last stderr
+    /// line), with the benchmark's own attempt (usually "Backoff: waiting ... before respawning",
+    /// which says nothing about the worker) only as context (W10-BFIX).
+    fn down_slot_error(&self, key: &str, attempt: anyhow::Error) -> anyhow::Error {
+        let last = self.workers.get(key).and_then(|entry| {
+            entry
+                .slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_spawn_error
+                .clone()
+        });
+        anyhow::anyhow!(
+            "{}",
+            down_slot_message(last.as_deref(), &format!("{attempt:#}"))
+        )
+    }
+
     fn slot_has_no_worker(&self, key: &str) -> bool {
         self.benchmark_slot_state(key).1
     }
@@ -4969,6 +5017,12 @@ impl WorkerPool {
             });
             // Still down after the attempt: it never came up, so this run could not benchmark it.
             let was_down = was_down && self.slot_has_no_worker(&key);
+            // Its error is why it never came up, not the respawn backoff the retry ran into.
+            let outcome = if was_down {
+                outcome.map_err(|e| self.down_slot_error(&key, e))
+            } else {
+                outcome
+            };
             let host_peak_bytes = self.host_peak_for_slot(&key);
             run.record(
                 &key,
@@ -5442,6 +5496,12 @@ impl WorkerPool {
             });
             // Still down after the attempt: it never came up, so this run could not benchmark it.
             let was_down = was_down && self.slot_has_no_worker(&key);
+            // Its error is why it never came up, not the respawn backoff the retry ran into.
+            let outcome = if was_down {
+                outcome.map_err(|e| self.down_slot_error(&key, e))
+            } else {
+                outcome
+            };
             let host_peak_bytes = self.host_peak_for_slot(&key);
             run.record(
                 &key,
@@ -10035,6 +10095,7 @@ impl WorkerPool {
                 slot.handle = Some(handle);
                 slot.consecutive_failures = 0;
                 slot.last_failure = None;
+                slot.last_spawn_error = None;
                 slot.proofs_since_spawn = 0;
                 Ok(())
             }
@@ -10058,8 +10119,9 @@ impl WorkerPool {
                         slot.backend,
                         slot.gpu_tag,
                     );
-                    slot.declined = Some(msg);
+                    slot.declined = Some(msg.clone());
                 }
+                slot.last_spawn_error = Some(msg);
                 slot.consecutive_failures += 1;
                 slot.last_failure = Some(Instant::now());
                 Err(e)
@@ -10340,6 +10402,7 @@ impl WorkerPool {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    last_spawn_error: None,
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),
@@ -10381,6 +10444,7 @@ impl WorkerPool {
                     consecutive_failures: 1,
                     last_failure: Some(Instant::now()),
                     declined: declined.map(str::to_string),
+                    last_spawn_error: None,
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),
@@ -10419,6 +10483,7 @@ impl WorkerPool {
                 consecutive_failures: 0,
                 last_failure: None,
                 declined: None,
+                last_spawn_error: None,
                 proofs_since_spawn: 0,
                 last_use: None,
             }),
@@ -11572,6 +11637,7 @@ mod tests {
                         consecutive_failures: 0,
                         last_failure: None,
                         declined: None,
+                        last_spawn_error: None,
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -13637,6 +13703,7 @@ mod tests {
             consecutive_failures: failures,
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         }
@@ -13763,6 +13830,7 @@ mod tests {
             consecutive_failures: MAX_RESPAWN_FAILURES,
             last_failure: Some(Instant::now()),
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13789,6 +13857,7 @@ mod tests {
             consecutive_failures: 1,
             last_failure: Some(Instant::now()), // just failed
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13814,6 +13883,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13821,6 +13891,61 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(slot.consecutive_failures, 1);
         assert!(slot.last_failure.is_some());
+        // W10-BFIX: the failure is kept for the operator, and a backoff bail does not replace it.
+        let spawn_error = slot.last_spawn_error.clone().expect("spawn error recorded");
+        assert!(spawn_error.contains("/nonexistent/binary"), "{spawn_error}");
+        let backoff = format!("{:#}", WorkerPool::respawn(&mut slot).unwrap_err());
+        assert!(backoff.starts_with("Backoff"), "{backoff}");
+        assert_eq!(slot.last_spawn_error.as_deref(), Some(spawn_error.as_str()));
+    }
+
+    /// W10-BFIX: a worker that dies before its handshake is reported with its last stderr line,
+    /// which is where it says why (the round-3 reviewer's `h_crash`).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_respawn_keeps_the_workers_last_words() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zkminer-bfix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dies-at-start");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'dyld: Library not loaded: @rpath/libx.dylib' >&2\nexit 134\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut slot = WorkerSlot::test_dead_slot(path);
+        assert!(WorkerPool::respawn(&mut slot).is_err());
+        let error = slot.last_spawn_error.clone().expect("spawn error recorded");
+        assert!(error.contains("Handshake"), "{error}");
+        assert!(
+            error.contains("the worker's last output: dyld: Library not loaded"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W10-BFIX: a down slot's benchmark failure leads with why it never started; the benchmark's
+    /// own attempt (a respawn backoff) is context only, and stands alone only when nothing else is
+    /// known.
+    #[test]
+    fn a_down_slot_reports_its_spawn_error_before_the_backoff() {
+        use super::{down_slot_message, COULD_NOT_START};
+        let backoff = "Backoff: waiting 4.7s before respawning /x";
+        let died =
+            "Handshake with worker risc0 failed (timeout=10s): Worker risc0 process died (EOF)";
+        assert_eq!(
+            down_slot_message(Some(died), backoff),
+            format!("{COULD_NOT_START}{died} (then, when the benchmark tried it: {backoff})")
+        );
+        assert_eq!(
+            down_slot_message(Some(died), died),
+            format!("{COULD_NOT_START}{died}")
+        );
+        assert_eq!(
+            down_slot_message(None, backoff),
+            format!("{COULD_NOT_START}{backoff}")
+        );
     }
 
     // ---- ensure_alive tests ----
@@ -13843,6 +13968,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13873,6 +13999,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13997,6 +14124,7 @@ mod declined_backend_tests {
             consecutive_failures: cf,
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         }
@@ -14216,8 +14344,30 @@ impl WorkerSlot {
             consecutive_failures: self.consecutive_failures,
             last_failure: self.last_failure,
             declined: self.declined.clone(),
+            last_spawn_error: self.last_spawn_error.clone(),
             proofs_since_spawn: self.proofs_since_spawn,
             last_use: self.last_use,
+        }
+    }
+
+    /// Test-only: a dead risc0 CPU slot for `path` that may respawn at once.
+    #[cfg(test)]
+    fn test_dead_slot(path: PathBuf) -> Self {
+        WorkerSlot {
+            handle: None,
+            path,
+            backend: "risc0".to_string(),
+            gpu_tag: "generic".to_string(),
+            device_index: None,
+            pci_bus_id: None,
+            gpu_name: None,
+            spawn_env: HashMap::new(),
+            consecutive_failures: 0,
+            last_failure: None,
+            declined: None,
+            last_spawn_error: None,
+            proofs_since_spawn: 0,
+            last_use: None,
         }
     }
 }
@@ -14252,6 +14402,7 @@ mod bus_id_locking_tests {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    last_spawn_error: None,
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),

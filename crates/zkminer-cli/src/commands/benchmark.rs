@@ -40,6 +40,8 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         benchmark_timeout,
     );
     let connected = pool.discover_and_spawn();
+    // Found but not started (died at startup, declined): named in the header, never "none" (W10-BFIX).
+    let not_started = pool.not_started().to_vec();
     init_worker_pool(pool);
 
     if !json {
@@ -50,11 +52,7 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         let cores = benchmark::get_cpu_cores();
         println!("CPU:    {}", cpu_info);
         println!("Cores:  {}", cores);
-        if connected.is_empty() {
-            println!("Workers: none — install prover binaries in ~/.zkminer/provers (CPU/simulated only)");
-        } else {
-            println!("Workers: {}", connected.join(", "));
-        }
+        println!("Workers: {}", workers_header(&connected, &not_started));
         println!();
 
         println!("Running benchmarks...");
@@ -225,6 +223,26 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     }
     print_results(&results);
     Ok(())
+}
+
+/// The header's worker list: the workers that started, then those found that did not (W10-BFIX).
+/// "none" only when no worker was found at all, which is the one case that runs simulated.
+fn workers_header(connected: &[String], not_started: &[(String, bool)]) -> String {
+    if connected.is_empty() && not_started.is_empty() {
+        return "none — install prover binaries in ~/.zkminer/provers (CPU/simulated only)".into();
+    }
+    connected
+        .iter()
+        .cloned()
+        .chain(not_started.iter().map(|(key, declined)| {
+            if *declined {
+                format!("{key} (declined; see below)")
+            } else {
+                format!("{key} (failed to start; see below)")
+            }
+        }))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The table of a simulated run (no prover worker at all; W10-BENCH): every line says SIMULATED, and

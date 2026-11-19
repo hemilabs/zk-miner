@@ -247,3 +247,91 @@ fn a_complete_metal_suite_is_a_normal_benchmark() {
     assert!(!stdout.contains("SIMULATED"), "{stdout}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A fresh `HOME` whose `~/.zkminer/provers/zkminer-prove-risc0-metal` is a shell script: a worker
+/// that is installed but never speaks the protocol (W10-BFIX).
+#[cfg(target_os = "macos")]
+fn sandbox_with_script(tag: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let home = sandbox(tag, None).expect("no mock needed");
+    let worker = home.join(".zkminer/provers/zkminer-prove-risc0-metal");
+    std::fs::write(&worker, script).unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    home
+}
+
+/// The checks shared by the two startup failures below: a failure (exit 1, no table), a header
+/// that names the worker that failed to start instead of "Workers: none", and a failure line with
+/// the startup error (`startup`), not the respawn backoff the benchmark's own retry ran into.
+#[cfg(target_os = "macos")]
+fn assert_failed_to_start(out: &Output, startup: &[&str]) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a worker that never started gave exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for absent in ["Program", "SIMULATED", "zkOP/s", "c/s", "Workers: none"] {
+        assert!(!stdout.contains(absent), "printed {absent:?}:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("Workers: risc0:metal:0 (failed to start; see below)"),
+        "the header does not name the worker that failed to start:\n{stdout}"
+    );
+    assert!(stderr.contains("BENCHMARK FAILED"), "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|l| l.trim_start().starts_with("risc0:metal:0"))
+        .unwrap_or_else(|| panic!("no failure line for risc0:metal:0:\n{stderr}"));
+    assert!(
+        line.contains("could not start: "),
+        "the failure line does not say the worker could not start: {line:?}"
+    );
+    for text in startup {
+        assert!(
+            line.contains(text),
+            "the failure line lacks the startup error {text:?}: {line:?}"
+        );
+    }
+    assert!(
+        !line.contains("could not start: Backoff"),
+        "the failure line leads with the respawn backoff: {line:?}"
+    );
+    assert!(stderr.contains("tools/macos-smoke.sh"), "{stderr}");
+    assert!(
+        stderr.contains("com.apple.quarantine"),
+        "no quarantine advice for a worker that could not start:\n{stderr}"
+    );
+}
+
+/// A worker that dies at once, as a quarantined worker SIGKILLed by Gatekeeper or one missing a
+/// dylib does: the error names the death and the worker's last stderr line (W10-BFIX; the round-3
+/// reviewer's `h_crash`, which reported "Backoff: waiting 4.77s before respawning" under
+/// "Workers: none").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_that_dies_at_startup_is_named_with_its_error() {
+    let home = sandbox_with_script(
+        "crash",
+        "#!/bin/sh\necho \"dyld: Library not loaded: @rpath/libmissing.dylib\" >&2\nexit 134\n",
+    );
+    let out = zkminer_benchmark(&home, &["--calibrate"], &[]);
+    assert_failed_to_start(&out, &["process died", "dyld: Library not loaded"]);
+    assert!(!home.join(".zkminer/benchmarks.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A worker that writes something other than the prover protocol on stdout (the round-3
+/// reviewer's `h_garbage`).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_worker_that_writes_garbage_is_named_with_its_error() {
+    let home = sandbox_with_script(
+        "garbage",
+        "#!/bin/sh\nwhile true; do echo garbage-not-ipc; sleep 0.1; done\n",
+    );
+    let out = zkminer_benchmark(&home, &[], &[]);
+    assert_failed_to_start(&out, &["Handshake", "frame too large"]);
+    assert!(!home.join(".zkminer/benchmarks.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
