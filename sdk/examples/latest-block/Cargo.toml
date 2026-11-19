@@ -1,0 +1,13 @@
+[package]
+name = "latest-block"
+description = "Example witness builder: W = finalized blockNumber (u64 BE) || blockHash, via evm-rpc/v1 capability 0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hemiprove-builder-sdk = { path = "../../hemiprove-builder-sdk" }

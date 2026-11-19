@@ -49,6 +49,12 @@ hex = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 bincode = "1"
+# `witness_exec`: checks a sandboxed execute's journals against their hashes.
+sha2 = "0.10"
+
+# `witness_exec`: the sandboxed one-shot witness execute's cgroup and launch hook.
+[target.'cfg(target_os = "linux")'.dependencies]
+zkminer-witness-sandbox = { workspace = true }
 
 # Loads the GPU vendors' telemetry libraries, which ship with their drivers.
 [target.'cfg(windows)'.dependencies]
@@ -71,6 +77,7 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 # verify the risc0-bigint2 precompile output (a hand-rolled reduction is too
 # error-prone to trust as the oracle).
 num-bigint = "0.4"
+tempfile = "3"
 
 [build-dependencies]
 risc0-build = { version = "3.0", optional = true }

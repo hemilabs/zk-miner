@@ -330,23 +330,27 @@ mod tests {
     /// v14 (W10-INT): GitHub main's v13 (`Benchmark { programs }`, the public `sys_rand` rule) and
     /// the macOS beta's v13 (`BenchmarkEntry.power_state`, risc0 3.1) are two different wires. A
     /// worker of either still answers a decodable `HelloAck`, and the exact version check refuses it.
+    /// v17 (W11-ON37): the same for the beta's own 14 (no witness fields) and main's 14-16 (no
+    /// `power_state`): every one of them is a different wire from 17.
     #[test]
     fn a_worker_of_either_v13_is_refused() {
-        assert_eq!(PROTOCOL_VERSION, 14);
-        let hello = bincode::serialize(&WorkerResponse::HelloAck {
-            protocol_version: 13,
-            backend: "risc0".to_string(),
-            sdk_version: "risc0-zkvm 3.1.0".to_string(),
-            worker_version: "0.1.0".to_string(),
-        })
-        .unwrap();
-        let mut framed = (hello.len() as u32).to_be_bytes().to_vec();
-        framed.extend_from_slice(&hello);
-        match read_message::<_, WorkerResponse>(&mut Cursor::new(framed)).unwrap() {
-            WorkerResponse::HelloAck {
-                protocol_version, ..
-            } => assert_ne!(protocol_version, PROTOCOL_VERSION),
-            other => panic!("wrong variant: {other:?}"),
+        assert_eq!(PROTOCOL_VERSION, 17);
+        for version in [13, 14, 15, 16] {
+            let hello = bincode::serialize(&WorkerResponse::HelloAck {
+                protocol_version: version,
+                backend: "risc0".to_string(),
+                sdk_version: "risc0-zkvm 3.1.0".to_string(),
+                worker_version: "0.1.0".to_string(),
+            })
+            .unwrap();
+            let mut framed = (hello.len() as u32).to_be_bytes().to_vec();
+            framed.extend_from_slice(&hello);
+            match read_message::<_, WorkerResponse>(&mut Cursor::new(framed)).unwrap() {
+                WorkerResponse::HelloAck {
+                    protocol_version, ..
+                } => assert_ne!(protocol_version, PROTOCOL_VERSION),
+                other => panic!("wrong variant: {other:?}"),
+            }
         }
     }
 
@@ -576,6 +580,287 @@ mod tests {
             }
         }
         const _: () = assert!(PROTOCOL_VERSION >= 11);
+    }
+
+    fn witness() -> crate::types::WitnessProve {
+        crate::types::WitnessProve {
+            input_path: "/retention/job/v1/w.bin".to_string(),
+            prefix: (0..64).collect(),
+            input_sha256: [0x11; 32],
+            w_len: 1 << 20,
+            expect_journal_sha256: [0x22; 32],
+            segment_dir: "/segments/risc0-cuda-0".to_string(),
+        }
+    }
+
+    /// v14 appended `witness` to `Prove`: it round-trips both ways, the fields before it keep their
+    /// places (a `None` frame is a v13 frame plus one byte), and a v13 frame no longer decodes, which
+    /// is why the version moved.
+    #[test]
+    fn a_witness_prove_round_trips_and_appends_last() {
+        use crate::types::WitnessProve;
+        for w in [None, Some(witness())] {
+            let cmd = WorkerCommand::Prove {
+                request_id: 5,
+                elf: vec![0x7f, b'E'],
+                input_data: vec![],
+                po2: Some(19),
+                program_id: Some([3u8; 32]),
+                witness: w.clone(),
+            };
+            let mut buf = Vec::new();
+            write_message(&mut buf, &cmd).unwrap();
+            assert_eq!(
+                &buf[4..8],
+                &3u32.to_le_bytes(),
+                "Prove is still the 4th command"
+            );
+            match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
+                WorkerCommand::Prove {
+                    request_id,
+                    po2,
+                    program_id,
+                    witness,
+                    ..
+                } => {
+                    assert_eq!(
+                        (request_id, po2, program_id),
+                        (5, Some(19), Some([3u8; 32]))
+                    );
+                    assert_eq!(witness, w);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+
+        #[derive(serde::Serialize)]
+        enum V13Command {
+            _Hello,
+            _Capabilities,
+            _Benchmark,
+            Prove {
+                request_id: u64,
+                elf: Vec<u8>,
+                input_data: Vec<u8>,
+                po2: Option<u8>,
+                program_id: Option<[u8; 32]>,
+            },
+        }
+        let v13 = bincode::serialize(&V13Command::Prove {
+            request_id: 5,
+            elf: vec![1],
+            input_data: vec![2],
+            po2: None,
+            program_id: None,
+        })
+        .unwrap();
+        let v14 = bincode::serialize(&WorkerCommand::Prove {
+            request_id: 5,
+            elf: vec![1],
+            input_data: vec![2],
+            po2: None,
+            program_id: None,
+            witness: None,
+        })
+        .unwrap();
+        assert_eq!(
+            &v14[..v13.len()],
+            &v13[..],
+            "every earlier field keeps its place"
+        );
+        assert_eq!(
+            &v14[v13.len()..],
+            &[0u8],
+            "and `witness: None` is one trailing byte"
+        );
+        assert!(
+            bincode::deserialize::<WorkerCommand>(&v13).is_err(),
+            "a v13 Prove must not decode as v14"
+        );
+        // The struct round-trips on its own too (the dispatcher clones it into the frame).
+        let w: WitnessProve =
+            bincode::deserialize(&bincode::serialize(&witness()).unwrap()).unwrap();
+        assert_eq!(w, witness());
+        const _: () = assert!(PROTOCOL_VERSION >= 14);
+    }
+
+    /// v14's `JournalDiverged` is appended after `SetupProgress`, and `InputMismatch` after
+    /// `Internal`: no older index moved.
+    #[test]
+    fn journal_diverged_and_input_mismatch_are_appended() {
+        use crate::types::{ErrorKind, GUEST_EXIT_PAUSED};
+        let resp = WorkerResponse::JournalDiverged {
+            request_id: 8,
+            journal: vec![1, 2, 3],
+            journal_len: 3,
+            journal_sha256: [9u8; 32],
+            exit_kind: GUEST_EXIT_PAUSED,
+            exit_code: 7,
+            cycles: 3 << 20,
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &resp).unwrap();
+        assert_eq!(
+            &buf[4..8],
+            &13u32.to_le_bytes(),
+            "JournalDiverged is the 14th response"
+        );
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+            WorkerResponse::JournalDiverged {
+                request_id,
+                journal,
+                journal_len,
+                journal_sha256,
+                exit_kind,
+                exit_code,
+                cycles,
+            } => {
+                assert_eq!((request_id, journal, journal_len), (8, vec![1, 2, 3], 3));
+                assert_eq!(journal_sha256, [9u8; 32]);
+                assert_eq!(
+                    (exit_kind, exit_code, cycles),
+                    (GUEST_EXIT_PAUSED, 7, 3 << 20)
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let index = |resp: &WorkerResponse| {
+            let mut b = Vec::new();
+            write_message(&mut b, resp).unwrap();
+            u32::from_le_bytes(b[4..8].try_into().unwrap())
+        };
+        assert_eq!(
+            index(&WorkerResponse::SetupProgress {
+                request_id: 1,
+                status: String::new(),
+                done_bytes: None,
+                total_bytes: None,
+            }),
+            12
+        );
+
+        let kind = |k: ErrorKind| bincode::serialize(&k).unwrap();
+        assert_eq!(kind(ErrorKind::Internal), 5u32.to_le_bytes());
+        assert_eq!(kind(ErrorKind::InputMismatch), 6u32.to_le_bytes());
+        let mut buf = Vec::new();
+        write_message(
+            &mut buf,
+            &WorkerResponse::Error {
+                request_id: 4,
+                kind: ErrorKind::InputMismatch,
+                message: "sha256 mismatch".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &buf[4..8],
+            &8u32.to_le_bytes(),
+            "Error is still the 9th response"
+        );
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(buf)).unwrap() {
+            WorkerResponse::Error {
+                request_id, kind, ..
+            } => {
+                assert_eq!(request_id, 4);
+                assert!(matches!(kind, ErrorKind::InputMismatch));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The sandboxed execute's request and response are single frames of their own.
+    #[test]
+    fn a_witness_execute_request_and_response_round_trip() {
+        use crate::types::{
+            WitnessExecutePo2, WitnessExecuteRequest, WitnessExecuteResponse, GUEST_EXIT_HALTED,
+        };
+        let req = WitnessExecuteRequest {
+            elf: vec![0x7f, b'E', b'L', b'F'],
+            prefix: vec![],
+            w_len: 12,
+            input_sha256: [1; 32],
+            sys_rand_seed: [2; 32],
+            po2s: vec![16, 20, 22],
+            keccak_po2: 17,
+            max_cycles: Some(1 << 30),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &req).unwrap();
+        let got: WitnessExecuteRequest = read_message(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got, req);
+
+        let po2 = |p: u8| WitnessExecutePo2 {
+            po2: p,
+            cycles: 1 << p,
+            journal: vec![p; 8],
+            journal_len: 8,
+            journal_sha256: [p; 32],
+            exit_kind: GUEST_EXIT_HALTED,
+            exit_code: 0,
+            segment_bytes: 4096,
+            peak_host_bytes: 1 << 28,
+            sys_rand_draws: Some(u64::from(p) - 16),
+        };
+        // `None` (no draw seen) round-trips apart from `Some(0)` (only the runtime's).
+        let unknown = WitnessExecutePo2 {
+            sys_rand_draws: None,
+            ..po2(22)
+        };
+        let resp = WitnessExecuteResponse {
+            image_id: [3; 32],
+            results: vec![po2(16), po2(20), unknown],
+            sdk_version: "risc0-zkvm 3.1.0".to_string(),
+            worker_version: "0.1.0".to_string(),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &resp).unwrap();
+        let got: WitnessExecuteResponse = read_message(&mut Cursor::new(buf)).unwrap();
+        assert_eq!(got, resp);
+
+        // v16 appended `sys_rand_draws` to each po2: a v15 worker's response (the same fields
+        // without it) does not decode, rather than read as a guest that drew nothing.
+        #[derive(serde::Serialize)]
+        struct V15Po2 {
+            po2: u8,
+            cycles: u64,
+            journal: Vec<u8>,
+            journal_len: u32,
+            journal_sha256: [u8; 32],
+            exit_kind: u8,
+            exit_code: u32,
+            segment_bytes: u64,
+            peak_host_bytes: u64,
+        }
+        #[derive(serde::Serialize)]
+        struct V15Response {
+            image_id: [u8; 32],
+            results: Vec<V15Po2>,
+            sdk_version: String,
+            worker_version: String,
+        }
+        let v15 = V15Response {
+            image_id: [3; 32],
+            results: vec![V15Po2 {
+                po2: 20,
+                cycles: 1 << 20,
+                journal: vec![1; 8],
+                journal_len: 8,
+                journal_sha256: [4; 32],
+                exit_kind: GUEST_EXIT_HALTED,
+                exit_code: 0,
+                segment_bytes: 4096,
+                peak_host_bytes: 1 << 28,
+            }],
+            sdk_version: "risc0-zkvm 3.1.0".to_string(),
+            worker_version: "0.1.0".to_string(),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &v15).unwrap();
+        assert!(
+            read_message::<_, WitnessExecuteResponse>(&mut Cursor::new(buf)).is_err(),
+            "a v15 response must not decode as v16"
+        );
+        const _: () = assert!(PROTOCOL_VERSION >= 16);
     }
 
     #[test]

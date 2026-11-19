@@ -1011,16 +1011,43 @@ fn detect_intel_gpus_sysfs() -> Vec<DetectedGpu> {
     gpus
 }
 
-/// An Intel discrete card's device memory as the xe driver reports it: `(total, used)` in bytes over
-/// its VRAM regions.
+/// An Intel discrete card's device memory as its driver reports it: `(total, used)` in bytes over its
+/// VRAM regions.
 ///
 /// sysfs has no answer on current xe kernels (`tile0/physical_vram_size_bytes` is gone, and BAR2 is the
-/// aperture, not the memory: 16 GiB on a 12 GB Arc B580), so this asks the driver directly, through
-/// `DRM_IOCTL_XE_DEVICE_QUERY` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS` on the card's render node, which any
-/// user that may compute on the card can open. `None` for a card the xe driver does not drive (i915
-/// has another query), a card with no render node, or a query that fails.
+/// aperture, not the memory: 16 GiB on a 12 GB Arc B580), and none on i915, so this asks the driver
+/// directly on the card's render node, which any user that may compute on the card can open: xe's
+/// `DRM_XE_DEVICE_QUERY_MEM_REGIONS` (Battlemage and later), or i915's `DRM_I915_QUERY_MEMORY_REGIONS`
+/// (Alchemist, e.g. the Arc A770, which kernels still give to i915). `None` for another driver, a card
+/// with no render node, or a query that fails.
 #[cfg(target_os = "linux")]
 pub fn intel_vram(pci_bus_id: &str) -> Option<(u64, u64)> {
+    let dev = Path::new("/sys/bus/pci/devices").join(pci_bus_id.to_ascii_lowercase());
+    let driver = std::fs::read_link(dev.join("driver")).ok()?;
+    let driver = driver.file_name()?.to_str()?.to_string();
+    if driver != "xe" && driver != "i915" {
+        return None;
+    }
+    let render = std::fs::read_dir(dev.join("drm"))
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("renderD"))?;
+    let node = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(Path::new("/dev/dri").join(render))
+        .ok()?;
+    if driver == "xe" {
+        xe_vram(&node)
+    } else {
+        i915_vram(&node)
+    }
+}
+
+/// `intel_vram` on an xe card: `DRM_IOCTL_XE_DEVICE_QUERY` / `DRM_XE_DEVICE_QUERY_MEM_REGIONS`.
+#[cfg(target_os = "linux")]
+fn xe_vram(node: &std::fs::File) -> Option<(u64, u64)> {
     use std::os::fd::AsRawFd;
 
     /// `struct drm_xe_device_query` (uapi/drm/xe_drm.h).
@@ -1037,21 +1064,6 @@ pub fn intel_vram(pci_bus_id: &str) -> Option<(u64, u64)> {
     const DRM_XE_DEVICE_QUERY_MEM_REGIONS: u32 = 1;
     const _: () = assert!(std::mem::size_of::<DeviceQuery>() == 40);
 
-    let dev = Path::new("/sys/bus/pci/devices").join(pci_bus_id.to_ascii_lowercase());
-    let driver = std::fs::read_link(dev.join("driver")).ok()?;
-    if driver.file_name()? != "xe" {
-        return None;
-    }
-    let render = std::fs::read_dir(dev.join("drm"))
-        .ok()?
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|n| n.starts_with("renderD"))?;
-    let node = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(Path::new("/dev/dri").join(render))
-        .ok()?;
     let mut q = DeviceQuery {
         extensions: 0,
         query: DRM_XE_DEVICE_QUERY_MEM_REGIONS,
@@ -1078,6 +1090,70 @@ pub fn intel_vram(pci_bus_id: &str) -> Option<(u64, u64)> {
     parse_xe_mem_regions(bytes)
 }
 
+/// `intel_vram` on an i915 card: `DRM_IOCTL_I915_QUERY` / `DRM_I915_QUERY_MEMORY_REGIONS`. Without
+/// `CAP_PERFMON` the driver reports each region's unallocated size as its probed size, so the used
+/// figure is then 0 (`card_occupancy` also counts what each process holds); the total is exact.
+#[cfg(target_os = "linux")]
+fn i915_vram(node: &std::fs::File) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+
+    /// `struct drm_i915_query_item` (uapi/drm/i915_drm.h).
+    #[repr(C)]
+    struct QueryItem {
+        query_id: u64,
+        length: i32,
+        flags: u32,
+        data_ptr: u64,
+    }
+    /// `struct drm_i915_query`.
+    #[repr(C)]
+    struct Query {
+        num_items: u32,
+        flags: u32,
+        items_ptr: u64,
+    }
+    // _IOWR('d', DRM_COMMAND_BASE + DRM_I915_QUERY, struct drm_i915_query)
+    const DRM_IOCTL_I915_QUERY: u64 = (3 << 30) | (16 << 16) | ((b'd' as u64) << 8) | (0x40 + 0x39);
+    const DRM_I915_QUERY_MEMORY_REGIONS: u64 = 4;
+    const _: () = assert!(std::mem::size_of::<QueryItem>() == 24);
+    const _: () = assert!(std::mem::size_of::<Query>() == 16);
+
+    let mut item = QueryItem {
+        query_id: DRM_I915_QUERY_MEMORY_REGIONS,
+        length: 0,
+        flags: 0,
+        data_ptr: 0,
+    };
+    let mut q = Query {
+        num_items: 1,
+        flags: 0,
+        items_ptr: std::ptr::addr_of_mut!(item) as u64,
+    };
+    // SAFETY: `q` names one live, correctly laid out `drm_i915_query_item`; with `length == 0` the
+    // driver only writes the length it needs into it (or a negative error code).
+    if unsafe { libc::ioctl(node.as_raw_fd(), DRM_IOCTL_I915_QUERY as _, &mut q) } != 0 {
+        return None;
+    }
+    if item.length <= 0 || item.length > 1 << 16 {
+        return None;
+    }
+    let len = item.length as usize;
+    let mut buf = vec![0u64; len.div_ceil(8)];
+    item.data_ptr = buf.as_mut_ptr() as u64;
+    q.items_ptr = std::ptr::addr_of_mut!(item) as u64;
+    // SAFETY: `data_ptr` points at `buf`, which holds at least the `length` bytes the driver asked for.
+    if unsafe { libc::ioctl(node.as_raw_fd(), DRM_IOCTL_I915_QUERY as _, &mut q) } != 0 {
+        return None;
+    }
+    if item.length <= 0 || item.length as usize > len {
+        return None;
+    }
+    // SAFETY: `buf` is `len.div_ceil(8) * 8 >= item.length` initialized bytes.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), item.length as usize) };
+    parse_i915_mem_regions(bytes)
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn intel_vram(_pci_bus_id: &str) -> Option<(u64, u64)> {
     None
@@ -1099,6 +1175,46 @@ fn parse_xe_mem_regions(b: &[u8]) -> Option<(u64, u64)> {
         }
     }
     (total > 0).then_some((total, used))
+}
+
+/// `(total, used)` over the device-memory regions of a `struct drm_i915_query_memory_regions`: a `u32`
+/// count and three reserved `u32`, then that many 88-byte `struct drm_i915_memory_region_info`
+/// (`u16 memory_class`, `u16 memory_instance`, `u32` reserved, `u64 probed_size`,
+/// `u64 unallocated_size`, ...); used is probed less unallocated. `None` when it is cut short or has no
+/// device memory.
+fn parse_i915_mem_regions(b: &[u8]) -> Option<(u64, u64)> {
+    const HEADER: usize = 16;
+    const REGION: usize = 88;
+    const I915_MEMORY_CLASS_DEVICE: u16 = 1;
+    let n = u32::from_ne_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+    let (mut total, mut used) = (0u64, 0u64);
+    for i in 0..n {
+        let r = b.get(HEADER + i * REGION..HEADER + (i + 1) * REGION)?;
+        if u16::from_ne_bytes(r[0..2].try_into().ok()?) == I915_MEMORY_CLASS_DEVICE {
+            let probed = u64::from_ne_bytes(r[8..16].try_into().ok()?);
+            let unallocated = u64::from_ne_bytes(r[16..24].try_into().ok()?);
+            total += probed;
+            used += probed.saturating_sub(unallocated);
+        }
+    }
+    (total > 0).then_some((total, used))
+}
+
+/// Whether the Intel card at `pci_bus_id` is an Alchemist (Xe-HPG: Arc A-series, Arc Pro A, Flex)
+/// part, by its PCI device id (`0x56xx`). False where sysfs has no answer (not Linux, or no such card).
+pub fn intel_is_alchemist(pci_bus_id: &str) -> bool {
+    let dev = Path::new("/sys/bus/pci/devices").join(pci_bus_id.to_ascii_lowercase());
+    let read = |f: &str| std::fs::read_to_string(dev.join(f)).ok();
+    let hex = |s: String| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    read("vendor").and_then(hex) == Some(0x8086)
+        && read("device")
+            .and_then(hex)
+            .is_some_and(is_alchemist_device_id)
+}
+
+/// Alchemist's PCI device ids, `0x5690`..=`0x56ff` (Arc A770 `0x56a0`, A750 `0x56a1`, A380 `0x56a5`, ...).
+fn is_alchemist_device_id(id: u32) -> bool {
+    (0x5690..=0x56ff).contains(&id)
 }
 
 /// Read Intel GPU name from sysfs, with fallbacks.
@@ -2052,7 +2168,8 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
 /// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
 /// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
-/// measured question, which keeps 12 GB cards out by default until their peaks are measured.
+/// measured question; with circuit v6.1.0's peaks that floor (10,012 MiB) is below this one, so a
+/// card this admits can clear it once its VRAM is free.
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
         "sp1" => Some(11_000_000_000),
@@ -2079,13 +2196,14 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// inside SP1 can notice, because the sizing happens before its first allocation.
 ///
 /// Why this, rather than a flat allowance for foreign VRAM, which is what this replaced: a flat
-/// allowance refuses work the card could actually do. Measured on this box on 2026-10-05, SP1 peaks at
-/// 15,092 MiB on the 134M-element tier and 17,766 MiB on the 268M tier. A 24,564 MiB 4090 with 6 GiB
-/// held by a display still has 18 GiB free — plenty for the lower tier — and a 512 MiB allowance
-/// refused it outright. Requiring the FLOOR to be free instead admits that card and leaves the sizing
-/// to [`sp1_element_threshold_for_available_vram`], which steps the tier down to match. The floor
-/// itself is the smaller tier's measured peak plus margin — 15,604 MiB — so a card that clears the
-/// floor has room for the configuration it will actually be given.
+/// allowance refuses work the card could actually do. With circuit v6.1.0, SP1 peaks at about
+/// 9,000 MiB on the 134M-element tier and 11,500 MiB on the 268M tier (recorded as 9,500 and 12,000;
+/// see `SP1_MEASURED_TIERS`). A 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free —
+/// plenty — and a 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead
+/// admits that card and leaves the sizing to [`sp1_element_threshold_for_available_vram`], which
+/// steps the tier down to match. The floor itself is the smaller tier's recorded peak plus margin —
+/// 10,012 MiB — so a card that clears the floor has room for the configuration it will actually be
+/// given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
 /// (`benchmark::risc0_job_po2`), and one too small for any proves none.
@@ -2348,6 +2466,51 @@ mod tests {
         igpu.extend(0u32.to_ne_bytes());
         igpu.extend(region(0, 0, 1 << 34, 0));
         assert_eq!(parse_xe_mem_regions(&igpu), None);
+    }
+
+    #[test]
+    fn alchemist_device_ids() {
+        for id in [0x5690, 0x56a0, 0x56a1, 0x56a5, 0x56b0, 0x56c0] {
+            assert!(is_alchemist_device_id(id), "{id:#x}");
+        }
+        // Battlemage (Arc B580 0xe20b), Lunar Lake (0x64a0), DG1 (0x4905): not Alchemist.
+        for id in [0xe20b, 0xe211, 0x64a0, 0x4905, 0x568f] {
+            assert!(!is_alchemist_device_id(id), "{id:#x}");
+        }
+    }
+
+    /// The layout an Arc A770 (i915) answers with, as measured: system memory, then 15.9 GiB of device
+    /// memory, reported unallocated in full to a user without `CAP_PERFMON`.
+    #[test]
+    fn i915_mem_regions_sum_only_device_memory() {
+        fn region(class: u16, probed: u64, unallocated: u64) -> Vec<u8> {
+            let mut r = Vec::new();
+            r.extend(class.to_ne_bytes());
+            r.extend(0u16.to_ne_bytes());
+            r.extend(0u32.to_ne_bytes());
+            r.extend(probed.to_ne_bytes());
+            r.extend(unallocated.to_ne_bytes());
+            r.extend([0u8; 88 - 24]);
+            r
+        }
+        let mut b = Vec::new();
+        b.extend(2u32.to_ne_bytes());
+        b.extend([0u8; 12]);
+        b.extend(region(0, 64_952_971_264, 64_952_971_264));
+        b.extend(region(1, 17_079_205_888, 17_079_205_888));
+        assert_eq!(b.len(), 192);
+        assert_eq!(parse_i915_mem_regions(&b), Some((17_079_205_888, 0)));
+        // With CAP_PERFMON the unallocated size is real.
+        let mut p = b.clone();
+        p[16 + 88 + 16..16 + 88 + 24]
+            .copy_from_slice(&(17_079_205_888u64 - (3 << 30)).to_ne_bytes());
+        assert_eq!(parse_i915_mem_regions(&p), Some((17_079_205_888, 3 << 30)));
+        assert_eq!(parse_i915_mem_regions(&b[..120]), None);
+        let mut igpu = Vec::new();
+        igpu.extend(1u32.to_ne_bytes());
+        igpu.extend([0u8; 12]);
+        igpu.extend(region(0, 1 << 34, 1 << 34));
+        assert_eq!(parse_i915_mem_regions(&igpu), None);
     }
 
     #[test]

@@ -65,6 +65,11 @@ jobs:
             binary: zkminer
           - target: dist-cli-windows
             binary: zkminer.exe
+          # Beside zkminer, for witness jobs: the sandbox probe, the builder and broker, and the
+          # risc0 CPU worker that executes requesters' guests.
+          - target: dist-witness
+            binary: zkminer-witness-sandbox-probe
+            extras: zkminer-witness-builder zkminer-witness-broker zkminer-prove-risc0-cpu
           - target: dist-openvm
             binary: zkminer-prove-openvm
           - target: dist-sp1

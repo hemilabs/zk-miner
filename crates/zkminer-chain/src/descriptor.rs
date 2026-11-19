@@ -36,6 +36,167 @@ impl std::fmt::Display for UndecodableDescriptor {
 
 impl std::error::Error for UndecodableDescriptor {}
 
+/// The four router entry points a job can be submitted through and still have its descriptor rebuilt
+/// from the transaction's own calldata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubmitEntryPoint {
+    SubmitJob,
+    SubmitJobSimple,
+    SubmitJobBatch,
+    SubmitJobDefault,
+}
+
+impl SubmitEntryPoint {
+    /// The entry point a 4-byte selector names, if it is one of the four.
+    pub fn from_selector(selector: [u8; 4]) -> Option<Self> {
+        [
+            Self::SubmitJob,
+            Self::SubmitJobSimple,
+            Self::SubmitJobBatch,
+            Self::SubmitJobDefault,
+        ]
+        .into_iter()
+        .find(|e| e.selector() == selector)
+    }
+
+    /// The function's 4-byte selector (from the ABI-pinned bindings).
+    pub fn selector(self) -> [u8; 4] {
+        match self {
+            Self::SubmitJob => IHemiProveCore::submitJobCall::SELECTOR,
+            Self::SubmitJobSimple => IHemiProveCore::submitJobSimpleCall::SELECTOR,
+            Self::SubmitJobBatch => IHemiProveCore::submitJobBatchCall::SELECTOR,
+            Self::SubmitJobDefault => IHemiProveCore::submitJobDefaultCall::SELECTOR,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SubmitJob => "submitJob",
+            Self::SubmitJobSimple => "submitJobSimple",
+            Self::SubmitJobBatch => "submitJobBatch",
+            Self::SubmitJobDefault => "submitJobDefault",
+        }
+    }
+}
+
+/// The router's `multicall(bytes[])` selector. A job submitted inside it has a descriptor the outer
+/// calldata does not carry as a submit call.
+pub const ROUTER_MULTICALL_SELECTOR: [u8; 4] = [0xac, 0x96, 0x50, 0xd8];
+
+/// How a job reached the router, judged from its submit transaction (design §5.3, "Submission form").
+///
+/// Only [`SubmissionForm::Direct`] is served as a witness job: a transaction sent straight to the
+/// router (`tx.to == router`) calling one of the four submit entry points. Then the descriptor is the
+/// calldata's, and the transaction's sender is the job's `caller`. Everything else is
+/// [`SubmissionForm::Unsupported`]: the router's `multicall`, a submission through another contract
+/// (the descriptor may still decode when that contract forwards identical calldata, but zkminer cannot
+/// rebuild descriptors a contract builds, and the sender is not the caller), a contract creation, or a
+/// descriptor that did not come from decoding its submit transaction at all.
+///
+/// Inline jobs ignore this: the existing fetch paths accept every transaction whose calldata decodes
+/// to a descriptor matching the on-chain hash, exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionForm {
+    Direct { selector: SubmitEntryPoint },
+    Unsupported { reason: UnsupportedSubmission },
+}
+
+/// Why a submission is not [`SubmissionForm::Direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedSubmission {
+    /// The transaction was sent to another address (an integrator contract, a proxy), or created a
+    /// contract (`to` is `None`).
+    NotSentToRouter { to: Option<Address> },
+    /// Sent to the router, inside its `multicall`.
+    RouterMulticall,
+    /// Sent to the router, with a selector that is not one of the four submit entry points.
+    UnknownSelector([u8; 4]),
+    /// Sent to the router with calldata shorter than a selector.
+    ShortCalldata { len: usize },
+    /// The descriptor did not come from decoding its submit transaction (a descriptor file, a cache
+    /// that did not keep the form).
+    NoSubmitTx,
+}
+
+impl std::fmt::Display for UnsupportedSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSentToRouter { to: Some(to) } => {
+                write!(f, "submitted through {to}, not directly to the router")
+            }
+            Self::NotSentToRouter { to: None } => {
+                write!(f, "submitted by a contract-creation transaction, not directly to the router")
+            }
+            Self::RouterMulticall => write!(f, "submitted inside the router's multicall"),
+            Self::UnknownSelector(s) => write!(
+                f,
+                "submitted with selector 0x{}, not submitJob/submitJobSimple/submitJobBatch/submitJobDefault",
+                alloy::hex::encode(s)
+            ),
+            Self::ShortCalldata { len } => write!(f, "submit calldata is {len} bytes, shorter than a selector"),
+            Self::NoSubmitTx => write!(f, "the descriptor was not decoded from its submit transaction"),
+        }
+    }
+}
+
+impl SubmissionForm {
+    /// Whether a witness job with this form may be served.
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct { .. })
+    }
+
+    /// The form of a descriptor that did not come from its submit transaction.
+    pub fn no_submit_tx() -> Self {
+        Self::Unsupported {
+            reason: UnsupportedSubmission::NoSubmitTx,
+        }
+    }
+}
+
+impl std::fmt::Display for SubmissionForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct { selector } => write!(f, "direct {} to the router", selector.name()),
+            Self::Unsupported { reason } => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// Classify a submit transaction by its recipient and calldata (pure; see [`SubmissionForm`]).
+pub fn classify_submission(
+    to: Option<Address>,
+    router: Address,
+    calldata: &[u8],
+) -> SubmissionForm {
+    let unsupported = |reason| SubmissionForm::Unsupported { reason };
+    if to != Some(router) {
+        return unsupported(UnsupportedSubmission::NotSentToRouter { to });
+    }
+    let Some(selector) = calldata.get(..4).map(|s| <[u8; 4]>::try_from(s).unwrap()) else {
+        return unsupported(UnsupportedSubmission::ShortCalldata {
+            len: calldata.len(),
+        });
+    };
+    match SubmitEntryPoint::from_selector(selector) {
+        Some(selector) => SubmissionForm::Direct { selector },
+        None if selector == ROUTER_MULTICALL_SELECTOR => {
+            unsupported(UnsupportedSubmission::RouterMulticall)
+        }
+        None => unsupported(UnsupportedSubmission::UnknownSelector(selector)),
+    }
+}
+
+/// A descriptor rebuilt from its submit transaction, with that transaction's [`SubmissionForm`].
+#[derive(Debug, Clone)]
+pub struct FetchedDescriptor {
+    pub descriptor: JobDescriptor,
+    pub form: SubmissionForm,
+    /// The submit transaction the descriptor was decoded from.
+    pub submit_tx: B256,
+    /// Its sender, when the node reported one (for a direct submission, the job's `caller`).
+    pub tx_from: Option<Address>,
+}
+
 /// Default lookback window for JobSubmitted log queries, in blocks (floored at the deployment's
 /// first block, `ChainClient::scan_from_block`). Hemi testnet produces 12-second blocks, so
 /// 500_000 blocks ≈ 69 days — well beyond
@@ -91,9 +252,23 @@ pub async fn fetch_job_descriptor_checked(
     job_id: B256,
     expected_hash: B256,
 ) -> Result<JobDescriptor> {
+    fetch_job_descriptor_checked_with_form(client, job_id, expected_hash)
+        .await
+        .map(|f| f.descriptor)
+}
+
+/// [`fetch_job_descriptor_checked`], also returning the submit transaction's [`SubmissionForm`]
+/// (judged from the same transaction the descriptor was decoded from, on the fast path or the scan).
+/// What it accepts and refuses is exactly what [`fetch_job_descriptor_checked`] does; the form is only
+/// reported, for the witness-job static gate to act on.
+pub async fn fetch_job_descriptor_checked_with_form(
+    client: &ChainClient,
+    job_id: B256,
+    expected_hash: B256,
+) -> Result<FetchedDescriptor> {
     if let Some(tx_hash) = client.submit_tx_for(job_id) {
         match decode_descriptor_from_tx(client, job_id, tx_hash, Some(expected_hash)).await {
-            Ok(d) if compute_descriptor_hash(&d) == expected_hash => return Ok(d),
+            Ok(f) if compute_descriptor_hash(&f.descriptor) == expected_hash => return Ok(f),
             Ok(_) => tracing::warn!(
                 "descriptor fast path hash mismatch for {job_id} (cached tx {tx_hash}) — falling back to log scan"
             ),
@@ -102,7 +277,7 @@ pub async fn fetch_job_descriptor_checked(
             ),
         }
     }
-    let d = scan_for_descriptor(
+    let f = scan_for_descriptor(
         client,
         job_id,
         DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS,
@@ -112,8 +287,9 @@ pub async fn fetch_job_descriptor_checked(
     // The scan decoded the AUTHORITATIVE tx (the one whose JobSubmitted log names this jobId) and
     // the hash is a pure function of it, so a mismatch can never heal: type it permanent so the
     // caller negative-caches this jobId instead of re-scanning it every tick.
-    verify_descriptor_hash(&d, expected_hash).map_err(|e| undecodable(format!("{e:#}")))?;
-    Ok(d)
+    verify_descriptor_hash(&f.descriptor, expected_hash)
+        .map_err(|e| undecodable(format!("{e:#}")))?;
+    Ok(f)
 }
 
 /// The descriptor of `job_id` from `tx_hash`, a transaction a caller names as the job's submit tx
@@ -131,6 +307,19 @@ pub async fn fetch_job_descriptor_from_submit_tx(
     tx_hash: B256,
     expected_hash: B256,
 ) -> Result<Option<JobDescriptor>> {
+    fetch_job_descriptor_from_submit_tx_with_form(client, job_id, tx_hash, expected_hash)
+        .await
+        .map(|f| f.map(|f| f.descriptor))
+}
+
+/// [`fetch_job_descriptor_from_submit_tx`], also returning the submit transaction's
+/// [`SubmissionForm`]. Accepts and refuses exactly what that function does.
+pub async fn fetch_job_descriptor_from_submit_tx_with_form(
+    client: &ChainClient,
+    job_id: B256,
+    tx_hash: B256,
+    expected_hash: B256,
+) -> Result<Option<FetchedDescriptor>> {
     // Raw JSON, as `decode_descriptor_from_tx` reads the tx: an L1 deposit (type 0x7E) does not
     // deserialize as an Ethereum receipt.
     let receipt: Option<serde_json::Value> = client
@@ -144,9 +333,10 @@ pub async fn fetch_job_descriptor_from_submit_tx(
     if !receipt_emits_job_submitted(&receipt, client.hemi_prove, job_id) {
         return Ok(None);
     }
-    let d = decode_descriptor_from_tx(client, job_id, tx_hash, Some(expected_hash)).await?;
-    verify_descriptor_hash(&d, expected_hash).map_err(|e| undecodable(format!("{e:#}")))?;
-    Ok(Some(d))
+    let f = decode_descriptor_from_tx(client, job_id, tx_hash, Some(expected_hash)).await?;
+    verify_descriptor_hash(&f.descriptor, expected_hash)
+        .map_err(|e| undecodable(format!("{e:#}")))?;
+    Ok(Some(f))
 }
 
 /// Whether a receipt (as the node's JSON) holds `router`'s `JobSubmitted` log for `job_id`.
@@ -186,7 +376,18 @@ pub async fn fetch_job_descriptor_with_lookback(
     job_id: B256,
     lookback_blocks: u64,
 ) -> Result<JobDescriptor> {
-    scan_for_descriptor(client, job_id, lookback_blocks, None).await
+    scan_for_descriptor(client, job_id, lookback_blocks, None)
+        .await
+        .map(|f| f.descriptor)
+}
+
+/// [`fetch_job_descriptor`] (the scan path), also returning the submit transaction's
+/// [`SubmissionForm`].
+pub async fn fetch_job_descriptor_with_form(
+    client: &ChainClient,
+    job_id: B256,
+) -> Result<FetchedDescriptor> {
+    scan_for_descriptor(client, job_id, DEFAULT_DESCRIPTOR_LOOKBACK_BLOCKS, None).await
 }
 
 /// Scan path: locate the JobSubmitted log, then decode the emitting tx's calldata.
@@ -197,7 +398,7 @@ async fn scan_for_descriptor(
     job_id: B256,
     lookback_blocks: u64,
     known_hash: Option<B256>,
-) -> Result<JobDescriptor> {
+) -> Result<FetchedDescriptor> {
     // Use the monitor-populated cached head instead of a fresh
     // eth_blockNumber. We only fetch a descriptor for a job we've already seen (claimed
     // or under recovery), whose JobSubmitted is necessarily mined and older than any
@@ -268,7 +469,7 @@ async fn decode_descriptor_from_tx(
     job_id: B256,
     tx_hash: B256,
     known_hash: Option<B256>,
-) -> Result<JobDescriptor> {
+) -> Result<FetchedDescriptor> {
     // Fetch the submitting tx and extract its calldata — as RAW JSON, not through the typed
     // Ethereum-network response. Hemi is an OP Stack chain: a job can be submitted from L1 through a
     // deposit transaction (type 0x7E), which alloy's Ethereum `TxEnvelope` cannot deserialize. The
@@ -289,6 +490,15 @@ async fn decode_descriptor_from_tx(
         .parse()
         .map_err(|e| undecodable(format!("submitting tx {tx_hash} has unparsable `input`: {e}")))?;
     let calldata = &calldata[..];
+    // `to` is null for a contract creation; an address that does not parse is treated the same (not
+    // the router), which only ever makes the form Unsupported.
+    let address_field = |name: &str| {
+        raw.get(name)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Address>().ok())
+    };
+    let form = classify_submission(address_field("to"), client.hemi_prove, calldata);
+    let tx_from = address_field("from");
     if calldata.len() < 4 {
         // Deterministic & permanent: the authoritative submit tx's calldata cannot carry a selector,
         // so the descriptor can never be reconstructed. Typed so the caller negative-caches it.
@@ -378,7 +588,12 @@ async fn decode_descriptor_from_tx(
         .into());
     };
 
-    Ok(descriptor)
+    Ok(FetchedDescriptor {
+        descriptor,
+        form,
+        submit_tx: tx_hash,
+        tx_from,
+    })
 }
 
 /// Compute the descriptor hash matching the on-chain `_hashDescriptorFields` (HemiProveBase).
@@ -498,6 +713,136 @@ mod tests {
         let mut upper = log(router, t, job, false);
         upper["address"] = serde_json::json!("0x00000000000000000000000000000000000000A1");
         assert!(receipt_emits_job_submitted(&receipt(vec![upper]), router, job));
+    }
+
+    fn router_abi() -> alloy::json_abi::JsonAbi {
+        let path = format!(
+            "{}/../../hemiprove-abi/HemiProveRouter.abi.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    /// The selectors the form check accepts and names are the deployed router's.
+    #[test]
+    fn submission_selectors_are_the_deployed_routers() {
+        let abi = router_abi();
+        let sel = |name: &str| {
+            let fs = abi
+                .function(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(fs.len(), 1, "{name} is overloaded");
+            fs[0].selector().0
+        };
+        for e in [
+            SubmitEntryPoint::SubmitJob,
+            SubmitEntryPoint::SubmitJobSimple,
+            SubmitEntryPoint::SubmitJobBatch,
+            SubmitEntryPoint::SubmitJobDefault,
+        ] {
+            assert_eq!(e.selector(), sel(e.name()), "{}", e.name());
+            assert_eq!(SubmitEntryPoint::from_selector(e.selector()), Some(e));
+        }
+        assert_eq!(ROUTER_MULTICALL_SELECTOR, sel("multicall"));
+        assert_eq!(
+            SubmitEntryPoint::from_selector(ROUTER_MULTICALL_SELECTOR),
+            None
+        );
+        assert_eq!(SubmitEntryPoint::from_selector(sel("claimJob")), None);
+    }
+
+    /// The witness-job submission form: only a direct transaction to the router calling one of the
+    /// four submit entry points is Direct.
+    #[test]
+    fn only_a_direct_submit_to_the_router_is_a_direct_submission() {
+        let router: Address = "0x00000000000000000000000000000000000000a1"
+            .parse()
+            .unwrap();
+        let proxy: Address = "0x00000000000000000000000000000000000000b2"
+            .parse()
+            .unwrap();
+        let call = |sel: [u8; 4]| {
+            let mut c = sel.to_vec();
+            c.extend_from_slice(&[0u8; 64]);
+            c
+        };
+        for e in [
+            SubmitEntryPoint::SubmitJob,
+            SubmitEntryPoint::SubmitJobSimple,
+            SubmitEntryPoint::SubmitJobBatch,
+            SubmitEntryPoint::SubmitJobDefault,
+        ] {
+            let form = classify_submission(Some(router), router, &call(e.selector()));
+            assert_eq!(form, SubmissionForm::Direct { selector: e });
+            assert!(form.is_direct());
+            // The same calldata through another contract (an integrator forwarding it verbatim):
+            // the descriptor would still decode, but the form is not direct.
+            let via = classify_submission(Some(proxy), router, &call(e.selector()));
+            assert_eq!(
+                via,
+                SubmissionForm::Unsupported {
+                    reason: UnsupportedSubmission::NotSentToRouter { to: Some(proxy) }
+                }
+            );
+            assert!(!via.is_direct());
+        }
+        // Inside the router's multicall.
+        assert_eq!(
+            classify_submission(Some(router), router, &call(ROUTER_MULTICALL_SELECTOR)),
+            SubmissionForm::Unsupported {
+                reason: UnsupportedSubmission::RouterMulticall
+            }
+        );
+        // Another router function.
+        let claim = IHemiProveCore::claimJobCall::SELECTOR;
+        assert_eq!(
+            classify_submission(Some(router), router, &call(claim)),
+            SubmissionForm::Unsupported {
+                reason: UnsupportedSubmission::UnknownSelector(claim)
+            }
+        );
+        // A contract creation, and short calldata.
+        assert_eq!(
+            classify_submission(None, router, &call(SubmitEntryPoint::SubmitJob.selector())),
+            SubmissionForm::Unsupported {
+                reason: UnsupportedSubmission::NotSentToRouter { to: None }
+            }
+        );
+        assert_eq!(
+            classify_submission(Some(router), router, &[0xac, 0x96]),
+            SubmissionForm::Unsupported {
+                reason: UnsupportedSubmission::ShortCalldata { len: 2 }
+            }
+        );
+        // The recipient is judged before the selector: multicall through a proxy is "not to router".
+        assert_eq!(
+            classify_submission(Some(proxy), router, &call(ROUTER_MULTICALL_SELECTOR)),
+            SubmissionForm::Unsupported {
+                reason: UnsupportedSubmission::NotSentToRouter { to: Some(proxy) }
+            }
+        );
+        assert!(!SubmissionForm::no_submit_tx().is_direct());
+    }
+
+    #[test]
+    fn submission_forms_read_well_in_logs() {
+        let router: Address = "0x00000000000000000000000000000000000000a1"
+            .parse()
+            .unwrap();
+        let proxy: Address = "0x00000000000000000000000000000000000000b2"
+            .parse()
+            .unwrap();
+        let direct = SubmissionForm::Direct {
+            selector: SubmitEntryPoint::SubmitJobBatch,
+        };
+        assert_eq!(direct.to_string(), "direct submitJobBatch to the router");
+        let via = classify_submission(Some(proxy), router, &[0u8; 4]);
+        assert!(via.to_string().contains(&proxy.to_string()), "{via}");
+        assert!(SubmissionForm::Unsupported {
+            reason: UnsupportedSubmission::UnknownSelector([0xde, 0xad, 0xbe, 0xef])
+        }
+        .to_string()
+        .contains("0xdeadbeef"));
     }
 
     #[test]

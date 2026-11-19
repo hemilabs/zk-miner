@@ -1,0 +1,28 @@
+[package]
+name = "zkminer-witness-builder"
+version.workspace = true
+edition.workspace = true
+description = "Runs a requester's WASM witness builder (ABI v1) inside the witness sandbox"
+
+[[bin]]
+name = "zkminer-witness-builder"
+path = "src/main.rs"
+
+# The runner's pre-pass as a command, for build-reproducible.sh and builder authors.
+[[bin]]
+name = "zkminer-builder-check"
+path = "src/bin/check.rs"
+
+[dependencies]
+zkminer-witness = { path = "../zkminer-witness" }
+zkminer-witness-sandbox = { path = "../zkminer-witness-sandbox" }
+wasmtime = { version = "=48.0.8", default-features = false, features = ["runtime", "cranelift"] }
+wasmparser = { version = "=0.254.2", default-features = false, features = ["std", "validate", "features"] }
+thiserror = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+hex = { workspace = true }
+wat = "1"
+sha2 = "0.10"
+alloy-primitives = { workspace = true }

@@ -1,0 +1,38 @@
+[package]
+name = "zkminer-witness-host"
+version.workspace = true
+edition.workspace = true
+description = "The miner side of witness-construction jobs: sandboxed spawns, the broker process, the retention store, builder runs and the pre-claim pipeline"
+
+[dependencies]
+zkminer-witness = { workspace = true }
+zkminer-witness-sandbox = { workspace = true }
+zkminer-witness-store = { workspace = true }
+zkminer-witness-broker = { path = "../zkminer-witness-broker" }
+zkminer-config = { workspace = true }
+# The network mode the broker runs in (from the miner's config, `ZkMinerConfig::net_mode`).
+zkminer-netguard = { workspace = true }
+# The router's binding mirror, the descriptor hash and the risc0 Groth16 proof-system id.
+zkminer-chain = { workspace = true }
+zkminer-contracts = { workspace = true }
+# The sandboxed witness execute (`witness_exec`) and its request, response and seed.
+zkminer-prover = { workspace = true }
+zkminer-prover-protocol = { workspace = true }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-sol-types = { workspace = true }
+sha2 = "0.10"
+hex = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Scheme 1's witness codec and structural mutations, for `simulate --adversarial`.
+hemiprove-eth-prelude = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+wat = "1"
+reqwest = { version = "0.12", default-features = false }

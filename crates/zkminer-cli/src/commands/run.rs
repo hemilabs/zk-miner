@@ -22,6 +22,15 @@ use crate::journal::JobJournal;
 
 use zkminer_chain::adapter::AdapterInfo;
 
+/// Witness-construction jobs: routing, the witness runtime and its pure policy (see its docs).
+mod witness;
+
+/// The collateral cap: what one job, and the unproven jobs of one program or submitter, may lock.
+mod collateral;
+
+/// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
+mod segment_disk;
+
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
@@ -337,6 +346,16 @@ static WATCH_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 
 fn watch_only() -> bool {
     WATCH_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The lock journal could not be loaded (unreadable, or written by a newer build): this run drives
+/// the locks it holds — found on chain, and witness locks in the retention store — and takes no new
+/// claim, with its journal written beside the file (`JobJournal::write_aside`). Set once, before
+/// the brain starts.
+static HELD_LOCKS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn held_locks_only() -> bool {
+    HELD_LOCKS_ONLY.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The options of `zkminer run --watch-only`.
@@ -1720,6 +1739,26 @@ fn job_collateral_terms(job_id: B256) -> Option<(u128, u128)> {
         .and_then(|m| m.get(&job_id).copied())
 }
 
+/// What a claim of `info`'s job may lock at most, and whose job it is, for the collateral cap: its
+/// collateral at its maximum price (or `price`, if higher: the price ramps up until the claim mines)
+/// under its own snapshotted `terms`, `(minCollateral, collateralBps)`, as the claim computes it.
+fn claim_exposure(
+    info: &zkminer_chain::jobs::JobInfo,
+    price: u128,
+    terms: (u128, u128),
+) -> collateral::Exposure {
+    let (min_collateral, bps) = terms;
+    collateral::Exposure {
+        program: info.program_id,
+        submitter: info.caller,
+        collateral: zkminer_chain::auction::compute_collateral(
+            info.max_price.max(price),
+            u64::try_from(bps).unwrap_or(u64::MAX),
+            min_collateral,
+        ),
+    }
+}
+
 /// PAGE lines waiting for the dashboard (see `PageToDashboard` in main.rs). Bounded: the oldest go.
 static PAGES: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
@@ -1911,6 +1950,21 @@ fn set_job_aside(job_id: B256, wait: Duration) {
         std::time::Instant::now() + wait,
         MEASURED_CYCLES_CAP,
     );
+}
+
+/// What the candidate loop does with a job's witness route: `true` skips it this tick. A witness job
+/// the witness path serves is its; one this host does not serve is set aside for as long as that
+/// lasts, so it ranks last in the Open set (see [`open_rank`]) and stays out of the per-tick cut, as
+/// any job the inline path finds it cannot claim on a lasting verdict.
+fn witness_route_skips(job_id: B256, route: witness::Route) -> bool {
+    match route {
+        witness::Route::Inline => false,
+        witness::Route::Witness => true,
+        witness::Route::WitnessUnserved { wait } => {
+            set_job_aside(job_id, wait);
+            true
+        }
+    }
 }
 
 fn job_set_aside(job_id: B256) -> bool {
@@ -2499,9 +2553,38 @@ pub async fn run(
 ) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    if let Some(banner) = config.dev_mode_banner() {
+        tracing::warn!("{banner}");
+    }
     if watch.is_none() {
         hold_instance_lock()?;
     }
+    // The lock journal, read before anything starts. One this build must not rewrite (a newer format)
+    // or cannot read is left as it is, and this run drives only the locks it holds (the chain scan
+    // finds each; the retention store each witness lock), taking no new claim, with its own journal
+    // written beside the file: refusing to start would leave every held lock undriven until slashed.
+    // A watch-only run holds nothing, and the journal on disk belongs to the miner that may be
+    // running beside it: it starts empty and never saves (see `save_journal_or_warn`).
+    let loaded_journal = if watch.is_none() {
+        match JobJournal::load_checked() {
+            Ok(j) => j,
+            Err(e) => {
+                let aside = JobJournal::write_aside(&JobJournal::default_path());
+                HELD_LOCKS_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+                let msg = format!(
+                    "PAGE: JOURNAL-UNUSABLE {e} — driving held locks only (found on chain and in the retention \
+                     store): no new claim is taken, and this run's journal is written to {} (the file is left as \
+                     it is). Fix the file, or run the release that wrote it, then restart",
+                    aside.display()
+                );
+                tracing::error!("{msg}");
+                note_page(msg);
+                JobJournal::default()
+            }
+        }
+    } else {
+        JobJournal::default()
+    };
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
@@ -2647,6 +2730,14 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
+    // A risc0 worker confines itself before its first guest, to what it is told of now: for witness
+    // proofs, the retention store it reads `W` from and the segment directories it writes.
+    if let Some(r) = &config.retention {
+        zkminer_prover::worker::set_risc0_witness_dirs(r.dir.clone(), r.segment_dir.clone());
+    }
+    // And there its inline proofs' segments go too (else under `~/.zkminer`): where the claim gate
+    // reserves their disk.
+    segment_disk::set_inline_root(config.retention.as_ref().map(|r| r.segment_dir.as_path()));
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -2787,6 +2878,10 @@ pub async fn run(
         s.address = format!("{}", client.address);
         s.connected = true;
         s.chain_id = config.chain.chain_id;
+        if let Some(banner) = config.dev_mode_banner() {
+            s.dev_private_network = true;
+            s.add_log(LogLevel::Warn, banner.to_string());
+        }
 
         // Hydrate head + ETH/HEMI balances + stake + prover-stats in
         // ONE Multicall3 round-trip instead of 6 sequential reads, de-peaking the boot burst
@@ -3228,15 +3323,16 @@ pub async fn run(
     // Miner brain: evaluates open jobs, claims, proves, and fulfills.
     let brain_client = client.clone();
     let brain_state = state.clone();
-    // A watch-only run holds nothing, and the journal on disk belongs to the miner that may be
-    // running beside it: start empty and never save (see `save_journal_or_warn`).
-    let journal: SharedJournal = Arc::new(Mutex::new(if watch_only() {
-        JobJournal::default()
-    } else {
-        JobJournal::load()
-    }));
+    // Read at the start (see `loaded_journal`).
+    let journal: SharedJournal = Arc::new(Mutex::new(loaded_journal));
     let brain_journal = journal.clone();
     let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
+    // Witness-construction jobs (docs/witness-construction-jobs.md §18): the retention store, the
+    // sandbox and broker self-tests and the broker, before the brain can see a witness job. Any
+    // failure leaves witness serving off with a page; inline jobs are unaffected.
+    let witness_rt =
+        witness::WitnessRuntime::start(&config, config_path, &client, &state, &journal, proving_timeout).await;
+    let brain_witness = witness_rt.clone();
     let cost_params = CostParams {
         electricity_cost_kwh: config.prover.electricity_cost_kwh,
         // The OVERHEAD only; `evaluate_job` adds the measured CPU and card.
@@ -3261,6 +3357,7 @@ pub async fn run(
             recovery_lookback,
             brain_journal,
             std::time::Duration::from_secs(queue_horizon_secs),
+            brain_witness,
         )
         .await;
     });
@@ -3471,6 +3568,11 @@ pub async fn run(
     // Distinct from `paused` (which the TUI's `p` key also sets, meaning only "stop
     // claiming"): the shutdown-only gates below key off THIS flag.
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Running witness simulations are abandoned (nothing of theirs is on chain); witness locks are
+    // drained like every other lock.
+    if let Some(w) = &witness_rt {
+        w.shutdown();
+    }
     monitor_handle.abort();
     event_handle.abort();
     hw_handle.abort();
@@ -3701,8 +3803,11 @@ pub async fn run(
                 short_id(jid)
             );
             drain_released.insert(jid, std::time::Instant::now());
-            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
             tokio::spawn(async move {
+                if let Some(w) = &w {
+                    w.note_release(jid, "released by the shutdown drain at its release margin").await;
+                }
                 release_and_clean(&c, &st, &jr, jid).await;
             });
         }
@@ -3887,10 +3992,13 @@ pub async fn run(
             // (In-memory fast path once the allocator is synced; a recycled gap is handed out
             // first, which only ever LOWERS the urgent job's nonce.)
             let pre_nonce = client.reserve_nonce().await.ok();
-            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
             releasing.push((
                 jid,
                 tokio::spawn(async move {
+                    if let Some(w) = &w {
+                        w.note_release(jid, "released at shutdown").await;
+                    }
                     release_and_clean_with_nonce(&c, &st, &jr, jid, pre_nonce).await;
                 }),
             ));
@@ -3915,10 +4023,13 @@ pub async fn run(
                  deadline before giving it up",
                 short_id(jid)
             );
-            let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
+            let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
             releasing.push((
                 jid,
                 tokio::spawn(async move {
+                    if let Some(w) = &w {
+                        w.note_release(jid, "released at shutdown").await;
+                    }
                     release_and_clean(&c, &st, &jr, jid).await;
                 }),
             ));
@@ -4579,6 +4690,46 @@ impl FiniteOr for f64 {
 /// Groth16 wrap that costs the same for any job, ~25-50 s on its own, and with hemilabs `sp1` from
 /// v6.8.1 it can also wait for the host-wide final-wrap slot while another card's wrap holds it. A
 /// small job sat at the 90 s floor, which those alone could use up.
+/// Whether a card proving at `rate` cycles/s can finish a measured job of `cycles` in time, by the two
+/// gates the claim admits it through: inside the per-attempt watchdog (`watchdog_secs`, the job's
+/// proof at the safety margin plus `allowance_secs`, as the watchdog gate counts it) and inside the
+/// job's prove window (`window_secs`, which already has those allowances taken off), by the
+/// evaluator's own test (`can_finish_at_throughput`). The claim gate admits a job on the cards this
+/// holds for, sizes it on the slowest of them, and the dispatcher sends it to no other
+/// (`JobCards`), so a slow card neither takes a job it cannot finish nor holds back a faster one.
+fn card_finishes_in_time(
+    cycles: u64,
+    rate: f64,
+    margin: f64,
+    allowance_secs: f64,
+    watchdog_secs: f64,
+    window_secs: u64,
+) -> bool {
+    if !(rate.is_finite() && rate > 0.0) {
+        return false;
+    }
+    let inside_watchdog = (cycles as f64 / rate) * margin + allowance_secs < watchdog_secs;
+    let inside_window =
+        zkminer_strategy::timing::can_finish_at_throughput(rate, cycles, window_secs, margin).0;
+    inside_watchdog && inside_window
+}
+
+/// The order a job's cards are tried in at dispatch (`JobCards::order`): the card it was planned for,
+/// then the rest of the cards it was admitted on (`eligible`, fastest first), leaving out the cards
+/// that refused it admission (`refused`), which the dispatcher then tries after these.
+fn job_card_order(
+    planned: Option<&String>,
+    eligible: &[String],
+    refused: &[String],
+) -> Vec<String> {
+    planned
+        .into_iter()
+        .chain(eligible.iter().filter(|d| Some(*d) != planned))
+        .filter(|d| !refused.contains(*d))
+        .cloned()
+        .collect()
+}
+
 fn fixed_proving_allowance_secs(backend: &str) -> u64 {
     if backend == zkminer_prover_protocol::BACKEND_SP1 {
         120
@@ -4890,6 +5041,7 @@ fn spawn_sp1_warmup() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn miner_brain(
     client: ChainClient,
     state: zkminer_tui::state::SharedState,
@@ -4906,6 +5058,8 @@ async fn miner_brain(
     // Startup value, for the banner only. The loop reads the LIVE setting each tick so the
     // settings screen can change it — do not use this for decisions.
     initial_queue_horizon: Duration,
+    // The witness runtime, when witness jobs are served (or witness locks may be held) here.
+    witness_rt: Option<Arc<witness::WitnessRuntime>>,
 ) {
     // Journal is owned by `run()` so the shutdown path can read it. Recovery
     // reconciles the on-disk journal AND scans the chain for locked positions the
@@ -4949,6 +5103,17 @@ async fn miner_brain(
     // (with no collateral: theirs is already in the on-chain figures).
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<B256>();
     let mut in_flight: HashMap<B256, u128> = HashMap::new();
+    // Witness locks join `in_flight` when they are locked (or recovered), with their collateral and
+    // sized cycles, and leave it through `done_tx` like every other lock.
+    let (witness_held_tx, mut witness_held_rx) = mpsc::unbounded_channel::<(B256, u128, u64)>();
+    // The witness locks among `in_flight` (their tasks take a card of their own): the witness runtime
+    // is told each tick how many inline jobs still need a card besides them.
+    let mut witness_held: std::collections::HashSet<B256> = std::collections::HashSet::new();
+    if let Some(w) = &witness_rt {
+        w.attach_brain(witness_held_tx, done_tx.clone());
+    } else {
+        drop(witness_held_tx);
+    }
     // The jobs in `in_flight` known to be of a backend other than risc0, so the rest can be held to
     // the risc0 cards (see `risc0_bypass_room`). Pruned to `in_flight` each tick; a job of unknown backend (a
     // recovered lock) counts as risc0, the safe direction.
@@ -4978,6 +5143,8 @@ async fn miner_brain(
         tracing::info!("watch-only: lock recovery and the nonce watchdog are off");
         RecoveryPass {
             deferred: false,
+            scan_ok: true,
+            undecided: Vec::new(),
             actions: Vec::new(),
             scan: None,
         }
@@ -4986,8 +5153,12 @@ async fn miner_brain(
             &client,
             &journal,
             recovery_lookback,
-            &std::collections::HashSet::new(),
+            &witness_rt
+                .as_ref()
+                .map(|w| w.owned_jobs())
+                .unwrap_or_default(),
             None,
+            witness_rt.as_ref(),
         )
         .await
     };
@@ -4995,18 +5166,22 @@ async fn miner_brain(
     let mut recovery_scan = startup_pass.scan;
     spawn_recovery_actions(
         startup_pass.actions,
+        (startup_pass.scan_ok, startup_pass.undecided),
         &mut in_flight,
         &client,
         &state,
         &journal,
         &done_tx,
         proving_timeout,
+        witness_rt.as_ref(),
     );
 
     // Per-proof-system adapter cache. Populated lazily; adapter parameters change
     // rarely, so a best-effort cache that never expires is acceptable. Repopulate
     // on miner restart.
     let mut adapter_cache: HashMap<alloy::primitives::B256, AdapterInfo> = HashMap::new();
+    // When the deployment's per-job collateral floor was last asked for, until it is known.
+    let mut last_floor_read: Option<std::time::Instant> = None;
     // Throttle for the "skipping all jobs — insufficient collateral" warning:
     // the brain re-evaluates every 5s, so warn at most once per COLLATERAL_WARN_EVERY.
     let mut last_collateral_warn: Option<std::time::Instant> = None;
@@ -5271,9 +5446,19 @@ async fn miner_brain(
             }
         }
 
+        // Witness locks taken (or recovered) since the last tick hold a slot like any lock. Before the
+        // reap below, so a lock that already ended is counted and then reaped in the same pass.
+        while let Ok((jid, collateral, cycles)) = witness_held_rx.try_recv() {
+            in_flight.insert(jid, collateral);
+            inflight_work.insert(jid, (cycles, zkminer_prover_protocol::BACKEND_RISC0));
+            witness_held.insert(jid);
+        }
+        witness_held.retain(|j| in_flight.contains_key(j));
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
+            collateral::forget(jid);
+            segment_disk::release(jid);
             proved.remove(&jid);
             inflight_work.remove(&jid);
             queue_model.settle(&jid.0);
@@ -5283,12 +5468,22 @@ async fn miner_brain(
             if in_flight.contains_key(&jid) && proved.insert(jid) {
                 queue_model.settle(&jid.0);
             }
+            // Proven (or never going to be): no longer counted against its program's and
+            // submitter's share of the stake, and its segments are gone.
+            collateral::forget(jid);
+            segment_disk::release(jid);
         }
         // Only jobs still held. Every path that reaps one removes it here too, but an entry left
         // behind would read as one card fewer needed for as long as the miner ran: it did, from a
         // recovery pass's own reap, and the planner's model then never matched again.
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
+        // Held and unproven, or a witness task's (claiming, or holding a lock the brain has not been
+        // told of yet): anything else left the count (a claim that did not land, a task that ended).
+        collateral::retain(|j| {
+            (in_flight.contains_key(j) && !proved.contains(j))
+                || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
+        });
         prune_lock_blocks(&in_flight);
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
@@ -5571,13 +5766,17 @@ async fn miner_brain(
                         inflight_work.remove(&jid);
                         queue_model.settle(&jid.0);
                     }
-                    let owned: std::collections::HashSet<B256> = in_flight.keys().copied().collect();
+                    let mut owned: std::collections::HashSet<B256> = in_flight.keys().copied().collect();
+                    if let Some(w) = &witness_rt {
+                        owned.extend(w.owned_jobs());
+                    }
                     let pass = recover_claimed_jobs(
                         &client,
                         &journal,
                         recovery_lookback,
                         &owned,
                         recovery_scan.take(),
+                        witness_rt.as_ref(),
                     )
                     .await;
                     recovery_deferred = pass.deferred;
@@ -5598,12 +5797,14 @@ async fn miner_brain(
                     }
                     spawn_recovery_actions(
                         pass.actions,
+                        (pass.scan_ok, pass.undecided),
                         &mut in_flight,
                         &client,
                         &state,
                         &journal,
                         &done_tx,
                         proving_timeout,
+                        witness_rt.as_ref(),
                     );
                 }
                 // Escalate the back-off on repeated deferrals; reset once a pass completes.
@@ -5620,6 +5821,10 @@ async fn miner_brain(
                 recovery_deferred = false;
                 consecutive_defers = 0;
                 last_recovery_at = std::time::Instant::now();
+                // No lock of ours on chain: none of the witness runtime's to hand over or spare.
+                if let Some(w) = &witness_rt {
+                    w.note_recovery_pass(true, Vec::new());
+                }
             }
         }
 
@@ -5646,6 +5851,15 @@ async fn miner_brain(
                 risc0_job_po2_overrides(&s.runtime_settings),
             )
         };
+
+        // The cards as a witness lock sees them: inline jobs still needing one, and the cap.
+        if let Some(w) = &witness_rt {
+            let inline_needing = in_flight
+                .keys()
+                .filter(|j| !proved.contains(*j) && !witness_held.contains(*j))
+                .count();
+            w.note_cards(inline_needing, max_concurrent);
+        }
 
         // Each risc0 card's job size (see `risc0_job_po2`), published for the Settings screen before
         // anything below can skip the tick, so it never shows a stale or guessed size.
@@ -5688,7 +5902,7 @@ async fn miner_brain(
             }
         }
 
-        if paused || open_jobs.is_empty() {
+        if paused || held_locks_only() || open_jobs.is_empty() {
             continue;
         }
         // The hard concurrency cap still applies: look-ahead queues CLAIMS, it does not run
@@ -6273,6 +6487,22 @@ async fn miner_brain(
         // a stranded lock is in `on_chain_locked` but not in `in_flight`, so max() dropped it.)
         let stake_read_block = stake_info.as_ref().and_then(|si| si.read_block);
         let lock_blocks = lock_blocks();
+        // The most one job, and the unproven jobs of one program or submitter, may lock
+        // (`collateral`): a share of the total stake, at least the deployment's per-job floor.
+        if collateral::floor().is_none()
+            && last_floor_read.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+        {
+            last_floor_read = Some(std::time::Instant::now());
+            match client.get_min_collateral_amount().await {
+                Ok(wei) => collateral::set_floor(wei),
+                Err(e) => tracing::debug!(
+                    "MIN_COLLATERAL_AMOUNT unreadable ({e:#}): the collateral cap has no floor yet"
+                ),
+            }
+        }
+        let total_staked = stake_info.as_ref().map_or(0, |si| si.total_staked);
+        collateral::note_stake(total_staked);
+        let job_collateral_cap = collateral::policy().cap(total_staked);
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
@@ -6401,6 +6631,20 @@ async fn miner_brain(
                     .saturating_sub(zkminer_chain::client::chain_now_floor());
                 tracing::debug!("Skipping {}: a bid is live for {left}s more", short_id(jid));
                 note_job_retry_after(jid, Duration::from_secs(left.clamp(30, 3600)));
+                continue;
+            }
+            // A witness-construction job (`inputData` starts with WITNESS_JOB_TAG_V1) takes the witness
+            // path: simulated in the sandbox, locked and proven from its retained bundle. It never
+            // reaches the measure path, the inline caches or the inline claim below.
+            if witness_route_skips(
+                jid,
+                witness::route(
+                    witness_rt.as_ref(),
+                    job,
+                    snapshot.descriptor_hash,
+                    claim_predicate_now,
+                ),
+            ) {
                 continue;
             }
             // EVICT a descriptor whose fulfill payload a prior measurement found to be over the
@@ -6959,11 +7203,47 @@ async fn miner_brain(
             // target. Only when there is no genuine row at all do we fall back to the mixed-list value
             // (behavior there is unchanged; the empty-rows case is handled by the sizing rework).
             let backend_name = backend_opt.unwrap_or("");
-            let genuine_throughputs: Vec<f64> = device_backend_throughputs
+            let genuine_rows: Vec<(String, f64)> = device_backend_throughputs
                 .iter()
                 .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
-                .map(|(_, _, t)| *t)
+                .map(|(d, _, t)| (d.clone(), *t))
                 .collect();
+            let genuine_throughputs: Vec<f64> = genuine_rows.iter().map(|(_, t)| *t).collect();
+            // A measured job is admitted only on the cards that can finish it in time (see
+            // `card_finishes_in_time`), and sized on the slowest of THOSE. Sizing on the slowest card of
+            // all let one slow card (an Arc A770 proves risc0 about 15x slower than an RX 7900 XTX)
+            // refuse every job too big for it, on every card; and fallback dispatch sent jobs to it
+            // while faster cards were free. When no card can, nothing changes: the gates below refuse
+            // the job on the slowest card's figure, as before.
+            let eligible_rows: Vec<(String, f64)> = match measured_for_job {
+                Some(cycles) => genuine_rows
+                    .iter()
+                    .filter(|(_, rate)| {
+                        card_finishes_in_time(
+                            cycles,
+                            *rate,
+                            deadline_safety_margin,
+                            (backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0)
+                                + execute_allowance) as f64,
+                            proving_timeout.as_secs_f64(),
+                            prove_window,
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            let sizing_rows = if eligible_rows.is_empty() {
+                &genuine_rows
+            } else {
+                &eligible_rows
+            };
+            // The cards the dispatcher may send it to, fastest first (`JobCards`); none named: any.
+            snapshot.eligible_devices = {
+                let mut by_speed = eligible_rows.clone();
+                by_speed.sort_by(|a, b| b.1.total_cmp(&a.1));
+                by_speed.into_iter().map(|(d, _)| d).collect()
+            };
             let slowest_eligible = if genuine_throughputs.is_empty() {
                 throughputs_for_backend(&device_backend_throughputs, backend_name)
                     .iter()
@@ -6973,13 +7253,15 @@ async fn miner_brain(
                     .fold(f64::INFINITY, f64::min)
                     .pipe_finite_or(0.0)
             } else {
-                genuine_throughputs.iter().copied().fold(f64::INFINITY, f64::min)
+                sizing_rows
+                    .iter()
+                    .map(|(_, t)| *t)
+                    .fold(f64::INFINITY, f64::min)
             };
-            snapshot.preferred_device = device_backend_throughputs
+            snapshot.preferred_device = sizing_rows
                 .iter()
-                .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
-                .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(id, _, _)| id.clone());
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| id.clone());
             // The conservative floor, charged for a risc0 card at a size below the one rows describe.
             let conservative_cps = if backend_name == zkminer_prover_protocol::BACKEND_RISC0 {
                 risc0_conservative_cps(&risc0_sizes)
@@ -7090,11 +7372,27 @@ async fn miner_brain(
             // genuinely tight — which is the correct, safe behaviour: you cannot prove what
             // you cannot collateralize. The real remedy for tight collateral is to stake
             // more or free stale locked collateral, not to over-commit.)
-            let required_collateral = zkminer_chain::auction::compute_collateral(
-                job.info.max_price.max(snapshot.current_price),
-                effective_bps,
-                job_min_collateral, // the job's snapshotted floor, not adapter.min_stake
+            // (The job's snapshotted floor, not adapter.min_stake.)
+            let exposure = claim_exposure(
+                &job.info,
+                snapshot.current_price,
+                (job_min_collateral, u128::from(effective_bps)),
             );
+            let required_collateral = exposure.collateral;
+            // No job may lock more than its share of the stake, nor the unproven jobs of its program
+            // or submitter held here with it (`collateral`). One whose terms alone ask for more is
+            // set aside: they are fixed while it is Open. One over a program's or submitter's share
+            // waits for their jobs to be proven.
+            let cap_verdict = collateral::check(jid, &exposure, job_collateral_cap);
+            if let Some(why) = cap_verdict.describe() {
+                if cap_verdict.is_final() {
+                    tracing::warn!("job {}: {why} — setting it aside", short_id(jid));
+                    set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                } else {
+                    tracing::debug!("job {}: {why} — not now", short_id(jid));
+                }
+                continue;
+            }
 
             let mut params = JobParams {
                 current_price: snapshot.current_price,
@@ -7537,6 +7835,33 @@ async fn miner_brain(
                     deadline_safety_margin,
                 );
             }
+            // A risc0 proof writes all its segments to disk first: claimed only while they fit beside
+            // every proof planned or running here, witness ones included (`segment_disk`). Reserved
+            // until its card is released.
+            if would_commit
+                && matches!(eval.recommendation, Recommendation::Claim)
+                && risc0_job
+                && !watch_only()
+            {
+                if let Err(why) = segment_disk::try_reserve_inline(jid, params.estimated_cycles) {
+                    tracing::debug!("job {}: its segments do not fit now ({why})", short_id(jid));
+                    continue;
+                }
+            }
+            // The cap again, deciding and recording in one step: a witness claim may have taken the
+            // program's or submitter's room since the check above.
+            if would_commit
+                && matches!(eval.recommendation, Recommendation::Claim)
+                && collateral::admit(jid, exposure, job_collateral_cap)
+                    != collateral::CapVerdict::Admit
+            {
+                segment_disk::release(jid);
+                tracing::debug!(
+                    "job {}: its program's or submitter's share of the stake is taken — not now",
+                    short_id(jid)
+                );
+                continue;
+            }
             if would_commit && matches!(eval.recommendation, Recommendation::Claim) {
                 claimed_this_tick = true;
                 // Reserve the slot + collateral NOW (like the single-claim path always
@@ -7639,7 +7964,7 @@ async fn miner_brain(
         // the drain, which a 6s supervised budget can never fulfil. Nothing on-chain has
         // happened yet (the breadcrumb and the tx both come after this point), so dropping
         // the batch just returns the reserved slots.
-        if !batch.is_empty() && state.read().await.paused {
+        if !batch.is_empty() && (state.read().await.paused || held_locks_only()) {
             tracing::info!(
                 "shutdown began mid-tick — dropping {} pending claim(s), nothing locked",
                 batch.len()
@@ -7900,6 +8225,10 @@ struct JobStatusSnapshot {
     /// passed to the dispatcher as a PREFERENCE (tried first, graceful fallback). `None` on paths
     /// without a plan (recovery, non-measurable backends). See `prove_min_vram`'s `preferred_device`.
     preferred_device: Option<String>,
+    /// Benchmark device ids of the cards the claim gate admitted this job on, fastest first: the
+    /// dispatcher sends it to no other (see `JobCards`). Empty: no such plan (recovery, an unmeasured
+    /// or non-measurable job), so any card.
+    eligible_devices: Vec<String>,
     /// keccak256 of the risc0 ELF whose image-id was verified when this (program, input) was measured,
     /// resolved from the measurement cache entry alongside `measured_cycles` (so it co-evicts with it).
     /// Threaded into `fetch_or_download_elf` on the claim-obtainability and prove fetches as the
@@ -7955,6 +8284,7 @@ impl JobStatusSnapshot {
             measured_cycles: None,
             measured_peak: None,
             preferred_device: None,
+            eligible_devices: Vec::new(),
             verified_elf_hash: None,
             measured_journal: None,
             measured_execute_secs: None,
@@ -8362,6 +8692,14 @@ async fn watch_inspect(
         describe_binding(&d),
         d.inputData.len()
     );
+    // Watch-only never runs builders (plan §18): a witness job is reported, not simulated.
+    if witness::policy::is_witness_input(&d.inputData) {
+        witness::note_class(job_id, witness::Class::Witness);
+        return Inspected::Done(
+            "witness job",
+            format!("{head}: witness job, not simulated in watch-only"),
+        );
+    }
     let Some(backend) = resolve_backend(view.proofSystemId) else {
         return Inspected::Done("not served", format!("{head}: not served by this build"));
     };
@@ -8531,6 +8869,27 @@ async fn watch_inspect(
             }
         }
     };
+    // The collateral cap, as the brain applies it to this job alone (`collateral`): one whose terms
+    // ask for more than one job may lock at the watched address's stake is set aside, not claimed.
+    prefetch_job_collateral_terms(client, &[job_id]).await;
+    let Some((min_collateral, bps)) = job_collateral_terms(job_id) else {
+        return Inspected::Retry("collateral terms (getJobSnapshots) unreadable".into());
+    };
+    let exposure = claim_exposure(&job.info, 0, (min_collateral, bps));
+    let total_staked = state
+        .read()
+        .await
+        .stake_info
+        .as_ref()
+        .map_or(0, |s| s.total_staked);
+    let cap = collateral::policy().cap(total_staked);
+    let verdict = collateral::decide(job_id, &exposure, cap, &HashMap::new());
+    if let (true, Some(why)) = (verdict.is_final(), verdict.describe()) {
+        return Inspected::Done(
+            "over the collateral cap",
+            format!("{head}: {measured}, {bound}; {why}: set aside, not claimed"),
+        );
+    }
     match client.preview_claim(job_id).await {
         Ok(ClaimPreview::Claimable(q)) => Inspected::Done(
             "claim quote ok",
@@ -8637,9 +8996,7 @@ fn spawn_lifecycle_task(
                 // No breadcrumb → release is skipped. If a fulfill nonetheless
                 // stashed a nonce for this job, it would leak as a permanent nonce gap;
                 // recycle it so the allocator stays gap-free.
-                if let Some(n) = client.take_abandoned_nonce(jid) {
-                    client.abort_nonce(n);
-                }
+                client.settle_abandoned_nonce(jid).await;
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != jid);
             }
@@ -8784,6 +9141,14 @@ async fn process_job_lifecycle(
                 return Ok(());
             }
         };
+        // A witness-construction job reaching the inline lifecycle (classified only now): never claimed
+        // here. The witness path serves it (its prefix marker included) from the next tick.
+        if witness::policy::is_witness_input(&d.inputData) {
+            witness::note_class(job_id, witness::Class::Witness);
+            skip("a witness-construction job: served only by the witness path".into(), false).await;
+            requeue_open_job(state, requeue_job.clone()).await;
+            return Ok(());
+        }
         // A binding MARKER in journalFields slot 0 (0xffffffff journal prefix `jobId ‖ prover`,
         // 0xfffffffe SP1 proof nonce) needs a guest input / patched prover this build does not have.
         let marker = u32::from_be_bytes(d.journalFields.0[..4].try_into().unwrap());
@@ -9283,6 +9648,17 @@ async fn process_job_lifecycle(
     };
     verify_descriptor_hash(&descriptor, view.descriptorHash)
         .map_err(|e| anyhow::anyhow!("descriptor hash mismatch: {e:#}"))?;
+    // A witness lock is never proven inline (its `inputData` is the envelope, not the guest's input):
+    // keep it, and let recovery hand it to the witness runtime, which proves it from its bundle.
+    if witness::policy::is_witness_input(&descriptor.inputData) {
+        witness::note_class(job_id, witness::Class::Witness);
+        request_recovery();
+        return Err(HandBack(
+            "a witness-construction lock: proven from its retained bundle by the witness runtime, never inline"
+                .into(),
+        )
+        .into());
+    }
     // programId in descriptor must match what the JobSubmitted event told us.
     if descriptor.programId != program_id {
         return Err(anyhow::anyhow!(
@@ -9470,12 +9846,20 @@ async fn process_job_lifecycle(
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
+        // Set once an attempt's worker declined (`WorkerDeclined`): it found, before running this
+        // job's guest, that its backend cannot run on this host. An environment fault, so if every
+        // attempt then fails the program and submitter are not marked divergent.
+        let mut env_declined = false;
+        // A risc0 attempt failed while this host's segment disk could not hold the job's segments
+        // (`segment_disk::inline_short`, read here, not from the worker): this host's failure.
+        let mut disk_short = false;
         let mut attempt = 0u32;
-        // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
-        // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
-        // dispatcher would re-pin the un-admittable cold preferred card every retry while the warm
-        // sibling idles → abandon → penalized release. Dropping it reverts to warm-first fallback.
-        let mut drop_preference = false;
+        // The cards that refused this job ADMISSION (an un-attempted host-RAM refusal), in the order
+        // they refused. Unlike a GPU shortage that does not exclude the card, so if it stayed in the
+        // order the dispatcher would re-pin the un-admittable card every retry while another idles →
+        // abandon → penalized release. It is taken out of the order instead: the job's other cards
+        // are tried first, fastest first, and the refused one after them (still eligible).
+        let mut refused_admission: Vec<String> = Vec::new();
         // Whether the log has said this job proves at a size it was not measured at, or that it is
         // waiting for a risc0 card.
         let mut warned_unmeasured = false;
@@ -9643,12 +10027,15 @@ async fn process_job_lifecycle(
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
-            // The card this job was planned for (benchmark id, e.g. "gpu1"), preferred at dispatch.
-            let preferred_for_prove = if drop_preference {
-                None
-            } else {
-                snapshot.preferred_device.clone()
-            };
+            // The cards this job was admitted on (a hard filter) and the order to try them in: the card
+            // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
+            // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
+            let eligible_for_prove = snapshot.eligible_devices.clone();
+            let order_for_prove = job_card_order(
+                snapshot.preferred_device.as_ref(),
+                &eligible_for_prove,
+                &refused_admission,
+            );
             // This job's pre-claim measured execute PEAK (SP1 only; 0 otherwise), for the dispatcher's
             // RH2 prove reservation — charges the `server + execute` spike so a concurrent other-backend
             // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
@@ -9725,7 +10112,10 @@ async fn process_job_lifecycle(
                         .is_some()
                         .then_some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
                     program_id_bytes,
-                    preferred_for_prove.as_deref(),
+                    zkminer_prover::dispatcher::JobCards {
+                        eligible: &eligible_for_prove,
+                        order: &order_for_prove,
+                    },
                     execute_peak_for_prove,
                 );
                 (r, used)
@@ -9846,6 +10236,31 @@ async fn process_job_lifecycle(
                             "proving failed after {attempt} attempt(s): {msg}"
                         ));
                     }
+                    // The worker declined before it ran the guest: this card cannot run the backend
+                    // here at all (the dispatcher no longer uses it). Not the job's fault, so it
+                    // must not count toward marking the program or submitter below; another card
+                    // may still prove it. Typed, as every arm here: a guest cannot produce it.
+                    if e.downcast_ref::<zkminer_prover_protocol::types::WorkerDeclined>()
+                        .is_some()
+                    {
+                        env_declined = true;
+                        if let Some(k) = used_slot.clone() {
+                            if !excluded.contains(&k) {
+                                excluded.push(k);
+                            }
+                        }
+                        tracing::error!(
+                            "{} could not be proved on {}: {msg}",
+                            short_id(job_id),
+                            used_slot.as_deref().unwrap_or("a card")
+                        );
+                        if attempt < MAX_PROVE_ATTEMPTS {
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!(
+                            "proving failed after {attempt} attempt(s): {msg}"
+                        ));
+                    }
                     // A HOST memory shortage is not this worker's fault and not this job's
                     // fault: the box is momentarily short of RAM. Classifying it as ill-health
                     // was a money-losing bug. The ledger is process-wide, so "retry on a
@@ -9871,12 +10286,17 @@ async fn process_job_lifecycle(
                     {
                         // An admission refusal (nothing ran) means the slot just tried — most likely
                         // the cold claim-time preferred card — could not be admitted now. Unlike a GPU
-                        // shortage this does NOT exclude the slot, so drop the device preference for the
-                        // rest of this job and let the dispatcher's warm-first ordering pick the warm
-                        // sibling instead of re-pinning the un-admittable card every retry. Only on an
-                        // un-attempted (admission) refusal; an OOM mid-proof is a different event.
+                        // shortage this does NOT exclude the slot, so take its card out of this job's
+                        // order: the other cards it may run on are tried first, fastest first, rather
+                        // than re-pinning the un-admittable card every retry. Only on an un-attempted
+                        // (admission) refusal; an OOM mid-proof is a different event.
                         if !shortage.attempted {
-                            drop_preference = true;
+                            let card = zkminer_prover::dispatcher::WorkerPool::benchmark_device_id(
+                                &shortage.slot_key,
+                            );
+                            if !refused_admission.contains(&card) {
+                                refused_admission.push(card);
+                            }
                         }
                         // Only an ADMISSION refusal is free. That costs a `/proc/meminfo` read, so
                         // nothing was attempted and waiting is the honest response. A worker
@@ -9986,6 +10406,20 @@ async fn process_job_lifecycle(
                         None => zkminer_prover_protocol::types::is_gpu_oom(&msg),
                     };
                     let health_fail = !invalid && !real_oom;
+                    // This host's segment disk, read now: a full disk (ENOSPC or a quota) is the
+                    // host's, whatever the worker said, and is not held against the job's program or
+                    // submitter below. The proof's own segments are gone by now, so only a disk short
+                    // without them reads so.
+                    if backend == zkminer_prover_protocol::BACKEND_RISC0
+                        && segment_disk::inline_short(job_id, sizing_cycles)
+                    {
+                        disk_short = true;
+                        tracing::warn!(
+                            "{}: this host's segment disk has too little room for the job's segments \
+                             (see README, risc0 segments): {msg}",
+                            short_id(job_id),
+                        );
+                    }
                     if attempt < MAX_PROVE_ATTEMPTS {
                         // BOTH non-invalid classes steer OFF the card that just failed.
                         //
@@ -10051,7 +10485,7 @@ async fn process_job_lifecycle(
                     }
                     // Every attempt failed on a job that measured clean. Class-agnostic on purpose: the
                     // worker's kind can follow guest-chosen text (see `note_post_claim_divergence`).
-                    if rode_measurement {
+                    if rode_measurement && !env_declined && !disk_short {
                         note_post_claim_divergence(program_id, backend, submitter, "all prove attempts failed");
                     }
                     return Err(anyhow::anyhow!(
@@ -10341,6 +10775,12 @@ async fn process_job_lifecycle(
                     .await
                 {
                     Ok(false) => {
+                        // A per-program cooldown only, not the post-claim breaker: one such revert
+                        // is not reliably the submitter's doing (a governance read that raced, a
+                        // cause not modelled), and the known causes are refused earlier (SP1 public
+                        // values not committed under SHA-256 before the claim; an SP1 programId in
+                        // another byte order before the proof, as a program mismatch). The per-job
+                        // collateral cap bounds what one costs.
                         if fulfill_no_lever {
                             mark_program_sim_reverted(fulfill_program_id, fulfill_proof_system);
                         }
@@ -10375,9 +10815,7 @@ async fn process_job_lifecycle(
                 tracing::warn!("LOCK-LOST: {} — {reason}", short_id(job_id));
                 journal_update(journal, |j| j.remove(job_id));
                 // No release will ever run for this job, and release is the stash's only consumer.
-                if let Some(n) = client.take_abandoned_nonce(job_id) {
-                    client.abort_nonce(n);
-                }
+                client.settle_abandoned_nonce(job_id).await;
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != job_id);
                 s.add_log(
@@ -10869,6 +11307,19 @@ async fn measure_cycles(
             return;
         }
     };
+    // A witness-construction job is never measured on its `inputData` (the envelope, not the guest's
+    // input) and enters no inline cache: recorded so the brain routes it to the witness path (or, with
+    // witness serving off or its caller not allowlisted, skips it) from now on.
+    if witness::policy::is_witness_input(&descriptor.inputData) {
+        witness::note_class(job_id, witness::Class::Witness);
+        tracing::info!(
+            "measure {}: job {} is a witness-construction job — not measured (served only by the witness \
+             path, to callers on [witness] callers)",
+            short_id(program_id),
+            short_id(job_id)
+        );
+        return;
+    }
     // (Pre-claim strikes are cleared only once this job's measurement OUTCOME is final — below — never
     // on a descriptor success alone: a job that fetches fine and then fails later in this path, every
     // time, must keep escalating its back-off.)
@@ -11478,6 +11929,15 @@ async fn measure_cycles(
                 // strike, no negative-cache, no TTL — re-measure next tick once the proof has freed the
                 // resources. A hostile guest cannot reach this branch: only the dispatcher's preemption
                 // path constructs `MeasurePreempted`, never a worker error carrying guest text.
+                // The measure worker declined before it ran the guest: it cannot run this backend
+                // here (the dispatcher no longer uses it). Nothing about the (program, input) is
+                // known, so no strike. Typed; only the dispatcher constructs it, from an exit code.
+                if e.downcast_ref::<zkminer_prover_protocol::types::WorkerDeclined>()
+                    .is_some()
+                {
+                    tracing::warn!("measure {}: {e:#}", short_id(program_id));
+                    continue;
+                }
                 if is_measure_preempted(&e) {
                     tracing::debug!(
                         "measure {}: preempted by a claimed proof, not sizing now (transient)",
@@ -11739,9 +12199,16 @@ pub(crate) async fn fetch_or_download_elf(
             ),
         );
     }
-    let elf = zkminer_chain::programs::download_elf(&info.storage_uris, integrity_hash)
-        .await
-        .context("ELF download failed")?;
+    // Through the network guard built from this config (`client.elf_fetcher()`): every storage URI
+    // and redirect is submitter-controlled, so only public destinations are reached unless
+    // `[dev] private_network` is on.
+    let elf = zkminer_chain::programs::download_elf(
+        client.elf_fetcher(),
+        &info.storage_uris,
+        integrity_hash,
+    )
+    .await
+    .context("ELF download failed")?;
     // Cache only bytes bound to a known hash. Unverified risc0 bytes (the measure bootstrap, a
     // recovery re-fetch) are cached by the measure path once the worker has image-id-verified them.
     if integrity_hash.is_none() && !honor_registry_hash {
@@ -11970,9 +12437,7 @@ async fn release_and_clean_with_nonce(
                 Ok(false) => {}
                 Ok(true) => {
                     journal_update(journal, |j| j.remove(job_id));
-                    if let Some(n) = client.take_abandoned_nonce(job_id) {
-                        client.abort_nonce(n);
-                    }
+                    client.settle_abandoned_nonce(job_id).await;
                     let mut s = state.write().await;
                     s.active_jobs.retain(|j| j.info.job_id != job_id);
                     s.add_log(
@@ -12080,9 +12545,7 @@ async fn release_and_clean_with_nonce(
                 // sibling arms below. A leaked stash nonce carries NO abort record
                 // and is not in `freed`, so it is exactly the hole shape the shutdown gate
                 // refuses to fill — every broadcast release above it then strands.
-                if let Some(n) = client.take_abandoned_nonce(job_id) {
-                    client.abort_nonce(n);
-                }
+                client.settle_abandoned_nonce(job_id).await;
                 // Skipping the release — recycle the caller's pre-reserved nonce so it
                 // cannot become a permanent gap in the signer's sequence.
                 if let Some(n) = pre_nonce {
@@ -12104,13 +12567,9 @@ async fn release_and_clean_with_nonce(
             journal_update(journal, |j| j.remove(job_id));
             // This path SKIPS release_job (the only stash consumer). If a fulfill
             // stashed its nonce for this job, drain it here or it becomes a permanent gap
-            // that wedges the whole signer. The fulfill either mined (abort self-heals via
-            // "nonce too low", or — once `commit`/`resync` has raised the `consumed_below`
-            // watermark — the abort simply no-ops) or never landed (abort correctly recycles
-            // the gap).
-            if let Some(n) = client.take_abandoned_nonce(job_id) {
-                client.abort_nonce(n);
-            }
+            // that wedges the whole signer. The fulfill either mined (the mined count is past
+            // it: committed) or never landed (recycled as a gap).
+            client.settle_abandoned_nonce(job_id).await;
             if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
@@ -12157,11 +12616,9 @@ async fn release_and_clean_with_nonce(
             );
             // Past-deadline SKIPS release_job — drain the fulfill stash so a stashed
             // nonce can't wedge the signer. (The stuck fulfill may still be pending at N;
-            // recycling it lets a reuser evict/replace it, self-healing via "nonce too low"
-            // if it later mines — far better than a permanent gap.)
-            if let Some(n) = client.take_abandoned_nonce(job_id) {
-                client.abort_nonce(n);
-            }
+            // unless it has mined, recycling it lets a reuser evict/replace it — far better
+            // than a permanent gap.)
+            client.settle_abandoned_nonce(job_id).await;
             if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
@@ -12286,6 +12743,9 @@ enum RecoveryAction {
     /// Too little room left (or a permanent defect): release it (or keep it, if a governance hold
     /// says so — `release_and_clean` decides).
     Release(B256),
+    /// A witness-construction lock: re-driven by the witness runtime from its retained bundle (the
+    /// store's pin names it), never from the chain's descriptor and never inline.
+    Witness(B256),
 }
 
 /// The outcome of one [`recover_claimed_jobs`] pass.
@@ -12293,6 +12753,12 @@ struct RecoveryPass {
     /// The pass was cut short (a rate-limit storm, a failed chain scan, a transient descriptor
     /// failure): retry SOONER than the periodic cadence.
     deferred: bool,
+    /// The on-chain locked-job scan covered the whole lookback window by this pass: every lock of
+    /// ours is among the ids the pass considered (decided, or in `undecided`).
+    scan_ok: bool,
+    /// Ids the pass considered but left without a decision (unreadable, a claim that may still be
+    /// pending, cut short): a later pass decides them.
+    undecided: Vec<B256>,
     actions: Vec<(B256, RecoveryAction)>,
     /// The incremental locked-job scan state to hand to the next pass.
     scan: Option<RecoveryScan>,
@@ -12310,6 +12776,39 @@ struct RecoveryScan {
 /// Blocks each incremental recovery scan re-reads behind its cursor (see `recover_claimed_jobs`).
 const RECOVERY_SCAN_OVERLAP: u64 = 64;
 
+/// Journal entries that did not parse (a newer build's, or a damaged one) are kept as written; once
+/// an authoritative read shows the job terminal (Fulfilled, Cancelled, or Open at the reopen limit),
+/// no lock of it is left, and the entry goes. One batched read per pass, only while there are some.
+async fn gc_unparsed_journal_entries(client: &ChainClient, journal: &SharedJournal) {
+    let ids = journal.lock().unwrap_or_else(|p| p.into_inner()).unparsed_job_ids();
+    if ids.is_empty() {
+        return;
+    }
+    let Ok(views) = client.get_job_status_views_batch(&ids).await else {
+        return;
+    };
+    let terminal: Vec<B256> = views
+        .into_iter()
+        .filter_map(|(jid, v)| v.map(|v| (jid, v)))
+        .filter(|(_, v)| {
+            v.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED
+                || v.status == 3
+                || (v.status == zkminer_chain::jobs::JOB_STATUS_OPEN
+                    && v.reopenCount >= zkminer_chain::jobs::MAX_REOPEN_COUNT)
+        })
+        .map(|(jid, _)| jid)
+        .collect();
+    if terminal.is_empty() {
+        return;
+    }
+    journal_update(journal, |j| {
+        let n = j.drop_unparsed(&terminal);
+        if n > 0 {
+            tracing::info!("journal: dropped {n} unreadable entr{} of terminal jobs", if n == 1 { "y" } else { "ies" });
+        }
+    });
+}
+
 /// Reconcile every lock we might hold — the journal's breadcrumbs plus every job the chain says we
 /// locked within `lookback_blocks` — against live chain state.
 ///
@@ -12323,7 +12822,9 @@ async fn recover_claimed_jobs(
     lookback_blocks: u64,
     skip: &std::collections::HashSet<B256>,
     scan: Option<RecoveryScan>,
+    witness_rt: Option<&Arc<witness::WitnessRuntime>>,
 ) -> RecoveryPass {
+    gc_unparsed_journal_entries(client, journal).await;
     // Reconcile everything the journal is tracking, PLUS any job this miner has
     // locked on-chain that the journal doesn't know about (crash before the
     // journal write, a cleared journal, or a claim from a previous machine).
@@ -12395,6 +12896,8 @@ async fn recover_claimed_jobs(
     let mut settled: Vec<B256> = Vec::new();
     // A live lifecycle task owns these: it is the only writer of their breadcrumbs.
     job_ids.retain(|jid| !skip.contains(jid));
+    // Every id this pass is about: whatever it neither settles nor acts on is left undecided.
+    let considered: Vec<B256> = job_ids.clone();
     if !job_ids.is_empty() {
         tracing::info!(
             "recover: reconciling {} claimed/locked job(s)",
@@ -12454,6 +12957,8 @@ async fn recover_claimed_jobs(
         }
     }
     let before = job_ids.len();
+    // Stashed fulfil nonces of dropped breadcrumbs, settled after the (synchronous) retain.
+    let mut stash_drains: Vec<B256> = Vec::new();
     let mut open_intent = false;
     job_ids.retain(|jid| match views_map.get(jid) {
         // Ours AND still Locked → re-drive. Persist a breadcrumb NOW for anything
@@ -12516,14 +13021,15 @@ async fn recover_claimed_jobs(
             // Dropping the breadcrumb means no `release_job` will ever run for this job again,
             // and that is the ONLY consumer of the abandoned-nonce stash. Leaking one leaves a
             // hole with no local trace that wedges the whole signer.
-            if let Some(n) = client.take_abandoned_nonce(*jid) {
-                client.abort_nonce(n);
-            }
+            stash_drains.push(*jid);
             false
         }
         // View unreadable (RPC miss / lagging node) → keep and re-read per-job (lag-tolerant).
         None => true,
     });
+    for jid in stash_drains {
+        client.settle_abandoned_nonce(jid).await;
+    }
     if before != job_ids.len() {
         tracing::info!(
             "recover: dropped {} settled/not-ours; {} still Locked to re-drive",
@@ -12622,13 +13128,11 @@ async fn recover_claimed_jobs(
             settled.push(jid);
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
-            if let Some(n) = client.take_abandoned_nonce(jid) {
-                client.abort_nonce(n);
-            }
+            client.settle_abandoned_nonce(jid).await;
             continue;
         }
-        // Terminal status check (Open=0, Locked=1, Fulfilled=2, Released=3, Cancelled=4): only a
-        // Locked job can be fulfilled or released.
+        // Terminal status check (Open=0, Locked=1, Fulfilled=2, Cancelled=3; a release reopens the job,
+        // so it reads Open): only a Locked job can be fulfilled or released.
         if view.status != 1 {
             tracing::info!(
                 "recover: {} has non-Locked status {} — dropping stale journal entry",
@@ -12638,9 +13142,7 @@ async fn recover_claimed_jobs(
             settled.push(jid);
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
-            if let Some(n) = client.take_abandoned_nonce(jid) {
-                client.abort_nonce(n);
-            }
+            client.settle_abandoned_nonce(jid).await;
             continue;
         }
         let lock_deadline = effective_cutoff(&view);
@@ -12686,6 +13188,28 @@ async fn recover_claimed_jobs(
                 recovery_margin,
             );
             actions.push((jid, RecoveryAction::Release(jid)));
+            continue;
+        }
+
+        // A witness lock (its breadcrumb names a bundle, or the retention store pins one): the store,
+        // not the chain's descriptor or the journal, is its authoritative index (plan §15.2). It is
+        // immune to the program-wide marks below. Without a witness runtime here (serving off and no
+        // store), it is kept: the room rule above releases it as its window closes.
+        let witness_lock = journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .witness_bundle(jid)
+            .is_some()
+            || witness_rt.is_some_and(|w| w.is_witness_lock(jid));
+        if witness_lock {
+            match witness_rt {
+                Some(_) => actions.push((jid, RecoveryAction::Witness(jid))),
+                None => tracing::error!(
+                    "PAGE: RETENTION-UNAVAILABLE {} is a witness lock and no retention store is open here \
+                     (configure [retention]): kept, released only as its window closes",
+                    short_id(jid)
+                ),
+            }
             continue;
         }
 
@@ -12752,6 +13276,21 @@ async fn recover_claimed_jobs(
             actions.push((jid, RecoveryAction::Release(jid)));
             continue;
         }
+        // A witness lock with no breadcrumb and no pin (adopted): never proven inline (its input is
+        // the envelope, not the guest's). The witness runtime pages it BUNDLE-MISSING and keeps it;
+        // the room rule releases it as its window closes.
+        if witness::policy::is_witness_input(&descriptor.inputData) {
+            witness::note_class(jid, witness::Class::Witness);
+            match witness_rt {
+                Some(_) => actions.push((jid, RecoveryAction::Witness(jid))),
+                None => tracing::error!(
+                    "PAGE: BUNDLE-MISSING {} is a witness lock with no retention store here: kept, released \
+                     only as its window closes",
+                    short_id(jid)
+                ),
+            }
+            continue;
+        }
 
         let mut tracked = TrackedJob {
             info: job_info,
@@ -12794,8 +13333,12 @@ async fn recover_claimed_jobs(
             sc.known.remove(jid);
         }
     }
+    let decided: std::collections::HashSet<B256> =
+        settled.iter().copied().chain(actions.iter().map(|(j, _)| *j)).collect();
     RecoveryPass {
         deferred: deferred || scan_failed || open_intent,
+        scan_ok: !scan_failed && next_scan.is_some(),
+        undecided: considered.into_iter().filter(|j| !decided.contains(j)).collect(),
         actions,
         scan: next_scan,
     }
@@ -12804,21 +13347,74 @@ async fn recover_claimed_jobs(
 /// Execute a recovery pass's actions as spawned tasks, each holding an `in_flight` slot (no
 /// collateral: the lock is already reflected in the on-chain stake figures). Shutdown can begin
 /// between the pass and here; a lock left undriven keeps its breadcrumb for the abandon path.
+/// `handover`: whether the pass's chain scan was complete, and the ids it left undecided (the
+/// witness runtime spares their bundles from eviction until a later pass decides them).
 #[allow(clippy::too_many_arguments)]
 fn spawn_recovery_actions(
     pass_actions: Vec<(B256, RecoveryAction)>,
+    handover: (bool, Vec<B256>),
     in_flight: &mut HashMap<B256, u128>,
     client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
     journal: &SharedJournal,
     done_tx: &mpsc::UnboundedSender<B256>,
     proving_timeout: Duration,
+    witness_rt: Option<&Arc<witness::WitnessRuntime>>,
 ) {
     for (jid, action) in pass_actions {
         if in_flight.contains_key(&jid) || SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
             continue;
         }
+        // A witness task may have taken the job since the pass read who owns what (a lock it just
+        // claimed, or one the store pass re-drove): it drives the lock, and a release beside its
+        // fulfil would race it.
+        if witness_rt.is_some_and(|w| w.owns(jid)) {
+            continue;
+        }
+        // A witness lock's task takes its `in_flight` slot itself once its bundle is found (see
+        // `WitnessRuntime::run_locked`); a lock it cannot drive yet stays out of it, for the room rule.
+        if let RecoveryAction::Witness(jid) = action {
+            if let Some(w) = witness_rt {
+                w.drive_recovered(jid);
+            }
+            continue;
+        }
+        // A witness lock's release is taken in the witness runtime first, in one step with the check
+        // that no witness task owns it: a store pass re-driving it at the same moment and this release
+        // never both go. The job's verdict is recorded before the release is sent.
+        let witness_release = match (&action, witness_rt) {
+            (RecoveryAction::Release(_), Some(w)) => match w.claim_release(jid) {
+                witness::ReleaseClaim::Owned => continue,
+                witness::ReleaseClaim::NotWitness => None,
+                witness::ReleaseClaim::Witness(r) => Some(r),
+            },
+            _ => None,
+        };
         in_flight.insert(jid, 0);
+        if let RecoveryAction::Drive {
+            job, descriptor, ..
+        } = &action
+        {
+            // A lock held and not proven yet counts against its program's and submitter's share of
+            // the stake: at what its settled price locks under its terms when they are known, and at
+            // least the deployment's floor, which every lock locks.
+            let floor = collateral::floor().unwrap_or(0);
+            let locked = job_collateral_terms(jid).map_or(floor, |(min, bps)| {
+                zkminer_chain::auction::compute_collateral(
+                    job.info.settled_price,
+                    u64::try_from(bps).unwrap_or(u64::MAX),
+                    min,
+                )
+            });
+            collateral::record(
+                jid,
+                collateral::Exposure {
+                    program: descriptor.programId,
+                    submitter: job.info.caller,
+                    collateral: locked.max(job.info.locked_collateral).max(floor),
+                },
+            );
+        }
         match action {
             RecoveryAction::Drive {
                 job,
@@ -12840,10 +13436,22 @@ fn spawn_recovery_actions(
                 let (c, st, jr, done) = (client.clone(), state.clone(), journal.clone(), done_tx.clone());
                 tokio::spawn(async move {
                     let _slot = SlotGuard(jid, done);
+                    if let Some(r) = &witness_release {
+                        r.record_verdict("released by the recovery room rule (too close to its deadline to drive)")
+                            .await;
+                    }
                     release_and_clean(&c, &st, &jr, jid).await;
+                    drop(witness_release);
                 });
             }
+            RecoveryAction::Witness(_) => unreachable!("handled above"),
         }
+    }
+    // After the handover: the witness runtime enables eviction once a pass whose chain scan was
+    // complete has handed it every witness lock it decided (and it has pinned each), sparing the
+    // bundles of the ids the pass left undecided.
+    if let Some(w) = witness_rt {
+        w.note_recovery_pass(handover.0, handover.1);
     }
 }
 
@@ -12931,6 +13539,49 @@ mod tests {
         assert_eq!(seal.len(), 260);
         assert_eq!(&seal[..4], &[0xe7, 0x1e, 0x66, 0x20]);
         assert_eq!(&seal[4..], &proof[..]);
+    }
+
+    #[test]
+    fn a_job_tries_its_planned_card_then_the_fastest_and_a_refusing_card_last() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let eligible = ids(&["gpu0", "gpu-rocm1", "gpu-rocm0", "gpu-intel0"]);
+        let planned = "gpu-rocm1".to_string();
+        assert_eq!(
+            job_card_order(Some(&planned), &eligible, &[]),
+            ids(&["gpu-rocm1", "gpu0", "gpu-rocm0", "gpu-intel0"])
+        );
+        // The 7900 XTX refused admission (host RAM): the 4090, then the 9070 XT, before the A770.
+        assert_eq!(
+            job_card_order(Some(&planned), &eligible, &ids(&["gpu-rocm1"])),
+            ids(&["gpu0", "gpu-rocm0", "gpu-intel0"])
+        );
+        // No plan: only the preference, which a refusal removes.
+        let any = "gpu0".to_string();
+        assert_eq!(job_card_order(Some(&any), &[], &[]), ids(&["gpu0"]));
+        assert!(job_card_order(Some(&any), &[], &ids(&["gpu0"])).is_empty());
+        assert!(job_card_order(None, &[], &[]).is_empty());
+    }
+
+    /// The cards a measured job is admitted on: those that finish it inside the watchdog and the
+    /// window, at the claim gate's margin. Measured on this host: an RX 7900 XTX proves risc0 at ~2.2M
+    /// c/s, an Arc A770 at ~116K.
+    #[test]
+    fn a_card_is_eligible_only_if_it_finishes_the_job_in_time() {
+        // A 1.5 margin, 2 s of allowances, a 600 s watchdog and a window of `window` s.
+        let fits =
+            |cycles, rate, window| card_finishes_in_time(cycles, rate, 1.5, 2.0, 600.0, window);
+        let (xtx, a770) = (2.2e6, 116e3);
+        // A 41M-cycle job: both cards (the A770's ~535 s, at the margin, fits the 600 s watchdog).
+        assert!(fits(41_418_752, xtx, 3000));
+        assert!(fits(41_418_752, a770, 3000));
+        // A 100M-cycle job: the XTX only; the A770 would need ~1300 s.
+        assert!(fits(100_000_000, xtx, 3000));
+        assert!(!fits(100_000_000, a770, 3000));
+        // The window binds too: 41M cycles on the A770 do not fit a 400 s window.
+        assert!(!fits(41_418_752, a770, 400));
+        // No rate, no card.
+        assert!(!fits(1, 0.0, 3000));
+        assert!(!fits(1, f64::NAN, 3000));
     }
 
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.
@@ -14143,6 +14794,57 @@ mod r2_sizing_tests {
         let expired = job(0xB4);
         set_job_aside(expired.info.job_id, Duration::ZERO);
         assert_eq!(open_rank(&expired), 1_000, "only while it lasts");
+    }
+
+    /// A witness job this host does not serve (no runtime, its caller not admitted, serving off,
+    /// ...) is set aside as an inline job it cannot claim is: it ranks last in the Open set and
+    /// stays out of the per-tick cut, so high-priced witness decoys never hold the top slots or push
+    /// claimable jobs out of the capped Open set. Before witness jobs were served, such a job was
+    /// measured as an inline one, failed, and was set aside the same way.
+    #[test]
+    fn unserved_witness_jobs_are_set_aside_like_unclaimable_inline_jobs() {
+        let job = |b| TrackedJob {
+            info: zkminer_chain::jobs::JobInfo {
+                job_id: B256::repeat_byte(b),
+                ..Default::default()
+            },
+            status: zkminer_tui::state::MinerJobStatus::Open,
+            current_price: u128::MAX / 2,
+            gpu_bus_id: None,
+            prover_backend: String::new(),
+            estimated_cycles: 0,
+        };
+        assert_eq!(
+            witness::policy::UNSERVED_SET_ASIDE,
+            DETERMINISTIC_SKIP_TTL,
+            "the inline path's set-aside for a verdict that lasts"
+        );
+        // No witness runtime here: a job classified as a witness job is unserved.
+        let decoy = job(0xC9);
+        witness::note_class(decoy.info.job_id, witness::Class::Witness);
+        let route = witness::route(None, &decoy, B256::ZERO, true);
+        assert!(matches!(route, witness::Route::WitnessUnserved { .. }), "{route:?}");
+        assert!(witness_route_skips(decoy.info.job_id, route));
+        assert!(job_set_aside(decoy.info.job_id) && claim_backing_off(decoy.info.job_id));
+        assert_eq!(open_rank(&decoy), 0, "a high-priced unserved witness job ranks last");
+        // A served witness job is skipped by the inline path but keeps its rank; an inline job is
+        // the inline path's.
+        let served = job(0xC2);
+        assert!(witness_route_skips(served.info.job_id, witness::Route::Witness));
+        assert_eq!(open_rank(&served), served.current_price);
+        assert!(!witness_route_skips(job(0xC3).info.job_id, witness::Route::Inline));
+        // A capped Open set keeps the claimable job over a pile of unserved decoys.
+        let mut open: Vec<TrackedJob> = (0xD0..0xD8u8)
+            .map(|b| {
+                let j = job(b);
+                witness_route_skips(j.info.job_id, witness::Route::WitnessUnserved { wait: Duration::from_secs(600) });
+                j
+            })
+            .collect();
+        let honest = TrackedJob { current_price: 1, ..job(0xE0) };
+        open.push(honest.clone());
+        retain_top_by_key(&mut open, 1, open_rank);
+        assert_eq!(open[0].info.job_id, honest.info.job_id);
     }
 
     #[test]

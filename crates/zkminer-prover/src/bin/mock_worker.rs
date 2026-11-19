@@ -36,9 +36,19 @@
 //!   is held.
 //! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
 //!   `unknown` for `None`. Default: 0.
+//! - `MOCK_WITNESS_DIVERGE`: set to anything to answer a witness Prove with `JournalDiverged`: the
+//!   journal is the bundle's `input_path`, the hash the complement of the expected one, and the cycles
+//!   its `w_len`. Unset = a witness Prove is answered as an inline one.
+//! - `MOCK_LURKER`: a file name. On its first command (a guest can run only on a command) the worker
+//!   starts a `sleep` that leaves its process group and session (`setsid`), as nothing in a
+//!   confined worker can, and writes its pid there: what ends the worker's cgroup must end it too.
 //! - `MOCK_SETUP_SECS`: a one-time setup of this many seconds (default 0), paid by the first
 //!   Warmup, Execute or ProgramId, as SP1's measure worker builds its CPU prover on first use.
 //! - `MOCK_WARMUP_LOG`: a file each Warmup appends a line to, so a test can count them.
+//! - `MOCK_BENCHMARK_SECS`: how long each Benchmark request takes (default 0): a benchmark is several
+//!   (the warm-up, the suite), so a test can make the whole run outlast a per-step deadline.
+//! - `MOCK_PROTOCOL_VERSION`: the protocol version the HelloAck reports, as a worker built for
+//!   another version would. Default: this build's.
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
@@ -46,6 +56,33 @@ use std::time::Duration;
 use zkminer_prover_protocol::{
     read_message, write_message, FrameError, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
+
+#[cfg(unix)]
+fn start_lurker() {
+    if let Some(file) = std::env::var_os("MOCK_LURKER") {
+        use std::os::unix::process::CommandExt;
+        let mut c = std::process::Command::new("sleep");
+        c.arg("600")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setsid is async-signal-safe.
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let lurker = c.spawn().expect("MOCK_LURKER: spawn");
+        std::fs::write(&file, lurker.id().to_string()).expect("MOCK_LURKER: pid file");
+        std::mem::forget(lurker);
+    }
+}
+
+#[cfg(not(unix))]
+fn start_lurker() {}
 
 fn main() {
     if std::env::var_os("MOCK_BE_MEMORY_HOG").is_some() {
@@ -72,6 +109,12 @@ fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
     );
+    let benchmark_delay = Duration::from_secs(
+        std::env::var("MOCK_BENCHMARK_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    );
     let mut setup = Some(Duration::from_secs(
         std::env::var("MOCK_SETUP_SECS")
             .ok()
@@ -88,12 +131,16 @@ fn main() {
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(io::stdout().lock());
 
+    let mut first = true;
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
             Ok(cmd) => cmd,
             Err(FrameError::UnexpectedEof) => break,
             Err(_) => break,
         };
+        if std::mem::replace(&mut first, false) {
+            start_lurker();
+        }
 
         match cmd {
             WorkerCommand::Hello {
@@ -133,6 +180,7 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
+                std::thread::sleep(benchmark_delay);
                 let resp = if fail_on == "benchmark" {
                     WorkerResponse::Error {
                         request_id: 0,
@@ -153,6 +201,7 @@ fn main() {
                 input_data: _,
                 po2,
                 program_id: _,
+                witness,
             } => {
                 if std::env::var_os("MOCK_SERVER_OOM").is_some() {
                     if limit_own_cgroup_memory(256 * 1024 * 1024).is_err() {
@@ -172,6 +221,24 @@ fn main() {
                     }
                 }
                 std::thread::sleep(prove_delay);
+                // A witness proof whose run did not reproduce its bundle: what the run committed is the
+                // input path's bytes, so a test sees the bundle reached the worker.
+                if let Some(w) = witness
+                    .as_ref()
+                    .filter(|_| std::env::var_os("MOCK_WITNESS_DIVERGE").is_some())
+                {
+                    let resp = WorkerResponse::JournalDiverged {
+                        request_id,
+                        journal: w.input_path.as_bytes().to_vec(),
+                        journal_len: w.input_path.len() as u32,
+                        journal_sha256: w.expect_journal_sha256.map(|b| !b),
+                        exit_kind: zkminer_prover_protocol::GUEST_EXIT_HALTED,
+                        exit_code: 0,
+                        cycles: w.w_len,
+                    };
+                    write_message(&mut stdout, &resp).unwrap();
+                    continue;
+                }
                 // 1,000 cycles, plus the segment size asked for, so a test can see which arrived.
                 let resp = WorkerResponse::ProofResult {
                     request_id,

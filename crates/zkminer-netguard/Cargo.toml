@@ -1,0 +1,48 @@
+[package]
+name = "zkminer-netguard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "zkminer's network guard: nothing a requester controls makes the miner connect anywhere but the public internet"
+
+[features]
+default = ["client"]
+# The guarded DNS resolver and HTTP client (reqwest, tokio). Without it, only the pure parts: the
+# address predicate, host-name hygiene, URL checks, the admission decision and the host's facts.
+client = ["dep:reqwest", "dep:tokio", "dep:rustls", "dep:webpki-roots"]
+# Test seams for the tests of crates that depend on this one: a resolver that connects to another
+# address than the one it admitted (so a public-mode fetch can be served by a server on loopback).
+# Only ever enabled from a `[dev-dependencies]` entry; nothing in a release build turns it on.
+test-util = ["client"]
+
+[dependencies]
+url = "2"
+tracing = { workspace = true }
+# No default features asked for here, but Cargo unifies features across a build: what other crates
+# ask of reqwest (zkminer-chain: system-proxy and HTTP/2) is turned on in this same reqwest. So the
+# guarded client switches off what must stay off itself, explicitly: `no_proxy()`,
+# `http1_only()`, and `no_gzip()` / `no_brotli()` / `no_deflate()` / `no_zstd()`. TLS is rustls
+# with the compiled-in webpki roots.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+tokio = { workspace = true, optional = true }
+# The public-address discovery's HTTPS reflector (a blocking-free TLS client of its own; ring, as
+# reqwest's rustls uses) and its compiled-in roots.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+# The near-hop probe's socket (hop limit set before connecting).
+socket2 = "0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = "1"

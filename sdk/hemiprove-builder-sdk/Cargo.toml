@@ -1,0 +1,15 @@
+[package]
+name = "hemiprove-builder-sdk"
+description = "Safe wrappers for HemiProve witness builders (builder ABI v1, wasm32-unknown-unknown)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies by default: everything a builder links is in this workspace and the Rust
+# toolchain. Feature `eth` adds the reference prelude (zkminer reference/eth-prelude, its only
+# dependency tiny-keccak): JSON-RPC results as headers, proofs and receipts, and their RLP encoders.
+[features]
+eth = ["dep:hemiprove-eth-prelude"]
+
+[dependencies]
+hemiprove-eth-prelude = { path = "../reference/eth-prelude", optional = true }

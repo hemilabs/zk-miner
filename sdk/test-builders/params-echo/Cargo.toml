@@ -1,0 +1,13 @@
+[package]
+name = "params-echo"
+description = "Test builder for the miner's pre-claim pipeline: writes its builderParams verbatim as W"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hemiprove-builder-sdk = { path = "../../hemiprove-builder-sdk" }

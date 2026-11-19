@@ -496,9 +496,11 @@ impl ChainClient {
         // the pinned router implementation itself: getFacet == 0).
         use alloy::sol_types::SolCall;
         use zkminer_contracts::bindings::{IHemiProveCore as C, IHemiProveFulfill as F};
-        let selectors: [[u8; 4]; 16] = [
+        let selectors: [[u8; 4]; 17] = [
             C::claimJobCall::SELECTOR,
             F::fulfillJobCall::SELECTOR,
+            // Witness jobs fulfil without resending `inputData` (`jobs::fulfill_job_hashed`).
+            F::fulfillJobHashedCall::SELECTOR,
             F::releaseJobCall::SELECTOR,
             F::graceReleaseCall::SELECTOR,
             IHemiProveAux::getJobStatusViewCall::SELECTOR,

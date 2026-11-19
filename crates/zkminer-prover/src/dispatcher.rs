@@ -387,6 +387,67 @@ pub struct ProgramIdDerivation {
 /// (see `WorkerPool::prove_min_vram`).
 pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
 
+/// The cards a job may run on and the order to try them in, as the claim gate planned it (see
+/// `WorkerPool::prove_min_vram`). Both lists hold benchmark device ids (e.g. `gpu0`, `gpu-rocm1`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobCards<'a> {
+    /// The cards this job may run on; empty: any. A HARD filter, like `disabled` and the job's sizes,
+    /// applied before every preference and never restored: the claim gate admitted the job only on
+    /// the cards it could finish on in time, and sized its watchdog on the slowest of them, so a card
+    /// outside it would be killed by the watchdog or miss the deadline.
+    pub eligible: &'a [String],
+    /// The cards to try first, in this order (the claim gate's: the card the job was planned for,
+    /// then the rest of `eligible`, fastest first). A preference: a busy or down card yields to the
+    /// next, and any candidate not in it follows in the usual warm-first order.
+    pub order: &'a [String],
+}
+
+/// A witness proof's execution that did not reproduce its bundle (`WorkerResponse::JournalDiverged`,
+/// plan §15.3): it did not halt with exit code 0, or its journal is not the bundle's. Nothing was
+/// proven. Built only from the worker's typed response, never from text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalDivergence {
+    /// The slot whose worker executed it, e.g. `risc0:cuda:0`.
+    pub slot_key: String,
+    /// The journal it committed; empty when longer than `EXECUTE_JOURNAL_MAX_BYTES` or none.
+    pub journal: Vec<u8>,
+    pub journal_len: u32,
+    pub journal_sha256: [u8; 32],
+    /// One of the protocol's `GUEST_EXIT_*` constants.
+    pub exit_kind: u8,
+    pub exit_code: u32,
+    /// Sized cycles, in the unit of `ExecuteMeasurement::cycles`.
+    pub cycles: u64,
+}
+
+/// The outcome of [`WorkerPool::prove_witness_min_vram`]: a proof, or a typed divergence the caller
+/// decides on (re-run the binding and the claim-gate limits on the new journal; re-dispatch, hand
+/// back, or release). Every other failure is an `Err`, as for an inline proof.
+#[derive(Debug, Clone)]
+pub enum WitnessProveOutcome {
+    Proved(ProofOutput),
+    JournalDiverged(JournalDivergence),
+}
+
+/// A proof's progress callback: the fraction done and the slot proving it.
+pub type ProveProgress = Box<dyn Fn(f64, &str) + Send>;
+
+/// The input a proof is dispatched with.
+#[derive(Debug, Clone, Copy)]
+enum ProveInput<'a> {
+    /// The bytes themselves, in the frame.
+    Inline(&'a [u8]),
+    /// A witness job's bundle, which the worker reads itself.
+    Witness(&'a zkminer_prover_protocol::WitnessProve),
+}
+
+/// What a slot's worker answered a proof with.
+#[derive(Debug)]
+enum SlotProof {
+    Proved(ProofOutput),
+    JournalDiverged(JournalDivergence),
+}
+
 /// The journal an `ExecuteResult` reported, if it is the whole journal `journal_len` describes. The
 /// caller claims no journal-bound job on a measurement without one.
 fn whole_journal(journal: Option<Vec<u8>>, journal_len: u64) -> Option<Vec<u8>> {
@@ -1113,6 +1174,39 @@ fn metal_idle_outgrown(
     }
 }
 
+/// Runs `attempt` on each of `keys` in turn and returns the first success, with its key (see
+/// `WorkerPool::warm_up`). A failure moves on to the next key, except a host-memory shortage, which
+/// is returned at once: it is the host's, and every other slot would meet it too. When every key
+/// fails, the last failure is returned, with the earlier ones in its context.
+fn first_slot_that_succeeds<T>(
+    keys: &[String],
+    mut attempt: impl FnMut(&str) -> Result<T>,
+) -> Result<(String, T)> {
+    let mut earlier: Vec<String> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        let e = match attempt(key) {
+            Ok(value) => return Ok((key.clone(), value)),
+            Err(e) => e,
+        };
+        let host_short = e
+            .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .is_some();
+        let Some(next) = keys.get(i + 1).filter(|_| !host_short) else {
+            return Err(if earlier.is_empty() {
+                e
+            } else {
+                e.context(format!(
+                    "no slot could run the one-time setup ({}); the last one tried, {key}, failed",
+                    earlier.join("; ")
+                ))
+            });
+        };
+        tracing::warn!("{key} could not run the one-time setup, so {next} is tried: {e:#}");
+        earlier.push(format!("{key}: {e:#}"));
+    }
+    bail!("no slot to run the one-time setup on")
+}
+
 struct WorkerSlot {
     handle: Option<WorkerHandle>,
     path: PathBuf,
@@ -1135,19 +1229,23 @@ struct WorkerSlot {
     consecutive_failures: u32,
     last_failure: Option<Instant>,
     /// Set when the worker SPOKE the protocol and declined: it cannot prove on this
-    /// host, and no retry will change that. Holds the reason for the operator.
+    /// host. Holds the reason for the operator.
     ///
     /// Distinct from `consecutive_failures` on purpose. A dead-but-eligible slot is
     /// deliberately still "healthy" (see `is_backend_healthy`) so a crashed worker
     /// respawns and claiming does not stall on a transient fault. A capability decline
     /// is not transient, so treating it the same way made the miner keep claiming jobs
     /// the worker had just said it could not prove -- and every ~RETIRE_COOLDOWN the
-    /// counter reset re-opened the window for the life of the process.
+    /// counter reset re-opened the window for the life of the process. So a declined slot is
+    /// never eligible: only a fresh worker that passes its handshake clears it, which
+    /// `retry_due_declines` tries after the slot's backoff (`decline_retry`).
     declined: Option<String>,
     /// The error of this slot's last failed spawn or respawn (the handshake error, with the
     /// worker's last stderr line), cleared when a worker starts. A benchmark of a slot that never
     /// came up reports THIS, not the respawn backoff its own retry ran into (W10-BFIX).
     last_spawn_error: Option<String>,
+    /// When a declined slot is next tried with a fresh worker, and the backoff that set it.
+    decline_retry: DeclineRetry,
     /// Number of proofs this worker instance has completed since it was (re)spawned.
     /// When it reaches `recycle_after_proofs()`, the worker is killed + respawned so
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
@@ -1177,6 +1275,32 @@ impl WorkerSlot {
             footprint,
         });
     }
+}
+
+/// The first wait before a declined slot is tried again with a fresh worker.
+const DECLINE_RETRY_FIRST: Duration = Duration::from_secs(10 * 60);
+
+/// The longest wait between two tries of a declined slot.
+const DECLINE_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// How often the background thread looks for a declined slot due for its retry
+/// (`WorkerPool::start_decline_retries`).
+const DECLINE_RETRY_POLL: Duration = Duration::from_secs(30);
+
+/// The retry of a declined slot (`WorkerSlot::declined`). A decline is no longer for the life of
+/// the miner: a condition of the host that has since passed (a worker's executor that could not
+/// run its canary while the host was short of something, a server that could not be installed)
+/// must not take the backend off the slot for good. A worker that is still unable declines again
+/// at once, at its handshake (an old server) or before its first guest runs (the canary), so a
+/// retry never puts a claim on a slot that cannot prove it.
+#[derive(Clone, Copy, Debug, Default)]
+struct DeclineRetry {
+    /// When the slot may be tried again; `None` while it is not declined.
+    at: Option<Instant>,
+    /// The wait that set `at`: `DECLINE_RETRY_FIRST` for a first decline, doubled for each decline
+    /// after it, up to `DECLINE_RETRY_MAX`. Back to zero once a guest has run on the slot, which
+    /// its executor canary must have passed first (`note_guest_ran`).
+    backoff: Duration,
 }
 
 /// Wrapper that holds a worker slot and its PID accessible without locking.
@@ -1222,14 +1346,40 @@ struct WorkerEntry {
     /// Prevents the error handler from incrementing consecutive_failures,
     /// which would permanently retire the slot after 3 timeouts.
     intentional_kill: Arc<AtomicBool>,
+    /// The build the slot's worker named at its handshake, published at every spawn. Outside the
+    /// slot mutex like the pid, so it can be read while the slot proves.
+    build: WorkerBuild,
+}
+
+/// A worker's build as its `Hello` names it: `(sdk_version, worker_version)`, `None` until a worker of
+/// the slot has completed its handshake (or when it named neither).
+#[derive(Debug, Default)]
+struct WorkerBuild(Mutex<Option<(String, String)>>);
+
+impl WorkerBuild {
+    fn of(h: Option<&WorkerHandle>) -> Self {
+        let b = Self::default();
+        if let Some(h) = h {
+            b.note(h);
+        }
+        b
+    }
+
+    fn note(&self, h: &WorkerHandle) {
+        let v = h.sdk_version.clone().zip(h.worker_version.clone());
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+
+    fn get(&self) -> Option<(String, String)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// A pre-claim cycle MEASUREMENT currently in flight, recorded so a committed (claimed) proof that
 /// cannot otherwise fit can PREEMPT it — kill its throwaway measure worker to reclaim the host RAM
-/// and/or `/dev/shm` it is holding. A measurement is speculative work with no collateral; a claimed
-/// proof is bonded and on a deadline, so on the marginal box where the two cannot co-fit the proof
-/// wins (finding RH-round3 residual A). See `preempt_measures_for_host` / `preempt_measures_for_shm`
-/// and `WorkerPool::inflight_measures`.
+/// it is holding. A measurement is speculative work with no collateral; a claimed proof is bonded
+/// and on a deadline, so on the marginal box where the two cannot co-fit the proof wins (finding
+/// RH-round3 residual A). See `preempt_measures_for_host` and `WorkerPool::inflight_measures`.
 #[derive(Clone)]
 struct InflightMeasure {
     /// The measure worker's pid Arc (shared with its `WorkerEntry`), re-read at kill time.
@@ -1262,8 +1412,6 @@ struct InflightMeasure {
     preempt: Arc<AtomicBool>,
     /// Host-RAM bytes this measurement reserved against the ledger (0 if it reserved none).
     host_bytes: u64,
-    /// `/dev/shm` bytes this measurement reserved against `shm_ledger` (0 off x86-64 / non-SP1).
-    shm_bytes: u64,
 }
 
 /// Source of the monotonic `InflightMeasure::generation`. A free-running counter is enough: a
@@ -1300,11 +1448,17 @@ impl Drop for InflightMeasureGuard<'_> {
 /// need no worker.
 trait PidSlot {
     fn clear(&self);
+    /// A worker was (re)spawned behind this slot: publish the build its handshake named.
+    fn note_build(&self, _h: &WorkerHandle) {}
 }
 
 impl PidSlot for WorkerEntry {
     fn clear(&self) {
         self.clear_pid();
+    }
+
+    fn note_build(&self, h: &WorkerHandle) {
+        self.build.note(h);
     }
 }
 
@@ -1354,6 +1508,28 @@ impl WorkerEntry {
     }
 }
 
+/// A watchdog's clock: its deadline is the last `touch` plus its timeout. A benchmark touches it as each
+/// step completes (the warm-up, each program, each scoring proof), so `benchmark_timeout` bounds a step
+/// rather than the whole run, which a slow card cannot finish in it (an Arc A770's risc0 suite and
+/// score take over 30 minutes, no step more than about 10), while a wedged step is still caught as
+/// soon.
+#[derive(Clone)]
+struct WatchdogClock(Arc<Mutex<Instant>>);
+
+impl WatchdogClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// RAII guard that kills a worker process after a deadline.
 /// Drop cancels the watchdog thread.
 struct ProvingWatchdog {
@@ -1368,11 +1544,30 @@ impl ProvingWatchdog {
     /// handler knows not to count it as a consecutive failure.
     fn new(
         pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_clock(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            WatchdogClock::new(),
+        )
+    }
+
+    /// [`new`](Self::new) with a deadline of `clock`'s last touch plus `timeout`, re-read every second.
+    fn with_clock(
+        pid_ref: Arc<AtomicU32>,
         // Only the identity-checked group kill reads it, and that is Unix-only.
         #[cfg_attr(not(unix), allow(unused_variables))] starttime_ref: Arc<AtomicU64>,
         timeout: Duration,
         slot_key: String,
         intentional_kill: Arc<AtomicBool>,
+        clock: WatchdogClock,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -1386,8 +1581,7 @@ impl ProvingWatchdog {
             std::thread::Builder::new()
                 .name(format!("prove-watchdog-{slot_key}"))
                 .spawn(move || {
-                    let deadline = Instant::now() + timeout;
-                    while Instant::now() < deadline {
+                    while Instant::now() < clock.last() + timeout {
                         std::thread::sleep(Duration::from_secs(1));
                         if cancel_clone.load(Ordering::Relaxed) {
                             return;
@@ -1531,8 +1725,8 @@ fn gpu_vram_bytes(
         if cfg!(windows) {
             return crate::discovery::intel_vram_bytes(idx);
         }
-        // The xe driver's own count of the card's device memory (sysfs has none): see
-        // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
+        // The driver's own count of the card's device memory (sysfs has none), from xe or i915:
+        // see `discovery::intel_vram`.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
     }
     if gpu_tag == "metal" {
@@ -2198,7 +2392,8 @@ fn read_drm_card_occupancy(
 
 /// What each process holds of one card's VRAM, in bytes, from the DRM fdinfo of the render and card
 /// nodes it has open (`<proc_root>/<pid>/fdinfo/<fd>`). amdgpu (ROCm's KFD memory included) and xe
-/// both report `drm-resident-vram*` per open DRM file, matched to the card by `drm-pdev`.
+/// report `drm-resident-vram*` per open DRM file, and i915 `drm-resident-local*`, matched to the card
+/// by `drm-pdev`.
 ///
 /// Only processes whose fds we may read appear: those of our own user, which every worker of ours
 /// is. Anyone else's memory stays in the card's `used` and reads as foreign, the conservative
@@ -2243,7 +2438,8 @@ fn drm_vram_by_pid(proc_root: &std::path::Path, pci_bus_id: &str) -> Vec<(u32, u
 
 /// `(drm-client-id, VRAM bytes)` from one DRM fdinfo, or `None` when it is for another card (or has
 /// no client id). The VRAM is the sum of the `drm-resident-vram<N>` regions (amdgpu: `vram`, xe:
-/// `vram0`, `vram1`, ...), or the older `drm-memory-vram` when no region is reported.
+/// `vram0`, `vram1`, ...) or i915's `drm-resident-local<N>` (its device memory; not `stolen-local`), or
+/// the older `drm-memory-vram` when no region is reported.
 fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
     let (mut pdev, mut client, mut resident, mut legacy) = (None, None, None, None);
     for line in info.lines() {
@@ -2255,9 +2451,12 @@ fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
             "drm-pdev" => pdev = Some(value.to_ascii_lowercase()),
             "drm-client-id" => client = value.parse::<u64>().ok(),
             "drm-memory-vram" => legacy = parse_drm_size(value),
-            key if key
-                .strip_prefix("drm-resident-vram")
-                .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit())) =>
+            key if ["drm-resident-vram", "drm-resident-local"]
+                .iter()
+                .any(|prefix| {
+                    key.strip_prefix(prefix)
+                        .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit()))
+                }) =>
             {
                 if let Some(bytes) = parse_drm_size(value) {
                     resident = Some(resident.unwrap_or(0u64).saturating_add(bytes));
@@ -2684,6 +2883,45 @@ const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 /// `/tmp/<name>-<device>.sock`); see `discovery::sp1_server_name`.
 const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 
+/// Level Zero's V2 adapter for a risc0 worker on an Alchemist card (Arc A-series, Xe-HPG), unless the
+/// operator chose an adapter (`SYCL_UR_USE_LEVEL_ZERO_V2`, inherited).
+///
+/// The loader picks V2 only when a visible device supports it, so an Alchemist card alone (the
+/// worker's `ZE_AFFINITY_MASK`) got the legacy adapter, whose copy engine there reads results before
+/// the kernels writing them have finished. On an Arc A770, risc0's Groth16 seal came out invalid (a
+/// point off the curve) in 12 of 40 proofs on the legacy adapter, and in 0 of 40 on V2, whose Groth16
+/// step also took 5.3 s instead of 14.4 (the legacy adapter with its copy engine off was right too, at
+/// 14.7 s).
+///
+/// Not SP1: its SYCL server picks the legacy adapter on Linux itself, and on V2 an A770 proof waited
+/// forever (the GPU idle, one host thread spinning) after five programs had proved.
+fn alchemist_level_zero_env(env: &mut HashMap<String, String>, backend: &str, alchemist: bool) {
+    const V2: &str = "SYCL_UR_USE_LEVEL_ZERO_V2";
+    if alchemist
+        && backend == zkminer_prover_protocol::BACKEND_RISC0
+        && std::env::var_os(V2).is_none()
+    {
+        env.insert(V2.into(), "1".into());
+    }
+}
+
+/// The SP1 SYCL server's cap on the freed device memory it keeps cached for reuse, in MiB.
+const SP1_ALLOC_CACHE_MB_ENV: &str = "SP1_GPU_ALLOC_CACHE_MB";
+
+/// `SP1_ALLOC_CACHE_MB_ENV` for an Alchemist card (Arc A-series, Xe-HPG). The server's default keeps up
+/// to three quarters of the card cached, and frees it only when one of its own allocations fails,
+/// not when the driver needs memory for a kernel. On a 16 GB Arc A770 that failed SP1 proofs: a Level
+/// Zero allocation or kernel launch ran out of memory mid-proof, after which the server's next proof
+/// hung (the GPU idle) or failed. With 4 GiB the benchmark suite proved and verified at the card's own
+/// shard size, `zkop-mix` included, with nothing failed or retried.
+const ALCHEMIST_SP1_ALLOC_CACHE_MB: u64 = 4096;
+
+/// Whether `key` is a slot on an Intel card, whose kernels are compiled for it on first use (see
+/// `WorkerPool::ensure_warmed`).
+fn is_intel_slot(key: &str) -> bool {
+    key.split(':').nth(1) == Some("intel")
+}
+
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
 /// Groth16 component (v0.2.0, risc0 3.1) 2.4 GB (5.4 GB installed).
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -2697,9 +2935,10 @@ pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// this off and sets its workers up itself (`WorkerPool::measure_setup_bound`).
 pub const SP1_MEASURE_SETUP_BOUND: Duration = Duration::from_secs(600);
 
-/// `~/.zkminer/locks`: on disk, owned by the miner, and the same for every worker it starts.
+/// `~/.zkminer/locks` (`sp1_groth16_queue_dir`): on disk, owned by the miner, and the same for
+/// every worker it starts.
 fn sp1_queue_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".zkminer").join("locks"))
+    dirs::home_dir().map(|home| zkminer_prover_protocol::types::sp1_groth16_queue_dir(&home))
 }
 
 /// Pool of worker processes, keyed by compound slot key.
@@ -2758,25 +2997,12 @@ pub struct WorkerPool {
     /// not each evict, and a measurement flood cannot thrash the warm prover with re-warm churn. See
     /// `MEASURE_EVICT_COOLDOWN`.
     last_measure_eviction: Mutex<Option<Instant>>,
-    /// Aggregate `/dev/shm` bytes reserved by in-flight SP1 native-executor stagings (finding RH1,
-    /// balloon Mode B). The native executor (x86-64 Linux ONLY) stages the guest memory IMAGE + trace
-    /// ring in `/dev/shm`; the per-execute `sp1_measure_cap_bytes` clamp bounds ONE image below the
-    /// tmpfs, but the x86_64 clamp does NOT bound the AGGREGATE of several concurrent stagings (a
-    /// measure-pool slot + a prove's execute phase, or two proves on two cards), whose sum can exceed
-    /// the shared tmpfs and SIGBUS synchronously — beating the 100 ms `MEMORY_LIMIT` poll and killing
-    /// whichever process touches the tipping page (possibly a claimed prove → slash). This ledger
-    /// admits exactly as many concurrent SP1 native executes as the tmpfs can physically back: each
-    /// staging reserves `sp1_measure_cap_bytes` against a capacity of `dev_shm − poll_margin`, held
-    /// across the execute/prove and released on drop. Inert off x86-64-Linux (portable in-process
-    /// executor, no `/dev/shm`) and when the tmpfs is unreadable (fails open, like the RAM ledger).
-    shm_ledger: crate::memory::MemoryLedger,
     /// In-flight pre-claim cycle MEASUREMENTS, keyed by measure-slot key (`sp1:measure:0`, …).
     /// Populated by `execute_cycles` for the duration of the Execute (RAII-removed on return) so a
-    /// committed proof that cannot fit can PREEMPT one — reclaim the host RAM / `/dev/shm` it holds by
-    /// killing its throwaway worker — rather than be forced into a penalized release (finding
-    /// RH-round3 residual A). A measurement is speculative and uncollateralized; a claimed proof is
-    /// bonded and on a deadline, so the proof wins. See `preempt_measures_for_host` /
-    /// `preempt_measures_for_shm` and `InflightMeasure`.
+    /// committed proof that cannot fit can PREEMPT one — reclaim the host RAM it holds by killing its
+    /// throwaway worker — rather than be forced into a penalized release (finding RH-round3 residual
+    /// A). A measurement is speculative and uncollateralized; a claimed proof is bonded and on a
+    /// deadline, so the proof wins. See `preempt_measures_for_host` and `InflightMeasure`.
     inflight_measures: Mutex<HashMap<String, InflightMeasure>>,
     /// When set, `discover_and_spawn` starts workers for these backends only (see
     /// [`Self::only_backends`]).
@@ -2874,7 +3100,6 @@ impl WorkerPool {
             gpu_locks: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             last_measure_eviction: Mutex::new(None),
-            shm_ledger: crate::memory::MemoryLedger::default(),
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
             progress: None,
@@ -3028,11 +3253,11 @@ impl WorkerPool {
                 // claim-then-fail (collateral already bonded). `MEMORY_LIMIT` bounds the
                 // prove-phase execute CHILD's RSS exactly as on the measure worker;
                 // `GAS_TRACE_CHUNK_SLOTS=2` gives that execute (which `run_proof` runs before
-                // proving) the SAME ~4.4 GiB /dev/shm ring as the measure worker's `Execute`, so
-                // equal `MEMORY_LIMIT` leaves equal guest-IMAGE headroom (asymmetric rings would
-                // otherwise pass a mid-size guest at measure and SIGKILL it at prove).
-                // `TRACE_CHUNK_SLOTS=2` keeps the proving phase's own ring (~0.28 GiB slots) small
-                // inside a modest /dev/shm. A worker pinned to an explicit `-cuda` binary has
+                // proving) the SAME ~4.4 GiB ring as the measure worker's `Execute`, so equal
+                // `MEMORY_LIMIT` leaves equal guest-IMAGE headroom (asymmetric rings would otherwise
+                // pass a mid-size guest at measure and SIGKILL it at prove).
+                // `TRACE_CHUNK_SLOTS=2` keeps the proving phase's own ring (~0.28 GiB slots) and its
+                // shared memory small. A worker pinned to an explicit `-cuda` binary has
                 // `device_index=None` but still proves on device 0, so this cannot live inside the
                 // `device_index` pin block below. SP1-only (`drives_cuda_…`), so risc0 and other
                 // cuda backends are untouched. A claimed job was measured under this cap, so its
@@ -3100,8 +3325,9 @@ impl WorkerPool {
                         // One host-wide queue for every SP1 server's final wrap (hemilabs `sp1`
                         // from v6.8.1), in a directory that is the same for all of them. Its own
                         // default is chosen per process, and lives in `/dev/shm` where `/run/lock`
-                        // is not writable, which logind empties at logout. Ignored by older servers;
-                        // an operator's own setting, inherited from this process, wins.
+                        // is not writable, which logind empties at logout and which a confined
+                        // server cannot reach. Ignored by older servers; an operator's own setting,
+                        // inherited from this process, wins.
                         if std::env::var_os(SP1_QUEUE_DIR_ENV).is_none() {
                             if let Some(dir) = sp1_queue_dir() {
                                 env.insert(SP1_QUEUE_DIR_ENV.into(), dir.display().to_string());
@@ -3169,6 +3395,11 @@ impl WorkerPool {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
                 }
+                alchemist_level_zero_env(
+                    &mut env,
+                    backend,
+                    pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist),
+                );
                 // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
                 // Groth16 proving key cached on the GPU between proofs only on a card it knows has
                 // room (`release_groth16_cache_if_tight`).
@@ -3218,6 +3449,17 @@ impl WorkerPool {
         {
             if let Some(name) = crate::discovery::sp1_server_name(gpu_tag) {
                 env.insert(SP1_GPU_SERVER_NAME_ENV.into(), name.into());
+            }
+            // An Alchemist card's SP1 server keeps less freed device memory cached: see
+            // `ALCHEMIST_SP1_ALLOC_CACHE_MB`. An operator's own setting, inherited, wins.
+            if gpu_tag == "intel"
+                && std::env::var_os(SP1_ALLOC_CACHE_MB_ENV).is_none()
+                && pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist)
+            {
+                env.insert(
+                    SP1_ALLOC_CACHE_MB_ENV.into(),
+                    ALCHEMIST_SP1_ALLOC_CACHE_MB.to_string(),
+                );
             }
             env.insert(
                 "MEMORY_LIMIT".into(),
@@ -3469,6 +3711,7 @@ impl WorkerPool {
             match WorkerHandle::spawn(&backend, &path, &env) {
                 Ok(handle) => {
                     let worker_pid = handle.pid();
+                    let build = WorkerBuild::of(Some(&handle));
                     tracing::info!(
                         "Worker {key} ready{device_desc} (pid {worker_pid}, binary {})",
                         path.display(),
@@ -3489,6 +3732,7 @@ impl WorkerPool {
                                 last_failure: None,
                                 declined: None,
                                 last_spawn_error: None,
+                                decline_retry: DeclineRetry::default(),
                                 proofs_since_spawn: 0,
                                 last_use: None,
                             }),
@@ -3503,6 +3747,7 @@ impl WorkerPool {
                                 crate::memory::pid_starttime(worker_pid).unwrap_or(0),
                             )),
                             intentional_kill: Arc::new(AtomicBool::new(false)),
+                            build,
                         },
                     );
                     connected.push(key);
@@ -3515,12 +3760,7 @@ impl WorkerPool {
                     let declined = msg
                         .contains(zkminer_prover_protocol::types::WORKER_DECLINED)
                         .then(|| msg.clone());
-                    if declined.is_some() {
-                        tracing::error!(
-                            "Worker {key}{device_desc} DECLINED and will not be \
-                             advertised or respawned: {msg}"
-                        );
-                    } else {
+                    if declined.is_none() {
                         tracing::error!("Failed to start worker {key}{device_desc}: {msg}");
                     }
                     self.startup_problems.push(format!(
@@ -3532,30 +3772,36 @@ impl WorkerPool {
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
                     self.not_started.push((key.clone(), declined.is_some()));
+                    let mut slot = WorkerSlot {
+                        handle: None,
+                        path,
+                        backend,
+                        gpu_tag,
+                        device_index,
+                        pci_bus_id,
+                        gpu_name,
+                        spawn_env: env,
+                        consecutive_failures: 1,
+                        last_failure: Some(Instant::now()),
+                        declined: None,
+                        decline_retry: DeclineRetry::default(),
+                        last_spawn_error: Some(msg),
+                        proofs_since_spawn: 0,
+                        last_use: None,
+                    };
+                    if let Some(reason) = declined {
+                        Self::note_decline(&mut slot, &format!("{key}{device_desc}"), reason);
+                    }
                     self.workers.insert(
                         key,
                         WorkerEntry {
-                            slot: Mutex::new(WorkerSlot {
-                                handle: None,
-                                path,
-                                backend,
-                                gpu_tag,
-                                device_index,
-                                pci_bus_id,
-                                gpu_name,
-                                spawn_env: env,
-                                consecutive_failures: 1,
-                                last_failure: Some(Instant::now()),
-                                declined,
-                                last_spawn_error: Some(msg),
-                                proofs_since_spawn: 0,
-                                last_use: None,
-                            }),
+                            slot: Mutex::new(slot),
                             vram_bytes,
                             pci_bus_id: entry_bus_id,
                             pid: Arc::new(AtomicU32::new(0)),
                             pid_starttime: Arc::new(AtomicU64::new(0)),
                             intentional_kill: Arc::new(AtomicBool::new(false)),
+                            build: WorkerBuild::default(),
                         },
                     );
                 }
@@ -3570,15 +3816,10 @@ impl WorkerPool {
         // built to end. Routing risc0 `Execute` to this dedicated pool means the self-guard kills only a
         // THROWAWAY measure worker (respawned cheaply, no CUDA was ever initialised — `default_prover()`
         // is touched only by `Prove`, which a measure-only worker never receives), while the prove
-        // worker stays warm and keeps proving already-claimed jobs. No `/dev/shm` guard or `MEMORY_LIMIT`
-        // (those bound SP1's native executor); risc0's bound is its own RSS self-guard, set explicitly to
-        // the ledger charge below so enforcement == charge. openvm is NOT pooled here (its binary/guard
-        // are unverified); it keeps the in-process fallback in `execute_cycles`.
-        //
-        // Provisioned BEFORE the SP1 block on purpose (finding RH-round2/1): the SP1 block early-returns
-        // when /dev/shm is too small for SP1's native executor, and risc0 — which never touches
-        // /dev/shm — must NOT be collateral-skipped by that, or risc0 would silently fall back to the
-        // measure-kills-warm-prover in-process path on small-/dev/shm hosts.
+        // worker stays warm and keeps proving already-claimed jobs. No `MEMORY_LIMIT` (that bounds
+        // SP1's native executor); risc0's bound is its own RSS self-guard, set explicitly to the ledger
+        // charge below so enforcement == charge. openvm is NOT pooled here (its binary/guard are
+        // unverified); it keeps the in-process fallback in `execute_cycles`.
         if let Some(path) = risc0_measure_path {
             self.report_progress("Starting the risc0 cycle-measuring workers".to_string());
             let backend = zkminer_prover_protocol::BACKEND_RISC0.to_string();
@@ -3655,6 +3896,7 @@ impl WorkerPool {
                         last_failure,
                         declined: None,
                         last_spawn_error: None,
+                        decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -3663,6 +3905,7 @@ impl WorkerPool {
                     pid: Arc::new(AtomicU32::new(pid)),
                     pid_starttime: Arc::new(AtomicU64::new(starttime)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 });
             }
             self.measure_workers.insert(backend, pool);
@@ -3682,73 +3925,12 @@ impl WorkerPool {
         // host-RAM admission on the measure path (added separately) bounds the aggregate.
         if let Some(path) = sp1_measure_path {
             self.report_progress("Starting the sp1 cycle-measuring workers".to_string());
-            // Layer-B /dev/shm guard (locked #3). The SP1 native executor stages its trace ring and
-            // memory image in /dev/shm; a tmpfs too small to hold even the 2-slot (~4.4 GiB) ring
-            // an `Execute` uses makes every measure SIGBUS the instant it is touched — the 64 MiB
-            // Docker default being the usual culprit. On too-small /dev/shm, register an EMPTY
-            // measure pool (below) instead of spawning workers that only SIGBUS-loop: that blocks
-            // SP1 claiming cleanly while leaving the already-registered prove workers up for jobs
-            // that were claimed before this point. Gated to x86-64 Linux, where the native executor
-            // exists; the portable executor elsewhere runs in-process and never touches /dev/shm.
-            // An unreadable probe (`None`) does NOT disable SP1 — spawn and let a real failure
-            // speak.
-            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            let shm_ok = {
-                // ~4.4 GiB ring (GAS_TRACE_CHUNK_SLOTS=2 × ~2.2 GiB, the ring every SP1 `Execute`
-                // stages) plus a little image headroom. Below this the ring cannot even be created
-                // and the first execute SIGBUSes. A measure execute and a concurrent prove's
-                // execute phase (`run_proof` executes before it proves) each stage their own such
-                // ring in this SAME tmpfs, so the floor is TWO rings (~10 GiB with headroom), not
-                // one: sizing for one ring lets a measure and a prove coexist and overflow /dev/shm
-                // → SIGBUS. (This static floor does NOT cover a misconfigured container that gives
-                // a large `--memory` but a modest `--shm-size`, where the RAM ledger can admit
-                // several concurrent MEASURES the tmpfs still cannot back; a /dev/shm-sized execute
-                // semaphore is the complete fix and is tracked separately.) The per-ring figure is
-                // `GAS_TRACE_CHUNK_SLOTS=2 × ~2.2 GiB` (sp1 9a0de74,
-                // `DEFAULT_GAS_TRACE_CHUNK_SLOTS`), both workers pinned to 2 slots. The proving
-                // phase's own ring is smaller (`TRACE_CHUNK_SLOTS` × ~0.28 GiB) and follows the
-                // execute, so it adds nothing here.
-                // Floor below which /dev/shm is too small to stage even the executor's irreducible
-                // working set (anon floor + a 2-slot trace ring), so the H3 cap clamp would drive
-                // `MEMORY_LIMIT` below what any measure needs and every measure would fail. Above this,
-                // the clamp (`sp1_measure_cap_bytes`) keeps the image from overflowing the tmpfs, so a
-                // too-small-but-usable /dev/shm LOWERS the cap rather than SIGBUS-ing — it does not
-                // need to hold the full 24 GiB default.
-                const MIN_DEV_SHM_FOR_MEASURE: u64 = 10 * 1024 * 1024 * 1024;
-                match crate::memory::dev_shm_capacity_bytes() {
-                    Some(cap) if cap < MIN_DEV_SHM_FOR_MEASURE => {
-                        tracing::error!(
-                            "SP1 measuring DISABLED (claims blocked): /dev/shm is {} MiB, below the \
-                             {} MiB the SP1 native executor needs for its working set — mount a larger \
-                             /dev/shm to enable SP1 (the execute cap is clamped to roughly /dev/shm \
-                             size, so size it for the jobs you want to claim, e.g. `--shm-size=24g` \
-                             for the full 24 GiB default). Prove workers stay up for already-claimed \
-                             jobs; the miner continues for other backends.",
-                            cap / (1024 * 1024),
-                            MIN_DEV_SHM_FOR_MEASURE / (1024 * 1024),
-                        );
-                        false
-                    }
-                    _ => true,
-                }
-            };
-            #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-            let shm_ok = true;
-
+            // No `/dev/shm` floor: SP1's executor shares the guest's memory and trace ring with its
+            // runner through memfds, which are host RAM (charged to the host ledger and bounded by the
+            // measure worker's `MEMORY_LIMIT` below and its cgroup), so a small `/dev/shm`, such as a
+            // container's 64 MiB default, no longer stops SP1 from measuring. The worker's executor
+            // canary declines its slot if it cannot share memory at all.
             let backend = zkminer_prover_protocol::BACKEND_SP1.to_string();
-            if !shm_ok {
-                // Register an EMPTY measure pool, NOT nothing. `execute_cycles` and
-                // `has_idle_or_revivable_worker` treat a backend with NO `measure_workers` entry as
-                // "measure on the prove pool" (their `None` arm) — which for SP1 is exactly the
-                // server-teardown DoS the dedicated measure pool exists to prevent. `Some([])` instead
-                // makes `execute_cycles` bail ("no worker registered") and `has_idle_or_revivable_worker`
-                // return false, so SP1 measuring is genuinely off and no job is ever sized on a prove
-                // worker. The risc0 measure pool is provisioned ABOVE this block (it never touches
-                // /dev/shm), so this early return skips ONLY the SP1 spawn — risc0 is unaffected.
-                self.measure_workers.insert(backend, Vec::new());
-                return connected;
-            }
-
             let pool_size = std::env::var("ZKMINER_SP1_MEASURE_WORKERS")
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
@@ -3770,16 +3952,17 @@ impl WorkerPool {
                     zkminer_prover_protocol::types::SP1_MEASURE_ONLY_ENV.to_string(),
                     "1".to_string(),
                 );
-                // Layer-B ring cap (locked #3). Pin the native executor's /dev/shm trace ring to 2
-                // slots (~4.4 GiB) on the measure worker. An `Execute` stages the gas-estimation
-                // ring, sized by `GAS_TRACE_CHUNK_SLOTS` (slots of ~2.2 GiB; sp1 9a0de74
-                // `execute.rs`), not `TRACE_CHUNK_SLOTS`, which sizes only the proving phase's ring
-                // and is inert here (measured: at 1 and at 8 slots every Execute reported the
+                // Layer-B ring cap (locked #3). Pin the native executor's trace ring to 2 slots
+                // (~4.4 GiB of shared memory, which the host holds for every measurement) on the
+                // measure worker. An `Execute` stages the gas-estimation ring, sized by
+                // `GAS_TRACE_CHUNK_SLOTS` (slots of ~2.2 GiB; sp1 9a0de74 `execute.rs`, unchanged at
+                // the pinned d20bbb645), not `TRACE_CHUNK_SLOTS`, which sizes only the proving phase's
+                // ring and is inert here (measured: at 1 and at 8 slots every Execute reported the
                 // same). 2 is SP1's default; pinning it means an inherited value cannot grow the
-                // ring past the /dev/shm floor above, and it equals the prove workers' pin
-                // (`gpu_env`), so a guest measures in the ring its prove-phase execute will have.
-                // Applied last by `WorkerHandle::spawn` (overrides any inherited value) and carried
-                // in `spawn_env` across respawns. Inert on the portable executor.
+                // ring, and it equals the prove workers' pin (`gpu_env`), so a guest measures in the
+                // ring its prove-phase execute will have. Applied last by `WorkerHandle::spawn`
+                // (overrides any inherited value) and carried in `spawn_env` across respawns. Inert on
+                // the portable executor.
                 menv.insert("GAS_TRACE_CHUNK_SLOTS".to_string(), "2".to_string());
                 // Layer-A enforced cap (locked #1/#2). SP1 reads `MEMORY_LIMIT` (bytes) and SIGKILLs the
                 // guest at that RSS via a 100 ms monitor, surfacing an in-band `TooMuchMemory` — the
@@ -3821,6 +4004,7 @@ impl WorkerPool {
                         last_failure,
                         declined: None,
                         last_spawn_error: None,
+                        decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -3829,6 +4013,7 @@ impl WorkerPool {
                     pid: Arc::new(AtomicU32::new(pid)),
                     pid_starttime: Arc::new(AtomicU64::new(starttime)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 });
             }
             self.measure_workers.insert(backend, pool);
@@ -4252,6 +4437,25 @@ impl WorkerPool {
         None
     }
 
+    /// Every prove slot of `backend` that has not declined, with the build its worker named at its
+    /// last handshake (`(sdk_version, worker_version)`), or `None` while no worker of the slot has
+    /// completed one. Read without waiting on a slot: a slot that is proving still answers. A witness
+    /// bundle records the build of every worker that may prove it (plan §15.1).
+    pub fn worker_builds(&self, backend: &str) -> Vec<(String, Option<(String, String)>)> {
+        let mut v: Vec<_> = self
+            .keys_for_prefix(backend)
+            .into_iter()
+            .filter_map(|k| {
+                let e = self.workers.get(&k)?;
+                // A busy slot is proving, so it has not declined.
+                let declined = e.slot.try_lock().is_ok_and(|s| s.declined.is_some());
+                (!declined).then(|| (k, e.build.get()))
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
     fn worker_info_from_key(&self, key: &str) -> Option<WorkerInfo> {
         let entry = self.workers.get(key)?;
         // Use try_lock to avoid blocking the TUI render loop during proving.
@@ -4467,57 +4671,143 @@ impl WorkerPool {
     /// for SP1, installing the Groth16 circuit artifacts and, where its server supports it,
     /// building the stripped circuit. Takes a host-memory reservation for it, and kills the worker
     /// if it runs past `timeout`. Returns what was done.
+    ///
+    /// The setup is the host's, not a card's, so any of the backend's slots can run it. They are
+    /// tried in turn until one succeeds, and a slot whose worker declined is tried last. Trying only
+    /// the first slot let one card that cannot run the backend stop the backend on every card: an
+    /// RTX 4090 whose SP1 worker had no CUDA server beside it kept two AMD cards with working HIP
+    /// servers from proving SP1 at all.
+    ///
+    /// Then it warms each of the backend's other Intel cards, whose kernels are compiled per card
+    /// (see `ensure_warmed`), so none does it inside its first claimed proof; one that fails is
+    /// warmed before its first proof instead.
     pub fn warm_up(&self, backend: &str, timeout: Duration) -> Result<String> {
-        let mut keys = self.keys_for_prefix(backend);
-        keys.sort();
-        let key = keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no {backend} worker to warm up"))?;
-        let summary = self.warm_up_slot(key, timeout)?;
-        self.warmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(backend.to_string());
+        let keys = self.warm_up_order(backend);
+        if keys.is_empty() {
+            bail!("no {backend} worker to warm up");
+        }
+        let (key, summary) =
+            first_slot_that_succeeds(&keys, |key| self.warm_up_slot(key, timeout, None, false))?;
+        if keys.len() > 1 {
+            tracing::info!("{backend}'s one-time setup ran on {key}");
+        }
+        self.mark_warmed(&key);
+        for other in keys.iter().filter(|k| **k != key && is_intel_slot(k)) {
+            if self.slot_warmed(other) {
+                continue;
+            }
+            match self.warm_up_slot(other, timeout, None, true) {
+                Ok(done) => {
+                    self.mark_warmed(other);
+                    tracing::info!("{other} warmed up: {done}");
+                }
+                Err(e) => tracing::warn!(
+                    "{other}: its warm-up failed, so it warms up before its first proof instead: {e:#}"
+                ),
+            }
+        }
         Ok(summary)
+    }
+
+    /// `backend`'s slots in the order `warm_up` tries them: those whose worker has not declined
+    /// first, then the declined ones; each group in key order.
+    fn warm_up_order(&self, backend: &str) -> Vec<String> {
+        let mut keys = self.keys_for_prefix(backend);
+        keys.sort_by_cached_key(|k| (self.slot_declined(k), k.clone()));
+        keys
+    }
+
+    /// Whether `key`'s worker has declined. A slot that is busy (its lock is held) is not declined,
+    /// since a declined worker does no work, so `try_lock` is enough and never waits for a proof.
+    fn slot_declined(&self, key: &str) -> bool {
+        self.workers
+            .get(key)
+            .is_some_and(|e| e.slot.try_lock().is_ok_and(|s| s.declined.is_some()))
+    }
+
+    /// Whether `key` is ready for a proof: its backend warmed (see `backend_warmed`) and, on an Intel
+    /// card, the card itself (see `ensure_warmed`).
+    fn slot_warmed(&self, key: &str) -> bool {
+        let backend = key.split(':').next().unwrap_or(key);
+        self.backend_warmed(backend)
+            && (!is_intel_slot(key)
+                || self
+                    .warmed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(key))
+    }
+
+    /// Records a warm-up on `key`: its backend, and the card for an Intel one. Before, the startup
+    /// warm-up recorded only the backend, so an Intel card warmed up again inside its first claimed
+    /// proof on every start that ran no benchmark.
+    fn mark_warmed(&self, key: &str) {
+        let backend = key.split(':').next().unwrap_or(key);
+        let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+        warmed.insert(backend.to_string());
+        if is_intel_slot(key) {
+            warmed.insert(key.to_string());
+        }
     }
 
     /// Warms `key` up first if it needs it, for a path that would otherwise do the setup inside its
     /// own watchdog: SP1's backend (a benchmark proves Groth16 too), and each Intel card, whose SYCL
     /// kernels are compiled for the device on first use (about 8 minutes on an Arc B580, longer than
     /// a benchmark's whole budget) and cached on disk for every later process.
-    fn ensure_warmed(&self, key: &str) -> Result<()> {
-        let backend = key.split(':').next().unwrap_or(key);
-        let intel = key.split(':').nth(1) == Some("intel");
-        let backend_ready = self.backend_warmed(backend);
-        let slot_ready = !intel
-            || self
-                .warmed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(key);
-        if backend_ready && slot_ready {
+    ///
+    /// `abort_at` is a claimed proof's deadline: a warm-up inside one (an Intel card whose startup
+    /// warm-up failed or has not finished) stops where the proof could no longer start (see
+    /// `acquire_gpu_guard`), not at `WARMUP_TIMEOUT`, as does its wait for the card.
+    fn ensure_warmed(&self, key: &str, abort_at: Option<Instant>) -> Result<()> {
+        if self.slot_warmed(key) {
             return Ok(());
         }
-        let summary = self.warm_up_slot(key, WARMUP_TIMEOUT)?;
-        {
-            let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
-            warmed.insert(backend.to_string());
-            if intel {
-                warmed.insert(key.to_string());
+        let deadline = |detail: String| {
+            anyhow::Error::new(zkminer_prover_protocol::types::ProofDeadlineReached { detail })
+        };
+        let give_up_at = abort_at.map(|at| at.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(at));
+        let timeout = match give_up_at {
+            None => WARMUP_TIMEOUT,
+            Some(at) => match at.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => left.min(WARMUP_TIMEOUT),
+                _ => {
+                    return Err(deadline(format!(
+                        "{key} has not warmed up, and too little of the job's time is left for it"
+                    )))
+                }
+            },
+        };
+        let summary = match self.warm_up_slot(key, timeout, abort_at, true) {
+            Ok(summary) => summary,
+            Err(e) if give_up_at.is_some_and(|at| Instant::now() >= at) => {
+                return Err(deadline(format!(
+                    "{key}'s warm-up ran to the job's deadline: {e:#}"
+                )))
             }
-        }
+            Err(e) => return Err(e),
+        };
+        self.mark_warmed(key);
         tracing::info!("{key} warmed up: {summary}");
         Ok(())
     }
 
-    fn warm_up_slot(&self, key: &str, timeout: Duration) -> Result<String> {
+    /// Warms `key` up. `if_cold`: not if it was warmed while this waited for its card (the startup
+    /// warm-up, or another proof's); an explicit warm-up (`warm_up`) always runs.
+    fn warm_up_slot(
+        &self,
+        key: &str,
+        timeout: Duration,
+        abort_at: Option<Instant>,
+        if_cold: bool,
+    ) -> Result<String> {
         let backend = key.split(':').next().unwrap_or(key);
         // An Intel card's warm-up is a proof (see `ensure_warmed`), so it takes the card's guard like
         // any other work on it.
-        let gpu_lock = (key.split(':').nth(1) == Some("intel"))
-            .then(|| self.gpu_lock_for(key))
-            .flatten();
-        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, Some(timeout))?;
+        let gpu_lock = is_intel_slot(key).then(|| self.gpu_lock_for(key)).flatten();
+        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, Some(timeout))?;
+        if if_cold && self.slot_warmed(key) {
+            return Ok("already warmed up".to_string());
+        }
         let entry = self
             .workers
             .get(key)
@@ -4554,6 +4844,25 @@ impl WorkerPool {
         };
 
         self.ensure_alive(&mut slot, entry)?;
+        // A worker that has run a requester's guest has no network (it confines itself first; see
+        // `zkminer_witness_sandbox::confine`), and this warm-up may download: it would only refuse.
+        // That happens where the slot measured a job before its backend was warmed (a risc0 slot
+        // with no measure pool) or benchmarked first. Run it on a fresh worker, whose first command
+        // it is, under this same lock.
+        if slot.handle.as_ref().is_some_and(|h| h.may_lack_network()) {
+            tracing::info!(
+                "{key}: starting a fresh worker for the warm-up, which may download (a worker \
+                 that has run a guest has no network)"
+            );
+            let before = self.read_card(key).map(|c| c.available_to(key));
+            entry.clear_pid();
+            if let Some(h) = slot.handle.as_mut() {
+                h.shutdown();
+            }
+            Self::mark_slot_dead(&mut slot, entry);
+            self.await_own_vram_release(key, before, None);
+            self.ensure_alive(&mut slot, entry)?;
+        }
         if let Some(h) = slot.handle.as_ref() {
             entry.publish_pid(h.pid());
         }
@@ -4643,6 +4952,9 @@ impl WorkerPool {
         key: &str,
         on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
         on_warmed: &dyn Fn(),
+        // Called as each step completes (the warm-up, each program, each scoring proof): the
+        // benchmark's watchdog clock (see `WatchdogClock`).
+        progress: &dyn Fn(),
     ) -> BenchmarkRequests {
         use zkminer_prover_protocol::{
             benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BACKEND_SP1,
@@ -4651,7 +4963,9 @@ impl WorkerPool {
         let backend = handle.backend.clone();
         // The worker's one-off first-proof costs land here, not on the first program's row. A
         // warm-up that fails costs only that; the suite still runs.
-        match Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {}) {
+        let warmup = Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {});
+        progress();
+        match warmup {
             Err(e) => {
                 return BenchmarkRequests {
                     results: Err(e),
@@ -4665,6 +4979,7 @@ impl WorkerPool {
         let programs = benchmark_suite(&backend);
         let total = programs.len() as u32 + 1;
         let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
+            progress();
             on_done(row, index, total)
         }) {
             Err(e) => {
@@ -4693,7 +5008,9 @@ impl WorkerPool {
         let mut lost: Option<anyhow::Error> = None;
         let scored = measure_zkop_mix(|iterations| {
             let rows = vec![zkop_mix_spec(iterations)];
-            match Self::benchmark_request(handle, rows, &|_, _, _| {}) {
+            let answer = Self::benchmark_request(handle, rows, &|_, _, _| {});
+            progress();
+            match answer {
                 Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
                 Ok(Err(message)) => {
                     tracing::error!("{key}: {BENCH_ZKOP_MIX}: {message}");
@@ -4748,7 +5065,7 @@ impl WorkerPool {
 
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
-        self.ensure_warmed(key)?;
+        self.ensure_warmed(key, None)?;
 
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
@@ -4828,32 +5145,7 @@ impl WorkerPool {
                     ));
                 }
             };
-            // RH1 / Mode B: an SP1 benchmark runs the native executor and stages its image + trace ring
-            // in /dev/shm exactly as a measure or a prove does, so it must take the SAME aggregate shm
-            // reservation (held for the whole benchmark) — otherwise its staging is invisible to the
-            // shm_ledger and could sum images past the shared tmpfs with a concurrent measure/prove and
-            // SIGBUS. Inert off x86-64-Linux and for non-SP1 slots (no native executor staged there).
-            let shm = if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 {
-                match self.reserve_sp1_shm() {
-                    Some(r) => Some(r),
-                    None => {
-                        return Err(anyhow::Error::new(
-                            zkminer_prover_protocol::types::HostMemoryShortage {
-                                attempted: false,
-                                slot_key: key.to_string(),
-                                needed: crate::memory::sp1_measure_cap_bytes(
-                                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                                ),
-                                reserved: self.shm_ledger.reserved_bytes(),
-                                available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                            },
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            (host, shm)
+            host
         };
 
         // W7-M10: a benchmark prices the Mac at its idle tier.
@@ -4874,18 +5166,21 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        // Start benchmark timeout watchdog if configured.
+        // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
+        let clock = WatchdogClock::new();
         let _watchdog = self.benchmark_timeout_for(key).map(|t| {
-            ProvingWatchdog::new(
+            ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
                 t,
                 key.to_string(),
                 entry.intentional_kill.clone(),
+                clock.clone(),
             )
         });
 
-        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {});
+        let requests =
+            Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {}, &|| clock.touch());
         slot.note_used(UseKind::Other);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
@@ -5162,6 +5457,7 @@ impl WorkerPool {
                     }
                     if let Some(h) = slot.handle.as_ref() {
                         entry.publish_pid(h.pid());
+                        entry.build.note(h);
                     }
                 }
             }
@@ -5177,7 +5473,7 @@ impl WorkerPool {
         on_progress: &dyn Fn(BenchmarkProgressEvent),
     ) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
-        self.ensure_warmed(key)?;
+        self.ensure_warmed(key, None)?;
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
         // the SAME physical card, each side's VRAM invisible to the other — the double-booking the
@@ -5262,32 +5558,7 @@ impl WorkerPool {
                     ));
                 }
             };
-            // RH1 / Mode B: an SP1 benchmark runs the native executor and stages its image + trace ring
-            // in /dev/shm exactly as a measure or a prove does, so it must take the SAME aggregate shm
-            // reservation (held for the whole benchmark) — otherwise its staging is invisible to the
-            // shm_ledger and could sum images past the shared tmpfs with a concurrent measure/prove and
-            // SIGBUS. Inert off x86-64-Linux and for non-SP1 slots (no native executor staged there).
-            let shm = if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 {
-                match self.reserve_sp1_shm() {
-                    Some(r) => Some(r),
-                    None => {
-                        return Err(anyhow::Error::new(
-                            zkminer_prover_protocol::types::HostMemoryShortage {
-                                attempted: false,
-                                slot_key: key.to_string(),
-                                needed: crate::memory::sp1_measure_cap_bytes(
-                                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                                ),
-                                reserved: self.shm_ledger.reserved_bytes(),
-                                available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                            },
-                        ));
-                    }
-                }
-            } else {
-                None
-            };
-            (host, shm)
+            host
         };
 
         // W7-M10: a benchmark prices the Mac at its idle tier.
@@ -5308,14 +5579,16 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        // Start benchmark timeout watchdog if configured.
+        // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
+        let clock = WatchdogClock::new();
         let _watchdog = self.benchmark_timeout_for(key).map(|t| {
-            ProvingWatchdog::new(
+            ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
                 t,
                 key.to_string(),
                 entry.intentional_kill.clone(),
+                clock.clone(),
             )
         });
 
@@ -5337,7 +5610,7 @@ impl WorkerPool {
         };
         let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
-        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed);
+        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed, &|| clock.touch());
         slot.note_used(UseKind::Other);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
@@ -5632,6 +5905,7 @@ impl WorkerPool {
                     }
                     if let Some(h) = slot.handle.as_ref() {
                         entry.publish_pid(h.pid());
+                        entry.build.note(h);
                     }
                 }
             }
@@ -5672,7 +5946,7 @@ impl WorkerPool {
             None,
             None,
             None, // program_id: convenience path (tests/benchmark) has no on-chain binding
-            None, // preferred_device: convenience path does not reserve a card
+            JobCards::default(), // any card: the convenience path does not plan one
             0,    // execute_peak_bytes: convenience path has no pre-claim measurement
         )
     }
@@ -5882,36 +6156,8 @@ impl WorkerPool {
         // sp1-gpu-server. On shortage, refuse now (nothing ran); the caller (`measure_cycles`) treats a
         // HostMemoryShortage as transient — no strike, no breaker. risc0 measures on its prove worker,
         // whose proofs the ledger already tracks, so it is exempt. Held across the Execute below.
-        // /dev/shm aggregate gate for the SP1 native executor (finding RH1, balloon Mode B). Acquired
-        // FIRST — before the host-RAM reservation below, which for a measure may evict a warm idle
-        // server via `make_measure_room` — so a /dev/shm shortage refuses CHEAPLY, without wasting a
-        // teardown and its cooldown on a measurement that could not stage anyway (finding RH-round2/6).
-        // Held across the Execute so this measure's image staging cannot sum past the shared tmpfs with
-        // a concurrent staging (another measure, or a prove's execute phase, which also takes an
-        // `shm_ledger` reservation) and SIGBUS. Only SP1 stages in /dev/shm; risc0/openvm executes are
-        // in-process. Inert off x86-64-Linux and on an unreadable tmpfs (both reserve 0 ⇒ always
-        // granted). A refusal is the SAME typed transient as a host-RAM shortage: not struck.
-        let _measure_shm = if backend == zkminer_prover_protocol::BACKEND_SP1 {
-            match self.reserve_sp1_shm() {
-                Some(r) => Some(r),
-                None => {
-                    return Err(anyhow::Error::new(
-                        zkminer_prover_protocol::types::HostMemoryShortage {
-                            attempted: false,
-                            slot_key: key.to_string(),
-                            needed: crate::memory::sp1_measure_cap_bytes(
-                                crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                            ),
-                            reserved: self.shm_ledger.reserved_bytes(),
-                            available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                        },
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
+        // (SP1's executor shares the guest's memory with its runner through memfds, which are host
+        // RAM, charged here; `/dev/shm` is no longer involved and is not budgeted.)
         let _measure_mem = if self.measure_workers.contains_key(backend) {
             let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
             // Charge the measurement's worst-case host RSS, PER BACKEND (charge == the enforced ceiling
@@ -5992,12 +6238,12 @@ impl WorkerPool {
 
         // Register this measurement as PREEMPTIBLE for exactly the duration of the Execute below. A
         // committed (claimed) proof that cannot otherwise fit may kill this throwaway worker to
-        // reclaim the host RAM / `/dev/shm` it holds (finding RH-round3 residual A): a measurement is
+        // reclaim the host RAM it holds (finding RH-round3 residual A): a measurement is
         // speculative work with no collateral, a claimed proof is bonded and on a deadline, so on the
         // marginal box where the two cannot co-fit the proof wins. `preempt` is read in the recv-fail
         // handler below so the kill is reported as a TYPED transient (`MeasurePreempted`) — never
-        // misread as a wall-clock timeout or a slot crash. The charges recorded here are the ACTUAL
-        // bytes each ledger reservation holds, so the preemptor's victim selection frees the right
+        // misread as a wall-clock timeout or a slot crash. The charge recorded here is the ACTUAL
+        // bytes the ledger reservation holds, so the preemptor's victim selection frees the right
         // amount; the guard removes the registration on return (success/error/panic), bounding the
         // preemptible window to the recv so a just-finished measurement is (almost) never targeted.
         let preempt = Arc::new(AtomicBool::new(false));
@@ -6010,7 +6256,6 @@ impl WorkerPool {
                 generation: INFLIGHT_MEASURE_GENERATION.fetch_add(1, Ordering::Relaxed),
                 preempt: preempt.clone(),
                 host_bytes: _measure_mem.as_ref().map(|r| r.bytes()).unwrap_or(0),
-                shm_bytes: _measure_shm.as_ref().map(|r| r.bytes()).unwrap_or(0),
             };
             self.inflight_measures
                 .lock()
@@ -6060,7 +6305,15 @@ impl WorkerPool {
             // `handle.is_none()`, so a dead-but-Some handle would be re-selected every dispatch and
             // never respawned — wedging the backend's measuring until process restart. Clear the slot
             // so the next dispatch revives it either way. (A bare `?` here previously leaked the dead
-            // handle.)
+            // handle.) Unless it exited declined: then nothing revives it.
+            if slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+                Self::decline_slot(&mut slot, entry, key);
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerDeclined {
+                        slot_key: key.to_string(),
+                    },
+                ));
+            }
             Self::mark_slot_dead(&mut slot, entry);
             // DISTINGUISH the cause, exactly as the recv-failure handler and the recv-Ok arm do: a
             // COMMITTED proof can preempt this measurement in the narrow window between registering it
@@ -6111,7 +6364,7 @@ impl WorkerPool {
             Err(e) => {
                 if preempt.load(Ordering::Acquire) {
                     // A committed (claimed) proof reclaimed this measurement's resources by killing
-                    // its worker (`preempt_measures_for_host` / `preempt_measures_for_shm`). Checked
+                    // its worker (`preempt_measures_for_host`). Checked
                     // FIRST, before the wall-clock-timeout branch: the preemptor's kill and a
                     // watchdog timeout can race, and this is neither a timeout nor a crash — the
                     // measurement was healthy and simply yielded to a bonded job. `mark_slot_dead`
@@ -6146,6 +6399,22 @@ impl WorkerPool {
                         },
                     ));
                 } else {
+                    // A worker that exited declined found, before it ran this guest, that it cannot
+                    // run here: its slot is declined, and the (program, input) is not at fault.
+                    #[cfg(unix)]
+                    if e.downcast_ref::<WorkerDied>().is_some() {
+                        if let Some(h) = slot.handle.as_mut() {
+                            h.await_exit_visible(Duration::from_secs(1));
+                        }
+                    }
+                    if slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+                        Self::decline_slot(&mut slot, entry, key);
+                        return Err(anyhow::Error::new(
+                            zkminer_prover_protocol::types::WorkerDeclined {
+                                slot_key: key.to_string(),
+                            },
+                        ));
+                    }
                     // A raw EOF here is a non-intentional crash. Treated as a slot failure (counts
                     // toward respawn backoff / retire), identical to HEAD.
                     //
@@ -6178,6 +6447,7 @@ impl WorkerPool {
                 keccak_cycles,
                 ..
             } => {
+                Self::note_guest_ran(&mut slot, key);
                 tracing::debug!(
                     "cycle measurement on {key}: {cycles} cycles in {duration_secs:.2}s, \
                      {journal_len} journal bytes, peak host {} MiB",
@@ -6226,8 +6496,8 @@ impl WorkerPool {
     ///
     /// Runs on the same slots as [`Self::execute_cycles`] and is bounded by `timeout` the same way (a
     /// watchdog SIGKILL comes back as the typed `MeasureWallClockTimeout`). On a dedicated measure
-    /// worker it is charged to the host-RAM ledger as a measurement of the backend is, but it takes no
-    /// `/dev/shm` reservation, as an SP1 `Execute` does. When the backend has NO measure
+    /// worker it is charged to the host-RAM ledger as a measurement of the backend is. When the
+    /// backend has NO measure
     /// pool and the request falls back to a prove worker, nothing is charged at all, and a watchdog
     /// kill would group-kill that prove worker (an SP1 one with its `sp1-gpu-server`): a miner must not
     /// call it then. Not registered as preemptible: only a process that proves nothing calls it
@@ -6424,16 +6694,112 @@ impl WorkerPool {
         job_po2: Option<SlotPo2<'_>>,
         // The job's on-chain programId (risc0 image-id binding; see WorkerCommand::Prove).
         program_id: Option<[u8; 32]>,
-        // Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time.
-        // Tried FIRST when dispatchable, as a PREFERENCE only: if it is not in the candidate set or is
-        // busy/down, dispatch falls through to the usual warm-first / first-free ordering, so a job is
-        // never stranded waiting for a reserved card. Feasibility is sized for the SLOWEST eligible
-        // card, so any fallback landing still meets the deadline.
-        preferred_device: Option<&str>,
+        // The cards this job may run on, and the order to try them in: see `JobCards`. The default (no
+        // cards named) leaves every card eligible, in the usual warm-first order.
+        cards: JobCards<'_>,
         // This job's pre-claim measured execute PEAK host RSS (bytes), 0 = unknown. Forwarded verbatim
         // to `prove_on_slot`, which charges the SP1 execute spike to the host ledger (finding RH2).
         execute_peak_bytes: u64,
     ) -> Result<ProofOutput> {
+        match self.dispatch_proof(
+            backend,
+            elf,
+            ProveInput::Inline(input_data),
+            po2,
+            timeout,
+            on_progress,
+            min_vram_bytes,
+            exclude,
+            disabled,
+            used_slot,
+            abort_at,
+            job_po2,
+            program_id,
+            cards,
+            execute_peak_bytes,
+        )? {
+            SlotProof::Proved(proof) => Ok(proof),
+            // Only a witness proof can diverge; a worker that says so of an inline one is confused.
+            SlotProof::JournalDiverged(d) => {
+                bail!(
+                    "{} answered an inline proof with JournalDiverged",
+                    d.slot_key
+                )
+            }
+        }
+    }
+
+    /// [`prove_min_vram`](Self::prove_min_vram) for a witness-construction job (plan §15.3): the
+    /// worker reads `prefix ‖ W` from `witness.input_path` itself (refusing it on a length or hash
+    /// mismatch: `ErrorKind::InputMismatch`, see `WorkerProofError::is_input_mismatch`), executes it
+    /// once with its segments under `witness.segment_dir`, and proves that execution only if its
+    /// journal hashes to `witness.expect_journal_sha256`. A run that does not reproduce the bundle is
+    /// `Ok(WitnessProveOutcome::JournalDiverged)`, never an error and never retried here. Every other
+    /// parameter, and every other outcome, is `prove_min_vram`'s. risc0 only: other workers refuse it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_witness_min_vram(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        witness: &zkminer_prover_protocol::WitnessProve,
+        po2: Option<u8>,
+        timeout: Option<Duration>,
+        on_progress: Option<ProveProgress>,
+        min_vram_bytes: Option<u64>,
+        exclude: &[String],
+        disabled: &[String],
+        used_slot: &mut Option<String>,
+        abort_at: Option<Instant>,
+        job_po2: Option<SlotPo2<'_>>,
+        program_id: Option<[u8; 32]>,
+        cards: JobCards<'_>,
+        execute_peak_bytes: u64,
+    ) -> Result<WitnessProveOutcome> {
+        Ok(
+            match self.dispatch_proof(
+                backend,
+                elf,
+                ProveInput::Witness(witness),
+                po2,
+                timeout,
+                on_progress,
+                min_vram_bytes,
+                exclude,
+                disabled,
+                used_slot,
+                abort_at,
+                job_po2,
+                program_id,
+                cards,
+                execute_peak_bytes,
+            )? {
+                SlotProof::Proved(proof) => WitnessProveOutcome::Proved(proof),
+                SlotProof::JournalDiverged(d) => WitnessProveOutcome::JournalDiverged(d),
+            },
+        )
+    }
+
+    /// The dispatch behind [`prove_min_vram`](Self::prove_min_vram) and
+    /// [`prove_witness_min_vram`](Self::prove_witness_min_vram).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_proof(
+        &self,
+        backend: &str,
+        elf: &[u8],
+        input: ProveInput<'_>,
+        po2: Option<u8>,
+        timeout: Option<Duration>,
+        on_progress: Option<ProveProgress>,
+        min_vram_bytes: Option<u64>,
+        exclude: &[String],
+        disabled: &[String],
+        used_slot: &mut Option<String>,
+        abort_at: Option<Instant>,
+        job_po2: Option<SlotPo2<'_>>,
+        program_id: Option<[u8; 32]>,
+        cards: JobCards<'_>,
+        execute_peak_bytes: u64,
+    ) -> Result<SlotProof> {
         let mut all_keys = self.keys_for_prefix(backend);
         if all_keys.is_empty() {
             bail!("No worker registered for backend '{backend}'");
@@ -6455,6 +6821,17 @@ impl WorkerPool {
                 bail!(
                     "no {backend} card proves at a segment size this job was measured at, so it \
                      cannot be proved here"
+                );
+            }
+        }
+        // The third: only the cards the claim gate admitted this job on. See `JobCards::eligible`.
+        if !cards.eligible.is_empty() {
+            all_keys.retain(|k| cards.eligible.contains(&Self::benchmark_device_id(k)));
+            if all_keys.is_empty() {
+                bail!(
+                    "none of the cards this job was admitted on ({}) has a usable {backend} worker, \
+                     and no other card can prove it in time",
+                    cards.eligible.join(", ")
                 );
             }
         }
@@ -6530,7 +6907,7 @@ impl WorkerPool {
             return self.prove_on_slot(
                 &keys[0],
                 elf,
-                input_data,
+                input,
                 po2,
                 timeout,
                 on_progress,
@@ -6572,11 +6949,11 @@ impl WorkerPool {
             rotated
         };
 
-        // Honor a claim-time device preference (see `preferred_device`): move its slot key, if present
-        // in the candidate set, to the FRONT so the dispatch loop (and the poll-wait loop, which
-        // reuses this ordering) tries it first. Pure preference — everything else keeps its warm-first
-        // order, and a preferred card that is busy/down simply yields to the next candidate.
-        let keys = Self::prefer_device_first(keys, preferred_device);
+        // Honor the claim-time order (see `JobCards::order`): its cards first, in its order, so the
+        // dispatch loop (and the poll-wait loop, which reuses this ordering) tries the planned card,
+        // then the fastest free one. Pure preference — everything else keeps its warm-first order,
+        // and a card that is busy/down simply yields to the next candidate.
+        let keys = Self::order_by_cards(keys, cards.order);
 
         for key in &keys {
             if let Some(entry) = self.workers.get(key) {
@@ -6604,7 +6981,7 @@ impl WorkerPool {
                         return self.prove_on_slot(
                             key,
                             elf,
-                            input_data,
+                            input,
                             po2,
                             timeout,
                             on_progress,
@@ -6664,7 +7041,7 @@ impl WorkerPool {
                         return self.prove_on_slot(
                             key,
                             elf,
-                            input_data,
+                            input,
                             po2,
                             timeout,
                             on_progress,
@@ -6702,27 +7079,26 @@ impl WorkerPool {
         }
     }
 
-    /// Reorder slot keys so the key whose benchmark device id equals `preferred` (e.g. "gpu1") comes
-    /// FIRST, preserving the relative order of the rest. A PREFERENCE only: a `preferred` that is
-    /// `None` or matches no key leaves the order unchanged, and a matched-but-busy/down card simply
-    /// yields to the next candidate in the dispatch/poll loops — a job is never stranded on it.
+    /// Reorder slot keys so those whose benchmark device id is in `order` come first, in `order`'s order,
+    /// keeping the relative order of the rest (the caller's warm-first rotation). A PREFERENCE only: an
+    /// empty `order`, or one naming no key, leaves the order unchanged, and a busy/down card simply
+    /// yields to the next candidate in the dispatch/poll loops, so a job is never stranded on it.
     ///
-    /// Note: this takes precedence over the warm-slot-first ordering applied by the caller, so a COLD
-    /// preferred card is tried ahead of a warm one. Under host-memory pressure that cold card may take
-    /// a host-RAM backoff (resident pages make a warm slot cheaper to admit) before its proof starts;
-    /// the caller'"'"'s retry loop handles that. The admission estimate is sized for the slowest eligible
-    /// card regardless, so preferring any particular card never risks the deadline.
-    fn prefer_device_first(keys: Vec<String>, preferred: Option<&str>) -> Vec<String> {
-        match preferred {
-            Some(pref) => {
-                let (mut preferred, rest): (Vec<String>, Vec<String>) = keys
-                    .into_iter()
-                    .partition(|k| Self::benchmark_device_id(k) == pref);
-                preferred.extend(rest);
-                preferred
-            }
-            None => keys,
+    /// This takes precedence over the warm-slot-first ordering, so a COLD planned card is tried ahead
+    /// of a warm one. Under host-memory pressure that cold card may take a host-RAM backoff before its
+    /// proof starts; the caller's retry loop then takes that card out of the order, so the job's other
+    /// cards are tried first and it follows them (it stays eligible). Every card in the order was
+    /// admitted on its own rate, so trying any of them first never risks the deadline.
+    fn order_by_cards(mut keys: Vec<String>, order: &[String]) -> Vec<String> {
+        if order.is_empty() {
+            return keys;
         }
+        let rank = |k: &String| {
+            let id = Self::benchmark_device_id(k);
+            order.iter().position(|d| *d == id).unwrap_or(order.len())
+        };
+        keys.sort_by_key(|k| rank(k));
+        keys
     }
 
     /// Benchmark-facing device id for a slot key: `"risc0:cuda:1"` -> `"gpu1"`,
@@ -6732,7 +7108,7 @@ impl WorkerPool {
     /// `benchmark::build_gpu_device_benchmarks_from_workers` (`format!("gpu{idx}")`)
     /// and the CPU rows (`"cpu"`), otherwise a card's calibration row and Settings size silently miss
     /// and its risc0 job size quietly falls back to the VRAM rule (`benchmark::risc0_job_po2`).
-    fn benchmark_device_id(key: &str) -> String {
+    pub fn benchmark_device_id(key: &str) -> String {
         let mut parts = key.split(':');
         let _backend = parts.next();
         match (parts.next(), parts.next()) {
@@ -6914,7 +7290,10 @@ impl WorkerPool {
             return None;
         }
         let backend = slot_key.split(':').next().unwrap_or(slot_key);
-        crate::memory::anon_memory_of_pid(pid, Some(&crate::memory::cap_unit_name(backend, pid)))
+        crate::memory::anon_memory_of_pid(
+            pid,
+            Some(&crate::memory::worker_cgroup_leaf(backend, pid)),
+        )
     }
 
     #[cfg(not(unix))]
@@ -6927,75 +7306,18 @@ impl WorkerPool {
         self.memory_ledger.reserved_bytes()
     }
 
-    /// Reserve the `/dev/shm` an SP1 native-executor staging needs, or `None` if the tmpfs cannot back
-    /// it alongside what is already staging (finding RH1, balloon Mode B). The per-execute charge is
-    /// the enforced execute cap (`sp1_measure_cap_bytes` = what one image can stage), reserved against
-    /// a capacity of `dev_shm − poll_margin`, so the `shm_ledger` admits exactly as many concurrent SP1
-    /// native executes as the tmpfs can physically hold — closing the aggregate-SIGBUS the per-execute
-    /// x86_64 clamp leaves open. Held across the execute/prove by the caller and released on drop.
-    ///
-    /// Gating is x86-64-Linux ONLY: that is the sole target that compiles SP1's native executor and
-    /// therefore stages in `/dev/shm`. Elsewhere the portable in-process executor runs (no `/dev/shm`),
-    /// and an unreadable tmpfs fails OPEN — both reserve 0 bytes against an unbounded capacity, which
-    /// `try_reserve` always grants, so the gate is inert exactly where there is nothing to bound.
-    /// Matches the x86_64 gating of `sp1_measure_cap_bytes`'s own `/dev/shm` clamp and the measure
-    /// pool's sufficiency guard.
-    fn reserve_sp1_shm(&self) -> Option<crate::memory::MemoryReservation<'_>> {
-        let (want, capacity) = if cfg!(target_arch = "x86_64") {
-            match crate::memory::dev_shm_capacity_bytes() {
-                Some(shm) => {
-                    let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
-                    (
-                        crate::memory::sp1_measure_cap_bytes(total),
-                        shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES),
-                    )
-                }
-                // Unreadable tmpfs: fail OPEN, exactly as `reserve_host_memory` does for an unreadable
-                // `/proc/meminfo`. The measure pool's own sufficiency guard still refused to stand up
-                // on a too-small `/dev/shm`, and the per-execute clamp still bounds a single image.
-                None => (0, u64::MAX),
-            }
-        } else {
-            // Portable in-process executor: nothing stages in `/dev/shm`, so there is nothing to bound.
-            (0, u64::MAX)
-        };
-        // 0 bytes against `u64::MAX` is always granted (`can_admit(0, ..)` holds), so the inert paths
-        // return a live-but-empty reservation rather than a spurious `None`. `resident`/`reserve` are 0
-        // and `available == total == capacity`: pure ledger-bounded concurrency, independent of live
-        // tmpfs occupancy. Our own files stay out of the way because a kill of ours unlinks them
-        // (`unlink_group_sp1_shm`), and the worker's startup sweep takes those of a death we did not
-        // cause, such as the kernel's OOM killer, after its 30 s age floor.
-        self.shm_ledger.try_reserve(want, 0, capacity, capacity, 0)
-    }
-
-    /// How many SP1 proofs this host can stage at once: the smaller of what `/dev/shm` holds of the
-    /// images `reserve_sp1_shm` charges (x86-64) and what host RAM holds of SP1's expected peak,
-    /// counting the reserve. `None` when neither can be read. Claim admission keeps the SP1 jobs
+    /// How many SP1 proofs this host can stage at once: what host RAM holds of SP1's expected peak,
+    /// counting the reserve. `None` when it cannot be read. Claim admission keeps the SP1 jobs
     /// waiting for a card to this many (plus one queued), so claimed jobs do not sit in the
-    /// memory-wait loop holding collateral and a concurrency slot: on a 92 GB host with a 46 GiB
-    /// `/dev/shm` it is 1, and SP1 jobs claimed beyond it waited a median 41 s.
+    /// memory-wait loop holding collateral and a concurrency slot. (SP1's executor shares its
+    /// memory through memfds, which are host RAM: the size of `/dev/shm` no longer bounds it.)
     pub fn sp1_concurrent_capacity(&self) -> Option<usize> {
-        let total = crate::memory::mem_total_bytes();
-        let shm = if cfg!(target_arch = "x86_64") {
-            crate::memory::dev_shm_capacity_bytes().map(|shm| {
-                staging_capacity(
-                    shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES),
-                    crate::memory::sp1_measure_cap_bytes(total.unwrap_or(u64::MAX)),
-                )
-            })
-        } else {
-            None
-        };
-        let host = total.map(|t| {
+        crate::memory::mem_total_bytes().map(|t| {
             staging_capacity(
                 t.saturating_sub(crate::memory::DEFAULT_HOST_RESERVE_BYTES),
                 self.expected_host_peak(zkminer_prover_protocol::BACKEND_SP1),
             )
-        });
-        match (shm, host) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        })
     }
 
     /// The host memory `key`'s next proof is charged: its backend's expected peak at the proof's
@@ -7024,11 +7346,10 @@ impl WorkerPool {
     /// anything; `None` whenever its admission might still succeed.
     ///
     /// Certain means: what is already reserved, less what a committed proof may preempt (pre-claim
-    /// measurements' charges), plus this proof, exceeds the whole host (`can_admit`'s committed term)
-    /// or, for SP1, the `/dev/shm` the staging ledger allows (`reserve_sp1_shm`). Recycling an idle
-    /// worker changes neither figure, so nothing `make_host_room` or the VRAM budget could do would
-    /// help: only another proof finishing will. The live term (`MemAvailable`) is left out on
-    /// purpose, since recycling can fix it.
+    /// measurements' charges), plus this proof, exceeds the whole host (`can_admit`'s committed
+    /// term). Recycling an idle worker does not change that figure, so nothing `make_host_room` or
+    /// the VRAM budget could do would help: only another proof finishing will. The live term
+    /// (`MemAvailable`) is left out on purpose, since recycling can fix it.
     fn host_side_refusal(
         &self,
         key: &str,
@@ -7054,17 +7375,6 @@ impl WorkerPool {
             })
         };
         let total = crate::memory::mem_total_bytes();
-        let backend = key.split(':').next().unwrap_or(key);
-        if backend == zkminer_prover_protocol::BACKEND_SP1 && cfg!(target_arch = "x86_64") {
-            if let Some(shm) = crate::memory::dev_shm_capacity_bytes() {
-                let need = crate::memory::sp1_measure_cap_bytes(total.unwrap_or(u64::MAX));
-                let capacity = shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES);
-                let held = self.shm_ledger.reserved_bytes();
-                if beyond_committed_room(held, preemptable(|m| m.shm_bytes), need, 0, capacity) {
-                    return refusal(need, held, shm);
-                }
-            }
-        }
         let held = self.reserved_host_memory();
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         if beyond_committed_room(held, preemptable(|m| m.host_bytes), want, reserve, total?) {
@@ -7258,79 +7568,6 @@ impl WorkerPool {
             wait_for_reclaim(key, reclaim_wait_budget(abort_at));
         }
         self.reserve_host_memory(want, key)
-    }
-
-    /// Preempt in-flight measurements to free the `/dev/shm` a COMMITTED SP1 proof on `key` needs to
-    /// stage its execute phase, then reserve it. The `/dev/shm` arm of the residual-A fix. Only an SP1
-    /// native-executor measurement reserves `shm_ledger`, so those are the only victims; inert off
-    /// x86-64-Linux / unreadable tmpfs (`reserve_sp1_shm` reserves 0 there, so the caller never
-    /// refuses and never reaches here).
-    ///
-    /// `None` when preempting every shm-holding measurement still would not admit the staging — then
-    /// another SP1 PROVE's staging holds the tmpfs. On a single-`/dev/shm` box the two serialize, and a
-    /// bonded prove is never preempted; size `/dev/shm` for N_gpu to run them concurrently. The caller
-    /// refuses with the typed shortage, as before.
-    ///
-    /// An SP1 measurement holds BOTH ledgers, so when we actually kill one to free `/dev/shm` we also
-    /// wait HERE for its host RAM to be reclaimed before returning. The host-RAM arm in `prove_on_slot`
-    /// runs immediately after this one; by then our victim is deregistered, so that arm's snapshot is
-    /// empty and it can neither preempt nor wait. Without this wait the committed proof would refuse
-    /// host RAM even though this kill just freed exactly what it needs (finding RH-round4, the
-    /// cross-arm reclaim gap). `key` is the proof's slot, used only as the reclaim-wait log label.
-    fn preempt_measures_for_shm(
-        &self,
-        key: &str,
-        abort_at: Option<Instant>,
-    ) -> Option<crate::memory::MemoryReservation<'_>> {
-        if self.closing.load(Ordering::Acquire) {
-            return None;
-        }
-        if abort_at
-            .is_some_and(|a| too_late_to_make_room(a.saturating_duration_since(Instant::now())))
-        {
-            return None;
-        }
-        let mut victims: Vec<(String, InflightMeasure)> = self
-            .inflight_measures_snapshot()
-            .into_iter()
-            .filter(|(_, m)| m.shm_bytes > 0)
-            .collect();
-        if victims.is_empty() {
-            // Nothing of ours holds `/dev/shm` — the blocker is a bonded prove's staging. Retry once
-            // in case room appeared, else None.
-            return self.reserve_sp1_shm();
-        }
-        victims.sort_by_key(|(_, m)| std::cmp::Reverse(m.shm_bytes));
-        // Kill the largest first and re-test after each, so the minimal set is preempted. Unlike host
-        // RAM there is nothing to wait on after the charge: `preempt_one_measure` unlinks what the
-        // measurement staged, so its pages go when it does. So poll the real `reserve_sp1_shm`.
-        for (k, m) in &victims {
-            let killed = self.preempt_one_measure(k, m);
-            // Same start-floor-respecting bound as the host arm (see `reclaim_wait_budget`): a full
-            // poll must not run past `abort_at - MIN_ABORT_START_BUDGET`.
-            let deadline = Instant::now() + reclaim_wait_budget(abort_at);
-            loop {
-                if let Some(r) = self.reserve_sp1_shm() {
-                    // Got the staging. If we actually KILLED a victim that also held host RAM, its
-                    // host ledger charge has already dropped (it unwinds before the shm charge), but
-                    // the kernel has not returned its anon pages yet — wait for that here so the
-                    // host-RAM arm can admit the proof (see the fn doc). Gated on `killed` so a shm
-                    // reservation that merely became free on its own does not block the full budget.
-                    if killed && m.host_bytes > 0 {
-                        // Start-floor-respecting bound again: this recomputes from `now`, so the poll
-                        // above plus this host wait together still stop at `abort_at -
-                        // MIN_ABORT_START_BUDGET` and never eat the proof's start budget.
-                        wait_for_reclaim(key, reclaim_wait_budget(abort_at));
-                    }
-                    return Some(r);
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-        None
     }
 
     /// Has the operator switched off every device this backend could run on?
@@ -7806,7 +8043,7 @@ impl WorkerPool {
         let backend = key.split(':').next().unwrap_or(key);
         if let Some(cgroup_peak) = crate::memory::peak_memory_of_pid(
             pid,
-            Some(&crate::memory::cap_unit_name(backend, pid)),
+            Some(&crate::memory::worker_cgroup_leaf(backend, pid)),
         ) {
             return Some(cgroup_peak);
         }
@@ -9218,7 +9455,7 @@ impl WorkerPool {
         &self,
         key: &str,
         elf: &[u8],
-        input_data: &[u8],
+        input: ProveInput<'_>,
         po2: Option<u8>,
         timeout: Option<Duration>,
         on_progress: Option<Box<dyn Fn(f64, &str) + Send>>,
@@ -9236,7 +9473,7 @@ impl WorkerPool {
         // other-backend proof is not admitted into memory the execute window will consume. 0 (older
         // path, non-SP1, or portable executor with no server-stacking) leaves the charge unchanged.
         execute_peak_bytes: u64,
-    ) -> Result<ProofOutput> {
+    ) -> Result<SlotProof> {
         // Resolve the segment size now that the card is known: a job's size on THIS slot, else the
         // caller's `po2`. A job never reaches a slot it has no size for (`prove_min_vram` filters
         // those out); refused here too, for a caller that names the slot itself.
@@ -9249,9 +9486,10 @@ impl WorkerPool {
         };
 
         // A card whose kernels are compiled on first use (Intel) is warmed up before its first proof,
-        // outside this proof's watchdog; a no-op for every other slot and for a warmed one.
-        if key.split(':').nth(1) == Some("intel") {
-            self.ensure_warmed(key)?;
+        // outside this proof's watchdog but inside its deadline; a no-op for every other slot and for
+        // a warmed one (the startup warm-up warms every Intel card; see `warm_up`).
+        if is_intel_slot(key) {
+            self.ensure_warmed(key, abort_at)?;
         }
 
         // Per-physical-GPU guard (see `gpu_locks`): serialize proofs across different
@@ -9273,11 +9511,11 @@ impl WorkerPool {
         let gpu_lock = self.gpu_lock_for(key);
         let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, timeout)?;
 
-        // Host memory and `/dev/shm` are reserved further down, after the slot mutex (see there), but
+        // Host memory is reserved further down, after the slot mutex (see there), but
         // the VRAM budget just below may recycle a warm same-card sibling to make room. If the proofs
         // already in flight leave this one no host-side room that anything below could make, it would
         // be refused there anyway, after the sibling was destroyed for nothing, and again on every
-        // retry. Seen on localnet: an SP1 proof waiting for `/dev/shm` behind another card's SP1 proof
+        // retry. Seen on localnet: an SP1 proof waiting for room behind another card's SP1 proof
         // recycled the idle risc0 worker on its own card seven times in four minutes. So it is refused
         // here first, with the same typed shortage.
         if let Some(shortage) = self.host_side_refusal(
@@ -9476,75 +9714,26 @@ impl WorkerPool {
         // free slots — the ledger's figure stopped meaning "in flight".
         //
         // Held for the rest of the proof; released on drop, including on every error path.
-        let backend_of_slot = key.split(':').next().unwrap_or(key);
         // Read again now, after any recycle above, which changes what the SP1 server holds.
         let want = self.host_want(key, po2, execute_peak_bytes);
-        // RH1 / Mode B: reserve the `/dev/shm` this SP1 proof's execute phase will stage, held for the
-        // whole proof so a concurrent measure or a prove on another card cannot sum images past the
-        // shared tmpfs and SIGBUS (which, hitting a claimed prove, is a slash). On shortage, refuse as
-        // a typed `HostMemoryShortage` — the retry loop re-dispatches once the other staging frees the
-        // tmpfs, exactly as for a host-RAM shortage. Inert off x86-64-Linux and for non-SP1 backends.
-        //
-        // DESIGN (findings RH-round2/3 and RH-round3 residual A): the reservation is held for the
-        // WHOLE proof, though only the brief execute phase actually stages in /dev/shm — the
-        // dispatcher cannot see when the worker's internal execute finishes without a protocol phase
-        // signal, and the trace ring's /dev/shm lifetime across GPU proving is not guaranteed, so
-        // releasing early could re-admit a colliding staging. When the /dev/shm clamp binds (tmpfs
-        // fits only one cap-sized image) this would SERIALIZE, for the whole proof, both:
-        //   * two SP1 proves on DIFFERENT cards (multi-GPU only); and
-        //   * an SP1 prove vs. a concurrent pre-claim SP1 MEASUREMENT — on the SUPPORTED SINGLE-GPU
-        //     box too. And the host-RAM ledger serializes measure-vs-prove independently of /dev/shm
-        //     (a ~12 GiB measure + an ~18 GiB prove exceed a 28 GiB box — the host-RAM half, from the
-        //     C3 measure charge, is the DOMINANT cause, not /dev/shm).
-        // RESOLVED for the committed proof (the only case that can be slashed): a bonded claim now
-        // PREEMPTS the speculative measurement on BOTH ledgers — host RAM via `preempt_measures_for_
-        // host`, /dev/shm via `preempt_measures_for_shm`, wired into the two reservations just below,
-        // gated on `committed` (= `abort_at.is_some()`). A measurement is uncollateralized pre-claim
-        // work; a claim is bonded and on a deadline, so the proof reclaims the measurement's charge
-        // (killing its throwaway worker, which re-measures next tick as a transient `MeasurePreempted`)
-        // rather than being forced into a penalized RELEASE. A bonded proof is NEVER preempted (both
-        // committed), so the only remaining serialization is prove-vs-prove, which is NOT a slash
-        // vector and is self-healing (re-dispatch once the other frees). To run concurrent multi-GPU
-        // SP1, additionally size /dev/shm for N_gpu cap-sized images so the ledger admits N concurrent
-        // stagings (a throughput choice, not a safety one).
+        // A bonded claim may PREEMPT a speculative pre-claim measurement's host-RAM charge (RH-round3
+        // residual A, in `preempt_measures_for_host` below): a measurement is uncollateralized; a
+        // claim is bonded and on a deadline, so the proof reclaims the measurement's charge (killing
+        // its throwaway worker, which re-measures next tick as a transient `MeasurePreempted`) rather
+        // than being forced into a penalized RELEASE. A bonded proof is NEVER preempted.
         // Committed == has a lock deadline: a claimed proof sets `abort_at`; the benchmark/calibration
         // paths (which reach `prove_on_slot` only via `prove_min_vram`) do not, so this never runs for
-        // speculative work (which would be sizing-vs-sizing, no priority to justify a kill).
+        // speculative work (which would be sizing-vs-sizing, no priority to justify a kill). SP1's
+        // executor shares its memory through memfds, host RAM charged here, so `/dev/shm` takes no
+        // reservation.
         let committed = abort_at.is_some();
-        let _prove_shm = if backend_of_slot == zkminer_prover_protocol::BACKEND_SP1 {
-            match self.reserve_sp1_shm().or_else(|| {
-                // `/dev/shm` is short. If a pre-claim SP1 measurement is holding it, preempt it so
-                // this bonded proof can stage (RH-round3 residual A, shm arm). None (not committed,
-                // or a bonded prove's staging is the blocker) falls through to the typed shortage.
-                committed
-                    .then(|| self.preempt_measures_for_shm(key, abort_at))
-                    .flatten()
-            }) {
-                Some(r) => Some(r),
-                None => {
-                    return Err(anyhow::Error::new(
-                        zkminer_prover_protocol::types::HostMemoryShortage {
-                            attempted: false,
-                            slot_key: key.to_string(),
-                            needed: crate::memory::sp1_measure_cap_bytes(
-                                crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                            ),
-                            reserved: self.shm_ledger.reserved_bytes(),
-                            available: crate::memory::dev_shm_capacity_bytes().unwrap_or(0),
-                        },
-                    ));
-                }
-            }
-        } else {
-            None
-        };
         let _memory_reservation = match self
             .reserve_host_memory(want, key)
             .or_else(|| self.make_host_room(key, want, abort_at))
             .or_else(|| {
                 // Host RAM is still short after recycling idle workers. If a pre-claim measurement is
                 // holding it, preempt it so this bonded proof can run (RH-round3 residual A, host-RAM
-                // arm — the DOMINANT half on the single-GPU box, independent of `/dev/shm`). None
+                // arm — the DOMINANT half on the single-GPU box). None
                 // (not committed, or a bonded proof is the blocker) falls through to the existing
                 // credit-unreadable recycle and then the typed shortage.
                 committed
@@ -9697,12 +9886,18 @@ impl WorkerPool {
         static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        let (input_data, witness) = match input {
+            ProveInput::Inline(bytes) => (bytes.to_vec(), None),
+            // The worker reads a witness job's input from its bundle: nothing inline.
+            ProveInput::Witness(w) => (Vec::new(), Some(w.clone())),
+        };
         if let Err(e) = handle.send(&WorkerCommand::Prove {
             request_id,
             elf: elf.to_vec(),
-            input_data: input_data.to_vec(),
+            input_data,
             po2,
             program_id,
+            witness,
         }) {
             // Send failed (broken pipe = worker died before receiving the command).
             Self::mark_slot_failed(&mut slot, entry);
@@ -9758,6 +9953,17 @@ impl WorkerPool {
                 if let Some(h) = slot.handle.as_mut() {
                     h.await_exit_visible(Duration::from_secs(1));
                 }
+            }
+            // A worker that exited declined (`WORKER_EXIT_DECLINED`) found it cannot run its backend
+            // on this host, before it ran this job's guest: the slot is declined, and the job is not
+            // at fault.
+            if is_eof && slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+                Self::decline_slot(&mut slot, entry, key);
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerDeclined {
+                        slot_key: key.to_string(),
+                    },
+                ));
             }
             #[cfg(unix)]
             let host_oom = !entry.intentional_kill.load(Ordering::Acquire)
@@ -9839,6 +10045,9 @@ impl WorkerPool {
         if proof_response.is_ok() {
             slot.proofs_since_spawn = slot.proofs_since_spawn.saturating_add(1);
         }
+        if matches!(proof_response, Ok(WorkerResponse::ProofResult { .. })) {
+            Self::note_guest_ran(&mut slot, key);
+        }
 
         match proof_response? {
             WorkerResponse::ProofResult {
@@ -9870,12 +10079,37 @@ impl WorkerPool {
                 if slot.gpu_tag == "metal" {
                     self.after_metal_proof(key, &mut slot, entry, po2);
                 }
-                Ok(ProofOutput {
+                Ok(SlotProof::Proved(ProofOutput {
                     journal,
                     seal,
                     duration: Duration::from_secs_f64(duration_secs),
                     cycles,
-                })
+                }))
+            }
+            // A witness proof's execution that did not reproduce its bundle. The worker and its slot
+            // are fine: the outcome is the job's, and typed, so the caller never reads it from text.
+            WorkerResponse::JournalDiverged {
+                journal,
+                journal_len,
+                journal_sha256,
+                exit_kind,
+                exit_code,
+                cycles,
+                ..
+            } if matches!(input, ProveInput::Witness(_)) => {
+                tracing::warn!(
+                    "Witness proof on {key} diverged from its bundle (exit kind {exit_kind}, code \
+                     {exit_code}, {journal_len} journal bytes, {cycles} cycles): nothing proven"
+                );
+                Ok(SlotProof::JournalDiverged(JournalDivergence {
+                    slot_key: key.to_string(),
+                    journal,
+                    journal_len,
+                    journal_sha256,
+                    exit_kind,
+                    exit_code,
+                    cycles,
+                }))
             }
             WorkerResponse::Error { kind, message, .. } => {
                 // TYPED, carrying the worker's own `kind`, so the caller does not classify this by
@@ -9983,6 +10217,149 @@ impl WorkerPool {
         // PID before handle — see `mark_slot_failed`.
         pid.clear();
         slot.handle = None;
+    }
+
+    /// Records that the slot's worker exited declined (`WorkerHandle::exited_declined`): it cannot
+    /// run its backend on this host, as a worker that declines its handshake cannot, so the slot is
+    /// not dispatched to or respawned until a fresh worker is tried after its wait
+    /// (`retry_due_declines`), and clears it.
+    fn decline_slot(slot: &mut WorkerSlot, pid: &impl PidSlot, key: &str) {
+        let msg = format!(
+            "{} Worker {key} found after its handshake that it cannot run {} here (exit code {}; \
+             its log says why)",
+            zkminer_prover_protocol::types::WORKER_DECLINED,
+            slot.backend,
+            zkminer_prover_protocol::types::WORKER_EXIT_DECLINED,
+        );
+        Self::mark_slot_dead(slot, pid);
+        Self::note_decline(slot, key, msg);
+    }
+
+    /// Records a decline (`WorkerSlot::declined`) and when the slot is next tried with a fresh
+    /// worker (`DeclineRetry`): after `DECLINE_RETRY_FIRST` the first time, twice the last wait
+    /// after that, up to `DECLINE_RETRY_MAX`.
+    fn note_decline(slot: &mut WorkerSlot, key: &str, reason: String) {
+        let backoff = if slot.decline_retry.backoff.is_zero() {
+            DECLINE_RETRY_FIRST
+        } else {
+            slot.decline_retry
+                .backoff
+                .saturating_mul(2)
+                .min(DECLINE_RETRY_MAX)
+        };
+        tracing::warn!(
+            "Worker {key} DECLINED: not used until a fresh worker is tried in {} min: {reason}",
+            backoff.as_secs() / 60
+        );
+        slot.declined = Some(reason);
+        slot.decline_retry = DeclineRetry {
+            at: Some(Instant::now() + backoff),
+            backoff,
+        };
+    }
+
+    /// Whether a declined slot is due to be tried again with a fresh worker.
+    fn decline_retry_due(slot: &WorkerSlot, now: Instant) -> bool {
+        slot.declined.is_some()
+            && slot.handle.is_none()
+            && slot.decline_retry.at.is_some_and(|at| now >= at)
+    }
+
+    /// A guest ran on the slot: its worker's executor canary passed first, so a decline before it
+    /// is behind it, and the next one starts again from the first wait.
+    fn note_guest_ran(slot: &mut WorkerSlot, key: &str) {
+        if !slot.decline_retry.backoff.is_zero() {
+            tracing::warn!(
+                "Worker {key} ran a guest after its decline (its executor canary passes): the \
+                 decline backoff starts again"
+            );
+            slot.decline_retry = DeclineRetry::default();
+        }
+    }
+
+    /// Tries every declined slot whose wait is over (`DeclineRetry`) with a fresh worker. One that
+    /// passes its handshake is offered again; one that declines again (an old server at its
+    /// handshake), or cannot start, waits twice as long. A slot declined by its executor canary is
+    /// offered again after the handshake, and its worker runs the canary before its first guest,
+    /// declining again at once if it still fails, which neither the job nor its program is blamed
+    /// for. The number of slots tried.
+    pub fn retry_due_declines(&self) -> usize {
+        let now = Instant::now();
+        let prove = self.workers.iter().map(|(k, e)| (k.clone(), e));
+        let measure = self.measure_workers.iter().flat_map(|(backend, pool)| {
+            pool.iter()
+                .enumerate()
+                .map(move |(i, e)| (format!("{backend}:measure:{i}"), e))
+        });
+        let mut tried = 0;
+        for (key, entry) in prove.chain(measure) {
+            if self.closing.load(Ordering::SeqCst) {
+                break;
+            }
+            // A busy slot is not declined: it is proving or measuring.
+            let Ok(mut slot) = entry.slot.try_lock() else {
+                continue;
+            };
+            if !Self::decline_retry_due(&slot, now) {
+                continue;
+            }
+            tried += 1;
+            let reason = slot.declined.clone().unwrap_or_default();
+            tracing::warn!(
+                "Retrying declined worker {key} with a fresh worker (it declined: {reason})"
+            );
+            match WorkerHandle::spawn(&slot.backend, &slot.path, &slot.spawn_env) {
+                Ok(handle) => {
+                    if self.closing.load(Ordering::SeqCst) {
+                        // Dropped, which ends it: nothing starts once the miner is closing.
+                        break;
+                    }
+                    entry.publish_pid(handle.pid());
+                    entry.note_build(&handle);
+                    slot.handle = Some(handle);
+                    slot.declined = None;
+                    slot.decline_retry.at = None;
+                    slot.consecutive_failures = 0;
+                    slot.last_failure = None;
+                    slot.last_spawn_error = None;
+                    slot.proofs_since_spawn = 0;
+                    tracing::warn!(
+                        "Worker {key} passed its handshake after its decline, and is offered again"
+                    );
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    // What a benchmark of this slot reports (W10-BFIX), as after any failed spawn.
+                    slot.last_spawn_error = Some(msg.clone());
+                    let reason = if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED) {
+                        msg
+                    } else {
+                        format!("{reason} (and the retry could not start a worker: {msg})")
+                    };
+                    Self::note_decline(&mut slot, &key, reason);
+                }
+            }
+        }
+        tried
+    }
+
+    /// Starts the thread that tries declined slots again (`retry_due_declines`) every
+    /// `DECLINE_RETRY_POLL`, until the pool closes. For the pool that lives as long as the miner.
+    pub fn start_decline_retries(&'static self) {
+        let spawned = std::thread::Builder::new()
+            .name("zkminer-decline-retry".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(DECLINE_RETRY_POLL);
+                if self.closing.load(Ordering::SeqCst) {
+                    return;
+                }
+                self.retry_due_declines();
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "no thread to retry declined workers ({e}): a decline lasts until restart"
+            );
+        }
     }
 
     /// True if a slot may be dispatched to: healthy, or retired-but-cooled-down so a
@@ -10111,15 +10488,9 @@ impl WorkerPool {
                 // for the life of the process. A decline is categorical: say so once and stop
                 // advertising the backend.
                 let msg = format!("{e:#}");
-                if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED)
-                    && slot.declined.is_none()
-                {
-                    tracing::error!(
-                        "Worker {}:{} DECLINED on respawn and will no longer be advertised: {msg}",
-                        slot.backend,
-                        slot.gpu_tag,
-                    );
-                    slot.declined = Some(msg.clone());
+                if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED) {
+                    let key = format!("{}:{}", slot.backend, slot.gpu_tag);
+                    Self::note_decline(slot, &key, msg.clone());
                 }
                 slot.last_spawn_error = Some(msg);
                 slot.consecutive_failures += 1;
@@ -10141,6 +10512,13 @@ impl WorkerPool {
 
         let needs_respawn = if is_alive {
             false
+        } else if slot.handle.as_mut().is_some_and(|h| h.exited_declined()) {
+            // It found, after its handshake, that it cannot run here: no respawn will either.
+            let key = format!("{}:{}", slot.backend, slot.gpu_tag);
+            Self::decline_slot(slot, pid, &key);
+            return Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::WorkerDeclined { slot_key: key },
+            ));
         } else if slot.handle.is_some() {
             let reason = slot
                 .handle
@@ -10193,6 +10571,16 @@ impl WorkerPool {
         };
 
         if needs_respawn {
+            // A declined slot gets a fresh worker only from `retry_due_declines`, after its wait:
+            // dispatching to it (a single slot's shortcut takes even an ineligible one) must not
+            // respawn it sooner.
+            if slot.declined.is_some() {
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerDeclined {
+                        slot_key: format!("{}:{}", slot.backend, slot.gpu_tag),
+                    },
+                ));
+            }
             if self.closing.load(Ordering::SeqCst) {
                 bail!(
                     "not respawning {}: the miner is shutting down",
@@ -10200,6 +10588,9 @@ impl WorkerPool {
                 );
             }
             Self::respawn(slot)?;
+            if let Some(h) = slot.handle.as_ref() {
+                pid.note_build(h);
+            }
         }
 
         slot.handle
@@ -10387,6 +10778,7 @@ impl WorkerPool {
         );
         let handle = WorkerHandle::spawn(backend, &path, &env)?;
         let pid = handle.pid();
+        let build = WorkerBuild::of(Some(&handle));
         self.workers.insert(
             key.to_string(),
             WorkerEntry {
@@ -10403,6 +10795,7 @@ impl WorkerPool {
                     last_failure: None,
                     declined: None,
                     last_spawn_error: None,
+                    decline_retry: DeclineRetry::default(),
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),
@@ -10413,14 +10806,16 @@ impl WorkerPool {
                     crate::memory::pid_starttime(pid).unwrap_or(0),
                 )),
                 intentional_kill: Arc::new(AtomicBool::new(false)),
+                build,
             },
         );
         Ok(())
     }
 
     /// Register a slot with NO worker, as `discover_and_spawn` leaves one whose worker could not
-    /// start: `declined` is the reason a worker that declined gave (it is then never respawned), or
-    /// `None` for a spawn that failed (it backs off before a respawn is tried). W10-BENCH round 1.
+    /// start: `declined` is the reason a worker that declined gave (no retry is scheduled here, so it
+    /// is never respawned: `retry_due_declines` needs a wait), or `None` for a spawn that failed (it
+    /// backs off before a respawn is tried). W10-BENCH round 1.
     pub fn insert_test_down_worker(
         &mut self,
         key: &str,
@@ -10444,6 +10839,7 @@ impl WorkerPool {
                     consecutive_failures: 1,
                     last_failure: Some(Instant::now()),
                     declined: declined.map(str::to_string),
+                    decline_retry: DeclineRetry::default(),
                     last_spawn_error: None,
                     proofs_since_spawn: 0,
                     last_use: None,
@@ -10453,8 +10849,26 @@ impl WorkerPool {
                 pid: Arc::new(AtomicU32::new(0)),
                 pid_starttime: Arc::new(AtomicU64::new(0)),
                 intentional_kill: Arc::new(AtomicBool::new(false)),
+                build: WorkerBuild::default(),
             },
         );
+    }
+
+    /// The decline of prove slot `key`, if it is declined: its reason and the backoff it waits.
+    pub fn test_decline(&self, key: &str) -> Option<(String, Duration)> {
+        let slot = self.workers.get(key)?.slot.lock().ok()?;
+        Some((slot.declined.clone()?, slot.decline_retry.backoff))
+    }
+
+    /// Ends the wait of declined prove slot `key` now, as if its backoff had passed.
+    pub fn test_expire_decline(&self, key: &str) {
+        if let Some(e) = self.workers.get(key) {
+            if let Ok(mut slot) = e.slot.lock() {
+                if slot.decline_retry.at.is_some() {
+                    slot.decline_retry.at = Some(Instant::now());
+                }
+            }
+        }
     }
 
     /// Insert a mock worker into the dedicated MEASURE pool for `backend` (registered as
@@ -10484,6 +10898,7 @@ impl WorkerPool {
                 last_failure: None,
                 declined: None,
                 last_spawn_error: None,
+                decline_retry: DeclineRetry::default(),
                 proofs_since_spawn: 0,
                 last_use: None,
             }),
@@ -10494,6 +10909,7 @@ impl WorkerPool {
                 crate::memory::pid_starttime(pid).unwrap_or(0),
             )),
             intentional_kill: Arc::new(AtomicBool::new(false)),
+            build: WorkerBuild::default(),
         };
         self.measure_workers
             .entry(backend.to_string())
@@ -10620,65 +11036,77 @@ mod tests {
         assert_eq!(whole_journal(Some(vec![0; CAP + 1]), CAP as u64 + 1), None);
     }
 
-    // Finding RH1 / Mode B: the `/dev/shm` ledger admits only as many concurrent SP1 native stagings
-    // as the tmpfs can physically back, and releases on drop.
     #[test]
-    fn sp1_shm_reservations_are_capacity_bounded_and_release() {
+    fn the_claim_time_order_comes_first() {
         use super::WorkerPool;
-        let pool = WorkerPool::new(std::collections::HashMap::new(), Vec::new(), None);
-
-        // The FIRST staging is always admissible: the per-execute cap is clamped `<= capacity` by
-        // construction (and off x86-64-Linux / on an unreadable tmpfs the gate is inert → always Some).
-        let first = pool.reserve_sp1_shm();
-        assert!(
-            first.is_some(),
-            "a single SP1 shm staging must always be admissible"
-        );
-
-        // Where the gate is ACTIVE and the tmpfs is too small to back two cap-sized images at once, a
-        // second concurrent staging is refused while the first is held.
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            if let Some(shm) = crate::memory::dev_shm_capacity_bytes() {
-                let capacity =
-                    shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES);
-                let cap = crate::memory::sp1_measure_cap_bytes(
-                    crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
-                );
-                if cap > 0 && capacity < cap.saturating_mul(2) {
-                    assert!(
-                        pool.reserve_sp1_shm().is_none(),
-                        "a second cap-sized staging must not fit a tmpfs that holds only one"
-                    );
-                }
-            }
-        }
-
-        drop(first);
-        // Released on drop: a staging is admissible again.
-        assert!(
-            pool.reserve_sp1_shm().is_some(),
-            "a dropped shm reservation must free its bytes"
-        );
-    }
-
-    #[test]
-    fn prefer_device_first_moves_matching_key_to_front() {
-        use super::WorkerPool;
-        let keys = vec![
-            "risc0:cuda:0".to_string(),
-            "risc0:cuda:1".to_string(),
-            "risc0:cuda:2".to_string(),
-        ];
-        // "gpu1" -> risc0:cuda:1 is moved first; the rest keep their relative order.
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let keys = strings(&[
+            "risc0:cuda:0",
+            "risc0:intel:0",
+            "risc0:rocm:0",
+            "risc0:rocm:1",
+        ]);
+        let ordered = |ids: &[&str]| WorkerPool::order_by_cards(keys.clone(), &strings(ids));
+        // The planned card, then the rest fastest first; a card not named keeps its place behind.
         assert_eq!(
-            WorkerPool::prefer_device_first(keys.clone(), Some("gpu1")),
-            vec!["risc0:cuda:1", "risc0:cuda:0", "risc0:cuda:2"]
+            ordered(&["gpu0", "gpu-rocm1", "gpu-rocm0"]),
+            [
+                "risc0:cuda:0",
+                "risc0:rocm:1",
+                "risc0:rocm:0",
+                "risc0:intel:0"
+            ]
         );
-        // A preference that matches nothing, or None, leaves the order unchanged (graceful fallback).
-        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), Some("gpu9")), keys);
-        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), None), keys);
+        // The A770 last, the 7900 XTX first: a slow card is tried only after every faster one.
+        assert_eq!(
+            ordered(&["gpu-rocm1", "gpu0", "gpu-intel0"]),
+            [
+                "risc0:rocm:1",
+                "risc0:cuda:0",
+                "risc0:intel:0",
+                "risc0:rocm:0"
+            ]
+        );
+        // An order that matches nothing, or none, leaves the warm-first order unchanged.
+        assert_eq!(ordered(&["gpu9"]), keys);
+        assert_eq!(ordered(&[]), keys);
     }
+
+    /// A job admitted only on cards with no worker is refused, never sent to another card.
+    #[test]
+    fn a_job_is_never_dispatched_outside_the_cards_it_was_admitted_on() {
+        let pool = pool_with_keys(&["risc0:cuda:0", "risc0:intel:0"]);
+        let mut used = None;
+        let eligible = vec!["gpu-rocm1".to_string()];
+        let err = pool
+            .prove_min_vram(
+                "risc0",
+                &[],
+                &[],
+                Some(20),
+                Some(Duration::from_secs(1)),
+                None,
+                None,
+                &[],
+                &[],
+                &mut used,
+                None,
+                None,
+                None,
+                JobCards {
+                    eligible: &eligible,
+                    order: &eligible,
+                },
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("none of the cards this job was admitted on (gpu-rocm1)"),
+            "{err:#}"
+        );
+        assert_eq!(used, None);
+    }
+
     use super::*;
 
     // ---- M9 Metal recycle policy ----
@@ -11638,6 +12066,7 @@ mod tests {
                         last_failure: None,
                         declined: None,
                         last_spawn_error: None,
+                        decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -11646,6 +12075,7 @@ mod tests {
                     pid: Arc::new(AtomicU32::new(0)),
                     pid_starttime: Arc::new(AtomicU64::new(0)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 },
             );
         }
@@ -11741,7 +12171,7 @@ mod tests {
                 None,
                 Some(&none),
                 None,
-                None,
+                JobCards::default(),
                 0,
             )
             .unwrap_err();
@@ -11755,7 +12185,7 @@ mod tests {
             .prove_on_slot(
                 "risc0:cuda:0",
                 &[],
-                &[],
+                ProveInput::Inline(&[]),
                 Some(20),
                 Some(Duration::from_secs(1)),
                 None,
@@ -11789,7 +12219,7 @@ mod tests {
                 None,
                 Some(&only_one),
                 None,
-                None,
+                JobCards::default(),
                 0,
             );
             if attempt == 0 {
@@ -11843,6 +12273,26 @@ mod tests {
         }
     }
 
+    /// An Alchemist card's risc0 workers get Level Zero's V2 adapter; SP1's, and any other card's, are
+    /// left as they were.
+    #[test]
+    fn alchemist_risc0_workers_get_the_v2_adapter() {
+        if std::env::var_os("SYCL_UR_USE_LEVEL_ZERO_V2").is_some() {
+            return; // the operator's choice wins, and is inherited as it is
+        }
+        let mut env = HashMap::new();
+        alchemist_level_zero_env(&mut env, "risc0", true);
+        assert_eq!(
+            env.get("SYCL_UR_USE_LEVEL_ZERO_V2").map(String::as_str),
+            Some("1")
+        );
+        for (backend, alchemist) in [("sp1", true), ("risc0", false), ("sp1", false)] {
+            let mut env = HashMap::new();
+            alchemist_level_zero_env(&mut env, backend, alchemist);
+            assert!(env.is_empty(), "{backend} {alchemist}");
+        }
+    }
+
     /// SP1 and risc0 wait for their one-time setup before their first proof; OpenVM has none.
     #[test]
     fn sp1_and_risc0_wait_for_their_warm_up() {
@@ -11854,6 +12304,84 @@ mod tests {
         pool.warmed.lock().unwrap().insert("risc0".to_string());
         assert!(pool.backend_warmed("risc0"));
         assert!(!pool.has_slots("sp1"));
+    }
+
+    /// `warm_up` tries a slot whose worker declined only after every other slot of the backend.
+    #[test]
+    fn warm_up_tries_a_declined_slot_last() {
+        let pool = pool_with_keys(&["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1", "risc0:cuda:0"]);
+        assert_eq!(
+            pool.warm_up_order("sp1"),
+            ["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1"]
+        );
+        pool.workers["sp1:cuda:0"].slot.lock().unwrap().declined =
+            Some("no CUDA server".to_string());
+        assert_eq!(
+            pool.warm_up_order("sp1"),
+            ["sp1:rocm:0", "sp1:rocm:1", "sp1:cuda:0"]
+        );
+        // A busy slot reads as not declined, without waiting for it.
+        let busy = pool.workers["sp1:rocm:0"].slot.lock().unwrap();
+        assert_eq!(
+            pool.warm_up_order("sp1"),
+            ["sp1:rocm:0", "sp1:rocm:1", "sp1:cuda:0"]
+        );
+        drop(busy);
+    }
+
+    #[test]
+    fn the_one_time_setup_moves_past_a_slot_that_fails_it() {
+        let keys: Vec<String> = ["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1"]
+            .map(String::from)
+            .to_vec();
+        let mut tried = Vec::new();
+        let (key, value) = first_slot_that_succeeds(&keys, |k| {
+            tried.push(k.to_string());
+            if k == "sp1:cuda:0" {
+                bail!("{}", zkminer_prover_protocol::types::WORKER_DECLINED)
+            }
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!((key.as_str(), value), ("sp1:rocm:0", 7));
+        assert_eq!(tried, ["sp1:cuda:0", "sp1:rocm:0"]);
+    }
+
+    /// A host short of memory is the host's problem: no other slot is tried.
+    #[test]
+    fn a_host_memory_shortage_ends_the_one_time_setup_at_once() {
+        let keys: Vec<String> = ["sp1:cuda:0", "sp1:rocm:0"].map(String::from).to_vec();
+        let mut tried = 0;
+        let err = first_slot_that_succeeds::<()>(&keys, |k| {
+            tried += 1;
+            Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::HostMemoryShortage {
+                    attempted: false,
+                    slot_key: k.to_string(),
+                    needed: 1,
+                    reserved: 0,
+                    available: 0,
+                },
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(tried, 1);
+        assert!(err
+            .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .is_some());
+    }
+
+    #[test]
+    fn when_every_slot_fails_the_one_time_setup_the_error_names_each() {
+        let keys: Vec<String> = ["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1"]
+            .map(String::from)
+            .to_vec();
+        let err = first_slot_that_succeeds::<()>(&keys, |k| bail!("{k} broke")).unwrap_err();
+        let msg = format!("{err:#}");
+        for k in &keys {
+            assert!(msg.contains(&format!("{k} broke")), "{msg}");
+        }
+        assert!(first_slot_that_succeeds::<()>(&[], |_| Ok(())).is_err());
     }
 
     /// EVERY path that puts work on a card must take the per-card guard, and the guard must be taken
@@ -11949,6 +12477,16 @@ mod tests {
         assert_eq!(
             parse_drm_fdinfo(xe, "0000:08:0d.0"),
             Some((41, (3 << 30) + (512 << 20)))
+        );
+
+        // An Arc A770 on i915, as measured: device memory is `local0`; `stolen-local0` is not counted.
+        let i915 = "drm-driver:\ti915\ndrm-client-id:\t12\ndrm-pdev:\t0000:01:00.0\n\
+                    drm-total-system0:\t2814168 KiB\ndrm-resident-system0:\t2814156 KiB\n\
+                    drm-total-local0:\t14316840 KiB\ndrm-resident-local0:\t14312168 KiB\n\
+                    drm-total-stolen-local0:\t0\ndrm-resident-stolen-local0:\t4 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(i915, "0000:01:00.0"),
+            Some((12, 14_312_168 << 10))
         );
 
         let old = "drm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-pdev:\t0000:03:00.0\n\
@@ -13224,18 +13762,16 @@ mod tests {
         assert!(
             guard < refusal && refusal < budget,
             "host_side_refusal must come after the per-card guard and before check_vram_budget: \
-             otherwise an SP1 proof waiting for another card's `/dev/shm` staging recycles the idle \
-             risc0 worker on its own card on every retry, for nothing"
+             otherwise an SP1 proof waiting for host room behind another card's proof recycles the \
+             idle risc0 worker on its own card on every retry, for nothing"
         );
     }
 
-    /// This host: a 46 GiB `/dev/shm` (less the poll margin) holds one 24 GiB SP1 image, and 92 GiB
-    /// of RAM three of SP1's 24 GiB unmeasured peak.
+    /// This host: 92 GiB of RAM holds three of SP1's 24 GiB unmeasured peak.
     #[test]
     fn sp1_staging_capacity_counts_whole_images() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        let shm = 46 * GIB - crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES;
-        assert_eq!(staging_capacity(shm, 24 * GIB), 1);
+        assert_eq!(staging_capacity(46 * GIB, 24 * GIB), 1);
         assert_eq!(
             staging_capacity(
                 92 * GIB - crate::memory::DEFAULT_HOST_RESERVE_BYTES,
@@ -13251,14 +13787,20 @@ mod tests {
     #[test]
     fn the_committed_room_is_net_of_what_a_claim_may_preempt() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        // `/dev/shm` of 46 GiB (half of 92) less the 2 GiB poll margin, one SP1 staging of 24 GiB
-        // in flight: a second one cannot fit, whatever is recycled.
-        let shm = 46 * GIB - crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES;
-        assert!(beyond_committed_room(24 * GIB, 0, 24 * GIB, 0, shm));
+        // A room of 44 GiB with one 24 GiB SP1 charge in flight: a second one cannot fit, whatever
+        // is recycled.
+        let room = 44 * GIB;
+        assert!(beyond_committed_room(24 * GIB, 0, 24 * GIB, 0, room));
         // ... unless the 24 GiB in flight is a pre-claim measurement a claimed proof may preempt.
-        assert!(!beyond_committed_room(24 * GIB, 24 * GIB, 24 * GIB, 0, shm));
-        // Nothing in flight: one staging fits.
-        assert!(!beyond_committed_room(0, 0, 24 * GIB, 0, shm));
+        assert!(!beyond_committed_room(
+            24 * GIB,
+            24 * GIB,
+            24 * GIB,
+            0,
+            room
+        ));
+        // Nothing in flight: one fits.
+        assert!(!beyond_committed_room(0, 0, 24 * GIB, 0, room));
         // Host RAM of 92 GiB with the 3 GiB reserve: an SP1 proof (24) beside two risc0 ones fits.
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         assert!(!beyond_committed_room(
@@ -13687,6 +14229,33 @@ mod tests {
         assert!(ik.load(Ordering::Acquire));
     }
 
+    /// A watchdog on a clock fires its timeout after the clock's last touch, not after it started:
+    /// touched for 4 s with a 1.5 s timeout it holds, and fires once the touches stop.
+    #[test]
+    fn a_watchdog_on_a_clock_fires_its_timeout_after_the_last_touch() {
+        let ik = Arc::new(AtomicBool::new(false));
+        let clock = WatchdogClock::new();
+        let watchdog = ProvingWatchdog::with_clock(
+            Arc::new(AtomicU32::new(99999)),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(1500),
+            "test:generic".to_string(),
+            ik.clone(),
+            clock.clone(),
+        );
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(500));
+            clock.touch();
+        }
+        assert!(!ik.load(Ordering::Acquire), "fired while touched");
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(
+            ik.load(Ordering::Acquire),
+            "did not fire after the touches stopped"
+        );
+        drop(watchdog);
+    }
+
     // ---- backoff-aware dispatch (job-loss on a dead slot inside its backoff window) ----
 
     fn slot_with(failures: u32, last_failure_ago: Option<Duration>, alive: bool) -> WorkerSlot {
@@ -13704,6 +14273,7 @@ mod tests {
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
             declined: None,
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         }
@@ -13831,6 +14401,7 @@ mod tests {
             last_failure: Some(Instant::now()),
             declined: None,
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13858,6 +14429,7 @@ mod tests {
             last_failure: Some(Instant::now()), // just failed
             declined: None,
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13884,6 +14456,7 @@ mod tests {
             last_failure: None,
             declined: None,
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13969,6 +14542,7 @@ mod tests {
             last_failure: None,
             declined: None,
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -14000,6 +14574,7 @@ mod tests {
             last_failure: None,
             declined: None,
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -14105,6 +14680,7 @@ mod declined_backend_tests {
                     pid: Arc::new(AtomicU32::new(0)),
                     pid_starttime: Arc::new(AtomicU64::new(0)),
                     intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
                 },
             );
         }
@@ -14125,6 +14701,7 @@ mod declined_backend_tests {
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
             last_spawn_error: None,
+            decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
             last_use: None,
         }
@@ -14186,6 +14763,87 @@ mod declined_backend_tests {
         }
     }
 
+    /// A worker that exited `WORKER_EXIT_DECLINED` after its handshake leaves its slot declined, as
+    /// a handshake decline does: cleared, never dispatchable or revived again, and the backend
+    /// reported declined when it was its only slot.
+    #[test]
+    fn a_slot_whose_worker_exited_declined_is_declined() {
+        let mut sl = slot(None, 0);
+        let pid = AtomicU32::new(4321);
+        WorkerPool::decline_slot(&mut sl, &pid, "sp1:cuda:0");
+        assert!(sl
+            .declined
+            .as_deref()
+            .is_some_and(|m| m.contains(zkminer_prover_protocol::types::WORKER_DECLINED)));
+        assert_eq!(pid.load(Ordering::Acquire), 0);
+        assert!(sl.handle.is_none());
+        assert!(!WorkerPool::slot_eligible(&sl));
+        assert!(!WorkerPool::slot_dispatchable(&sl));
+        let pool = pool_with(vec![("sp1:cuda:0", sl)]);
+        assert!(pool.backend_declined("sp1").is_some());
+        assert!(!pool.has_idle_or_revivable_worker("sp1"));
+    }
+
+    /// A decline lasts a backoff, not the life of the miner: ten minutes, then twice the last wait,
+    /// up to an hour, and the first wait again once a guest has run on the slot (its canary
+    /// passed). Until its wait is over the slot is out of use.
+    #[test]
+    fn a_decline_expires_after_a_backoff_that_doubles_to_an_hour() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let mut sl = slot(None, 0);
+        let mut waits = Vec::new();
+        for _ in 0..5 {
+            let before = Instant::now();
+            WorkerPool::note_decline(&mut sl, "sp1:cuda:0", "it declined".to_string());
+            let at = sl.decline_retry.at.expect("a declined slot has a retry");
+            waits.push(sl.decline_retry.backoff);
+            assert!(at >= before + sl.decline_retry.backoff);
+            assert!(!WorkerPool::slot_eligible(&sl));
+            assert!(!WorkerPool::decline_retry_due(
+                &sl,
+                at - Duration::from_secs(1)
+            ));
+            assert!(WorkerPool::decline_retry_due(&sl, at));
+        }
+        assert_eq!(waits, [min(10), min(20), min(40), min(60), min(60)]);
+        WorkerPool::note_guest_ran(&mut sl, "sp1:cuda:0");
+        WorkerPool::note_decline(&mut sl, "sp1:cuda:0", "again".to_string());
+        assert_eq!(sl.decline_retry.backoff, min(10));
+        // A slot that has a worker is not retried, whatever its wait.
+        let at = sl.decline_retry.at.unwrap();
+        assert!(!WorkerPool::decline_retry_due(&slot(None, 0), at));
+    }
+
+    /// A declined slot whose wait is over is tried with a fresh worker; one whose worker still
+    /// cannot start stays declined and waits twice as long; one whose wait is not over is left
+    /// alone, and neither is ever eligible meanwhile.
+    #[test]
+    fn a_due_decline_is_retried_and_one_that_fails_again_waits_longer() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let mut due = slot(None, 0);
+        WorkerPool::note_decline(&mut due, "sp1:cuda:0", "it declined".to_string());
+        due.decline_retry.at = Some(Instant::now());
+        let mut waiting = slot(None, 0);
+        WorkerPool::note_decline(&mut waiting, "sp1:cuda:1", "it declined".to_string());
+        let pool = pool_with(vec![("sp1:cuda:0", due), ("sp1:cuda:1", waiting)]);
+        // The slots' worker (`/nonexistent`) cannot start.
+        assert_eq!(pool.retry_due_declines(), 1);
+        let retried = pool.workers["sp1:cuda:0"].slot.lock().unwrap();
+        assert!(retried
+            .declined
+            .as_deref()
+            .is_some_and(|r| r.contains("it declined")));
+        assert_eq!(retried.decline_retry.backoff, min(20));
+        assert!(retried.decline_retry.at.unwrap() > Instant::now() + min(19));
+        assert!(!WorkerPool::slot_eligible(&retried));
+        drop(retried);
+        let untouched = pool.workers["sp1:cuda:1"].slot.lock().unwrap();
+        assert_eq!(untouched.decline_retry.backoff, min(10));
+        drop(untouched);
+        assert_eq!(pool.retry_due_declines(), 0, "nothing else is due");
+        assert!(pool.backend_declined("sp1").is_some());
+    }
+
     fn measure_entry(sl: WorkerSlot) -> WorkerEntry {
         WorkerEntry {
             slot: Mutex::new(sl),
@@ -14194,6 +14852,7 @@ mod declined_backend_tests {
             pid: Arc::new(AtomicU32::new(0)),
             pid_starttime: Arc::new(AtomicU64::new(0)),
             intentional_kill: Arc::new(AtomicBool::new(false)),
+            build: WorkerBuild::default(),
         }
     }
 
@@ -14345,6 +15004,7 @@ impl WorkerSlot {
             last_failure: self.last_failure,
             declined: self.declined.clone(),
             last_spawn_error: self.last_spawn_error.clone(),
+            decline_retry: self.decline_retry,
             proofs_since_spawn: self.proofs_since_spawn,
             last_use: self.last_use,
         }
@@ -14365,6 +15025,7 @@ impl WorkerSlot {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            decline_retry: DeclineRetry::default(),
             last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
@@ -14403,6 +15064,7 @@ mod bus_id_locking_tests {
                     last_failure: None,
                     declined: None,
                     last_spawn_error: None,
+                    decline_retry: DeclineRetry::default(),
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),
@@ -14411,6 +15073,7 @@ mod bus_id_locking_tests {
                 pid: Arc::new(AtomicU32::new(0)),
                 pid_starttime: Arc::new(AtomicU64::new(0)),
                 intentional_kill: Arc::new(AtomicBool::new(false)),
+                build: WorkerBuild::default(),
             },
         );
         pool
@@ -14458,7 +15121,7 @@ mod preemption_tests {
         WorkerPool::new(HashMap::new(), Vec::new(), None)
     }
 
-    fn fake_measure(host_bytes: u64, shm_bytes: u64) -> (InflightMeasure, Arc<AtomicBool>) {
+    fn fake_measure(host_bytes: u64) -> (InflightMeasure, Arc<AtomicBool>) {
         let preempt = Arc::new(AtomicBool::new(false));
         (
             InflightMeasure {
@@ -14471,7 +15134,6 @@ mod preemption_tests {
                 generation: INFLIGHT_MEASURE_GENERATION.fetch_add(1, Ordering::Relaxed),
                 preempt: preempt.clone(),
                 host_bytes,
-                shm_bytes,
             },
             preempt,
         )
@@ -14482,7 +15144,7 @@ mod preemption_tests {
     #[test]
     fn inflight_measure_guard_removes_on_drop() {
         let pool = empty_pool();
-        let (m, _p) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m, _p) = fake_measure(8 * 1024 * 1024 * 1024);
         {
             pool.inflight_measures
                 .lock()
@@ -14528,7 +15190,7 @@ mod preemption_tests {
             !pool.backend_fits_for_claim(peak, "sp1", 0, 1),
             "held by proofs: nothing can be preempted"
         );
-        let (m, _flag) = fake_measure(held, 0);
+        let (m, _flag) = fake_measure(held);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -14584,7 +15246,7 @@ mod preemption_tests {
     #[test]
     fn preempt_one_measure_sets_the_flag_on_the_live_registration() {
         let pool = empty_pool();
-        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -14605,7 +15267,7 @@ mod preemption_tests {
     #[test]
     fn preempt_one_measure_skips_a_vanished_registration() {
         let pool = empty_pool();
-        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m, flag) = fake_measure(8 * 1024 * 1024 * 1024);
         // Not inserted: the registry is empty, as if the measurement already returned.
         let killed = pool.preempt_one_measure("sp1:measure:0", &m);
         assert!(!killed);
@@ -14621,10 +15283,10 @@ mod preemption_tests {
     #[test]
     fn preempt_one_measure_skips_a_changed_registration() {
         let pool = empty_pool();
-        let (stale, _stale_flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (stale, _stale_flag) = fake_measure(8 * 1024 * 1024 * 1024);
         // A later measurement M2 on the SAME slot: fake_measure draws a fresh generation, so even
         // with identical pid/start-time (0/0) it is a distinct registration.
-        let (m2, m2_flag) = fake_measure(8 * 1024 * 1024 * 1024, 0);
+        let (m2, m2_flag) = fake_measure(8 * 1024 * 1024 * 1024);
         assert_ne!(stale.generation, m2.generation);
         pool.inflight_measures
             .lock()
@@ -14644,7 +15306,7 @@ mod preemption_tests {
     fn preemption_is_refused_while_closing() {
         let pool = empty_pool();
         pool.closing.store(true, Ordering::Release);
-        let (m, _p) = fake_measure(12 * 1024 * 1024 * 1024, 0);
+        let (m, _p) = fake_measure(12 * 1024 * 1024 * 1024);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -14652,7 +15314,6 @@ mod preemption_tests {
         assert!(pool
             .preempt_measures_for_host("sp1:cuda:0", 18 * 1024 * 1024 * 1024, None)
             .is_none());
-        assert!(pool.preempt_measures_for_shm("sp1:cuda:0", None).is_none());
         // And nothing was preempted.
         assert_eq!(pool.test_inflight_measure_count(), 1);
     }
@@ -14662,7 +15323,7 @@ mod preemption_tests {
     #[test]
     fn preemption_is_refused_when_the_deadline_is_too_close() {
         let pool = empty_pool();
-        let (m, flag) = fake_measure(12 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024);
+        let (m, flag) = fake_measure(12 * 1024 * 1024 * 1024);
         pool.inflight_measures
             .lock()
             .unwrap()
@@ -14672,7 +15333,6 @@ mod preemption_tests {
         assert!(pool
             .preempt_measures_for_host("sp1:cuda:0", 18 * 1024 * 1024 * 1024, soon)
             .is_none());
-        assert!(pool.preempt_measures_for_shm("sp1:cuda:0", soon).is_none());
         assert!(
             !flag.load(Ordering::Acquire),
             "no measurement should be preempted when the deadline is too close"

@@ -37,6 +37,17 @@
 //!   dispatched, nothing is sent); the paused one claims and fulfils after the lift.
 //! - `mines_the_claimable_jobs`: the replay test with the real risc0 worker on the fibonacci guest:
 //!   real GPU proofs. Runs only with `ZKMINER_LOCALNET_MINE=1`.
+//! - `serves_witness_jobs` (Linux): witness-construction jobs end to end with `[witness] enabled`,
+//!   the real broker, builder runner and CPU risc0 worker under the rootless sandbox, a builder
+//!   published on the fork as `hemi-code`: one job simulated, pinned, claimed, proven on the CPU,
+//!   fulfilled with `fulfillJobHashed` and its bundle deleted; one with a bad binding never claimed;
+//!   one from a caller not on `[witness] callers` never simulated. Needs a delegated cgroup: see the
+//!   witness section at the end of this file.
+//! - `serves_the_proxy_slots_witness_job` and `serves_the_proxy_slots_witness_job_on_a_gpu`
+//!   (Linux): plan §12's job end to end, on the CPU worker and on a GPU worker: a second anvil as the
+//!   `evm-rpc` chain, the reference builder published with `zkminer artifact publish`, the job made
+//!   with the requester tools, its `publicValues` checked against that chain's state. See the
+//!   witness section.
 //!
 //! risc0 3.1 (P31-19, B9-CHAIN): the 743111 deployment of 2026-11-16 verifies risc0 3.1 receipts only
 //! (risc0-ethereum v3.1.0 `RiscZeroGroth16Verifier`, SELECTOR 0xe71e6620, the selector this build
@@ -1232,8 +1243,12 @@ impl World {
     }
 
     /// Where the miner's backfill starts: the block of the Case::Full job's submit, the first job
-    /// submitted (see [`World::new`]). A backfill that started a block late would lose that job.
+    /// submitted (see [`World::new`]). A backfill that started a block late would lose that job. A
+    /// world with no inline cases (the witness test) starts at the first block after setup began.
     fn scan_from_block(&self) -> u64 {
+        if self.cases.is_empty() {
+            return self.from_block;
+        }
         self.jobs
             .iter()
             .find(|j| j.case == Case::Full)
@@ -1313,6 +1328,12 @@ impl World {
         c.contracts.hemi_prove_registry = DEPLOYMENT.registry.to_string();
         c.contracts.hemi_token = DEPLOYMENT.token.to_string();
         c.contracts.program_registry = DEPLOYMENT.program_registry.to_string();
+        // The programs are served from this machine (127.0.0.1), which the network guard refuses
+        // outside developer mode. The config file is the only switch: there is no environment
+        // variable for it, and the miner refuses it on mainnet (the fork is 743111). It names the
+        // chain it is meant for, which the RPC confirms at startup.
+        c.dev.private_network = true;
+        c.dev.chain_id = Some(c.chain.chain_id);
         // A 5 HEMI job is the whole market here: claim anything that pays.
         c.prover.min_profit_threshold = 0.0;
         c.prover.skip_benchmark_gate = true;
@@ -1761,8 +1782,6 @@ impl Miner {
         }
         cmd.env("HOME", dir)
             .env("PATH", path_without_workers())
-            // The programs are served from this machine.
-            .env("ZKMINER_ELF_ALLOW_PRIVATE_URLS", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2029,6 +2048,13 @@ async fn watch_only_reports_every_job() {
     // some other failure.
     if world.elf_hits.load(Ordering::SeqCst) == 0 {
         failures.push("the guest was never downloaded from its registry URI".into());
+    }
+    // Served from 127.0.0.1 because the config's `[dev] private_network` let it, and said so.
+    if !lines
+        .iter()
+        .any(|l| l.contains(zkminer_config::DEV_MODE_BANNER))
+    {
+        failures.push("the miner never announced developer mode".into());
     }
     if !lines
         .iter()
@@ -3173,8 +3199,8 @@ async fn every_gpu(name: &str) -> EveryGpu {
         "SP1_GROTH16_CIRCUIT_PATH",
         "XDG_CACHE_HOME",
         "ZKMINER_MIN_AVAILABLE_VRAM_MB",
-        // To steer jobs onto particular NVIDIA cards: one SP1 proof at a time fits this host's
-        // `/dev/shm` (each may stage 24 GiB), so it lands on the same card unless others are hidden.
+        // To steer jobs onto particular NVIDIA cards: the host's RAM may hold one SP1 proof at a
+        // time (each may stage 24 GiB), so it lands on the same card unless others are hidden.
         "ZKMINER_GPU_NAME_FILTER",
     ]
     .into_iter()
@@ -3633,4 +3659,1377 @@ fn occupancy_is_measured_while_work_waits() {
     assert!((o.all_busy - 10.0 / 12.0).abs() < 1e-6);
     // One proof is no window at all.
     assert!(occupancy(&spans[..1]).is_none());
+}
+
+// ── witness-construction jobs ─────────────────────────────────────────────────────────────────────
+//
+// `serves_witness_jobs`: the miner with `[witness] enabled` on the fork, end to end, with the real
+// broker, builder runner and CPU risc0 worker under the rootless sandbox. The SDK's `params-echo`
+// test builder is published on the fork as `hemi-code` (its chunks and manifest deployed with
+// `manifest::creation_code`); it writes its `builderParams` as `W`, and the fibonacci guest reads
+// `n` from `W` and commits `fib(n)`. Three witness jobs are submitted: one FULL-bound job from an
+// allowlisted caller (simulated, pinned, claimed, proven on the CPU, fulfilled with
+// `fulfillJobHashed`, its bundle deleted once Fulfilled), one whose binding names a journal the guest
+// does not commit (simulated and skipped, never claimed), and one from a caller not on
+// `[witness] callers` (never simulated, never claimed).
+//
+// `serves_the_proxy_slots_witness_job` (and `..._on_a_gpu`): plan §12's job end to end. A second
+// anvil (chain 31337, standing for Base) is the `evm-rpc/v1` chain: an EIP-1967 proxy is deployed on
+// it and changed by real transactions before and after the block B the job pins (an upgrade and slot
+// writes through the proxy; `anvil_set*` would rewrite the head block's state in place, and B's proofs
+// with it). The reference builder (`sdk/examples/proxy-slots`) is published on the fork by `zkminer
+// artifact publish`; the reference guest (`reference/proxy-slots/guest`, exported by the methods
+// crate) is registered in the ProgramRegistry and served as the other tests serve theirs; and the
+// job is made by the requester tools (`zkminer witness envelope encode`, `witness binding compute`
+// and `check`): FIELDS over the 160-byte header with the journal-prefix marker, assigned to the
+// miner's prover with an exclusivity window. The miner's broker reads the second anvil as its
+// `evm-rpc` endpoint and the fork as its artifact endpoint. The job must be simulated before its
+// claim, claimed, executed, compared and proven, and fulfilled with `fulfillJobHashed`, and
+// `JobFulfilled.publicValues` must be byte for byte the journal of the second chain's state at B
+// (its implementation, that one's code hash and the slots' values, read from the second anvil at B,
+// where they differ from its head). The CPU test proves on the CPU worker (a debug build: the guest's
+// one 2^20 segment and the Groth16 wrap took 24 minutes on a busy 32-core host); the GPU test on
+// `ZKMINER_LOCALNET_RISC0_WORKER` (default the release CUDA worker; 4 s on an RTX 4090), with the
+// CPU worker still the sandboxed execute. With `CUDA_VISIBLE_DEVICES` set, that worker is named
+// outright and proves on the cards it allows; unset, the miner discovers one worker per card the
+// binary covers (the way to run an AMD or Intel worker, which the dispatcher then pins and tunes per
+// card). A real Groth16 seal: the fork's verifier accepts it at fulfil.
+//
+// Needs a delegated cgroup, anvil, the 743111 RPC and the SDK's pinned toolchain; the §12 tests also
+// need the risc0 toolchain (rzup), with which the methods crate builds the guest:
+//
+// ```text
+// systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUIRED=1 \
+//     cargo test -p zkminer-cli --test localnet serves_witness_jobs -- --ignored --nocapture
+// systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUIRED=1 \
+//     cargo test -p zkminer-cli --test localnet serves_the_proxy_slots_witness_job -- --ignored \
+//     --nocapture --exact
+// ```
+//
+// They build the builder runner, the broker, the sandbox probe and (unless
+// `ZKMINER_LOCALNET_RISC0_CPU_WORKER` names one) `zkminer-prove-risc0-cpu` into this test's target
+// dir. The miner runs in developer mode (`[dev] private_network`: anvil and the ELF server are on
+// 127.0.0.1) with a fixed DA backlog reading (`[dev] da_backlog_bytes`: anvil's receipts carry no
+// `l1GasUsed`). The broker's endpoints are local anvils its `chain_rpc_host` is told otherwise: a
+// real deployment never shares them with the miner's chain RPC.
+
+#[cfg(target_os = "linux")]
+mod witness_support {
+    use super::*;
+    use alloy::eips::{BlockId, BlockNumberOrTag};
+    use hemiprove_proxy_slots::{Rule, RuleKind, Statement, EIP1967_IMPLEMENTATION_SLOT};
+    use zkminer_config::witness::{BrokerSection, RetentionConfig, SandboxModeConfig, UnitPrices};
+    use zkminer_witness::envelope::{
+        encode_envelope, encode_evm_rpc_config, Capability, Limits, WitnessJobV1, CLASS_EVM_RPC_V1,
+        METHOD_SET_STATE_READ,
+    };
+    use zkminer_witness::manifest::{chunk_runtime_code, creation_code, manifest_runtime_code, sha256};
+
+    /// `<target>/debug`, where this test binary's workspace binaries are.
+    pub fn target_debug_dir() -> PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn cargo_build(args: &[&str]) {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let target = target_debug_dir().parent().unwrap().to_path_buf();
+        let out = Command::new(cargo)
+            .current_dir(workspace_root())
+            .arg("build")
+            .args(args)
+            .arg("--target-dir")
+            .arg(&target)
+            .output()
+            .expect("run cargo");
+        assert!(
+            out.status.success(),
+            "cargo build {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    pub struct Bins {
+        pub builder: PathBuf,
+        pub broker: PathBuf,
+        pub probe: PathBuf,
+        pub cpu_worker: PathBuf,
+    }
+
+    /// The sandboxed binaries and the CPU risc0 worker (built here, one cargo at a time).
+    pub fn bins() -> Bins {
+        cargo_build(&[
+            "-p",
+            "zkminer-witness-builder",
+            "-p",
+            "zkminer-witness-broker",
+            "-p",
+            "zkminer-witness-sandbox",
+            "--bins",
+        ]);
+        let debug = target_debug_dir();
+        let cpu_worker = match std::env::var_os("ZKMINER_LOCALNET_RISC0_CPU_WORKER") {
+            Some(p) => PathBuf::from(p),
+            None => {
+                cargo_build(&[
+                    "-p",
+                    "zkminer-prove-risc0",
+                    "--features",
+                    "cpu",
+                    "--bin",
+                    "zkminer-prove-risc0-cpu",
+                ]);
+                debug.join("zkminer-prove-risc0-cpu")
+            }
+        };
+        Bins {
+            builder: debug.join("zkminer-witness-builder"),
+            broker: debug.join("zkminer-witness-broker"),
+            probe: debug.join("zkminer-witness-sandbox-probe"),
+            cpu_worker,
+        }
+    }
+
+    fn sdk_dir() -> PathBuf {
+        workspace_root().join("sdk").canonicalize().unwrap()
+    }
+
+    fn sdk_tool(tool: &str) -> std::ffi::OsString {
+        let out = Command::new("rustup")
+            .args(["which", tool])
+            .current_dir(sdk_dir())
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8(o.stdout).unwrap().trim().into(),
+            _ => tool.into(),
+        }
+    }
+
+    /// An SDK builder (`package`, its module `file`), built with the SDK's pinned toolchain, one
+    /// package per invocation (unified features would change a module's bytes).
+    fn sdk_wasm(package: &str, file: &str) -> Vec<u8> {
+        let target =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sdk-target-localnet-{package}"));
+        let mut cmd = Command::new(sdk_tool("cargo"));
+        cmd.current_dir(sdk_dir())
+            .args([
+                "build",
+                "--locked",
+                "--release",
+                "--target",
+                "wasm32-unknown-unknown",
+                "-p",
+                package,
+                "--target-dir",
+            ])
+            .arg(&target)
+            .env("RUSTC", sdk_tool("rustc"));
+        for v in [
+            "RUSTUP_TOOLCHAIN",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+        ] {
+            cmd.env_remove(v);
+        }
+        let out = cmd.output().expect("run the SDK's cargo");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read(target.join(format!("wasm32-unknown-unknown/release/{file}"))).unwrap()
+    }
+
+    /// The SDK's `params-echo` test builder.
+    pub fn params_echo_wasm() -> Vec<u8> {
+        sdk_wasm("params-echo", "params_echo.wasm")
+    }
+
+    /// Plan §12's reference builder (`sdk/examples/proxy-slots`).
+    pub fn proxy_slots_wasm() -> Vec<u8> {
+        sdk_wasm("proxy-slots-builder", "proxy_slots_builder.wasm")
+    }
+
+    /// Plan §12's reference guest (risc0's program binary) and its image id, exported by the methods
+    /// crate, whose build script builds the guest with risc0-build (the risc0 toolchain).
+    pub fn proxy_slots_guest(dir: &Path) -> (Vec<u8>, B256) {
+        let path = dir.join("proxy-slots.bin");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let target = target_debug_dir().parent().unwrap().to_path_buf();
+        let out = Command::new(cargo)
+            .current_dir(workspace_root())
+            .args(["run", "-q", "-p", "hemiprove-proxy-slots-methods", "--example", "export-guest"])
+            .arg("--target-dir")
+            .arg(&target)
+            .args(["--", "proxy-slots"])
+            .arg(&path)
+            .output()
+            .expect("run cargo");
+        assert!(
+            out.status.success(),
+            "export the proxy-slots guest: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let id: B256 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("export-guest prints the image id");
+        (std::fs::read(&path).unwrap(), id)
+    }
+
+    impl World {
+        /// Deploys `runtime` verbatim (`creation_code`) from the submitter; the address and block.
+        async fn deploy_code(&self, runtime: &[u8]) -> (Address, u64) {
+            let tx = TransactionRequest {
+                from: Some(self.submitter),
+                to: Some(alloy::primitives::TxKind::Create),
+                input: alloy::rpc::types::TransactionInput::new(Bytes::from(creation_code(runtime))),
+                ..Default::default()
+            };
+            let receipt = tokio::time::timeout(SETUP_TX_TIMEOUT, async {
+                self.provider
+                    .send_transaction(tx)
+                    .await
+                    .expect("send a hemi-code deployment")
+                    .get_receipt()
+                    .await
+                    .expect("a hemi-code deployment's receipt")
+            })
+            .await
+            .expect("a hemi-code deployment mined in time");
+            assert!(receipt.status(), "a hemi-code deployment reverted");
+            (
+                receipt.contract_address.expect("a contract address"),
+                receipt.block_number.expect("a block"),
+            )
+        }
+
+        /// Publishes `bytes` as `hemi-code` on the fork (chunks, then the manifest) and waits until
+        /// the manifest is 40 blocks deep (the broker reads code at the safe head first). Returns the
+        /// locator.
+        pub async fn publish_hemi_code(&self, bytes: &[u8]) -> String {
+            let mut chunks = Vec::new();
+            for c in bytes.chunks(20_000) {
+                chunks.push(self.deploy_code(&chunk_runtime_code(c)).await.0);
+            }
+            let (manifest, block) = self
+                .deploy_code(&manifest_runtime_code(bytes.len() as u64, &sha256(bytes), &chunks))
+                .await;
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while self.provider.get_block_number().await.unwrap() < block + 40 {
+                assert!(Instant::now() < deadline, "the fork stopped mining");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            format!("hemi-code://{}/{manifest:#x}", DEPLOYMENT.chain_id)
+        }
+
+        /// Gives `who` ETH and `amount` tHEMI, and lets the router take any of it.
+        pub async fn fund_caller(&self, who: Address, amount: U256) {
+            set_balance(&self.provider, who, 100 * HEMI).await;
+            let owner = owner_of(&self.provider, DEPLOYMENT.token).await;
+            mined!(
+                ITestnetToken::new(DEPLOYMENT.token, &self.provider)
+                    .mint(who, amount)
+                    .from(owner),
+                "mint tHEMI to a witness caller"
+            );
+            mined!(
+                IERC20::new(DEPLOYMENT.token, &self.provider)
+                    .approve(DEPLOYMENT.router, U256::MAX)
+                    .from(who),
+                "approve the router for a witness caller"
+            );
+        }
+
+        /// Submits `d` from `caller` directly to the router (`submitJob`, a fixed price); the jobId.
+        pub async fn submit_witness(&self, caller: Address, d: JobDescriptor, what: &str) -> B256 {
+            self.submit_witness_with(caller, d, fixed_price(JOB_PRICE), what).await
+        }
+
+        /// [`World::submit_witness`] under `auction`.
+        pub async fn submit_witness_with(
+            &self,
+            caller: Address,
+            d: JobDescriptor,
+            auction: AuctionConfig,
+            what: &str,
+        ) -> B256 {
+            let core = IHemiProveCore::new(DEPLOYMENT.router, &self.provider);
+            let receipt = mined!(
+                core.submitJob(d.clone(), auction.clone(), no_cycles(), no_bidding())
+                    .from(caller),
+                what
+            );
+            receipt
+                .inner
+                .logs()
+                .iter()
+                .find_map(|l| l.log_decode::<IHemiProveCore::JobSubmitted>().ok())
+                .map(|l| l.inner.data.jobId)
+                .expect("JobSubmitted in the submit receipt")
+        }
+    }
+
+    /// A witness job for the fibonacci guest: `params-echo` writes `n` (4 little-endian bytes) as
+    /// `W`; FULL-bound to `journal`.
+    pub fn witness_descriptor(
+        program: &Program,
+        wasm: &[u8],
+        locator: &str,
+        n: u32,
+        journal: &[u8],
+        tag: &str,
+    ) -> JobDescriptor {
+        let envelope = WitnessJobV1 {
+            builderType: 1,
+            builderId: B256::from(sha256(wasm)),
+            builderURIs: vec![locator.to_string()],
+            builderParams: n.to_le_bytes().to_vec().into(),
+            sources: vec![Capability {
+                class: CLASS_EVM_RPC_V1,
+                config: encode_evm_rpc_config(DEPLOYMENT.chain_id, true, METHOD_SET_STATE_READ, 0).into(),
+            }],
+            limits: Limits {
+                maxFetches: 4,
+                maxFetchBytes: 1 << 20,
+                maxRequestBytes: 65_536,
+                maxResponseBytes: 1 << 20,
+                maxBuilderFuel: 1_000_000_000,
+                maxBuilderMemoryBytes: 64 << 20,
+                maxBuilderSeconds: 30,
+                maxWitnessBytes: 1 << 16,
+                // Within the CPU slot's derived maximum: what one attempt can prove inside the
+                // configured 1,800 s watchdog beside the CPU Groth16 allowance, both with the 1.5
+                // safety margin (about 3M sized cycles at the CPU floor rate); the guest uses 32,768.
+                maxGuestCycles: 1 << 21,
+            },
+        };
+        JobDescriptor {
+            programId: program.id,
+            proofSystemId: program.proof_system,
+            callbackContract: Address::ZERO,
+            assignedProver: Address::ZERO,
+            tag: keccak256(format!("zkminer localnet witness {tag}")),
+            inputData: encode_envelope(&envelope).into(),
+            callbackExtraData: Bytes::new(),
+            extraVerifierData: Bytes::new(),
+            expectedJournalHash: full_hash(program.proof_system, program.id, journal),
+            journalFields: B256::ZERO,
+        }
+    }
+
+    /// The broker's own config file: each `(alias, url, chain id)` as an `evm-rpc/v1` endpoint, and
+    /// `artifacts_url` (the fork) as its `[artifacts]` endpoint for 743111.
+    pub fn write_broker_config(dir: &Path, evm_rpc: &[(&str, &str, u64)], artifacts_url: &str) -> PathBuf {
+        let spool = dir.join("broker-spool");
+        std::fs::create_dir_all(&spool).unwrap();
+        let path = dir.join("broker.toml");
+        let mut text = format!("chain_rpc_host = \"chain-rpc.invalid\"\nspool_dir = \"{}\"\n", spool.display());
+        for (alias, url, chain) in evm_rpc {
+            text.push_str(&format!(
+                "[[evm_rpc]]\nalias = \"{alias}\"\nurl = \"{url}\"\nchain_id = {chain}\narchive = true\n\
+                 max_proof_age = 1000000\nmethod_sets = [\"state-read\"]\ncidrs = [\"127.0.0.1/32\"]\n"
+            ));
+        }
+        text.push_str(&format!(
+            "[artifacts]\nalias = \"fork-artifacts\"\nurl = \"{artifacts_url}\"\nchain_id = {chain}\n\
+             max_requests_per_sec = 1000\nmax_builder_bytes = 4194304\ncidrs = [\"127.0.0.1/32\"]\n",
+            chain = DEPLOYMENT.chain_id,
+        ));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// The miner's config for witness serving on the fork: `[witness] enabled` for the world's
+    /// submitter, the rootless sandbox, the broker with `broker_config`, a retention store
+    /// initialised by `zkminer witness init-store`, all checked by `zkminer witness self-test`. The
+    /// CPU worker is the sandboxed execute; `worker` proves, named outright or (`discover`) found
+    /// per card. Returns the config and the store's directory.
+    pub fn witness_miner_config(
+        world: &World,
+        dir: &RunDir,
+        bins: &Bins,
+        broker_config: PathBuf,
+        worker: &Path,
+        discover: bool,
+        proving_timeout_secs: u64,
+    ) -> (PathBuf, PathBuf) {
+        let config = world.write_config(&dir.0, worker, discover);
+        let store_dir = dir.0.join("witness-store");
+        let segment_dir = dir.0.join("witness-segments");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let mut c = ZkMinerConfig::load(Some(&config)).unwrap();
+        c.witness.enabled = true;
+        c.witness.sandbox_mode = SandboxModeConfig::Rootless;
+        c.witness.callers = vec![world.submitter];
+        c.witness.prover_address = Some(world.prover.address());
+        c.witness.hemi_per_eth = Some(1.0);
+        c.witness.hemi_per_eth_expires =
+            Some((chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339());
+        c.witness.unit_prices = Some(UnitPrices {
+            cpu_second_hemi: 0.0,
+            gib_hour_retained_hemi: 0.0,
+            provider_overage_unit_hemi: 0.0,
+        });
+        c.witness.builder_binary = Some(bins.builder.clone());
+        c.witness.execute_binary = Some(bins.cpu_worker.clone());
+        c.witness.execute_memory_bytes = 4 << 30;
+        c.retention = Some(RetentionConfig {
+            dir: store_dir.clone(),
+            store_uuid: String::new(),
+            quota_bytes: 4 << 30,
+            quota_inodes: 100_000,
+            per_caller_bytes: 1 << 30,
+            free_floor_pct: 1.0,
+            segment_dir: segment_dir.clone(),
+            require_dedicated_mount: false,
+            allow_any_filesystem: false,
+        });
+        c.broker = Some(BrokerSection {
+            config: broker_config,
+            binary: Some(bins.broker.clone()),
+            memory_bytes: 512 << 20,
+        });
+        c.dev.da_backlog_bytes = Some(0);
+        // A CPU slot with no benchmark row budgets its Groth16 path (minutes on a CPU) at the CPU
+        // allowance, and the claim gate refuses an estimate at or over the per-attempt watchdog, as
+        // the inline gate refuses one. The default 10-minute watchdog (meant for a wedged GPU) cannot
+        // hold that estimate, so a CPU host runs with a watchdog sized for CPU proofs, and the gate
+        // checks that the estimate fits it.
+        c.prover.proving_timeout_secs = proving_timeout_secs;
+        c.save(Some(&config)).unwrap();
+        // The probe the self-test runs is found next to zkminer (a link in the run directory).
+        let probe = dir.0.join("zkminer-witness-sandbox-probe");
+        let _ = std::fs::remove_file(&probe);
+        if std::fs::hard_link(&bins.probe, &probe).is_err() {
+            std::fs::copy(&bins.probe, &probe).unwrap();
+        }
+
+        // `zkminer witness init-store`, then its UUID into the config.
+        let out = Miner::command(&dir.0, &config, &[], "witness", &["init-store"], &[])
+            .output()
+            .expect("run zkminer witness init-store");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "init-store: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let uuid = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("store_uuid = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("init-store printed no store_uuid: {stdout}"))
+            .to_string();
+        let mut c = ZkMinerConfig::load(Some(&config)).unwrap();
+        c.retention.as_mut().unwrap().store_uuid = uuid;
+        c.save(Some(&config)).unwrap();
+
+        // `zkminer witness self-test`: the sandbox and the broker, as the miner runs them.
+        let out = Miner::command(&dir.0, &config, &[], "witness", &["self-test"], &[])
+            .output()
+            .expect("run zkminer witness self-test");
+        assert!(
+            out.status.success(),
+            "self-test: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (config, store_dir)
+    }
+
+    /// What is wrong with a fulfilled witness lock's log: it must be simulated, its bundle pinned,
+    /// claimed, proved, fulfilled with `fulfillJobHashed` and its bundle deleted, in that order.
+    pub fn lock_step_failures(lines: &[String], id: B256) -> Vec<String> {
+        let s = short_id(id);
+        let steps = [
+            format!("witness job {s}: simulated"),
+            format!("WITNESS-LOCK {s}: bundle v"),
+            format!("WITNESS-LOCK {s}: claimed"),
+            format!("WITNESS-LOCK {s}: proved"),
+            format!("WITNESS-LOCK {s}: fulfilled with fulfillJobHashed"),
+            format!("WITNESS-LOCK {s}: bundle deleted"),
+        ];
+        let mut failures = Vec::new();
+        let mut last = None;
+        for step in &steps {
+            match lines.iter().position(|l| l.contains(step)) {
+                None => failures.push(format!("no `{step}` line")),
+                Some(i) => {
+                    if last.is_some_and(|l| i < l) {
+                        failures.push(format!("`{step}` came out of order"));
+                    }
+                    last = Some(i);
+                }
+            }
+        }
+        failures
+    }
+
+    /// The claim gate's estimate and the proof's time for `id`, in seconds, from the log.
+    pub fn estimate_and_proof_secs(lines: &[String], id: B256) -> (Option<f64>, Option<f64>) {
+        let s = short_id(id);
+        let secs_after = |needle: &str, marker: &str| -> Option<f64> {
+            let line = lines.iter().find(|l| l.contains(needle))?;
+            let rest = &line[line.find(marker)? + marker.len()..];
+            rest.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .find(|t| !t.is_empty())?
+                .parse()
+                .ok()
+        };
+        (
+            secs_after(&format!("witness job {s}: claim gate passed"), "~"),
+            secs_after(&format!("WITNESS-LOCK {s}: proved ("), " cycles, "),
+        )
+    }
+
+    /// What is wrong with `id`'s claim and fulfil on the fork: claimed by the world's prover in an
+    /// earlier block than its fulfil, fulfilled by `fulfillJobHashed` with `publicValues` = `journal`.
+    pub async fn fulfil_failures(world: &World, id: B256, journal: &[u8]) -> Vec<String> {
+        let mut failures = Vec::new();
+        let claims = world.logs::<IHemiProveCore::JobClaimed>().await;
+        let fulfils = world.logs::<IHemiProveFulfill::JobFulfilled>().await;
+        match (
+            claims.iter().find(|(j, _)| *j == id).map(|(_, l)| l),
+            fulfils.iter().find(|(j, _)| *j == id).map(|(_, l)| l),
+        ) {
+            (Some(c), Some(f)) => {
+                if c.block >= f.block || c.event.prover != world.prover.address() {
+                    failures.push(format!(
+                        "claimed in block {} by {} and fulfilled in block {}",
+                        c.block, c.event.prover, f.block
+                    ));
+                }
+                if f.event.publicValues.as_ref() != journal {
+                    failures.push(format!(
+                        "fulfilled with journal {}, not 0x{}",
+                        f.event.publicValues,
+                        alloy::hex::encode(journal)
+                    ));
+                }
+                let tx = world
+                    .provider
+                    .get_transaction_by_hash(f.tx)
+                    .await
+                    .unwrap()
+                    .expect("the fulfil transaction");
+                use alloy::consensus::Transaction as _;
+                use alloy::sol_types::SolCall;
+                if tx.input()[..4] != IHemiProveFulfill::fulfillJobHashedCall::SELECTOR {
+                    failures.push(format!(
+                        "fulfilled by selector 0x{}, not fulfillJobHashed",
+                        alloy::hex::encode(&tx.input()[..4])
+                    ));
+                }
+            }
+            (c, f) => failures.push(format!("claimed {}, fulfilled {}", c.is_some(), f.is_some())),
+        }
+        failures
+    }
+
+    /// What is wrong with the store after `id`'s lock ended: its bundles and pin must be gone.
+    pub fn store_failures(store_dir: &Path, id: B256) -> Vec<String> {
+        let mut failures = Vec::new();
+        let hex_id = alloy::hex::encode(id);
+        if store_dir.join("bundles").join(&hex_id).exists() {
+            failures.push(format!("{}'s bundles are still in the store", short_id(id)));
+        }
+        let pins: Vec<String> = std::fs::read_dir(store_dir.join("pins"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        if pins.iter().any(|p| p.starts_with(&hex_id)) {
+            failures.push(format!("{} is still pinned", short_id(id)));
+        }
+        failures
+    }
+
+    // ── Plan §12 ──────────────────────────────────────────────────────────────────────────────────
+
+    /// The second chain's id: a plain anvil's.
+    pub const EVM_CHAIN_ID: u64 = 31337;
+
+    /// A plain anvil (chain [`EVM_CHAIN_ID`]): the `evm-rpc/v1` chain a witness job's builder reads,
+    /// as Base is plan §12's. It mines a block per transaction. Stopped on drop.
+    pub struct EvmChain {
+        child: Child,
+        pub url: String,
+        pub provider: DynProvider,
+        /// anvil's first dev account, which it signs for.
+        dev: Address,
+    }
+
+    impl Drop for EvmChain {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl EvmChain {
+        pub async fn start(dir: &Path) -> Self {
+            let port = free_port();
+            let log = std::fs::File::create(dir.join("anvil-evm-rpc.log")).expect("create its log");
+            let mut cmd = Command::new(std::env::var("ANVIL").unwrap_or_else(|_| "anvil".into()));
+            cmd.args(["--host", "127.0.0.1", "--port", &port.to_string()])
+                .args(["--chain-id", &EVM_CHAIN_ID.to_string()])
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log);
+            die_with_parent(&mut cmd);
+            let child = cmd.spawn().expect("start the second anvil");
+            let url = format!("http://127.0.0.1:{port}");
+            let provider = ProviderBuilder::new()
+                .connect_http(url.parse().unwrap())
+                .erased();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while provider.get_chain_id().await.ok() != Some(EVM_CHAIN_ID) {
+                assert!(Instant::now() < deadline, "the second anvil did not come up");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let dev = provider.get_accounts().await.unwrap()[0];
+            EvmChain { child, url, provider, dev }
+        }
+
+        /// Sends `input` from the dev account, to `to` or as a creation; the receipt.
+        async fn send(
+            &self,
+            to: Option<Address>,
+            input: Vec<u8>,
+            what: &str,
+        ) -> alloy::rpc::types::TransactionReceipt {
+            let tx = TransactionRequest {
+                from: Some(self.dev),
+                to: Some(to.map_or(alloy::primitives::TxKind::Create, alloy::primitives::TxKind::Call)),
+                input: alloy::rpc::types::TransactionInput::new(Bytes::from(input)),
+                ..Default::default()
+            };
+            let receipt = self
+                .provider
+                .send_transaction(tx)
+                .await
+                .unwrap_or_else(|e| panic!("{what}: {e}"))
+                .get_receipt()
+                .await
+                .unwrap_or_else(|e| panic!("{what}: no receipt: {e}"));
+            assert!(receipt.status(), "{what} reverted");
+            receipt
+        }
+
+        async fn deploy(&self, creation: Vec<u8>, what: &str) -> Address {
+            self.send(None, creation, what)
+                .await
+                .contract_address
+                .expect("a contract address")
+        }
+
+        /// `slot` of `at` in block `block`.
+        pub async fn storage(&self, at: Address, slot: [u8; 32], block: BlockId) -> [u8; 32] {
+            self.provider
+                .get_storage_at(at, U256::from_be_bytes(slot))
+                .block_id(block)
+                .await
+                .expect("eth_getStorageAt")
+                .to_be_bytes()
+        }
+    }
+
+    /// Creation code: `SSTORE(slot, value)` for each pair, then return `runtime` (no compiler needed;
+    /// as reference/proxy-slots/methods/tests/anvil_e2e.rs assembles it).
+    fn creation(stores: &[([u8; 32], [u8; 32])], runtime: &[u8]) -> Vec<u8> {
+        let mut c = Vec::new();
+        for (slot, value) in stores {
+            c.push(0x7f); // PUSH32 value
+            c.extend_from_slice(value);
+            c.push(0x7f); // PUSH32 slot
+            c.extend_from_slice(slot);
+            c.push(0x55); // SSTORE
+        }
+        let len = u16::try_from(runtime.len()).unwrap().to_be_bytes();
+        let offset = u16::try_from(c.len() + 15).unwrap().to_be_bytes();
+        // PUSH2 len PUSH2 offset PUSH1 0 CODECOPY PUSH2 len PUSH1 0 RETURN
+        c.extend_from_slice(&[
+            0x61, len[0], len[1], 0x61, offset[0], offset[1], 0x60, 0x00, 0x39, 0x61, len[0], len[1],
+            0x60, 0x00, 0xf3,
+        ]);
+        c.extend_from_slice(runtime);
+        c
+    }
+
+    /// An implementation: stores calldata word 1 at the slot calldata word 0 names (in the proxy's
+    /// storage, when called through it), then returns 42. So a call through the proxy can write any
+    /// of the proxy's slots, the EIP-1967 one included: an upgrade.
+    const IMPLEMENTATION_RUNTIME: [u8; 14] = [
+        0x60, 0x20, 0x35, 0x5f, 0x35, 0x55, 0x60, 0x2a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xf3,
+    ];
+
+    /// An EIP-1967 proxy: delegate the calldata to the address in the implementation slot, return or
+    /// revert with what it returned.
+    fn proxy_runtime() -> Vec<u8> {
+        let mut r = vec![0x36, 0x5f, 0x5f, 0x37, 0x5f, 0x5f, 0x36, 0x5f, 0x7f];
+        r.extend_from_slice(&EIP1967_IMPLEMENTATION_SLOT);
+        // SLOAD GAS DELEGATECALL; RETURNDATACOPY(0, 0, size); JUMPI ok; REVERT; ok: RETURN
+        r.extend_from_slice(&[
+            0x54, 0x5a, 0xf4, 0x3d, 0x5f, 0x5f, 0x3e, 0x60, 0x36, 0x57, 0x3d, 0x5f, 0xfd, 0x5b, 0x3d,
+            0x5f, 0xf3,
+        ]);
+        assert_eq!(r[0x36], 0x5b, "the jump target is the JUMPDEST");
+        r
+    }
+
+    fn word(n: u64) -> [u8; 32] {
+        B256::from(U256::from(n)).0
+    }
+
+    fn address_word(a: Address) -> [u8; 32] {
+        B256::left_padding_from(a.as_slice()).0
+    }
+
+    /// The §12 statement on the second chain, and what its state at B says.
+    pub struct ProxyAtB {
+        pub statement: Statement,
+        pub implementation: Address,
+        /// `EXTCODEHASH(implementation)` at B.
+        pub code_hash: B256,
+        /// The k slots' values at B, in rule order.
+        pub values: Vec<[u8; 32]>,
+    }
+
+    impl ProxyAtB {
+        /// The journal a proof of this statement for `job` by `prover` commits: the prefix, the
+        /// header, then the implementation, its code hash and each `(slot, value)`.
+        pub fn journal(&self, job: B256, prover: Address) -> Vec<u8> {
+            let mut j = zkminer_witness::binding::journal_prefix(job, prover).to_vec();
+            j.extend_from_slice(&self.statement.header());
+            j.extend_from_slice(&address_word(self.implementation));
+            j.extend_from_slice(self.code_hash.as_slice());
+            let slots = self.statement.rule.slots(&self.implementation.0 .0, self.statement.k);
+            for (slot, value) in slots.iter().zip(&self.values) {
+                j.extend_from_slice(slot);
+                j.extend_from_slice(value);
+            }
+            assert_eq!(j.len(), hemiprove_proxy_slots::journal_len(self.statement.k));
+            j
+        }
+    }
+
+    /// The proxy of plan §12 on `chain`, deployed and then changed by real transactions: deployed
+    /// pointing at implementation A with slots 10–12 = 100, 101, 102; then, through the proxy, slot
+    /// 11 set to 201 and an upgrade to implementation B (other code). That block is B. After it, slot
+    /// 10 is set to 999 and the proxy downgraded to A, so B's state is not the head's. The statement:
+    /// rule 1 at slot 10, k = 3. What B's state says is read back from the chain at B.
+    pub async fn proxy_at_b(chain: &EvmChain) -> ProxyAtB {
+        let a = chain
+            .deploy(creation(&[], &IMPLEMENTATION_RUNTIME), "deploy implementation A")
+            .await;
+        // B: the same, with an unreachable trailing STOP (another code hash).
+        let mut b_runtime = IMPLEMENTATION_RUNTIME.to_vec();
+        b_runtime.push(0x00);
+        let b_impl = chain
+            .deploy(creation(&[], &b_runtime), "deploy implementation B")
+            .await;
+        let stores = [
+            (EIP1967_IMPLEMENTATION_SLOT, address_word(a)),
+            (word(10), word(100)),
+            (word(11), word(101)),
+            (word(12), word(102)),
+        ];
+        let proxy = chain
+            .deploy(creation(&stores, &proxy_runtime()), "deploy the proxy")
+            .await;
+        let write = |slot: [u8; 32], value: [u8; 32]| [slot, value].concat();
+        chain
+            .send(Some(proxy), write(word(11), word(201)), "set slot 11 through the proxy")
+            .await;
+        let upgrade = chain
+            .send(
+                Some(proxy),
+                write(EIP1967_IMPLEMENTATION_SLOT, address_word(b_impl)),
+                "upgrade the proxy to implementation B",
+            )
+            .await;
+        let b_hash = upgrade.block_hash.expect("the upgrade's block");
+        // A working proxy: a call reaches implementation B through DELEGATECALL.
+        let answer = chain
+            .provider
+            .call(TransactionRequest::default().to(proxy).input(Bytes::from(vec![0x12, 0x34]).into()))
+            .await
+            .expect("eth_call through the proxy");
+        assert_eq!(answer.as_ref(), word(42), "the proxy delegates");
+        // After B.
+        chain
+            .send(Some(proxy), write(word(10), word(999)), "set slot 10 through the proxy, after B")
+            .await;
+        chain
+            .send(
+                Some(proxy),
+                write(EIP1967_IMPLEMENTATION_SLOT, address_word(a)),
+                "downgrade the proxy to implementation A, after B",
+            )
+            .await;
+        let head = BlockId::Number(BlockNumberOrTag::Latest);
+        assert_eq!(chain.storage(proxy, word(10), head).await, word(999));
+        assert_eq!(chain.storage(proxy, EIP1967_IMPLEMENTATION_SLOT, head).await, address_word(a));
+
+        let statement = Statement {
+            block_hash: b_hash.0,
+            proxy: proxy.0 .0,
+            rule: Rule::new(RuleKind::Consecutive, &word(10)).unwrap(),
+            k: 3,
+        };
+        // What B's state says, read from the chain at B.
+        let at_b = BlockId::hash(b_hash);
+        let implementation = Address::from_word(B256::from(
+            chain.storage(proxy, EIP1967_IMPLEMENTATION_SLOT, at_b).await,
+        ));
+        let code = chain
+            .provider
+            .get_code_at(implementation)
+            .block_id(at_b)
+            .await
+            .expect("eth_getCode");
+        let mut values = Vec::new();
+        for slot in statement.rule.slots(&implementation.0 .0, statement.k) {
+            values.push(chain.storage(proxy, slot, at_b).await);
+        }
+        assert_eq!(implementation, b_impl, "B's implementation is B");
+        assert_eq!(values, vec![word(100), word(201), word(102)], "B's values");
+        ProxyAtB {
+            statement,
+            implementation,
+            code_hash: keccak256(&code),
+            values,
+        }
+    }
+
+    /// `zkminer artifact publish FILE --kind builder` to the fork, from a fresh funded key in a
+    /// keystore, its password on fd 3, one send a second (developer mode allows the floor below
+    /// Hemi's 12 s). The JSON it prints.
+    pub async fn publish_with_the_cli(
+        world: &World,
+        dir: &Path,
+        config: &Path,
+        file: &Path,
+    ) -> serde_json::Value {
+        let key = PrivateKeySigner::random();
+        set_balance(&world.provider, key.address(), 10 * HEMI).await;
+        PrivateKeySigner::encrypt_keystore(
+            dir,
+            &mut rand::thread_rng(),
+            key.to_bytes(),
+            "pw",
+            Some("publisher"),
+        )
+        .unwrap();
+        let mut fds = [0i32; 2];
+        // SAFETY: a valid array of two fds.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the write end is ours.
+        let mut w = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1]) };
+        w.write_all(b"pw\n").unwrap();
+        drop(w);
+        let read_end = fds[0];
+        let chain = DEPLOYMENT.chain_id.to_string();
+        let file = file.display().to_string();
+        let keystore = dir.join("publisher").display().to_string();
+        let args = [
+            "publish",
+            &file,
+            "--kind",
+            "builder",
+            "--rpc-url",
+            &world.rpc_url,
+            "--chain-id",
+            &chain,
+            "--keystore",
+            &keystore,
+            "--password-fd",
+            "3",
+            "--block-time-ms",
+            "1000",
+            "--yes",
+            "--json",
+        ];
+        let mut cmd = Miner::command(dir, config, &[], "artifact", &args, &[]);
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                // `dup2` onto itself, when the read end already is 3, would leave it close-on-exec.
+                if read_end != 3 && libc::dup2(read_end, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        let out = tokio::task::spawn_blocking(move || cmd.output())
+            .await
+            .unwrap()
+            .expect("run zkminer artifact publish");
+        // SAFETY: the parent's copy of the read end.
+        unsafe { libc::close(read_end) };
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        std::fs::write(dir.join("artifact-publish.log"), &stderr).unwrap();
+        assert!(out.status.success(), "artifact publish: {stderr}");
+        eprintln!(
+            "localnet: artifact publish took {:.0} s",
+            started.elapsed().as_secs_f64()
+        );
+        serde_json::from_slice(&out.stdout).expect("artifact publish --json prints JSON")
+    }
+
+    /// `zkminer` (from the run directory, as the miner runs) with `args`; its output, required to
+    /// succeed.
+    fn zkminer_ok(dir: &Path, config: &Path, sub: &str, args: &[&str]) -> String {
+        let out = Miner::command(dir, config, &[], sub, args, &[])
+            .output()
+            .unwrap_or_else(|e| panic!("run zkminer {sub} {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "zkminer {sub} {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The §12 job, made as a requester makes it: the job spec encoded by `zkminer witness envelope
+    /// encode` (the builder's sha256 as its builderId, the descriptor file), its binding computed
+    /// from the requester's own parameters by `zkminer witness binding compute` and checked by
+    /// `binding check`: FIELDS over the 160-byte header after the journal-prefix marker, assigned to
+    /// `prover`.
+    pub fn proxy_slots_descriptor(
+        dir: &Path,
+        config: &Path,
+        program: &Program,
+        prover: Address,
+        locator: &str,
+        wasm: &Path,
+        p: &ProxyAtB,
+    ) -> JobDescriptor {
+        let words: Vec<String> = p
+            .statement
+            .header_words()
+            .iter()
+            .map(|w| format!("word:0x{}", alloy::hex::encode(w)))
+            .collect();
+        let spec = dir.join("proxy-slots-job.toml");
+        std::fs::write(
+            &spec,
+            format!(
+                "program_id = \"{id}\"\nassigned_prover = \"{prover}\"\n\
+                 [binding]\nprefix = true\nheader = {words:?}\n\
+                 [envelope]\nbuilder_uris = [\"{locator}\"]\nbuilder_params = \"0x{params}\"\n\
+                 [[envelope.sources]]\nclass = \"evm-rpc/v1\"\nchain_id = {EVM_CHAIN_ID}\narchive = true\n\
+                 method_set = \"state-read\"\nmax_proof_age = 1000\n\
+                 [envelope.limits]\nmax_fetches = 8\nmax_fetch_bytes = 4194304\nmax_request_bytes = 65536\n\
+                 max_response_bytes = 1048576\nmax_builder_fuel = 5000000000\n\
+                 max_builder_memory_bytes = 67108864\nmax_builder_seconds = 60\nmax_witness_bytes = 1048576\n\
+                 max_guest_cycles = {max_cycles}\n",
+                id = program.id,
+                params = alloy::hex::encode(p.statement.builder_params(EVM_CHAIN_ID)),
+                // The guest runs in one 2^20 segment here; within the CPU slot's derived maximum at a
+                // 1,800 s watchdog (about 3M sized cycles at the CPU floor rate).
+                max_cycles = 1u64 << 21,
+            ),
+        )
+        .unwrap();
+        let d_path = dir.join("proxy-slots-job.json");
+        let (spec_s, wasm_s, d_s) = (
+            spec.display().to_string(),
+            wasm.display().to_string(),
+            d_path.display().to_string(),
+        );
+        zkminer_ok(
+            dir,
+            config,
+            "witness",
+            &["envelope", "encode", &spec_s, "--builder", &wasm_s, "--descriptor-out", &d_s],
+        );
+        let d: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&d_path).unwrap()).expect("the descriptor file");
+        let b256 = |k: &str| -> B256 { d[k].as_str().unwrap().parse().unwrap() };
+        let bytes = |k: &str| -> Bytes { d[k].as_str().unwrap().parse().unwrap() };
+
+        // The binding from the requester's own parameters, by the separate calculator.
+        let mut args = vec!["binding", "compute", "--json"];
+        for w in &words {
+            args.extend(["--word", w.as_str()]);
+        }
+        let out: serde_json::Value =
+            serde_json::from_str(&zkminer_ok(dir, config, "witness", &args)).unwrap();
+        let computed = &out["binding"];
+        assert_eq!(computed["mode"], "fields", "{out}");
+        assert_eq!(computed["prefix"], true, "{out}");
+        assert_eq!(computed["headerBytes"], 160, "{out}");
+        assert_eq!(out["check"]["ok"], true, "the mutation check over the header: {out}");
+        let fields: B256 = computed["journalFields"].as_str().unwrap().parse().unwrap();
+        let expected: B256 = computed["expectedJournalHash"].as_str().unwrap().parse().unwrap();
+        assert_eq!(fields, B256::from(hemiprove_proxy_slots::journal_fields()), "FIELDS: the marker, then [0, 160)");
+        assert_eq!(expected, B256::from(p.statement.expected_journal_hash()));
+        assert_eq!((b256("journalFields"), b256("expectedJournalHash")), (fields, expected), "envelope encode agrees");
+        // And the mutation check over the whole header.
+        let header = format!("0x{}", alloy::hex::encode(p.statement.header()));
+        zkminer_ok(
+            dir,
+            config,
+            "witness",
+            &["binding", "check", "--descriptor", &d_s, "--statement", &header, "--header-bytes", "160"],
+        );
+
+        let descriptor = JobDescriptor {
+            programId: b256("programId"),
+            proofSystemId: b256("proofSystemId"),
+            callbackContract: d["callbackContract"].as_str().unwrap().parse().unwrap(),
+            assignedProver: d["assignedProver"].as_str().unwrap().parse().unwrap(),
+            tag: b256("tag"),
+            inputData: bytes("inputData"),
+            callbackExtraData: bytes("callbackExtraData"),
+            extraVerifierData: bytes("extraVerifierData"),
+            expectedJournalHash: b256("expectedJournalHash"),
+            journalFields: b256("journalFields"),
+        };
+        assert_eq!(descriptor.programId, program.id);
+        assert_eq!(descriptor.proofSystemId, program.proof_system);
+        assert_eq!(descriptor.assignedProver, prover);
+        descriptor
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a delegated cgroup, anvil, the SDK toolchain and the 743111 RPC; see the witness section"]
+async fn serves_witness_jobs() {
+    use witness_support::*;
+
+    let dir = RunDir::new("witness");
+    let bins = bins();
+    let wasm = params_echo_wasm();
+    let program = Program::fibonacci(&bins.cpu_worker, &dir.0);
+    let journal = program.journal.clone();
+    let mut wrong = journal.clone();
+    wrong[0] ^= 1;
+    let world = World::new(&dir.0, program, &[], Clock::Wall).await;
+    let locator = world.publish_hemi_code(&wasm).await;
+    eprintln!("localnet: params-echo published at {locator}");
+
+    // Three witness jobs: an allowlisted caller's good one and bad one, and an outsider's.
+    let outsider = Address::from_word(keccak256(b"zkminer localnet witness outsider"));
+    world.fund_deposits(U256::from(10 * JOB_PRICE)).await;
+    world.fund_caller(outsider, U256::from(10 * JOB_PRICE)).await;
+    let n = fib_n();
+    let good = world
+        .submit_witness(
+            world.submitter,
+            witness_descriptor(&world.program, &wasm, &locator, n, &journal, "good"),
+            "submit the good witness job",
+        )
+        .await;
+    let bad = world
+        .submit_witness(
+            world.submitter,
+            witness_descriptor(&world.program, &wasm, &locator, n, &wrong, "bad binding"),
+            "submit the bad-binding witness job",
+        )
+        .await;
+    let foreign = world
+        .submit_witness(
+            outsider,
+            witness_descriptor(&world.program, &wasm, &locator, n, &journal, "outsider"),
+            "submit the outsider's witness job",
+        )
+        .await;
+    eprintln!(
+        "localnet: witness jobs good {} bad {} outsider {}",
+        short_id(good),
+        short_id(bad),
+        short_id(foreign)
+    );
+
+    // The miner's config: the fork, witness serving with the allowlist, the store, the broker (the
+    // fork as its evm-rpc endpoint for 743111 and its artifact endpoint). The host proves on a CPU
+    // slot, with a watchdog sized for a CPU proof.
+    let broker_config =
+        write_broker_config(&dir.0, &[("fork", &world.rpc_url, DEPLOYMENT.chain_id)], &world.rpc_url);
+    let (config, store_dir) =
+        witness_miner_config(&world, &dir, &bins, broker_config, &bins.cpu_worker, false, 1_800);
+
+    let nonce_before = world.prover_nonce().await;
+    let mut miner = start_mining(&world, &dir, &config, Vec::new(), false);
+    let started = Instant::now();
+    let timeout = Duration::from_secs(1_200);
+    loop {
+        let fulfilled = world.jobs_with::<IHemiProveFulfill::JobFulfilled>().await;
+        if fulfilled.contains(&good) {
+            break;
+        }
+        if miner.exited() {
+            miner.fail("zkminer exited before the witness job was fulfilled");
+        }
+        if started.elapsed() > timeout {
+            miner.fail("the witness job was not fulfilled in time");
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let (sg, sb, sf) = (short_id(good), short_id(bad), short_id(foreign));
+    if !wait_for_line(&mut miner, &format!("WITNESS-LOCK {sg}: bundle deleted"), Duration::from_secs(120)).await {
+        miner.fail("the fulfilled witness job's bundle was not deleted");
+    }
+    if !wait_for_line(&mut miner, &format!("witness job {sb}: skipped — BindingMismatch"), Duration::from_secs(300)).await {
+        miner.fail("the bad-binding witness job was not skipped for its binding");
+    }
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(DRAIN_GRACE);
+    let lines = miner.lines();
+
+    let mut failures: Vec<String> = stop_failure(stopped, DRAIN_GRACE).into_iter().collect();
+    let pos = |needle: &str| lines.iter().position(|l| l.contains(needle));
+    // The good job: simulated, pinned before the claim, claimed, proved, fulfilled, deleted.
+    failures.extend(lock_step_failures(&lines, good));
+    // The claim gate's estimate was realistic: at least what the CPU proof took, and inside the
+    // watchdog it was checked against.
+    let (estimated, proved) = estimate_and_proof_secs(&lines, good);
+    eprintln!("localnet: the claim gate estimated {estimated:?} s; the CPU proof took {proved:?} s");
+    match (estimated, proved) {
+        (Some(e), Some(p)) => {
+            if e < p {
+                failures.push(format!("the claim gate estimated {e} s, the proof took {p} s"));
+            }
+            if e >= 1_800.0 {
+                failures.push(format!("the claim gate admitted a {e} s estimate at a 1,800 s watchdog"));
+            }
+        }
+        _ => failures.push("no claim-gate estimate or proof time in the log".into()),
+    }
+    failures.extend(fulfil_failures(&world, good, &journal).await.into_iter().map(|f| format!("the good job: {f}")));
+    // Its bundle and pin are gone from the store.
+    failures.extend(store_failures(&store_dir, good));
+    // The bad binding: simulated, never claimed. The outsider's: never simulated, never claimed.
+    let claims = world.logs::<IHemiProveCore::JobClaimed>().await;
+    for (id, what) in [(bad, "the bad-binding job"), (foreign, "the outsider's job")] {
+        if claims.iter().any(|(j, _)| *j == id) {
+            failures.push(format!("{what} was claimed"));
+        }
+        let (status, prover) = world.job_state(id).await;
+        if status != zkminer_chain::jobs::JOB_STATUS_OPEN || prover != Address::ZERO {
+            failures.push(format!("{what} ends with status {status} prover {prover}"));
+        }
+    }
+    if pos(&format!("witness job {sf}: simulating")).is_some() {
+        failures.push("the outsider's job was simulated".into());
+    }
+    if pos(&format!("witness job {sb}: simulating")).is_none() {
+        failures.push("the bad-binding job was never simulated".into());
+    }
+    eprintln!(
+        "localnet: outsider recognised: {}",
+        pos(&format!("witness job {sf}: caller")).is_some()
+            || pos(&format!("job {sf} is a witness-construction job")).is_some()
+    );
+    // Exactly a claim and a fulfil were sent, and nothing is left locked.
+    let nonce_after = world.prover_nonce().await;
+    if nonce_after.checked_sub(nonce_before) != Some(2) {
+        failures.push(format!(
+            "the prover's nonce moved from {nonce_before} to {nonce_after}, not by a claim and a fulfil"
+        ));
+    }
+    let stake = world.stake().await;
+    if stake.lockedCollateral != 0 {
+        failures.push(format!("{} HEMI of collateral still locked", hemi(stake.lockedCollateral)));
+    }
+    report(&world, &dir, &miner, &failures).await;
+    drop(world);
+    dir.finish();
+}
+
+/// Plan §12's job on the miner, proven on the CPU worker: see the witness section.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a delegated cgroup, anvil, the risc0 and SDK toolchains and the 743111 RPC; see the witness section"]
+async fn serves_the_proxy_slots_witness_job() {
+    proxy_slots_witness_job(false).await;
+}
+
+/// Plan §12's job on the miner, proven on a GPU by `ZKMINER_LOCALNET_RISC0_WORKER`: see the witness
+/// section.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a GPU, its release risc0 worker, a delegated cgroup, anvil, the risc0 and SDK toolchains and the 743111 RPC"]
+async fn serves_the_proxy_slots_witness_job_on_a_gpu() {
+    proxy_slots_witness_job(true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn proxy_slots_witness_job(gpu: bool) {
+    use witness_support::*;
+
+    let dir = RunDir::new(if gpu { "proxy-slots-gpu" } else { "proxy-slots" });
+    let bins = bins();
+    let worker = if gpu { risc0_worker() } else { bins.cpu_worker.clone() };
+    let wasm = proxy_slots_wasm();
+    let wasm_path = dir.0.join("proxy_slots_builder.wasm");
+    std::fs::write(&wasm_path, &wasm).unwrap();
+    let (elf, id) = proxy_slots_guest(&dir.0);
+    eprintln!("localnet: the proxy-slots guest's image id is {id}");
+
+    // The second chain and the statement: the proxy at B.
+    let chain = EvmChain::start(&dir.0).await;
+    let proxy = proxy_at_b(&chain).await;
+    eprintln!(
+        "localnet: on chain {EVM_CHAIN_ID} at {}: proxy {} -> implementation {} (code hash {}), values {}",
+        chain.url,
+        Address::from(proxy.statement.proxy),
+        proxy.implementation,
+        proxy.code_hash,
+        proxy.values.iter().map(alloy::hex::encode).collect::<Vec<_>>().join(", ")
+    );
+
+    // The fork, with the guest registered and served.
+    let program = Program {
+        name: "proxy-slots, plan §12 (zkminer localnet)",
+        id,
+        proof_system: risc_zero_groth16_v1_id(),
+        elf,
+        input: Vec::new(),
+        journal: Vec::new(),
+    };
+    let world = World::new(&dir.0, program, &[], Clock::Wall).await;
+
+    // The miner's config (the publisher reads developer mode from it): the broker's evm-rpc endpoint
+    // is the second chain, its artifact endpoint the fork.
+    let broker_config =
+        write_broker_config(&dir.0, &[("evm", &chain.url, EVM_CHAIN_ID)], &world.rpc_url);
+    let discover = gpu && std::env::var_os("CUDA_VISIBLE_DEVICES").is_none();
+    let proving_timeout_secs = if gpu { 600 } else { 3_600 };
+    let (config, store_dir) = witness_miner_config(
+        &world,
+        &dir,
+        &bins,
+        broker_config,
+        &worker,
+        discover,
+        proving_timeout_secs,
+    );
+
+    // The builder, published by the requester's tool.
+    let published = publish_with_the_cli(&world, &dir.0, &config, &wasm_path).await;
+    let locator = published["locator"].as_str().unwrap().to_string();
+    assert!(locator.starts_with("hemi-code://743111/0x"), "{published}");
+    let builder_id: B256 = published["builderId"].as_str().unwrap().parse().unwrap();
+    assert_eq!(builder_id, B256::from(zkminer_witness::manifest::sha256(&wasm)));
+    eprintln!("localnet: the proxy-slots builder published at {locator}");
+
+    // The job, made by the requester tools and submitted with an exclusivity window for the prover.
+    let descriptor = proxy_slots_descriptor(
+        &dir.0,
+        &config,
+        &world.program,
+        world.prover.address(),
+        &locator,
+        &wasm_path,
+        &proxy,
+    );
+    world.fund_deposits(U256::from(10 * JOB_PRICE)).await;
+    let mut auction = fixed_price(JOB_PRICE);
+    auction.exclusivityDuration = U40::from(EXCLUSIVITY.as_secs());
+    let job = world
+        .submit_witness_with(world.submitter, descriptor, auction, "submit the proxy-slots witness job")
+        .await;
+    let journal = proxy.journal(job, world.prover.address());
+    eprintln!("localnet: proxy-slots witness job {job}");
+
+    let nonce_before = world.prover_nonce().await;
+    let mut miner = start_mining(&world, &dir, &config, Vec::new(), false);
+    let started = Instant::now();
+    let timeout = Duration::from_secs(if gpu { 1_800 } else { 5_400 });
+    loop {
+        if world.jobs_with::<IHemiProveFulfill::JobFulfilled>().await.contains(&job) {
+            break;
+        }
+        if miner.exited() {
+            miner.fail("zkminer exited before the proxy-slots job was fulfilled");
+        }
+        if started.elapsed() > timeout {
+            miner.fail("the proxy-slots job was not fulfilled in time");
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    let fulfilled_after = started.elapsed();
+    let s = short_id(job);
+    if !wait_for_line(&mut miner, &format!("WITNESS-LOCK {s}: bundle deleted"), Duration::from_secs(120)).await {
+        miner.fail("the fulfilled proxy-slots job's bundle was not deleted");
+    }
+    tokio::time::sleep(SETTLE).await;
+    let stopped = miner.stop(DRAIN_GRACE);
+    let lines = miner.lines();
+
+    let mut failures: Vec<String> = stop_failure(stopped, DRAIN_GRACE).into_iter().collect();
+    // Simulated before the claim, pinned, claimed, proved (execute, compare, prove), fulfilled with
+    // fulfillJobHashed, deleted.
+    failures.extend(lock_step_failures(&lines, job));
+    // `JobFulfilled.publicValues`: exactly the journal of the second chain's state at B.
+    failures.extend(fulfil_failures(&world, job, &journal).await);
+    let fulfils = world.logs::<IHemiProveFulfill::JobFulfilled>().await;
+    if let Some((_, f)) = fulfils.iter().find(|(j, _)| *j == job) {
+        match hemiprove_proxy_slots::decode_journal(&f.event.publicValues) {
+            Ok(j) => {
+                if j.statement != proxy.statement
+                    || j.prefix.job_id() != job.0
+                    || Address::from(j.prefix.prover()) != world.prover.address()
+                    || Address::from(j.outputs.implementation) != proxy.implementation
+                    || j.outputs.code_hash != proxy.code_hash.0
+                    || j.outputs.slots.iter().map(|(_, v)| *v).collect::<Vec<_>>() != proxy.values
+                {
+                    failures.push(format!("the fulfilled journal says {j:?}"));
+                }
+            }
+            Err(e) => failures.push(format!("the fulfilled journal does not decode: {e:?}")),
+        }
+    }
+    failures.extend(store_failures(&store_dir, job));
+    let (estimated, proved) = estimate_and_proof_secs(&lines, job);
+    let proofs: Vec<&String> = lines.iter().filter(|l| l.contains("Proof complete on ")).collect();
+    eprintln!(
+        "localnet: fulfilled {:.0} s after the miner started; the claim gate estimated {estimated:?} s, \
+         the proof took {proved:?} s; {proofs:?}",
+        fulfilled_after.as_secs_f64()
+    );
+    match (estimated, proved) {
+        (Some(e), Some(_)) if e >= proving_timeout_secs as f64 => failures.push(format!(
+            "the claim gate admitted a {e} s estimate at a {proving_timeout_secs} s watchdog"
+        )),
+        (Some(_), Some(_)) => {}
+        _ => failures.push("no claim-gate estimate or proof time in the log".into()),
+    }
+    // The proving slot, by its key: a worker named outright (CUDA_VISIBLE_DEVICES set) has no
+    // discovered card name, so the line's `[…]` reads `cpu` for it whatever it runs on.
+    let slots: Vec<&str> = proofs
+        .iter()
+        .filter_map(|l| l.split_once("Proof complete on ")?.1.split_once(' ').map(|(k, _)| k))
+        .collect();
+    if gpu && (slots.len() != 1 || slots[0].ends_with(":cpu") || slots[0].contains(":measure")) {
+        failures.push(format!("not one proof on a GPU slot: {proofs:?}"));
+    }
+    let nonce_after = world.prover_nonce().await;
+    if nonce_after.checked_sub(nonce_before) != Some(2) {
+        failures.push(format!(
+            "the prover's nonce moved from {nonce_before} to {nonce_after}, not by a claim and a fulfil"
+        ));
+    }
+    let stake = world.stake().await;
+    if stake.lockedCollateral != 0 {
+        failures.push(format!("{} HEMI of collateral still locked", hemi(stake.lockedCollateral)));
+    }
+    report(&world, &dir, &miner, &failures).await;
+    drop(world);
+    drop(chain);
+    dir.finish();
 }

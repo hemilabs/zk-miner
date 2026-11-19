@@ -14,9 +14,14 @@ use crate::dispatcher::WorkerPool;
 static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
 
 /// Initialize the global worker pool. Must be called after config is loaded,
-/// before TUI starts rendering. Subsequent calls are ignored.
+/// before TUI starts rendering. Subsequent calls are ignored. Starts the thread that tries a
+/// declined worker slot again after its backoff (`WorkerPool::start_decline_retries`).
 pub fn init_worker_pool(pool: WorkerPool) {
-    WORKER_POOL.set(pool).ok();
+    if WORKER_POOL.set(pool).is_ok() {
+        if let Some(pool) = WORKER_POOL.get() {
+            pool.start_decline_retries();
+        }
+    }
 }
 
 /// Returns the global worker pool, or None if not yet initialized.

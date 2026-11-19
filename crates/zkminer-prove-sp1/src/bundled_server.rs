@@ -39,8 +39,20 @@ const COMPANIONS: &[&str] = &[
 #[cfg(not(windows))]
 const COMPANIONS: &[&str] = &[];
 
-/// Installs the server shipped beside this executable, if there is one; see the module docs.
-/// Never fails the worker: without it the SDK runs whatever is installed, as before.
+/// Why the server shipped beside this worker could not be installed, if it could not
+/// ([`install_bundled_server`]).
+static INSTALL_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Why the server this release ships beside the worker is not the one installed, if
+/// [`install_bundled_server`] could not install it. A worker that proves then declines SP1
+/// (`sp1_usability`): whatever is installed instead is not the build this worker was made for, and
+/// may need what its confinement no longer gives (the named `/dev/shm` objects of an older one).
+pub(crate) fn install_failure() -> Option<&'static str> {
+    INSTALL_FAILURE.get().map(String::as_str)
+}
+
+/// Installs the server shipped beside this executable, if there is one; see the module docs. Does
+/// not fail the worker itself: a failure is kept for [`install_failure`].
 pub(crate) fn install_bundled_server() {
     if std::env::var(INSTALL_ENV).is_ok_and(|value| value.trim() == "0") {
         return;
@@ -62,6 +74,7 @@ pub(crate) fn install_bundled_server() {
         Ok(target) => target,
         Err(e) => {
             tracing::warn!("not installing {}: {e:#}", bundled.display());
+            let _ = INSTALL_FAILURE.set(format!("not installing {}: {e:#}", bundled.display()));
             return;
         }
     };
@@ -70,12 +83,16 @@ pub(crate) fn install_bundled_server() {
     match install(&bundled, &target) {
         Ok(true) => tracing::info!("installed {} as {}", bundled.display(), target.display()),
         Ok(false) => tracing::debug!("{} is already installed", bundled.display()),
-        Err(e) => tracing::warn!(
-            "could not install {} as {} ({e:#}); the SDK will run what is there, or download \
-             upstream's server, which lacks this release's GPU fixes",
-            bundled.display(),
-            target.display()
-        ),
+        Err(e) => {
+            let failure = format!(
+                "could not install {} as {} ({e:#}), and what is there instead is not the server \
+                 this release ships",
+                bundled.display(),
+                target.display()
+            );
+            tracing::warn!("{failure}");
+            let _ = INSTALL_FAILURE.set(failure);
+        }
     }
     // What the server loads from beside itself, shipped beside it in turn.
     if let (Some(from_dir), Some(to_dir)) = (bundled.parent(), target.parent()) {
