@@ -82,6 +82,9 @@ pub const RISC0_EXECUTE_PEAK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// can only ever LOWER the enforced cap — never raise it above SP1's own default nor past what the
 /// host can actually admit (which would desync the charge from the enforced ceiling).
 pub fn sp1_measure_cap_bytes(total: u64) -> u64 {
+    // An RSS ceiling, so bounded by physical memory: on Windows `total` is the commit limit, which
+    // can be larger and moves as the page file grows, and the three places above must agree.
+    let total = total.min(physical_total_bytes().unwrap_or(u64::MAX));
     let mut cap = SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total));
     // /dev/shm clamp (finding H3). The native executor stages the guest memory IMAGE in /dev/shm,
     // whose resident backing grows with touched pages; a tmpfs-FULL write SIGBUSes SYNCHRONOUSLY,
@@ -180,17 +183,124 @@ pub fn dev_shm_capacity_bytes() -> Option<u64> {
     None
 }
 
-/// Windows: `GlobalMemoryStatusEx`'s available physical memory, which, like `MemAvailable`, counts
-/// the reclaimable standby (cache) list as available.
+/// Windows: what can still be allocated, the smaller of free physical memory and free COMMIT
+/// (`windows_figures`).
 #[cfg(windows)]
 pub fn mem_available_bytes() -> Option<u64> {
-    win32::physical_memory().map(|(_, available)| available)
+    win32::memory_status().map(|s| windows_figures(&s).0)
 }
 
-/// Windows: `GlobalMemoryStatusEx`'s total physical memory.
+/// Windows: the commit limit (`windows_figures`).
 #[cfg(windows)]
 pub fn mem_total_bytes() -> Option<u64> {
-    win32::physical_memory().map(|(total, _)| total)
+    win32::memory_status().map(|s| windows_figures(&s).1)
+}
+
+/// Physical memory, in bytes: `mem_total_bytes` except on Windows, where that is the commit limit.
+pub fn physical_total_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        win32::memory_status().map(|s| s.total_phys)
+    }
+    #[cfg(not(windows))]
+    {
+        mem_total_bytes()
+    }
+}
+
+/// What the pressure check (`classify_pressure`) reads as available: `mem_available_bytes`, except
+/// that on Windows the commit `idle` workers hold counts as free, since a proof that needs it stops
+/// them (`WorkerPool::idle_reclaimable_host_bytes`), while free RAM is taken as it is: an idle
+/// worker's commit is far more than what it keeps in RAM.
+pub fn pressure_available_bytes(idle: u64) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let s = win32::memory_status()?;
+        Some(s.avail_phys.min(s.commit_free.saturating_add(idle)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = idle;
+        mem_available_bytes()
+    }
+}
+
+/// Windows: `(commit limit, free commit)`, in bytes: physical memory plus page files, and what of
+/// that no process has committed yet. `None` elsewhere.
+#[cfg(windows)]
+pub fn commit_bytes() -> Option<(u64, u64)> {
+    win32::memory_status().map(|s| (s.commit_limit, s.commit_free))
+}
+
+#[cfg(not(windows))]
+pub fn commit_bytes() -> Option<(u64, u64)> {
+    None
+}
+
+/// What `GlobalMemoryStatusEx` reports, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsMemoryStatus {
+    pub total_phys: u64,
+    pub avail_phys: u64,
+    /// Physical memory plus page files: what all processes together may commit.
+    pub commit_limit: u64,
+    /// The commit limit less what is committed now.
+    pub commit_free: u64,
+}
+
+/// Windows `(available, total)` for admission and the pressure check.
+///
+/// Windows has no overcommit. Every allocation is charged against the commit limit when it is made,
+/// whether or not a page of it is ever touched, and an allocation that would pass the limit FAILS:
+/// a CUDA host allocation, a Rust `Vec`, the driver's own. Free physical memory says nothing about
+/// that. A RISC Zero proof on an RTX 5090 at po2 20 was measured committing 28.4 GB while its working
+/// set stayed at 2-6 GB, so physical memory barely moves while commit runs out, and an admission
+/// check that reads only physical memory admits proofs into a host that cannot hold them. On the
+/// machine this was measured on, free RAM stayed above 70 GB while free commit fell from 70 GB to
+/// 7 GB during one SP1 proof.
+///
+/// So `available` is the smaller of the two: free physical memory (past it, Windows pages, which
+/// stalls the desktop) and free commit (past it, allocations fail and proofs crash). `total` is the
+/// commit limit, what every charge here (`unmeasured_peak_for`, `learned_host_peak`) is a share of:
+/// a larger page file raises it, and the proofs that fit with it.
+pub fn windows_figures(s: &WindowsMemoryStatus) -> (u64, u64) {
+    (s.avail_phys.min(s.commit_free), s.commit_limit)
+}
+
+/// Windows: what a process and every process it started (`process_tree`) have committed, summed:
+/// `(now, peak)`, in bytes. Peak is each process's own high-water mark, so the sum can exceed the
+/// tree's real simultaneous peak, which is the safe direction for a budget. `None` when the root
+/// cannot be read (exited, or a different process with the number).
+///
+/// Committed memory (`PagefileUsage`, the process's private commit charge) and not the working set:
+/// commit is what runs out (`windows_figures`), and a CUDA prover's commit is many times its working
+/// set.
+#[cfg(windows)]
+pub fn tree_commit_bytes(root: u32, root_started: Option<u64>) -> Option<(u64, u64)> {
+    let tree = process_tree(root, root_started);
+    let (root_pid, _) = *tree.first()?;
+    let mut now = 0u64;
+    let mut peak = 0u64;
+    let mut root_read = false;
+    for (pid, started) in tree {
+        let Some(process) = win32::open(
+            pid,
+            win32::PROCESS_QUERY_LIMITED_INFORMATION | win32::PROCESS_VM_READ,
+        ) else {
+            continue;
+        };
+        // The number may have been reused since the tree was walked.
+        if process.creation_time() != Some(started) {
+            continue;
+        }
+        let Some((n, p)) = process.commit() else {
+            continue;
+        };
+        root_read |= pid == root_pid;
+        now = now.saturating_add(n);
+        peak = peak.saturating_add(p);
+    }
+    root_read.then_some((now, peak))
 }
 
 /// Pull one `kB` field out of `/proc/meminfo` and return it in bytes.
@@ -295,7 +405,9 @@ fn oom_events_path() -> Option<std::path::PathBuf> {
 /// summing past RAM is admission control's job, where it can be done with knowledge of what is
 /// already in flight.
 pub fn worker_memory_ceiling_bytes(reserve: u64) -> Option<u64> {
-    let total = mem_total_bytes()?;
+    // Physical memory, not Windows' commit limit (`mem_total_bytes` there): SP1 sizes pinned host
+    // buffers from this, and pinned memory has to sit in RAM.
+    let total = physical_total_bytes()?;
     total.checked_sub(reserve).filter(|c| *c > 0)
 }
 
@@ -729,6 +841,7 @@ mod win32 {
     use std::ffi::c_void;
 
     pub const PROCESS_TERMINATE: u32 = 0x0001;
+    pub const PROCESS_VM_READ: u32 = 0x0010;
     pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
     #[repr(C)]
@@ -751,8 +864,8 @@ mod win32 {
         avail_extended_virtual: u64,
     }
 
-    /// `(total, available)` physical memory, in bytes.
-    pub fn physical_memory() -> Option<(u64, u64)> {
+    /// Physical memory and commit, in bytes.
+    pub fn memory_status() -> Option<super::WindowsMemoryStatus> {
         let mut status = MemoryStatusEx {
             length: std::mem::size_of::<MemoryStatusEx>() as u32,
             memory_load: 0,
@@ -765,7 +878,30 @@ mod win32 {
             avail_extended_virtual: 0,
         };
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        (ok != 0).then_some((status.total_phys, status.avail_phys))
+        (ok != 0).then_some(super::WindowsMemoryStatus {
+            total_phys: status.total_phys,
+            avail_phys: status.avail_phys,
+            // `ullTotalPageFile`/`ullAvailPageFile` are, despite their names, the commit limit and
+            // what is left of it.
+            commit_limit: status.total_page_file,
+            commit_free: status.avail_page_file,
+        })
+    }
+
+    /// `PROCESS_MEMORY_COUNTERS`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
     }
 
     const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
@@ -850,6 +986,11 @@ mod win32 {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
+        fn K32GetProcessMemoryInfo(
+            handle: *mut c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
         fn GetProcessTimes(
             handle: *mut c_void,
             creation: *mut FileTime,
@@ -877,6 +1018,20 @@ mod win32 {
 
         pub fn terminate(&self) -> bool {
             unsafe { TerminateProcess(self.0, 1) != 0 }
+        }
+
+        /// `(committed now, peak committed)`: the process's private commit charge and its
+        /// high-water mark, in bytes. Needs `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`.
+        pub fn commit(&self) -> Option<(u64, u64)> {
+            let mut counters = ProcessMemoryCounters {
+                cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+                ..Default::default()
+            };
+            let ok = unsafe { K32GetProcessMemoryInfo(self.0, &mut counters, counters.cb) };
+            (ok != 0).then_some((
+                counters.pagefile_usage as u64,
+                counters.peak_pagefile_usage as u64,
+            ))
         }
     }
 
@@ -1114,8 +1269,20 @@ pub fn plan_measure_preemption(
 /// An UNKNOWN name is the one case that gets the expensive figure. It is not a backend we have
 /// characterised, it could be any of them, and it is also what a malformed slot key degrades to —
 /// in which case refusing work is the right failure.
+///
+/// Windows charges COMMIT, not resident memory (`windows_figures`), and its figures are what was
+/// measured there, on an RTX 5090: a RISC Zero proof at po2 20 committed 28.4 GB, and an SP1 proof
+/// 62.7 GiB at once (worker and server, 33.6 GiB of it kept between proofs). Until a proof on a
+/// card has been measured (`learned_host_peak`), its backend is charged these.
 pub fn unmeasured_peak_for(backend: &str) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
+    if cfg!(windows) {
+        return match backend {
+            "risc0" | "openvm" => 30 * GIB,
+            "mock" => 64 * 1024 * 1024,
+            _ => 64 * GIB,
+        };
+    }
     match backend {
         "risc0" | "openvm" => 6 * GIB,
         // `mock_worker` speaks the protocol and allocates nothing; `crates/zkminer-prover/src/bin/`
@@ -1227,6 +1394,54 @@ pub fn peak_for_po2(baseline_peak: u64, po2: u8) -> u64 {
     baseline_peak.saturating_mul(1u64.checked_shl(steps.min(16) as u32).unwrap_or(u64::MAX))
 }
 
+/// The host memory one card's real proofs have reached, by the po2 they proved at (`BASELINE_PO2`
+/// for a proof given none), in bytes. Windows only: see `learned_host_peak`.
+pub type LearnedPeaks = std::collections::BTreeMap<u8, u64>;
+
+/// A learned peak is charged at this many eighths of itself: jobs differ, and the next one may
+/// reach a little further than any so far.
+pub const LEARNED_PEAK_MARGIN_EIGHTHS: u64 = 9;
+
+/// Note that a proof at `po2` on a card peaked at `peak`; whether the card's figure for that po2
+/// rose. A worker's peak is its lifetime high-water mark, so a later reading never describes less
+/// than an earlier one of the same worker; a lower one comes from a respawned worker, and the
+/// higher figure stands.
+pub fn note_learned_peak(learned: &mut LearnedPeaks, po2: Option<u8>, peak: u64) -> bool {
+    let slot = learned.entry(po2.unwrap_or(BASELINE_PO2)).or_insert(0);
+    let rose = peak > *slot;
+    *slot = (*slot).max(peak);
+    rose
+}
+
+/// What a proof at `po2` is charged on a card whose real proofs reached `learned`, or `None` when
+/// none of them says (no proof there yet at this po2 or above). A peak is what the worker and every
+/// process it started held AT ONCE (`LowWater::tree_peak`), which is what the host must hold. It is
+/// sampled, so a spike shorter than `LOW_WATER_SAMPLE` can be missed; the margin covers some of
+/// that, and a proof that runs the host out drops the card's figure (`forget_learned_host_peak`).
+/// The sum of each process's lifetime peak is no floor for it: SP1's Groth16 helper exits, taking
+/// its peak along, and the sampled figure came in above that sum.
+///
+/// The figure of the smallest po2 at or above this one: a proof at a larger segment size bounds a
+/// smaller one, while one at a smaller size says nothing about a larger. With the margin
+/// (`LEARNED_PEAK_MARGIN_EIGHTHS`), never below what is believed at all (`MIN_TRUSTED_PEAK_BYTES`)
+/// and never above what the host can admit (`max_admissible_budget`).
+///
+/// Unlike a benchmark measurement, this one may come in BELOW the blind default
+/// (`unmeasured_peak_for`). The safety factor and the floor in `budget_from_measurement` exist
+/// because a benchmark proves a cheaper workload than a job: a composite receipt, sometimes at a
+/// smaller po2. This is the job itself, Groth16 wrap included, at the po2 it is charged for, on the
+/// card it is charged on, measured as the commit that runs out on Windows. Per card, because cards
+/// of one backend differ: an RTX 4070 at po2 19 and an RTX 5090 at po2 20 are not one figure.
+pub fn learned_host_peak(learned: &LearnedPeaks, po2: Option<u8>, host_total: u64) -> Option<u64> {
+    let (_, &peak) = learned.range(po2.unwrap_or(BASELINE_PO2)..).next()?;
+    Some(
+        (peak / 8)
+            .saturating_mul(LEARNED_PEAK_MARGIN_EIGHTHS)
+            .max(MIN_TRUSTED_PEAK_BYTES)
+            .min(max_admissible_budget(host_total)),
+    )
+}
+
 /// The unmeasured default for `backend`, clamped to what this host can admit.
 ///
 /// The clamp has to apply to the FALLBACK too, not only to the measured path. `budget_from_measurement`
@@ -1284,6 +1499,31 @@ pub fn budget_from_measurement(measured: u64, backend: &str, host_total: u64) ->
 #[derive(Debug, Default)]
 pub struct MemoryLedger {
     reserved: std::sync::atomic::AtomicU64,
+    /// Admissions whose growth is tracked (`try_reserve_tracked`): id -> what was admitted.
+    tracked: std::sync::Mutex<std::collections::HashMap<u64, Tracked>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+/// One tracked admission: on `slot`, `increment` bytes beyond the `resident_at` its worker held
+/// when admitted.
+#[derive(Debug, Clone)]
+struct Tracked {
+    slot: String,
+    increment: u64,
+    resident_at: u64,
+}
+
+/// What admitted proofs have still to allocate: each one's increment, less what its worker has grown
+/// by since (`holding_now` less `resident_at`; all of it when unreadable). Live headroom does not
+/// show an allocation not made yet, so two proofs admitted a moment apart would otherwise each see
+/// the other's share as free.
+pub fn pending_growth(admitted: impl IntoIterator<Item = (u64, u64, Option<u64>)>) -> u64 {
+    admitted
+        .into_iter()
+        .fold(0u64, |sum, (increment, resident_at, holding_now)| {
+            let grown = holding_now.map_or(0, |h| h.saturating_sub(resident_at));
+            sum.saturating_add(increment.saturating_sub(grown))
+        })
 }
 
 /// A reservation held for as long as a proof is running. Releases on drop, including on panic or an
@@ -1291,6 +1531,8 @@ pub struct MemoryLedger {
 pub struct MemoryReservation<'a> {
     ledger: &'a MemoryLedger,
     bytes: u64,
+    /// Its entry in the ledger's tracked admissions, if it has one.
+    tracked: Option<u64>,
 }
 
 impl MemoryReservation<'_> {
@@ -1314,6 +1556,13 @@ impl Drop for MemoryReservation<'_> {
             std::sync::atomic::Ordering::Acquire,
             |v| Some(v.saturating_sub(self.bytes)),
         );
+        if let Some(id) = self.tracked {
+            self.ledger
+                .tracked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
         MEMORY_RELEASED.notify_waiters();
     }
 }
@@ -1367,11 +1616,71 @@ impl MemoryLedger {
                     return Some(MemoryReservation {
                         ledger: self,
                         bytes,
+                        tracked: None,
                     })
                 }
                 Err(observed) => current = observed,
             }
         }
+    }
+
+    /// How many tracked admissions are held: proofs in flight, on Windows.
+    pub fn tracked_count(&self) -> usize {
+        self.tracked.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// What the tracked admissions have still to allocate (`pending_growth`), with `holding` reading
+    /// what a slot's worker holds now.
+    pub fn pending_growth(&self, holding: impl Fn(&str) -> Option<u64>) -> u64 {
+        let tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        pending_growth(
+            tracked
+                .values()
+                .map(|t| (t.increment, t.resident_at, holding(&t.slot))),
+        )
+    }
+
+    /// As `try_reserve`, for a proof on `slot` whose worker allocates as it goes: live headroom is
+    /// taken net of what admissions already in flight have still to allocate (`pending_growth`),
+    /// and this one is tracked until its reservation drops. Admissions through here are serialised,
+    /// so two cannot each count the other's share as free.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_reserve_tracked(
+        &self,
+        bytes: u64,
+        resident: u64,
+        available: u64,
+        total: u64,
+        reserve: u64,
+        slot: &str,
+        holding: impl Fn(&str) -> Option<u64>,
+    ) -> Option<MemoryReservation<'_>> {
+        let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = pending_growth(
+            tracked
+                .values()
+                .map(|t| (t.increment, t.resident_at, holding(&t.slot))),
+        );
+        let mut reservation = self.try_reserve(
+            bytes,
+            resident,
+            available.saturating_sub(pending),
+            total,
+            reserve,
+        )?;
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracked.insert(
+            id,
+            Tracked {
+                slot: slot.to_string(),
+                increment: bytes.saturating_sub(resident),
+                resident_at: resident,
+            },
+        );
+        reservation.tracked = Some(id);
+        Some(reservation)
     }
 }
 
@@ -1433,6 +1742,178 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
     } else {
         PressureState::Ok
     }
+}
+
+/// Free commit (`commit_bytes`) when it started, and the least while it was held, sampled every
+/// `LOW_WATER_SAMPLE` on a thread of its own, plus whenever `sample` is called. Windows only, where
+/// there is no OOM-kill counter to ask how a proof died (`windows_failure_is_host_shortage`);
+/// elsewhere it samples nothing and answers `None`.
+///
+/// Commit, not `mem_available_bytes`: free physical memory running low makes Windows page, which
+/// fails no allocation, so it says nothing about why a proof failed.
+///
+/// Given a worker (`tree`: its pid and start time), it also samples what the worker and every
+/// process it started hold AT ONCE (`tree_peak`): the proof's real peak, which the sum of each
+/// process's own lifetime peak overstates (they need not coincide, and the SP1 server's is
+/// reached outside proofs).
+pub struct LowWater {
+    start: Option<u64>,
+    lowest: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tree_peak: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tree: Option<(u32, u64)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What the worker `tree` (pid, start time) and what it started hold now, committed; Windows only.
+fn tree_commit_now(tree: Option<(u32, u64)>) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let (pid, started) = tree?;
+        tree_commit_bytes(pid, Some(started)).map(|(now, _)| now)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tree;
+        None
+    }
+}
+
+/// How often `LowWater` samples. Commit runs out over seconds as a proof allocates, not in one step.
+pub const LOW_WATER_SAMPLE: Duration = Duration::from_millis(250);
+
+impl LowWater {
+    pub fn start(tree: Option<(u32, u64)>) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        let tree = tree.filter(|(pid, started)| *pid != 0 && *started != 0);
+        let watch = Self {
+            start: commit_bytes().map(|(_, free)| free),
+            lowest: Arc::new(AtomicU64::new(u64::MAX)),
+            tree_peak: Arc::new(AtomicU64::new(0)),
+            tree,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        if cfg!(windows) {
+            watch.sample();
+            let (lowest, peak, stop) = (
+                watch.lowest.clone(),
+                watch.tree_peak.clone(),
+                watch.stop.clone(),
+            );
+            let spawned = std::thread::Builder::new()
+                .name("host-low-water".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(LOW_WATER_SAMPLE);
+                        if let Some((_, free)) = commit_bytes() {
+                            lowest.fetch_min(free, Ordering::AcqRel);
+                        }
+                        if let Some(now) = tree_commit_now(tree) {
+                            peak.fetch_max(now, Ordering::AcqRel);
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::debug!("host low-water sampler not started: {e}");
+            }
+        }
+        watch
+    }
+
+    /// Sample now, as well as on the thread's schedule.
+    pub fn sample(&self) {
+        if let Some((_, free)) = commit_bytes() {
+            self.lowest
+                .fetch_min(free, std::sync::atomic::Ordering::AcqRel);
+        }
+        if let Some(now) = tree_commit_now(self.tree) {
+            self.tree_peak
+                .fetch_max(now, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// The most the worker's tree held at once, of the samples, or `None` if none was read.
+    pub fn tree_peak(&self) -> Option<u64> {
+        Some(self.tree_peak.load(std::sync::atomic::Ordering::Acquire)).filter(|v| *v != 0)
+    }
+
+    /// Free commit when it started, or `None` if it was not read.
+    pub fn started_at(&self) -> Option<u64> {
+        self.start
+    }
+
+    /// The least seen, or `None` if nothing was read.
+    pub fn lowest(&self) -> Option<u64> {
+        Some(self.lowest.load(std::sync::atomic::Ordering::Acquire)).filter(|v| *v != u64::MAX)
+    }
+}
+
+impl Drop for LowWater {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A proof that failed while no more than this much commit was free (`LowWater`) may have failed
+/// for want of it, by `windows_failure_is_host_shortage`. Twice the reserve: an allocation that
+/// fails takes nothing, so at the moment of failure what is free is whatever the failed request
+/// exceeded, and a prover asks for gigabytes at a time.
+pub const HOST_SHORT_LOW_WATER_BYTES: u64 = 2 * DEFAULT_HOST_RESERVE_BYTES;
+
+/// ... and only if free commit FELL at least this much during the proof. A host that merely sits
+/// low (idle workers keep what they committed, and admission lets a warm worker start with little
+/// to spare) has not run out because of anything the proof did; a GPU out of memory there is the
+/// card's.
+pub const HOST_SHORT_FALL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Windows: did a proof fail because the HOST ran short of memory, rather than the card or the
+/// prover? Then it is not the card's fault, and a retry should neither avoid the card nor shrink
+/// what it proves at.
+///
+/// Linux reads its OOM-kill counter for this (`WorkerHandle::died_of_host_oom`). Windows kills
+/// nothing: an allocation past the commit limit fails, and the process that asked dies of it or
+/// reports it. A CUDA host allocation that fails says `cudaErrorMemoryAllocation: out of memory`,
+/// word for word what a card out of memory says, so the text cannot tell them apart, and it may in
+/// any case come from a job's guest program. Two facts can:
+///
+/// * the worker's exit code (`exit_code`, `None` while it lives) is one Windows gives a process that
+///   could not get memory: `STATUS_COMMITMENT_LIMIT`, `STATUS_NO_MEMORY`,
+///   `STATUS_INSUFFICIENT_RESOURCES`, or `ERROR_COMMITMENT_LIMIT` as a plain code;
+/// * or free commit fell during the proof, by `HOST_SHORT_FALL_BYTES` or more from where it
+///   started (`start`), to `HOST_SHORT_LOW_WATER_BYTES` or below (`lowest`).
+///
+/// Neither catches everything: a Rust allocation failure aborts with `0xC0000409`, which other
+/// aborts share, and a single large request that fails leaves commit where it was. Those read as
+/// the worker's failure, as before. The other error, a card out of memory while another proof
+/// drained commit, costs the attempt and goes back to the same card at the same size (for SP1,
+/// lowered on the next out-of-memory there); a host shortage read as the card's excludes a healthy
+/// card from the job and, for SP1, lowers what the card proves at for good.
+pub fn windows_failure_is_host_shortage(
+    exit_code: Option<i32>,
+    start: Option<u64>,
+    lowest: Option<u64>,
+) -> bool {
+    const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+    const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000_009A;
+    const STATUS_COMMITMENT_LIMIT: u32 = 0xC000_012D;
+    const ERROR_COMMITMENT_LIMIT: u32 = 1455;
+    let by_code = exit_code.is_some_and(|c| {
+        matches!(
+            c as u32,
+            STATUS_NO_MEMORY
+                | STATUS_INSUFFICIENT_RESOURCES
+                | STATUS_COMMITMENT_LIMIT
+                | ERROR_COMMITMENT_LIMIT
+        )
+    });
+    let by_fall = match (start, lowest) {
+        (Some(start), Some(lowest)) => {
+            lowest <= HOST_SHORT_LOW_WATER_BYTES
+                && start.saturating_sub(lowest) >= HOST_SHORT_FALL_BYTES
+        }
+        _ => false,
+    };
+    by_code || by_fall
 }
 
 #[cfg(test)]
@@ -1525,7 +2006,8 @@ mod tests {
     #[test]
     fn the_ceiling_leaves_the_reserve_and_refuses_an_impossible_one() {
         // A reserve larger than the machine must yield None rather than a tiny or wrapped ceiling.
-        let total = mem_total_bytes().expect("this host reports MemTotal");
+        // Physical memory (on Windows `mem_total_bytes` is the commit limit).
+        let total = physical_total_bytes().expect("this host reports MemTotal");
         assert!(worker_memory_ceiling_bytes(total + 1).is_none());
         let c = worker_memory_ceiling_bytes(DEFAULT_HOST_RESERVE_BYTES)
             .expect("a 3 GiB reserve fits on any host that can prove");
@@ -2104,9 +2586,26 @@ mod budget_tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    /// The Linux blind default for `backend`, which the 28 GiB box these tests describe charges;
+    /// on Windows the figures are commit, and larger.
+    fn linux_default(backend: &str) -> u64 {
+        if cfg!(windows) {
+            match backend {
+                "risc0" => 6 * GIB,
+                _ => 18 * GIB,
+            }
+        } else {
+            unmeasured_peak_for(backend)
+        }
+    }
+
     /// A raw measurement must never be used as the budget: it comes from a composite receipt at the
     /// default segment size, while production runs a Groth16 wrap at the resolved po2, and this
     /// project's own model has memory doubling per po2 step.
+    ///
+    /// Linux figures: on Windows the blind defaults (commit) are above these readings doubled, so
+    /// the floor answers (`windows_commit_tests`).
+    #[cfg(not(windows))]
     #[test]
     fn a_measurement_is_scaled_before_it_is_trusted() {
         let big = 512 * GIB; // a host large enough that the clamp is not what we are testing
@@ -2201,6 +2700,9 @@ mod budget_tests {
     /// One blunt default for every backend is its own outage: charging risc0 the SP1 figure needs
     /// ~21 GiB free before anything is admitted, so a host with idle workers mines nothing and says
     /// only "cannot fit it right now".
+    /// The Linux figures (resident memory); Windows charges commit, with its own defaults
+    /// (`windows_commit_tests`).
+    #[cfg(not(windows))]
     #[test]
     fn unmeasured_defaults_are_per_backend_and_let_this_box_work() {
         let total = 28 * GIB;
@@ -2245,7 +2747,7 @@ mod budget_tests {
     fn a_resident_worker_is_not_charged_for_its_memory_twice() {
         let total = 28 * GIB;
         let reserve = DEFAULT_HOST_RESERVE_BYTES;
-        let sp1 = unmeasured_peak_for("sp1");
+        let sp1 = linux_default("sp1");
         // Proof #1 on an idle box: admitted.
         assert!(can_admit(sp1, 0, 0, 25 * GIB, total, reserve));
         // sp1-gpu-server is now resident at ~17.6 GiB, so MemAvailable has fallen to ~7.4 GiB and
@@ -2261,7 +2763,7 @@ mod budget_tests {
         // real headroom minus the 3 GiB host reserve leaves 4.4 GiB, and the proof wants 6. That
         // refusal is the gate working, not collateral damage — the bug was only ever the slot whose
         // own worker already holds the pages.
-        let risc0 = unmeasured_peak_for("risc0");
+        let risc0 = linux_default("risc0");
         assert!(!can_admit(risc0, 0, 0, available, total, reserve));
         // Give it genuine room and it is admitted, which is what distinguishes the two cases.
         assert!(can_admit(risc0, 0, 0, 10 * GIB, total, reserve));
@@ -2279,7 +2781,7 @@ mod budget_tests {
     fn an_idle_worker_of_another_backend_is_recycled_to_make_room() {
         let total = 28 * GIB;
         let reserve = DEFAULT_HOST_RESERVE_BYTES;
-        let risc0 = unmeasured_peak_for("risc0");
+        let risc0 = linux_default("risc0");
         // An idle sp1-gpu-server has been observed holding 23.3 GB.
         let sp1_idle = 23_300_000_000;
         let available = total - sp1_idle - GIB;
@@ -2492,5 +2994,315 @@ mod process_tree_tests {
         // A cycle in the recorded parents (reused numbers) ends.
         let cyclic = [(11, 10), (10, 11)];
         assert_eq!(tree_from(10, 100, &cyclic, started).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod windows_commit_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// What can be allocated is the smaller of free RAM and free commit, and the machine is the
+    /// smaller of RAM and the commit limit. Both figures from the machine this was measured on:
+    /// 74 GB of RAM free while commit fell to 40 GB free during one SP1 proof.
+    #[test]
+    fn windows_admits_against_commit_when_commit_is_shorter() {
+        let proving = WindowsMemoryStatus {
+            total_phys: 94 * GIB,
+            avail_phys: 74 * GIB,
+            commit_limit: 107 * GIB,
+            commit_free: 40 * GIB,
+        };
+        assert_eq!(windows_figures(&proving), (40 * GIB, 107 * GIB));
+        // Idle, RAM is the shorter.
+        let idle = WindowsMemoryStatus {
+            commit_free: 90 * GIB,
+            ..proving
+        };
+        assert_eq!(windows_figures(&idle).0, 74 * GIB);
+        // The machine is the commit limit, whether a page file raises it above RAM or, without
+        // one, it is below.
+        let no_page_file = WindowsMemoryStatus {
+            total_phys: 32 * GIB,
+            avail_phys: 20 * GIB,
+            commit_limit: 31 * GIB,
+            commit_free: 18 * GIB,
+        };
+        assert_eq!(windows_figures(&no_page_file), (18 * GIB, 31 * GIB));
+        // The gate that admitted proofs while commit ran out now refuses: a 30 GiB proof does not
+        // fit in 30 GiB of free commit beside the reserve, though 74 GiB of RAM is free.
+        let (available, total) = windows_figures(&WindowsMemoryStatus {
+            commit_free: 30 * GIB,
+            ..proving
+        });
+        assert!(!can_admit(
+            30 * GIB,
+            0,
+            0,
+            available,
+            total,
+            DEFAULT_HOST_RESERVE_BYTES
+        ));
+        // And the pressure check brakes on it, where by RAM alone it read Ok.
+        assert_eq!(
+            classify_pressure(None, 74 * GIB, 94 * GIB),
+            PressureState::Ok
+        );
+        assert_ne!(
+            classify_pressure(None, 8 * GIB, total),
+            PressureState::Ok,
+            "8 GiB of free commit on a 94 GiB machine is pressure"
+        );
+    }
+
+    /// A card's learned figure: the smallest po2 at or above the proof's, with the margin, inside
+    /// what is believed and what the host can admit.
+    #[test]
+    fn a_card_is_charged_what_its_own_proofs_reached() {
+        let total = 94 * GIB;
+        let mut learned = LearnedPeaks::new();
+        assert_eq!(learned_host_peak(&learned, Some(20), total), None);
+        assert!(note_learned_peak(&mut learned, Some(20), 24 * GIB));
+        // 24 GiB with an eighth on top.
+        assert_eq!(learned_host_peak(&learned, Some(20), total), Some(27 * GIB));
+        // A proof at a smaller po2 is bounded by one at a larger.
+        assert_eq!(learned_host_peak(&learned, Some(19), total), Some(27 * GIB));
+        // One at a larger po2 is not: nothing is known about it.
+        assert_eq!(learned_host_peak(&learned, Some(21), total), None);
+        // No po2 is the baseline.
+        assert_eq!(learned_host_peak(&learned, None, total), Some(27 * GIB));
+        // A lower reading (a respawned worker) leaves the higher one standing.
+        assert!(!note_learned_peak(&mut learned, Some(20), 20 * GIB));
+        assert_eq!(learned_host_peak(&learned, Some(20), total), Some(27 * GIB));
+        // A higher one raises it.
+        assert!(note_learned_peak(&mut learned, Some(20), 32 * GIB));
+        assert_eq!(learned_host_peak(&learned, Some(20), total), Some(36 * GIB));
+        // The nearest po2 at or above answers, not the largest.
+        assert!(note_learned_peak(&mut learned, Some(22), 48 * GIB));
+        assert_eq!(learned_host_peak(&learned, Some(20), total), Some(36 * GIB));
+        assert_eq!(learned_host_peak(&learned, Some(21), total), Some(54 * GIB));
+        // Never above what the host can admit, nor below what is believed at all.
+        let mut huge = LearnedPeaks::new();
+        note_learned_peak(&mut huge, Some(20), 90 * GIB);
+        assert_eq!(
+            learned_host_peak(&huge, Some(20), total),
+            Some(max_admissible_budget(total))
+        );
+        let mut tiny = LearnedPeaks::new();
+        note_learned_peak(&mut tiny, Some(20), 100 * 1024 * 1024);
+        assert_eq!(
+            learned_host_peak(&tiny, Some(20), total),
+            Some(MIN_TRUSTED_PEAK_BYTES)
+        );
+    }
+
+    /// A failure is the host's when the exit code says the process could not get memory, or when
+    /// free commit fell during the proof to the low-water bound; otherwise it is not.
+    #[test]
+    fn a_failure_is_the_hosts_by_its_exit_code_or_a_fall_in_commit() {
+        let plenty = (Some(40 * GIB), Some(40 * GIB));
+        // NTSTATUS codes, as the negative numbers `ExitStatus::code` gives.
+        for status in [0xC000_012Du32, 0xC000_0017, 0xC000_009A] {
+            assert!(windows_failure_is_host_shortage(
+                Some(status as i32),
+                plenty.0,
+                plenty.1
+            ));
+        }
+        assert!(windows_failure_is_host_shortage(
+            Some(1455),
+            plenty.0,
+            plenty.1
+        ));
+        // An access violation, a fast-fail abort, a plain error exit, an in-page error: not by
+        // their code.
+        for other in [0xC000_0005u32, 0xC000_0409, 1, 0xC000_0006] {
+            assert!(!windows_failure_is_host_shortage(
+                Some(other as i32),
+                plenty.0,
+                plenty.1
+            ));
+            assert!(!windows_failure_is_host_shortage(
+                Some(other as i32),
+                None,
+                None
+            ));
+        }
+        // By a fall to the low water, whatever the code, and with none (a worker that reported its
+        // error).
+        assert!(windows_failure_is_host_shortage(
+            Some(0xC000_0409u32 as i32),
+            Some(30 * GIB),
+            Some(HOST_SHORT_LOW_WATER_BYTES)
+        ));
+        assert!(windows_failure_is_host_shortage(
+            None,
+            Some(30 * GIB),
+            Some(GIB)
+        ));
+        // Not low enough.
+        assert!(!windows_failure_is_host_shortage(
+            None,
+            Some(30 * GIB),
+            Some(HOST_SHORT_LOW_WATER_BYTES + 1)
+        ));
+        // Low, but it was low already: the proof did not run the host out.
+        assert!(!windows_failure_is_host_shortage(
+            None,
+            Some(5 * GIB),
+            Some(4 * GIB)
+        ));
+        assert!(windows_failure_is_host_shortage(
+            None,
+            Some(5 * GIB),
+            Some(3 * GIB)
+        ));
+        // Nothing read.
+        assert!(!windows_failure_is_host_shortage(None, None, Some(GIB)));
+        assert!(!windows_failure_is_host_shortage(None, None, None));
+    }
+
+    /// The sampler reads free commit on Windows, from where it started, and keeps the least;
+    /// elsewhere it reads nothing.
+    #[test]
+    fn the_low_water_keeps_the_least_reading() {
+        let watch = LowWater::start(None);
+        if cfg!(windows) {
+            let start = watch.started_at().expect("read at start");
+            let first = watch.lowest().expect("sampled at start");
+            assert!(first <= start + GIB);
+            std::thread::sleep(LOW_WATER_SAMPLE * 3);
+            watch.sample();
+            assert!(watch.lowest().expect("still read") <= first);
+            assert!(watch.lowest().unwrap() <= commit_bytes().unwrap().1 + GIB);
+        } else {
+            watch.sample();
+            assert_eq!((watch.started_at(), watch.lowest()), (None, None));
+        }
+    }
+
+    /// The real figures on this machine: available is within free commit, and a live process's
+    /// commit is read, for its tree, only under its own start time.
+    #[cfg(windows)]
+    #[test]
+    fn this_machines_commit_is_read() {
+        let (limit, free) = commit_bytes().expect("GlobalMemoryStatusEx");
+        assert!(limit > 0 && free <= limit);
+        // Read a moment apart, so within a GiB.
+        let available = mem_available_bytes().unwrap();
+        assert!(available <= free + GIB, "{available} vs {free}");
+        assert!(mem_total_bytes().unwrap() <= limit);
+
+        let me = std::process::id();
+        let started = pid_starttime(me).expect("own start time");
+        // Hold a known amount, touched, so it is committed and counted.
+        let held = vec![1u8; 256 * 1024 * 1024];
+        let (now, peak) = tree_commit_bytes(me, Some(started)).expect("own commit");
+        assert!(now >= 256 * 1024 * 1024, "{now}");
+        assert!(peak >= now);
+        drop(held);
+        // Another start time is another process with the same number: nothing.
+        assert_eq!(tree_commit_bytes(me, Some(started + 1)), None);
+        // Physical memory is RAM, not the commit limit; the pressure check counts idle workers'
+        // commit as free, never more RAM than there is.
+        let phys = physical_total_bytes().unwrap();
+        assert!(phys > 0 && phys <= limit + GIB);
+        let idle = 50 * GIB;
+        let pressure = pressure_available_bytes(idle).unwrap();
+        assert!(pressure <= phys);
+        assert!(pressure + GIB >= mem_available_bytes().unwrap());
+    }
+
+    /// Growth still to come: an admission's increment less what its worker has grown by since,
+    /// all of it when unreadable.
+    #[test]
+    fn pending_growth_is_what_admitted_proofs_have_not_allocated_yet() {
+        assert_eq!(pending_growth([]), 0);
+        // Admitted for 20 GiB more than the 5 it held; it holds 12 now, so 13 is still to come.
+        assert_eq!(
+            pending_growth([(20 * GIB, 5 * GIB, Some(12 * GIB))]),
+            13 * GIB
+        );
+        // Grown past its increment: nothing to come. Unreadable: all of it. Shrunk: all of it.
+        assert_eq!(pending_growth([(20 * GIB, 5 * GIB, Some(30 * GIB))]), 0);
+        assert_eq!(pending_growth([(20 * GIB, 5 * GIB, None)]), 20 * GIB);
+        assert_eq!(pending_growth([(20 * GIB, 5 * GIB, Some(GIB))]), 20 * GIB);
+        assert_eq!(
+            pending_growth([(20 * GIB, 0, Some(5 * GIB)), (10 * GIB, 0, None)]),
+            25 * GIB
+        );
+    }
+
+    /// Two proofs admitted a moment apart: the second sees the first's share as taken, though live
+    /// headroom does not show it yet; once the first has allocated, the headroom shows it instead,
+    /// and once it ends, nothing is held for it.
+    #[test]
+    fn a_tracked_admission_holds_its_growth_until_it_is_made() {
+        let ledger = MemoryLedger::default();
+        let total = 100 * GIB;
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let held = std::sync::Mutex::new(HashMap::from([("a".to_string(), 0u64)]));
+        let holding = |slot: &str| held.lock().unwrap().get(slot).copied();
+        // 40 GiB free: the first, wanting 30, fits.
+        let first = ledger
+            .try_reserve_tracked(30 * GIB, 0, 40 * GIB, total, reserve, "a", holding)
+            .expect("fits");
+        assert_eq!(ledger.pending_growth(holding), 30 * GIB);
+        assert_eq!(ledger.tracked_count(), 1);
+        // An untracked reservation is not counted as a proof in flight.
+        let plain = ledger
+            .try_reserve(GIB, 0, 100 * GIB, total, reserve)
+            .unwrap();
+        assert_eq!(ledger.tracked_count(), 1);
+        drop(plain);
+        // A second wanting 20, against the same 40 GiB reading: 30 of it is the first's.
+        assert!(ledger
+            .try_reserve_tracked(20 * GIB, 0, 40 * GIB, total, reserve, "b", holding)
+            .is_none());
+        // The first has allocated 25 of its 30: free commit reads 15, 5 is still to come.
+        held.lock().unwrap().insert("a".to_string(), 25 * GIB);
+        assert_eq!(ledger.pending_growth(holding), 5 * GIB);
+        assert!(ledger
+            .try_reserve_tracked(10 * GIB, 0, 15 * GIB, total, reserve, "b", holding)
+            .is_none());
+        let second = ledger
+            .try_reserve_tracked(7 * GIB, 0, 15 * GIB, total, reserve, "b", holding)
+            .expect("7 + 3 + 5 to come fits in 15");
+        drop(first);
+        drop(second);
+        assert_eq!(ledger.pending_growth(holding), 0);
+        assert_eq!(ledger.tracked_count(), 0);
+        assert_eq!(ledger.reserved_bytes(), 0);
+    }
+
+    /// The Windows defaults are what was measured there. On the host they were measured on (100 GiB
+    /// of commit, about 60 free with a RISC Zero proof running) an SP1 proof waits for the RISC Zero
+    /// one; with a 40 GB page file (134 GiB) it runs beside it. A small host runs one at a time.
+    #[cfg(windows)]
+    #[test]
+    fn windows_defaults_admit_one_of_each_on_the_measured_host() {
+        let reserve = DEFAULT_HOST_RESERVE_BYTES;
+        let risc0 = unmeasured_peak_for("risc0");
+        let sp1 = unmeasured_peak_for("sp1");
+        assert!(risc0 >= 28 * GIB && sp1 >= 62 * GIB);
+        assert!(!can_admit(sp1, 0, risc0, 60 * GIB, 100 * GIB, reserve));
+        assert!(can_admit(sp1, 0, risc0, 94 * GIB, 134 * GIB, reserve));
+        // A benchmark's reading, doubled, never undercuts them.
+        let big = 512 * GIB;
+        assert_eq!(budget_from_measurement(4 * GIB, "risc0", big), risc0);
+        assert_eq!(budget_from_measurement(25 * GIB, "risc0", big), 50 * GIB);
+        assert_eq!(budget_from_measurement(25 * GIB, "sp1", big), sp1);
+        // A 32 GiB machine: each is clamped to what it can admit, and admitted alone.
+        let small = 32 * GIB;
+        for backend in ["risc0", "sp1"] {
+            let want = admissible_unmeasured_peak_for(backend, small);
+            assert!(can_admit(want, 0, 0, 28 * GIB, small, reserve), "{backend}");
+            assert!(
+                !can_admit(want, 0, want, 28 * GIB, small, reserve),
+                "{backend}"
+            );
+        }
     }
 }

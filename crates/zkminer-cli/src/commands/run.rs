@@ -7384,7 +7384,12 @@ async fn miner_brain(
         // fail-open means "keep piling on". Absent facts mean we cannot classify, so we keep the
         // last thing we could prove: PSI alone, which is the symptom and the stronger signal.
         let stall_pct = zkminer_prover::memory::memory_stall_percent();
-        let mem_avail = zkminer_prover::memory::mem_available_bytes();
+        // Windows: idle workers keep what they committed, and a proof that needs it recycles them
+        // (`make_host_room`). Braking on it would stop the dispatch that gives it back, for good.
+        let mem_avail = zkminer_prover::memory::pressure_available_bytes(
+            zkminer_prover::engine::worker_pool()
+                .map_or(0, |pool| pool.idle_reclaimable_host_bytes()),
+        );
         let mem_total = zkminer_prover::memory::mem_total_bytes();
         let pressure = match (mem_avail, mem_total) {
             (Some(avail), Some(total)) => {
@@ -12032,9 +12037,15 @@ async fn process_job_lifecycle(
                             short_id(job_id)
                         ));
                     }
+                    // A worker that DIED has no typed error, and its message carries its last
+                    // lines of output (`WorkerHandle::death_note`), which can be a job's guest
+                    // program's: never classified by text. It is a health failure.
+                    let died = e
+                        .downcast_ref::<zkminer_prover::worker::WorkerDied>()
+                        .is_some();
                     let invalid = match worker_err {
                         Some(w) => w.is_invalid(),
-                        None => is_invalid_proof(&msg),
+                        None => !died && is_invalid_proof(&msg),
                     };
                     // A genuine GPU OOM means the job is too big for that card (retry on
                     // a bigger card). Everything else non-invalid is a worker-health /
@@ -12045,7 +12056,7 @@ async fn process_job_lifecycle(
                     // whitelist only retried wedge/EOF and dropped the rest).
                     let real_oom = match worker_err {
                         Some(w) => w.is_gpu_oom(),
-                        None => zkminer_prover_protocol::types::is_gpu_oom(&msg),
+                        None => !died && zkminer_prover_protocol::types::is_gpu_oom(&msg),
                     };
                     let health_fail = !invalid && !real_oom;
                     // An SP1 OOM that lowered its card's shard size is retried THERE, at the
@@ -15624,6 +15635,29 @@ mod tests {
             forged.downcast_ref::<HostMemoryShortage>().is_none(),
             "a guest must not be able to buy itself unlimited retries"
         );
+    }
+
+    /// A worker that died carries its last lines of output in its error (`death_note`), and those
+    /// can be a job's guest program's. Their text trips the classifiers, so it must never reach
+    /// them: a guest that prints "proof is invalid" and then crashes the worker would end the job,
+    /// and one that prints "out of memory" would be read as a GPU out-of-memory. The death is
+    /// recognised by its type under the added context, and is a health failure.
+    #[test]
+    fn a_dead_workers_output_is_never_classified_by_text() {
+        let note = "risc0:cuda:0: worker exited with code -1073741819 (0xC0000005); its last \
+                    output: guest says out of memory | proof is invalid";
+        assert!(zkminer_prover_protocol::types::is_gpu_oom(note) && is_invalid_proof(note));
+        let died = anyhow::Error::new(zkminer_prover::worker::WorkerDied {
+            backend: "risc0".to_string(),
+        })
+        .context(note);
+        assert!(died
+            .downcast_ref::<zkminer_prover::worker::WorkerDied>()
+            .is_some());
+        let job = body(include_str!("run.rs"), "\nasync fn process_job_lifecycle(");
+        assert!(job.contains("None => !died && is_invalid_proof(&msg),"));
+        assert!(job.contains("None => !died && zkminer_prover_protocol::types::is_gpu_oom(&msg),"));
+        assert!(job.contains(".downcast_ref::<zkminer_prover::worker::WorkerDied>()"));
     }
 
     /// The same property for the GPU-memory class. This arm refunds its attempt AND excludes a slot,

@@ -404,6 +404,21 @@ Worth knowing:
   shard size: re-benchmark such a card after upgrading, as its saved SP1 rate was measured at the
   larger one). `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns all of this off.
 
+- **Under Windows, host memory means commit** (Task Manager → Performance → Memory,
+  "Committed"), not free RAM. Windows refuses any allocation past its commit limit (RAM plus the
+  page file), and a CUDA prover commits far more than it keeps in RAM. Measured on an RTX 5090: a
+  RISC Zero proof at po2 20 commits 28 GB with 2–6 GB in RAM, and an SP1 proof 63 GB, 34 GB of
+  which its worker keeps between proofs. A proof starts only when its figure fits in free commit
+  beside what the proofs already running have still to take. Until a card has proved, the
+  figures are 30 GiB (RISC Zero) and 64 GiB (SP1); after that, that card's own peak plus an
+  eighth. An idle worker of the other zkVM is stopped when a proof needs what it holds. The
+  page file is what decides how much runs at once. On a 94 GB machine with the default
+  system-managed one (a 100 GB limit), an SP1 proof waits for a running RISC Zero one. A
+  fixed page file of about 40 GB (System Properties → Advanced → Performance → Virtual memory;
+  it uses disk, not RAM) lets them run together, and avoids the stall while Windows grows the
+  page file. If a proof fails while the host is out of commit, the failure isn't held against
+  the card.
+
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
   NVIDIA cards, `gpu-rocm0`, … for AMD, `gpu-intel0`, … for Intel):

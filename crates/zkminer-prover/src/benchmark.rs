@@ -5081,13 +5081,16 @@ mod host_peak_tests {
         let ceiling = crate::memory::max_admissible_budget(
             crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
         );
+        // Never below the backend's blind default (`budget_from_measurement`), which on Windows,
+        // charging commit, is above these readings doubled.
+        let floor = crate::memory::unmeasured_peak_for;
         assert_eq!(
             suite.expected_host_peak_bytes("risc0"),
-            (11 * gib * factor).min(ceiling)
+            (11 * gib * factor).max(floor("risc0")).min(ceiling)
         );
         assert_eq!(
             suite.expected_host_peak_bytes("sp1"),
-            (18 * gib * factor).min(ceiling)
+            (18 * gib * factor).max(floor("sp1")).min(ceiling)
         );
         // The worst card, not the average: 4 and 11 GiB were measured for risc0 and the budget must
         // come from the 11, since the dispatcher does not pick the cheapest card.
@@ -5109,16 +5112,19 @@ mod host_peak_tests {
         let ceiling = crate::memory::max_admissible_budget(
             crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
         );
-        // Exactly what the pipeline produces for SP1: no device row, a backend-keyed peak.
+        // Exactly what the pipeline produces for SP1: no device row, a backend-keyed peak. Large
+        // enough, doubled, to stand above the blind default it must be told apart from (Windows'
+        // is larger, charging commit).
+        let measured = if cfg!(windows) { 34 * gib } else { 10 * gib };
         let suite = BenchmarkSuite {
             device_benchmarks: vec![row("risc0", Some(5 * gib))],
-            host_peaks: std::collections::HashMap::from([("sp1".to_string(), 10 * gib)]),
+            host_peaks: std::collections::HashMap::from([("sp1".to_string(), measured)]),
             ..Default::default()
         };
         let sp1 = suite.expected_host_peak_bytes("sp1");
         assert_eq!(
             sp1,
-            (10 * gib * crate::memory::MEASUREMENT_SAFETY_FACTOR).min(ceiling),
+            (measured * crate::memory::MEASUREMENT_SAFETY_FACTOR).min(ceiling),
             "a measured SP1 peak must reach the budget even with no SP1 device row"
         );
         assert_ne!(
