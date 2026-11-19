@@ -60,7 +60,8 @@ impl AttemptProgress {
 pub struct StageSecs {
     pub setup: f64,
     pub execute: f64,
-    pub prove: f64,
+    /// `None` without a measurement of the job: then only the stage's own observed rate tells.
+    pub prove: Option<f64>,
     /// The wrap: the card's measured time, whatever the job's size.
     pub finish: f64,
     /// The part of the finish that grows with the STARK (risc0's lift/join tail), as a share of the
@@ -100,11 +101,12 @@ fn default_wrap_secs(backend: &str) -> f64 {
 }
 
 /// The expected seconds of each stage of a job of `cycles` on the card of `row`. `execute_secs` is
-/// how long measuring the job took (risc0 executes it again before proving). `None` when the row has
-/// no STARK rate.
+/// how long measuring the job took (risc0 executes it again before proving). Without `cycles` (a lock
+/// recovered from a breadcrumb that did not record them) the `Prove` stage's time is left to its
+/// observed rate. `None` when the row has no STARK rate.
 pub fn expected_stage_secs(
     backend: &str,
-    cycles: u64,
+    cycles: Option<u64>,
     execute_secs: Option<f64>,
     row: &DeviceBenchmark,
 ) -> Option<StageSecs> {
@@ -113,7 +115,7 @@ pub fn expected_stage_secs(
         .wrap_secs()
         .filter(|w| w.is_finite() && *w >= 0.0)
         .unwrap_or_else(|| default_wrap_secs(backend));
-    let prove = cycles as f64 / rate;
+    let prove = cycles.map(|c| c as f64 / rate);
     Some(if backend == BACKEND_RISC0 {
         StageSecs {
             setup: 0.0,
@@ -140,8 +142,9 @@ const MIN_UNITS_FOR_RATE: u32 = 3;
 /// the current stage's remainder (from its own observed rate once it has counted a few units, else
 /// its expected time less what it has run) plus every later stage's expected time. A card faster or
 /// slower than its benchmark moves the estimate with it. Never below `p.floor`; never 1.0 until the
-/// proof is in.
-pub fn attempt_fraction(p: &AttemptProgress, exp: &StageSecs, now: Instant) -> f64 {
+/// proof is in. `None` while the `Prove` stage's time is unknown: no measured cycles, and too few
+/// units counted (or their total not yet final) to go by its own rate.
+pub fn attempt_fraction(p: &AttemptProgress, exp: &StageSecs, now: Instant) -> Option<f64> {
     let stage = p.stage().unwrap_or(ProveStage::Setup);
     let in_stage = now.saturating_duration_since(p.stage_started).as_secs_f64();
     // The `Prove` stage's time as best known: what it took once it has ended; while it runs, its
@@ -164,7 +167,7 @@ pub fn attempt_fraction(p: &AttemptProgress, exp: &StageSecs, now: Instant) -> f
     let prove = p
         .prove_secs
         .or(observed.map(|(total, _)| total))
-        .unwrap_or(exp.prove);
+        .or(exp.prove)?;
     let expected = exp.of(stage, prove);
     let remaining_here = match p.report {
         Some(_) if observed.is_some() => observed.map(|(_, left)| left).unwrap_or(0.0),
@@ -191,7 +194,7 @@ pub fn attempt_fraction(p: &AttemptProgress, exp: &StageSecs, now: Instant) -> f
     let elapsed = now.saturating_duration_since(p.started).as_secs_f64();
     let total = elapsed + remaining_here + later;
     let f = if total > 0.0 { elapsed / total } else { 0.0 };
-    f.clamp(0.0, 0.99).max(p.floor)
+    Some(f.clamp(0.0, 0.99).max(p.floor))
 }
 
 /// A short label for the stage, with its counts.
@@ -264,13 +267,13 @@ mod tests {
     #[test]
     fn the_wrap_share_follows_the_job_size() {
         let r = row(100_000_000, 10.0, Some(16.0)); // 10M cycles/s, 16 s wrap
-        let small = expected_stage_secs(BACKEND_SP1, 30_000_000, None, &r).unwrap();
-        let large = expected_stage_secs(BACKEND_SP1, 1_500_000_000, None, &r).unwrap();
+        let small = expected_stage_secs(BACKEND_SP1, Some(30_000_000), None, &r).unwrap();
+        let large = expected_stage_secs(BACKEND_SP1, Some(1_500_000_000), None, &r).unwrap();
         let share = |s: &StageSecs| {
-            let finish = s.finish + s.finish_share_of_prove * s.prove;
-            finish / (s.setup + s.execute + s.prove + finish)
+            let finish = s.finish + s.finish_share_of_prove * s.prove.unwrap();
+            finish / (s.setup + s.execute + s.prove.unwrap() + finish)
         };
-        assert!((small.prove - 3.0).abs() < 1e-9);
+        assert!((small.prove.unwrap() - 3.0).abs() < 1e-9);
         assert!(share(&small) > 0.5, "{}", share(&small));
         assert!(share(&large) < 0.11, "{}", share(&large));
     }
@@ -279,7 +282,7 @@ mod tests {
     fn a_row_without_a_stark_rate_gives_no_estimate() {
         let mut r = row(100, 1.0, None);
         r.program_stages.clear();
-        assert!(expected_stage_secs(BACKEND_RISC0, 1_000, None, &r).is_none());
+        assert!(expected_stage_secs(BACKEND_RISC0, Some(1_000), None, &r).is_none());
     }
 
     /// Midway through the segments the fraction is the elapsed share of the expected total, and it
@@ -289,7 +292,7 @@ mod tests {
         let exp = StageSecs {
             setup: 0.0,
             execute: 10.0,
-            prove: 80.0,
+            prove: Some(80.0),
             finish: 10.0,
             finish_share_of_prove: 0.0,
         };
@@ -297,7 +300,7 @@ mod tests {
         let mut p = AttemptProgress::new("risc0:cuda:0", t0);
         p.record(report(ProveStage::Execute, 0, 0, false), t0);
         // Half the execution: 5 of 100 expected seconds.
-        let f = attempt_fraction(&p, &exp, t0 + Duration::from_secs(5));
+        let f = attempt_fraction(&p, &exp, t0 + Duration::from_secs(5)).unwrap();
         assert!((f - 0.05).abs() < 0.01, "{f}");
         // Segments start at 10 s; at 50 s, half of them done at the expected rate: 50 of 100 s.
         p.record(
@@ -308,7 +311,7 @@ mod tests {
             report(ProveStage::Prove, 50, 100, true),
             t0 + Duration::from_secs(50),
         );
-        let on_rate = attempt_fraction(&p, &exp, t0 + Duration::from_secs(50));
+        let on_rate = attempt_fraction(&p, &exp, t0 + Duration::from_secs(50)).unwrap();
         assert!((on_rate - 0.5).abs() < 0.01, "{on_rate}");
         // Twice as fast: 50 done after 20 s, 20 s left, then the finish: 30 / 60.
         let mut q = AttemptProgress::new("risc0:cuda:0", t0);
@@ -320,14 +323,14 @@ mod tests {
             report(ProveStage::Prove, 50, 100, true),
             t0 + Duration::from_secs(30),
         );
-        let fast = attempt_fraction(&q, &exp, t0 + Duration::from_secs(30));
+        let fast = attempt_fraction(&q, &exp, t0 + Duration::from_secs(30)).unwrap();
         assert!((fast - 0.5).abs() < 0.01, "{fast}");
         // In the finish, past its expected time: close to, never at, the end.
         p.record(
             report(ProveStage::Finish, 0, 0, false),
             t0 + Duration::from_secs(90),
         );
-        let late = attempt_fraction(&p, &exp, t0 + Duration::from_secs(150));
+        let late = attempt_fraction(&p, &exp, t0 + Duration::from_secs(150)).unwrap();
         assert!(late > 0.95 && late <= 0.99, "{late}");
     }
 
@@ -338,7 +341,7 @@ mod tests {
         let exp = StageSecs {
             setup: 0.0,
             execute: 0.0,
-            prove: 90.0,
+            prove: Some(90.0),
             finish: 0.0,
             finish_share_of_prove: 0.1,
         };
@@ -355,7 +358,7 @@ mod tests {
         );
         assert_eq!(p.prove_secs, Some(30.0));
         // 30 s of segments, a 3 s tail: at 31.5 s, half the tail is left of 33 s.
-        let f = attempt_fraction(&p, &exp, t0 + Duration::from_millis(31_500));
+        let f = attempt_fraction(&p, &exp, t0 + Duration::from_millis(31_500)).unwrap();
         assert!((f - 31.5 / 33.0).abs() < 0.01, "{f}");
     }
 
@@ -364,14 +367,60 @@ mod tests {
         let exp = StageSecs {
             setup: 10.0,
             execute: 0.0,
-            prove: 10.0,
+            prove: Some(10.0),
             finish: 10.0,
             finish_share_of_prove: 0.0,
         };
         let t0 = Instant::now();
         let mut p = AttemptProgress::new("sp1:cuda:0", t0);
         p.floor = 0.6;
-        assert_eq!(attempt_fraction(&p, &exp, t0), 0.6);
+        assert_eq!(attempt_fraction(&p, &exp, t0), Some(0.6));
+    }
+
+    /// A lock recovered without its measurement has no bar until its own segments give a rate,
+    /// then it goes by that rate.
+    #[test]
+    fn without_cycles_the_bar_waits_for_the_observed_rate() {
+        let exp = StageSecs {
+            setup: 0.0,
+            execute: 0.0,
+            prove: None,
+            finish: 10.0,
+            finish_share_of_prove: 0.0,
+        };
+        let t0 = Instant::now();
+        let mut p = AttemptProgress::new("risc0:cuda:0", t0);
+        assert_eq!(
+            attempt_fraction(&p, &exp, t0 + Duration::from_secs(1)),
+            None
+        );
+        p.record(report(ProveStage::Prove, 0, 100, true), t0);
+        p.record(
+            report(ProveStage::Prove, 1, 100, true),
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!(
+            attempt_fraction(&p, &exp, t0 + Duration::from_secs(1)),
+            None
+        );
+        // 50 of 100 segments in 45 s: 45 s left, then the 10 s finish: 45 / 100.
+        p.record(
+            report(ProveStage::Prove, 50, 100, true),
+            t0 + Duration::from_secs(45),
+        );
+        let f = attempt_fraction(&p, &exp, t0 + Duration::from_secs(45)).unwrap();
+        assert!((f - 0.45).abs() < 0.01, "{f}");
+        // SP1 still executing: its shard total is not final, so no rate to go by yet.
+        let mut q = AttemptProgress::new("sp1:cuda:0", t0);
+        q.record(report(ProveStage::Prove, 0, 40, false), t0);
+        q.record(
+            report(ProveStage::Prove, 20, 40, false),
+            t0 + Duration::from_secs(20),
+        );
+        assert_eq!(
+            attempt_fraction(&q, &exp, t0 + Duration::from_secs(20)),
+            None
+        );
     }
 
     #[test]

@@ -1166,11 +1166,7 @@ impl MinerState {
     pub fn proving_fraction(&self, job: &TrackedJob) -> Option<f64> {
         let attempt = self.proving.get(&job.info.job_id)?;
         let exp = self.expected_stage_secs(job, attempt)?;
-        Some(crate::progress::attempt_fraction(
-            attempt,
-            &exp,
-            std::time::Instant::now(),
-        ))
+        crate::progress::attempt_fraction(attempt, &exp, std::time::Instant::now())
     }
 
     /// The stage a proving job's current attempt is in, with its counts, e.g. "segment 40/91".
@@ -1192,7 +1188,7 @@ impl MinerState {
                 let exp = self.expected_stage_secs(job, attempt)?;
                 Some((
                     job.info.job_id,
-                    crate::progress::attempt_fraction(attempt, &exp, now),
+                    crate::progress::attempt_fraction(attempt, &exp, now)?,
                 ))
             })
             .collect();
@@ -1205,6 +1201,8 @@ impl MinerState {
 
     /// The expected seconds of each stage of `job` on the card of `attempt`: from the job's measured
     /// cycles, and the card's benchmark row for the backend, else the slowest row of that backend.
+    /// Without a measurement (a lock recovered from a breadcrumb that did not record one) the `Prove`
+    /// stage is left to its observed rate.
     fn expected_stage_secs(
         &self,
         job: &TrackedJob,
@@ -1212,8 +1210,8 @@ impl MinerState {
     ) -> Option<crate::progress::StageSecs> {
         let mut parts = attempt.slot.split(':');
         let (backend, tag, index) = (parts.next()?, parts.next()?, parts.next()?);
-        let measurement = self.job_measurements.get(&job.info.job_id)?;
-        let cycles = measurement.cycles?;
+        let measurement = self.job_measurements.get(&job.info.job_id);
+        let cycles = measurement.and_then(|m| m.cycles);
         let device = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(tag, index);
         let rows = &self.benchmark_results.as_ref()?.device_benchmarks;
         let of_backend = || rows.iter().filter(|r| r.prover_backend == backend);
@@ -1226,7 +1224,8 @@ impl MinerState {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
         })?;
-        crate::progress::expected_stage_secs(backend, cycles, Some(measurement.execute_secs), row)
+        let execute_secs = measurement.map(|m| m.execute_secs);
+        crate::progress::expected_stage_secs(backend, cycles, execute_secs, row)
     }
 
     /// The Jobs page's rows, in order: the jobs this miner has claimed, then the open market less

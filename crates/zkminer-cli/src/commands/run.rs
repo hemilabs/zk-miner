@@ -10860,6 +10860,14 @@ async fn process_job_lifecycle(
             j.record_claim_intent(job_id, snapshot.lock_deadline, submit_tx);
             // A restart proves it on a card at a size it measured clean at.
             j.note_measured_po2s(job_id, &snapshot.measured_po2s);
+            // A restart shows how far its proof is from these.
+            j.note_measured_cycles(
+                job_id,
+                snapshot
+                    .measured_cycles
+                    .filter(|c| *c < UNMEASURABLE_CYCLES),
+                snapshot.measured_execute_secs,
+            );
         });
         let mut s = state.write().await;
         s.add_log(
@@ -11088,9 +11096,27 @@ async fn process_job_lifecycle(
         });
     }
 
+    // A recovered lock's measurement from its breadcrumb (a fresh claim's is already shown), so its
+    // detail and its proving progress have the cycles it was claimed on.
+    let recovered_measurement = if is_recovery {
+        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+        j.entries.get(&job_id).and_then(|e| {
+            Some(zkminer_tui::state::JobMeasurement {
+                cycles: Some(e.measured_cycles?),
+                backend: resolve_backend(view.proofSystemId)?.to_string(),
+                po2s: e.measured_po2s.clone(),
+                execute_secs: e.measured_execute_secs.unwrap_or(0) as f64,
+            })
+        })
+    } else {
+        None
+    };
     {
         let mut s = state.write().await;
         s.open_jobs.retain(|j| j.info.job_id != job_id);
+        if let Some(m) = recovered_measurement {
+            s.job_measurements.insert(job_id, m);
+        }
         // The monitor ingest hardcodes `lock_deadline: 0` (run.rs ~489), so without this
         // backfill EVERY in-session job carries deadline 0 and the shutdown path's
         // "nearest deadline first" release ordering sorts on all-zero keys — i.e. does not
