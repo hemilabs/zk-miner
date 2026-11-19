@@ -82,27 +82,10 @@ pub const RISC0_EXECUTE_PEAK_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// can only ever LOWER the enforced cap — never raise it above SP1's own default nor past what the
 /// host can actually admit (which would desync the charge from the enforced ceiling).
 pub fn sp1_measure_cap_bytes(total: u64) -> u64 {
-    let mut cap = SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total));
-    // /dev/shm clamp (finding H3). The native executor stages the guest memory IMAGE in /dev/shm,
-    // whose resident backing grows with touched pages; a tmpfs-FULL write SIGBUSes SYNCHRONOUSLY,
-    // beating the 100 ms-poll `MEMORY_LIMIT`, so if `MEMORY_LIMIT` lets the image reach the tmpfs size
-    // the guest SIGBUSes (→ a strike on a feasible job, or a prove-side slash) instead of declining
-    // cleanly. The resident image + ring ≤ total_RSS, and `MEMORY_LIMIT` bounds total_RSS, so keeping
-    // `MEMORY_LIMIT ≤ dev_shm` holds the shm resident below the tmpfs. We do NOT credit the executor's
-    // anon working set: it was ~7.2 GiB for TYPICAL guests but is NOT an adversarial lower bound — a
-    // crafted guest keeps anon to the image's page tables (tens of MiB for a multi-GiB image) while
-    // ballooning the shm image, so crediting any anon floor is attacker-falsifiable and would SIGBUS.
-    // Instead subtract a small poll-race margin so the 100 ms monitor SIGKILLs before a fast writer
-    // can cross the last pages into a full tmpfs. x86-64-Linux ONLY — that is the sole target that
-    // compiles SP1's native executor (and thus stages in /dev/shm); on linux-aarch64 or linux+profiling
-    // the PORTABLE in-process executor runs, never touching /dev/shm, so clamping MEMORY_LIMIT from an
-    // unrelated tmpfs there would needlessly shrink (or, with a tiny /dev/shm, wedge) the cap. Matches
-    // the x86_64 gating of the paired /dev/shm sufficiency guard.
-    if cfg!(target_arch = "x86_64") {
-        if let Some(shm) = dev_shm_capacity_bytes() {
-            cap = cap.min(shm.saturating_sub(SP1_DEV_SHM_POLL_MARGIN_BYTES));
-        }
-    }
+    // Not bounded by the size of `/dev/shm`: SP1's executor shares the guest's memory and trace ring
+    // with its runner through memfds, which are host RAM (charged to the host ledger, and bounded by
+    // the worker's cgroup and this limit's RSS monitor), not a tmpfs that SIGBUSes when full.
+    let cap = SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total));
     std::env::var("ZKMINER_SP1_MEASURE_PEAK_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -110,13 +93,6 @@ pub fn sp1_measure_cap_bytes(total: u64) -> u64 {
         .map(|o| o.min(cap))
         .unwrap_or(cap)
 }
-
-/// Headroom kept BELOW the /dev/shm size when clamping `MEMORY_LIMIT` (finding H3). `MEMORY_LIMIT` is
-/// a 100 ms-poll RSS monitor, so after it is crossed the executor can still dirty pages for up to one
-/// interval before the SIGKILL lands; tmpfs-full SIGBUSes synchronously on the next page. This margin
-/// (comfortably above a ~1 GiB/100 ms tmpfs write burst) ensures the monitor fires with room to spare,
-/// regardless of how small the guest keeps its anon set. Credited as 0 anon = adversarially safe.
-pub const SP1_DEV_SHM_POLL_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// `/proc/pressure/memory`'s `full avg10`, in percent, above which the host is genuinely stalling.
 ///
@@ -263,33 +239,6 @@ pub(crate) fn sysctl_string(name: &str) -> Option<String> {
         .trim()
         .to_string();
     (!s.is_empty()).then_some(s)
-}
-
-/// Total capacity of the `/dev/shm` tmpfs, in bytes, or `None` if it cannot be stat'd.
-///
-/// The SP1 native executor (x86-64 Linux) stages its trace ring and memory image here. A tmpfs too
-/// small to hold even the bounded ring — the classic 64 MiB Docker default is the usual culprit —
-/// makes every execute SIGBUS the instant the ring is touched, so the measure-pool spawn consults
-/// this to refuse to stand up workers that would only SIGBUS-loop. Total capacity, not free space:
-/// this is a one-time "could this tmpfs ever hold the ring" misconfiguration guard, and transient
-/// occupancy is the host-memory ledger's concern, not this check's.
-#[cfg(target_os = "linux")]
-pub fn dev_shm_capacity_bytes() -> Option<u64> {
-    let path = std::ffi::CString::new("/dev/shm").ok()?;
-    // SAFETY: `statvfs` only reads through `path` and writes the out-param, which it fully
-    // initializes on success (rc == 0); we read the struct only in that case.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    (st.f_blocks as u64).checked_mul(st.f_frsize as u64)
-}
-
-/// Non-Linux: there is no `/dev/shm` tmpfs and the portable executor runs in-process, so there is
-/// nothing to size. `None` means "cannot tell", which the caller treats as "do not block".
-#[cfg(not(target_os = "linux"))]
-pub fn dev_shm_capacity_bytes() -> Option<u64> {
-    None
 }
 
 /// Windows: `GlobalMemoryStatusEx`'s available physical memory, which, like `MemAvailable`, counts
@@ -450,6 +399,19 @@ pub fn cap_unit_name(unit_hint: &str, pid: u32) -> String {
         sanitize_unit(unit_hint),
         pid
     )
+}
+
+/// The leaf name a worker's cgroup must have for the memory readers to trust its counters: the
+/// cgroup of its own the miner made for it (`containment`), else its scope ([`cap_unit_name`]).
+pub fn worker_cgroup_leaf(unit_hint: &str, pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        crate::containment::cgroup_leaf(unit_hint, pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cap_unit_name(unit_hint, pid)
+    }
 }
 
 /// Windows has no resident-memory ceiling that kills: a Job Object limits COMMITTED memory, which
@@ -1478,7 +1440,7 @@ impl Drop for MemoryReservation<'_> {
     }
 }
 
-/// Signalled whenever any reservation (host RAM or `/dev/shm`) is given back, so a proof waiting for
+/// Signalled whenever any reservation (host RAM) is given back, so a proof waiting for
 /// memory can retry the moment some frees instead of on its next poll. A wake-up only: the waiter
 /// still has to win the reservation, and waits with a timeout, since a release between its refusal
 /// and its wait is not remembered.
@@ -1599,40 +1561,19 @@ pub fn classify_pressure(stall_pct: Option<f64>, available: u64, total: u64) -> 
 mod tests {
     use super::*;
 
-    /// On this Linux host `/dev/shm` exists and has a real capacity, so the statvfs wrapper must
-    /// return a plausible `Some`. Guards against a zeroed-struct / wrong-field-scaling regression
-    /// (an all-zero or absurdly small answer would wrongly disable SP1 measuring).
-    #[cfg(target_os = "linux")]
     #[test]
-    fn dev_shm_capacity_is_a_plausible_nonzero_size() {
-        let cap = dev_shm_capacity_bytes().expect("/dev/shm should stat on a Linux CI/dev host");
-        // At least 1 MiB (even a locked-down tmpfs clears this) and sane (< 1 PiB).
-        assert!(cap >= 1024 * 1024, "implausibly small /dev/shm: {cap} bytes");
-        assert!(cap < 1u64 << 50, "implausibly large /dev/shm: {cap} bytes");
-    }
-
-    #[test]
-    fn sp1_measure_cap_never_exceeds_any_of_its_bounds() {
-        // cap = min(24 GiB default, admissible budget, /dev/shm − poll margin [Linux]). The /dev/shm
-        // term is host-dependent, so assert the INVARIANTS that hold on any host, not a fixed value.
-        let shm_bound =
-            dev_shm_capacity_bytes().map(|s| s.saturating_sub(SP1_DEV_SHM_POLL_MARGIN_BYTES));
+    fn sp1_measure_cap_is_the_default_within_the_budget() {
+        // cap = min(SP1's 24 GiB default, admissible budget): no term for `/dev/shm`, whose size no
+        // longer bounds what SP1's executor can share, so it is the same on any host of that RAM.
         for t in [8u64, 16, 24, 28, 36, 64, 256] {
             let total = t * 1024 * 1024 * 1024;
             let cap = sp1_measure_cap_bytes(total);
             assert!(cap > 0, "cap must be positive at {t} GiB");
-            assert!(cap <= SP1_DEFAULT_MEMORY_LIMIT_BYTES, "cap above SP1 24 GiB default at {t} GiB");
-            assert!(cap <= max_admissible_budget(total), "cap above admissible budget at {t} GiB");
-            if let Some(shm_bound) = shm_bound {
-                assert!(cap <= shm_bound, "cap above the /dev/shm bound at {t} GiB");
-            }
-        }
-        // On a host whose /dev/shm comfortably clears the budget (its +5 GiB credit ≥ the budget), the
-        // /dev/shm term never binds, so the cap is exactly min(24 GiB, budget) — the locked-#1 value.
-        let total = 28u64 * 1024 * 1024 * 1024;
-        let non_shm_cap = SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total));
-        if shm_bound.map_or(true, |b| b >= non_shm_cap) {
-            assert_eq!(sp1_measure_cap_bytes(total), non_shm_cap);
+            assert_eq!(
+                cap,
+                SP1_DEFAULT_MEMORY_LIMIT_BYTES.min(max_admissible_budget(total)),
+                "at {t} GiB"
+            );
         }
     }
 

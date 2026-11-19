@@ -462,6 +462,9 @@ key_env_var = "ZKMINER_PRIVATE_KEY"
 [prover]
 max_concurrent_proofs = 0           # 0 = one proof per detected GPU
 skip_benchmark_gate   = true
+
+[egress]                            # optional
+deny_cidrs = ["203.0.113.0/24"]     # the rest of your fleet, your VPC's ranges
 ```
 
 `zkminer init` will scaffold a config, but **verify the contract addresses it writes
@@ -481,6 +484,93 @@ rewrite it with `zkminer init --network testnet --force`.
 The code pins (`crates/zkminer-chain/src/deployment.rs`) are the contracts repo's
 `script/lib/ReleaseCorePins.sol` and `VerifierPins.sol` at 3bc441d (8e1808b); `ZKMINER_CONTRACTS_REPO=<checkout>
 cargo test -p zkminer-chain --lib the_pins_match_the_contracts_repo` checks them against those files.
+
+### Network guard: `[egress]` and `[dev]`
+
+Anyone can register a program and post a job, so the URLs a miner downloads programs from
+are chosen by strangers. zkminer only ever connects to **public internet** addresses on
+their behalf: never loopback, the LAN, link-local or cloud metadata, this host's own
+addresses (its public address behind NAT included, which it learns from fixed reflectors), a
+neighbour on a network it is connected to or routes to other than through its default route
+(the kernel is asked, per destination and port, how it would route the connection, policy rules
+included), an address a `local` route delivers to this host, the rest of its IPv6 site (a /32)
+or of the IPv4 /16 around a public address on its interfaces, the DNS servers it uses, a
+private address behind NAT64, a destination that answers within 2 hops of this host (its router,
+a neighbour in the same VPC: a hop-limited probe asks right before each connection), or a name
+only a local resolver answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label
+names, …). Requester host names are resolved over DNS-over-HTTPS by public resolvers, never
+through this host's own resolver. Anycast service addresses (`2001:1::/32`, AMT, AS112) are
+refused too. See [SECURITY.md](SECURITY.md) for exactly what is refused and why.
+
+It **fails closed**: while this host's public address of a family it routes is unknown
+(outbound DNS and HTTPS to the reflectors blocked or intercepted), no requester connection goes
+out over that family, and the miner says so at startup, when it changes, and in `zkminer status`;
+`[egress] public_addresses` fixes it. A host with a public IPv4 address on an interface (a campus,
+a data centre) or a default route through a tunnel (a full-tunnel VPN) does not start in public
+mode until `[egress] internal_ranges` lists its own network's ranges (`[]` if there are none),
+and stops making requester connections if that happens later (a VPN that comes up).
+
+Run the miner with the host's network (`--network host` in a container): inside a container
+it sees only the container's interfaces and routes, so list the host's networks and addresses
+in `[egress] deny_cidrs` if it cannot.
+
+**Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
+endpoints for builders, has no network of its own: its sandbox denies every socket call. The
+miner's *connector* makes each connection for it — the broker can only name one of the endpoints
+in its config file, which the miner reads itself — and admits the address with this same guard
+(the near-hop probe right before connecting included), using the miner's `[egress]` settings (the broker file's `[egress] deny_cidrs` are added to
+them) and the miner's `[dev] private_network`. So a broker an attacker took over still reaches
+only your configured endpoints. See SECURITY.md, "Witness jobs: the broker".
+
+Give each chain two `[[evm_rpc]]` endpoints on independent nodes (distinct host and port) if you
+can. When a builder asks for a block or state an endpoint lacks, two independent endpoints that
+both lack it make the answer final, and so does one whose head is fresh (its latest block stamped
+within `head_fresh_secs`, default 36 s; set a few of the chain's block times): the builder is then
+judged on its own exit. With one endpoint per chain whose head is stale, the lag is unconfirmed and
+the job is retried unblamed (up to 6 times) when its builder gave up or trapped.
+
+| key | default | meaning |
+|---|---|---|
+| `[egress] deny_cidrs` | `[]` | More addresses no requester-caused connection may reach: CIDRs (`"203.0.113.0/24"`, `"2001:db8::/32"`) or bare addresses. Name the rest of your fleet and, on a cloud host, your VPC's IPv6 range (its other subnets have global addresses and are reached through the default route). Host bits must be zero. |
+| `[egress] internal_ranges` | unset | The ranges of your own network this host reaches by the same route as the internet: a campus's or data centre's public ranges, your VPC's, what a full-tunnel VPN leads to. Refused like `deny_cidrs`. **Required** (`internal_ranges = []` states there are none) on a host with a global IPv4 address on an interface or an uplink that is not plainly physical: a default route out of anything but a NIC, bridge, bond, team, VLAN, macvlan, ipvlan, veth or VRF (so any tunnel or VPN, and `ppp` unless it is a PPPoE session), a default route in a routing table other than `main` (strongSwan's table 220), or one through a nexthop object whose interface cannot be read. In public mode the miner refuses to start without it, naming the reason; when such a condition appears later (a VPN that comes up after startup), every requester-caused connection is refused until it is set or the condition clears. |
+| `[egress] ipv6_site_prefix_len` | `32` | The site refused around each of this host's global IPv6 addresses: its enclosing /N, 16 to 64. The default is the `/32` an organisation usually holds; it also refuses the rest of your own ISP's `/32` over IPv6 (a name there that also has an IPv4 address still connects over IPv4). Set 48 or 56 if your site is no wider and that is in the way. |
+| `[egress] ipv4_site_prefix_len` | `16` | The site refused around each global IPv4 address on this host's interfaces: its enclosing /N, 8 to 32. |
+| `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes from fixed reflectors — `ns1.google.com` and `1.1.1.1` over DNS, and Cloudflare's `https://1.1.1.1/cdn-cgi/trace` over HTTPS (also over IPv6, and on an IPv6-only host through its NAT64 prefix) — and refuse every address any reports. A family counts as known only when the HTTPS reflector or both DNS reflectors confirm it (and the DNS agreement counts for nothing when the HTTPS reflector's connection was made but its TLS or answer failed), for 10 minutes after the last confirmation, and only on the uplink it was learned on (discovery runs again when the default route changes); while a family this host routes is unknown, requester connections over it are refused. Off: `public_addresses` must name an address of every family this host routes, or the miner does not start. |
+| `[egress] public_addresses` | `[]` | This host's public addresses as you know them (behind NAT, your router's; on an IPv6-only host, the NAT64 translator's IPv4 address). Refused as its own, and a family named here counts as known: set it where outbound DNS or HTTPS to the reflectors is filtered or intercepted. |
+| `[egress] near_hop_limit` | `2` | Right before every requester-caused connection, a probe whose packets may cross at most this many hops connects to the destination: one that answers (accepts, or refuses with a reset) is this host's own network and is refused. When the probe gets no answer, a check connection decides: once connected, its FIN, limited to the same hop count, must go unanswered. 2 to 16. |
+| `[egress] doh_resolvers` | Cloudflare, Google, Quad9 | The DNS-over-HTTPS resolvers requester host names are resolved with (never this host's resolver, `/etc/hosts` or a local stub): `https://` URLs whose host is a public IP literal, e.g. `["https://9.9.9.9/dns-query"]`. |
+| `[egress] nat64_prefixes` | `[]` | NAT64 prefixes this host's translator uses besides the well-known `64:ff9b::/96` (RFC 6052: a `/32`, `/40`, `/48`, `/56`, `/64` or `/96`, e.g. `"2001:db8:64::/96"`). An address under one is judged by the IPv4 address it carries, so `<prefix>::10.0.0.1` is refused. The prefix a DNS64 resolver uses is learned at startup from this host's DNS servers (`ipv4only.arpa`, RFC 7050); name it here when it cannot be. |
+| `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine (names then resolve through the system resolver, and no near-hop probe is sent). The only way to turn the guard off (there is no environment variable or flag). Needs `[dev] chain_id`; refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
+| `[dev] chain_id` | unset | The test network `private_network` is meant for: it must equal `[chain] chain_id` (which the RPC confirms at startup), or the miner refuses the config. A config copied to another network does not open the guard there. |
+
+The prover workers that run requesters' guests are confined before the first one runs: no
+sockets of any kind, the filesystem limited by Landlock to what proving needs (nothing of your
+home directory but `~/.risc0`/`~/.sp1` and a private temporary directory), and no reaching the
+miner or other processes; `sp1-gpu-server` likewise, under a supervisor (its socket is now
+`/tmp/zkminer-confined-<server>-<device>.sock`). This needs Linux with Landlock ABI 6, and ABI 8
+(`TSYNC`) for the SP1 worker and GPU workers that start threads before their first guest; a worker
+that cannot confine itself refuses to run guests. Workers (and the witness sandboxes) also refuse
+to run guests while **any network or remote-capable FUSE filesystem, or an automount map, is
+mounted where this user can reach it** (NFS, SMB, 9p and virtiofs shares, sshfs, rclone, a GNOME
+session's gvfs, autofs `/net`, ...): Landlock cannot stop a path lookup, which would query that
+filesystem's server. Of FUSE filesystems only two that root mounts are fine (lxcfs, and ntfs-3g
+or exfat-fuse on a block device); a user's own FUSE mounts (gvfs, the document portal, AppImages,
+rclone, ...) are not, whatever they call themselves. Unmount them, or run the miner as a dedicated
+user (another user's FUSE mount without `allow_other` is closed to it) or in a container or mount
+namespace that leaves them out. Confined workers also
+change no file's mode, owner, attributes or times. Nothing a worker starts outlives it: each worker
+runs in a cgroup of its own, killed with `cgroup.kill` when the worker ends (below the miner's when
+the miner runs in a cgroup delegated to it, such as under `systemd-run --user --scope -p
+Delegate=yes zkminer run`, else in a scope of your systemd user manager); a small reaper process
+(`zkminer-worker-reaper`) kills every worker if the miner dies abruptly; and the miner kills every
+worker the moment a filesystem that is not local is mounted. The CPU risc0 worker's Docker Groth16 wrap runs in
+a helper process that accepts only a strictly checked prover input, with the image pinned by digest
+and `--network none`. See [SECURITY.md](SECURITY.md#inline-workers-confined).
+
+Unknown keys in `[dev]` and `[egress]` are errors, so a misspelt setting stops the miner
+instead of being ignored. `ZKMINER_ELF_ALLOW_PRIVATE_URLS`, which older builds read, is no
+longer read: move a test setup that used it to `[dev] private_network = true` with `[dev]
+chain_id` set to the test network's chain id.
 
 ## Run
 
@@ -558,7 +648,40 @@ Worth knowing:
   the known deployment's, `ZKMINER_RISC0_SKIP_PROGRAM_ID_CHECK=1` proves an ELF whose image
   id isn't the job's program id. Each one turns off a guard against losing collateral.
 - **Rebuild every worker with the miner.** A worker built for another protocol version is
-  refused at start.
+  refused at start, and its proof system is not offered on that card. Workers in
+  `~/.zkminer/provers` are found before the ones shipped beside the miner: replace them too, or
+  remove them, when you upgrade.
+- **One job locks at most half the stake, and so do one program's and one submitter's jobs
+  together.** A submitter chooses a job's collateral rate (up to 500%) and its maximum price, and a
+  forced release burns a share of what is locked. The cap is `ZKMINER_MAX_JOB_COLLATERAL_FRACTION`
+  (default `0.5`; `0` turns it off) of the total stake, but never less than the deployment's
+  per-job floor (`MIN_COLLATERAL_AMOUNT`, 100 HEMI on 743111), so a stake of 100–199 HEMI can still
+  claim one job (the miner says so once at startup). A job whose collateral at its maximum price is
+  over the cap is set aside, not claimed; one that would take the jobs of its program, or of its
+  submitter, that this miner holds and has not proven yet over the cap waits until they are proven.
+  Witness jobs are held to the same cap, inline and witness locks counting together, and
+  `run --watch-only` reports a job over it. A value that is not a number from 0 up is warned
+  about and the default used.
+- **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
+  sha, bigint) by what they cost to prove, where the instruction count counted each as one.
+  Benchmarks saved by an older miner count SP1 instructions per second, which is close for code
+  without precompiles; run `zkminer benchmark` (again with `--calibrate` if you calibrated) to
+  record SP1 in gas.
+- **risc0 proofs write their segments to disk**, not to the temporary directory: a long proof
+  stages gigabytes there, which on a tmpfs would be RAM the miner does not count. Each worker has
+  a directory of its own (mode 0700): `<segment_dir>/inline/<pid>-<start>` when `[retention]` is
+  configured, beside the witness proofs', else `~/.zkminer/risc0-segments/<pid>-<start>`
+  (`~/.zkminer` may be a link of yours to a directory of yours, on another disk). Keep room there:
+  an inline risc0 job is claimed only while its segments (estimated at 4 bytes per sized cycle)
+  fit beside those of every proof planned or running, witness ones included, with 1 GiB to spare,
+  and a worker does not start a proof with under 1 GiB free. A proof that fails while the disk
+  has no room for its segments (a full disk or quota) is this host's failure: it is not held
+  against the job's program or submitter. Each proof empties its directory, and a worker that was
+  killed has its directory removed when the next one starts. That sweep tells a live worker by
+  its pid and start time in `/proc`. On another OS it cannot, and keeps every directory: remove a
+  killed worker's by hand. Workers that share one home from different pid namespaces (containers)
+  cannot see each other and would remove each other's: give each its own home, or its own
+  `[retention] segment_dir`.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
@@ -665,7 +788,7 @@ A `measured` report also says whether its count is evidence of the proven run:
 
 A count is evidence when `proven` is `matches`, `binding` is not `fails`, `hostInputReads` is
 present and `sizeCheck` is not `differs`. risc0 guests' `sys_rand` is seeded by a public rule (`SYS_RAND_RULE`) that zkminer's proofs
-use from protocol 13 (14 since the macOS line merged): a function of the image id and every byte the guest reads, so a guest's random
+use from protocol 13 (on the macOS line from its 14; one line since 17): a function of the image id and every byte the guest reads, so a guest's random
 bytes, and the path it takes on them, are the same here as in a proof zkminer makes under that rule.
 The figure is the cost of that run at the size the report names (a miner proves at its own card's).
 
@@ -730,7 +853,7 @@ With `--stdin`, a READY line comes first, once the measure workers run (an SP1 o
 any request is read; a reader should send nothing before it:
 
 ```json
-{"schema":1,"ready":true,"backends":["risc0","sp1"],"zkminerVersion":"0.1.0","protocolVersion":11}
+{"schema":1,"ready":true,"backends":["risc0","sp1"],"zkminerVersion":"0.1.0","protocolVersion":15}
 ```
 
 (`backends`: those with a live measure worker, sorted.) A line that is not a request is answered
@@ -753,9 +876,10 @@ Reading the counts:
 
 - **Units differ by backend.** risc0's count is cycles with every segment padded to its power of two
   at the report's `po2`, plus a charge of 2^20 for each keccak proof request (a price, not cycles: about a 2^20
-  segment's proving time; doubled per step of a larger keccak po2). SP1's is
-  the RV64 instruction count, where a precompile (keccak, sha, ...) counts once. Never add or compare
-  the two.
+  segment's proving time; doubled per step of a larger keccak po2). SP1's is SP1's gas, which
+  weights each operation by what it costs to prove: about the instruction count for plain code, far
+  more for precompiles (keccak, sha, ...), which the instruction count counted once. Never add or
+  compare the two.
 - **po2.** risc0 counts depend on the segment size: a job proven on a small card (po2 16) has about
   1.8 times the po2-20 count. A report carries the `po2` of its figure, which is the lowest of the
   seven sizes unless the request was `singleRun`.
@@ -763,16 +887,244 @@ Reading the counts:
   hundred cycles of guest work and is charged 2^20), so it bounds what one job adds to a sum. The
   default, 1e9, is ten times the largest proof seen on this market.
 
-**Never run `simulate` on a host that runs a miner.** The miner's host-RAM and `/dev/shm` ledgers are
-per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` and may hold up to
-24 GiB) is invisible to a miner beside it, and the two can together OOM or SIGBUS its proofs.
+**Never run `simulate` on a host that runs a miner.** The miner's host-RAM ledger is per process: a
+simulate measurement (an SP1 one stages gigabytes of shared memory and may hold up to 24 GiB) is
+invisible to a miner beside it, and the two can together run the host out of memory under its proofs.
+
+## Witness jobs: requester tools
+
+A witness-construction job carries an envelope in `inputData` instead of the guest input: the miner
+runs the requester's builder (a WASM module) in a sandbox to construct the witness `W`, executes the
+guest on `W` and checks the journal against the binding before it claims (see
+`docs/witness-construction-jobs.md`). These commands are for the requester; none of them needs a
+miner's key.
+
+**The envelope.** `zkminer witness envelope encode SPEC` writes `inputData = WITNESS_JOB_TAG_V1 ‖
+abi.encode(WitnessJobV1)` as 0x hex from a TOML (by its extension) or JSON spec, and checks it with
+the miner's own strict decoder (a spec the miner would skip is refused with its reason). With
+`--builder b.wasm` the builder id is the module's sha256 (and must equal a given one). A *job* spec
+adds the program, the binding and the envelope, and with `--descriptor-out` also writes the
+descriptor file `zkminer simulate --descriptor` reads:
+
+```toml
+program_id = "0x…"                 # the guest's risc0 image id
+# assigned_prover = "0x…"          # needed for a NONE binding
+[binding]
+prefix = true                      # the journal-prefix marker (the default for open witness jobs)
+header = ["uint:1", "bytes32:0x…", "address:0x…", "keccak:my-layout-rule", "uint:3"]   # FIELDS
+# full_statement = "0x…"           # or FULL, for a journal known in full at submit
+[envelope]
+builder_uris = ["hemi-code://743111/0x…"]
+builder_params_abi = ["uint64:8453", "bytes32:0x…", "address:0x…"]   # abi.encode of static values
+[[envelope.sources]]
+class = "evm-rpc/v1"
+chain_id = 8453
+archive = true
+method_set = "state-read"
+max_proof_age = 300
+[envelope.limits]                  # every limit explicit: 0 means none allowed
+max_fetches = 64
+max_fetch_bytes = 16777216
+max_request_bytes = 65536
+max_response_bytes = 4194304
+max_builder_fuel = 10000000000
+max_builder_memory_bytes = 268435456
+max_builder_seconds = 60
+max_witness_bytes = 1048576
+max_guest_cycles = 67108864
+```
+
+`zkminer witness envelope decode 0x…|FILE [--chain-id N]` explains an existing `inputData`: the
+decoder's verdict, each builder URI as a miner on that chain reads it (usable, or why it is
+ignored), size warnings, and the envelope as an editable spec (TOML; JSON when a value is above
+2^63 − 1, which TOML cannot hold). Control and bidirectional-format characters in what it prints are
+escaped (`\u{1b}`): an envelope's URIs are the requester's bytes. It exits non-zero when the miner
+would skip the job, and 0 for any envelope the miner decodes.
+
+**The binding.** `zkminer witness binding compute --word TYPE:VALUE …` derives `journalFields` and
+`expectedJournalHash` from your own parameters, FIELDS over the whole header (`H = 32 × words`,
+pinned at statement offset 0, with the journal-prefix marker unless `--no-prefix`); `--full-statement
+0x… --program-id …` is FULL, `--none --assigned 0x…` is NONE. Never take these from a prover's
+journal. Word types: `uintN`, `bool`, `address`, `bytesN`, `bytes32`, `word` (raw), `keccak:<text>`.
+`zkminer witness binding check` is the mutation check: give the binding (`--journal-fields` and
+`--expected-journal-hash`, or `--descriptor`) and the statement (`--word …`, `--statement 0x…`, or a
+whole `--journal`), and it changes each byte in turn, recomputes the router's hash, and reports the
+pinned and free byte ranges, the header's free bytes, the free bytes of each header word, and
+whether the expected hash matches. It exits non-zero when:
+- a header byte is free; the header's length is `--header-bytes`, or 32 × the `--word`s;
+- the header's length is unknown under FIELDS (give it: a binding cannot be shown to pin a header of
+  unknown length), or it is longer than the statement given;
+- no expected hash is given (the mode is reported `unknown`: FULL and NONE look alike without it);
+- the binding is NONE without `--assigned` (or the descriptor's assigned prover);
+- the router would refuse the binding at submit (`InvalidJournalBinding`), a range ends past the
+  statement, or the hash does not match.
+
+A descriptor file whose binding the router would refuse at submit (NONE without an assigned prover,
+FIELDS without a hash, a range past the journal) does not load anywhere.
+
+**Simulate a job before submitting it.** `zkminer simulate --descriptor d.json` runs the job through
+the miner's own pre-claim pipeline: the static gates, the builder (from `--builder`, or fetched by
+the broker from the envelope's `hemi-code` locators exactly as a miner fetches it), the sandboxed
+builder and execute at every `--po2` (one size, a range or a list), the router's binding check, a
+bundle published to a throwaway retention store under `--cache-dir` (removed at the end; it must
+not be tmpfs), and the claim gate's DA check (the exact fulfil against `[witness]
+fulfil_da_cap_bytes`). The guest ELF is `--elf`, else the ProgramRegistry's. The broker uses your own
+endpoints: `--broker-config` (the broker's TOML; default `[broker] config`), copied into the run's
+work directory with a spool of its own, so a simulation never shares a running miner's. The
+configuration's `[witness]` limits apply, the miner's per-job artifact budget (bytes and chunk reads)
+holds `hemi-code` reads, and `[witness] sandbox_mode = "rootless"` on a host without root; the
+sandbox and broker self-tests must pass first. A miner without `[witness] max_guest_cycles` derives
+its cycle maximum from its cards and proving timeout; give `--max-guest-cycles` to judge the job by
+one (else 2^34 applies, and the check is listed as not done). Without `--po2`, `maxGuestCycles` is
+judged at the sizes this configuration's risc0 cards prove at (its benchmark cache and
+`prover.risc0_job_po2`), else every job size is executed and judged at po2 20, the size every card
+without a calibration or an operator's size proves at (`po2Source` says which). The miner also sizes
+a card by its VRAM, which the benchmark cache does not record: a card under 14 GiB proves at its
+calibrated size, below 20 when 20 failed there, or no job at all uncalibrated. `po2Source` names
+the size each such card would have, and `--po2` judges at it. Run it in a delegated cgroup:
+
+```bash
+systemd-run --user --scope -q -p Delegate=yes -- \
+    zkminer -c simulate.toml simulate --descriptor d.json --builder b.wasm --elf guest.elf \
+    --prover 0x… --out report.json
+```
+
+The report (one JSON document, `"kind": "witness"`) has the outcome (`simulated`, or `skipped` with
+the verdict, its step — `static_gates`, `artifact`, `builder`, `execute`, `binding`, `publish` or
+`claim_gate` — and its retry class — `never`, `once_jittered`, `backoff` with `retryMaxAttempts`,
+`on_host_change` or `deferred` — or `aborted`), the builder's fuel, fetches, fetched bytes, compile
+and run time and peak memory, `|W|` and its hashes, cycles per po2 in the `maxGuestCycles` unit,
+the journal, the pinned bytes and the binding's mutation check (the header's length from a scheme-1
+`W`'s word count, or `--header-bytes`), the fulfil's estimated DA size (by the chain's
+`GasPriceOracle` when `[chain] rpc_url` answers, else an upper bound) against the cap, this
+configuration's admission parameters, and `notChecked`: what was not checked and a miner would
+(claimability, submission form, deployment pins, admission, reservation, the DA backlog, deadline,
+prove resources; the builder's availability through its URIs or a mirror with `--builder`; the
+registry's ELF with `--elf`; a card-derived cycle maximum without `--max-guest-cycles`). The
+`sys_rand` seed is the public rule's, as a miner's (`sysRandRule`), and a journal-prefix job is
+reproduced exactly only with the real `jobId` (the file's `jobId`) and `--prover`. It exits non-zero
+when a miner with this configuration would skip the job: a journal the router's binding check
+refuses included (`BindingMismatch`). A binding the router accepts but that leaves header bytes
+free, or whose header's length is unknown, is reported (`binding.ok`, `binding.warnings`, and a
+line on stderr) with exit 0, since a miner serves it; `--adversarial` fails it. In `--job`/`--stdin` mode a witness job on
+chain is reported `not_served`: its proven input is the builder's `W`, not its `inputData`.
+
+**`--adversarial`** then attacks the witness and the host inputs, within `--adversarial-secs`
+(default 600; every execute and broker start gets what is left of it and is killed there). It
+checks the binding's coverage, then the host inputs and the providers (a few runs each), then
+spends what is left on the mutations, each execute getting a share of the time left (the time over
+the mutations still to run, and at least four times the unchanged `W`'s execute): one mutation that
+runs away cannot starve the others, and one cut at its share is inconclusive. Every re-execution
+runs under the attack's cycle cap: this host's maximum when one is configured (`--max-guest-cycles`,
+`[witness] max_guest_cycles`), else 4 × the job's `maxGuestCycles` (`attackCycleCap`):
+
+- **the binding's coverage** first: it must pin the whole journal header `[0, H)` with a non-zero
+  `expectedJournalHash` (`H` from a scheme-1 `W`, or `--header-bytes`), else the verdict is `fail`.
+  A free header word is exploitable only with a consistent change of `W` (another block and its
+  header, another `k` and its proofs), which no mutation makes, so the mutations alone would pass it;
+- **mutations of `W`**, each made just before it runs (repeats recognised by their sha256) and
+  re-executed by the same sandboxed worker under the attack's cycle cap, not the job's (the router
+  does not check cycles: a run past `maxGuestCycles` is judged on its journal, and only one stopped
+  at the cap, cut at its share of the time, or that ends in an executor panic or a run no proof can
+  verify is inconclusive, which under FULL decides nothing): byte flips at `--flips`
+  sampled offsets (default 32; the first and last byte always), truncations, trailing bytes, and
+  the drop, duplication and reordering of items in every length-delimited framing `W` parses as
+  (u32/u64 length prefixes, risc0's word-padded `Vec<u8>`, a top-level RLP list), plus, first, the
+  structured mutations of the job's scheme, by the scheme id in the header's first word (or
+  `--scheme`). Scheme 1 (`eth-block`) is registered, from the reference prelude's codec
+  (`reference/eth-prelude`): byte flips in header words, headers and trie nodes, nodes dropped,
+  duplicated and appended, proof kinds flipped (inclusion for exclusion), proofs truncated,
+  dropped, duplicated and swapped (another slot's proof), and the block header replaced by its
+  parent's and the next block's, fetched through the job's own `evm-rpc/v1` source. At most
+  `--max-mutations` run (default 256). Each must fail in the guest, give the same journal byte for
+  byte, or change pinned bytes (which the router refuses); a changed journal that still satisfies
+  the binding is a **soundness failure**, reported with the mutation that caused it;
+- **host inputs**: the same `W` under two `sys_rand` seeds (the rule's and a random one: the proof
+  binds no seed, so a prover on other software can answer with anything), two po2s (the first
+  `--po2` and the one farthest from it, else the far end of 16..22; one request each) and two keccak
+  po2s; any journal change is a dependence on an input the prover controls (a run past the cycle
+  maximum is reported as such, not as a dependence). These compare journals only, and a guest can
+  check `W` by the seed while its journal ignores it (a spot check at a drawn index passes an honest
+  `W` under every seed, and a forged one under the seed its prover picks). So every execute counts
+  the guest's own `sys_rand` calls (`perPo2[].sysRandDraws`, past the one its runtime makes before
+  `main`): a job whose guest makes any is skipped before any attack (`GuestUsesSysRand`, the
+  caller's, as a miner skips it), and a pair whose run draws is dependent. The count is of calls; a
+  guest that reads its runtime's own draw from memory is not caught by it;
+- **providers**: the whole pipeline against two `[[evm_rpc]]` endpoints of the broker configuration
+  (`--providers a,b`, default the first two serving the job's chain), each alone; different
+  journals that both satisfy the binding are a soundness failure. So a `pass` needs two `evm-rpc`
+  endpoints for the job's chain in the broker configuration (with fewer the differential is not run,
+  and the verdict is `incomplete`).
+
+`adversarial.verdict` is `pass`, `fail`, or `incomplete`: something not run in time or
+inconclusive, no mutation run (`--max-mutations 0`), or, unless the binding is FULL (which decides
+every journal), no structured mutations (the job's scheme is not registered, or `W` is not of it:
+the generic ones change bytes, never a consistent `W`). The command exits non-zero unless it is
+`pass`. A `W` above `--adversarial-max-w-bytes` (default 8 MiB) is not attacked (`refused`): the
+attack runs in this process, unsandboxed, and its peak memory grows with `W`: about 4 × `|W|` for
+the generic mutations, and up to about 32 × `|W|` for a scheme-1 `W` of many small trie nodes
+(the decoded proofs it rearranges), so set the bound by the memory you can give it.
+
+**Publish a builder.** `zkminer artifact publish FILE --kind builder|elf --rpc-url URL --chain-id N
+--keystore KEY.json` stores the file on the HemiProve chain as contract code (`hemi-code`): chunks
+of at most 24,575 bytes as `0x00`-prefixed data contracts, then a manifest. It is permanent and
+public. The rules it follows are the format's own (§13.5 of the design):
+
+- the key is an encrypted keystore of its own (password from the terminal, or `--password-fd N`:
+  N ≥ 3, a pipe or a file the caller opened for the command, checked before anything else
+  starts), never the miner's key file, the environment or argv; it is refused when it is
+  `[witness] prover_address`, staked as a prover, authorized as a prover's operator (read from the
+  chain; an authorization voided by `revokeAllOperators` no longer counts), or has pending
+  transactions it did not send. A stuck chunk blocks every later nonce of its sender, so a prover
+  key would stall its fulfils. The keystore's parameters are checked before any work, and the
+  password, the derived key and the decrypted key are zeroed after use;
+- every request goes through the network guard with a rate limit of its own
+  (`--max-requests-per-sec`, default 4); the RPC must be `https://` unless the configuration's
+  `[dev] private_network` is for that very chain (which also lets it be on loopback or the LAN);
+  `--rpc-url` may not be the miner's `[chain] rpc_url` while a miner runs. The URL can come from
+  `--rpc-url-file FILE` or `ZKMINER_PUBLISH_RPC_URL` instead of argv, where every local user sees
+  it (it may carry a provider key);
+- **the RPC is trusted**: the pacing gate's readings and the key checks are its answers, so a
+  lying one could open the gate or pass a prover key. Two things bound that. Sends are paced by
+  the local clock too, at least a block time apart whatever the RPC reports (12 s on Hemi, else
+  measured, never under 1 s outside developer mode; `--block-time-ms` sets it, never below a known
+  chain's). And `--verify-rpc-url URL` (or `--verify-rpc-url-file`) names a second provider:
+  each deployment must show there, in the same block and with the same code, before the next
+  chunk is signed, and the artifact is read back there too;
+- a cost preview (L2 gas at the chosen tip, the L1 data fee from `GasPriceOracle`, the balance one
+  in-flight chunk needs) comes first, confirmed on the terminal or with `--yes`;
+- one chunk in flight, at most one send per block and per block time, and only while the DA
+  backlog plus its own unmined estimates is under 250 KB, the safe head lags at most 300 s, the
+  router is not paused and the head is at most 60 s old: about twenty minutes per MiB. Each chunk's
+  transaction estimates at most 19,500 DA bytes. A chunk unmined for 3 blocks with the gate open is
+  replaced at its nonce with both fee fields raised, at most 16 times, the tip never past 64 times
+  the measured tip floor and the max fee never past 8 times the starting base fee plus that; a
+  refused replacement leaves the pooled fees as they were. Past the replacements or the caps it
+  waits while the pool holds the chunk; one the pool dropped is sent again as it was, at most 3
+  times, and the publish stops with an error if the pool refuses it or keeps dropping it. A failed
+  creation is redeployed at a new nonce;
+- it waits until every deploying block is at or below the safe head with its hash unchanged, reads
+  the artifact back there with the miner's manifest, chunk and assembly checks, and only then
+  prints the locator, sha256, length, addresses, total cost, and the `builderId` (or, for an ELF,
+  the `addStorageURI` arguments). Submit the job only after that. `--json` prints it as JSON;
+- `--progress FILE` records each mined deployment, and each transaction before it is sent (synced
+  to disk); run the same command again after a failure and it reuses the recorded chunks whose code
+  is on chain, and the transaction a killed run left in flight when it created the next one, sending
+  only the rest (while that transaction is still pending, the run refuses to start: let it settle).
+  Without it, a run that stopped part-way is run again from the start: every chunk is sent (and
+  paid) again.
+
+The router is the known deployment's on the chain, else `--router`. A configuration's `[dev]
+da_backlog_bytes` stands in for the backlog reading only in developer mode, and on Hemi testnet's
+chain id only against a node on loopback (a local fork).
 
 ## Layout
 
 | crate | role |
 |---|---|
-| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `init` |
+| `zkminer-cli` | binary entry point: `status`, `benchmark`, `run`, `simulate`, `witness`, `artifact`, `init` |
 | `zkminer-chain` | chain client, auction math, staking, monitor, tx/nonce layer, RPC metering |
+| `zkminer-netguard` | the network guard: what a requester-caused connection may reach (see SECURITY.md) |
 | `zkminer-contracts` | `sol!()` bindings — the source of truth for the on-chain ABI |
 | `zkminer-prover` | worker dispatcher, ELF registry, benchmarks, guest programs |
 | `zkminer-prover-protocol` | worker↔dispatcher IPC types |
@@ -805,6 +1157,23 @@ than skipping, so a half-installed box can't look green. Set `ZKVM_ALLOW_SKIP=1`
 instead. Run it single-threaded to avoid GPU contention, and log to a file rather than
 piping to `tail`, which buffers and can hide a hang.
 
+### Witness requester tools end to end
+
+`crates/zkminer-cli/tests/simulate_witness.rs` runs `zkminer witness envelope encode`, `zkminer
+simulate --descriptor` (with `--adversarial`) and `zkminer artifact publish` on anvil with the real
+sandboxed runner, broker and CPU risc0 worker, and checks that a builder published with `artifact
+publish` is fetched by the broker's own `hemi-code` reader. It needs a delegated cgroup, anvil and
+the SDK's pinned toolchain:
+
+```bash
+systemd-run --user --scope -q -p Delegate=yes -- env ZKMINER_SANDBOX_TESTS_REQUIRED=1 \
+    cargo test -p zkminer-cli --test simulate_witness -- --test-threads=1
+```
+
+The publisher's own tests (pacing, a chunk dropped from the pool and replaced at its nonce, an
+out-of-gas creation redeployed, the key refusals) run against anvil in `cargo test -p zkminer-cli
+--bin zkminer artifact::` (skipped without anvil unless `ZKMINER_ANVIL_TESTS_REQUIRED` is set).
+
 ### Localnet end-to-end test
 
 `crates/zkminer-cli/tests/localnet.rs` runs the real `zkminer` binary against a local anvil
@@ -824,7 +1193,9 @@ the tests:
 Some jobs are submitted before the miner starts and some after, so both the startup backfill
 and the live monitor are covered; the backfill starts at the first job's block, so one that
 starts a block late loses it. Nothing touches the real chain, and no key of yours is involved;
-each miner runs with its own HOME and a cleaned environment.
+each miner runs with its own HOME and a cleaned environment. The programs are served from
+127.0.0.1, so each miner's config sets `[dev] private_network = true` and `[dev] chain_id =
+743111` (the fork's chain id, where developer mode is allowed).
 
 ```bash
 env NVCC=/usr/local/cuda/bin/nvcc HIPCC=off \
@@ -856,6 +1227,17 @@ On a Mac, build the Metal worker (`--features metal --bin zkminer-prove-risc0-me
 - **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) is the replay test with
   real risc0 proofs of the fibonacci guest; it also checks each `JobFulfilled` payout
   (settled price + speed bonus - 1% protocol fee).
+- **`serves_witness_jobs`** (Linux, CPU only, a delegated cgroup) serves witness-construction jobs
+  with the real broker, builder runner and CPU worker under the rootless sandbox: one simulated,
+  claimed, proven and fulfilled with `fulfillJobHashed`; one whose binding the guest does not meet,
+  never claimed; one from a caller not allowed, never simulated.
+- **`serves_the_proxy_slots_witness_job`** (Linux, a delegated cgroup, the risc0 toolchain) runs the
+  plan's §12 job: an EIP-1967 proxy changed by real transactions on a second anvil (the `evm-rpc`
+  chain), the reference builder published with `zkminer artifact publish`, the job made with
+  `zkminer witness envelope encode` and `binding compute` (FIELDS over its 160-byte header, the
+  journal-prefix marker, an exclusivity window), proven on the CPU worker, and `publicValues`
+  checked against the second chain's state at the job's block. **`..._on_a_gpu`** proves it on
+  `ZKMINER_LOCALNET_RISC0_WORKER` (default the release CUDA worker).
 
 The tests need Foundry's `anvil` and the testnet RPC, which serves archive state; anvil caches
 what it fetches. Settings (fork URL and block, worker paths, echoing the log) are in the file's

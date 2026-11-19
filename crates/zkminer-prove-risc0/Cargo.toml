@@ -95,8 +95,15 @@ risc0-groth16-sys = { version = "0.1", optional = true }
 # threads (M9, `metal_start::apply_proving_qos`). The same rayon as risc0's, so it is that pool.
 rayon = { version = "1", optional = true }
 
+# The Docker Groth16 helper reads the prover image's proof (`groth16_wrap`).
+serde_json = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.29", optional = true }
+
+# The one-shot sandboxed witness execute (`--witness-execute`, src/witness.rs) restricts itself with it.
+[target.'cfg(target_os = "linux")'.dependencies]
+zkminer-witness-sandbox = { workspace = true }
 
 [package.metadata.risc0]
 methods = [
@@ -121,8 +128,14 @@ methods = [
 [dev-dependencies]
 tempfile = "3"
 # The dispatcher (with its test hooks), so `tests/metal_worker.rs` can drive a real Metal worker
-# through it (M9's growth-net test).
+# through it (M9's growth-net test), and tests/witness_execute.rs drives the CPU worker's sandboxed
+# execute through the miner's launcher.
 zkminer-prover = { workspace = true, features = ["testing"] }
+
+# Linux only, as the crate is (seccomp, Landlock): tests/witness_execute.rs is Linux-only, and on macOS
+# the dependency would not build, so `cargo test -p zkminer-prove-risc0 --features metal` could not.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zkminer-witness-sandbox = { workspace = true }
 
 [build-dependencies]
 risc0-build = "3.0"

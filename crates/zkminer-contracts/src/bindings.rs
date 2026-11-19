@@ -368,6 +368,30 @@ sol! {
         function getBidState(bytes32 jobId) external view returns (BidState memory);
         function submitBid(bytes32 jobId, uint96 bidAmount) external;
         function settleBid(bytes32 jobId) external;
+
+        // A competitive bid on `jobId`. A witness simulation of the job stops on it (design §5.2):
+        // zkminer does not bid in Phase 1, and once a bid is live the caller can no longer cancel.
+        event BidSubmitted(
+            bytes32 indexed jobId, address indexed bidder, uint96 bidAmount, uint40 newBidDeadline,
+            address operator, address previousBidder
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Router upgrade timelock (HemiProve.sol). One pending operation at a time: an upgrade, a facet
+    // update, or both, named by its `operationHash`. Watched by the governance watcher (design §5.5):
+    // no witness lock whose deadline falls after a pending upgrade's `readyAt`.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[sol(rpc)]
+    #[derive(Debug)]
+    interface IHemiProveRouterGov {
+        event UpgradeProposed(bytes32 indexed operationHash, uint48 readyAt);
+        event UpgradeCancelled(bytes32 indexed operationHash);
+        event UpgradeExecuted(bytes32 indexed operationHash);
+
+        // `(0, 0)` when nothing is pending.
+        function pendingUpgrade() external view returns (bytes32 operationHash, uint48 readyAt);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -470,10 +494,34 @@ sol! {
     #[derive(Debug)]
     interface IHemiProveRegistry {
         event AdapterDisabledEvent(bytes32 indexed proofSystemId);
+        // Emitted by the instant re-enable AND by `executePendingReactivation` (the verifier swap
+        // landing): either way the adapter is enabled again, at `adapter`.
+        event AdapterReactivated(bytes32 indexed proofSystemId, address adapter);
+        event AdapterRegistered(
+            bytes32 indexed proofSystemId, address adapter, uint16 feeRateBps, uint128 minStake,
+            uint96 defaultCollateralRatio, uint8 cycleAttestationMode
+        );
+        // A verifier swap for a Disabled adapter, executable from `readyAt` (the switch delay: 48 h by
+        // default, governable from 1 h to 30 days). A new proposal replaces a pending one, emitting
+        // `VerifierSwitchCancelled` for the old one first.
+        event VerifierSwitchProposed(bytes32 indexed proofSystemId, address indexed newAdapter, uint40 readyAt);
+        event VerifierSwitchCancelled(bytes32 indexed proofSystemId, address indexed rejectedAdapter);
+        // `Paused`/`Unpaused` share topic0 with the router's: filter by address.
+        event Paused(address account);
+        event Unpaused(address account);
+        // The Registry's own upgrade timelock. `UpgradeExecuted` differs from the router's (it also
+        // names the implementation), so its topic0 does too.
+        event UpgradeProposed(bytes32 indexed opHash, uint48 readyAt);
+        event UpgradeCancelled(bytes32 indexed opHash);
+        event UpgradeExecuted(bytes32 indexed opHash, address indexed newImpl);
 
         function getAdapter(bytes32 proofSystemId) external view returns (AdapterEntry memory);
         function isBlacklisted(address verifier) external view returns (bool);
         function paused() external view returns (bool);
+        // The pending verifier swap for a proof system; `(0, 0)` when none.
+        function pendingReactivation(bytes32 proofSystemId) external view returns (address newAdapter, uint40 readyAt);
+        // `(0, 0)` when nothing is pending.
+        function pendingUpgrade() external view returns (bytes32 opHash, uint48 readyAt);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -579,7 +627,34 @@ sol! {
             StorageURI[] calldata initialURIs
         ) external;
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GasPriceOracle — the OP Stack L2 predeploy at 0x420000000000000000000000000000000000000F
+    // (GAS_PRICE_ORACLE below). Hemi runs it at version 1.4.0 with Fjord active (`isFjord()`), so
+    // `getL1GasUsed(unsignedTx)` is `max(100, -42.5856 + 0.8365 x (FastLZ(unsignedTx) + 68)) x 16`:
+    // divided by 16, the estimated DA size the sequencer's per-transaction DA cap compares (the
+    // same figure as a mined receipt's `l1GasUsed / 16`). Not part of the vendored HemiProve ABIs;
+    // the selectors are pinned by `tests` below.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[sol(rpc)]
+    #[derive(Debug)]
+    interface IGasPriceOracle {
+        function getL1GasUsed(bytes memory _data) external view returns (uint256);
+        function getL1Fee(bytes memory _data) external view returns (uint256);
+        function getL1FeeUpperBound(uint256 _unsignedTxSize) external view returns (uint256);
+        function isFjord() external view returns (bool);
+        function isEcotone() external view returns (bool);
+        function l1BaseFee() external view returns (uint256);
+        function baseFeeScalar() external view returns (uint32);
+        function blobBaseFeeScalar() external view returns (uint32);
+        function version() external view returns (string);
+    }
 }
+
+/// The OP Stack `GasPriceOracle` predeploy (present on both Hemi chains).
+pub const GAS_PRICE_ORACLE: alloy::primitives::Address =
+    alloy::primitives::address!("420000000000000000000000000000000000000F");
 
 /// The router's raw `jobs(jobId)` record (27 outputs, in ABI order). Decoded from the 27-word return
 /// by [`JobRecord::from_words`], which REJECTS a word whose value does not fit its declared type —
@@ -896,6 +971,24 @@ mod tests {
         assert_eq!(IHemiProveFulfill::DeadlineExtended::SIGNATURE_HASH, topic("DeadlineExtended"));
         assert_eq!(IHemiProveAux::Paused::SIGNATURE_HASH, topic("Paused"));
         assert_eq!(IHemiProveAux::Unpaused::SIGNATURE_HASH, topic("Unpaused"));
+        assert_eq!(
+            IHemiProveAux::BidSubmitted::SIGNATURE_HASH,
+            topic("BidSubmitted")
+        );
+        assert_eq!(
+            IHemiProveRouterGov::UpgradeProposed::SIGNATURE_HASH,
+            topic("UpgradeProposed")
+        );
+        assert_eq!(
+            IHemiProveRouterGov::UpgradeCancelled::SIGNATURE_HASH,
+            topic("UpgradeCancelled")
+        );
+        assert_eq!(
+            IHemiProveRouterGov::UpgradeExecuted::SIGNATURE_HASH,
+            topic("UpgradeExecuted")
+        );
+        let f = pin_call!(r, IHemiProveRouterGov::pendingUpgradeCall, "pendingUpgrade");
+        assert_eq!(outputs(&f), "(bytes32,uint48)");
         // Handoff Appendix C values, as a second, independent anchor.
         assert_eq!(
             format!("{:x}", IHemiProveCore::JobSubmitted::SIGNATURE_HASH),
@@ -904,6 +997,80 @@ mod tests {
         assert_eq!(
             format!("{:x}", IHemiProveFulfill::JobCancelled::SIGNATURE_HASH),
             "a96b38c2858070b5eb59b3be21c9261ebf35b64c358634f372d7e2b1e17b4e88"
+        );
+    }
+
+    /// The Registry events the governance watcher decodes (verifier swaps, adapter disables, pauses,
+    /// upgrades), pinned against the deployed Registry ABI. `Paused`/`Unpaused` and the upgrade events
+    /// must equal the router's where the signatures agree, since the watcher tells them apart by
+    /// address only.
+    #[test]
+    fn registry_event_topics_match_the_deployed_abi() {
+        let g = abi("HemiProveRegistry.abi.json");
+        let topic = |name: &str| -> B256 {
+            let es = g
+                .event(name)
+                .unwrap_or_else(|| panic!("event {name} missing"));
+            assert_eq!(es.len(), 1);
+            es[0].selector()
+        };
+        assert_eq!(
+            IHemiProveRegistry::AdapterDisabledEvent::SIGNATURE_HASH,
+            topic("AdapterDisabledEvent")
+        );
+        assert_eq!(
+            IHemiProveRegistry::AdapterReactivated::SIGNATURE_HASH,
+            topic("AdapterReactivated")
+        );
+        assert_eq!(
+            IHemiProveRegistry::AdapterRegistered::SIGNATURE_HASH,
+            topic("AdapterRegistered")
+        );
+        assert_eq!(
+            IHemiProveRegistry::VerifierSwitchProposed::SIGNATURE_HASH,
+            topic("VerifierSwitchProposed")
+        );
+        assert_eq!(
+            IHemiProveRegistry::VerifierSwitchCancelled::SIGNATURE_HASH,
+            topic("VerifierSwitchCancelled")
+        );
+        assert_eq!(IHemiProveRegistry::Paused::SIGNATURE_HASH, topic("Paused"));
+        assert_eq!(
+            IHemiProveRegistry::Unpaused::SIGNATURE_HASH,
+            topic("Unpaused")
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeProposed::SIGNATURE_HASH,
+            topic("UpgradeProposed")
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeCancelled::SIGNATURE_HASH,
+            topic("UpgradeCancelled")
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeExecuted::SIGNATURE_HASH,
+            topic("UpgradeExecuted")
+        );
+        // Shared with the router's (same signature) — or not (UpgradeExecuted names the impl here).
+        assert_eq!(
+            IHemiProveRegistry::Paused::SIGNATURE_HASH,
+            IHemiProveAux::Paused::SIGNATURE_HASH
+        );
+        assert_eq!(
+            IHemiProveRegistry::Unpaused::SIGNATURE_HASH,
+            IHemiProveAux::Unpaused::SIGNATURE_HASH
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeProposed::SIGNATURE_HASH,
+            IHemiProveRouterGov::UpgradeProposed::SIGNATURE_HASH
+        );
+        assert_eq!(
+            IHemiProveRegistry::UpgradeCancelled::SIGNATURE_HASH,
+            IHemiProveRouterGov::UpgradeCancelled::SIGNATURE_HASH
+        );
+        assert_ne!(
+            IHemiProveRegistry::UpgradeExecuted::SIGNATURE_HASH,
+            IHemiProveRouterGov::UpgradeExecuted::SIGNATURE_HASH
         );
     }
 
@@ -938,6 +1105,43 @@ mod tests {
         assert_eq!(IHemiProveErrors::EnforcedPause::SELECTOR, [0xd9, 0x3c, 0x06, 0x65]);
     }
 
+    /// The GasPriceOracle predeploy has no vendored ABI: pin its selectors to the OP Stack
+    /// signatures (and `cast sig`'s values), and fulfillJobHashed's to its canonical signature —
+    /// the struct's member order is what `fulfill_job_hashed` encodes.
+    #[test]
+    fn gas_price_oracle_and_fulfill_job_hashed_selectors() {
+        assert_eq!(IGasPriceOracle::getL1GasUsedCall::SELECTOR, [0xde, 0x26, 0xc4, 0xa1]);
+        assert_eq!(IGasPriceOracle::getL1FeeCall::SELECTOR, [0x49, 0x94, 0x8e, 0x0e]);
+        assert_eq!(IGasPriceOracle::getL1FeeUpperBoundCall::SELECTOR, [0xf1, 0xc7, 0xa5, 0x8b]);
+        assert_eq!(IGasPriceOracle::isFjordCall::SELECTOR, [0x96, 0x0e, 0x3a, 0x23]);
+        assert_eq!(IGasPriceOracle::isEcotoneCall::SELECTOR, [0x4e, 0xf6, 0xe2, 0x24]);
+        assert_eq!(IGasPriceOracle::l1BaseFeeCall::SELECTOR, [0x51, 0x9b, 0x4b, 0xd3]);
+        assert_eq!(IGasPriceOracle::baseFeeScalarCall::SELECTOR, [0xc5, 0x98, 0x59, 0x18]);
+        assert_eq!(IGasPriceOracle::blobBaseFeeScalarCall::SELECTOR, [0x68, 0xd5, 0xdc, 0xa6]);
+        assert_eq!(IGasPriceOracle::versionCall::SELECTOR, [0x54, 0xfd, 0x4d, 0x50]);
+        assert_eq!(
+            format!("{GAS_PRICE_ORACLE}"),
+            "0x420000000000000000000000000000000000000F"
+        );
+        assert_eq!(
+            IHemiProveFulfill::fulfillJobHashedCall::SIGNATURE,
+            "fulfillJobHashed(bytes32,(bytes32,bytes32,address,address,bytes32,bytes32,bytes32,bytes32),\
+             bytes,bytes,bytes,bytes)"
+        );
+        assert_eq!(IHemiProveFulfill::fulfillJobHashedCall::SELECTOR, [0x80, 0xf7, 0x65, 0xf2]);
+        // ...and the member names line up with the ABI's HashedDescriptor, in order.
+        let f = only(&router(), "fulfillJobHashed");
+        let abi_names: Vec<&str> = f.inputs[1].components.iter().map(|c| c.name.as_str()).collect();
+        let bound = <HashedDescriptor as alloy::sol_types::SolStruct>::eip712_root_type();
+        let bound_names: Vec<&str> = bound
+            .trim_start_matches("HashedDescriptor(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|m| m.rsplit(' ').next().unwrap())
+            .collect();
+        assert_eq!(bound_names, abi_names, "HashedDescriptor member order drifted");
+    }
+
     #[test]
     fn staking_registry_and_program_registry_match_the_deployed_abis() {
         let s = abi("HemiProveStaking.abi.json");
@@ -957,6 +1161,14 @@ mod tests {
         assert_eq!(outputs(&f), "((address,uint8,uint40,bytes32,uint96,uint128,uint16,uint8))");
         pin_call!(g, IHemiProveRegistry::isBlacklistedCall, "isBlacklisted");
         pin_call!(g, IHemiProveRegistry::pausedCall, "paused");
+        let f = pin_call!(
+            g,
+            IHemiProveRegistry::pendingReactivationCall,
+            "pendingReactivation"
+        );
+        assert_eq!(outputs(&f), "(address,uint40)");
+        let f = pin_call!(g, IHemiProveRegistry::pendingUpgradeCall, "pendingUpgrade");
+        assert_eq!(outputs(&f), "(bytes32,uint48)");
 
         let p = abi("ProgramRegistry.abi.json");
         let f = pin_call!(p, IProgramRegistry::getProgramCall, "getProgram");

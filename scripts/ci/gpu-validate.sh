@@ -45,7 +45,10 @@ trap 'rm -rf "$work"' EXIT
 "$ci/unpack-provers.sh" "$release" "$work/zkminer/provers" >/dev/null
 chmod 0755 "$kit/localnet" "$kit/anvil"
 
-args=(--rm --pull=newer --group-add keep-groups --shm-size=46g
+# The image keeps Podman's default /dev/shm (64 MiB), as a container a miner is run in would: SP1's
+# executor shares its memory through file descriptors (memfds) and puts nothing there, and nothing
+# else here needs more than the few bytes ROCm SMI's mutexes take.
+args=(--rm --pull=newer --group-add keep-groups
   --security-opt label=disable
   -v "$work/zkminer:/opt/zkminer:ro" -v "$kit:/opt/kit:ro" -v "$ci:/ci:ro" -v "$cache:/cache")
 

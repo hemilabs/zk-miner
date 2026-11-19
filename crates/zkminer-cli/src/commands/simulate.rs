@@ -29,8 +29,8 @@
 //!    run to the proven one: the chain never checks the input, so a requester who is also the prover can
 //!    prove another input with the same journal, and choose a count up to `--max-cycles`.
 //!
-//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 13 (14
-//! since the macOS line merged, W10-INT) (`zkminer_prover_protocol::sys_rand`), so this run takes the path such a proof took, up to the
+//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 13 (on
+//! the macOS line, from its 14, W10-INT; one line since 17, W11-ON37) (`zkminer_prover_protocol::sys_rand`), so this run takes the path such a proof took, up to the
 //! segment size: the count is the cost of that run at the size the report names. A prover on other software, or a job
 //! proven before the rule, was seeded otherwise; the proof does not bind it.
 //!
@@ -477,15 +477,13 @@ pub fn redact_urls(text: &str) -> String {
     out
 }
 
-/// Whether `derived` (as a worker reports it) is `program_id`. risc0: the native order only, the one
-/// the deployed adapter verifies (see the risc0 worker's `image_id_matches`). SP1: either order, as
-/// the SP1 worker's prove-path gate accepts, since the on-chain order of a vkey hash is
-/// deployment-defined and a wrong ELF matches neither.
-pub fn program_id_matches(backend: &str, derived: &[u8; 32], program_id: &B256) -> bool {
-    if derived == &program_id.0 {
-        return true;
-    }
-    backend == BACKEND_SP1 && derived.iter().rev().eq(program_id.0.iter())
+/// Whether `derived` (as a worker reports it) is `program_id`: in the native order only, the one the
+/// chain verifies. risc0: the deployed adapter's (see the risc0 worker's `image_id_matches`). SP1: the
+/// verifier reads `programId` as `uint256(programVKey)`, the big-endian bytes32 the worker derives,
+/// and the SP1 worker's prove-path gate refuses any other order, so a reversed id would bind here and
+/// then never be proven.
+pub fn program_id_matches(derived: &[u8; 32], program_id: &B256) -> bool {
+    derived == &program_id.0
 }
 
 /// Classify a failed `execute_cycles` the way the miner's measure path does: typed transients first
@@ -693,6 +691,37 @@ fn guest_input(
     input.extend_from_slice(B256::left_padding_from(prover.as_slice()).as_slice());
     input.extend_from_slice(&d.inputData);
     Ok(input)
+}
+
+/// `--po2`: one size (`20`), an inclusive range (`16..22` or `16..=22`), or a list (`16,18,20`), each a
+/// job po2 the risc0 worker accepts; sorted and unique.
+pub fn parse_po2_set(s: &str) -> Result<Vec<u8>> {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let one = |t: &str| -> Result<u8> { t.trim().parse::<u8>().with_context(|| format!("--po2: {t:?} is not a po2")) };
+    let mut v: Vec<u8> = if let Some((a, b)) = s.split_once("..") {
+        let (a, b) = (one(a)?, one(b.strip_prefix('=').unwrap_or(b))?);
+        anyhow::ensure!(a <= b, "--po2 {s}: an empty range");
+        (a..=b).collect()
+    } else {
+        s.split(',').map(one).collect::<Result<_>>()?
+    };
+    v.sort_unstable();
+    v.dedup();
+    anyhow::ensure!(!v.is_empty(), "--po2 names no size");
+    if let Some(p) = v.iter().find(|&&p| !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(&p)) {
+        anyhow::bail!("--po2 {p} is outside {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}");
+    }
+    Ok(v)
+}
+
+/// Why an on-chain witness-construction job is not measured here: its proven input is `prefix ‖ W`,
+/// which its builder made on the prover's host, never the envelope in `inputData`.
+fn witness_job_reason(input_data: &[u8]) -> Option<&'static str> {
+    zkminer_witness::classify(input_data).map(|_| {
+        "a witness-construction job (its inputData is a witness envelope): its proven input is the builder's \
+         W, which measuring inputData cannot reproduce; run it through the miner's pipeline with \
+         `zkminer simulate --descriptor`"
+    })
 }
 
 /// Why a measured count is not reported as one: above `max`.
@@ -1083,7 +1112,7 @@ impl Simulator {
             return Ok(elf);
         }
         if let Some(h) = info.elf_hash {
-            match download_elf(&info.storage_uris, Some(h)).await {
+            match download_elf(self.client.elf_fetcher(), &info.storage_uris, Some(h)).await {
                 Ok(elf) => return Ok(elf),
                 Err(e) if e.downcast_ref::<NoStorageUris>().is_some() => return Err(e),
                 Err(e) => tracing::info!(
@@ -1093,7 +1122,7 @@ impl Simulator {
                 ),
             }
         }
-        download_elf(&info.storage_uris, None).await
+        download_elf(self.client.elf_fetcher(), &info.storage_uris, None).await
     }
 
     /// SP1: set up the measure worker the next request runs on (its CPU prover), outside that
@@ -1199,6 +1228,9 @@ impl Simulator {
 
         if program_id == B256::ZERO {
             return r.end(Outcome::ProgramMismatch, "its programId is zero");
+        }
+        if let Some(why) = witness_job_reason(&d.inputData) {
+            return r.end(Outcome::NotServed, why);
         }
         // Decided before the ELF: a job whose proven run cannot be reproduced here costs no download.
         let input = match guest_input(&d, job_id, view.prover, backend) {
@@ -1308,7 +1340,7 @@ impl Simulator {
                 }
             }
         };
-        if !program_id_matches(backend, &derived, &program_id) {
+        if !program_id_matches(&derived, &program_id) {
             let derived_hex = alloy::hex::encode(derived);
             // Read again: a long derivation outlives the client's cache, and the entry may have
             // changed meanwhile.
@@ -1626,6 +1658,9 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     anyhow::ensure!(opts.max_cycles > 0, "--max-cycles must be at least 1");
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    if let Some(banner) = config.dev_mode_banner() {
+        tracing::warn!("{banner}");
+    }
     // No key is read (the client signs with a throwaway one), so none must reach a worker either.
     if config.wallet.key_source == "env" {
         std::env::remove_var(&config.wallet.key_env_var);
@@ -1893,16 +1928,15 @@ mod tests {
     }
 
     #[test]
-    fn risc0_binds_in_native_order_only_and_sp1_in_either() {
+    fn a_program_binds_in_the_native_order_only() {
         let pid = B256::from(std::array::from_fn::<u8, 32, _>(|i| i as u8));
         let native = pid.0;
         let mut reversed = native;
         reversed.reverse();
-        assert!(program_id_matches(BACKEND_RISC0, &native, &pid));
-        assert!(!program_id_matches(BACKEND_RISC0, &reversed, &pid));
-        assert!(program_id_matches(BACKEND_SP1, &native, &pid));
-        assert!(program_id_matches(BACKEND_SP1, &reversed, &pid));
-        assert!(!program_id_matches(BACKEND_SP1, &[0u8; 32], &pid));
+        assert!(program_id_matches(&native, &pid));
+        // Neither a risc0 image id nor an SP1 verifying-key hash binds byte-reversed.
+        assert!(!program_id_matches(&reversed, &pid));
+        assert!(!program_id_matches(&[0u8; 32], &pid));
     }
 
     #[test]
@@ -2200,6 +2234,26 @@ mod tests {
         assert_eq!(outcome, Outcome::NotServed);
         assert!(!outcome.retryable());
         assert!(why.contains("journal-prefix"), "{why}");
+    }
+
+    #[test]
+    fn po2_sets_are_sizes_ranges_or_lists() {
+        assert_eq!(parse_po2_set("20").unwrap(), vec![20]);
+        assert_eq!(parse_po2_set("16..22").unwrap(), (16..=22).collect::<Vec<u8>>());
+        assert_eq!(parse_po2_set("16..=18").unwrap(), vec![16, 17, 18]);
+        assert_eq!(parse_po2_set("20,16,20").unwrap(), vec![16, 20]);
+        for bad in ["", "15", "23", "22..16", "16..x", "a"] {
+            assert!(parse_po2_set(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn on_chain_witness_jobs_are_not_measured_as_inline_ones() {
+        let mut input = zkminer_witness::WITNESS_JOB_TAG_V1.to_vec();
+        input.extend_from_slice(&[0u8; 64]);
+        assert!(witness_job_reason(&input).is_some());
+        assert!(witness_job_reason(&10u32.to_le_bytes()).is_none());
+        assert!(witness_job_reason(&input[..31]).is_none());
     }
 
     #[test]

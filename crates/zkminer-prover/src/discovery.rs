@@ -2052,7 +2052,8 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
 /// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
 /// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
-/// measured question, which keeps 12 GB cards out by default until their peaks are measured.
+/// measured question; with circuit v6.1.0's peaks that floor (10,012 MiB) is below this one, so a
+/// card this admits can clear it once its VRAM is free.
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
         "sp1" => Some(11_000_000_000),
@@ -2079,13 +2080,14 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// inside SP1 can notice, because the sizing happens before its first allocation.
 ///
 /// Why this, rather than a flat allowance for foreign VRAM, which is what this replaced: a flat
-/// allowance refuses work the card could actually do. Measured on this box on 2026-10-05, SP1 peaks at
-/// 15,092 MiB on the 134M-element tier and 17,766 MiB on the 268M tier. A 24,564 MiB 4090 with 6 GiB
-/// held by a display still has 18 GiB free — plenty for the lower tier — and a 512 MiB allowance
-/// refused it outright. Requiring the FLOOR to be free instead admits that card and leaves the sizing
-/// to [`sp1_element_threshold_for_available_vram`], which steps the tier down to match. The floor
-/// itself is the smaller tier's measured peak plus margin — 15,604 MiB — so a card that clears the
-/// floor has room for the configuration it will actually be given.
+/// allowance refuses work the card could actually do. With circuit v6.1.0, SP1 peaks at about
+/// 9,000 MiB on the 134M-element tier and 11,500 MiB on the 268M tier (recorded as 9,500 and 12,000;
+/// see `SP1_MEASURED_TIERS`). A 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free —
+/// plenty — and a 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead
+/// admits that card and leaves the sizing to [`sp1_element_threshold_for_available_vram`], which
+/// steps the tier down to match. The floor itself is the smaller tier's recorded peak plus margin —
+/// 10,012 MiB — so a card that clears the floor has room for the configuration it will actually be
+/// given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
 /// (`benchmark::risc0_job_po2`), and one too small for any proves none.

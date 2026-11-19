@@ -45,7 +45,7 @@ pub struct ProgramStage {
     /// slot; see `BenchmarkEntry::wrap_secs`.
     pub wrap_secs: Option<f64>,
     /// W7-M11: why this program was measured below the host's full speed (Low Power Mode, battery,
-    /// a throttling thermal state; `BenchmarkEntry::power_state`, protocol v12 of the macOS line, v14 since W10-INT), or `None` when it
+    /// a throttling thermal state; `BenchmarkEntry::power_state`, protocol v12 of the macOS line, v17 since W11-ON37), or `None` when it
     /// was measured at full power or the worker reports no power state. A suite holding a Low Power
     /// Mode or battery row stays in use as measured, and the miner advises a re-benchmark once the
     /// host is at full power again ([`power_redo_reason`]).
@@ -1983,7 +1983,7 @@ fn host_peaks_from_workers(
     peaks
 }
 
-/// W7-M11: the reduced-power reason a worker's entry carries (protocol v12 of the macOS line, v14 since W10-INT), unless
+/// W7-M11: the reduced-power reason a worker's entry carries (protocol v12 of the macOS line, v17 since W11-ON37), unless
 /// `ZKMINER_POWER_STATE_IN_BENCH=0` (`knob_off`) says to use every entry as measured.
 fn entry_power_reduced(
     entry: &zkminer_prover_protocol::BenchmarkEntry,

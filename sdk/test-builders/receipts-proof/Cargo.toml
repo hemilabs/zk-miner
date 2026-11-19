@@ -1,0 +1,19 @@
+[package]
+name = "receipts-proof"
+description = "Realistic test builder: a block's receipts with Merkle-Patricia proofs (serde_json, alloy-rlp, tiny-keccak, a hand-rolled MPT)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hemiprove-builder-sdk = { path = "../../hemiprove-builder-sdk" }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+alloy-sol-types = { version = "1", default-features = false, features = ["std"] }
+alloy-primitives = { version = "1", default-features = false, features = ["std", "serde"] }

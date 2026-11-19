@@ -44,7 +44,7 @@ fn the_metal_worker_warms_up_and_proves_over_ipc() {
         to.flush().unwrap();
         loop {
             match read_message(&mut from).unwrap() {
-                // Streamed before the answer (protocol 14: a Warmup's setup steps).
+                // Streamed before the answer (`SetupProgress`, main's protocol 12: a Warmup's setup steps).
                 WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
                 other => return other,
             }
@@ -89,6 +89,7 @@ fn the_metal_worker_warms_up_and_proves_over_ipc() {
         input_data: 1000u32.to_le_bytes().to_vec(),
         po2: None,
         program_id: None,
+        witness: None,
     }) {
         WorkerResponse::ProofResult { seal, cycles, .. } => {
             eprintln!(
@@ -158,6 +159,7 @@ fn a_first_prove_without_warmup_proves() {
             input_data: iters.to_le_bytes().to_vec(),
             po2: None,
             program_id: None,
+            witness: None,
         },
     )
     .unwrap();
@@ -288,7 +290,7 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
         to.flush().unwrap();
         loop {
             match read_message(&mut from).unwrap() {
-                // Streamed before the answer (protocol 14: a Warmup's setup steps).
+                // Streamed before the answer (`SetupProgress`, main's protocol 12: a Warmup's setup steps).
                 WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
                 other => return other,
             }
@@ -329,6 +331,7 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
             input_data: input.clone(),
             po2: None,
             program_id: None,
+            witness: None,
         }) {
             WorkerResponse::ProofResult { seal, cycles, .. } => {
                 eprintln!(
@@ -469,7 +472,7 @@ fn m9_proofs_in_one_worker() {
         to.flush().unwrap();
         loop {
             match read_message(&mut from).unwrap() {
-                // Streamed before the answer (protocol 14: a Warmup's setup steps).
+                // Streamed before the answer (`SetupProgress`, main's protocol 12: a Warmup's setup steps).
                 WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
                 other => return other,
             }
@@ -509,6 +512,7 @@ fn m9_proofs_in_one_worker() {
             input_data: iters.to_le_bytes().to_vec(),
             po2: None,
             program_id: None,
+            witness: None,
         }) {
             WorkerResponse::ProofResult { seal, cycles, .. } => {
                 assert!(!seal.is_empty());

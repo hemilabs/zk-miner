@@ -1,0 +1,16 @@
+[package]
+name = "keccak-3-0"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# A negative control, pinned to the toolchain guests must NOT be built with: risc0-zkvm 3.0.5, whose
+# keccak batcher roots two or more batches under risc0-circuit-recursion 4.0's control root, which the
+# miner's 3.1 prover cannot resolve. methods/tests/keccak_batches.rs shows such a guest unprovable
+# here, and simulate_adversarial.rs that the miner refuses it, naming the cause. Never deployed.
+[workspace]
+
+[dependencies]
+risc0-zkvm = { version = "=3.0.5", default-features = false }
+risc0-zkvm-platform = { version = "=2.2.2", default-features = false }

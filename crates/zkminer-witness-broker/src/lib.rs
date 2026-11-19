@@ -1,0 +1,94 @@
+//! The witness-job fetch broker (plan §11, §13.3–13.4, §14): typed `evm-rpc/v1` and `blob/v1`
+//! capabilities served to builders over per-job sockets, and `hemi-code` artifact reads.
+//!
+//! The process: `main` reads the config and key files and the host facts, applies the sandbox, then
+//! runs [`serve`] on the control socket at fd 3. The miner drives it with [`client::BrokerClient`].
+//!
+//! The broker has **no network of its own** (review r2 F5): its sandbox denies `socket`,
+//! `connect`, `bind`, `listen` and `accept*`. Every TCP connection it uses comes, already
+//! connected, from the miner's [`connector`] over the socket at fd 4: the broker names an operator
+//! endpoint by its index, and the miner — which loaded the same configuration itself — resolves,
+//! admits and connects. A broker an attacker controls can therefore reach nothing but the
+//! endpoints the operator configured, at addresses the miner's network floor admits.
+
+pub mod artifact;
+pub mod blob;
+pub(crate) mod broker;
+pub mod cache;
+pub mod client;
+pub mod config;
+pub mod connector;
+pub(crate) mod control;
+pub mod dns;
+pub mod egress;
+pub mod evm_rpc;
+pub mod fdpass;
+pub mod hooks;
+pub mod hostinfo;
+pub(crate) mod job;
+pub mod jsonrpc;
+pub mod lanes;
+pub mod logging;
+pub mod net;
+pub(crate) mod rpc_serve;
+pub(crate) mod selftest;
+pub mod spool;
+#[doc(hidden)]
+pub mod testkit;
+
+use std::os::fd::{AsFd, OwnedFd};
+
+pub use client::BrokerClient;
+pub use config::{BrokerConfig, HostFacts};
+pub use hooks::Hooks;
+
+/// The tokio worker threads `main` runs with.
+pub const WORKER_THREADS: usize = 4;
+/// The most blocking-pool threads (spool file creation, writes and reads).
+pub const MAX_BLOCKING_THREADS: usize = 8;
+
+/// Serves the control channel `control` (a connected `AF_UNIX` stream socket) until the miner
+/// closes it, with every connection from the miner's connector at `connector` (the broker's end
+/// of the connector socketpair). Uses `config.host` when present (read before the sandbox) and
+/// reads the host facts itself otherwise. Runs in `config.net_mode` (the miner's); in public mode
+/// a role entry that reaches the host's own addresses, connected prefixes or DNS servers is
+/// refused here ([`BrokerConfig::validate_host`]).
+pub async fn serve(config: BrokerConfig, control: OwnedFd, connector: OwnedFd) -> anyhow::Result<()> {
+    serve_with(config, control, connector, Hooks::real()).await
+}
+
+/// [`serve`] with explicit seams (tests).
+pub async fn serve_with(mut config: BrokerConfig, control: OwnedFd, connector: OwnedFd, hooks: Hooks) -> anyhow::Result<()> {
+    if !fdpass::is_unix_stream(control.as_fd()) {
+        anyhow::bail!("the control fd is not a Unix stream socket");
+    }
+    let wait = connector::request_budget(config.timeouts.connect()) + std::time::Duration::from_secs(2);
+    let connector = std::sync::Arc::new(connector::ConnectorClient::new(connector, wait)?);
+    let host = match config.host.take() {
+        Some(h) => h,
+        None => {
+            let (c, e) = (config.clone(), hooks.egress.clone());
+            tokio::task::spawn_blocking(move || HostFacts::gather(&c, &*e)).await??
+        }
+    };
+    config.validate_host(&host)?;
+    if config.net_mode == egress::NetMode::DevPrivate {
+        tracing::warn!("{}: operator endpoints may be on loopback and the local network", zkminer_netguard::DEV_MODE_BANNER);
+    }
+    let broker = broker::Broker::new(config, host, hooks, connector)?;
+    if let Some(ep) = broker.artifacts.endpoint().cloned() {
+        let want = broker.artifacts.chain_id();
+        tokio::spawn(async move {
+            let ids = std::sync::atomic::AtomicU64::new(1);
+            let wait = lanes::WaitFlag::default();
+            match (jsonrpc::RpcClient { ep: &ep, held: false, ids: &ids, wait: &wait }).chain_id().await {
+                Ok(got) if got == want => tracing::info!(endpoint = %ep.alias(), chain_id = got, "artifact endpoint chain id checked"),
+                Ok(got) => tracing::error!(endpoint = %ep.alias(), got, want, "PAGE: ARTIFACT-ENDPOINT wrong chain id"),
+                Err(e) => tracing::warn!(endpoint = %ep.alias(), error = %ep.redact(&e.to_string()), "artifact endpoint chain id check failed"),
+            }
+        });
+    }
+    fdpass::set_nonblocking(&control)?;
+    let sock = tokio::net::UnixStream::from_std(std::os::unix::net::UnixStream::from(control))?;
+    control::run(broker, sock).await
+}
