@@ -57,18 +57,74 @@ pub fn run(
 
     println!("Config file created at {}", path.display());
     println!();
-    println!("Pre-configured for Hemi Testnet (chain ID {TESTNET_CHAIN_ID})");
-    println!("  RPC:     {TESTNET_RPC}");
-    println!("  Router:  {}", TESTNET.router);
-    println!("  Token:   {} (tHEMI — owner-minted)", TESTNET.token);
-    println!();
-    println!("Next steps:");
-    println!("  1. Set your private key:");
-    println!("     export ZKMINER_PRIVATE_KEY=0xYOUR_KEY");
-    println!("  2. Get testnet ETH (gas) and tHEMI from the HemiProve team — tHEMI is minted only");
-    println!("     by its owner; you need at least 100 tHEMI per lock you want to hold at once");
-    println!("  3. Stake it (via the Wallet screen); claims start one block after the first stake");
-    println!("  4. Run: zkminer run");
+    for line in summary(network) {
+        println!("{line}");
+    }
 
     Ok(())
+}
+
+/// What `init` prints after writing the config: the network it targets and, on testnet, the steps
+/// from there to a mining prover. Every step names the command that does it (W10-DOC: step 3 used to
+/// point at a "Wallet screen" although `zkminer stake` exists). The testnet facts are the 2026-11-16
+/// deployment's (handoff section 12): tHEMI is minted only by its owner, so it comes from the
+/// HemiProve team, and each lock needs 100 tHEMI of free stake (the 100 tHEMI minimum collateral).
+fn summary(network: &str) -> Vec<String> {
+    if network != "testnet" {
+        return vec![
+            format!("Hemi mainnet (chain ID {MAINNET_CHAIN_ID}), RPC {MAINNET_RPC}."),
+            "No HemiProve deployment on mainnet is built in: fill in [contracts] in the config"
+                .to_string(),
+            "before you run anything.".to_string(),
+        ];
+    }
+    vec![
+        format!("Pre-configured for Hemi Testnet (chain ID {TESTNET_CHAIN_ID})"),
+        format!("  RPC:     {TESTNET_RPC}"),
+        format!("  Router:  {}", TESTNET.router),
+        format!("  Token:   {} (tHEMI, owner-minted)", TESTNET.token),
+        String::new(),
+        "Next steps:".to_string(),
+        "  1. Set the prover's private key (a key of your own; zkminer does not make one):".to_string(),
+        "       export ZKMINER_PRIVATE_KEY=0xYOUR_KEY".to_string(),
+        "  2. Ask the HemiProve team for testnet ETH (gas; a Hemi testnet faucet also works) and".to_string(),
+        "     tHEMI for that key's address. tHEMI is minted only by its owner. Each job you hold at".to_string(),
+        "     once locks at least 100 tHEMI of stake.".to_string(),
+        "  3. Stake it: zkminer stake 100      (approves and stakes; the amount is in tHEMI)".to_string(),
+        "     The first claim can come one block after the first stake.".to_string(),
+        "  4. Check:    zkminer status".to_string(),
+        "  5. Run:      zkminer run".to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summary;
+
+    #[test]
+    fn testnet_steps_name_the_commands() {
+        let text = summary("testnet").join("\n");
+        assert!(text.contains("export ZKMINER_PRIVATE_KEY="), "{text}");
+        assert!(text.contains("HemiProve team"), "{text}");
+        assert!(text.contains("zkminer stake 100"), "{text}");
+        assert!(text.contains("zkminer status"), "{text}");
+        assert!(text.contains("zkminer run"), "{text}");
+        assert!(!text.contains("Wallet screen"), "{text}");
+        assert!(
+            text.contains("0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58"),
+            "{text}"
+        );
+        assert!(
+            text.contains("0x46955EdCF61b23a8c0b0d71428A9F1C07Bbf36cc"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn mainnet_is_not_described_as_testnet() {
+        let text = summary("mainnet").join("\n");
+        assert!(!text.contains("Testnet"), "{text}");
+        assert!(text.contains("43111"), "{text}");
+        assert!(text.contains("[contracts]"), "{text}");
+    }
 }

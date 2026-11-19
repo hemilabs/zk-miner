@@ -211,8 +211,10 @@ process group the dispatcher relies on.
 
 The RISC Zero worker also runs on Apple Silicon Macs, on the GPU through Metal:
 `zkminer-prove-risc0-metal`. It is built from the Metal port of the risc0 3.1 fork, which
-`Cargo.toml`'s `[patch.crates-io]` takes from `../deps/risc0-3.1` (branch `zkminer/metal-3.1`:
-hemilabs `release-3.1`, risc0 v3.1.0, with the Metal port merged onto it). The
+`Cargo.toml`'s `[patch.crates-io]` pins by git rev (hemilabs/risc0 branch `zkminer/metal-3.1`:
+hemilabs `release-3.1`, risc0 v3.1.0, with the Metal port merged onto it; one pin for every
+platform). `make -f Makefile.mac RISC0_SRC=local` builds against a checkout at `../deps/risc0-3.1`
+instead (`RELEASE-DEPS.md`). The
 segment proofs, the recursion and the Groth16 wrap run on the GPU (two steps still run on the CPU
 for now: the rv32im witness generation and the last recursion step before the wrap), and neither
 Docker nor a CUDA/ROCm toolkit is involved. SP1 and OpenVM have no Mac worker; the miner never gives an Apple
@@ -225,15 +227,18 @@ The macOS beta ships as `zkminer-<version>-macos-arm64.tar.gz`, built by
 with **16 GB or more**. It contains the CLI, the Metal worker, an installer, a
 smoke test (`tools/macos-smoke.sh`, run from the kit folder after `./install.sh --with-groth16`) and a
 README. It has no offline GPU pipeline archives (its `metal-aot/` is empty). The kit is about
-0.2 GB; the Groth16 component adds 5.4 GB (about 7.8 GB free while it downloads and unpacks).
+0.2 GB; the Groth16 component adds 5.8 GB (5.4 GiB), and about 8.3 GB must be free while it installs
+(its 2.4 GB archive and the unpacked files are on disk together).
 
 ```sh
-shasum -a 256 zkminer-<version>-macos-arm64.tar.gz   # compare with the release's SHA256SUMS first
+shasum -a 256 -c --ignore-missing SHA256SUMS   # the release's SHA256SUMS, beside the tarball: "...: OK"
 tar -xzf zkminer-<version>-macos-arm64.tar.gz
 cd zkminer-<version>-macos-arm64
 ./install.sh                    # ~/.zkminer/zkminer and ~/.zkminer/provers/; --help for options
 export PATH="$HOME/.zkminer:$PATH"
-zkminer init && zkminer benchmark
+zkminer init                    # testnet config; prints the next steps
+export ZKMINER_PRIVATE_KEY=0x... # then testnet ETH and tHEMI from the HemiProve team
+zkminer stake 100 && zkminer run
 ```
 
 `zkminer init` is needed once, on the first install (`--with-groth16` or not); it leaves an existing
@@ -245,7 +250,7 @@ the kit's `BUILDINFO` names its version and commit, and `zkminer help` lists the
   kit's own `SHA256SUMS` only catches damage. `install.sh` checks the kit's
   `SHA256SUMS` and removes `com.apple.quarantine` from the files it installs. To run a binary from the
   kit directly, use `xattr -d com.apple.quarantine <file>`, or System Settings → Privacy & Security →
-  Open Anyway.
+  Open Anyway. Over SSH a quarantined binary hangs without output instead of showing a dialog.
 - **Groth16 component.** It is not in the kit (2.4 GB). The worker downloads it at its first warm-up,
   checked against its pinned SHA-256; `./install.sh --with-groth16` fetches it at install time instead.
 - **First start.** Every Mac compiles its GPU pipelines once, at the worker's first start: about a
@@ -284,8 +289,10 @@ phase, segments / recursion / Groth16 wrap; process peak footprint):
 | ≥ 10 GiB (28.1 GiB) | 20 | 8.35 s (879K c/s) | 1.58 s | 9437 / 9437 / 5635 | 13.2 GB | 24 GB and up |
 
 (The footprint model can keep a smaller po2 than the limit allows on a Mac with little RAM: a
-simulated 18 GB Mac proves at po2 19.) The full six-program `--benchmark` at po2 20 proves 154.5M
-cycles in 169.6 s of STARK (911K c/s) and wraps each program in 1.57-1.59 s. The worker keeps the
+simulated 18 GB Mac proves at po2 19.) `--benchmark` at po2 20 proves main's suite: the discarded
+fibonacci warm-up and the five programs (154.5M cycles) in 169.6-171.1 s of STARK (903-911K c/s),
+each wrapped in 1.57-1.60 s, then the two zkOP/s scoring proofs of zkop-mix (4.2M and 61.9M cycles,
+no wrap) in 73 s: 254 s of wall time (BASELINES '3.1', W10-INT). The worker keeps the
 Groth16 proving key loaded between proofs only when the working-set limit holds the largest STARK
 phase, the resident key and 12 GiB of host headroom (`keep_groth16_cache` in
 `crates/zkminer-prover/src/metal_sizing.rs`: about 29.5 GiB at po2 20), so 36 GB Macs and smaller,
@@ -301,7 +308,12 @@ the limit allows is refused as ResourceExhausted instead of being swapped throug
 - The **Metal shader compiler**. The Command Line Tools do not include it. With Xcode 26 or later,
   download it as a component: `xcodebuild -downloadComponent MetalToolchain`. Check with
   `xcrun --sdk macosx metal --version`; the fork's build scripts call exactly that, and stop with a
-  hint if it is missing.
+  hint if it is missing. Release kits are compiled with Metal Toolchain 27B47 (`Apple metal version
+  32023.922`), the compiler the beta was validated with: `scripts/ci/fetch-metal-toolchain.sh`
+  fetches it (no Xcode needed), and `assemble-macos.sh` refuses metallibs from another compiler
+  unless `METAL_COMPILER_UNVALIDATED=1` is set.
+  Xcode 26's own component is another compiler build, whose GPU code was never validated
+  ([docs/macos-beta.md](docs/macos-beta.md), "Metal compiler").
 - Without Xcode (no admin rights, Command Line Tools only), the toolchain can be fetched the way
   Xcode does it; this is how the development machine got it. Apple's downloadable index
   (`index2.dvtdownloadableindex`) maps an Xcode build to its Metal Toolchain build (Xcode 27.2 →
@@ -355,7 +367,7 @@ make -f Makefile.mac mac-bench BENCH_ONLY=fibonacci
 | `mac-install-worker` | copies the worker into `PROVERS_DIR` (default `~/.zkminer/provers`; copy then rename, so a running worker is never modified in place), then proves fibonacci once with it to warm the pipelines (`WARM=0` skips) | ~1 min warm; add the cold warm-up below on a new machine |
 | `mac-test-miner` | the worker's unit tests, `zkminer-prover` `discovery::`/`dispatcher::`, and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
 | `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal`, `risc0-circuit-rv32im` `prove::`, `risc0-circuit-recursion`, `risc0-circuit-keccak`, `risc0-groth16-sys` and `risc0-groth16`; each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
-| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (the miner's suite: a discarded fibonacci warm-up, the five programs, then the zkOP/s scoring proofs; about 4.5 min at po2 20; `BENCH_ONLY=<program>` runs the warm-up and that program) | ~1 min for fibonacci (the warm-up alone) |
+| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (the miner's suite: a discarded fibonacci warm-up, the five programs, then the zkOP/s scoring proofs; about 4.2 min (254 s) at po2 20; `BENCH_ONLY=<program>` runs the warm-up and that program) | ~1 min for fibonacci (the warm-up alone) |
 
 Every target sources `env.sh`, sets `NVCC=off HIPCC=off`, passes `--locked` (never `cargo update`,
 see [Layout](#layout)), and builds with `-j` = `CARGO_BUILD_JOBS` if set, else the number of
@@ -422,8 +434,9 @@ Read at run time by the worker (they pass through the miner's environment):
   blocks a downloaded binary until its quarantine flag is removed. The kit's `install.sh` removes it,
   and building the worker yourself avoids it.
 - The rv32im GPU witness generation is disabled by default (see the knob above).
-- The six-program benchmark takes about 3 minutes at po2 20 on an M5 Max (177-180 s of wall time:
-  169.6 s of STARK plus six wraps), longer on smaller Macs.
+- The benchmark takes about 4.2 minutes at po2 20 on an M5 Max for `--benchmark` (254 s of wall
+  time) and 4.4-5.2 minutes for `zkminer benchmark` with its warm-up (262-314 s), longer on smaller
+  Macs.
 - GPU power is not read on macOS; the miner's cost model assumes its 300 W default.
 
 ## Configure
@@ -549,7 +562,7 @@ Worth knowing:
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
-  NVIDIA cards, `gpu-rocm0`, … for AMD, `gpu-intel0`, … for Intel):
+  NVIDIA cards, `gpu-rocm0`, … for AMD, `gpu-intel0`, … for Intel, `gpu-metal0` for a Mac's GPU):
 
   ```toml
   [prover.risc0_job_po2]
@@ -561,7 +574,9 @@ Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
   and names a configured card that isn't here;
 - else po2 20, or none for a card with less than 14 GiB of VRAM (po2 20 peaks around 12.1 GiB).
   A card whose VRAM isn't known gets 20: an Intel card, a CUDA query that failed, or the card
-  behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card);
+  behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card).
+  A Mac's GPU instead takes the Metal tier of its RAM (19 on a 16 GB Mac, 20 from 24 GB; see
+  [Supported Macs](#supported-macs));
 - `benchmark --calibrate` proves a 62M-cycle Groth16 job at each size, on a card whose VRAM
   is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with the miner
   stopped. A card then uses its fastest size,
@@ -766,10 +781,10 @@ per process: a simulate measurement (an SP1 one stages gigabytes in `/dev/shm` a
 | `zkminer-tui` | ratatui interface |
 | `zkminer-config` | TOML config and wallet key loading |
 
-RISC Zero and SP1 are patched to the `hemilabs` forks (GPU + AMD support) via
-`[patch.crates-io]`, pinned by `Cargo.lock`. **Don't run `cargo update`** — those two are
-referenced by moving branch heads, so the lockfile is what holds the build on validated
-commits. (sppark is pinned by immutable rev and is not exposed to that drift.)
+RISC Zero, SP1 and sppark are patched to the `hemilabs` forks (GPU + AMD support, and Metal for
+risc0) via `[patch.crates-io]`, each pinned by an immutable git rev in `Cargo.toml` and recorded in
+`Cargo.lock`. **Don't run `cargo update`**: builds use `--locked`, and the lockfile is what holds every
+other dependency on the versions that were validated.
 
 ## Testing
 

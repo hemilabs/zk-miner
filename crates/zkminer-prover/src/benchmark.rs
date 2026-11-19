@@ -550,6 +550,16 @@ pub struct BenchmarkSuite {
     /// simultaneous, so this is an upper bound rather than an instantaneous draw.
     #[serde(default)]
     pub gpu_power_watts: Option<f64>,
+    /// The worker slots whose benchmark failed in THIS run (W10-BENCH). Never written to or read from
+    /// the cache (`serde(skip)`): a suite with any is a failed run, which `save_benchmark` refuses, and
+    /// every caller must report it as a failure rather than show or price its rows.
+    #[serde(skip)]
+    pub failures: Vec<crate::dispatcher::SlotBenchmarkFailure>,
+    /// Slots that were down when this run started (declined at startup, or could not be started) in
+    /// a run where another slot measured: reported to the operator, but they do not fail the run
+    /// (`dispatcher::BenchmarkRun::not_benchmarked`). Never cached.
+    #[serde(skip)]
+    pub not_benchmarked: Vec<crate::dispatcher::SlotBenchmarkFailure>,
 }
 
 /// The three supported prover backends.
@@ -645,6 +655,31 @@ pub fn find_optimal_po2(device_memory_bytes: u64, backend: &str, is_gpu: bool) -
 }
 
 impl BenchmarkSuite {
+    /// True when a worker slot's benchmark failed in this run (W10-BENCH): the run is a failure, even
+    /// if other slots measured.
+    pub fn failed(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// Why this suite must not be saved to the benchmark cache, or `None` when it may be (W10-BENCH).
+    /// The cache prices every job `zkminer run` claims, so only a complete, measured run belongs there.
+    pub fn not_cacheable(&self) -> Option<String> {
+        if self.failed() {
+            let slots: Vec<&str> = self.failures.iter().map(|f| f.slot_key.as_str()).collect();
+            return Some(format!("the benchmark failed on {}", slots.join(", ")));
+        }
+        if self.is_simulated() {
+            return Some("its results are simulated, not measured".to_string());
+        }
+        if self.results.is_empty()
+            && self.device_benchmarks.is_empty()
+            && self.host_peaks.is_empty()
+        {
+            return Some("it measured nothing".to_string());
+        }
+        None
+    }
+
     /// Returns true if all benchmark results are from simulated workloads
     /// (no real prover backend was available). Simulated throughput numbers
     /// are not reliable for profitability decisions and should not be used
@@ -833,7 +868,8 @@ pub fn machine_zkops(devices: &[DeviceBenchmark]) -> f64 {
 
 /// A GPU's or machine's score for display, e.g. "13.83 MzkOP/s".
 pub fn format_mzkops(zkops: f64) -> String {
-    format!("{:.2} MzkOP/s", zkops / 1e6)
+    // `+ 0.0` turns a -0.0 (no score) into 0.00, not "-0.00".
+    format!("{:.2} MzkOP/s", zkops / 1e6 + 0.0)
 }
 
 /// Get CPU info string.
@@ -1517,10 +1553,7 @@ pub fn run_benchmark() -> BenchmarkSuite {
     // Snapshot power counters before benchmarks
     let rapl_before = read_rapl_energy_uj();
     if rapl_before.is_none() {
-        tracing::warn!(
-            "CPU power monitoring unavailable. \
-             To enable, run: sudo chmod o+r /dev/cpu/0/msr"
-        );
+        log_cpu_power_unavailable();
     }
     // This path's load is a long inline sequence (CPU programs, then GPU workers), so it uses
     // the explicit start/finish pair rather than `around`. The two GPU-only paths, where the
@@ -1546,19 +1579,28 @@ pub fn run_benchmark() -> BenchmarkSuite {
 
     // Subprocess worker benchmarks (always try — captures GPU provers).
     // Use benchmark_all_with_device_info to get GPU metadata alongside results.
-    let worker_device_results = if let Some(pool) = crate::engine::worker_pool() {
-        let device_results = pool.benchmark_all_with_device_info();
-        if !device_results.is_empty() {
-            let total: usize = device_results.iter().map(|r| r.entries.len()).sum();
+    let pool = crate::engine::worker_pool();
+    // W10-BENCH: a worker that was started but produced nothing is a FAILED benchmark, never a
+    // reason to show simulated numbers.
+    let workers_present = pool.is_some_and(|p| p.has_any_worker());
+    let crate::dispatcher::BenchmarkRun {
+        results: worker_device_results,
+        mut failures,
+        not_benchmarked,
+        ..
+    } = if let Some(pool) = pool {
+        let run = pool.benchmark_all_with_device_info();
+        if !run.results.is_empty() {
+            let total: usize = run.results.iter().map(|r| r.entries.len()).sum();
             tracing::info!(
                 "Got {} benchmark results from {} subprocess workers",
                 total,
-                device_results.len()
+                run.results.len()
             );
         }
-        device_results
+        run
     } else {
-        Vec::new()
+        crate::dispatcher::BenchmarkRun::default()
     };
 
     // Flatten worker entries for main results (if no compile-time backend)
@@ -1570,9 +1612,16 @@ pub fn run_benchmark() -> BenchmarkSuite {
         }
     }
 
-    // Fallback: simulated benchmarks when no prover backend is enabled
+    // Simulated only when there is no prover at all: no compiled-in backend and no worker
+    // (W10-BENCH). With a worker present, an empty result is that worker's failure.
+    let mut simulated = false;
     if results.is_empty() {
-        results = run_simulated_benchmarks();
+        if workers_present {
+            note_unexplained_empty_run(&mut failures);
+        } else {
+            results = run_simulated_benchmarks();
+            simulated = true;
+        }
     }
 
     // Snapshot power counters after benchmarks
@@ -1584,6 +1633,8 @@ pub fn run_benchmark() -> BenchmarkSuite {
     let cpu_power_watts = cpu_power_over(rapl_before, power_elapsed);
 
     let gpu_power_watts = match suite_total_watts(&per_card) {
+        // Nothing proved on a card (a failed or simulated run): there are no rows to carry a figure.
+        None if worker_device_results.is_empty() => None,
         None => {
             tracing::warn!(
                 "GPU power unavailable for the proving cards — device rows will carry the \
@@ -1615,7 +1666,12 @@ pub fn run_benchmark() -> BenchmarkSuite {
     let device_benchmarks =
         build_gpu_device_benchmarks_from_workers(&worker_device_results, &per_card);
 
-    let zkops = machine_zkops(&device_benchmarks);
+    // No score from a simulated run: nothing was proved.
+    let zkops = if simulated {
+        0.0
+    } else {
+        machine_zkops(&device_benchmarks)
+    };
     BenchmarkSuite {
         results,
         device_benchmarks,
@@ -1625,7 +1681,118 @@ pub fn run_benchmark() -> BenchmarkSuite {
         cpu_power_watts,
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
+        failures,
+        not_benchmarked,
     }
+}
+
+/// The CPU-power line of a benchmark whose host cannot read the CPU's draw. The `/dev/cpu/0/msr`
+/// advice is Linux's (RAPL); macOS has no such counter for an unprivileged process, so it is told what
+/// the cost model uses instead (W10-BENCH).
+fn log_cpu_power_unavailable() {
+    #[cfg(target_os = "linux")]
+    tracing::warn!(
+        "CPU power monitoring unavailable. \
+         To enable, run: sudo chmod o+r /dev/cpu/0/msr"
+    );
+    #[cfg(target_os = "macos")]
+    tracing::info!(
+        "CPU power is not measured on macOS; the cost model uses the configured system_power_watts \
+         and its default CPU draw"
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    tracing::info!("CPU power is not measured on this platform");
+}
+
+/// A run with workers present that measured nothing and reported no slot failure (only measure
+/// workers started, or every slot was skipped) is still a failure, with a reason (W10-BENCH).
+fn note_unexplained_empty_run(failures: &mut Vec<crate::dispatcher::SlotBenchmarkFailure>) {
+    if failures.is_empty() {
+        tracing::error!("{NO_PROVING_WORKER}");
+        failures.push(crate::dispatcher::SlotBenchmarkFailure {
+            slot_key: "workers".to_string(),
+            gpu_name: None,
+            // The advice follows the tag: on a Mac the prover is the Metal worker, whose advice is
+            // macos-smoke.sh and the kit README, not a generic `--benchmark` line.
+            gpu_tag: if cfg!(target_os = "macos") {
+                "metal"
+            } else {
+                "generic"
+            }
+            .to_string(),
+            error: NO_PROVING_WORKER.to_string(),
+        });
+    }
+}
+
+/// The failure of a run whose workers started but none of which could benchmark.
+const NO_PROVING_WORKER: &str = "prover workers started, but none of them could run the benchmark \
+     (no proving worker is up; see the log above for why it did not start)";
+
+/// What to try after a slot's benchmark failed, for the operator (W10-BENCH).
+pub fn benchmark_failure_advice(gpu_tag: &str) -> &'static str {
+    match gpu_tag {
+        "metal" => {
+            "Run tools/macos-smoke.sh from the macOS kit folder: it proves and verifies one small \
+             proof and says what failed. See Troubleshooting in the kit's README.md."
+        }
+        _ => {
+            "Check the worker's log lines above, then run the worker's own benchmark by hand \
+             (`<worker binary> --benchmark`) to see the error on its own."
+        }
+    }
+}
+
+/// What to try when a Metal worker could not start (W10-BFIX).
+pub const METAL_START_ADVICE: &str =
+    "The prover could not start. If it was copied out of the kit by hand, or macOS blocked it, run \
+     ./install.sh from the kit folder again: the installed copies have no com.apple.quarantine \
+     mark (see Gatekeeper in the kit's README.md; check with `xattr -l \
+     ~/.zkminer/provers/zkminer-prove-risc0-metal`).";
+
+/// The failures of a run, one line each, with what to try: for the CLI and the TUI (W10-BENCH).
+pub fn describe_failures(failures: &[crate::dispatcher::SlotBenchmarkFailure]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut advice: Vec<&'static str> = Vec::new();
+    for f in failures {
+        let on = f
+            .gpu_name
+            .as_deref()
+            .map(|g| format!(" ({g})"))
+            .unwrap_or_default();
+        lines.push(format!("{}{on}: {}", f.slot_key, f.error));
+        let a = benchmark_failure_advice(&f.gpu_tag);
+        if !advice.contains(&a) {
+            advice.push(a);
+        }
+        // A Metal worker that never started: the likeliest cause on an unsigned beta is a copy that
+        // still carries the browser's quarantine mark, which Gatekeeper kills at exec (W10-BFIX).
+        if f.gpu_tag == "metal"
+            && f.error.starts_with(crate::dispatcher::COULD_NOT_START)
+            && !advice.contains(&METAL_START_ADVICE)
+        {
+            advice.push(METAL_START_ADVICE);
+        }
+    }
+    lines.extend(advice.into_iter().map(str::to_string));
+    lines
+}
+
+/// The slots a successful run could not benchmark, one line each, for the CLI and the TUI: declined
+/// at startup, down beside a measured GPU of their own backend, or a worker that only simulates
+/// (W10-BENCH rounds 1 and 2; see `dispatcher::BenchmarkRun::not_benchmarked`).
+pub fn describe_not_benchmarked(slots: &[crate::dispatcher::SlotBenchmarkFailure]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|f| {
+            let on = f
+                .gpu_name
+                .as_deref()
+                .map(|g| format!(" ({g})"))
+                .unwrap_or_default();
+            format!("{}{on} was not benchmarked: {}", f.slot_key, f.error)
+        })
+        .collect()
 }
 
 /// Run only GPU worker benchmarks, skipping CPU proof programs.
@@ -1642,23 +1809,30 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
     // Sampling WRAPS the load, so it cannot be reordered after it. Sampling afterwards reads an
     // idle card: slots are dispatched sequentially, so by the time the load returns every card
     // but the last has been idle for minutes.
-    let (worker_device_results, per_card) =
-        PowerSampler::around(proving_bus_ids_from_pool(), || {
-            if let Some(pool) = crate::engine::worker_pool() {
-                let device_results = pool.benchmark_all_with_device_info();
-                if !device_results.is_empty() {
-                    let total: usize = device_results.iter().map(|r| r.entries.len()).sum();
-                    tracing::info!(
-                        "Got {} benchmark results from {} GPU workers (CPU benchmarks skipped)",
-                        total,
-                        device_results.len()
-                    );
-                }
-                device_results
-            } else {
-                Vec::new()
+    let (run, per_card) = PowerSampler::around(proving_bus_ids_from_pool(), || {
+        if let Some(pool) = crate::engine::worker_pool() {
+            let run = pool.benchmark_all_with_device_info();
+            if !run.results.is_empty() {
+                let total: usize = run.results.iter().map(|r| r.entries.len()).sum();
+                tracing::info!(
+                    "Got {} benchmark results from {} GPU workers (CPU benchmarks skipped)",
+                    total,
+                    run.results.len()
+                );
             }
-        });
+            run
+        } else {
+            crate::dispatcher::BenchmarkRun::default()
+        }
+    });
+    let worker_device_results = run.results;
+    let mut failures = run.failures;
+    let not_benchmarked = run.not_benchmarked;
+    if worker_device_results.is_empty()
+        && crate::engine::worker_pool().is_some_and(|p| p.has_any_worker())
+    {
+        note_unexplained_empty_run(&mut failures);
+    }
     let gpu_power_watts = suite_total_watts(&per_card);
 
     // Build GPU device benchmarks from worker results
@@ -1682,6 +1856,8 @@ pub fn run_benchmark_gpu_only() -> BenchmarkSuite {
         cpu_power_watts: None, // see the note in the streaming path below
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
+        failures,
+        not_benchmarked,
     }
 }
 
@@ -1704,14 +1880,21 @@ pub fn run_benchmark_gpu_only_streaming(
     let cpu_window = Instant::now();
 
     // Sampling WRAPS the load — see `PowerSampler::around`.
-    let (worker_device_results, per_card) =
-        PowerSampler::around(proving_bus_ids_from_pool(), || {
-            if let Some(pool) = crate::engine::worker_pool() {
-                pool.benchmark_all_streaming(on_progress)
-            } else {
-                Vec::new()
-            }
-        });
+    let (run, per_card) = PowerSampler::around(proving_bus_ids_from_pool(), || {
+        if let Some(pool) = crate::engine::worker_pool() {
+            pool.benchmark_all_streaming(on_progress)
+        } else {
+            crate::dispatcher::BenchmarkRun::default()
+        }
+    });
+    let worker_device_results = run.results;
+    let mut failures = run.failures;
+    let not_benchmarked = run.not_benchmarked;
+    if worker_device_results.is_empty()
+        && crate::engine::worker_pool().is_some_and(|p| p.has_any_worker())
+    {
+        note_unexplained_empty_run(&mut failures);
+    }
     let gpu_power_watts = suite_total_watts(&per_card);
 
     let device_benchmarks =
@@ -1733,6 +1916,8 @@ pub fn run_benchmark_gpu_only_streaming(
         cpu_power_watts: cpu_power_over(rapl_before, cpu_window.elapsed()),
         gpu_power_watts,
         host_peaks: host_peaks_from_workers(&worker_device_results),
+        failures,
+        not_benchmarked,
     }
 }
 
@@ -2354,7 +2539,10 @@ fn sweep_po2(
 
 /// Run simulated benchmarks for all canonical programs.
 fn run_simulated_benchmarks() -> Vec<BenchmarkResult> {
-    tracing::info!("No prover backend enabled — running simulated benchmarks");
+    tracing::warn!(
+        "No prover worker found — running SIMULATED benchmarks: CPU stand-ins, not proofs; nothing \
+         is measured, scored or saved"
+    );
 
     let mut results = Vec::new();
 
@@ -2374,7 +2562,7 @@ fn run_simulated_benchmarks() -> Vec<BenchmarkResult> {
         let throughput = program.simulated_cycles as f64 / duration.as_secs_f64();
 
         tracing::info!(
-            "  {}: {} cycles in {:?} ({:.0} cycles/sec){}",
+            "  SIMULATED {}: {} cycles in {:?} ({:.0} cycles/sec, not a proof){}",
             program.name,
             program.simulated_cycles,
             duration,
@@ -2945,6 +3133,15 @@ pub(crate) fn load_cached_benchmark_from(
     }
 
     let mut suite = saved.suite;
+    // W10-BENCH: a simulated suite cached before that was refused (the TUI's full benchmark saved
+    // one when no worker answered) prices nothing.
+    if suite.is_simulated() {
+        tracing::warn!(
+            "The cached benchmark at {} is simulated, not measured; ignoring it (re-benchmark)",
+            path.display()
+        );
+        return None;
+    }
     migrate_device_identity(&mut suite);
     floor_implausible_gpu_power(&mut suite);
     drop_cpu_device_rows(&mut suite);
@@ -3104,6 +3301,7 @@ pub fn save_benchmark(suite: &BenchmarkSuite) {
     let path = benchmark_cache_path();
     match save_benchmark_to(&path, &suite_version(), &hardware_fingerprint(), suite) {
         Ok(()) => tracing::info!("Saved benchmarks to {}", path.display()),
+        Err(e) if suite.not_cacheable().is_some() => tracing::warn!("{e}"),
         Err(e) => tracing::error!("{e}"),
     }
 }
@@ -3116,12 +3314,28 @@ pub(crate) fn save_benchmark_to(
     current_fp: &str,
     suite: &BenchmarkSuite,
 ) -> Result<(), String> {
+    // W10-BENCH: only a complete, measured run is priced from. Callers check too; this is the gate.
+    if let Some(why) = suite.not_cacheable() {
+        return Err(format!(
+            "Not saving the benchmark to {}: {why}",
+            path.display()
+        ));
+    }
     let saved = SavedBenchmark {
         suite_version: current_version.to_string(),
         hardware_fingerprint: current_fp.to_string(),
         suite: suite.clone(),
     };
     write_saved_benchmark(path, &saved)
+}
+
+/// [`save_benchmark_to`] for the integration tests (W10-BENCH), with a fixed version and fingerprint.
+#[cfg(any(test, feature = "testing"))]
+pub fn save_benchmark_to_for_test(
+    path: &std::path::Path,
+    suite: &BenchmarkSuite,
+) -> Result<(), String> {
+    save_benchmark_to(path, "v-test", "fp-test", suite)
 }
 
 /// Writes `saved` to `path` atomically (temp file, fsync, rename, fsync of the directory).
@@ -3239,6 +3453,11 @@ mod zkop_score_tests {
         // Shown per zkVM in its own cycles per second.
         assert_eq!(devices[0].scoring_cycles_per_sec(), Some(c / 5.0));
         assert_eq!(format_mzkops(13_830_000.0), "13.83 MzkOP/s");
+        assert_eq!(
+            format_mzkops(-0.0),
+            "0.00 MzkOP/s",
+            "no score is not \"-0.00\""
+        );
     }
 
     #[test]
@@ -5445,5 +5664,125 @@ mod power_state_tests {
         let (_, advice) = kept.expect("in use");
         assert!(advice.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// W10-BENCH: a failed, simulated or empty run is never cached, and a simulated cache is never used.
+#[cfg(test)]
+mod failure_cache_tests {
+    use super::*;
+    use crate::dispatcher::SlotBenchmarkFailure;
+
+    fn scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "zkbench-w10-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("benchmarks.json");
+        (dir, path)
+    }
+
+    fn measured() -> BenchmarkSuite {
+        BenchmarkSuite {
+            results: vec![BenchmarkResult {
+                program_name: "memory-merkle".to_string(),
+                prover_backend: "risc0".to_string(),
+                cycles: 7_340_032,
+                duration: Duration::from_secs_f64(8.4),
+                throughput: 873_813.0,
+                weight: 0.15,
+                precompile: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn failure(tag: &str) -> SlotBenchmarkFailure {
+        SlotBenchmarkFailure {
+            slot_key: format!("risc0:{tag}:0"),
+            gpu_name: Some("Apple M5 Max".to_string()),
+            gpu_tag: tag.to_string(),
+            error: "warm-up of risc0:metal:0 failed: warm-up failed: stepAccumA".to_string(),
+        }
+    }
+
+    #[test]
+    fn only_a_complete_measured_run_is_saved() {
+        let (dir, path) = scratch("save");
+        assert_eq!(measured().not_cacheable(), None);
+
+        let mut failed = measured();
+        failed.failures.push(failure("metal"));
+        assert!(failed.failed());
+        let simulated = BenchmarkSuite {
+            results: run_simulated_benchmarks(),
+            ..Default::default()
+        };
+        for (what, suite) in [
+            ("a failed run", failed),
+            ("a simulated run", simulated),
+            ("an empty run", BenchmarkSuite::default()),
+        ] {
+            let err = save_benchmark_to(&path, "v-test", "fp-test", &suite).expect_err(what);
+            assert!(err.starts_with("Not saving"), "{what}: {err}");
+            assert!(!path.exists(), "{what} was written");
+        }
+
+        save_benchmark_to(&path, "v-test", "fp-test", &measured()).expect("a measured run");
+        let loaded = load_cached_benchmark_from(&path, "v-test", "fp-test").expect("loads");
+        assert!(!loaded.failed(), "failures are never cached");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A simulated suite saved before W10-BENCH (the TUI's full benchmark did, with no worker) is
+    /// ignored on load, so `zkminer run` never prices from it.
+    #[test]
+    fn a_simulated_cache_is_not_loaded() {
+        let (dir, path) = scratch("load");
+        let saved = SavedBenchmark {
+            suite_version: "v-test".to_string(),
+            hardware_fingerprint: "fp-test".to_string(),
+            suite: BenchmarkSuite {
+                results: run_simulated_benchmarks(),
+                zkops: 3_022_602.0,
+                ..Default::default()
+            },
+        };
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(load_cached_benchmark_from(&path, "v-test", "fp-test").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failures_name_the_worker_the_error_and_what_to_try() {
+        let lines = describe_failures(&[failure("metal"), failure("cuda"), failure("metal")]);
+        assert!(
+            lines[0].starts_with("risc0:metal:0 (Apple M5 Max): warm-up of"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("stepAccumA"));
+        // Each piece of advice once, after the failures.
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(lines[3].contains("tools/macos-smoke.sh") && lines[3].contains("Troubleshooting"));
+        assert!(lines[4].contains("--benchmark"));
+    }
+
+    /// The simulated stand-ins never carry a score, and a run with no worker at all is the only one
+    /// that is simulated (`run_benchmark` with no pool).
+    #[test]
+    fn a_simulated_run_has_no_score() {
+        if crate::engine::worker_pool().is_some() {
+            return; // another test in this binary set the pool up
+        }
+        let suite = run_benchmark();
+        assert!(suite.is_simulated());
+        assert!(!suite.failed());
+        assert_eq!(suite.zkops, 0.0);
+        assert!(suite.not_cacheable().is_some());
     }
 }

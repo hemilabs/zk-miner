@@ -186,6 +186,11 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".zkminer")
             .join("logs");
+        // The directory first: the builder prunes old files before it creates the directory, and on
+        // a fresh install (no ~/.zkminer/logs yet) its read_dir failure went to stderr as "Error
+        // reading the log directory/files: No such file or directory", ahead of the real outcome
+        // (W10-DOC). A failure here is left to the builder, which reports its own.
+        let _ = std::fs::create_dir_all(&log_dir);
         // Cap log retention so a submitter who floods log-worthy events (bad jobs, rejected URIs,
         // failed proofs) cannot fill the operator's disk via unbounded daily files. Keep ~2 weeks
         // of daily logs; fall back to the simple appender if the builder errors.

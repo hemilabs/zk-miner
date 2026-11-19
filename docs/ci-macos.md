@@ -103,8 +103,8 @@ the Metal kernels and the guests. Run after the release build in one job, it fil
    architecture (family), unified memory and `recommendedMaxWorkingSetSize`.
 2. The risc0-groth16 component comes from the runner's own `~/.risc0` when it is complete there.
    Otherwise it is streamed into the job's temp directory (`curl | SHA-256 | tar`, checked against the
-   kit's pin, deleted at the end) and never into `~/.risc0`: 5.4 GB left there would take the build
-   job's room on a persistent runner.
+   kit's pin, deleted at the end) and never into `~/.risc0`: 5.8 GB (5.4 GiB) left there would take
+   the build job's room on a persistent runner.
 3. One fibonacci proof with its Groth16 wrap (`--try-paravirtual`). The worker's Groth16 coefficient
    cache (343 MB) goes to the work directory (`RISC0_G16_CACHE_DIR`), deleted at the end, not to
    `~/.cache/risc0-groth16`.
@@ -128,7 +128,8 @@ the kit: 1 (proof failed), 6 (did not launch), 7, 8 or 2. Codes 3 (no device), 4
 
   A Mac with a CI kit therefore compiles its GPU pipelines once at the first start: about a minute on an
   M5 Max, longer on smaller Macs, then about 2.3 s per start (B9-M26). A kit with archives is built on a
-  Mac with `scripts/ci/assemble-macos.sh` (docs/macos-beta.md).
+  Mac with `scripts/ci/assemble-macos.sh`, and its README needs the archive text back first, or
+  `check-macos-kit.py` fails it (docs/macos-beta.md, "Build the kit").
 - **Never register a developer's Mac as a runner** (organisation rule). The runner is the repository's
   own.
 
@@ -151,7 +152,7 @@ Full numbers are in the B9-CI note.
 |---|---|---|---|
 | build | 11.74-11.76 GB (end of the build) | 2.05 / 2.03 GB | `target/` 7.1 GB, of it 3.5 GB the 13 guests' builds |
 | cpu-tests | 10.90-10.97 GB | 2.89 / 2.82 GB | the test build, 6.2 GB before the guests are pruned |
-| metal-probe | 10.60 GB | 3.19 GB | the risc0-groth16 component, 5.4 GB (temporary, in `RUNNER_TEMP`) |
+| metal-probe | 10.60 GB | 3.19 GB | the risc0-groth16 component, 5.8 GB = 5.4 GiB (temporary, in `RUNNER_TEMP`) |
 
 Without `macos-clean-home.sh`, the second build had 0.90 GB left and the second test run 1.69 GB (B9-CI
 round-1 review). The test job's extra crate sources (0.7 GB) and the probe's coefficient cache (0.34
@@ -196,7 +197,10 @@ need to, today).
   - under 1 GiB.
 
   It fails a release with no kit, or two, and any Mach-O file elsewhere in the release.
-- The release notes have a macOS section (unsigned beta, `./install.sh --with-groth16`).
+- The release notes have a macOS section (unsigned beta, `./install.sh --with-groth16`), and their
+  checksum line uses `--ignore-missing` (`shasum -a 256 -c --ignore-missing SHA256SUMS` on a Mac):
+  a Mac user downloads only the kit, and a plain `-c` fails on the Linux and Windows lines (BETA_RC
+  RC2, W10-DOC).
 
 ## Pins
 

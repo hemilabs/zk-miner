@@ -42,6 +42,253 @@ pub struct SlotBenchmarkResult {
     pub host_peak_bytes: Option<u64>,
 }
 
+/// The failure of a slot that answered its benchmark but proved none of the programs.
+pub const NO_BENCHMARK_ROWS: &str =
+    "the worker proved none of the benchmark programs (its own log lines above say why)";
+
+/// A worker slot whose benchmark produced no result, and why (W10-BENCH).
+///
+/// Reported, not only logged: a caller that sees no rows must be able to tell "this slot failed"
+/// from "there was nothing to benchmark", or it shows made-up numbers as a benchmark (the simulated
+/// table `zkminer benchmark` printed, with exit 0, after a Metal warm-up failed).
+#[derive(Debug, Clone)]
+pub struct SlotBenchmarkFailure {
+    pub slot_key: String,
+    pub gpu_name: Option<String>,
+    /// "cuda", "rocm", "intel", "metal" or "generic".
+    pub gpu_tag: String,
+    /// The error, with its causes (`{:#}`).
+    pub error: String,
+}
+
+/// What a benchmark of every slot produced: the slots that measured, the slots that failed, and the
+/// slots that were not running when it started.
+#[derive(Debug, Clone, Default)]
+pub struct BenchmarkRun {
+    /// One per slot that answered with rows. A slot whose suite came back short is here too (its rows
+    /// can be shown) AND in `failures`.
+    pub results: Vec<SlotBenchmarkResult>,
+    /// The slots whose benchmark failed: an error, no rows, or not every program of the suite (and,
+    /// on risc0 and SP1, the zkOP/s score) proved. Any entry makes the run a failure.
+    pub failures: Vec<SlotBenchmarkFailure>,
+    /// Slots this run could not benchmark that do not fail it, each with its reason (warnings):
+    ///  * the worker DECLINED at startup (it cannot prove here, so it is not even tried; a declined
+    ///    SP1 beside a working RISC Zero card must not block that card's benchmark);
+    ///  * it could not be started or respawned, AND another slot of the SAME backend measured on a
+    ///    GPU (one card of a multi-card rig is down). A down slot with no such stand-in is a
+    ///    failure: a CPU (`generic`) worker or another backend never covers for it (W10-BENCH
+    ///    round 2);
+    ///  * its worker only SIMULATES a benchmark (the OpenVM stub, which cannot prove): its rows are
+    ///    discarded, never shown, cached or priced as measurements (W10-BENCH round 2).
+    ///
+    /// When no slot measured, they are the run's failures instead (W10-BENCH round 1).
+    pub not_benchmarked: Vec<SlotBenchmarkFailure>,
+    /// Down slots whose classification waits for the end of the run: `(backend, failure)`.
+    down: Vec<(String, SlotBenchmarkFailure)>,
+    /// Backends of which a GPU slot (cuda/rocm/intel/metal) measured a complete suite.
+    measured_gpu_backends: Vec<String>,
+}
+
+/// The tags of a GPU slot (everything but the CPU-only `generic`).
+fn is_gpu_tag(gpu_tag: &str) -> bool {
+    matches!(gpu_tag, "cuda" | "rocm" | "intel" | "metal")
+}
+
+/// Backends whose worker cannot prove and answers `Benchmark` with a SIMULATED workload under its
+/// own backend name: OpenVM (`zkminer-prove-openvm` returns an error for every `Prove`; its
+/// `run_benchmarks` times a busy loop). Its rows are never measurements (W10-BENCH round 2).
+const SIMULATED_BENCHMARK_BACKENDS: &[&str] = &[zkminer_prover_protocol::BACKEND_OPENVM];
+
+/// Why a slot's benchmark rows are not measurements, if they are not: the worker labelled any row
+/// `simulated`, or its backend is one whose worker only simulates (W10-BENCH round 2).
+pub fn simulated_benchmark_reason(backend: &str, entries: &[BenchmarkEntry]) -> Option<String> {
+    if SIMULATED_BENCHMARK_BACKENDS.contains(&backend) {
+        return Some(format!(
+            "{SIMULATED_BENCHMARK}: the {backend} worker cannot prove yet, and its benchmark \
+             only times a stand-in workload, so it is not run"
+        ));
+    }
+    let simulated: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.prover_backend == "simulated")
+        .map(|e| e.program_name.as_str())
+        .collect();
+    (!simulated.is_empty()).then(|| {
+        format!(
+            "{SIMULATED_BENCHMARK}: the worker reported simulated results ({}); its rows were \
+             discarded",
+            simulated.join(", ")
+        )
+    })
+}
+
+/// The start of the reason a slot whose rows are simulated was not benchmarked (W10-BENCH round 2).
+pub const SIMULATED_BENCHMARK: &str = "not measured (SIMULATED)";
+
+impl BenchmarkRun {
+    /// Files one slot's benchmark outcome (W10-BENCH). `was_down`: the slot had no worker when the
+    /// benchmark started, so an error is "not benchmarked" rather than a failure of a running worker.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        key: &str,
+        backend: &str,
+        was_down: bool,
+        outcome: Result<Vec<BenchmarkEntry>>,
+        entries_into: impl FnOnce(Vec<BenchmarkEntry>) -> SlotBenchmarkResult,
+        gpu_name: Option<String>,
+        gpu_tag: &str,
+    ) {
+        let failure = |error: String| SlotBenchmarkFailure {
+            slot_key: key.to_string(),
+            gpu_name: gpu_name.clone(),
+            gpu_tag: gpu_tag.to_string(),
+            error,
+        };
+        match outcome {
+            Ok(entries) if !entries.is_empty() => {
+                if let Some(reason) = simulated_benchmark_reason(backend, &entries) {
+                    tracing::warn!("{key} was not benchmarked: {reason}");
+                    self.not_benchmarked.push(failure(reason));
+                    return;
+                }
+                let missing = missing_benchmark_rows(backend, &entries);
+                if !missing.is_empty() {
+                    let error = format!(
+                        "{} {}: {} (the worker's own log lines above say why)",
+                        INCOMPLETE_BENCHMARK,
+                        if missing.len() == 1 {
+                            "program"
+                        } else {
+                            "programs"
+                        },
+                        missing.join(", ")
+                    );
+                    tracing::error!("Benchmark failed for {key}: {error}");
+                    self.failures.push(failure(error));
+                } else if is_gpu_tag(gpu_tag) {
+                    self.measured_gpu_backends.push(backend.to_string());
+                }
+                self.results.push(entries_into(entries));
+            }
+            Ok(_) => {
+                let error = NO_BENCHMARK_ROWS.to_string();
+                tracing::error!("Benchmark failed for {key}: {error}");
+                self.failures.push(failure(error));
+            }
+            Err(e) if was_down => {
+                // Classified in `finish`, once it is known whether a same-backend GPU slot measured.
+                self.down
+                    .push((backend.to_string(), failure(format!("{e:#}"))));
+            }
+            Err(e) => {
+                tracing::error!("Benchmark failed for {key}: {e:#}");
+                self.failures.push(failure(format!("{e:#}")));
+            }
+        }
+    }
+
+    /// Files a slot that declined at startup: never benchmarked (W10-BENCH round 1).
+    fn record_declined(
+        &mut self,
+        key: &str,
+        reason: &str,
+        gpu_name: Option<String>,
+        gpu_tag: &str,
+    ) {
+        tracing::info!("Skipping benchmark for {key}: it declined at startup ({reason})");
+        self.not_benchmarked.push(SlotBenchmarkFailure {
+            slot_key: key.to_string(),
+            gpu_name,
+            gpu_tag: gpu_tag.to_string(),
+            error: format!("declined at startup: {reason}"),
+        });
+    }
+
+    /// Files a slot whose worker only simulates a benchmark: never run, never a measurement
+    /// (W10-BENCH round 2).
+    fn record_simulated(
+        &mut self,
+        key: &str,
+        reason: String,
+        gpu_name: Option<String>,
+        gpu_tag: &str,
+    ) {
+        tracing::warn!("Skipping benchmark for {key}: {reason}");
+        self.not_benchmarked.push(SlotBenchmarkFailure {
+            slot_key: key.to_string(),
+            gpu_name,
+            gpu_tag: gpu_tag.to_string(),
+            error: reason,
+        });
+    }
+
+    /// The finished run: with nothing measured, the slots that could not be benchmarked are its
+    /// failures (a lone Metal worker that never started fails the benchmark, with its reason).
+    fn finish(mut self) -> Self {
+        // A down slot is only "not benchmarked" when a GPU slot of its own backend measured: one
+        // card of a rig is down, and the rig's rows for that backend are still real GPU rows.
+        // Otherwise (a lone GPU worker that crashed at start with a CPU `generic` worker or another
+        // backend measured instead) the run did not measure what this host proves with, and it
+        // fails: exit 1, nothing cached or priced (W10-BENCH round 2).
+        for (backend, down) in std::mem::take(&mut self.down) {
+            if self.measured_gpu_backends.contains(&backend) {
+                tracing::warn!(
+                    "{} was not running and could not be benchmarked (another {backend} GPU \
+                     measured): {}",
+                    down.slot_key,
+                    down.error
+                );
+                self.not_benchmarked.push(down);
+            } else {
+                tracing::error!("Benchmark failed for {}: {}", down.slot_key, down.error);
+                self.failures.push(down);
+            }
+        }
+        if self.results.is_empty() && !self.not_benchmarked.is_empty() {
+            self.failures.append(&mut self.not_benchmarked);
+        }
+        self
+    }
+}
+
+/// The start of the failure of a slot that had no worker during the benchmark (W10-BFIX).
+pub const COULD_NOT_START: &str = "could not start: ";
+
+/// The failure of a down slot: its last spawn error, or failing that the benchmark's own attempt,
+/// which is only context when it differs (see [`WorkerPool::down_slot_error`]).
+fn down_slot_message(last_spawn_error: Option<&str>, attempt: &str) -> String {
+    match last_spawn_error {
+        Some(last) if last != attempt => {
+            format!("{COULD_NOT_START}{last} (then, when the benchmark tried it: {attempt})")
+        }
+        Some(last) => format!("{COULD_NOT_START}{last}"),
+        None => format!("{COULD_NOT_START}{attempt}"),
+    }
+}
+
+/// The start of the failure of a slot whose suite came back short (W10-BENCH round 1).
+pub const INCOMPLETE_BENCHMARK: &str = "the benchmark is incomplete: no result for";
+
+/// The rows a complete benchmark of a `backend` worker has and `entries` lacks, by name: every
+/// program of `benchmark_suite(backend)`, and on risc0 and SP1 (the zkVMs a zkOP/s score is defined
+/// for) the `zkop-mix` score. A worker drops a program that fails to prove and verify, and the
+/// dispatcher drops a score that failed, so a short list is a failed benchmark (W10-BENCH round 1).
+pub fn missing_benchmark_rows(backend: &str, entries: &[BenchmarkEntry]) -> Vec<String> {
+    use zkminer_prover_protocol::{benchmark_suite, BACKEND_RISC0, BACKEND_SP1, BENCH_ZKOP_MIX};
+    let mut wanted: Vec<String> = benchmark_suite(backend)
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    if backend == BACKEND_RISC0 || backend == BACKEND_SP1 {
+        wanted.push(BENCH_ZKOP_MIX.to_string());
+    }
+    wanted
+        .into_iter()
+        .filter(|name| !entries.iter().any(|e| &e.program_name == name))
+        .collect()
+}
+
 /// A streaming benchmark progress update from a specific worker slot.
 #[derive(Debug, Clone)]
 pub struct BenchmarkProgressEvent {
@@ -897,6 +1144,10 @@ struct WorkerSlot {
     /// the worker had just said it could not prove -- and every ~RETIRE_COOLDOWN the
     /// counter reset re-opened the window for the life of the process.
     declined: Option<String>,
+    /// The error of this slot's last failed spawn or respawn (the handshake error, with the
+    /// worker's last stderr line), cleared when a worker starts. A benchmark of a slot that never
+    /// came up reports THIS, not the respawn backoff its own retry ran into (W10-BFIX).
+    last_spawn_error: Option<String>,
     /// Number of proofs this worker instance has completed since it was (re)spawned.
     /// When it reaches `recycle_after_proofs()`, the worker is killed + respawned so
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
@@ -2548,6 +2799,8 @@ pub struct WorkerPool {
     metal_tier_jobs: [AtomicU64; 2],
     /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
     startup_problems: Vec<String>,
+    /// The slots `discover_and_spawn` found but could not start, and whether each declined (W10-BFIX).
+    not_started: Vec<(String, bool)>,
     /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
     setup_status: Mutex<HashMap<String, zkminer_prover_protocol::SetupStep>>,
 }
@@ -2632,6 +2885,7 @@ impl WorkerPool {
             recycle_override: Mutex::new(HashMap::new()),
             metal_tier_jobs: [AtomicU64::new(0), AtomicU64::new(0)],
             startup_problems: Vec::new(),
+            not_started: Vec::new(),
             setup_status: Mutex::new(HashMap::new()),
         }
     }
@@ -2643,6 +2897,12 @@ impl WorkerPool {
 
     /// Why workers could not start in `discover_and_spawn`, in words for the operator: without
     /// this a card missing a zkVM has no explanation outside the log file.
+    /// The workers `discover_and_spawn` found but could not start, as `(slot key, declined)`: the
+    /// CLI names them instead of saying there is no worker (W10-BFIX).
+    pub fn not_started(&self) -> &[(String, bool)] {
+        &self.not_started
+    }
+
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
     }
@@ -3228,6 +3488,7 @@ impl WorkerPool {
                                 consecutive_failures: 0,
                                 last_failure: None,
                                 declined: None,
+                                last_spawn_error: None,
                                 proofs_since_spawn: 0,
                                 last_use: None,
                             }),
@@ -3270,6 +3531,7 @@ impl WorkerPool {
                     ));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
+                    self.not_started.push((key.clone(), declined.is_some()));
                     self.workers.insert(
                         key,
                         WorkerEntry {
@@ -3285,6 +3547,7 @@ impl WorkerPool {
                                 consecutive_failures: 1,
                                 last_failure: Some(Instant::now()),
                                 declined,
+                                last_spawn_error: Some(msg),
                                 proofs_since_spawn: 0,
                                 last_use: None,
                             }),
@@ -3391,6 +3654,7 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        last_spawn_error: None,
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -3556,6 +3820,7 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        last_spawn_error: None,
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -3570,6 +3835,46 @@ impl WorkerPool {
         }
 
         connected
+    }
+
+    /// Whether any worker was started at all: a proving slot or a measure worker (W10-BENCH). When
+    /// one was, a benchmark that produced nothing FAILED; only a pool with none may fall back to the
+    /// simulated suite.
+    pub fn has_any_worker(&self) -> bool {
+        !self.workers.is_empty() || self.measure_workers.values().any(|pool| !pool.is_empty())
+    }
+
+    /// A slot's state as a benchmark sees it (W10-BENCH round 1): why it DECLINED at startup, if it
+    /// did, and whether it has no worker running.
+    fn benchmark_slot_state(&self, key: &str) -> (Option<String>, bool) {
+        self.workers.get(key).map_or((None, true), |entry| {
+            let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+            (slot.declined.clone(), slot.handle.is_none())
+        })
+    }
+
+    /// Whether `key` has no worker running now.
+    /// The benchmark error of a slot that had no worker and still has none: "could not start: "
+    /// and the error of its last failed spawn (a handshake that died, with the worker's last stderr
+    /// line), with the benchmark's own attempt (usually "Backoff: waiting ... before respawning",
+    /// which says nothing about the worker) only as context (W10-BFIX).
+    fn down_slot_error(&self, key: &str, attempt: anyhow::Error) -> anyhow::Error {
+        let last = self.workers.get(key).and_then(|entry| {
+            entry
+                .slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_spawn_error
+                .clone()
+        });
+        anyhow::anyhow!(
+            "{}",
+            down_slot_message(last.as_deref(), &format!("{attempt:#}"))
+        )
+    }
+
+    fn slot_has_no_worker(&self, key: &str) -> bool {
+        self.benchmark_slot_state(key).1
     }
 
     /// Get all compound keys that have registered worker slots.
@@ -3660,14 +3965,27 @@ impl WorkerPool {
     }
 
     /// The (benchmark device id, backend) pair of every GPU prove worker: the rows a complete
-    /// benchmark suite has. Reads only the slot keys, so it never waits on a running proof.
+    /// benchmark suite has. Never waits on a running proof.
+    ///
+    /// A slot whose worker DECLINED at startup is not one (W10-BENCH round 1): it is never
+    /// benchmarked, so counting it made every start re-run the benchmark for a row that cannot come.
+    /// `try_lock`: a slot busy proving is not a declined one.
     pub fn benchmark_targets(&self) -> Vec<(String, String)> {
         self.workers
-            .keys()
-            .filter_map(|key| {
+            .iter()
+            .filter(|(_, entry)| match entry.slot.try_lock() {
+                Ok(slot) => slot.declined.is_none(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().declined.is_none(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            })
+            .filter_map(|(key, _)| {
                 let parts: Vec<&str> = key.split(':').collect();
-                (parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel"))
-                    .then(|| (Self::benchmark_device_id(key), parts[0].to_string()))
+                // A backend whose worker only simulates a benchmark never yields a saved row, so
+                // it is no target: it would re-run the startup benchmark forever (W10-BENCH r2).
+                (parts.len() == 3
+                    && matches!(parts[1], "cuda" | "rocm" | "intel")
+                    && !SIMULATED_BENCHMARK_BACKENDS.contains(&parts[0]))
+                .then(|| (Self::benchmark_device_id(key), parts[0].to_string()))
             })
             .collect()
     }
@@ -4597,8 +4915,8 @@ impl WorkerPool {
 
     /// Run benchmarks on all connected workers, returning device metadata alongside results.
     /// This allows callers to build per-device benchmark records with real GPU identification.
-    pub fn benchmark_all_with_device_info(&self) -> Vec<SlotBenchmarkResult> {
-        let mut results = Vec::new();
+    pub fn benchmark_all_with_device_info(&self) -> BenchmarkRun {
+        let mut run = BenchmarkRun::default();
         let mut keys: Vec<String> = self.registered_backends();
 
         // Sort keys so GPU workers (cuda/rocm) run first. This ensures the GPU
@@ -4632,7 +4950,10 @@ impl WorkerPool {
                     .slot
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if slot.gpu_tag != "generic" && slot.handle.is_some() {
+                // A GPU slot that is down but not declined counts too (W10-BENCH round 2): it is
+                // still tried (a respawn may bring it up), and if it stays down the run fails, so a
+                // CPU benchmark of the same backend would only take hours to show a failed run.
+                if slot.gpu_tag != "generic" && slot.declined.is_none() {
                     Some(slot.backend.clone())
                 } else {
                     None
@@ -4673,6 +4994,20 @@ impl WorkerPool {
                 continue;
             }
 
+            // W10-BENCH round 1: a declined worker cannot prove here and is never respawned; trying
+            // it only re-declines, and must not fail the other slots' benchmark. A slot with no
+            // worker is still tried (a respawn may bring it up), but its error is "not benchmarked".
+            let (declined, was_down) = self.benchmark_slot_state(&key);
+            if let Some(reason) = declined {
+                run.record_declined(&key, &reason, gpu_name, &gpu_tag);
+                continue;
+            }
+            // W10-BENCH round 2: a worker that only simulates a benchmark is not run either.
+            if let Some(reason) = simulated_benchmark_reason(&backend, &[]) {
+                run.record_simulated(&key, reason, gpu_name, &gpu_tag);
+                continue;
+            }
+
             let outcome = self.benchmark_slot(&key);
             // Never got the card: the guard timed out behind a proof. Nothing ran, so there is
             // nothing to recycle — and recycling would wait the whole guard timeout again first.
@@ -4680,24 +5015,33 @@ impl WorkerPool {
                 e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
                     .is_some()
             });
-            match outcome {
-                Ok(entries) if !entries.is_empty() => {
-                    results.push(SlotBenchmarkResult {
-                        slot_key: key.clone(),
-                        gpu_name,
-                        device_index,
-                        pci_bus_id: slot_pci_bus_id.clone(),
-                        gpu_tag: gpu_tag.clone(),
-                        entries,
-                        vram_bytes,
-                        host_peak_bytes: self.host_peak_for_slot(&key),
-                    });
-                }
-                Ok(_) => {} // empty results, skip
-                Err(e) => {
-                    tracing::error!("Benchmark failed for {key}: {e:#}");
-                }
-            }
+            // Still down after the attempt: it never came up, so this run could not benchmark it.
+            let was_down = was_down && self.slot_has_no_worker(&key);
+            // Its error is why it never came up, not the respawn backoff the retry ran into.
+            let outcome = if was_down {
+                outcome.map_err(|e| self.down_slot_error(&key, e))
+            } else {
+                outcome
+            };
+            let host_peak_bytes = self.host_peak_for_slot(&key);
+            run.record(
+                &key,
+                &backend,
+                was_down,
+                outcome,
+                |entries| SlotBenchmarkResult {
+                    slot_key: key.clone(),
+                    gpu_name: gpu_name.clone(),
+                    device_index,
+                    pci_bus_id: slot_pci_bus_id.clone(),
+                    gpu_tag: gpu_tag.clone(),
+                    entries,
+                    vram_bytes,
+                    host_peak_bytes,
+                },
+                gpu_name.clone(),
+                &gpu_tag,
+            );
 
             // After benchmarking a GPU-specific worker (cuda/rocm/intel/metal), shut it down
             // to free VRAM. GPU prover processes hold buffer pools that prevent
@@ -4823,7 +5167,7 @@ impl WorkerPool {
             }
         }
 
-        results
+        run.finish()
     }
 
     /// Run benchmarks on a specific worker slot with per-program progress streaming.
@@ -5035,8 +5379,8 @@ impl WorkerPool {
     pub fn benchmark_all_streaming(
         &self,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
-    ) -> Vec<SlotBenchmarkResult> {
-        let mut results = Vec::new();
+    ) -> BenchmarkRun {
+        let mut run = BenchmarkRun::default();
         let mut keys: Vec<String> = self.registered_backends();
 
         keys.sort_by(|a, b| {
@@ -5063,7 +5407,10 @@ impl WorkerPool {
                     .slot
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if slot.gpu_tag != "generic" && slot.handle.is_some() {
+                // A GPU slot that is down but not declined counts too (W10-BENCH round 2): it is
+                // still tried (a respawn may bring it up), and if it stays down the run fails, so a
+                // CPU benchmark of the same backend would only take hours to show a failed run.
+                if slot.gpu_tag != "generic" && slot.declined.is_none() {
                     Some(slot.backend.clone())
                 } else {
                     None
@@ -5075,7 +5422,9 @@ impl WorkerPool {
         for key in &keys {
             let skipped = self.workers.get(key).is_some_and(|entry| {
                 let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
-                slot.gpu_tag == "generic" && gpu_backends.contains(&slot.backend)
+                (slot.gpu_tag == "generic" && gpu_backends.contains(&slot.backend))
+                    || slot.declined.is_some()
+                    || SIMULATED_BENCHMARK_BACKENDS.contains(&slot.backend.as_str())
             });
             if !skipped {
                 if let Some(event) = self.benchmark_event(key, BenchmarkProgressKind::Queued) {
@@ -5111,11 +5460,30 @@ impl WorkerPool {
                 continue;
             }
 
+            // W10-BENCH round 1: a declined worker cannot prove here and is never respawned; trying
+            // it only re-declines, and must not fail the other slots' benchmark. A slot with no
+            // worker is still tried (a respawn may bring it up), but its error is "not benchmarked".
+            let (declined, was_down) = self.benchmark_slot_state(&key);
+            if let Some(reason) = declined {
+                run.record_declined(&key, &reason, gpu_name, &gpu_tag);
+                continue;
+            }
+            // W10-BENCH round 2: a worker that only simulates a benchmark is not run either.
+            if let Some(reason) = simulated_benchmark_reason(&backend, &[]) {
+                run.record_simulated(&key, reason, gpu_name, &gpu_tag);
+                continue;
+            }
+
             if let Some(event) = self.benchmark_event(&key, BenchmarkProgressKind::Started) {
                 on_progress(event);
             }
             let outcome = self.benchmark_slot_streaming(&key, on_progress);
-            let succeeded = matches!(&outcome, Ok(entries) if !entries.is_empty());
+            // A short suite is a failed card too (W10-BENCH round 1), and so are simulated rows
+            // (round 2).
+            let succeeded = matches!(&outcome, Ok(entries)
+                if !entries.is_empty()
+                    && simulated_benchmark_reason(&backend, entries).is_none()
+                    && missing_benchmark_rows(&backend, entries).is_empty());
             if let Some(event) =
                 self.benchmark_event(&key, BenchmarkProgressKind::Finished { succeeded })
             {
@@ -5126,24 +5494,33 @@ impl WorkerPool {
                 e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
                     .is_some()
             });
-            match outcome {
-                Ok(entries) if !entries.is_empty() => {
-                    results.push(SlotBenchmarkResult {
-                        slot_key: key.clone(),
-                        gpu_name,
-                        device_index,
-                        pci_bus_id: slot_pci_bus_id.clone(),
-                        gpu_tag: gpu_tag.clone(),
-                        entries,
-                        vram_bytes,
-                        host_peak_bytes: self.host_peak_for_slot(&key),
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("Benchmark failed for {key}: {e:#}");
-                }
-            }
+            // Still down after the attempt: it never came up, so this run could not benchmark it.
+            let was_down = was_down && self.slot_has_no_worker(&key);
+            // Its error is why it never came up, not the respawn backoff the retry ran into.
+            let outcome = if was_down {
+                outcome.map_err(|e| self.down_slot_error(&key, e))
+            } else {
+                outcome
+            };
+            let host_peak_bytes = self.host_peak_for_slot(&key);
+            run.record(
+                &key,
+                &backend,
+                was_down,
+                outcome,
+                |entries| SlotBenchmarkResult {
+                    slot_key: key.clone(),
+                    gpu_name: gpu_name.clone(),
+                    device_index,
+                    pci_bus_id: slot_pci_bus_id.clone(),
+                    gpu_tag: gpu_tag.clone(),
+                    entries,
+                    vram_bytes,
+                    host_peak_bytes,
+                },
+                gpu_name.clone(),
+                &gpu_tag,
+            );
 
             if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel" | "metal") {
                 if let Some(entry) = self.workers.get(&key) {
@@ -5260,7 +5637,7 @@ impl WorkerPool {
             }
         }
 
-        results
+        run.finish()
     }
 
     /// Submit a proof to a backend worker.
@@ -9718,6 +10095,7 @@ impl WorkerPool {
                 slot.handle = Some(handle);
                 slot.consecutive_failures = 0;
                 slot.last_failure = None;
+                slot.last_spawn_error = None;
                 slot.proofs_since_spawn = 0;
                 Ok(())
             }
@@ -9741,8 +10119,9 @@ impl WorkerPool {
                         slot.backend,
                         slot.gpu_tag,
                     );
-                    slot.declined = Some(msg);
+                    slot.declined = Some(msg.clone());
                 }
+                slot.last_spawn_error = Some(msg);
                 slot.consecutive_failures += 1;
                 slot.last_failure = Some(Instant::now());
                 Err(e)
@@ -10023,6 +10402,7 @@ impl WorkerPool {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    last_spawn_error: None,
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),
@@ -10036,6 +10416,45 @@ impl WorkerPool {
             },
         );
         Ok(())
+    }
+
+    /// Register a slot with NO worker, as `discover_and_spawn` leaves one whose worker could not
+    /// start: `declined` is the reason a worker that declined gave (it is then never respawned), or
+    /// `None` for a spawn that failed (it backs off before a respawn is tried). W10-BENCH round 1.
+    pub fn insert_test_down_worker(
+        &mut self,
+        key: &str,
+        backend: &str,
+        gpu_tag: &str,
+        path: PathBuf,
+        declined: Option<&str>,
+    ) {
+        self.workers.insert(
+            key.to_string(),
+            WorkerEntry {
+                slot: Mutex::new(WorkerSlot {
+                    handle: None,
+                    path,
+                    backend: backend.to_string(),
+                    gpu_tag: gpu_tag.to_string(),
+                    device_index: key.rsplit(':').next().and_then(|i| i.parse().ok()),
+                    pci_bus_id: None,
+                    gpu_name: None,
+                    spawn_env: HashMap::new(),
+                    consecutive_failures: 1,
+                    last_failure: Some(Instant::now()),
+                    declined: declined.map(str::to_string),
+                    last_spawn_error: None,
+                    proofs_since_spawn: 0,
+                    last_use: None,
+                }),
+                vram_bytes: None,
+                pci_bus_id: None,
+                pid: Arc::new(AtomicU32::new(0)),
+                pid_starttime: Arc::new(AtomicU64::new(0)),
+                intentional_kill: Arc::new(AtomicBool::new(false)),
+            },
+        );
     }
 
     /// Insert a mock worker into the dedicated MEASURE pool for `backend` (registered as
@@ -10064,6 +10483,7 @@ impl WorkerPool {
                 consecutive_failures: 0,
                 last_failure: None,
                 declined: None,
+                last_spawn_error: None,
                 proofs_since_spawn: 0,
                 last_use: None,
             }),
@@ -11217,6 +11637,7 @@ mod tests {
                         consecutive_failures: 0,
                         last_failure: None,
                         declined: None,
+                        last_spawn_error: None,
                         proofs_since_spawn: 0,
                         last_use: None,
                     }),
@@ -13282,6 +13703,7 @@ mod tests {
             consecutive_failures: failures,
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         }
@@ -13408,6 +13830,7 @@ mod tests {
             consecutive_failures: MAX_RESPAWN_FAILURES,
             last_failure: Some(Instant::now()),
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13434,6 +13857,7 @@ mod tests {
             consecutive_failures: 1,
             last_failure: Some(Instant::now()), // just failed
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13459,6 +13883,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13466,6 +13891,61 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(slot.consecutive_failures, 1);
         assert!(slot.last_failure.is_some());
+        // W10-BFIX: the failure is kept for the operator, and a backoff bail does not replace it.
+        let spawn_error = slot.last_spawn_error.clone().expect("spawn error recorded");
+        assert!(spawn_error.contains("/nonexistent/binary"), "{spawn_error}");
+        let backoff = format!("{:#}", WorkerPool::respawn(&mut slot).unwrap_err());
+        assert!(backoff.starts_with("Backoff"), "{backoff}");
+        assert_eq!(slot.last_spawn_error.as_deref(), Some(spawn_error.as_str()));
+    }
+
+    /// W10-BFIX: a worker that dies before its handshake is reported with its last stderr line,
+    /// which is where it says why (the round-3 reviewer's `h_crash`).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_respawn_keeps_the_workers_last_words() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zkminer-bfix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dies-at-start");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'dyld: Library not loaded: @rpath/libx.dylib' >&2\nexit 134\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut slot = WorkerSlot::test_dead_slot(path);
+        assert!(WorkerPool::respawn(&mut slot).is_err());
+        let error = slot.last_spawn_error.clone().expect("spawn error recorded");
+        assert!(error.contains("Handshake"), "{error}");
+        assert!(
+            error.contains("the worker's last output: dyld: Library not loaded"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W10-BFIX: a down slot's benchmark failure leads with why it never started; the benchmark's
+    /// own attempt (a respawn backoff) is context only, and stands alone only when nothing else is
+    /// known.
+    #[test]
+    fn a_down_slot_reports_its_spawn_error_before_the_backoff() {
+        use super::{down_slot_message, COULD_NOT_START};
+        let backoff = "Backoff: waiting 4.7s before respawning /x";
+        let died =
+            "Handshake with worker risc0 failed (timeout=10s): Worker risc0 process died (EOF)";
+        assert_eq!(
+            down_slot_message(Some(died), backoff),
+            format!("{COULD_NOT_START}{died} (then, when the benchmark tried it: {backoff})")
+        );
+        assert_eq!(
+            down_slot_message(Some(died), died),
+            format!("{COULD_NOT_START}{died}")
+        );
+        assert_eq!(
+            down_slot_message(None, backoff),
+            format!("{COULD_NOT_START}{backoff}")
+        );
     }
 
     // ---- ensure_alive tests ----
@@ -13488,6 +13968,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13518,6 +13999,7 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         };
@@ -13642,6 +14124,7 @@ mod declined_backend_tests {
             consecutive_failures: cf,
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
+            last_spawn_error: None,
             proofs_since_spawn: 0,
             last_use: None,
         }
@@ -13861,8 +14344,30 @@ impl WorkerSlot {
             consecutive_failures: self.consecutive_failures,
             last_failure: self.last_failure,
             declined: self.declined.clone(),
+            last_spawn_error: self.last_spawn_error.clone(),
             proofs_since_spawn: self.proofs_since_spawn,
             last_use: self.last_use,
+        }
+    }
+
+    /// Test-only: a dead risc0 CPU slot for `path` that may respawn at once.
+    #[cfg(test)]
+    fn test_dead_slot(path: PathBuf) -> Self {
+        WorkerSlot {
+            handle: None,
+            path,
+            backend: "risc0".to_string(),
+            gpu_tag: "generic".to_string(),
+            device_index: None,
+            pci_bus_id: None,
+            gpu_name: None,
+            spawn_env: HashMap::new(),
+            consecutive_failures: 0,
+            last_failure: None,
+            declined: None,
+            last_spawn_error: None,
+            proofs_since_spawn: 0,
+            last_use: None,
         }
     }
 }
@@ -13897,6 +14402,7 @@ mod bus_id_locking_tests {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    last_spawn_error: None,
                     proofs_since_spawn: 0,
                     last_use: None,
                 }),
@@ -14193,5 +14699,177 @@ mod preemption_tests {
             budget <= left - MIN_ABORT_START_BUDGET,
             "reclaim wait {budget:?} would eat the {MIN_ABORT_START_BUDGET:?} start floor of a {left:?} deadline"
         );
+    }
+}
+
+/// W10-BENCH round 2: the bookkeeping of `BenchmarkRun` on its own, without workers.
+#[cfg(test)]
+mod benchmark_run_tests {
+    use super::*;
+
+    fn row(program: &str, prover_backend: &str) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: program.to_string(),
+            prover_backend: prover_backend.to_string(),
+            cycles: 1_000,
+            duration_secs: 1.0,
+            throughput: 1_000.0,
+            weight: 0.2,
+            precompile: false,
+            wrap_secs: None,
+            power_state: None,
+        }
+    }
+
+    fn full_suite(backend: &str) -> Vec<BenchmarkEntry> {
+        zkminer_prover_protocol::benchmark_suite(backend)
+            .into_iter()
+            .map(|p| p.name)
+            .chain([zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string()])
+            .map(|name| row(&name, backend))
+            .collect()
+    }
+
+    fn measured(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
+        run.record(
+            key,
+            backend,
+            false,
+            Ok(full_suite(backend)),
+            |entries| SlotBenchmarkResult {
+                slot_key: key.to_string(),
+                gpu_name: None,
+                device_index: None,
+                pci_bus_id: None,
+                gpu_tag: tag.to_string(),
+                entries,
+                vram_bytes: None,
+                host_peak_bytes: None,
+            },
+            None,
+            tag,
+        );
+    }
+
+    fn down(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
+        run.record(
+            key,
+            backend,
+            true,
+            Err(anyhow::anyhow!("Backoff: waiting before respawning")),
+            |_| unreachable!(),
+            None,
+            tag,
+        );
+    }
+
+    fn keys(slots: &[SlotBenchmarkFailure]) -> Vec<&str> {
+        slots.iter().map(|f| f.slot_key.as_str()).collect()
+    }
+
+    #[test]
+    fn only_a_same_backend_gpu_covers_for_a_down_slot() {
+        // A CPU worker of the same backend: failure.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:generic", "risc0", "generic");
+        down(&mut run, "risc0:metal:0", "risc0", "metal");
+        let run = run.finish();
+        assert_eq!(keys(&run.failures), ["risc0:metal:0"]);
+        assert!(run.not_benchmarked.is_empty());
+
+        // A GPU of another backend: failure.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
+        down(&mut run, "sp1:cuda:0", "sp1", "cuda");
+        let run = run.finish();
+        assert_eq!(keys(&run.failures), ["sp1:cuda:0"]);
+
+        // A GPU of the same backend, whichever order the slots ran in: not benchmarked.
+        for down_first in [true, false] {
+            let mut run = BenchmarkRun::default();
+            if down_first {
+                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+            }
+            measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
+            if !down_first {
+                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+            }
+            let run = run.finish();
+            assert!(run.failures.is_empty(), "{:?}", run.failures);
+            assert_eq!(keys(&run.not_benchmarked), ["risc0:cuda:1"]);
+        }
+
+        // A same-backend GPU whose suite came back short does not cover for it either.
+        let mut run = BenchmarkRun::default();
+        let mut short = full_suite("risc0");
+        short.pop();
+        run.record(
+            "risc0:cuda:0",
+            "risc0",
+            false,
+            Ok(short),
+            |entries| SlotBenchmarkResult {
+                slot_key: "risc0:cuda:0".to_string(),
+                gpu_name: None,
+                device_index: None,
+                pci_bus_id: None,
+                gpu_tag: "cuda".to_string(),
+                entries,
+                vram_bytes: None,
+                host_peak_bytes: None,
+            },
+            None,
+            "cuda",
+        );
+        down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+        let mut failed = keys(&run.clone().finish().failures)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        failed.sort();
+        assert_eq!(failed, ["risc0:cuda:0", "risc0:cuda:1"]);
+    }
+
+    #[test]
+    fn simulated_rows_are_never_results() {
+        assert!(simulated_benchmark_reason("openvm", &[]).is_some());
+        assert!(simulated_benchmark_reason("risc0", &full_suite("risc0")).is_none());
+        let mut rows = full_suite("risc0");
+        rows[0].prover_backend = "simulated".to_string();
+        let reason = simulated_benchmark_reason("risc0", &rows).unwrap();
+        assert!(reason.starts_with(SIMULATED_BENCHMARK), "{reason}");
+
+        // A worker that labels a row simulated: not a result, and alone, the run's failure.
+        let mut run = BenchmarkRun::default();
+        run.record(
+            "risc0:cuda:0",
+            "risc0",
+            false,
+            Ok(rows.clone()),
+            |_| panic!("simulated rows must not become a result"),
+            None,
+            "cuda",
+        );
+        let run = run.finish();
+        assert!(run.results.is_empty());
+        assert_eq!(keys(&run.failures), ["risc0:cuda:0"]);
+
+        // Beside a measured card: reported, and the card's run is clean; it covers for nothing.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:metal:0", "risc0", "metal");
+        run.record(
+            "openvm:cuda:0",
+            "openvm",
+            false,
+            Ok(full_suite("openvm")),
+            |_| panic!("simulated rows must not become a result"),
+            None,
+            "cuda",
+        );
+        down(&mut run, "openvm:cuda:1", "openvm", "cuda");
+        let run = run.finish();
+        assert_eq!(keys(&run.not_benchmarked), ["openvm:cuda:0"]);
+        assert_eq!(keys(&run.failures), ["openvm:cuda:1"]);
+        assert_eq!(run.results.len(), 1);
     }
 }
