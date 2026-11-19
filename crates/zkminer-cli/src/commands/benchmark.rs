@@ -24,11 +24,7 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // `ZkMinerConfig::load` returns defaults when the file is absent, so a missing
     // config degrades to the default worker search paths rather than failing.
     let config = ZkMinerConfig::load(config_path)?;
-    let benchmark_timeout = if config.prover.benchmark_timeout_secs > 0 {
-        Some(Duration::from_secs(config.prover.benchmark_timeout_secs))
-    } else {
-        None
-    };
+    let benchmark_timeout = config.prover.benchmark_timeout();
     let mut pool = WorkerPool::new(
         config
             .prover
@@ -215,7 +211,36 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
 
     println!("{}", "─".repeat(86));
     println!();
-    println!("  zkOP/s: {:.0}  (3970X baseline = 100,000)", results.zkops);
+    println!(
+        "  {}  (all GPUs: each GPU's SP1 and RISC Zero scores blended, added up)",
+        zkminer_prover::benchmark::format_mzkops(results.zkops)
+    );
+    let devices = &results.device_benchmarks;
+    let mut seen: Vec<&str> = Vec::new();
+    for d in devices {
+        if seen.contains(&d.device_id.as_str()) {
+            continue;
+        }
+        seen.push(&d.device_id);
+        let Some(score) = zkminer_prover::benchmark::gpu_zkops(devices, &d.device_id) else {
+            continue;
+        };
+        // Each zkVM in its own cycles per second: the scoring program's rate.
+        let per_zkvm: Vec<String> = devices
+            .iter()
+            .filter(|r| r.device_id == d.device_id)
+            .filter_map(|r| {
+                let rate = r.scoring_cycles_per_sec()?;
+                Some(format!("{} {:.2}M c/s", r.prover_backend, rate / 1e6))
+            })
+            .collect();
+        println!(
+            "    {}: {}  ({})",
+            d.device_label,
+            zkminer_prover::benchmark::format_mzkops(score),
+            per_zkvm.join(", ")
+        );
+    }
     println!();
 
     // Device benchmarks summary

@@ -26,13 +26,16 @@ use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
 use zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV;
 use zkminer_prover_protocol::{
-    is_gpu_oom, read_message, write_message, BenchmarkEntry, ErrorKind, WorkerCommand,
-    WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX, BENCH_ECDSA_VERIFY,
-    BENCH_FIBONACCI, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
+    is_gpu_oom, read_message, write_message, BenchmarkEntry, BenchmarkProgramSpec, ErrorKind,
+    WorkerCommand, WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX,
+    BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
     PROTOCOL_VERSION, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
+
+#[cfg(all(feature = "rocm", windows))]
+mod hip;
 
 const WORKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -208,21 +211,32 @@ fn main() {
         return;
     }
 
+    // The HIP devices, for the host's GPU discovery where there is no rocm-smi (Windows).
+    #[cfg(all(feature = "rocm", windows))]
+    if std::env::args().any(|a| a == "--list-hip-devices") {
+        hip::print_devices();
+        return;
+    }
+
     // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its image
     // id, which is the `programId` of a job for it. For harnesses that submit jobs this worker can
     // serve (crates/zkminer-cli/tests/localnet.rs). Speaks no IPC.
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--export-guest") {
         let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
-            eprintln!("usage: --export-guest fibonacci|memory-merkle <path>");
+            eprintln!("usage: --export-guest fibonacci|memory-merkle|sys-rand-echo|segment-size-steer <path>");
             std::process::exit(2);
         };
         let elf = match name.as_str() {
             "fibonacci" => FIBONACCI_ELF,
             // B9-ZK: a second rv32im guest for the IPC job-sequence test (tests/metal_worker.rs).
             "memory-merkle" => MEMORY_MERKLE_ELF,
+            "sys-rand-echo" => SYS_RAND_ECHO_ELF,
+            "segment-size-steer" => SEGMENT_SIZE_STEER_ELF,
             other => {
-                eprintln!("unknown guest {other:?} (known: fibonacci, memory-merkle)");
+                eprintln!(
+                    "unknown guest {other:?} (known: fibonacci, memory-merkle, sys-rand-echo, segment-size-steer)"
+                );
                 std::process::exit(2);
             }
         };
@@ -254,7 +268,11 @@ fn main() {
         unsafe { libc::dup2(io::stderr().as_raw_fd(), stdout_fd) };
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
-    #[cfg(not(unix))]
+    // Windows: the same isolation through the C runtime (ipc.rs): circom-witnesscalc and other
+    // native code print to the process's stdout, which now goes to stderr.
+    #[cfg(windows)]
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    #[cfg(not(any(unix, windows)))]
     let ipc_stdout = io::stdout();
 
     {
@@ -272,10 +290,6 @@ fn main() {
             .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()))
             .init();
     }
-
-    // Load (or create) the `sys_rand` key now, outside any job: a failure inside a job's panic
-    // containment would be blamed on that job's program.
-    sys_rand_key();
 
     // W7-M10: with `ZKMINER_METAL_ENFORCE_BUDGET=1` the HAL enforces the limit this worker plans
     // with (the dispatcher's figure for this job tier); set before the first request, so before
@@ -353,12 +367,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     backend: BACKEND_RISC0.to_string(),
                     version: risc0_zkvm::VERSION.to_string(),
                     supported_benchmarks: vec![
-                        BENCH_FIBONACCI.to_string(),
                         BENCH_SHA256_CHAIN.to_string(),
                         BENCH_ECDSA_VERIFY.to_string(),
                         BENCH_BIGINT_MUL.to_string(),
                         BENCH_MEMORY_MERKLE.to_string(),
                         BENCH_CHACHA_MIX.to_string(),
+                        zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string(),
                     ],
                     gpu_available,
                     gpu_name,
@@ -366,7 +380,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark => {
+            WorkerCommand::Benchmark { programs } => {
                 tracing::info!("Running benchmarks...");
                 let results = if let Some(refusal) = gpu_refusal() {
                     tracing::error!("not benchmarking: {refusal}");
@@ -377,7 +391,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         metal_start::log_power_state("benchmark");
                         metal_start::prewarm_before_benchmark(default_job_po2());
                     }
-                    run_benchmarks_streaming(&mut stdout)?
+                    run_benchmarks_streaming(&mut stdout, &programs)?
                 };
                 let resp = WorkerResponse::BenchmarkResult { results };
                 write_message(&mut stdout, &resp)?;
@@ -547,7 +561,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     run_execute(&elf, &input_data, program_id, po2)
                 }));
                 match outcome {
-                    Ok(Ok((cycles, journal, duration_secs, host_entropy_reads))) => {
+                    Ok(Ok(ExecuteOutcome {
+                        cycles,
+                        journal,
+                        duration_secs,
+                        host_entropy_reads,
+                        user_cycles,
+                        keccak_cycles,
+                    })) => {
                         tracing::info!(
                             "Execute {request_id}: {cycles} cycles in {duration_secs:.2}s"
                         );
@@ -558,17 +579,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             duration_secs,
                             journal_len,
                             // The host checks the job's journal binding against these bytes. One no
-                            // fulfil could carry is reported by its length alone, and so is one a
-                            // proof on another worker may not reproduce (a process-only seed key).
-                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES
-                                && sys_rand_key_is_shared())
-                            .then_some(journal),
+                            // fulfil could carry is reported by its length alone.
+                            journal: (journal.len() <= EXECUTE_JOURNAL_MAX_BYTES).then_some(journal),
                             // risc0 is bounded by its own in-process RSS self-guard + the ledger charge
                             // (finding H4), not by the SP1-only prove-stacking claim gate (H1), so it
                             // reports no peak: 0 = "unknown", which leaves `sp1_execute_provable_beside_
                             // server` ungated for risc0 (it is only consulted for SP1 anyway).
                             peak_host_bytes: 0,
                             host_entropy_reads,
+                            user_cycles: Some(user_cycles),
+                            keccak_cycles: Some(keccak_cycles),
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -609,7 +629,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                let resp = match warm_up() {
+                let resp = match warm_up(&mut |status, done_bytes, total_bytes| {
+                    // A closed pipe is reported by the final answer's write below.
+                    let _ = write_message(
+                        &mut stdout,
+                        &WorkerResponse::SetupProgress {
+                            request_id,
+                            status: status.to_string(),
+                            done_bytes,
+                            total_bytes,
+                        },
+                    );
+                }) {
                     Ok(summary) => WorkerResponse::WarmupDone {
                         request_id,
                         summary,
@@ -701,7 +732,22 @@ fn detect_gpu() -> (bool, Option<String>) {
             }
         }
     }
-    #[cfg(feature = "rocm")]
+    // Windows has neither rocm-smi nor /dev/kfd: ask HIP for the device this worker proves on
+    // (the dispatcher pins it with HIP_VISIBLE_DEVICES, so it is the first one visible).
+    #[cfg(all(feature = "rocm", windows))]
+    {
+        return match hip::devices() {
+            Ok(devices) => match devices.into_iter().next() {
+                Some(d) => (true, Some(d.name)),
+                None => (false, None),
+            },
+            Err(e) => {
+                tracing::warn!("{e}");
+                (false, None)
+            }
+        };
+    }
+    #[cfg(all(feature = "rocm", not(windows)))]
     {
         // Try rocm-smi first (more reliable than sysfs product_name)
         if let Ok(output) = std::process::Command::new("rocm-smi")
@@ -729,6 +775,11 @@ fn detect_gpu() -> (bool, Option<String>) {
     }
     #[cfg(feature = "intel")]
     {
+        // Windows has no sysfs. The dispatcher starts this worker only for an Intel GPU it detected
+        // (and pins it with ZE_AFFINITY_MASK); the prover fails loudly if no device is visible.
+        if cfg!(windows) {
+            return (true, Some("Intel GPU".to_string()));
+        }
         // The host pins this worker to one card through ZE_AFFINITY_MASK, which sysfs does not see;
         // name the card only when the box has exactly one Intel GPU, so the name is never another
         // card's. The host names its slots from its own discovery either way.
@@ -1051,85 +1102,47 @@ fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T 
     out
 }
 
-/// The seed for the guest's `sys_rand` on one (program, input).
+/// The seed for the guest's `sys_rand` on one (program, input): the public rule
+/// `zkminer_prover_protocol::sys_rand::SYS_RAND_RULE`, `SHA-256(domain || image id || SHA-256(stdin))`.
 ///
 /// Unseeded, risc0 answers `sys_rand` with fresh host entropy on every execution, so a guest can
-/// branch on its random bytes: measure clean before the claim and fail the proof after it, which
-/// costs us the release penalty. The pre-claim measurement and every proving attempt use this seed
-/// instead, so they run the guest identically, even in different workers. It is keyed with this
-/// host's secret key, so the bytes stay unpredictable to everyone else, as the guest's randomness
-/// should be: risc0 also draws the entropy that keeps a receipt's post-state digest from revealing
-/// private inputs from it. It hashes the program's IMAGE ID, not its ELF bytes: two ELFs with one
-/// image id (one stripped, say) are the same program, and a lock re-driven after a restart may fetch
-/// the other one.
-fn sys_rand_seed(key: &[u8; 32], image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+/// branch on its random bytes: measure clean before the claim and fail the proof after it. The
+/// pre-claim measurement, every proving attempt and `zkminer simulate` all use this one function.
+/// It hashes the program's IMAGE ID, not its ELF bytes (two ELFs with one image id are the same
+/// program), and the exact bytes the guest reads, which for a journal-prefix job begin with the prefix.
+fn sys_rand_seed(image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(b"zkminer/risc0/sys_rand/v2");
-    mac.update(image_id);
-    mac.update(&Sha256::digest(input_data));
-    mac.finalize().into_bytes().into()
+    let mut h = Sha256::new();
+    h.update(zkminer_prover_protocol::sys_rand::SYS_RAND_DOMAIN);
+    h.update(image_id);
+    h.update(Sha256::digest(input_data));
+    h.finalize().into()
 }
 
-/// This host's `sys_rand` key, loaded once per process: the one the miner passed in
-/// [`SYS_RAND_KEY_ENV`] (it hands the same key to every risc0 worker it spawns), else
-/// `~/.zkminer/risc0-sys-rand.key` (created there on first use) for a worker started on its own.
-///
-/// If neither can be used, the worker keys its seeds for this process alone: its measurements and
-/// proofs still agree with each other, but a job measured by another worker can diverge again, so its
-/// measurements then report no journal (see [`sys_rand_key_is_shared`]).
-fn sys_rand_key() -> [u8; 32] {
-    sys_rand_key_state().0
+/// The environment every run of a job starts from: its input and its `sys_rand` seed, together, so a
+/// measurement and a proof can differ in neither (a run that forgot the seed would have to forget
+/// the guest's input too).
+fn job_env_builder<'a>(input_data: &[u8], seed: [u8; 32]) -> risc0_zkvm::ExecutorEnvBuilder<'a> {
+    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
+    if !input_data.is_empty() {
+        env_builder.write_slice(input_data);
+    }
+    env_builder.random_seed(seed);
+    env_builder
 }
 
-/// Whether the seed key is the host's lasting key (its file's, read here or passed by the miner)
-/// rather than one for this process or this miner run alone.
-fn sys_rand_key_is_shared() -> bool {
-    sys_rand_key_state().1
-}
-
-fn sys_rand_key_state() -> &'static ([u8; 32], bool) {
-    use zkminer_prover_protocol::sys_rand;
-    static KEY: std::sync::OnceLock<([u8; 32], bool)> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        if let Ok(v) = std::env::var(sys_rand::SYS_RAND_KEY_ENV) {
-            // Out of this process's environment once read, so nothing it starts (nvidia-smi,
-            // rocm-smi, docker) inherits it. `main` reads the key before any other thread exists.
-            std::env::remove_var(sys_rand::SYS_RAND_KEY_ENV);
-            let ephemeral =
-                std::env::var(sys_rand::SYS_RAND_KEY_EPHEMERAL_ENV).is_ok_and(|v| v == "1");
-            match sys_rand::decode_key(v.trim()) {
-                // A key for the miner's run alone keeps this run's workers in step, but a lock
-                // re-proved after a restart would not be: report no journal, as for a
-                // process-only key.
-                Some(key) => return (key, !ephemeral),
-                None => tracing::warn!(
-                    "{} is not 64 hex digits — ignoring it",
-                    sys_rand::SYS_RAND_KEY_ENV
-                ),
-            }
-        }
-        let loaded = match dirs::home_dir() {
-            Some(home) => sys_rand::load_or_create_key(&sys_rand::key_path(&home))
-                .map_err(anyhow::Error::from),
-            None => Err(anyhow::anyhow!("no home directory")),
-        };
-        match loaded {
-            Ok(key) => (key, true),
-            Err(e) => {
-                tracing::warn!(
-                    "sys_rand key unavailable ({e:#}): seeding with a key for this process only, so \
-                     a job measured here may be proved by another worker with other randomness; \
-                     measurements report no journal, and no journal-bound job is claimed on them"
-                );
-                let mut key = [0u8; 32];
-                getrandom::fill(&mut key).expect("no OS randomness for the sys_rand key");
-                (key, false)
-            }
-        }
-    })
+/// What one execution of a job measured.
+#[derive(Debug)]
+struct ExecuteOutcome {
+    cycles: u64,
+    journal: Vec<u8>,
+    duration_secs: f64,
+    host_entropy_reads: Option<u64>,
+    /// The cycles the guest itself executed, before paging and padding.
+    user_cycles: u64,
+    /// The keccak proof charges inside `cycles`.
+    keccak_cycles: u64,
 }
 
 /// What one keccak proof request at the default keccak po2 (17) is charged in a measurement (see
@@ -1245,13 +1258,15 @@ fn reads_given_keccak(reads: Option<u64>, keccak_cycles: u64, assumptions: usize
 
 /// Counts the guest's `sys_rand` calls during an execution, for `ExecuteResult.host_entropy_reads`.
 ///
-/// `sys_rand` is the one syscall risc0's executor answers from host entropy (seeded here, see
-/// [`sys_rand_seed`], but by a key the job's prover does not share): `sys_getenv` and `sys_argv` read
-/// an environment and arguments this worker leaves empty, `sys_read` the job's input, `sys_cycle_count`
-/// the run itself, and the keccak and verify calls are checked functions of what the guest passes.
-/// So reading none beyond its runtime's own draw rules out a guest whose path depends on host
-/// entropy. It does not bind the run to the proven one: the chain never checks the input, so a
-/// requester who is also the prover can prove another input with the same journal.
+/// `sys_rand` is the one syscall risc0's executor would answer from host entropy; here the public
+/// seed answers it (see [`sys_rand_seed`]). `sys_getenv` and `sys_argv` read an environment and
+/// arguments this worker leaves empty, `sys_read` the job's input, and `sys_cycle_count` the run itself.
+///
+/// The count is a fact to report, not a test of a run: reading none does not show the path ignores
+/// the seed (a guest can read its runtime's own draw straight from memory), and reading some does not
+/// show it follows it. What the seed gives is reproducibility: a zkminer run of the same input takes
+/// the same path. `None` keeps its meaning (nothing was counted: a guest without risc0's runtime, or a
+/// keccak charge the guest never assumed), and no count there is evidence.
 ///
 /// The executor exposes no count, so this counts the line the pinned fork's handler logs at DEBUG
 /// for each call (`risc0/zkvm/src/host/server/exec/syscall/random.rs`: `SYS_RANDOM: <words>`), with a
@@ -1355,7 +1370,7 @@ fn run_execute(
     input_data: &[u8],
     program_id: Option<[u8; 32]>,
     po2: Option<u8>,
-) -> anyhow::Result<(u64, Vec<u8>, f64, Option<u64>)> {
+) -> anyhow::Result<ExecuteOutcome> {
     use std::time::Instant;
     let po2 = job_segment_po2(po2)?;
     // Bind the ELF to the job's programId before spending any execution on it (the pre-claim
@@ -1363,11 +1378,7 @@ fn run_execute(
     let image_id = verify_program_id(elf, program_id)?;
     let started = Instant::now();
 
-    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
-    if !input_data.is_empty() {
-        env_builder.write_slice(input_data);
-    }
-    env_builder.random_seed(sys_rand_seed(&sys_rand_key(), &image_id, input_data));
+    let mut env_builder = job_env_builder(input_data, sys_rand_seed(&image_id, input_data));
     // At the size the job will be proven at, on the card the host asked for: the guest can tell (see
     // `RISC0_DEFAULT_JOB_PO2`).
     env_builder.segment_limit_po2(po2 as u32);
@@ -1454,12 +1465,15 @@ fn run_execute(
     // check makes measure-ELF == prove-ELF). The host checks the job's journal binding against it,
     // and screens a journal that would blow the fulfillJob payload cap, before committing
     // collateral and a full proof to it.
-    Ok((
+    let user_cycles = session.cycles();
+    Ok(ExecuteOutcome {
         cycles,
-        session.journal.bytes,
-        started.elapsed().as_secs_f64(),
+        journal: session.journal.bytes,
+        duration_secs: started.elapsed().as_secs_f64(),
         host_entropy_reads,
-    ))
+        user_cycles,
+        keccak_cycles: keccak.cycles,
+    })
 }
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
@@ -1473,7 +1487,15 @@ fn run_execute(
 /// The saving from keeping it turned out small: wraps after a release ran 2.08-2.12 s on the 5080
 /// against 2.01-2.05 s on the cache-keeping 4090, so at most ~0.1 s. The threshold is therefore cheap to
 /// get wrong in the conservative direction, which is why an unknown size releases.
+#[cfg(not(all(feature = "intel", windows)))]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// On Intel under Windows the threshold is higher: risc0 proves its segments at po2 21 there, and
+/// a 23M-cycle keccak job's segments alone peaked at 23 GB of a 32 GB Arc Pro B70. With the cache
+/// kept from the previous proof, the same segments ran with the card full and up to 5.8 GB spilled
+/// into shared system memory (WDDM's spill), at 2-5x the time (2026-10-14).
+#[cfg(all(feature = "intel", windows))]
+const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
 /// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
 ///
@@ -1585,7 +1607,7 @@ fn run_proof(
         anyhow::bail!("{refusal}");
     }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
-    let seed = sys_rand_seed(&sys_rand_key(), &image_id, input_data);
+    let seed = sys_rand_seed(&image_id, input_data);
     // P31-M9b: a Prove does not wait for the in-flight specialized eval pipeline (logged), unless
     // ZKMINER_METAL_PREWARM_PROVE_JOIN=1.
     #[cfg(feature = "metal")]
@@ -1708,9 +1730,7 @@ fn run_proof_once(
         }
     }
 
-    let mut env_builder = risc0_zkvm::ExecutorEnv::builder();
-    env_builder.write_slice(input_data);
-    env_builder.random_seed(seed);
+    let mut env_builder = job_env_builder(input_data, seed);
     // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at the size the host
     // names here, and the guest can tell the size it runs at.
     let po2 = po2.unwrap_or_else(default_job_po2);
@@ -1826,164 +1846,93 @@ fn run_proof_once(
     Ok((journal, seal, duration_secs, cycles))
 }
 
-/// Run benchmarks, sending a BenchmarkProgress message after each program completes.
+/// The embedded guest a benchmark request names, or `None` for a name this build has no guest for
+/// (or a guest stubbed out of the build).
+fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
+    let elf = match name {
+        BENCH_SHA256_CHAIN => SHA256_CHAIN_ELF,
+        BENCH_ECDSA_VERIFY => ECDSA_VERIFY_ELF,
+        BENCH_BIGINT_MUL => BIGINT_MUL_ELF,
+        BENCH_MEMORY_MERKLE => MEMORY_MERKLE_ELF,
+        BENCH_CHACHA_MIX => CHACHA_MIX_ELF,
+        zkminer_prover_protocol::BENCH_ZKOP_MIX => ZKOP_MIX_ELF,
+        zkminer_prover_protocol::BENCH_WARMUP => FIBONACCI_ELF,
+        _ => return None,
+    };
+    (!elf.is_empty()).then_some(elf)
+}
+
+/// Prove each of `programs`, sending a `BenchmarkProgress` after each one that proved. The suite is
+/// the host's; see `zkminer_prover_protocol::suite`.
 fn run_benchmarks_streaming<W: std::io::Write>(
     stdout: &mut W,
+    programs: &[BenchmarkProgramSpec],
 ) -> anyhow::Result<Vec<BenchmarkEntry>> {
     let mut results = Vec::new();
-    let bench_only = std::env::var("BENCH_ONLY").ok();
-
-    // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
-    // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
-    // keeping total benchmark time under 2 minutes on a 4090.
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_ELF,
-            &10_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_ELF,
-            &100u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_ELF,
-            &512u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_ELF,
-            &5_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    let active: Vec<_> = benchmarks
-        .iter()
-        .filter(|&&(name, elf, _, _, _)| {
-            !elf.is_empty()
-                && bench_only
-                    .as_ref()
-                    .map_or(true, |only| name.eq_ignore_ascii_case(only))
-        })
-        .collect();
-    let total = active.len() as u32;
-
-    for (idx, &&(name, elf, input, weight, precompile)) in active.iter().enumerate() {
-        if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
+    let total = programs.len() as u32;
+    for (idx, spec) in programs.iter().enumerate() {
+        if let Some(entry) = benchmark_spec(spec) {
             let progress = WorkerResponse::BenchmarkProgress {
                 entry: entry.clone(),
-                program_index: (idx + 1) as u32,
+                program_index: idx as u32 + 1,
                 total_programs: total,
             };
             write_message(stdout, &progress)?;
             results.push(entry);
         }
     }
-
     Ok(results)
 }
 
+/// Prove one requested program, if this build has its guest.
+fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
+    let Some(elf) = benchmark_guest(&spec.name) else {
+        tracing::warn!("{}: no guest for it in this build; skipped", spec.name);
+        return None;
+    };
+    benchmark_stages(
+        &spec.name,
+        elf,
+        &spec.input,
+        spec.weight,
+        spec.precompile,
+        spec.measure_wrap,
+    )
+}
+
+/// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
+/// program of it (or only the score, for `zkop-mix`).
 fn run_benchmarks() -> Vec<BenchmarkEntry> {
-    let mut results = Vec::new();
-
-    // Check for single-benchmark mode via env var (e.g., BENCH_ONLY=fibonacci)
-    let bench_only = std::env::var("BENCH_ONLY").ok();
-
-    // All 6 canonical programs matching BENCHMARK_PROGRAMS weights.
-    // Input sizes tuned so each completes in 5-30s on a mid-range GPU,
-    // keeping total benchmark time under 2 minutes on a 4090.
-    let benchmarks: &[(&str, &[u8], &[u8], f64, bool)] = &[
-        (
-            BENCH_FIBONACCI,
-            FIBONACCI_ELF,
-            &1000u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_SHA256_CHAIN,
-            SHA256_CHAIN_ELF,
-            &10_000u32.to_le_bytes(),
-            0.20,
-            true,
-        ),
-        (
-            BENCH_ECDSA_VERIFY,
-            ECDSA_VERIFY_ELF,
-            &10u32.to_le_bytes(),
-            0.25,
-            true,
-        ),
-        (
-            BENCH_BIGINT_MUL,
-            BIGINT_MUL_ELF,
-            &100u32.to_le_bytes(),
-            0.10,
-            false,
-        ),
-        (
-            BENCH_MEMORY_MERKLE,
-            MEMORY_MERKLE_ELF,
-            &512u32.to_le_bytes(),
-            0.15,
-            true,
-        ),
-        (
-            BENCH_CHACHA_MIX,
-            CHACHA_MIX_ELF,
-            &5_000u32.to_le_bytes(),
-            0.20,
-            false,
-        ),
-    ];
-
-    for &(name, elf, input, weight, precompile) in benchmarks {
-        if elf.is_empty() {
-            continue;
-        }
-        if let Some(ref only) = bench_only {
-            if !name.eq_ignore_ascii_case(only) {
-                continue;
-            }
-        }
-        if let Some(entry) = benchmark_program(name, elf, input, weight, precompile) {
-            results.push(entry);
+    use zkminer_prover_protocol::{
+        benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
+    };
+    // Discarded, as under a host: see `warmup_spec`.
+    benchmark_spec(&warmup_spec(BACKEND_RISC0));
+    let only = std::env::var("BENCH_ONLY").ok();
+    let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
+    let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)
+        .iter()
+        .filter(|spec| wanted(&spec.name))
+        .filter_map(benchmark_spec)
+        .collect();
+    if wanted(BENCH_ZKOP_MIX) {
+        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations))) {
+            Some(entry) => results.push(entry),
+            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score"),
         }
     }
-
     results
 }
 
-fn benchmark_program(
+/// Prove `elf`, timing each stage. Without `measure_wrap` it stops at the constant-size STARK, whose
+/// receipt it verifies instead of a Groth16 one.
+fn benchmark_stages(
     name: &str,
     elf: &[u8],
     input: &[u8],
     weight: f64,
     precompile: bool,
+    measure_wrap: bool,
 ) -> Option<BenchmarkEntry> {
     // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
     // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
@@ -2051,6 +2000,60 @@ fn benchmark_program(
     sampler.phase("recursion");
     #[cfg(target_os = "macos")]
     footprint.phase("recursion");
+
+    if !measure_wrap {
+        // W10-INT: the release the wrapped path makes after its wrap, here after the STARK. Without
+        // it a scoring proof (zkop-mix) kept this thread's cached provers, and the next proof ran on
+        // top of them: the process peak of a full `--benchmark` rose by ~1.5 GB, at the 8 GiB tier
+        // too. Metal only (elsewhere nothing was wrapped, so there is nothing to release); revert
+        // with ZKMINER_METAL_NOWRAP_RELEASE=0.
+        #[cfg(feature = "metal")]
+        {
+            if metal_host::nowrap_release_enabled() {
+                metal_host::release_after_proof();
+            }
+            sampler.held("held after release");
+            tracing::info!(
+                "{name}: Metal peak GPU memory at po2 {}: {}",
+                default_job_po2(),
+                sampler.summary()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            footprint.phase("held after release");
+            tracing::info!(
+                "{name}: peak process footprint (host + GPU) at po2 {}: {}",
+                default_job_po2(),
+                footprint.summary()
+            );
+        }
+        let image_id = match risc0_zkvm::compute_image_id(elf) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::error!("{name}: failed to compute image id for verification: {e:#}");
+                return None;
+            }
+        };
+        if let Err(e) = succinct.verify(image_id) {
+            tracing::error!("{name}: succinct receipt.verify() FAILED: {e:#}");
+            return None;
+        }
+        let cycles = prove_info.stats.total_cycles;
+        let duration_secs = composite_secs + recursion_secs;
+        tracing::info!("{name}: {cycles} cycles, STARK {duration_secs:.2}s, verified");
+        return Some(BenchmarkEntry {
+            program_name: name.to_string(),
+            prover_backend: BACKEND_RISC0.to_string(),
+            cycles,
+            duration_secs,
+            throughput: cycles as f64 / duration_secs,
+            weight,
+            precompile,
+            wrap_secs: None,
+            power_state: bench_power_state_over(name, power_before),
+        });
+    }
 
     // Stage 3: STARK-to-SNARK. Proves the fixed `stark_verify` circuit with a fixed proving key
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
@@ -2128,17 +2131,7 @@ fn benchmark_program(
          verified"
     );
 
-    let power_state = match (power_before, bench_power_state()) {
-        (Some(a), Some(b)) => Some(a.merge(b)),
-        (a, b) => a.or(b),
-    };
-    if let Some(why) = power_state.and_then(|p| p.reduced()) {
-        tracing::warn!(
-            "{name}: measured in reduced power ({why}); the host prices it as measured and \
-             advises a re-benchmark once the Mac is back at full power (a thermal mark is \
-             informational)"
-        );
-    }
+    let power_state = bench_power_state_over(name, power_before);
 
     Some(BenchmarkEntry {
         program_name: name.to_string(),
@@ -2176,8 +2169,28 @@ fn dump_benchmark_receipt(name: &str, receipt: &risc0_zkvm::Receipt, image_id: r
     }
 }
 
-/// The power state a benchmark entry reports (protocol v12, W7-M11): on a Mac, M9's reading;
+/// The power state a benchmark entry reports (protocol v12 of the macOS line, v14 since W10-INT; W7-M11): on a Mac, M9's reading;
 /// elsewhere, and with `ZKMINER_POWER_STATE_IN_BENCH=0`, none.
+/// The power state over a whole benchmark proof: the state read before it merged with the one now
+/// (W7-M11), with a warning when it was reduced.
+fn bench_power_state_over(
+    name: &str,
+    before: Option<zkminer_prover_protocol::BenchPowerState>,
+) -> Option<zkminer_prover_protocol::BenchPowerState> {
+    let power_state = match (before, bench_power_state()) {
+        (Some(a), Some(b)) => Some(a.merge(b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(why) = power_state.and_then(|p| p.reduced()) {
+        tracing::warn!(
+            "{name}: measured in reduced power ({why}); the host prices it as measured and \
+             advises a re-benchmark once the Mac is back at full power (a thermal mark is \
+             informational)"
+        );
+    }
+    power_state
+}
+
 fn bench_power_state() -> Option<zkminer_prover_protocol::BenchPowerState> {
     if zkminer_prover_protocol::power_state_in_bench_off() {
         return None;
@@ -2224,8 +2237,13 @@ const CALIBRATION_ITERS: u32 = 6_000_000;
 /// full Groth16 pipeline compiles everything once for every later process. It is verified, so a
 /// broken card fails here, not on a job.
 #[cfg(feature = "intel")]
-fn warm_up() -> Result<String> {
-    let component = groth16_component::ensure_installed()?;
+fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
+    let component = groth16_component::ensure_installed(report)?;
+    report(
+        "Preparing GPU kernels for this card (a first run can take several minutes)",
+        None,
+        None,
+    );
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
         .write_slice(&1000u32.to_le_bytes())
@@ -2259,16 +2277,21 @@ fn measure_only_worker() -> bool {
 /// here and not on a job. A dedicated measure worker (it only executes guests on the CPU) installs
 /// the component only.
 #[cfg(feature = "metal")]
-fn warm_up() -> Result<String> {
+fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     if let Some(refusal) = gpu_refusal() {
         anyhow::bail!("{refusal}");
     }
-    let component = groth16_component::ensure_installed()?;
+    let component = groth16_component::ensure_installed(report)?;
     if measure_only_worker() {
         return Ok(component);
     }
     // A no-op if worker start already began it; starts it if this call just installed the component.
     metal_host::start_groth16_graph_preload("warm-up");
+    report(
+        "Preparing the Metal pipelines for this Mac (a first run of a new build can take minutes)",
+        None,
+        None,
+    );
     let pipelines = metal_start::prewarm_before_benchmark(default_job_po2());
     let start = Instant::now();
     let env = risc0_zkvm::ExecutorEnv::builder()
@@ -2292,8 +2315,8 @@ fn warm_up() -> Result<String> {
 }
 
 #[cfg(not(any(feature = "intel", feature = "metal")))]
-fn warm_up() -> Result<String> {
-    groth16_component::ensure_installed()
+fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
+    groth16_component::ensure_installed(report)
 }
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
@@ -2435,6 +2458,32 @@ mod program_id_tests {
 }
 
 #[cfg(test)]
+mod groth16_selector_tests {
+    use risc0_zkvm::sha::Digestible;
+
+    /// The miner prefixes every seal with the pinned verifier's `SELECTOR()`, 0xe71e6620
+    /// (zkminer-chain `pins::RISC0_V3_1_SELECTOR`, hemiprove-contracts `RISC_ZERO_V3_1_SELECTOR`):
+    /// the first 4 bytes of this worker's Groth16 verifier parameters. A risc0 whose parameters
+    /// differ proves seals that verifier rejects, so it must move with a new verifier and selector.
+    #[test]
+    fn groth16_verifier_parameters_match_the_pinned_selector() {
+        let digest = risc0_zkvm::Groth16ReceiptVerifierParameters::default().digest();
+        assert_eq!(
+            digest.as_bytes(),
+            unhex("e71e6620a834f4d8dc1998476b865a9a6437a14474f9442cf8664f9ec22a5eee"),
+            "risc0 3.1's Groth16 verifier parameters (RISC_ZERO_V3_1_PARAMS_DIGEST)"
+        );
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod keccak_audit_tests {
     use super::*;
     use risc0_zkvm::sha::Digestible;
@@ -2488,14 +2537,22 @@ mod sys_rand_tests {
     use super::*;
 
     #[test]
-    fn seed_is_fixed_by_key_image_id_and_input() {
-        let key = [1u8; 32];
+    fn seed_is_fixed_by_image_id_and_input() {
         let image = [7u8; 32];
-        let seed = sys_rand_seed(&key, &image, b"input");
-        assert_eq!(sys_rand_seed(&key, &image, b"input"), seed);
-        assert_ne!(sys_rand_seed(&[2u8; 32], &image, b"input"), seed);
-        assert_ne!(sys_rand_seed(&key, &[8u8; 32], b"input"), seed);
-        assert_ne!(sys_rand_seed(&key, &image, b"input2"), seed);
+        let seed = sys_rand_seed(&image, b"input");
+        assert_eq!(sys_rand_seed(&image, b"input"), seed);
+        assert_ne!(sys_rand_seed(&[8u8; 32], b"input"), seed);
+        assert_ne!(sys_rand_seed(&image, b"input2"), seed);
+    }
+
+    /// A rule change is a compatibility break with every miner that seeded by the old one: this must
+    /// only change together with SYS_RAND_RULE. From Python's hashlib.
+    #[test]
+    fn the_seed_rule_known_answer() {
+        assert_eq!(
+            sys_rand_seed(&[7u8; 32], b"input").map(|b| format!("{b:02x}")).concat(),
+            "ba157a4c0fd9382ff3e51b1f758c75061651e6374ca1dfd38a5d648a4a37bce8"
+        );
     }
 
     #[test]
@@ -2591,11 +2648,13 @@ mod sys_rand_draw_tests {
         let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
         let subscriber = tracing_subscriber::registry()
             .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()));
-        let (_, journal, _, reads) = tracing::subscriber::with_default(subscriber, || {
+        let outcome = tracing::subscriber::with_default(subscriber, || {
             run_execute(FIBONACCI_ELF, &10u32.to_le_bytes(), Some(image), Some(20)).unwrap()
         });
-        assert_eq!(journal, 55u64.to_le_bytes());
-        assert_eq!(reads, Some(0));
+        assert_eq!(outcome.journal, 55u64.to_le_bytes());
+        assert_eq!(outcome.host_entropy_reads, Some(0));
+        assert!(outcome.user_cycles > 0);
+        assert_eq!(outcome.keccak_cycles, 0);
     }
 }
 

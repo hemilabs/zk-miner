@@ -375,6 +375,12 @@ pub fn mib(bytes: u64) -> f64 {
 /// after every Groth16 wrap (`release_hal_buffers`), so on a successful proof this finds nothing; a
 /// proof that failed before its wrap leaves the segment prover's pool cached until the next
 /// proof, because the zkvm has no public entry point to drop it (M1 note, issue for the zkvm owner).
+/// Whether a benchmark proof that stops at the STARK (no wrap: the zkOP/s scoring proofs) releases
+/// like a wrapped one (W10-INT). Revert knob: `ZKMINER_METAL_NOWRAP_RELEASE=0`.
+pub fn nowrap_release_enabled() -> bool {
+    std::env::var("ZKMINER_METAL_NOWRAP_RELEASE").map_or(true, |v| v != "0")
+}
+
 pub fn release_after_proof() {
     risc0_circuit_recursion::prove::release_cached_provers();
     tracing::info!(

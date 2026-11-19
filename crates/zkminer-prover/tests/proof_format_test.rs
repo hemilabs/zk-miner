@@ -4,7 +4,7 @@
 //! Run with: cargo test -p zkminer-prover --test proof_format_test -- --nocapture
 //!
 //! This test:
-//! 1. Discovers GPU worker binaries (zkminer-prove-risc0-cuda, -rocm)
+//! 1. Discovers GPU worker binaries (zkminer-prove-risc0-cuda, -rocm, -intel)
 //! 2. Sends the fibonacci guest ELF + input via the Prove command
 //! 3. Gets back journal + seal (Groth16 proof)
 //! 4. Verifies the seal is a valid Groth16 proof (not bincode-serialized junk)
@@ -54,7 +54,7 @@ fn test_gpu_groth16_proof_format() {
 
     let gpu_workers: Vec<_> = connected
         .iter()
-        .filter(|k| k.contains("cuda") || k.contains("rocm"))
+        .filter(|k| k.contains("cuda") || k.contains("rocm") || k.contains("intel"))
         .collect();
 
     if gpu_workers.is_empty() {

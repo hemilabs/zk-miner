@@ -327,6 +327,29 @@ mod tests {
         );
     }
 
+    /// v14 (W10-INT): GitHub main's v13 (`Benchmark { programs }`, the public `sys_rand` rule) and
+    /// the macOS beta's v13 (`BenchmarkEntry.power_state`, risc0 3.1) are two different wires. A
+    /// worker of either still answers a decodable `HelloAck`, and the exact version check refuses it.
+    #[test]
+    fn a_worker_of_either_v13_is_refused() {
+        assert_eq!(PROTOCOL_VERSION, 14);
+        let hello = bincode::serialize(&WorkerResponse::HelloAck {
+            protocol_version: 13,
+            backend: "risc0".to_string(),
+            sdk_version: "risc0-zkvm 3.1.0".to_string(),
+            worker_version: "0.1.0".to_string(),
+        })
+        .unwrap();
+        let mut framed = (hello.len() as u32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&hello);
+        match read_message::<_, WorkerResponse>(&mut Cursor::new(framed)).unwrap() {
+            WorkerResponse::HelloAck {
+                protocol_version, ..
+            } => assert_ne!(protocol_version, PROTOCOL_VERSION),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     /// v13 (P31-19, risc0 3.1): a v12 worker proves risc0 3.0 receipts, which no 3.1 seal selector
     /// verifies; its HelloAck still decodes, and the version check (and the sdk check) refuse it.
     #[test]
@@ -523,6 +546,8 @@ mod tests {
                     peak_host_bytes: 7,
                     journal: Some(vec![0xab, 0xcd]),
                     host_entropy_reads: reads,
+                    user_cycles: reads.map(|r| r ^ 1),
+                    keccak_cycles: reads,
                 },
             )
             .unwrap();
@@ -534,6 +559,8 @@ mod tests {
                     peak_host_bytes,
                     journal,
                     host_entropy_reads,
+                    user_cycles,
+                    keccak_cycles,
                     ..
                 } => {
                     assert_eq!(
@@ -542,6 +569,8 @@ mod tests {
                     );
                     assert_eq!(journal.as_deref(), Some(&[0xab, 0xcd][..]));
                     assert_eq!(host_entropy_reads, reads);
+                    assert_eq!(user_cycles, reads.map(|r| r ^ 1));
+                    assert_eq!(keccak_cycles, reads);
                 }
                 other => panic!("wrong variant: {other:?}"),
             }

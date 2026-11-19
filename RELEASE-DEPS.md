@@ -2,27 +2,45 @@
 
 What a zk-miner build on this branch takes from outside the repository, how it is pinned, and how
 to build it on a clean macOS machine (a CI runner) or against a local risc0 checkout. Item B9-DEP;
-evidence in `docs/metal-port-notes/B9-DEP.md`.
+evidence in `docs/metal-port-notes/B9-DEP.md`. The pin moved to `28b4bef33` when GitHub main was merged
+into the macOS beta (W10-INT, `docs/metal-port-notes/W10-INT.md`).
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1`** | `rev = "d94ef65015f4753c5496ad7302f15c44513370f3"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1`** | `rev = "28b4bef339773e96539879c5c4314c23e20c5249"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
-| SP1 crates | `hemilabs/sp1` | rev `9a0de746…` (unchanged) |
+| SP1 crates | `hemilabs/sp1` | rev `a4df7c8f7…` (`zkminer/windows-server-connect`, from GitHub main; was `9a0de746…`) |
 | guest crates (`crates/zkminer-prover/guests/risc0/*`) | crates.io (`risc0-zkvm` 3.0.5) and the RustCrypto risc0 forks on GitHub | each guest's own `Cargo.lock` (unchanged) |
 
-`d94ef6501` is `/Users/user/zkminer/deps/risc0-3.1` at the end of the Wave 9 phase-1 merges
-(`Merge metal/B9-4G`). It contains the release-3.1 port (Wave 8), the 3.1 security fixes (B9-SEC,
-merge `abea7c97c`), and the 4 GiB Groth16 wrap (B9-G1 `afb524d8e`, B9-4G `d94ef6501`). **The branch
-has to be pushed to hemilabs/risc0 unchanged as `zkminer/metal-3.1`** before anyone outside this Mac
-can build: until then `https://github.com/hemilabs/risc0` has no commit `d94ef6501` (checked
-2026-11-17 with `git ls-remote`; the repository is public, so no credentials are needed once it is
-pushed). If the branch is rebased or amended before the push, the rev in `Cargo.toml` and the 18
-`source = "git+…"` lines in `Cargo.lock` must be updated to the pushed sha.
+`28b4bef33` is `/Users/user/zkminer/deps/risc0-3.1` after the Wave 10 phase-1 merge (`Merge metal/W10-R0`).
+It is the Wave 9 beta pin `d94ef6501` (the release-3.1 port of Wave 8, the 3.1 security fixes of B9-SEC,
+merge `abea7c97c`, and the 4 GiB Groth16 wrap, B9-G1 `afb524d8e` and B9-4G `d94ef6501`) merged with
+upstream hemilabs `release-3.1` @ `5beab26b5`, which GitHub main pinned until this merge
+(`git merge-base --is-ancestor 5beab26b5 28b4bef33` holds). The two commits that release-3.1 had and the
+beta pin lacked are the ROCm evalfast `eval_check` regeneration for the 3.1 circuit (4 files, ROCm only).
+**The branch has to be pushed to hemilabs/risc0 unchanged as `zkminer/metal-3.1`** before anyone outside
+this Mac can build: until then `https://github.com/hemilabs/risc0` has no commit `28b4bef33`. If the
+branch is rebased or amended before the push, the rev in `Cargo.toml` and the 18 `source = "git+…"`
+lines in `Cargo.lock` must be updated to the pushed sha.
+
+**What the Metal fork changes on the other platforms** (W10-R0's audit; the fork note
+`docs/metal-port/notes/W10-R0.md` in the risc0 repository has the evidence). Each has a revert knob:
+
+| change | platforms | revert |
+|---|---|---|
+| keccak requests right-sized to the smallest po2 that holds their inputs (control ids stay under `KECCAK_CONTROL_ROOT`) | all, at the executor | `RISC0_KECCAK_RIGHTSIZE_PO2=0` |
+| `risc0_circuit_recursion::prove::zkr::get_zkr` returns `Arc<Program>` and caches programs per process (zk-miner does not call it) | all | `RISC0_METAL_REC_ZKR_CACHE=0` (works everywhere despite the name) |
+| recursion ZK noise drawn on a helper thread (same distribution as stock 3.1) | all | `RISC0_RECURSION_NOISE_OVERLAP=0` |
+| rv32im drops the data witness after `step_accum` at every po2 (upstream: po2 >= 22); seals unchanged | CPU HAL | `RISC0_METAL_DROP_DATA_EARLY=0` |
+| Groth16 graph build memoized, digest overlapped (same program) | Intel (shares `fast.rs`) | `RISC0_G16_GRAPH_MEMO=0` |
+| `RISC0_REC_HOST_CHAIN_MIN_LEN` also overrides the CUDA/ROCm host-chain length (default 16 unchanged) | CUDA, ROCm | unset it |
+
+None of these could be exercised on non-Metal hardware here: Windows targets, CUDA/HIP/SYCL compiles
+and GPU runs need a Linux/Windows CI run of the fork before GitHub main relies on this pin for them.
 
 Do not `cargo update` the risc0 crates: a rev is used, not a branch, so that a moved branch head can
 never change the build without a review (the same rule as for sppark and SP1).

@@ -44,7 +44,8 @@ fn the_metal_worker_warms_up_and_proves_over_ipc() {
         to.flush().unwrap();
         loop {
             match read_message(&mut from).unwrap() {
-                WorkerResponse::Progress { .. } => continue,
+                // Streamed before the answer (protocol 14: a Warmup's setup steps).
+                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
                 other => return other,
             }
         }
@@ -287,7 +288,8 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
         to.flush().unwrap();
         loop {
             match read_message(&mut from).unwrap() {
-                WorkerResponse::Progress { .. } => continue,
+                // Streamed before the answer (protocol 14: a Warmup's setup steps).
+                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
                 other => return other,
             }
         }
@@ -467,7 +469,8 @@ fn m9_proofs_in_one_worker() {
         to.flush().unwrap();
         loop {
             match read_message(&mut from).unwrap() {
-                WorkerResponse::Progress { .. } => continue,
+                // Streamed before the answer (protocol 14: a Warmup's setup steps).
+                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
                 other => return other,
             }
         }

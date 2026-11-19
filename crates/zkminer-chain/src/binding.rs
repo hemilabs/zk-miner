@@ -6,7 +6,8 @@
 //! penalty. The binding is a pure function of the descriptor and the journal, and the journal is a
 //! deterministic function of (ELF, input), so the pre-claim measurement decides it exactly.
 //!
-//! This mirrors the Solidity line for line (zkmarket c8333aa, `src/core/HemiProveFulfill.sol`):
+//! This mirrors the Solidity line for line (hemiprove-contracts 3bc441d, the deployed 8e1808b,
+//! `src/core/HemiProveFulfill.sol` `_checkBinding`):
 //! - slot 0 of `journalFields` may hold a marker. `0xffffffff` (journal prefix) requires
 //!   `journal[0:64] == jobId ‖ uint256(prover)` and moves the statement check to `journal[64:]`;
 //!   `0xfffffffe` (SP1 proof nonce) is a check on the SEAL, which this module does not see, so a job
