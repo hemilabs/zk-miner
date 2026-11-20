@@ -292,6 +292,8 @@ pub struct HostFacts {
     unreadable: Option<String>,
     /// [`RawFacts::nat64_unsettled`].
     nat64_unsettled: bool,
+    /// The nexthop objects (Linux), for the default routes through one ([`default_path_known`]).
+    nexthops: Vec<crate::routes::Nexthop>,
 }
 
 /// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict_from`]).
@@ -431,8 +433,14 @@ fn uplink_signature(routes: &RouteTable, internet: &[u32]) -> u64 {
 /// judges once more. On Linux a default route through a nexthop object reads with its hop
 /// [`crate::routes::Hop::Unknown`] in the dump; the kernel's answer for it carries the same, so
 /// such a route is held as long as the facts hold it on that interface.
+///
+/// Review round 4, cross-4: a route through a nexthop object (`RTA_NH_ID`) must go through the
+/// same object as the facts' default route, and that object must resolve in the facts' nexthop
+/// dump (`nexthops`): with `nexthop_compat_mode` 0 the routes show no gateway and no interface,
+/// so hop and interface alone held any default-like route through any object.
 fn default_path_known(
     routes: &RouteTable,
+    nexthops: &[crate::routes::Nexthop],
     answer: &crate::routes::KernelAnswer,
 ) -> Result<(), crate::routes::RouteRefusal> {
     use crate::routes::{Hop, KernelAnswer, RouteKind, RouteRefusal};
@@ -446,6 +454,9 @@ fn default_path_known(
                 && d.prefix.addr.is_ipv6() == r.prefix.addr.is_ipv6()
                 && d.hop == r.hop
                 && d.ifindex == r.ifindex
+                && d.nexthop == r.nexthop
+                && (d.nexthop == 0
+                    || crate::routes::nexthop_interfaces(nexthops, d.nexthop).is_some())
         });
         if r.is_default_like() && !held {
             return Err(RouteRefusal {
@@ -780,6 +791,7 @@ impl HostFacts {
             internal_ranges_stated: true,
             unreadable: None,
             nat64_unsettled: false,
+            nexthops: Vec::new(),
         }
     }
 
@@ -863,6 +875,7 @@ impl HostFacts {
             internal_ranges_stated: opts.internal_ranges.is_some(),
             unreadable: None,
             nat64_unsettled: raw.nat64_unsettled,
+            nexthops: raw.nexthops,
         }
     }
 
@@ -1071,7 +1084,7 @@ impl HostFacts {
                     Ok(answer) => self
                         .routes
                         .judge_answer(&answer)
-                        .and_then(|()| default_path_known(&self.routes, &answer))
+                        .and_then(|()| default_path_known(&self.routes, &self.nexthops, &answer))
                         .map_err(KernelRefusal::Route),
                     Err(e) => Err(KernelRefusal::QueryFailed(e.to_string())),
                 };
@@ -3142,6 +3155,58 @@ mod tests {
         crate::nat64::unheld_after_round(held, "test: one source named too many");
         assert!(nat64_unsettled_on(&dual, held));
         assert!(!nat64_unsettled_on(&dual, fresh()));
+    }
+
+    /// Review round 4, cross-4: with nexthop objects (`nexthop_compat_mode` 0: the dump shows no
+    /// gateway and no interface), a default-like route of the kernel's answer is held only when
+    /// it goes through the same nexthop object as one of the facts' default routes, and that
+    /// object resolves in the facts' nexthop dump; any other (a `0.0.0.0/1 nhid 30` via a LAN box
+    /// that came up after the facts were read) is off the default path.
+    #[test]
+    fn r4_a_nexthop_object_default_is_held_only_through_the_same_object() {
+        use crate::routes::{Hop, KernelAnswer, Nexthop};
+        let nh = |prefix: &str, id: u32| Route {
+            hop: Hop::Unknown,
+            ifindex: 0,
+            nexthop: id,
+            ..Route::via(p(prefix), ip("192.0.2.1"), 0)
+        };
+        let routes = RouteTable::new(vec![nh("0.0.0.0/0", 10)]);
+        let nexthops = vec![
+            Nexthop {
+                id: 10,
+                oif: 2,
+                group: vec![],
+                blackhole: false,
+            },
+            Nexthop {
+                id: 30,
+                oif: 2,
+                group: vec![],
+                blackhole: false,
+            },
+        ];
+        let answer = |r: Route| KernelAnswer::Entry(vec![r]);
+        assert_eq!(default_path_known(&routes, &nexthops, &answer(nh("0.0.0.0/0", 10))), Ok(()));
+        let e = default_path_known(&routes, &nexthops, &answer(nh("0.0.0.0/1", 30)));
+        assert!(e.is_err(), "another nexthop object held: {e:?}");
+        // The facts' object that does not resolve in their dump: not held either.
+        assert!(default_path_known(&routes, &[], &answer(nh("0.0.0.0/0", 10))).is_err());
+        // A route with a gateway shown (compat mode 1 shows both) still needs the same object.
+        let shown = |id| Route {
+            nexthop: id,
+            ..Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2)
+        };
+        let compat1 = RouteTable::new(vec![shown(10)]);
+        assert_eq!(default_path_known(&compat1, &nexthops, &answer(shown(10))), Ok(()));
+        assert!(default_path_known(&compat1, &nexthops, &answer(shown(30))).is_err());
+        // Plain routes as before.
+        let plain = RouteTable::new(vec![Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 2)]);
+        assert_eq!(
+            default_path_known(&plain, &[], &answer(Route::via(p("0.0.0.0/1"), ip("192.168.1.1"), 2))),
+            Ok(())
+        );
+        assert!(default_path_known(&plain, &[], &answer(Route::via(p("0.0.0.0/1"), ip("192.168.1.9"), 2))).is_err());
     }
 
     #[test]
