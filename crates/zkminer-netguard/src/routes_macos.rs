@@ -580,11 +580,11 @@ fn address_interfaces() -> io::Result<Vec<(IpAddr, u32)>> {
     Ok(out)
 }
 
-/// The interface a connection to `dst` leaves by, as a real socket sees it: the interface of the
-/// source address the kernel chooses when a UDP socket is connected to `dst` (no packet is sent).
-/// `None` when the kernel will not connect a socket there (unreachable); 0 when the source address
-/// is on no interface.
-fn socket_interface(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<u32>> {
+/// The interfaces a connection to `dst` may leave by, as a real socket sees it: every interface
+/// that holds the source address the kernel chooses when a UDP socket is connected to `dst` (no
+/// packet is sent), sorted. `None` when the kernel will not connect a socket there (unreachable);
+/// empty when the source address is on no interface.
+fn socket_interfaces(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<Vec<u32>>> {
     let any: SocketAddr = match dst {
         IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
@@ -597,36 +597,65 @@ fn socket_interface(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<u32>> 
         };
     }
     let src = sock.local_addr()?.ip();
-    Ok(Some(
-        address_interfaces()?
-            .into_iter()
-            .find(|(a, _)| *a == src)
-            .map_or(0, |(_, i)| i),
-    ))
+    let mut v: Vec<u32> = address_interfaces()?
+        .into_iter()
+        .filter(|(a, _)| *a == src)
+        .map(|(_, i)| i)
+        .collect();
+    v.sort();
+    v.dedup();
+    Ok(Some(v))
 }
 
 /// How the kernel would route a connection from this process to `dst` (see the module doc).
 pub(super) fn query(dst: IpAddr, dport: Option<u16>) -> io::Result<KernelAnswer> {
-    let Some(route) = ask(dst)? else {
+    // A connection to 0.0.0.0 or :: goes to this host (loopback), while `RTM_GET` answers it with
+    // the default route: answered here as what it is, a destination on this host.
+    if dst.is_unspecified() {
+        return Ok(KernelAnswer::Entry(vec![Route {
+            loopback: true,
+            ..Route::local(Prefix::host(dst), 0)
+        }]));
+    }
+    decide(ask(dst)?, || socket_interfaces(dst, dport))
+}
+
+/// The kernel's answer for one destination from its route (`None`: no route) and, asked only when
+/// the judge could admit the route, the socket's view (`socket`: [`socket_interfaces`]). A route
+/// the judge could admit is one through a gateway, or a default-like one, that does not deliver
+/// to this host; an on-link route that is not default-like, and a route that delivers to this
+/// host, are refused whatever the socket says, so it is not asked (under Local Network privacy a
+/// UDP connect into the LAN can fail, and the refusal then still names the route). For one the
+/// judge could admit: a socket the kernel will not connect is no route; a source address on no
+/// interface, or on any interface but the route's, is [`KernelAnswer::Split`] (refused); a source
+/// address only on the route's interface leaves the route's answer as it is.
+pub(super) fn decide(
+    route: Option<Route>,
+    socket: impl FnOnce() -> io::Result<Option<Vec<u32>>>,
+) -> io::Result<KernelAnswer> {
+    let Some(route) = route else {
         return Ok(KernelAnswer::NoRoute);
     };
-    // Only an answer the judge could admit needs the socket's view: an on-link route that is not
-    // default-like, and a route that delivers to this host, are refused whatever it says.
     let admissible = route.kind == RouteType::Unicast
         && (matches!(route.hop, Hop::Via(_)) || route.is_default_like());
-    if admissible {
-        match socket_interface(dst, dport)? {
-            None => return Ok(KernelAnswer::NoRoute),
-            Some(i) if i != route.ifindex => {
-                return Ok(KernelAnswer::Split {
-                    first_table: SCOPED_TABLE + i,
-                    entry: vec![route],
-                })
-            }
-            Some(_) => {}
-        }
+    if !admissible {
+        return Ok(KernelAnswer::Entry(vec![route]));
     }
-    Ok(KernelAnswer::Entry(vec![route]))
+    let Some(interfaces) = socket()? else {
+        return Ok(KernelAnswer::NoRoute);
+    };
+    let elsewhere = match interfaces.iter().find(|i| **i != route.ifindex) {
+        Some(i) => Some(*i),
+        None if interfaces.is_empty() => Some(0),
+        None => None,
+    };
+    Ok(match elsewhere {
+        Some(i) => KernelAnswer::Split {
+            first_table: SCOPED_TABLE + i,
+            entry: vec![route],
+        },
+        None => KernelAnswer::Entry(vec![route]),
+    })
 }
 
 /// The interface the kernel would send a connection to `dst` out of (the route's), `None` without
@@ -1046,6 +1075,119 @@ mod tests {
         assert!(parse_answer(&cb, ch.pid, ch.seq, ip("1.1.1.2")).is_err());
     }
 
+    /// The socket's view of an answer the judge could admit (cross-1): only a source address on
+    /// the route's interface alone leaves the answer as it is; a source address on another
+    /// interface, on several, or on none is a split (refused), a socket the kernel will not
+    /// connect is no route, and a failure to ask is an error. On-link and local answers never ask
+    /// the socket.
+    #[test]
+    fn the_socket_view_decides_an_admissible_answer() {
+        let routes = parse_dump(&dump_fixture()).unwrap();
+        let t = RouteTable::with_rules(
+            routes,
+            vec![
+                Rule::lookup(false, RT_TABLE_MAIN),
+                Rule::lookup(true, RT_TABLE_MAIN),
+            ],
+        );
+        for d in ["8.8.4.4", "1.1.1.1", "2606:4700:4700::1111"] {
+            let r = answer(d).unwrap();
+            assert_eq!(r.ifindex, 8);
+            let with = |s: Option<Vec<u32>>| decide(Some(r), || Ok(s)).unwrap();
+            assert_eq!(with(Some(vec![8])), KernelAnswer::Entry(vec![r]), "{d}");
+            assert_eq!(t.judge_answer(&with(Some(vec![8]))), Ok(()), "{d}");
+            for (s, first) in [
+                (vec![22], SCOPED_TABLE + 22),
+                (vec![], SCOPED_TABLE),
+                (vec![8, 22], SCOPED_TABLE + 22),
+                (vec![1, 8], SCOPED_TABLE + 1),
+            ] {
+                let a = with(Some(s.clone()));
+                assert_eq!(
+                    a,
+                    KernelAnswer::Split {
+                        first_table: first,
+                        entry: vec![r]
+                    },
+                    "{d} {s:?}"
+                );
+                assert_eq!(
+                    t.judge_answer(&a).map_err(|r| r.kind),
+                    Err(RouteKind::PolicyRule),
+                    "{d} {s:?}"
+                );
+            }
+            assert_eq!(with(None), KernelAnswer::NoRoute, "{d}");
+            assert!(decide(Some(r), || Err(io::Error::other("no socket"))).is_err());
+        }
+        assert_eq!(
+            decide(None, || panic!("asked the socket without a route")).unwrap(),
+            KernelAnswer::NoRoute
+        );
+        for d in [
+            "192.168.1.1",
+            "192.168.1.50",
+            "2001:db8:9024:184::99",
+            "fe80::1",
+            "192.168.1.213",
+            "127.0.0.1",
+            "::1",
+            "2001:db8:9024:184:2cd3:b59f:bfaa:3b77",
+        ] {
+            let r = answer(d).unwrap();
+            assert_eq!(
+                decide(Some(r), || panic!("asked the socket for {d}")).unwrap(),
+                KernelAnswer::Entry(vec![r]),
+                "{d}"
+            );
+        }
+        // A default route that delivers locally is refused without asking; an on-link split
+        // default (a VPN's `0/1` on a utun) is default-like, so the socket is asked.
+        let local = Route::local(p("0.0.0.0/0"), 1);
+        assert_eq!(
+            decide(Some(local), || panic!("asked")).unwrap(),
+            KernelAnswer::Entry(vec![local])
+        );
+        let half = Route::on_link(p("0.0.0.0/1"), 30);
+        assert_eq!(
+            decide(Some(half), || Ok(Some(vec![8]))).unwrap(),
+            KernelAnswer::Split {
+                first_table: SCOPED_TABLE + 8,
+                entry: vec![half]
+            }
+        );
+    }
+
+    /// A connection to 0.0.0.0 or :: goes to this host; `RTM_GET` answers the default route for
+    /// them (as `route -n get 0.0.0.0` shows). The query answers them as local (bypass-2).
+    #[test]
+    fn the_unspecified_addresses_are_this_host() {
+        let routes = parse_dump(&dump_fixture()).unwrap();
+        let t = RouteTable::with_rules(
+            routes,
+            vec![
+                Rule::lookup(false, RT_TABLE_MAIN),
+                Rule::lookup(true, RT_TABLE_MAIN),
+            ],
+        );
+        for d in ["0.0.0.0", "::"] {
+            let a = query(ip(d), Some(443)).unwrap();
+            assert!(
+                matches!(&a, KernelAnswer::Entry(e) if e.len() == 1
+                    && e[0].kind == RouteType::Local && e[0].prefix == Prefix::host(ip(d))),
+                "{d}: {a:?}"
+            );
+            assert_eq!(
+                t.judge_answer(&a).map_err(|r| r.kind),
+                Err(RouteKind::Local),
+                "{d}"
+            );
+            // What the kernel itself answers: the default route.
+            let r = ask(ip(d)).unwrap();
+            eprintln!("RTM_GET {d}: {r:?}");
+        }
+    }
+
     /// Truncated or malformed input of every kind is an error, never a route: a reply cut short
     /// anywhere, a message length past the datagram or below a header, a sockaddr that runs past
     /// the message, an address bit beyond `RTAX_MAX`, an IP sockaddr too short for its address, a
@@ -1232,6 +1374,43 @@ mod tests {
             assert!(links.iter().any(|l| l.index == i), "{i} in {links:?}");
         }
         assert!(nexthops().unwrap().is_empty());
+    }
+
+    /// This host's real sockets to public addresses of each family it routes leave by the
+    /// interface the kernel's route names, and by no other (the check of [`decide`], on real
+    /// answers).
+    #[test]
+    fn this_hosts_sockets_leave_by_the_routes_interface() {
+        let (routes, rules) = dump().unwrap();
+        let t = RouteTable::with_rules(routes, rules);
+        let mut checked = 0;
+        for d in [
+            "8.8.8.8",
+            "1.0.0.1",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
+            let d = ip(d);
+            if !t.routes_family(d.is_ipv6()) {
+                eprintln!("SKIPPED {d}: no default route of its family");
+                continue;
+            }
+            let r = ask(d).unwrap().expect("a route");
+            let s = socket_interfaces(d, Some(443)).unwrap().expect("a socket");
+            assert_eq!(s, vec![r.ifindex], "{d}: {r:?}");
+            // The connect may have made the kernel clone the route (a host route on the same
+            // interface, through the same gateway) in between: the answer is still an entry there.
+            let a = query(d, Some(443)).unwrap();
+            assert!(
+                matches!(&a, KernelAnswer::Entry(e) if e.iter().all(|e| e.ifindex == r.ifindex
+                    && e.hop == r.hop)),
+                "{d}: {a:?}"
+            );
+            assert_eq!(t.judge_answer(&a), Ok(()), "{d}: {a:?}");
+            eprintln!("{d}: route and socket both on interface {}", r.ifindex);
+            checked += 1;
+        }
+        assert!(checked >= 1, "no family routed");
     }
 
     /// The parser against `route -n get` (/sbin/route, unprivileged) for this host's own
