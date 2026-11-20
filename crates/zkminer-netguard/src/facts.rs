@@ -486,11 +486,16 @@ fn default_path_known(
 /// is heard, and a prefix named there that the guard could not hold
 /// ([`crate::nat64::unheld`]) refuses IPv6 destinations on any host (it is a sign of a hostile
 /// network, or of a network the guard cannot judge).
-fn nat64_unsettled_on(table: &RouteTable, signature: u64) -> (bool, Option<String>) {
+fn nat64_unsettled_on(
+    table: &RouteTable,
+    signature: u64,
+    clat: bool,
+) -> (bool, Option<String>) {
     use crate::routes::Hop;
     let up = crate::nat64::Uplink {
         signature,
         routed: [table.routes_family(false), table.routes_family(true)],
+        clat,
     };
     let gateways: Vec<(std::net::Ipv6Addr, u32)> = table
         .routes()
@@ -1155,7 +1160,16 @@ impl HostFacts {
         // The NAT64 prefixes, learned again whenever the uplink changes (review round 3,
         // bypass-1; every platform since the Linux application); IPv6 destinations are refused
         // on a host with IPv6 and no IPv4 route until the new uplink's round has finished.
-        let (nat64_unsettled, nat64_unheld) = nat64_unsettled_on(&table, signature);
+        // Review round 5, bypass-4: a host whose IPv4 goes out through a CLAT is IPv6-only.
+        let v4_default_interfaces: Vec<String> = table
+            .routes()
+            .iter()
+            .filter(|r| r.prefix.addr.is_ipv4() && r.is_default_like())
+            .filter_map(|r| links.iter().find(|l| l.index == r.ifindex))
+            .map(|l| l.name.clone())
+            .collect();
+        let clat = crate::nat64::clat_in_use(&interface_addresses, &v4_default_interfaces);
+        let (nat64_unsettled, nat64_unheld) = nat64_unsettled_on(&table, signature, clat);
         let public = if opts.discover_public_addresses {
             // Addresses confirmed under another uplink (a new default gateway, a VPN that came
             // up) are not this one's: discovery runs again, and meanwhile they are not known.
@@ -3142,10 +3156,12 @@ mod tests {
 
     /// Review round 3, bypass-1 (every platform since the Linux application): the facts of a host with IPv6 and no IPv4 route that has
     /// just joined a network (an uplink signature not seen before) refuse IPv6 until that
-    /// network's NAT64 round has finished; a dual-stack host's never do.
+    /// network's NAT64 round has finished, and so, since review round 5 (bypass-4), do those of
+    /// a host whose IPv4 goes out through a CLAT; a dual-stack host's never do.
     #[test]
     fn a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends() {
         use crate::routes::Route;
+        use std::time::Duration;
         use std::hash::{BuildHasher, Hasher};
         let fresh = || {
             std::collections::hash_map::RandomState::new()
@@ -3158,18 +3174,26 @@ mod tests {
             Route::via(p("0.0.0.0/0"), ip("192.0.2.1"), 4),
         ]);
         // The process's first round runs on the caller's thread; the next uplinks' in the
-        // background.
-        nat64_unsettled_on(&dual, fresh());
-        assert!(nat64_unsettled_on(&v6_only, fresh()).0);
-        assert!(!nat64_unsettled_on(&dual, fresh()).0);
+        // background. Review round 5, bypass-4: a host whose IPv4 goes through a CLAT is an
+        // IPv6-only one.
+        nat64_unsettled_on(&dual, fresh(), false);
+        assert!(nat64_unsettled_on(&v6_only, fresh(), false).0);
+        assert!(!nat64_unsettled_on(&dual, fresh(), false).0);
+        let behind_clat = fresh();
+        assert!(nat64_unsettled_on(&dual, behind_clat, true).0);
+        let t = Instant::now();
+        while nat64_unsettled_on(&dual, behind_clat, true).0 && t.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!nat64_unsettled_on(&dual, behind_clat, true).0, "settled once its round ended");
         // Review round 4, bypass-1: a prefix named on the uplink that could not be held refuses
         // IPv6 there, on a dual-stack host too.
         let held = fresh();
-        nat64_unsettled_on(&dual, held);
+        nat64_unsettled_on(&dual, held, false);
         crate::nat64::unheld_after_round(held, "test: one source named too many");
-        let (_, why) = nat64_unsettled_on(&dual, held);
+        let (_, why) = nat64_unsettled_on(&dual, held, false);
         assert_eq!(why.as_deref(), Some("test: one source named too many"));
-        assert!(nat64_unsettled_on(&dual, fresh()).1.is_none());
+        assert!(nat64_unsettled_on(&dual, fresh(), false).1.is_none());
     }
 
     /// Review round 4, cross-4: with nexthop objects (`nexthop_compat_mode` 0: the dump shows no
