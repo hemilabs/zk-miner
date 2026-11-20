@@ -775,7 +775,8 @@ fn conn_info(fd: i32) -> io::Result<ConnInfo> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    // Read (and so cleared) only for TCP_CLOSE, which ends the check either way.
+    // Read (and so cleared) only for TCP_CLOSE, which every caller takes as final: polled again,
+    // a reset's TCP_CLOSE would read as acknowledged (its error already read).
     let so_error = || {
         let mut e: libc::c_int = 0;
         let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -1484,10 +1485,13 @@ mod tests {
         let t = std::time::Instant::now();
         let mut acked = false;
         while t.elapsed() < Duration::from_secs(2) && !acked {
-            acked = matches!(
-                conn_info(c.as_raw_fd()).map(|i| i.state),
-                Ok(TcpState::FinWait2 | TcpState::TimeWait)
-            );
+            match conn_info(c.as_raw_fd()).map(|i| i.state) {
+                Ok(TcpState::FinWait2 | TcpState::TimeWait) => acked = true,
+                // Reset (or unreadable): final. On Linux `SO_ERROR` is read, and cleared, with
+                // the first `TCP_CLOSE`, so the state is never polled past it.
+                Ok(TcpState::Closed) | Err(_) => break,
+                Ok(_) => {}
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
         drop(c);
