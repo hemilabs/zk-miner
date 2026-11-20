@@ -252,6 +252,11 @@ pub struct RawFacts {
     /// How many PPPoE sessions the host has (`/proc/net/pppoe`): a `ppp` uplink is an ordinary
     /// PPPoE uplink only when every `ppp` interface can be one of them.
     pub pppoe_sessions: usize,
+    /// macOS: the host has IPv6 and no IPv4 route, and NAT64 prefix discovery for the uplink it
+    /// is on now has not finished ([`crate::nat64`]): every IPv6 destination is refused until it
+    /// has (review round 3, bypass-1).
+    #[cfg(target_os = "macos")]
+    pub nat64_unsettled: bool,
 }
 
 /// A snapshot of the host's facts (see the module doc).
@@ -281,6 +286,9 @@ pub struct HostFacts {
     /// their time): every requester connection is refused ([`crate::Denied::FactsUnreadable`]).
     #[cfg(target_os = "macos")]
     unreadable: Option<String>,
+    /// macOS: [`RawFacts::nat64_unsettled`].
+    #[cfg(target_os = "macos")]
+    nat64_unsettled: bool,
 }
 
 /// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict`]).
@@ -448,6 +456,20 @@ fn default_path_known(
     Ok(())
 }
 
+/// macOS: NAT64 prefix discovery for the uplink of `table`, `internet` and `networks` (the
+/// configuration daemon's network signatures), started when it is due
+/// ([`crate::nat64::ensure_discovered_on`]); whether IPv6 destinations are refused meanwhile (a
+/// host with IPv6 and no IPv4 route whose uplink's round has not finished: review round 3,
+/// bypass-1).
+#[cfg(target_os = "macos")]
+fn nat64_unsettled_on(table: &RouteTable, internet: &[u32], networks: &[String]) -> bool {
+    let up = crate::nat64::Uplink {
+        signature: macos_uplink_signature(uplink_signature(table, internet), networks),
+        routed: [table.routes_family(false), table.routes_family(true)],
+    };
+    up.refuses_ipv6(crate::nat64::ensure_discovered_on(up))
+}
+
 /// macOS: [`uplink_signature`] (`base`) and the network each service is on, as the configuration
 /// daemon identifies it (`NetworkSignature`: the router's address and hardware address for IPv4,
 /// the prefix and the router's hardware address for IPv6; [`macos_dns::network_signatures`]).
@@ -512,6 +534,8 @@ impl HostFacts {
             internal_ranges_stated: true,
             #[cfg(target_os = "macos")]
             unreadable: None,
+            #[cfg(target_os = "macos")]
+            nat64_unsettled: false,
         }
     }
 
@@ -594,6 +618,8 @@ impl HostFacts {
             internal_ranges_stated: opts.internal_ranges.is_some(),
             #[cfg(target_os = "macos")]
             unreadable: None,
+            #[cfg(target_os = "macos")]
+            nat64_unsettled: raw.nat64_unsettled,
         }
     }
 
@@ -610,6 +636,13 @@ impl HostFacts {
     #[cfg(target_os = "macos")]
     pub(crate) fn unreadable(&self) -> Option<&str> {
         self.unreadable.as_deref()
+    }
+
+    /// macOS: whether NAT64 prefix discovery for the uplink is unsettled on a host with IPv6 and
+    /// no IPv4 route ([`RawFacts::nat64_unsettled`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn nat64_unsettled(&self) -> bool {
+        self.nat64_unsettled
     }
 
     /// macOS: these facts without the kernel's cached verdicts (a refresh failed: what the kernel
@@ -812,6 +845,7 @@ impl HostFacts {
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
         // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
+        #[cfg(not(target_os = "macos"))]
         crate::nat64::ensure_discovered();
         let (routes, rules) = crate::routes::read_routing(&loopback)?;
         let links = crate::routes::read_links()?;
@@ -821,6 +855,15 @@ impl HostFacts {
             Vec::new()
         };
         let internet_interfaces = crate::routes::internet_interfaces();
+        // macOS: the NAT64 prefixes, learned again whenever the uplink changes (review round 3,
+        // bypass-1); IPv6 destinations are refused on a host with IPv6 and no IPv4 route until
+        // the new uplink's round has finished.
+        #[cfg(target_os = "macos")]
+        let nat64_unsettled = nat64_unsettled_on(
+            &RouteTable::with_rules(routes.clone(), rules.clone()),
+            &internet_interfaces,
+            &macos_dns::network_signatures()?,
+        );
         let public = if opts.discover_public_addresses {
             // Addresses confirmed under another uplink (a new default gateway, a VPN that came
             // up) are not this one's: discovery runs again, and meanwhile they are not known.
@@ -852,6 +895,8 @@ impl HostFacts {
                 internet_interfaces,
                 nexthops,
                 pppoe_sessions: crate::routes::pppoe_sessions(),
+                #[cfg(target_os = "macos")]
+                nat64_unsettled,
             },
             opts,
         )
@@ -1277,6 +1322,80 @@ pub(crate) mod macos_dns {
         // SAFETY: a value of a property-list dictionary is a property list, retained here.
         let sig = unsafe { CFPropertyList::wrap_under_get_rule(*sig) }.downcast::<CFString>()?;
         Some(Some(sig.to_string()))
+    }
+
+    /// The key holding the system's active DNS configuration (the primary service's resolvers).
+    pub(crate) const GLOBAL_DNS_KEY: &str = "State:/Network/Global/DNS";
+
+    /// The active DNS servers, in the order the configuration daemon gives them (the resolvers
+    /// the system asks first): [`GLOBAL_DNS_KEY`]'s `ServerAddresses`; none without the key.
+    /// NAT64 discovery asks them first (review round 3, bypass-2).
+    pub(crate) fn global_servers() -> io::Result<Vec<IpAddr>> {
+        ASKING.run(CONFIGD_TIMEOUT, || {
+            let store = session()?;
+            servers_of(
+                store
+                    .get(GLOBAL_DNS_KEY)
+                    .map(|v| (GLOBAL_DNS_KEY.to_string(), Some(v))),
+            )
+        })
+    }
+
+    /// The configuration daemon's per-interface NAT64 state (its PLAT discovery, RFC 7050, and
+    /// the prefixes a router announces, RFC 8781): one key per interface.
+    pub(crate) const NAT64_KEYS: &[&str] = &["State:/Network/Interface/[^/]+/NAT64"];
+
+    /// The NAT64 prefixes the configuration daemon publishes for this host's interfaces
+    /// ([`NAT64_KEYS`], read by [`nat64_prefixes_of`]); review round 3, bypass-1.
+    pub(crate) fn nat64_prefixes() -> io::Result<Vec<crate::ip::Prefix>> {
+        ASKING.run(CONFIGD_TIMEOUT, || {
+            let store = session()?;
+            Ok(nat64_prefixes_of(
+                keys(&store, NAT64_KEYS)?
+                    .into_iter()
+                    .filter_map(|k| store.get(k.as_str())),
+            ))
+        })
+    }
+
+    /// The IPv6 prefixes of an RFC 6052 length ([`crate::nat64::NSP_LENS`]) written as strings
+    /// (`2001:db8:64::/96`) anywhere among the values of NAT64 dictionaries, alone or in an
+    /// array. configd writes its prefix list under a key of its private schema
+    /// (`kSCPropNetNAT64PrefixList`), next to discovery times; reading every string value rather
+    /// than one key name keeps a renamed key from hiding a prefix, and what is not such a prefix
+    /// is ignored (a learned prefix only refuses more). On this Mac the key holds only
+    /// `PLATDiscoveryStartTime` and `PLATDiscoveryCompletionTime` (no NAT64 here).
+    pub(crate) fn nat64_prefixes_of(
+        values: impl IntoIterator<Item = CFPropertyList>,
+    ) -> Vec<crate::ip::Prefix> {
+        let prefix = |v: &CFPropertyList| -> Option<crate::ip::Prefix> {
+            let s = v.downcast::<CFString>()?.to_string();
+            let p: crate::ip::Prefix = s.trim().parse().ok()?;
+            (p.addr.is_ipv6() && crate::nat64::NSP_LENS.contains(&p.len)).then_some(p)
+        };
+        let mut out = Vec::new();
+        for value in values {
+            let Some(dict) = value.downcast::<CFDictionary>() else {
+                continue;
+            };
+            let (_, items) = dict.get_keys_and_values();
+            for item in items {
+                // SAFETY: a value of a property-list dictionary is a property list, retained here.
+                let item = unsafe { CFPropertyList::wrap_under_get_rule(item) };
+                if let Some(p) = prefix(&item) {
+                    out.push(p);
+                } else if let Some(list) = item.downcast::<CFArray>() {
+                    for e in list.iter() {
+                        // SAFETY: an element of a property-list array is a property list.
+                        let e = unsafe { CFPropertyList::wrap_under_get_rule(*e) };
+                        out.extend(prefix(&e));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Calls to the configuration daemon: at most four outstanding (see [`Bounded`]).
@@ -2583,6 +2702,27 @@ mod tests {
         // it returns); a wrapped count is near usize::MAX.
         assert!(highest <= 32, "the count wrapped: {highest}");
         assert_eq!(REFUSED.load(Ordering::Relaxed), 0);
+    }
+
+    /// macOS, review round 3, bypass-1: the facts of a host with IPv6 and no IPv4 route that has
+    /// just joined a network (an uplink signature not seen before) refuse IPv6 until that
+    /// network's NAT64 round has finished; a dual-stack host's never do.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends() {
+        use crate::routes::Route;
+        // SAFETY: arc4random takes no arguments and cannot fail.
+        let fresh = || format!("test={}", unsafe { libc::arc4random() });
+        let v6_only = RouteTable::new(vec![Route::via(p("::/0"), ip("fe80::1"), 4)]);
+        let dual = RouteTable::new(vec![
+            Route::via(p("::/0"), ip("fe80::1"), 4),
+            Route::via(p("0.0.0.0/0"), ip("192.0.2.1"), 4),
+        ]);
+        // The process's first round runs on the caller's thread; the next uplinks' in the
+        // background.
+        nat64_unsettled_on(&dual, &[4], &[fresh()]);
+        assert!(nat64_unsettled_on(&v6_only, &[4], &[fresh()]));
+        assert!(!nat64_unsettled_on(&dual, &[4], &[fresh()]));
     }
 
     #[test]
