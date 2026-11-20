@@ -6319,6 +6319,36 @@ fn fastest_benchmarked_device(
         .map(|d| d.device_id.clone())
 }
 
+/// How long, in seconds, a job of `backend` claimed now waits before it can start, with the planner
+/// off: the work already claimed and not yet proven (`outstanding`, cycles and backend, at each
+/// backend's fastest rate) spread over the `cards`, once every card has a job; or the work of its own
+/// backend spread over the `side_by_side` that fit in memory together, once that many are claimed.
+/// The larger of the two; 0 while a card and a turn are free. Pessimistic (a running job counts in
+/// full), as a deadline estimate should be.
+fn expected_queue_wait_secs(
+    outstanding: &[(u64, &str)],
+    backend: &str,
+    cards: usize,
+    side_by_side: usize,
+    rate: impl Fn(&str) -> Option<f64>,
+) -> u64 {
+    let secs = |(cycles, b): &(u64, &str)| rate(b).map_or(0.0, |r| *cycles as f64 / r);
+    let cards = cards.max(1);
+    let card_wait = if outstanding.len() >= cards {
+        outstanding.iter().map(secs).sum::<f64>() / cards as f64
+    } else {
+        0.0
+    };
+    let side_by_side = side_by_side.max(1);
+    let same: Vec<&(u64, &str)> = outstanding.iter().filter(|(_, b)| *b == backend).collect();
+    let turn_wait = if same.len() >= side_by_side {
+        same.iter().map(|w| secs(w)).sum::<f64>() / side_by_side as f64
+    } else {
+        0.0
+    };
+    card_wait.max(turn_wait).ceil() as u64
+}
+
 /// The card an attempt tries first: the one an SP1 retry is pinned to (`retry_pin_after`), else the
 /// card the job was planned for (`planned`). A card that refused it admission moves to the back of
 /// the order instead (`job_card_order`).
@@ -9103,6 +9133,45 @@ async fn miner_brain(
             let execute_allowance =
                 execute_allowance_secs(backend_opt.unwrap_or(""), snapshot.measured_execute_secs);
             let prove_window = prove_window.saturating_sub(execute_allowance);
+            // Without the planner (no queue horizon), a job claimed while every card already has a
+            // job, or behind as many of its own backend as run side by side, starts only once those
+            // are done: what is left of its window is what it has, not the whole of it. Checked as
+            // if it started now, a queued job could reach its cutoff waiting and be released.
+            let prove_window = if planner_active {
+                prove_window
+            } else {
+                let backend = backend_opt.unwrap_or("");
+                let outstanding: Vec<(u64, &str)> = inflight_work
+                    .iter()
+                    .filter(|(j, _)| !proved.contains(*j))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let mut cards: Vec<&str> = device_backend_throughputs
+                    .iter()
+                    .map(|(d, _, _)| d.as_str())
+                    .filter(|d| d.starts_with("gpu"))
+                    .collect();
+                cards.sort_unstable();
+                cards.dedup();
+                let side_by_side = zkminer_prover::engine::worker_pool()
+                    .map_or(usize::MAX, |p| p.backend_side_by_side(backend));
+                let wait = expected_queue_wait_secs(
+                    &outstanding,
+                    backend,
+                    cards.len().clamp(1, max_concurrent.max(1)),
+                    side_by_side,
+                    |b| {
+                        device_backend_throughputs
+                            .iter()
+                            .filter(|(_, rb, t)| rb == b && t.is_finite() && *t > 0.0)
+                            .map(|(_, _, t)| *t)
+                            .fold(None, |best: Option<f64>, t| {
+                                Some(best.map_or(t, |x| x.max(t)))
+                            })
+                    },
+                );
+                prove_window.saturating_sub(wait)
+            };
 
             // H1 provability gate (SP1 only). A guest measured feasible on the SERVER-LESS measure
             // worker can still OOM at PROVE time, where `run_proof` replays the same deterministic
@@ -12563,7 +12632,18 @@ async fn process_job_lifecycle(
                         let waited = memory_wait_since
                             .get_or_insert_with(std::time::Instant::now)
                             .elapsed();
-                        if (!shortage.attempted || outside) && waited < HOST_MEMORY_WAIT_LIMIT {
+                        // Refused only because our own proofs hold the memory (what they hold
+                        // and what is free would cover it): it waits its turn behind them, which
+                        // the deadline budget bounds (released in time), not the 5-minute cap
+                        // meant for memory held by something else. A second SP1 proof behind a
+                        // first waits the first's few minutes.
+                        let behind_ours = !shortage.attempted
+                            && shortage.reserved > 0
+                            && shortage.available.saturating_add(shortage.reserved)
+                                >= shortage.needed;
+                        if (!shortage.attempted || outside)
+                            && (waited < HOST_MEMORY_WAIT_LIMIT || behind_ours)
+                        {
                             memory_waits += 1;
                             attempt = attempt.saturating_sub(1);
                             tracing::warn!(
@@ -16670,6 +16750,40 @@ mod tests {
         assert!(text.starts_with("claiming: checking the job"), "{text}");
     }
 
+    /// With the planner off, a claim waits for the work ahead of it once every card has a job, or
+    /// once as many of its backend as fit side by side are claimed; nothing while both are free.
+    #[test]
+    fn a_queued_claim_is_charged_the_work_ahead_of_it() {
+        let rate = |b: &str| match b {
+            "sp1" => Some(10_000_000.0),
+            "risc0" => Some(5_000_000.0),
+            _ => None,
+        };
+        // One SP1 job (100 s) out, two cards, two SP1 fit: a card and a turn are free.
+        assert_eq!(
+            expected_queue_wait_secs(&[(1_000_000_000, "sp1")], "sp1", 2, 2, rate),
+            0
+        );
+        // Only one SP1 fits in memory: a second waits the first's 100 s.
+        assert_eq!(
+            expected_queue_wait_secs(&[(1_000_000_000, "sp1")], "sp1", 2, 1, rate),
+            100
+        );
+        // A RISC Zero job is not behind SP1's turn while a card is free...
+        assert_eq!(
+            expected_queue_wait_secs(&[(1_000_000_000, "sp1")], "risc0", 2, 4, rate),
+            0
+        );
+        // ...but once both cards have work, it waits for their work spread over the two.
+        let both = [(1_000_000_000, "sp1"), (500_000_000, "risc0")];
+        assert_eq!(expected_queue_wait_secs(&both, "risc0", 2, 4, rate), 100);
+        // A backend with no rate counts nothing.
+        assert_eq!(
+            expected_queue_wait_secs(&[(9, "openvm"), (9, "openvm")], "sp1", 1, 1, rate),
+            0
+        );
+    }
+
     /// A shortage the proof did not cause (`ShortageFromOutside`) is read through its marker: the
     /// retry loop still sees the shortage, waits instead of spending the attempt, and does not hold
     /// it against the submitter. Without the marker, a proof that died mid-run still costs one.
@@ -16691,10 +16805,17 @@ mod tests {
         let own = anyhow::Error::new(shortage());
         assert!(own.downcast_ref::<ShortageFromOutside>().is_none());
         // The loop: an outside shortage waits as a refusal does, and is not a divergence.
+        // The code only, not this test's own strings.
         let src = include_str!("run.rs");
-        assert!(src
-            .contains("if (!shortage.attempted || outside) && waited < HOST_MEMORY_WAIT_LIMIT {"));
-        assert!(src.contains("if rode_measurement && shortage.attempted && !outside {"));
+        let code = &src[..src
+            .find(
+                "
+mod tests {",
+            )
+            .unwrap()];
+        assert!(code.contains("if (!shortage.attempted || outside)"));
+        assert!(code.contains("&& (waited < HOST_MEMORY_WAIT_LIMIT || behind_ours)"));
+        assert!(code.contains("if rode_measurement && shortage.attempted && !outside {"));
     }
 
     /// The same property for the host-memory class, where a forgery buys the opposite prize:
