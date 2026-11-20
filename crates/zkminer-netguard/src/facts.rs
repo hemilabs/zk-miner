@@ -1154,6 +1154,7 @@ mod sys {
 
     /// # Safety
     /// `sa` is null or points to a sockaddr valid for its `sa_family`.
+    #[cfg(not(target_os = "macos"))]
     unsafe fn sockaddr_ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
         if sa.is_null() {
             return None;
@@ -1168,6 +1169,34 @@ mod sys {
             libc::AF_INET6 => {
                 let sin6 = &*(sa as *const libc::sockaddr_in6);
                 Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+            }
+            _ => None,
+        }
+    }
+
+    /// macOS: the address of an IP sockaddr, read within its `sa_len` bytes (`getifaddrs` copies
+    /// each sockaddr by its `sa_len`, and gives a `utun`'s destination address `sa_len` 0); an IP
+    /// sockaddr too short for its address names none (review round 1, parse-4).
+    ///
+    /// # Safety
+    /// `sa` is null or points to a sockaddr valid for its `sa_len` bytes.
+    #[cfg(target_os = "macos")]
+    pub(super) unsafe fn sockaddr_ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
+        use std::mem::offset_of;
+        if sa.is_null() {
+            return None;
+        }
+        let b = std::slice::from_raw_parts(sa.cast::<u8>(), usize::from((*sa).sa_len));
+        match i32::from(*b.get(1)?) {
+            libc::AF_INET => {
+                let o = offset_of!(libc::sockaddr_in, sin_addr);
+                let a: [u8; 4] = b.get(o..o + 4)?.try_into().ok()?;
+                Some(IpAddr::V4(Ipv4Addr::from(a)))
+            }
+            libc::AF_INET6 => {
+                let o = offset_of!(libc::sockaddr_in6, sin6_addr);
+                let a: [u8; 16] = b.get(o..o + 16)?.try_into().ok()?;
+                Some(IpAddr::V6(Ipv6Addr::from(a)))
             }
             _ => None,
         }
@@ -1535,6 +1564,47 @@ mod tests {
                 ip("fe80::1")
             ]
         );
+    }
+
+    /// parse-4: an IP sockaddr is read within its `sa_len`: one too short for its address (here
+    /// `sa_len` 4 with an address's bytes after it, another sockaddr's) names none; whole ones
+    /// read as before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ip_sockaddrs_are_read_within_their_length() {
+        let v4 = |len: u8| {
+            let mut b = [0u8; 16];
+            b[0] = len;
+            b[1] = libc::AF_INET as u8;
+            b[4..8].copy_from_slice(&[203, 0, 113, 9]);
+            // SAFETY: `b` holds 16 bytes, at least `len`.
+            unsafe { sys::sockaddr_ip(b.as_ptr().cast()) }
+        };
+        assert_eq!(v4(16), Some(ip("203.0.113.9")));
+        assert_eq!(v4(8), Some(ip("203.0.113.9")));
+        for len in [0, 1, 2, 4, 7] {
+            assert_eq!(v4(len), None, "sa_len {len}");
+        }
+        let v6 = |len: u8| {
+            let mut b = [0u8; 28];
+            b[0] = len;
+            b[1] = libc::AF_INET6 as u8;
+            b[8..24].copy_from_slice(
+                &"2001:db8::9"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            // SAFETY: `b` holds 28 bytes, at least `len`.
+            unsafe { sys::sockaddr_ip(b.as_ptr().cast()) }
+        };
+        assert_eq!(v6(28), Some(ip("2001:db8::9")));
+        assert_eq!(v6(24), Some(ip("2001:db8::9")));
+        for len in [0, 8, 16, 23] {
+            assert_eq!(v6(len), None, "sa_len {len}");
+        }
+        // SAFETY: null is allowed.
+        assert_eq!(unsafe { sys::sockaddr_ip(std::ptr::null()) }, None);
     }
 
     /// parse-2: nameserver words as macOS's parsers read them, every reading counted; what none
