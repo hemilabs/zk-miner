@@ -7815,7 +7815,8 @@ async fn miner_brain(
                 &state,
                 // The claim limit, not the cards: jobs beyond the cards wait for one.
                 format!(
-                    "holding {} job(s), the most it claims at once ({}); more as they finish",
+                    "{} job(s) being claimed or proven, the most it takes at once ({}); more as \
+                     they finish",
                     needing_card(&in_flight, &proved),
                     if planner_active {
                         format!("{claim_ceiling}: 3 x max_concurrent_proofs")
@@ -9870,10 +9871,10 @@ async fn miner_brain(
                 }
                 reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
-                {
-                    let mut s = state.write().await;
-                    s.open_jobs.retain(|j| j.info.job_id != jid);
-                }
+                // Kept in the market list until its claim lands (it moves to `active_jobs` then):
+                // its row says it is being claimed (`JobNote`). Taken off here, it was in neither
+                // list for the claim's minute, while the claim limit counted it. The candidate
+                // loop skips it (`in_flight`).
                 batch.push(((*job).clone(), snapshot, required_collateral));
 
                 // Bound to free proving slots (never lock more than we can prove before
@@ -10967,12 +10968,10 @@ fn spawn_lifecycle_task(
             prefetched_descriptor,
         )
         .await;
-        // Not claimed after all (a check refused it, a lost race): its row goes back to the market's
-        // reasons. A claimed job's note was cleared when the claim landed.
-        state
-            .write()
-            .await
-            .clear_job_note(jid, zkminer_tui::state::JobNoteKind::Claim);
+        // Over: nothing it said about a stage may outlive it (a row that comes back, re-driven, starts
+        // clean; a job not claimed after all goes back to the market's reasons). A release below sets
+        // its own note.
+        state.write().await.clear_job_notes(jid);
         if let Err(e) = outcome {
             // A lock we hold that must NOT be released (a pause / disable hold, an unreadable post-
             // claim state): keep the breadcrumb, leave the stashed fulfil nonce for the re-drive or
@@ -11637,6 +11636,10 @@ async fn process_job_lifecycle(
         // the authoritative value read from the post-claim status view a few lines above.
         let mut claimed_info = job.info.clone();
         claimed_info.lock_deadline = lock_deadline;
+        // What the claim locked (the view's settled price), for the Jobs page's price column.
+        claimed_info.settled_price = view.settledPrice.to::<u128>();
+        // A lock re-driven after its row was dropped starts over: no note from its last run.
+        s.clear_job_notes(job_id);
         // The collateral the dashboard's quit prompt prices an abandon from: what the claim locked,
         // `computeCollateral(settledPrice, collateralBps, minCollateral)` with the job's own terms
         // (0, "unknown", without them).
@@ -11966,36 +11969,41 @@ async fn process_job_lifecycle(
         let mut waiting_for_card = false;
         // Whether an attempt (or a wait for a card or memory) came before this pass.
         let mut retrying = false;
+        // Whether the pass before this one was a failed attempt (not a wait or a refund).
+        let mut failed_last = false;
         loop {
             attempt += 1;
             // Between attempts the job is not proving: back to Queued until a worker takes it again,
             // and the last attempt's progress dropped, so the dashboard shows no stale bar or time.
             if retrying {
+                end_attempt_display(state, job_id).await;
                 let mut s = state.write().await;
-                s.proving.remove(&job_id);
-                if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
-                    if matches!(j.status, zkminer_tui::state::MinerJobStatus::Proving { .. }) {
-                        j.status = zkminer_tui::state::MinerJobStatus::Queued;
-                    }
-                }
-                // Not "waiting for a GPU" when it is trying again after an attempt failed. A wait
-                // for memory has set its own note (below), and a wait for a card is what Queued says.
+                // Not "waiting for a GPU" when it is trying again. A wait for memory has set its own
+                // note (below), and a wait for a card is what Queued says. Only a pass that failed
+                // says it failed: a governance hold or a refunded cut-off proof did not.
                 if !waiting_for_card && !s.job_notes.contains_key(&job_id) {
                     s.set_job_note(
                         job_id,
                         zkminer_tui::state::JobNoteKind::Wait,
-                        format!(
-                            "trying again after a failed attempt (attempt {attempt} of \
-                             {MAX_PROVE_ATTEMPTS})"
-                        ),
+                        if failed_last {
+                            format!(
+                                "trying again after a failed attempt (attempt {attempt} of \
+                                 {MAX_PROVE_ATTEMPTS})"
+                            )
+                        } else {
+                            format!(
+                                "preparing to prove (attempt {attempt} of {MAX_PROVE_ATTEMPTS})"
+                            )
+                        },
                     );
                 }
             }
+            failed_last = false;
             retrying = true;
             // The EFFECTIVE deadline moves out while the protocol is paused or a Disabled window
             // lasts (and on a downtime extension): refresh it each attempt, so a proof is never cut
             // short — and its lock released — at a stale pre-pause cutoff.
-            refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await;
+            refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline).await;
             // Pre-deadline release margin: compute the absolute instant past
             // which this job must stop proving to still release its collateral, and
             // bail early if too little time remains to even start. `abort_at` is
@@ -12102,6 +12110,11 @@ async fn process_job_lifecycle(
                         .into());
                     }
                     waiting_for_card = true;
+                    // A wait for a card is what Queued says: an earlier memory note no longer applies.
+                    state
+                        .write()
+                        .await
+                        .clear_job_note(job_id, zkminer_tui::state::JobNoteKind::Wait);
                     if !warned_no_card {
                         warned_no_card = true;
                         let detail = format!(
@@ -12330,7 +12343,8 @@ async fn process_job_lifecycle(
                         // Unless the deadline itself moved out meanwhile (a pause began during this
                         // proof): then the kill was against a stale cutoff, and there is room to prove
                         // again. The refund is bounded — every one needs the deadline to have moved.
-                        if refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await
+                        if refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline)
+                            .await
                             && deadline_proof_budget(lock_deadline)
                                 .is_some_and(|b| b >= Duration::from_secs(MIN_ATTEMPT_BUDGET_SECS))
                         {
@@ -12518,6 +12532,8 @@ async fn process_job_lifecycle(
                                 HOST_MEMORY_WAIT_LIMIT.as_secs(),
                                 memory_waits,
                             );
+                            // The attempt is over: no progress bar or card while it waits.
+                            end_attempt_display(state, job_id).await;
                             state.write().await.set_job_note(
                                 job_id,
                                 zkminer_tui::state::JobNoteKind::Wait,
@@ -12551,6 +12567,8 @@ async fn process_job_lifecycle(
                         );
                         if attempt < MAX_PROVE_ATTEMPTS {
                             // Give memory a backoff to come back before the next real attempt.
+                            end_attempt_display(state, job_id).await;
+                            failed_last = true;
                             tokio::time::sleep(Duration::from_secs(HOST_MEMORY_BACKOFF_SECS)).await;
                             continue;
                         }
@@ -12715,6 +12733,7 @@ async fn process_job_lifecycle(
                                 ""
                             },
                         );
+                        failed_last = true;
                         continue;
                     }
                     // Every attempt failed on a job that measured clean. Class-agnostic on purpose: the
@@ -12925,7 +12944,7 @@ async fn process_job_lifecycle(
     // lock kept through a pause is fulfilled after the lift instead of released for nothing.
     loop {
         let before = lock_deadline;
-        if refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await {
+        if refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline).await {
             tracing::info!(
                 "{}: effective deadline moved out by {}s (pause credit / downtime extension)",
                 short_id(job_id),
@@ -13109,12 +13128,28 @@ async fn process_job_lifecycle(
             clear_submitting("shutdown during a held fulfil").await;
             return Err(HandBack(format!("shutdown while the fulfil is held: {reason}")).into());
         }
+        // What it waits on now, while nothing is out: the last send's note would go stale.
+        if !published_unconfirmed {
+            state.write().await.set_job_note(
+                job_id,
+                zkminer_tui::state::JobNoteKind::Submit,
+                format!(
+                    "submitting the proof: {} ({reason}); trying again every {}s",
+                    if matches!(class, FulfilClass::Keep | FulfilClass::VerifierFailed) {
+                        "held"
+                    } else {
+                        "not settled"
+                    },
+                    FULFIL_RETRY_WAIT.as_secs()
+                ),
+            );
+        }
         // Never sleep past the release point: the release must start with its whole reserved ladder
         // (DEADLINE_RELEASE_MARGIN_SECS) still ahead of the window's close. When the next round
         // would have too little budget, go to the release now instead of after one more wait.
         match deadline_proof_budget(lock_deadline) {
             Some(b) if b <= FULFIL_RETRY_WAIT + Duration::from_secs(MIN_ATTEMPT_BUDGET_SECS) => {
-                if refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await {
+                if refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline).await {
                     continue;
                 }
                 if clock_stopped_or_unknown(client, fulfill_proof_system, b).await {
@@ -13308,6 +13343,7 @@ async fn clock_stopped_or_unknown(client: &ChainClient, proof_system_id: B256, b
 /// downtime extension), raise `lock_deadline` and the journal breadcrumb to it. True if it moved.
 async fn refresh_lock_deadline(
     client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
     journal: &SharedJournal,
     job_id: B256,
     lock_deadline: &mut u64,
@@ -13328,7 +13364,35 @@ async fn refresh_lock_deadline(
             e.lock_deadline = c;
         }
     });
+    // And the row's: the Jobs page counts down to it, and read "PAST its deadline" in red after a
+    // pause credit moved the cutoff out.
+    if let Some(j) = state
+        .write()
+        .await
+        .active_jobs
+        .iter_mut()
+        .find(|j| j.info.job_id == job_id)
+    {
+        j.info.lock_deadline = c;
+    }
     true
+}
+
+/// A proof attempt of `job_id` is over (failed, waiting, or released): its row goes back to Queued,
+/// with no progress and no card, so neither the bar nor the card's row show work that is not running.
+async fn end_attempt_display(state: &zkminer_tui::state::SharedState, job_id: B256) {
+    let mut s = state.write().await;
+    s.proving.remove(&job_id);
+    if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
+        if matches!(
+            j.status,
+            zkminer_tui::state::MinerJobStatus::Proving { .. }
+                | zkminer_tui::state::MinerJobStatus::Skipped { .. }
+        ) {
+            j.status = zkminer_tui::state::MinerJobStatus::Queued;
+        }
+        j.gpu_bus_id = None;
+    }
 }
 
 /// How often the brain re-reads the router/Registry pause state before claiming.
@@ -14592,6 +14656,14 @@ async fn release_and_clean_with_nonce(
     pre_nonce: Option<u64>,
 ) {
     use zkminer_chain::jobs::GovernanceHold;
+    // On its row: being released, off its card (its next job may already be proving there), no
+    // progress bar. The release transaction's events rewrite the note.
+    end_attempt_display(state, job_id).await;
+    state.write().await.set_job_note(
+        job_id,
+        zkminer_tui::state::JobNoteKind::Release,
+        "releasing the lock",
+    );
     // A keep-locks stop hands every lock to the next start: a lifecycle that fails on the way out
     // (its worker stopped under it) must not release its lock. The breadcrumb stays for recovery.
     if keeping_lock(job_id) {
@@ -16454,7 +16526,7 @@ mod tests {
             .expect("note set at spawn");
         let run = spawn.find("process_job_lifecycle(").unwrap();
         let clear = spawn
-            .find(".clear_job_note(jid, zkminer_tui::state::JobNoteKind::Claim)")
+            .find(".clear_job_notes(jid)")
             .expect("note cleared at the end");
         assert!(set < run && run < clear);
         let mut state = zkminer_tui::state::MinerState::default();
