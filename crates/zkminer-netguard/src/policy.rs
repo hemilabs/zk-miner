@@ -1493,14 +1493,10 @@ mod tests {
                 kind: RouteKind::OtherGateway
             })
         );
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(a("93.184.216.34"), Ok(()));
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(a("1.0.0.1"), Ok(()));
-        // macOS (review round 3, bypass-3): a default-like answer must be one of these facts'
-        // default routes; the split default via the VPN and wg-quick's table on interface 9 are
-        // not (`a_new_uplink_is_refused_until_the_facts_hold_it`).
-        #[cfg(target_os = "macos")]
+        // Review round 3, bypass-3 (every platform since the Linux application; before it Linux
+        // admitted both): a default-like answer must be one of these facts' default routes; the
+        // split default via the VPN and wg-quick's table on interface 9 are not
+        // (`a_new_uplink_is_refused_until_the_facts_hold_it`).
         for (dst, kind) in [
             ("93.184.216.34", RouteKind::OtherGateway),
             ("1.0.0.1", RouteKind::OnLink),
@@ -1555,14 +1551,13 @@ mod tests {
         let _ = RouteType::Local;
     }
 
-    /// macOS, review round 3, bypass-3 (the reviewer's `r3_a_new_uplink_passes_the_kernel_check_
-    /// of_old_facts`): the kernel's default-like answer is admitted only when these facts hold
+    /// Review round 3, bypass-3 (the reviewer's `r3_a_new_uplink_passes_the_kernel_check_
+    /// of_old_facts`; every platform since the Linux application): the kernel's default-like answer is admitted only when these facts hold
     /// that default route (its family, hop and interface). A full-tunnel VPN that came up after
     /// the facts were read (`0/1` on a `utun`, or its own default via its peer) and a second
     /// network's default are refused as off the default path, a refusal that rests on the facts
     /// (the policy reads them again and judges once more); the facts' own default, a clone through
     /// their uplink, and the same VPN once the facts hold it are admitted.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_new_uplink_is_refused_until_the_facts_hold_it() {
         use crate::facts::RawFacts;
