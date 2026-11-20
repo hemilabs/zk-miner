@@ -93,6 +93,11 @@ pub enum Denied {
     /// until they can be read (review round 2, bypass-1).
     #[cfg(target_os = "macos")]
     FactsUnreadable { ip: IpAddr, why: String },
+    /// macOS: an IPv6 destination while this host, with IPv6 and no IPv4 route, has just joined a
+    /// network whose NAT64 prefix is still being learned ([`crate::nat64`]): an address under
+    /// that prefix can carry a private IPv4 address (review round 3, bypass-1).
+    #[cfg(target_os = "macos")]
+    Nat64Unsettled(IpAddr),
 }
 
 /// What is wrong with a URL, apart from where it points.
@@ -253,6 +258,14 @@ impl Denied {
                  requester-caused connection is refused until they can be",
                 (FACTS_TTL + REFRESH_GRACE).as_secs()
             ),
+            #[cfg(target_os = "macos")]
+            Denied::Nat64Unsettled(ip) => write!(
+                f,
+                "{ip} cannot be judged yet: this host, with IPv6 and no IPv4 route, is on a new \
+                 network whose NAT64 prefix is still being learned (RFC 7050, at most {}s), and an \
+                 IPv6 address under that prefix can carry a private IPv4 address",
+                crate::nat64::DISCOVERY_TIMEOUT.as_secs()
+            ),
             Denied::NearHop { addr, hops, what } => write!(
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
@@ -279,7 +292,10 @@ impl Denied {
     /// read), rather than on the address alone or the operator's deny CIDRs.
     pub fn depends_on_facts(&self) -> bool {
         #[cfg(target_os = "macos")]
-        if matches!(self, Denied::FactsUnreadable { .. }) {
+        if matches!(
+            self,
+            Denied::FactsUnreadable { .. } | Denied::Nat64Unsettled(_)
+        ) {
             return true;
         }
         matches!(
@@ -346,6 +362,10 @@ fn admit_inner(
             ip,
             why: why.to_string(),
         });
+    }
+    #[cfg(target_os = "macos")]
+    if ip.is_ipv6() && facts.nat64_unsettled() {
+        return Err(Denied::Nat64Unsettled(ip));
     }
     if !is_global(ip) {
         return Err(Denied::NotGlobal(ip));
@@ -1608,6 +1628,66 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// macOS, review round 3, bypass-1 (the reviewer's `r3_an_unlearned_nsp_carries_private_
+    /// ipv4_as_global`): on a host with IPv6 and no IPv4 route, `<NSP>::<private IPv4>` under a
+    /// network-specific NAT64 prefix not learned yet is an ordinary global IPv6 address. While the
+    /// new uplink's discovery round has not finished, every IPv6 destination is refused, and the
+    /// refusal rests on the facts; once the prefix is learned, what it carries is judged.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ipv6_is_refused_while_a_new_uplinks_nat64_prefix_is_learned() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let nsp = pfx("2a0b:7e40:64::/96");
+        let under =
+            |v4: [u8; 4]| IpAddr::V6(crate::nat64::synthesize(nsp, std::net::Ipv4Addr::from(v4)));
+        let facts = |unsettled: bool| {
+            HostFacts::assemble(
+                RawFacts {
+                    interface_prefixes: vec![pfx("2a02:db8:99::/64")],
+                    interface_addresses: vec![ip("2a02:db8:99::7")],
+                    routes: vec![Route::via(pfx("::/0"), ip("fe80::1"), 4)],
+                    nat64_unsettled: unsettled,
+                    ..RawFacts::default()
+                },
+                &FactsOptions {
+                    public_addresses: vec![ip("2a02:db8:99::7")],
+                    ..offline()
+                },
+            )
+        };
+        let targets = [
+            [10, 0, 0, 1],
+            [192, 168, 1, 1],
+            [169, 254, 169, 254],
+            [127, 0, 0, 1],
+        ];
+        let pending = facts(true);
+        for v4 in targets {
+            let e = admit(NetMode::Public, under(v4), &pending, &[]).unwrap_err();
+            assert_eq!(e, Denied::Nat64Unsettled(under(v4)));
+            assert!(e.depends_on_facts());
+            assert!(
+                e.to_string()
+                    .contains("NAT64 prefix is still being learned"),
+                "{e}"
+            );
+        }
+        let e = admit(NetMode::Public, ip("2606:4700:4700::1111"), &pending, &[]).unwrap_err();
+        assert!(matches!(e, Denied::Nat64Unsettled(_)), "{e:?}");
+        // Settled, and the prefix learned: refused as the IPv4 address it carries.
+        crate::nat64::add_learned(&[nsp]);
+        let settled = facts(false);
+        for v4 in targets {
+            let d = admit(NetMode::Public, under(v4), &settled, &[]);
+            assert_eq!(d, Err(Denied::NotGlobal(under(v4))));
+        }
+        assert_eq!(
+            admit(NetMode::Public, ip("2606:4700:4700::1111"), &settled, &[]),
+            Ok(())
+        );
     }
 
     /// Review r1 fetch F1 (PoC `facts`), inverted, on this host's real facts: neighbours in the
