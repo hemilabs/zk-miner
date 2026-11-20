@@ -205,23 +205,24 @@ fn sa_ip(sa: &[u8]) -> io::Result<Option<IpAddr>> {
 
 /// The prefix length of a netmask slot, read in the route's family. The kernel trims a mask's
 /// trailing zero bytes (`sa_len` 7 for 255.255.255.0) and leaves its family byte unset, so the
-/// address bytes are read at the family's offset up to `sa_len`, the rest zero; a non-contiguous
-/// mask counts its leading ones (which only widens the prefix).
-fn mask_len(sa: &[u8], v4: bool) -> u8 {
+/// address bytes are read at the family's offset up to `sa_len`, the rest zero. `None` for a
+/// non-contiguous mask (`0.255.255.0`): no prefix length says which addresses such a route
+/// holds, and counting its leading ones would read it as wider than it is (a /0, a default
+/// route); the message is malformed.
+fn mask_len(sa: &[u8], v4: bool) -> Option<u8> {
     let (off, width) = if v4 {
         (offset_of!(libc::sockaddr_in, sin_addr), 4)
     } else {
         (offset_of!(libc::sockaddr_in6, sin6_addr), 16)
     };
-    let mut n = 0u8;
-    for i in 0..width {
-        let byte = sa.get(off + i).copied().unwrap_or(0);
-        n += byte.leading_ones() as u8;
-        if byte != 0xff {
-            break;
-        }
+    let mut m = [0u8; 16];
+    for (i, b) in m[..width].iter_mut().enumerate() {
+        *b = sa.get(off + i).copied().unwrap_or(0);
     }
-    n
+    let bits = u128::from_be_bytes(m);
+    let len = bits.leading_ones();
+    // Contiguous: nothing set after the leading ones.
+    (bits.checked_shl(len).unwrap_or(0) == 0).then_some(len as u8)
 }
 
 /// One `RTM_GET` message's route (`body`: what follows its header). `None` for a route that reaches
@@ -251,7 +252,7 @@ pub(super) fn parse_route(h: &Header, body: &[u8], dump: bool) -> io::Result<Opt
     let width = if v4 { 32 } else { 128 };
     // A route without a netmask is a host route (BSD's radix tree keeps no mask for one).
     let len = match sas[libc::RTAX_NETMASK as usize] {
-        Some(m) if f & libc::RTF_HOST == 0 => mask_len(m, v4),
+        Some(m) if f & libc::RTF_HOST == 0 => mask_len(m, v4).ok_or_else(malformed)?,
         _ => width,
     };
     let hop = if f & libc::RTF_GATEWAY != 0 {
@@ -1294,21 +1295,112 @@ mod tests {
     /// Netmasks the kernel trims, leaves empty or writes non-contiguous; embedded scopes.
     #[test]
     fn netmasks_and_scopes_read_as_the_kernel_means_them() {
-        assert_eq!(mask_len(&[], true), 0);
-        assert_eq!(mask_len(&[7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], true), 24);
-        assert_eq!(mask_len(&[5, 0xff, 0, 0, 0xff], true), 8);
-        assert_eq!(mask_len(&[8, 0xff, 0, 0, 0xff, 0xff, 0xff, 0xfe], true), 31);
-        assert_eq!(mask_len(&[8, 0xff, 0, 0, 0xff, 0x0f, 0xff, 0xff], true), 8);
+        assert_eq!(mask_len(&[], true), Some(0));
+        assert_eq!(
+            mask_len(&[7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], true),
+            Some(24)
+        );
+        assert_eq!(mask_len(&[5, 0xff, 0, 0, 0xff], true), Some(8));
+        assert_eq!(
+            mask_len(&[8, 0xff, 0, 0, 0xff, 0xff, 0xff, 0xfe], true),
+            Some(31)
+        );
+        assert_eq!(
+            mask_len(&[8, 0xff, 0, 0, 0xff, 0xff, 0xff, 0xff], true),
+            Some(32)
+        );
+        // Non-contiguous masks are no prefix length (parse-1: 255.15.255.255 read as /8 before,
+        // 0.255.255.0 as /0).
+        assert_eq!(
+            mask_len(&[8, 0xff, 0, 0, 0xff, 0x0f, 0xff, 0xff], true),
+            None
+        );
+        assert_eq!(mask_len(&[8, 0xff, 0, 0, 0, 0xff, 0xff, 0], true), None);
+        assert_eq!(mask_len(&[8, 0xff, 0, 0, 0xff, 0xff, 0xfd, 0], true), None);
         let mut v6 = vec![0x10, 0xff, 0, 0, 0, 0, 0, 0];
         v6.extend([0xff; 8]);
-        assert_eq!(mask_len(&v6, false), 64);
-        assert_eq!(mask_len(&[], false), 0);
+        assert_eq!(mask_len(&v6, false), Some(64));
+        assert_eq!(mask_len(&[], false), Some(0));
+        let mut v6 = vec![0x1c, 0xff, 0, 0, 0, 0, 0, 0];
+        v6.extend([0xff; 8]);
+        v6.extend([0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(mask_len(&v6, false), None);
         let mut a = [0xfe, 0x80, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         clear_embedded_scope(&mut a);
         assert_eq!(Ipv6Addr::from(a), "fe80::1".parse::<Ipv6Addr>().unwrap());
         let mut g = "2606:8::1".parse::<Ipv6Addr>().unwrap().octets();
         clear_embedded_scope(&mut g);
         assert_eq!(Ipv6Addr::from(g), "2606:8::1".parse::<Ipv6Addr>().unwrap());
+    }
+
+    /// parse-1: the captured replies and dump with a netmask made non-contiguous (the LAN /24's
+    /// 255.255.255.0 as 0.255.255.0, or with a hole) are malformed, never a wider route: the
+    /// reply is an error (the destination refused) and the dump fails (the facts read fails).
+    #[test]
+    fn a_non_contiguous_netmask_is_malformed() {
+        // Where each message's netmask's address bytes start, in `b`.
+        let mask_at = |b: &[u8], start: usize| {
+            let h = header(&b[start..]).unwrap();
+            let body = &b[start + HDR_LEN..start + h.len];
+            sockaddrs(body, h.addrs).unwrap()[libc::RTAX_NETMASK as usize].map(|m| {
+                let v4 = m.len() <= 8;
+                (
+                    m.as_ptr() as usize - b.as_ptr() as usize,
+                    m.len(),
+                    v4,
+                    h.flags & libc::RTF_HOST != 0,
+                )
+            })
+        };
+        let (d, b) = reply("192.168.1.50");
+        let h = header(&b).unwrap();
+        let (at, len, _, _) = mask_at(&b, 0).unwrap();
+        assert_eq!(len, 7);
+        let a = offset_of!(libc::sockaddr_in, sin_addr);
+        assert_eq!(&b[at + a..at + len], &[0xff, 0xff, 0xff]);
+        assert_eq!(answer("192.168.1.50").unwrap().prefix, p("192.168.1.0/24"));
+        for mask in [
+            [0, 0xff, 0xff],
+            [0xff, 0, 0xff],
+            [0xff, 0xff, 0x7f],
+            [0xfe, 0xff, 0xff],
+        ] {
+            let mut m = b.clone();
+            m[at + a..at + len].copy_from_slice(&mask);
+            let r = parse_answer(&m, h.pid, h.seq, d);
+            assert!(r.is_err(), "{mask:02x?}: {r:?}");
+        }
+        // Every netmask of the dump, one at a time: its first address byte cleared where it was
+        // set and followed by more mask bits.
+        let dump = dump_fixture();
+        let n = parse_dump(&dump).unwrap().len();
+        let mut start = 0;
+        let mut mutated = 0;
+        while start < dump.len() {
+            let h = header(&dump[start..]).unwrap();
+            if let Some((at, len, _, host)) = mask_at(&dump, start) {
+                let first = if len > 8 {
+                    offset_of!(libc::sockaddr_in6, sin6_addr)
+                } else {
+                    a
+                };
+                let body = start + HDR_LEN..start + h.len;
+                let read = parse_route(&h, &dump[body.clone()], true)
+                    .unwrap()
+                    .is_some();
+                if read && !host && len > first + 1 && dump[at + first] == 0xff {
+                    // A route the dump reads: it is malformed, and the whole dump refused.
+                    let mut m = dump.clone();
+                    m[at + first] = 0;
+                    assert!(parse_route(&h, &m[body], true).is_err(), "at {start}");
+                    assert!(parse_dump(&m).is_err(), "message at {start}");
+                    mutated += 1;
+                }
+            }
+            start += h.len;
+        }
+        eprintln!("{mutated} of the dump's {n} routes' netmasks made non-contiguous: each refused");
+        assert!(mutated >= 3, "{mutated}");
     }
 
     #[test]
