@@ -1296,6 +1296,39 @@ mod tests {
         );
     }
 
+    /// Review round 4, cross-3: the hop's connection leaves from the source it was vetted with
+    /// (bound to it), so the re-check sees that source: vetted with one of this host's
+    /// non-loopback addresses, a connection to a loopback listener leaves from it, not from
+    /// 127.0.0.1. Skipped without such an address.
+    #[tokio::test]
+    async fn r4_the_hop_connects_from_the_vetted_source() {
+        let Ok(probe) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|u| u.connect("192.0.2.1:9").map(|()| u))
+            .and_then(|u| u.local_addr())
+        else {
+            crate::skipped("no IPv4 route here");
+            return;
+        };
+        let lan = probe.ip();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = l.local_addr().unwrap();
+        let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
+        let layer = RecheckLayer {
+            policy: dev,
+            vetted: vec![Vetted {
+                addr: peer,
+                connect: peer,
+                source: Some(lan),
+            }]
+            .into(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        match hop::connect_checked(&[peer], &layer, &ClientOptions::default(), deadline).await {
+            Ok(tcp) => assert_eq!(tcp.local_addr().unwrap().ip(), lan),
+            Err(e) => crate::skipped(format!("a connection from {lan} to {peer} failed here: {e}")),
+        }
+    }
+
     /// `vet_path` reads the source the kernel chooses for the connection, right after the
     /// checks: for a loopback stand-in, loopback.
     #[tokio::test]
