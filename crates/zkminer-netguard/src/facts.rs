@@ -839,7 +839,7 @@ fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
 /// per-domain resolver file in `/etc/resolver` (resolver(5)), and of every resolver the
 /// configuration daemon knows (`scutil --dns`: a secondary interface's DHCP or RDNSS servers, a
 /// VPN's supplemental and split-DNS resolvers, scoped resolvers), sorted; empty when they cannot
-/// be read (the facts read then fails: [`HostFacts::gather_with`]). See [`macos_dns`].
+/// be read (the facts read then fails: [`HostFacts::gather_with`]). See `facts::macos_dns`.
 #[cfg(target_os = "macos")]
 pub fn system_resolvers() -> Vec<IpAddr> {
     read_system_resolvers().unwrap_or_default()
