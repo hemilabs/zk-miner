@@ -362,18 +362,7 @@ fn poll_connected(sock: &socket2::Socket, timeout: Duration) -> io::Result<()> {
         // SAFETY: `p` is one valid pollfd.
         match unsafe { libc::poll(&mut p, 1, ms) } {
             0 => return Err(io::ErrorKind::TimedOut.into()),
-            n if n > 0 => {
-                if p.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    return match sock.take_error() {
-                        Ok(Some(e)) | Err(e) => Err(e),
-                        Ok(None) => Err(io::Error::other("no error set after POLLHUP")),
-                    };
-                }
-                return match sock.take_error()? {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                };
-            }
+            n if n > 0 => return connect_result(p.revents, sock.take_error()),
             _ => {
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
@@ -381,6 +370,23 @@ fn poll_connected(sock: &socket2::Socket, timeout: Duration) -> io::Result<()> {
                 }
             }
         }
+    }
+}
+
+/// macOS: how a connect in progress ended, from `poll`'s `revents` and the socket's pending error
+/// (`SO_ERROR`): that error; a hang-up or error event with no error set is a failure of its own
+/// (never an unreachable, which would read as far: review round 3, cross-1); otherwise connected.
+#[cfg(target_os = "macos")]
+fn connect_result(revents: libc::c_short, error: io::Result<Option<io::Error>>) -> io::Result<()> {
+    if revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return match error {
+            Ok(Some(e)) | Err(e) => Err(e),
+            Ok(None) => Err(io::Error::other("no error set after POLLHUP")),
+        };
+    }
+    match error? {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
@@ -475,8 +481,13 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     if let Err(e) = sock.connect_timeout(&addr.into(), timeout) {
         return ConfirmOutcome::ConnectFailed(e.to_string());
     }
+    // The hop limit the connection was made with, restored for the positive control.
+    let default_hops = match default_hops(&sock, addr) {
+        Ok(h) => h,
+        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+    };
     // From here on every packet of this socket — the FIN, its retransmissions, the closing
-    // reset — may cross at most `hops` hops.
+    // reset — may cross at most `hops` hops (until the positive control).
     let _ = sock.set_linger(Some(Duration::ZERO));
     if let Err(e) = set_hops(&sock, addr, hops) {
         return ConfirmOutcome::Failed(e.to_string());
@@ -509,9 +520,102 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
             return done;
         }
         if std::time::Instant::now() >= deadline {
-            return fin_at_deadline(state);
+            return match fin_at_deadline(state) {
+                ConfirmOutcome::Unanswered => positive_control(&sock, addr, default_hops, rtt),
+                other => other,
+            };
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// macOS: the hop limit `sock` (to `addr`) has now, as it was connected: `IP_TTL`, or
+/// `IPV6_UNICAST_HOPS` (-1, read as `u32::MAX`: the system's default).
+#[cfg(target_os = "macos")]
+fn default_hops(sock: &socket2::Socket, addr: SocketAddr) -> io::Result<u32> {
+    if addr.is_ipv4() {
+        sock.ttl_v4()
+    } else {
+        sock.unicast_hops_v6()
+    }
+}
+
+/// macOS: the check connection's positive control (review round 3, probe-1). Its FIN went
+/// unacknowledged within `hops` hops until the deadline, which reads as far only if the peer
+/// acknowledges a FIN at all: a peer that never acknowledges a bare FIN (every AWS S3 front end
+/// tested: `r3-probe/finack-s3.log`) would read as far at any distance. So the hop limit the
+/// connection was made with (`default_hops`) is restored and the FIN's retransmission (due within
+/// the retransmission timeout, `tcpi_rto`) is waited for: acknowledged now, the peer answers a
+/// FIN that reaches it, and the one limited to `hops` did not: far ([`fin_after_control`]); not
+/// acknowledged within the RTO, two round trips (`rtt`) and 250 ms (clamped to 0.5–4 s), or the
+/// peer closed or reset the connection meanwhile: the check cannot tell, refused
+/// ([`fin_after_control_deadline`]). Only an acknowledgement counts: a reset may come from a
+/// timer of the peer's (an S3 front end resets an idle connection), whatever reached it.
+#[cfg(target_os = "macos")]
+fn positive_control(
+    sock: &socket2::Socket,
+    addr: SocketAddr,
+    default_hops: u32,
+    rtt: Duration,
+) -> ConfirmOutcome {
+    use std::os::fd::AsRawFd;
+    let restored = if addr.is_ipv4() {
+        sock.set_ttl_v4(default_hops)
+    } else {
+        sock.set_unicast_hops_v6(default_hops)
+    };
+    if let Err(e) = restored {
+        return ConfirmOutcome::Failed(e.to_string());
+    }
+    let rto = match connection_info(sock.as_raw_fd()) {
+        Ok(i) => Duration::from_millis(u64::from(i.rto_ms)),
+        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+    };
+    let wait = (rto + rtt * 2 + Duration::from_millis(250))
+        .clamp(Duration::from_millis(500), Duration::from_secs(4));
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let state = match connection_info(sock.as_raw_fd()) {
+            Ok(i) => i.state,
+            Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+        };
+        if let Some(done) = fin_after_control(state) {
+            return done;
+        }
+        if std::time::Instant::now() >= deadline {
+            return fin_after_control_deadline(state);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// macOS: what the check connection's state decides once the default hop limit is restored
+/// ([`positive_control`]): the FIN acknowledged (`FIN_WAIT_2`, `TIME_WAIT`) only now is far;
+/// still unacknowledged (`FIN_WAIT_1`, `CLOSING`) decides nothing yet; the peer closed or reset
+/// the connection: a failure.
+#[cfg(target_os = "macos")]
+fn fin_after_control(state: u8) -> Option<ConfirmOutcome> {
+    match fin_step(state)? {
+        ConfirmOutcome::Answered => Some(ConfirmOutcome::Unanswered),
+        other => Some(other),
+    }
+}
+
+/// macOS: the state when the positive control's time is up: a FIN acknowledged at no hop limit
+/// (or a peer that closed on its own meanwhile) cannot tell how near the peer is: a failure,
+/// never far.
+#[cfg(target_os = "macos")]
+fn fin_after_control_deadline(state: u8) -> ConfirmOutcome {
+    match state {
+        TCPS_FIN_WAIT_1 => ConfirmOutcome::Failed(
+            "the peer acknowledged the check connection's FIN neither within the hop limit nor \
+             at the default one, so the check cannot tell how near it is"
+                .into(),
+        ),
+        other => ConfirmOutcome::Failed(peer_closed_first(match other {
+            TCPS_CLOSING => TCPS_LAST_ACK,
+            o => o,
+        })),
     }
 }
 
@@ -587,6 +691,8 @@ struct ConnectionInfo {
     /// `tcpi_rttcur`, `tcpi_srtt`: the last and the smoothed round trip, in milliseconds.
     rttcur_ms: u32,
     srtt_ms: u32,
+    /// `tcpi_rto`: the retransmission timeout, in milliseconds.
+    rto_ms: u32,
 }
 
 /// The bytes of a `tcp_connection_info` that must have been written for [`ConnectionInfo`] to be
@@ -614,6 +720,7 @@ fn connection_info_fields(i: &libc::tcp_connection_info, len: usize) -> io::Resu
         state: i.tcpi_state,
         rttcur_ms: i.tcpi_rttcur,
         srtt_ms: i.tcpi_srtt,
+        rto_ms: i.tcpi_rto,
     })
 }
 
@@ -840,11 +947,13 @@ mod tests {
         assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_state), 0);
         assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_rttcur), 40);
         assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_srtt), 44);
+        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_rto), 12);
         assert_eq!(CONNECTION_INFO_NEEDED, 48);
         // SAFETY: plain integers.
         let mut i: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
         i.tcpi_state = 4;
         i.tcpi_srtt = 7;
+        i.tcpi_rto = 9;
         let size = std::mem::size_of::<libc::tcp_connection_info>();
         for len in [48, 112, size] {
             assert_eq!(
@@ -852,7 +961,8 @@ mod tests {
                 ConnectionInfo {
                     state: 4,
                     rttcur_ms: 0,
-                    srtt_ms: 7
+                    srtt_ms: 7,
+                    rto_ms: 9
                 }
             );
         }
@@ -949,6 +1059,140 @@ mod tests {
             "{o:?}"
         );
         assert!(matches!(peer_closed_first(TCPS_CLOSE_WAIT), w if w.contains("closed")));
+    }
+
+    /// Review round 3, cross-1 (mutant X30): a connect whose `poll` reports a hang-up or an error
+    /// with no error set is a failed probe, never an unreachable (far); a pending error is that
+    /// error; neither is connected.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_hang_up_without_an_error_is_a_failed_probe_on_macos() {
+        for ev in [libc::POLLHUP, libc::POLLERR, libc::POLLHUP | libc::POLLOUT] {
+            let r = connect_result(ev, Ok(None));
+            let o = ProbeOutcome::of(r);
+            assert!(matches!(o, ProbeOutcome::Failed(_)), "{ev}: {o:?}");
+            assert!(matches!(o.verdict(), Verdict::Failed(_)));
+        }
+        let e = || io::Error::from_raw_os_error(libc::EHOSTUNREACH);
+        assert_eq!(
+            ProbeOutcome::of(connect_result(libc::POLLHUP, Ok(Some(e())))),
+            ProbeOutcome::Unreachable
+        );
+        assert_eq!(
+            ProbeOutcome::of(connect_result(libc::POLLOUT, Ok(Some(e())))),
+            ProbeOutcome::Unreachable
+        );
+        assert_eq!(
+            ProbeOutcome::of(connect_result(
+                libc::POLLHUP,
+                Err(io::Error::from_raw_os_error(libc::ECONNREFUSED))
+            )),
+            ProbeOutcome::Refused
+        );
+        assert_eq!(
+            ProbeOutcome::of(connect_result(libc::POLLOUT, Ok(None))),
+            ProbeOutcome::Connected
+        );
+    }
+
+    /// Review round 3, cross-1 (mutant X37; the reviewer's `x37_test.rs`): the real probe's own
+    /// timeout (`poll` returning 0) is no answer (a check connection follows), never unreachable
+    /// (far). TEST-NET-1 is routed out the default route and answered by nothing. Skipped when
+    /// the probe fails here (no default route).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_silent_destination_is_no_answer_to_the_real_probe_on_macos() {
+        let dst: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let o = TtlProbe.probe(dst, 64, Duration::from_millis(400));
+        eprintln!("{dst}: {o:?}");
+        if matches!(o, ProbeOutcome::Failed(_)) {
+            crate::skipped(format!("the probe of {dst} failed here: {o:?}"));
+            return;
+        }
+        assert_eq!(o, ProbeOutcome::TimedOut);
+        assert_eq!(o.verdict(), Verdict::Undecided);
+    }
+
+    /// Review round 3, probe-1: a FIN unacknowledged within the hop limit is far only if the
+    /// peer acknowledges it once the default hop limit is restored (the positive control); a FIN
+    /// acknowledged at no hop limit, and a peer that closes or resets meanwhile, is a failure,
+    /// never far.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_fin_acknowledged_at_no_hop_limit_is_never_far_on_macos() {
+        for acked in [TCPS_FIN_WAIT_2, TCPS_TIME_WAIT] {
+            assert_eq!(fin_after_control(acked), Some(ConfirmOutcome::Unanswered));
+        }
+        assert_eq!(fin_after_control(TCPS_FIN_WAIT_1), None);
+        assert_eq!(fin_after_control(TCPS_CLOSING), None);
+        for state in [
+            TCPS_CLOSED,
+            TCPS_CLOSE_WAIT,
+            TCPS_LAST_ACK,
+            TCPS_ESTABLISHED,
+        ] {
+            assert!(
+                matches!(fin_after_control(state), Some(ConfirmOutcome::Failed(_))),
+                "{state}"
+            );
+        }
+        for state in [TCPS_FIN_WAIT_1, TCPS_CLOSING, TCPS_CLOSED] {
+            let o = fin_after_control_deadline(state);
+            assert!(matches!(o, ConfirmOutcome::Failed(_)), "{state}: {o:?}");
+            assert!(matches!(o.verdict(), Verdict::Failed(_)));
+        }
+        assert!(matches!(
+            fin_after_control_deadline(TCPS_FIN_WAIT_1),
+            ConfirmOutcome::Failed(w) if w.contains("neither within the hop limit nor")
+        ));
+    }
+
+    /// Review round 3, probe-1, live: AWS S3's front ends never acknowledge a bare FIN, at any
+    /// hop limit (`r3-probe/finack-s3.log`), so the check connection read them as far at any
+    /// distance; with the positive control they are a failed check (refused when the probe had no
+    /// answer: the cost, docs/netguard-macos.md). Skipped when S3 cannot be reached, or when it
+    /// now acknowledges a bare FIN at the default hop limit.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peer_that_never_acknowledges_a_fin_is_not_far_on_macos() {
+        use std::net::ToSocketAddrs;
+        use std::os::fd::AsRawFd;
+        let Some(addr) = ("s3.amazonaws.com", 443)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut a| a.find(SocketAddr::is_ipv4))
+        else {
+            crate::skipped("s3.amazonaws.com does not resolve here");
+            return;
+        };
+        // Does it acknowledge a bare FIN at the default hop limit within 2 s?
+        let Ok(c) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
+            crate::skipped(format!("{addr} unreachable here"));
+            return;
+        };
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let t = std::time::Instant::now();
+        let mut acked = false;
+        while t.elapsed() < Duration::from_secs(2) && !acked {
+            acked = matches!(
+                connection_info(c.as_raw_fd()).map(|i| i.state),
+                Ok(TCPS_FIN_WAIT_2 | TCPS_TIME_WAIT)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(c);
+        if acked {
+            crate::skipped(format!("{addr} now acknowledges a bare FIN"));
+            return;
+        }
+        let o = TtlProbe.confirm(addr, 2, Duration::from_secs(5));
+        eprintln!("{addr}, hop limit 2: {o:?}");
+        if let ConfirmOutcome::ConnectFailed(e) = &o {
+            crate::skipped(format!("{addr} unreachable here: {e}"));
+            return;
+        }
+        assert!(matches!(o, ConfirmOutcome::Failed(_)), "{o:?}");
+        assert_ne!(o.verdict(), Verdict::Far);
     }
 
     /// probe-1, live: a loopback peer that closes, or resets, each connection as soon as it
