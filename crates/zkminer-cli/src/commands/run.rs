@@ -88,6 +88,15 @@ const HOST_MEMORY_BACKOFF_SECS: u64 = 15;
 /// flight, bounded so a permanently short host cannot hold a claim until its deadline.
 const MAX_HOST_MEMORY_WAITS: u32 = 20;
 
+/// The longest a job waits for host memory in all (`MAX_HOST_MEMORY_WAITS` backoffs): its waits
+/// are bounded by the clock, since a wake-up (`MEMORY_RELEASED`) ends one early. Counting them let
+/// a run of wake-ups spend all 20 in well under a second.
+const HOST_MEMORY_WAIT_LIMIT: Duration =
+    Duration::from_secs(MAX_HOST_MEMORY_WAITS as u64 * HOST_MEMORY_BACKOFF_SECS);
+
+/// The least time between two tries for host memory, however soon a wake-up comes.
+const HOST_MEMORY_MIN_RETRY: Duration = Duration::from_secs(2);
+
 /// How long to wait before retrying a job refused because the card's VRAM is held — by another
 /// process, or by one of our own workers of the other backend that could not be recycled to make room
 /// (its slot was busy, or its memory had not come back yet).
@@ -3440,6 +3449,7 @@ pub async fn run(
     // Each card's SP1 shard-size cap, recorded when a job that ran out of GPU memory there
     // proved at a smaller size.
     pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
+    pool.use_host_peaks(zkminer_prover::host_peaks::default_path());
     // Watch-only proves nothing, and only measures what this build serves: no worker for another
     // backend (SP1's has host-wide startup effects: it installs its bundled `sp1-gpu-server` and
     // reaps orphaned servers' sockets, beside whatever miner runs on this host).
@@ -6062,6 +6072,19 @@ fn retry_pin_after(
         Some((slot, _)) if !refused_before_start && used_slot == Some(slot.as_str()) => None,
         pin => pin,
     }
+}
+
+/// The benchmark's fastest card (its device id, e.g. "gpu0") for `backend`, if it measured one.
+fn fastest_benchmarked_device(
+    suite: &zkminer_prover::benchmark::BenchmarkSuite,
+    backend: &str,
+) -> Option<String> {
+    suite
+        .device_benchmarks
+        .iter()
+        .filter(|d| d.prover_backend == backend && d.throughput.is_finite() && d.throughput > 0.0)
+        .max_by(|a, b| a.throughput.total_cmp(&b.throughput))
+        .map(|d| d.device_id.clone())
 }
 
 /// The card an attempt prefers: the one an SP1 retry is pinned to (`retry_pin_after`), else the
@@ -11457,6 +11480,21 @@ async fn process_job_lifecycle(
     // MEASURED count — not the adversarial declared `expected_cycles`. See `prove_sizing_cycles`.
     let sizing_cycles: u64 = prove_sizing_cycles(snapshot.expected_cycles, snapshot.measured_cycles);
 
+    // A job re-driven at start (recovery) was never planned this run: prefer its backend's fastest
+    // card, from the benchmark, as the planner would have. Without it, a 1.1 B-cycle job kept over a
+    // restart went to the first free card, a 4070, and took 28 minutes while the 5090 sat idle.
+    let mut snapshot = snapshot;
+    if is_recovery && snapshot.preferred_device.is_none() {
+        let backend_name = backend.to_string();
+        snapshot.preferred_device = tokio::task::spawn_blocking(move || {
+            zkminer_prover::benchmark::load_cached_benchmark()
+                .and_then(|suite| fastest_benchmarked_device(&suite, &backend_name))
+        })
+        .await
+        .ok()
+        .flatten();
+    }
+
     // No VRAM floor up front, however long the job: both zkVMs prove in fixed-size pieces (risc0
     // segments at the card's po2, SP1 shards at its threshold), so a card's VRAM need does not grow
     // with the cycle count, and the dispatcher already gates each card on the room its size needs.
@@ -11512,6 +11550,8 @@ async fn process_job_lifecycle(
         // Free host-RAM waits used by this job. Bounded separately from `attempt`, because a wait
         // deliberately refunds the attempt it would otherwise have spent.
         let mut memory_waits = 0u32;
+        // When this job first waited for host memory: its waits end `HOST_MEMORY_WAIT_LIMIT` after.
+        let mut memory_wait_since: Option<std::time::Instant> = None;
         // Free VRAM waits, counted separately from `memory_waits`: the two shortages have different
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
@@ -12028,17 +12068,21 @@ async fn process_job_lifecycle(
                         // attempt means `MAX_PROVE_ATTEMPTS` no longer bounds anything by itself:
                         // an alternating health-fail / shortage sequence refunds each increment the
                         // health-fail spends, so without this cap the only bound was the deadline.
-                        if !shortage.attempted && memory_waits < MAX_HOST_MEMORY_WAITS {
+                        let waited = memory_wait_since
+                            .get_or_insert_with(std::time::Instant::now)
+                            .elapsed();
+                        if !shortage.attempted && waited < HOST_MEMORY_WAIT_LIMIT {
                             memory_waits += 1;
                             attempt = attempt.saturating_sub(1);
                             tracing::warn!(
                                 "{} is waiting for host RAM, not failing: {msg}. Retrying the same \
-                                 slot in {}s (wait {}/{}); the deadline budget decides when to give \
-                                 up.",
+                                 slot in {}s at most (waited {}s of {}s, try {}); the deadline \
+                                 budget decides when to give up.",
                                 short_id(job_id),
                                 HOST_MEMORY_BACKOFF_SECS,
+                                waited.as_secs(),
+                                HOST_MEMORY_WAIT_LIMIT.as_secs(),
                                 memory_waits,
-                                MAX_HOST_MEMORY_WAITS,
                             );
                             state.write().await.set_job_note(
                                 job_id,
@@ -12047,9 +12091,15 @@ async fn process_job_lifecycle(
                             );
                             // Until memory is given back, or the backoff at most: a release is a
                             // wake-up, not a promise, and one before this wait began is missed.
+                            let began = std::time::Instant::now();
                             let _ = tokio::time::timeout(
                                 Duration::from_secs(HOST_MEMORY_BACKOFF_SECS),
                                 zkminer_prover::memory::MEMORY_RELEASED.notified(),
+                            )
+                            .await;
+                            // Not straight back: a wake-up is often one of several releases.
+                            tokio::time::sleep(
+                                HOST_MEMORY_MIN_RETRY.saturating_sub(began.elapsed()),
                             )
                             .await;
                             continue;
@@ -12066,6 +12116,8 @@ async fn process_job_lifecycle(
                             },
                         );
                         if attempt < MAX_PROVE_ATTEMPTS {
+                            // Give memory a backoff to come back before the next real attempt.
+                            tokio::time::sleep(Duration::from_secs(HOST_MEMORY_BACKOFF_SECS)).await;
                             continue;
                         }
                         // A proof OOM-killed mid-run is a failure after a clean measurement like any
@@ -12088,6 +12140,15 @@ async fn process_job_lifecycle(
                     // largest card and set a VRAM floor, and panicking with "proof is invalid"
                     // suppressed the slot exclusion so the retry landed straight back on the card
                     // that had just failed. `ErrorKind` is set by the worker about itself.
+                    // The workers are being shut down (the miner is stopping): this attempt was
+                    // stopped, not failed. No retry, no card excluded, nothing counted against the
+                    // card or the job; a kept lock is proved again by the next start.
+                    if pool.is_closing() {
+                        return Err(anyhow::anyhow!(
+                            "proving stopped for {}: the miner is shutting its workers down",
+                            short_id(job_id)
+                        ));
+                    }
                     let worker_err =
                         e.downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>();
                     // A programId/vkey mismatch is PERMANENT for this program: the served ELF's

@@ -2707,6 +2707,8 @@ pub struct WorkerPool {
     learned_peaks: Mutex<HashMap<String, crate::memory::LearnedPeaks>>,
     /// The same for COMMIT (Windows, `memory::CommitFigures`): what the slot's proofs committed.
     learned_commit: Mutex<HashMap<String, crate::memory::LearnedPeaks>>,
+    /// Where the learned figures are kept across runs (`use_host_peaks`), when they are.
+    host_peaks_path: Option<PathBuf>,
     /// Commit in-flight proofs have laid claim to (Windows; `reserve_commit`), beside the RAM ones in
     /// `memory_ledger`.
     commit_ledger: crate::memory::MemoryLedger,
@@ -2883,6 +2885,7 @@ impl WorkerPool {
             expected_peaks: Mutex::new(HashMap::new()),
             learned_peaks: Mutex::new(HashMap::new()),
             learned_commit: Mutex::new(HashMap::new()),
+            host_peaks_path: None,
             commit_ledger: crate::memory::MemoryLedger::default(),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
@@ -2916,6 +2919,71 @@ impl WorkerPool {
             survey_gpus: Vec::new(),
             survey_searched: Vec::new(),
             setup_status: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Keep the learned host-memory figures in `path` (`host_peaks`): loaded now, so a restart
+    /// charges each card what its proofs took, and written whenever one changes.
+    pub fn use_host_peaks(&mut self, path: PathBuf) {
+        let cards = crate::host_peaks::load(&path);
+        {
+            let mut ram = self.learned_peaks.lock().unwrap_or_else(|e| e.into_inner());
+            let mut commit = self
+                .learned_commit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (card, figures) in cards {
+                if !figures.ram.is_empty() {
+                    ram.insert(card.clone(), figures.ram);
+                }
+                if !figures.commit.is_empty() {
+                    commit.insert(card, figures.commit);
+                }
+            }
+        }
+        self.host_peaks_path = Some(path);
+    }
+
+    /// The key a slot's learned figures are kept under: its zkVM and its card's PCI bus id
+    /// (`"sp1@0000:01:00.0"`), which a restart finds again; the slot key when the bus id is unknown.
+    fn learn_key(&self, key: &str) -> String {
+        let backend = key.split(':').next().unwrap_or(key);
+        match self.workers.get(key).and_then(|e| e.pci_bus_id.as_deref()) {
+            Some(bus) => format!("{backend}@{bus}"),
+            None => key.to_string(),
+        }
+    }
+
+    /// Write the learned figures to their file (`use_host_peaks`), if one is kept.
+    fn save_host_peaks(&self) {
+        let Some(path) = &self.host_peaks_path else {
+            return;
+        };
+        let mut cards: HashMap<String, crate::host_peaks::Card> = HashMap::new();
+        for (card, ram) in self
+            .learned_peaks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            cards.entry(card.clone()).or_default().ram = ram.clone();
+        }
+        for (card, commit) in self
+            .learned_commit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            cards.entry(card.clone()).or_default().commit = commit.clone();
+        }
+        for (card, figures) in cards.iter_mut() {
+            figures.card = card.clone();
+        }
+        if let Err(e) = crate::host_peaks::save(path, &cards) {
+            tracing::warn!(
+                "could not keep the learned host-memory figures in {}: {e}",
+                path.display()
+            );
         }
     }
 
@@ -7218,7 +7286,7 @@ impl WorkerPool {
             .learned_peaks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(key)
+            .get(&self.learn_key(key))
             .and_then(|learned| {
                 crate::memory::learned_host_peak(
                     learned,
@@ -7255,7 +7323,7 @@ impl WorkerPool {
             .learned_commit
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(key)
+            .get(&self.learn_key(key))
             .and_then(|learned| crate::memory::learned_host_peak(learned, po2, total));
         learned.unwrap_or_else(|| {
             let base = crate::memory::unmeasured_commit_for(backend);
@@ -7275,17 +7343,34 @@ impl WorkerPool {
             .unwrap_or_else(|| crate::memory::unmeasured_commit_for(backend))
     }
 
-    /// Drop what `key`'s proofs were learned to take: one ran the host out of memory, so the figure
-    /// did not cover it, and its next proofs are charged the published one until one succeeds.
-    fn forget_learned_host_peak(&self, key: &str) {
-        self.learned_peaks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
-        self.learned_commit
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+    /// A proof at `po2` on `key` ran the host out of memory, so what its card was learned to take did
+    /// not cover it: raise the figure, never lower it. Each measure goes to the larger of an eighth
+    /// above what was learned and the published figure. Dropping it instead charged an SP1 card
+    /// that had just run short its 40 GiB default, below the 41.6 GiB it had learned.
+    fn raise_learned_after_shortage(&self, key: &str, po2: Option<u8>) {
+        let backend = key.split(':').next().unwrap_or(key);
+        let card = self.learn_key(key);
+        let at = po2.unwrap_or(crate::memory::BASELINE_PO2);
+        let commit_published = {
+            let base = crate::memory::unmeasured_commit_for(backend);
+            po2.map_or(base, |p| crate::memory::peak_for_po2(base, p))
+        };
+        for (learned, published) in [
+            (
+                &self.learned_peaks,
+                self.published_host_peak_at_po2(backend, po2),
+            ),
+            (&self.learned_commit, commit_published),
+        ] {
+            let mut learned = learned.lock().unwrap_or_else(|e| e.into_inner());
+            let peak = learned
+                .entry(card.clone())
+                .or_default()
+                .entry(at)
+                .or_insert(0);
+            *peak = (*peak / 8 * 9).max(published);
+        }
+        self.save_host_peaks();
     }
 
     /// What the IDLE workers have COMMITTED (Windows): for the pressure check, as
@@ -7494,18 +7579,23 @@ impl WorkerPool {
         if !cfg!(windows) {
             return;
         }
+        let card = self.learn_key(key);
+        let mut changed = false;
         if let Some(commit) = commit {
-            crate::memory::note_learned_peak(
+            changed |= crate::memory::note_learned_peak(
                 self.learned_commit
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .entry(key.to_string())
+                    .entry(card.clone())
                     .or_default(),
                 po2,
                 commit,
             );
         }
         let Some(peak) = peak else {
+            if changed {
+                self.save_host_peaks();
+            }
             return;
         };
         let before = self.slot_host_peak(key, po2);
@@ -7513,11 +7603,14 @@ impl WorkerPool {
             self.learned_peaks
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry(key.to_string())
+                .entry(card)
                 .or_default(),
             po2,
             peak,
         );
+        if rose || changed {
+            self.save_host_peaks();
+        }
         let after = self.slot_host_peak(key, po2);
         if rose && after != before {
             const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -8432,8 +8525,38 @@ impl WorkerPool {
         self.reserve_host_memory(want, key)
     }
 
-    /// The commit half of `backend_fits_for_claim` (Windows; `reserve_commit`): `concurrent` proofs
-    /// of `backend`'s commit figure at `po2` (as the RAM half charges) fit what can ever be
+    /// How many proofs can run at once, for a claim's set (`memory::claim_set_bytes`): one per card
+    /// with a worker, no more than `max_concurrent`; `max_concurrent` when no card is known.
+    fn claim_slots(&self, max_concurrent: usize) -> usize {
+        let mut cards: Vec<&str> = self
+            .workers
+            .values()
+            .filter_map(|e| e.pci_bus_id.as_deref())
+            .collect();
+        cards.sort_unstable();
+        cards.dedup();
+        match cards.len() {
+            0 => max_concurrent.max(1),
+            n => n.min(max_concurrent.max(1)),
+        }
+    }
+
+    /// The backends with a worker here other than `backend`.
+    fn other_backends(&self, backend: &str) -> Vec<String> {
+        let mut others: Vec<String> = self
+            .workers
+            .keys()
+            .filter_map(|k| k.split(':').next())
+            .filter(|b| *b != backend)
+            .map(str::to_string)
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        others
+    }
+
+    /// The commit half of `backend_fits_for_claim` (Windows; `reserve_commit`): the claim's set
+    /// (`memory::claim_set_bytes`) of commit figures at `po2` (as the RAM half charges) fits what can ever be
     /// committed, one more fits what may still be, counting idle workers of other backends as
     /// recycled and, for a first claim (`credit_resident`), what this backend's warmest worker
     /// already holds, and the RAM still to come (`ram_want` with the proofs' in flight) plus the
@@ -8442,7 +8565,8 @@ impl WorkerPool {
     fn commit_fits_for_claim(
         &self,
         backend: &str,
-        concurrent: u64,
+        // The outstanding jobs of this backend and of others, and how many proofs run at once.
+        (same, other, slots): (usize, usize, usize),
         credit_resident: bool,
         po2: Option<u8>,
         ram_want: u64,
@@ -8452,7 +8576,14 @@ impl WorkerPool {
         };
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         let want = self.backend_commit_peak_in(backend, po2, figures.total);
-        if want.saturating_mul(concurrent).saturating_add(reserve) > figures.total {
+        let other_peak = self
+            .other_backends(backend)
+            .iter()
+            .map(|b| self.backend_commit_peak_in(b, None, figures.total))
+            .max()
+            .unwrap_or(0);
+        let set = crate::memory::claim_set_bytes(want, same, other, other_peak, slots);
+        if set.saturating_add(reserve) > figures.total {
             return false;
         }
         // Dispatch's host rule (`reserve_commit`): the RAM still to come, this proof's included,
@@ -8563,16 +8694,30 @@ impl WorkerPool {
             return true;
         };
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
-        // How many of this backend's proofs could be running at once if we take this one.
-        let concurrent = outstanding.saturating_add(1).min(max_concurrent.max(1)) as u64;
-        let committed = expected_peak.saturating_mul(concurrent);
+        // The set of proofs that could run at once if we take this one: it, and the largest of the
+        // outstanding, as many as the cards (and the concurrency limit) run (`claim_set_bytes`).
+        let slots = self.claim_slots(max_concurrent);
+        let other = outstanding.saturating_sub(same_backend_outstanding);
+        let other_peak = self
+            .other_backends(backend)
+            .iter()
+            .map(|b| self.backend_host_peak(b, None))
+            .max()
+            .unwrap_or(0);
+        let committed = crate::memory::claim_set_bytes(
+            expected_peak,
+            same_backend_outstanding,
+            other,
+            other_peak,
+            slots,
+        );
         if committed.saturating_add(reserve) > total {
             return false;
         }
         // Windows: commit too, as dispatch will test it (`reserve_commit`).
         if !self.commit_fits_for_claim(
             backend,
-            concurrent,
+            (same_backend_outstanding, other, slots),
             same_backend_outstanding == 0,
             po2,
             expected_peak,
@@ -10100,7 +10245,11 @@ impl WorkerPool {
         let _memory_reservation = match self.reserve_commit(key, po2, abort_at, want) {
             Ok(Some(commit)) => _memory_reservation.pair(commit),
             Ok(None) => _memory_reservation,
-            Err(shortage) => return Err(anyhow::Error::new(shortage)),
+            Err(shortage) => {
+                // Nothing ran: no waiter is woken by the RAM given back (`release_quietly`).
+                _memory_reservation.release_quietly();
+                return Err(anyhow::Error::new(shortage));
+            }
         };
 
         self.ensure_alive(&mut slot, entry)?;
@@ -10323,7 +10472,7 @@ impl WorkerPool {
                     );
                 }
                 // As below: the card's learned figure did not cover this job.
-                self.forget_learned_host_peak(key);
+                self.raise_learned_after_shortage(key, po2);
                 Self::mark_slot_dead(&mut slot, entry);
             } else {
                 Self::mark_slot_failed(&mut slot, entry);
@@ -10445,7 +10594,7 @@ impl WorkerPool {
                     );
                     // The card's figure did not cover this job: charge its next proofs the
                     // published one until a proof there succeeds again.
-                    self.forget_learned_host_peak(key);
+                    self.raise_learned_after_shortage(key, po2);
                     entry.clear_pid();
                     if let Some(h) = slot.handle.as_mut() {
                         h.kill();
@@ -10858,6 +11007,12 @@ impl WorkerPool {
     pub fn close(&self) {
         self.closing.store(true, Ordering::SeqCst);
         self.shutdown_all();
+    }
+
+    /// Whether the workers are being shut down for good (`close`): a proof that fails now failed
+    /// because its worker was stopped, not because of the job or the card.
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
     }
 
     /// Shutdown all workers.
@@ -15783,12 +15938,18 @@ mod learned_host_peak_tests {
             pool.backend_commit_peak_in("risc0", Some(19), total),
             learned.max(default(Some(19)))
         );
-        // Forgetting a card drops both measures.
-        pool.forget_learned_host_peak("risc0:cuda:1");
-        assert_eq!(
-            pool.slot_commit_peak("risc0:cuda:1", Some(19)),
-            default(Some(19))
+        // A proof that ran the host short raises the card's charge, never lowers it: an eighth above
+        // what was learned, and no less than the published figure.
+        let before = pool.slot_commit_peak("risc0:cuda:1", Some(19));
+        pool.raise_learned_after_shortage("risc0:cuda:1", Some(19));
+        let after = pool.slot_commit_peak("risc0:cuda:1", Some(19));
+        assert!(after >= default(Some(19)), "{after} < the published figure");
+        assert!(
+            after > before || before == crate::memory::max_admissible_budget(total),
+            "{after} did not rise from {before}"
         );
+        pool.raise_learned_after_shortage("risc0:cuda:1", Some(19));
+        assert!(pool.slot_commit_peak("risc0:cuda:1", Some(19)) >= after);
     }
 
     /// The prove path holds the commit reservation with the RAM one, after it and before the
