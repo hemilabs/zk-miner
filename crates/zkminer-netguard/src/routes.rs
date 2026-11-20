@@ -954,6 +954,19 @@ pub(crate) fn read_links() -> std::io::Result<Vec<Link>> {
     sys::links()
 }
 
+/// Linux: every interface's carrier changes (`IFLA_CARRIER_CHANGES`: up and down counted), as the
+/// last [`read_links`] read them.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static CARRIER_CHANGES: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Linux: per interface, how many times its carrier went up or down, as the last [`read_links`]
+/// read it (review round 6, bypass-2 = cross-5: a move goes with a link that went down, which the
+/// uplink signature now sees even when the new network is numbered like the old).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn carrier_changes() -> Vec<(u32, u32)> {
+    CARRIER_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// One entry of the kernel's neighbour table (ARP, NDP): the interface, the neighbour's address,
 /// and its link-layer address when the entry holds a usable one (`None`: the entry is incomplete,
 /// failed, or names none).
@@ -1874,11 +1887,30 @@ mod sys {
         Ok(())
     }
 
-    /// Every network interface and its kind: an `RTM_GETLINK` dump (unprivileged).
+    /// Every network interface and its kind: an `RTM_GETLINK` dump (unprivileged). Each one's
+    /// `IFLA_CARRIER_CHANGES` is kept for [`super::carrier_changes`].
     pub(super) fn links() -> io::Result<Vec<Link>> {
         // `struct ifinfomsg`: family (AF_UNSPEC), pad, type, index, flags, change.
         let hdr = [0u8; IFINFOMSG_LEN];
-        dump_consistent_with(RTM_GETLINK, RTM_NEWLINK, &hdr, parse_link)
+        let both = dump_consistent_with(RTM_GETLINK, RTM_NEWLINK, &hdr, |p, out| {
+            let mut one = Vec::new();
+            parse_link(p, &mut one)?;
+            let changes = carrier_changes_of(p);
+            out.extend(one.into_iter().map(|l| (l, changes)));
+            Ok(())
+        })?;
+        *super::CARRIER_CHANGES.lock().unwrap_or_else(|e| e.into_inner()) =
+            both.iter().filter_map(|(l, c)| c.map(|c| (l.index, c))).collect();
+        Ok(both.into_iter().map(|(l, _)| l).collect())
+    }
+
+    /// `IFLA_CARRIER_CHANGES` of one `RTM_NEWLINK` (Linux 3.15 and later), if it says.
+    pub(super) fn carrier_changes_of(p: &[u8]) -> Option<u32> {
+        const IFLA_CARRIER_CHANGES: u16 = 35;
+        let a = attrs(p.get(IFINFOMSG_LEN..)?).ok()?;
+        a.into_iter()
+            .find(|(t, d)| *t == IFLA_CARRIER_CHANGES && d.len() >= 4)
+            .and_then(|(_, d)| u32_at(d, 0))
     }
 
     /// One `RTM_NEWLINK`: its index, `IFLA_IFNAME`, and `IFLA_INFO_KIND` inside `IFLA_LINKINFO`.
@@ -2941,6 +2973,22 @@ mod sys {
             // A source of the other family is never sent.
             let v6 = request_body("2606:4700::1".parse().unwrap(), Some(src), Some(80), true);
             assert_eq!(v6[2], 0);
+        }
+
+        /// Review round 6: a link message's `IFLA_CARRIER_CHANGES` (35) is read; one without it
+        /// says nothing; a short one is not read.
+        #[test]
+        fn r6_carrier_changes_are_read() {
+            let mut p = vec![0u8; IFINFOMSG_LEN];
+            p[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            p.extend(attr(IFLA_IFNAME, b"eth0\0"));
+            assert_eq!(carrier_changes_of(&p), None);
+            p.extend(attr(35, &9u32.to_ne_bytes()));
+            assert_eq!(carrier_changes_of(&p), Some(9));
+            let mut short = vec![0u8; IFINFOMSG_LEN];
+            short.extend(attr(35, &[1, 2]));
+            assert_eq!(carrier_changes_of(&short), None);
+            assert_eq!(carrier_changes_of(&[0u8; 4]), None);
         }
 
         /// Link messages parse to their index, name and kind (inside `IFLA_LINKINFO`).

@@ -1016,7 +1016,7 @@ fn check_rto(before: Duration, after: Option<Duration>) -> Duration {
 }
 
 /// The RTO the last check connection used, in milliseconds (tests).
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos")))]
 static LAST_RTO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The longest the check connection may wait for the decision ([`Check`]); a path whose round
@@ -2769,7 +2769,7 @@ mod r6_tests {
                 std::thread::spawn(move || {
                     decide_remembered(Some(key), Instant::now() + Duration::from_secs(5), || {
                         ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Verdict::Near("answered".into())
+                        Verdict::Near("answered")
                     })
                 })
             })
