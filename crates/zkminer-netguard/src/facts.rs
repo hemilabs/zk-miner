@@ -488,22 +488,20 @@ fn default_path_known(
 /// network, or of a network the guard cannot judge).
 fn nat64_unsettled_on(
     table: &RouteTable,
+    nexthops: &[crate::routes::Nexthop],
     signature: u64,
     clat: bool,
 ) -> (bool, Option<String>) {
-    use crate::routes::Hop;
     let up = crate::nat64::Uplink {
         signature,
         routed: [table.routes_family(false), table.routes_family(true)],
         clat,
     };
-    let gateways: Vec<(std::net::Ipv6Addr, u32)> = table
-        .routes()
-        .iter()
-        .filter(|r| r.is_default_like() && r.ifindex != 0)
-        .filter_map(|r| match r.hop {
-            Hop::Via(IpAddr::V6(gw)) => Some((gw, r.ifindex)),
-            _ => None,
+    let gateways: Vec<(std::net::Ipv6Addr, u32)> = default_gateways(table, nexthops)
+        .into_iter()
+        .filter_map(|(gw, ifindex)| match gw {
+            IpAddr::V6(gw) => Some((gw, ifindex)),
+            IpAddr::V4(_) => None,
         })
         .collect();
     crate::nat64::on_uplink(signature, &gateways);
@@ -513,11 +511,17 @@ fn nat64_unsettled_on(
 
 /// The signature of the uplink this host is on now ([`uplink_signature`], and what tells two
 /// networks behind the same router address apart): macOS adds the configuration daemon's
-/// network signatures ([`macos_uplink_signature`]), Linux the default gateways' link-layer
-/// addresses ([`MacHistory::signature`]); elsewhere the routes alone. Public-address discovery
-/// and NAT64 discovery both run per signature.
+/// network signatures ([`macos_uplink_signature`]), Linux the addressing of the uplink's
+/// interfaces ([`uplink_addressing`]) and the default gateways' link-layer addresses
+/// ([`MacHistory::signature`]); elsewhere the routes alone. Public-address discovery and NAT64
+/// discovery both run per signature.
 #[cfg(target_os = "macos")]
-fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64> {
+fn host_uplink_signature(
+    table: &RouteTable,
+    internet: &[u32],
+    _addresses: &[IpAddr],
+    _nexthops: &[crate::routes::Nexthop],
+) -> io::Result<u64> {
     let networks = macos_dns::network_signatures()?;
     Ok(macos_uplink_signature(
         uplink_signature(table, internet),
@@ -528,31 +532,42 @@ fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64
 /// See the macOS one. A neighbour table that cannot be read (a dump that is denied, unsupported
 /// or keeps being interrupted: review round 4) does not fail the facts read: every gateway's
 /// link-layer address is then unknown ([`MacHistory::signature`]: the last known one stands, and
-/// with none known every read is an uplink of its own).
+/// with none known the routes and the uplink's addressing decide, warned about once: review
+/// round 5, parse-4).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64> {
+fn host_uplink_signature(
+    table: &RouteTable,
+    internet: &[u32],
+    addresses: &[IpAddr],
+    nexthops: &[crate::routes::Nexthop],
+) -> io::Result<u64> {
     static HISTORY: std::sync::Mutex<MacHistory> = std::sync::Mutex::new(MacHistory::new());
     Ok(linux_signature(
         &mut HISTORY.lock().unwrap_or_else(|e| e.into_inner()),
         table,
         internet,
+        addresses,
+        nexthops,
         crate::routes::read_neighbours(),
-        next_read(),
         Instant::now(),
     ))
 }
 
 /// Linux: [`host_uplink_signature`] with the neighbour table read as `neighbours` (an error
-/// counts as no entry, warned about once), on read `read` at `now`.
+/// counts as no entry, warned about once), at `now`: the routes ([`uplink_signature`]) and the
+/// addressing of the uplink's interfaces ([`uplink_addressing`]) are the base, the gateways'
+/// link-layer addresses tell networks of the same base apart ([`MacHistory::signature`]).
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 fn linux_signature(
     history: &mut MacHistory,
     table: &RouteTable,
     internet: &[u32],
+    addresses: &[IpAddr],
+    nexthops: &[crate::routes::Nexthop],
     neighbours: io::Result<Vec<crate::routes::Neighbour>>,
-    read: u64,
     now: Instant,
 ) -> u64 {
+    use std::hash::{Hash, Hasher};
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let neighbours = neighbours.unwrap_or_else(|e| {
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -563,18 +578,101 @@ fn linux_signature(
         }
         Vec::new()
     });
-    history.signature(
-        uplink_signature(table, internet),
-        &gateway_identities(table, &neighbours),
-        read,
-        now,
-    )
+    let gateways = gateway_identities(table, nexthops, &neighbours);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    uplink_signature(table, internet).hash(&mut h);
+    uplink_addressing(table, internet, addresses, &gateways).hash(&mut h);
+    history.signature(h.finish(), &gateways, now)
 }
 
 /// See the macOS one.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64> {
+fn host_uplink_signature(
+    table: &RouteTable,
+    internet: &[u32],
+    _addresses: &[IpAddr],
+    _nexthops: &[crate::routes::Nexthop],
+) -> io::Result<u64> {
     Ok(uplink_signature(table, internet))
+}
+
+/// The default routes' gateways, each with its interface: a route's own (`Hop::Via` on an
+/// interface), or, for a route through a nexthop object, its gateways
+/// ([`crate::routes::nexthop_gateways`]; review round 5, cross-4: with `nexthop_compat_mode` 0
+/// the dump shows no gateway, and the uplink's gateways were missing from its identities and
+/// from the routers whose PREF64 is heard). Sorted.
+pub(crate) fn default_gateways(
+    routes: &RouteTable,
+    nexthops: &[crate::routes::Nexthop],
+) -> Vec<(IpAddr, u32)> {
+    use crate::routes::Hop;
+    let mut v: Vec<(IpAddr, u32)> = Vec::new();
+    for r in routes.routes().iter().filter(|r| r.is_default_like()) {
+        match r.hop {
+            Hop::Via(gw) if r.ifindex != 0 => v.push((gw, r.ifindex)),
+            _ if r.nexthop != 0 => v.extend(crate::routes::nexthop_gateways(nexthops, r.nexthop)),
+            _ => {}
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Linux: what the uplink's interfaces are numbered with (review round 5, bypass-1): the
+/// prefixes of the on-link routes out of them (every IPv4 one, the global IPv6 ones: a
+/// network's SLAAC or DHCPv6 prefix; never `fe80::/64`, the same everywhere), and the host's IPv4
+/// addresses within those IPv4 prefixes. Two networks whose routers have the same address on the
+/// same interface differ here unless they also number their hosts alike (two home networks on
+/// 192.168.1.0/24 handing out the same address: the gateways' link-layer addresses then tell
+/// them apart, [`MacHistory::signature`]); and these do not depend on the neighbour table. The
+/// uplink's interfaces: those of its default routes and gateways and `internet`. Sorted.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) fn uplink_addressing(
+    table: &RouteTable,
+    internet: &[u32],
+    addresses: &[IpAddr],
+    gateways: &[(IpAddr, u32, Option<Vec<u8>>)],
+) -> Vec<(Prefix, u32, Option<IpAddr>)> {
+    use crate::routes::{Hop, RouteType};
+    let mut uplinks: Vec<u32> = internet.to_vec();
+    uplinks.extend(gateways.iter().map(|g| g.1));
+    uplinks.extend(
+        table
+            .routes()
+            .iter()
+            .filter(|r| r.is_default_like() && r.ifindex != 0)
+            .map(|r| r.ifindex),
+    );
+    let mut v: Vec<(Prefix, u32, Option<IpAddr>)> = Vec::new();
+    for r in table.routes() {
+        if r.hop != Hop::OnLink
+            || r.loopback
+            || r.is_default_like()
+            || r.kind != RouteType::Unicast
+            || !uplinks.contains(&r.ifindex)
+        {
+            continue;
+        }
+        if r.prefix.addr.is_ipv6() {
+            if is_global(r.prefix.addr) {
+                v.push((r.prefix, r.ifindex, None));
+            }
+            continue;
+        }
+        let inside: Vec<IpAddr> = addresses
+            .iter()
+            .copied()
+            .filter(|a| a.is_ipv4() && crate::ip::mask(*a, r.prefix.len) == r.prefix.addr)
+            .collect();
+        if inside.is_empty() {
+            v.push((r.prefix, r.ifindex, None));
+        }
+        v.extend(inside.into_iter().map(|a| (r.prefix, r.ifindex, Some(a))));
+    }
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// macOS: [`uplink_signature`] (`base`) and the network each service is on, as the configuration
@@ -597,33 +695,26 @@ fn macos_uplink_signature(base: u64, networks: &[String]) -> u64 {
 }
 
 /// Linux: the link-layer address of each default gateway, from the neighbour table: for every
-/// default-like route through a gateway, `(gateway, interface, its link-layer address)`, the
-/// address `None` when the table holds no usable entry for that gateway on that interface
-/// (incomplete, failed, garbage-collected, never resolved yet). Sorted.
+/// default gateway ([`default_gateways`], a nexthop object's included), `(gateway, interface,
+/// its link-layer address)`, the address `None` when the table holds no usable entry for that
+/// gateway on that interface (incomplete, failed, garbage-collected, never resolved yet).
+/// Sorted.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 pub(crate) fn gateway_identities(
     routes: &RouteTable,
+    nexthops: &[crate::routes::Nexthop],
     neighbours: &[crate::routes::Neighbour],
 ) -> Vec<(IpAddr, u32, Option<Vec<u8>>)> {
-    use crate::routes::Hop;
-    let mut v: Vec<(IpAddr, u32, Option<Vec<u8>>)> = routes
-        .routes()
-        .iter()
-        .filter(|r| r.is_default_like())
-        .filter_map(|r| match r.hop {
-            Hop::Via(gw) if r.ifindex != 0 => {
-                let lladdr = neighbours
-                    .iter()
-                    .find(|n| n.ifindex == r.ifindex && n.addr == gw)
-                    .and_then(|n| n.lladdr.clone());
-                Some((gw, r.ifindex, lladdr))
-            }
-            _ => None,
+    default_gateways(routes, nexthops)
+        .into_iter()
+        .map(|(gw, ifindex)| {
+            let lladdr = neighbours
+                .iter()
+                .find(|n| n.ifindex == ifindex && n.addr == gw)
+                .and_then(|n| n.lladdr.clone());
+            (gw, ifindex, lladdr)
         })
-        .collect();
-    v.sort();
-    v.dedup();
-    v
+        .collect()
 }
 
 /// Linux: how many reads in a row, and how long, a default gateway must show another
@@ -635,24 +726,30 @@ pub(crate) const MAC_CHANGE_READS: u32 = 3;
 pub(crate) const MAC_CHANGE_HOLD: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Linux: the default gateways' link-layer addresses as the facts reads have seen them, per
-/// [`uplink_signature`] (`base`, the routes; the last few), for [`MacHistory::signature`].
+/// base (the routes and the uplink's addressing; the last few), for [`MacHistory::signature`].
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 #[derive(Debug, Default)]
 pub(crate) struct MacHistory {
     bases: Vec<MacsOf>,
 }
 
+/// One gateway's link-layer address (a gateway: its address and interface).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+type GatewayMac = ((IpAddr, u32), Vec<u8>);
+
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 #[derive(Debug)]
 struct MacsOf {
     base: u64,
-    /// Per gateway (address, interface): the link-layer address known for it.
-    known: Vec<((IpAddr, u32), Vec<u8>)>,
-    /// Per gateway: another address it showed, since when, and on how many reads in a row.
+    /// Per gateway: the link-layer address known for it (the first seen, or the last that held).
+    known: Vec<GatewayMac>,
+    /// Per gateway whose known address changed (and held): the address it changed to. Part of
+    /// the signature (an address first seen is not: it changes nothing).
+    changed: Vec<GatewayMac>,
+    /// Per gateway now showing another address than the known one: the latest it showed, since
+    /// when it has shown other addresses, and on how many reads.
     #[allow(clippy::type_complexity)]
     candidate: Vec<((IpAddr, u32), Vec<u8>, Instant, u32)>,
-    /// How many times a gateway's known address changed: part of the signature.
-    epoch: u64,
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
@@ -661,31 +758,36 @@ impl MacHistory {
         MacHistory { bases: Vec::new() }
     }
 
-    /// Linux: [`uplink_signature`] (`base`) and the default gateways' link-layer addresses
-    /// ([`gateway_identities`]). Two networks whose routers have the same address on the same
-    /// interface (two home networks behind 192.168.1.1) have the same routes, so `base` alone
-    /// cannot tell them apart, and a public address confirmed on the first would stay confirmed on
-    /// the second for up to [`crate::public::DISCOVERY_TTL`]; their routers' link-layer addresses
-    /// differ (review round 2, bypass-2; Linux reads them unprivileged, unlike macOS).
+    /// Linux: the uplink signature for `base` (the routes and the uplink's addressing) and the
+    /// default gateways' link-layer addresses ([`gateway_identities`]). Two networks whose
+    /// routers have the same address on the same interface and whose hosts are numbered alike
+    /// (two home networks behind 192.168.1.1) have the same base; their routers' link-layer
+    /// addresses differ (review round 2, bypass-2; Linux reads them unprivileged, unlike macOS).
     ///
-    /// Review round 4 (cross-2, bypass-3): an entry that goes missing (`ip neigh flush`, a
-    /// `FAILED` or garbage-collected entry, a neighbour table that cannot be read) changes
-    /// nothing: the address known before stands; an address first seen where none was known is
-    /// that gateway's (no change); only another known address than the one known before counts,
-    /// and only once it has held for [`MAC_CHANGE_READS`] reads in a row and [`MAC_CHANGE_HOLD`]
-    /// (an ARP flapper on the LAN, or a short spoof, does not make the guard learn its public
-    /// addresses again on every read). A gateway that shows the known address again clears what
-    /// it showed meanwhile. When no gateway's address has been known under these routes, the
-    /// signature also hashes `read`, a number no other facts read has, so every such read is an
-    /// uplink of its own (never one network for two) until one is known.
+    /// Review round 4 (cross-2): an entry that goes missing (`ip neigh flush`, a `FAILED` or
+    /// garbage-collected entry, a neighbour table that cannot be read) changes nothing; an
+    /// address first seen where none was known is that gateway's (no change).
+    ///
+    /// Review round 5 (bypass-1): another address than the known one is another network at once
+    /// (the signature hashes it): until round 5 the old network's signature stood until the new
+    /// address had held for [`MAC_CHANGE_READS`] reads and [`MAC_CHANGE_HOLD`], and a host that
+    /// flipped the entry between two addresses kept it standing, so on a new network the old
+    /// one's public addresses and NAT64 state counted (macOS changes at once). The debounce now
+    /// only decides when the new address becomes the known one (so that a later flush or the old
+    /// address keep the new network); the old address showing again before that is the old
+    /// network again, and only it resets the debounce (a flapper or a spoof makes the guard
+    /// learn again: it fails closed). Review round 5 (parse-4): with no address known, the base
+    /// alone decides (stable; before, every such read was an uplink of its own, which refused
+    /// every connection for want of a public address, for good).
     pub(crate) fn signature(
         &mut self,
         base: u64,
         gateways: &[(IpAddr, u32, Option<Vec<u8>>)],
-        read: u64,
         now: Instant,
     ) -> u64 {
         use std::hash::{Hash, Hasher};
+        static UNKNOWN_WARNED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         let i = match self.bases.iter().position(|m| m.base == base) {
             Some(i) => i,
             None => {
@@ -695,8 +797,8 @@ impl MacHistory {
                 self.bases.push(MacsOf {
                     base,
                     known: Vec::new(),
+                    changed: Vec::new(),
                     candidate: Vec::new(),
-                    epoch: 0,
                 });
                 self.bases.len() - 1
             }
@@ -710,12 +812,10 @@ impl MacHistory {
                 Some((_, known)) if known == seen => m.candidate.retain(|c| c.0 != key),
                 Some((_, known)) => {
                     let c = match m.candidate.iter_mut().find(|c| c.0 == key) {
-                        Some(c) if c.1 == *seen => {
-                            c.3 += 1;
-                            c
-                        }
                         Some(c) => {
-                            *c = (key, seen.clone(), now, 1);
+                            // The latest address, the time since the first other one.
+                            c.1 = seen.clone();
+                            c.3 += 1;
                             c
                         }
                         None => {
@@ -726,35 +826,51 @@ impl MacHistory {
                     if c.3 >= MAC_CHANGE_READS && now.saturating_duration_since(c.2) >= MAC_CHANGE_HOLD
                     {
                         tracing::info!(
-                            "network guard: default gateway {gw}'s link-layer address changed; \
-                             another network: its public addresses are learned again"
+                            "network guard: default gateway {gw}'s link-layer address changed and \
+                             held; it is the known one from now on"
                         );
                         *known = seen.clone();
-                        m.epoch += 1;
+                        m.changed.retain(|(k, _)| *k != key);
+                        m.changed.push((key, seen.clone()));
                         m.candidate.retain(|c| c.0 != key);
+                    } else if c.3 == 1 {
+                        tracing::info!(
+                            "network guard: default gateway {gw} shows another link-layer \
+                             address; another network until it shows the known one again: its \
+                             public addresses and NAT64 prefixes are learned again"
+                        );
                     }
                 }
             }
         }
         let ids: Vec<(IpAddr, u32)> = gateways.iter().map(|(g, i, _)| (*g, *i)).collect();
+        if !ids.is_empty()
+            && !ids.iter().any(|k| m.known.iter().any(|(kk, _)| kk == k))
+            && !UNKNOWN_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "network guard: no default gateway's link-layer address is in the neighbour table; \
+                 two networks behind the same gateway address are told apart by their routes and \
+                 addressing alone until one is"
+            );
+        }
+        // What tells this network from another of the same base: the gateways' addresses that
+        // changed (and held), and those showing another address now.
+        let mut macs: Vec<GatewayMac> = m
+            .changed
+            .iter()
+            .filter(|(k, _)| !m.candidate.iter().any(|c| c.0 == *k))
+            .cloned()
+            .chain(m.candidate.iter().map(|c| (c.0, c.1.clone())))
+            .filter(|(k, _)| ids.contains(k))
+            .collect();
+        macs.sort();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         base.hash(&mut h);
         ids.hash(&mut h);
-        // Not the addresses themselves: one first seen changes nothing; a change counts
-        // through the epoch.
-        m.epoch.hash(&mut h);
-        if !ids.is_empty() && !ids.iter().any(|k| m.known.iter().any(|(kk, _)| kk == k)) {
-            read.hash(&mut h);
-        }
+        macs.hash(&mut h);
         h.finish()
     }
-}
-
-/// Linux: a number for each facts read ([`MacHistory::signature`]'s `read`).
-#[cfg(any(test, target_os = "linux", target_os = "android"))]
-fn next_read() -> u64 {
-    static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The enclosing /`len` of every global IPv6 address in `own` (`len` clamped to
@@ -1156,7 +1272,12 @@ impl HostFacts {
         };
         let internet_interfaces = crate::routes::internet_interfaces();
         let table = RouteTable::with_rules(routes.clone(), rules.clone());
-        let signature = host_uplink_signature(&table, &internet_interfaces)?;
+        let signature = host_uplink_signature(
+            &table,
+            &internet_interfaces,
+            &interface_addresses,
+            &nexthops,
+        )?;
         // The NAT64 prefixes, learned again whenever the uplink changes (review round 3,
         // bypass-1; every platform since the Linux application); IPv6 destinations are refused
         // on a host with IPv6 and no IPv4 route until the new uplink's round has finished.
@@ -1169,7 +1290,8 @@ impl HostFacts {
             .map(|l| l.name.clone())
             .collect();
         let clat = crate::nat64::clat_in_use(&interface_addresses, &v4_default_interfaces);
-        let (nat64_unsettled, nat64_unheld) = nat64_unsettled_on(&table, signature, clat);
+        let (nat64_unsettled, nat64_unheld) =
+            nat64_unsettled_on(&table, &nexthops, signature, clat);
         let public = if opts.discover_public_addresses {
             // Addresses confirmed under another uplink (a new default gateway, a VPN that came
             // up) are not this one's: discovery runs again, and meanwhile they are not known.
@@ -2806,12 +2928,13 @@ mod tests {
         }
     }
 
-    /// Review round 2, bypass-2, the Linux application, and review round 4 (cross-2, bypass-3):
-    /// two networks behind the same router address on the same interface differ by the router's
-    /// link-layer address in the neighbour table, once it has held; the same router read twice is
-    /// the same uplink; an entry that goes missing, or first appears, changes nothing; an ARP
-    /// flapper changes nothing; with no address ever known every read is an uplink of its own.
-    /// Pure (runs on every platform).
+    /// Review round 2, bypass-2, the Linux application, review round 4 (cross-2, bypass-3) and
+    /// review round 5 (bypass-1, parse-4): two networks behind the same router address on the
+    /// same interface differ by the router's link-layer address in the neighbour table, at once;
+    /// the same router read twice is the same uplink; an entry that goes missing, or first
+    /// appears, changes nothing; another address is another uplink until the known one shows
+    /// again (a flapper never keeps the old one's); once it held it is the known one; with no
+    /// address ever known the routes and addressing decide, stably. Pure (every platform).
     #[test]
     fn two_networks_behind_the_same_router_address_are_two_uplinks_on_linux() {
         use crate::routes::Neighbour;
@@ -2823,7 +2946,7 @@ mod tests {
             Route::via(p("::/0"), gw6, 2),
             Route::on_link(p("192.168.1.0/24"), 2),
         ]);
-        let base = uplink_signature(&table, &[2]);
+        let addrs = [ip("192.168.1.33")];
         let n = |addr: IpAddr, ifindex: u32, ll: Option<&[u8]>| Neighbour {
             ifindex,
             addr,
@@ -2831,52 +2954,58 @@ mod tests {
         };
         let home = [0xa4, 0x2b, 0xb0, 0, 0, 1];
         let cafe = [0x3c, 0x84, 0x6a, 0, 0, 2];
+        let spoof = [0x02, 0, 0, 0, 0, 0x99];
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let at_home = [n(gw, 2, Some(&home)), n(gw6, 2, Some(&home))];
         let at_cafe = [n(gw, 2, Some(&cafe)), n(gw6, 2, Some(&cafe))];
+        let at_spoof = [n(gw, 2, Some(&spoof)), n(gw6, 2, Some(&spoof))];
         let flushed: [Neighbour; 0] = [];
-        let mut h = MacHistory::new();
-        let mut read = 0u64;
-        let mut sig = |h: &mut MacHistory, ns: &[Neighbour], t: u64| {
-            read += 1;
-            h.signature(base, &gateway_identities(&table, ns), read, at(t))
+        let sig = |h: &mut MacHistory, ns: &[Neighbour], t: u64| {
+            linux_signature(h, &table, &[2], &addrs, &[], Ok(ns.to_vec()), at(t))
         };
+        let mut h = MacHistory::new();
         let home_sig = sig(&mut h, &at_home, 0);
-        // Known gateways: the read does not count, the order of the table does not either.
+        // Known gateways: stable, whatever the order of the table.
         assert_eq!(sig(&mut h, &at_home, 100), home_sig);
         let mut reordered = at_home.to_vec();
         reordered.reverse();
         assert_eq!(sig(&mut h, &reordered, 200), home_sig);
-        // cross-2: a flushed table (or one that cannot be read), a FAILED entry, an entry that
-        // comes back: the same uplink.
+        // cross-2: a flushed table, a FAILED entry, an entry that comes back: the same uplink.
         assert_eq!(sig(&mut h, &flushed, 300), home_sig);
         assert_eq!(sig(&mut h, &[n(gw, 2, None), n(gw6, 2, None)], 400), home_sig);
         assert_eq!(sig(&mut h, &[n(gw, 2, Some(&home))], 500), home_sig);
         assert_eq!(sig(&mut h, &at_home, 600), home_sig);
-        // bypass-3: an ARP flapper (the gateway's address alternating), or a spoof shorter than
-        // MAC_CHANGE_READS reads and MAC_CHANGE_HOLD: the same uplink.
-        let seq: [&[Neighbour]; 7] = [&at_cafe, &at_home, &at_cafe, &at_home, &at_cafe, &flushed, &at_home];
-        for (k, ns) in seq
-            .into_iter()
-            .enumerate()
-        {
-            assert_eq!(sig(&mut h, ns, 700 + 1000 * k as u64), home_sig, "{k}");
-        }
-        assert_eq!(sig(&mut h, &at_cafe, 10_000), home_sig);
-        assert_eq!(sig(&mut h, &at_cafe, 10_100), home_sig);
-        assert_eq!(sig(&mut h, &at_cafe, 10_200), home_sig, "3 reads, not yet 2 s");
-        // Another network: another address that holds: another uplink, stable from then on.
-        let cafe_sig = sig(&mut h, &at_cafe, 12_000);
+        // bypass-1: another address is another uplink at once; a flush meanwhile keeps it; the
+        // known one showing again is home again.
+        let cafe_sig = sig(&mut h, &at_cafe, 700);
         assert_ne!(cafe_sig, home_sig);
-        assert_eq!(sig(&mut h, &at_cafe, 12_100), cafe_sig);
-        assert_eq!(sig(&mut h, &flushed, 12_200), cafe_sig);
-        // Back home: another change, another uplink (never the café's).
-        for t in [13_000, 14_000] {
-            assert_eq!(sig(&mut h, &at_home, t), cafe_sig);
+        assert_eq!(sig(&mut h, &flushed, 800), cafe_sig);
+        assert_eq!(sig(&mut h, &at_home, 900), home_sig);
+        // An on-link host flipping the gateway's entry between two addresses (neither known)
+        // never gets the home signature, read after read.
+        for k in 0..60u64 {
+            let ns: &[Neighbour] = if k % 2 == 0 { &at_spoof } else { &at_cafe };
+            assert_ne!(sig(&mut h, ns, 1_000 + 1_000 * k), home_sig, "{k}");
         }
-        let back = sig(&mut h, &at_home, 15_000);
-        assert_ne!(back, cafe_sig);
+        // That held (and the debounce was not reset by the known one): the latest is known now;
+        // home is another change.
+        let last = sig(&mut h, &at_cafe, 70_000);
+        assert_eq!(sig(&mut h, &flushed, 70_100), last);
+        assert_ne!(sig(&mut h, &at_home, 70_200), home_sig);
+        // A real move: the café's address from the first read on, and once it held (3 reads,
+        // 2 s) the same uplink still (one relearning, not two); a flush keeps it.
+        let mut h = MacHistory::new();
+        assert_eq!(sig(&mut h, &at_home, 0), home_sig);
+        let moved = sig(&mut h, &at_cafe, 1_000);
+        assert_ne!(moved, home_sig);
+        for t in [2_000, 3_000, 4_000, 5_000] {
+            assert_eq!(sig(&mut h, &at_cafe, t), moved, "{t}");
+        }
+        assert_eq!(sig(&mut h, &flushed, 6_000), moved);
+        // Back home: another change again (never the café's, never a merge).
+        let back = sig(&mut h, &at_home, 7_000);
+        assert_ne!(back, moved);
         // An entry on another interface, or for another address, is not the gateway's.
         let elsewhere = [
             n(gw, 3, Some(&cafe)),
@@ -2884,41 +3013,127 @@ mod tests {
             n(gw6, 2, Some(&home)),
         ];
         assert_eq!(
-            gateway_identities(&table, &elsewhere),
+            gateway_identities(&table, &[], &elsewhere),
             vec![(gw, 2, None), (gw6, 2, Some(home.to_vec()))]
         );
-        // No gateway's address ever known under these routes: every read differs (never one
-        // network for two); the first known one then holds, and appearing more changes nothing.
+        // parse-4: no gateway's address ever known (or the table cannot be read): one stable
+        // signature, the first known one changes nothing, and it holds.
+        let denied = || Err(io::Error::from_raw_os_error(13));
         let mut fresh = MacHistory::new();
         let a = sig(&mut fresh, &flushed, 0);
-        let b = sig(&mut fresh, &[n(gw, 2, None)], 10);
-        assert_ne!(a, b);
-        let first = sig(&mut fresh, &[n(gw, 2, Some(&home)), n(gw6, 2, None)], 20);
-        assert_ne!(first, b);
-        assert_eq!(sig(&mut fresh, &at_home, 30), first, "the IPv6 gateway's entry appeared");
-        assert_eq!(sig(&mut fresh, &[n(gw6, 2, Some(&home))], 40), first);
-        // The neighbour table that cannot be read (denied, unsupported, interrupted on every
-        // try): no failure; the known address stands, and with none known every read differs
-        // (cross-6: each read has a number of its own).
-        let denied = || Err(io::Error::from_raw_os_error(13));
-        assert_eq!(linux_signature(&mut h, &table, &[2], denied(), 999, at(16_000)), back);
-        let mut none = MacHistory::new();
-        let x = linux_signature(&mut none, &table, &[2], denied(), next_read(), t0);
-        let y = linux_signature(&mut none, &table, &[2], denied(), next_read(), t0);
-        assert_ne!(x, y);
-        assert_ne!(next_read(), next_read());
+        assert_eq!(sig(&mut fresh, &[n(gw, 2, None)], 10), a);
+        assert_eq!(
+            linux_signature(&mut fresh, &table, &[2], &addrs, &[], denied(), at(15)),
+            a
+        );
+        assert_eq!(sig(&mut fresh, &[n(gw, 2, Some(&home)), n(gw6, 2, None)], 20), a);
+        assert_eq!(sig(&mut fresh, &at_home, 30), a, "the IPv6 gateway's entry appeared");
+        assert_eq!(a, home_sig, "the same network as the first history's");
+        // The table that cannot be read: the known address stands.
+        assert_eq!(
+            linux_signature(&mut h, &table, &[2], &addrs, &[], denied(), at(16_000)),
+            back
+        );
         // A device without link-layer addresses (NOARP, an empty one) is a stable identity.
         let tun = RouteTable::new(vec![Route::via(p("0.0.0.0/0"), ip("10.8.0.1"), 9)]);
-        let ids = gateway_identities(&tun, &[n(ip("10.8.0.1"), 9, Some(&[]))]);
+        let ids = gateway_identities(&tun, &[], &[n(ip("10.8.0.1"), 9, Some(&[]))]);
         assert_eq!(ids, vec![(ip("10.8.0.1"), 9, Some(Vec::new()))]);
         let mut h2 = MacHistory::new();
-        assert_eq!(h2.signature(1, &ids, 1, t0), h2.signature(1, &ids, 2, t0));
+        assert_eq!(h2.signature(1, &ids, t0), h2.signature(1, &ids, at(5)));
         // No gateway at all (an on-link default): nothing to look up, the routes decide.
         let onlink = RouteTable::new(vec![Route::on_link(p("0.0.0.0/0"), 9)]);
-        assert!(gateway_identities(&onlink, &[]).is_empty());
-        assert_eq!(h2.signature(7, &[], 1, t0), h2.signature(7, &[], 2, t0));
-        // Other routes are other uplinks.
-        assert_ne!(h2.signature(7, &[], 1, t0), h2.signature(8, &[], 1, t0));
+        assert!(gateway_identities(&onlink, &[], &[]).is_empty());
+        assert_eq!(h2.signature(7, &[], t0), h2.signature(7, &[], at(5)));
+        // Other bases are other uplinks.
+        assert_ne!(h2.signature(7, &[], t0), h2.signature(8, &[], t0));
+    }
+
+    /// Review round 5 (bypass-1, parse-4): the uplink's addressing is part of the Linux
+    /// signature: two IPv6-only networks behind `fe80::1` differ by their global prefix, two
+    /// IPv4 ones behind 192.168.1.1 by their subnet or the address handed out, with no
+    /// neighbour entry at all; a link-local prefix, another interface's routes, an IPv6
+    /// address that changes within the prefix (privacy addresses) and a route that is not
+    /// on-link change nothing.
+    #[test]
+    fn r5_the_uplinks_addressing_tells_networks_apart_on_linux() {
+        use std::time::Duration;
+        let t0 = Instant::now();
+        let sig = |routes: Vec<Route>, addrs: &[&str]| {
+            let table = RouteTable::new(routes);
+            let addrs: Vec<IpAddr> = addrs.iter().map(|a| ip(a)).collect();
+            let mut h = MacHistory::new();
+            linux_signature(&mut h, &table, &[3], &addrs, &[], Ok(Vec::new()), t0)
+        };
+        let v6 = |prefix: &str| {
+            vec![
+                Route::via(p("::/0"), ip("fe80::1"), 3),
+                Route::on_link(p(prefix), 3),
+                Route::on_link(p("fe80::/64"), 3),
+            ]
+        };
+        let home = sig(v6("2a01:4f8:a:1::/64"), &["2a01:4f8:a:1::5"]);
+        assert_ne!(home, sig(v6("2a01:4f8:b:1::/64"), &["2a01:4f8:b:1::5"]));
+        assert_eq!(home, sig(v6("2a01:4f8:a:1::/64"), &["2a01:4f8:a:1::77"]));
+        let mut other_if = v6("2a01:4f8:a:1::/64");
+        other_if.push(Route::on_link(p("2a01:4f8:dead::/64"), 9));
+        other_if.push(Route::on_link(p("fe80::/64"), 4));
+        assert_eq!(home, sig(other_if, &["2a01:4f8:a:1::5"]));
+        let v4 = |subnet: &str| {
+            vec![
+                Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 3),
+                Route::on_link(p(subnet), 3),
+                Route::via(p("10.9.0.0/16"), ip("192.168.1.254"), 3),
+            ]
+        };
+        let a = sig(v4("192.168.1.0/24"), &["192.168.1.33"]);
+        assert_ne!(a, sig(v4("192.168.1.0/24"), &["192.168.1.34"]));
+        assert_ne!(a, sig(v4("192.168.0.0/23"), &["192.168.1.33"]));
+        assert_eq!(a, sig(v4("192.168.1.0/24"), &["192.168.1.33", "172.17.0.1"]));
+        let _ = Duration::ZERO;
+    }
+
+    /// Review round 5, cross-4: with `nexthop_compat_mode` 0 a default route through a nexthop
+    /// object shows no gateway; its gateways come from the nexthop dump (a group's members'),
+    /// so they are the uplink's identities and the routers whose PREF64 is heard.
+    #[test]
+    fn r5_a_nexthop_objects_gateways_are_the_uplinks() {
+        use crate::routes::{Hop, Neighbour, Nexthop};
+        let mut r4 = Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 0);
+        r4.hop = Hop::Unknown;
+        r4.nexthop = 10;
+        let mut r6 = Route::via(p("::/0"), ip("fe80::1"), 0);
+        r6.hop = Hop::Unknown;
+        r6.nexthop = 20;
+        let table = RouteTable::new(vec![r4, r6]);
+        let nh = |id: u32, oif: u32, gw: Option<&str>, group: Vec<u32>| Nexthop {
+            id,
+            oif,
+            gateway: gw.map(ip),
+            group,
+            blackhole: false,
+        };
+        let nexthops = vec![
+            nh(10, 2, Some("192.168.1.1"), vec![]),
+            nh(21, 2, Some("fe80::1"), vec![]),
+            nh(22, 5, Some("fe80::2"), vec![]),
+            nh(20, 0, None, vec![21, 22]),
+        ];
+        assert_eq!(
+            default_gateways(&table, &nexthops),
+            vec![(ip("192.168.1.1"), 2), (ip("fe80::1"), 2), (ip("fe80::2"), 5)]
+        );
+        assert!(default_gateways(&table, &[]).is_empty());
+        let mac = [1u8, 2, 3, 4, 5, 6];
+        let ids = gateway_identities(
+            &table,
+            &nexthops,
+            &[Neighbour {
+                ifindex: 2,
+                addr: ip("192.168.1.1"),
+                lladdr: Some(mac.to_vec()),
+            }],
+        );
+        assert_eq!(ids[0], (ip("192.168.1.1"), 2, Some(mac.to_vec())));
     }
 
     /// bypass-2: a service's `NetworkSignature` is read strictly.
@@ -3176,24 +3391,24 @@ mod tests {
         // The process's first round runs on the caller's thread; the next uplinks' in the
         // background. Review round 5, bypass-4: a host whose IPv4 goes through a CLAT is an
         // IPv6-only one.
-        nat64_unsettled_on(&dual, fresh(), false);
-        assert!(nat64_unsettled_on(&v6_only, fresh(), false).0);
-        assert!(!nat64_unsettled_on(&dual, fresh(), false).0);
+        nat64_unsettled_on(&dual, &[], fresh(), false);
+        assert!(nat64_unsettled_on(&v6_only, &[], fresh(), false).0);
+        assert!(!nat64_unsettled_on(&dual, &[], fresh(), false).0);
         let behind_clat = fresh();
-        assert!(nat64_unsettled_on(&dual, behind_clat, true).0);
+        assert!(nat64_unsettled_on(&dual, &[], behind_clat, true).0);
         let t = Instant::now();
-        while nat64_unsettled_on(&dual, behind_clat, true).0 && t.elapsed() < Duration::from_secs(10) {
+        while nat64_unsettled_on(&dual, &[], behind_clat, true).0 && t.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!nat64_unsettled_on(&dual, behind_clat, true).0, "settled once its round ended");
+        assert!(!nat64_unsettled_on(&dual, &[], behind_clat, true).0, "settled once its round ended");
         // Review round 4, bypass-1: a prefix named on the uplink that could not be held refuses
         // IPv6 there, on a dual-stack host too.
         let held = fresh();
-        nat64_unsettled_on(&dual, held, false);
+        nat64_unsettled_on(&dual, &[], held, false);
         crate::nat64::unheld_after_round(held, "test: one source named too many");
-        let (_, why) = nat64_unsettled_on(&dual, held, false);
+        let (_, why) = nat64_unsettled_on(&dual, &[], held, false);
         assert_eq!(why.as_deref(), Some("test: one source named too many"));
-        assert!(nat64_unsettled_on(&dual, fresh(), false).1.is_none());
+        assert!(nat64_unsettled_on(&dual, &[], fresh(), false).1.is_none());
     }
 
     /// Review round 4, cross-4: with nexthop objects (`nexthop_compat_mode` 0: the dump shows no
@@ -3215,12 +3430,14 @@ mod tests {
             Nexthop {
                 id: 10,
                 oif: 2,
+                gateway: None,
                 group: vec![],
                 blackhole: false,
             },
             Nexthop {
                 id: 30,
                 oif: 2,
+                gateway: None,
                 group: vec![],
                 blackhole: false,
             },
