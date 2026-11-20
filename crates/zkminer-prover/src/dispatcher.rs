@@ -7311,6 +7311,24 @@ impl WorkerPool {
     /// What a proof at `po2` on the slot `key` is charged in COMMIT (Windows): what that card's real
     /// proofs at this po2 or above committed (`memory::learned_host_peak`), else the unmeasured
     /// default (`memory::unmeasured_commit_for`) at `po2`, within what the host can ever commit.
+    /// Whether a proof on `key` at `po2` stayed, at its peak (`low_water`), within what was reserved
+    /// for it: `ram_charge` of RAM, and the slot's commit figure. A host shortage it died in then
+    /// came from outside the job (`ShortageFromOutside`). Unknown peaks are not within.
+    fn stayed_within_charge(
+        &self,
+        key: &str,
+        po2: Option<u8>,
+        ram_charge: u64,
+        low_water: &crate::memory::LowWater,
+    ) -> bool {
+        let ram = low_water.tree_ram_peak().is_some_and(|p| p <= ram_charge);
+        let commit = !cfg!(windows)
+            || low_water
+                .tree_peak()
+                .is_some_and(|p| p <= self.slot_commit_peak(key, po2));
+        ram && commit
+    }
+
     fn slot_commit_peak(&self, key: &str, po2: Option<u8>) -> u64 {
         let total = crate::memory::commit_figures().map_or(u64::MAX, |c| c.total);
         self.slot_commit_peak_in(key, po2, total)
@@ -10444,12 +10462,15 @@ impl WorkerPool {
             // Don't count intentional kills (timeout/cancel) as failures —
             // otherwise 3 timeouts permanently retire the slot. A host OOM is likewise not the
             // slot's fault.
+            // The proof stayed within its reservation while the host ran short (`stayed_within_charge`).
+            let mut outside = false;
             if entry.intentional_kill.load(Ordering::Acquire) {
                 tracing::info!(
                     "Worker {key} killed intentionally (timeout/cancel), not counting as failure"
                 );
                 Self::mark_slot_dead(&mut slot, entry);
             } else if host_oom {
+                outside = self.stayed_within_charge(key, po2, want, &low_water);
                 if cfg!(windows) {
                     tracing::error!(
                         "Worker {key} died while the host was OUT OF COMMIT ({} free at the \
@@ -10471,6 +10492,13 @@ impl WorkerPool {
                          investigating the prover."
                     );
                 }
+                if outside {
+                    tracing::warn!(
+                        "{key}: its proof stayed within the memory reserved for it; the host ran \
+                         short for another reason (another program, or the page file not growing in \
+                         time). Not held against the job, and its card's figure is not raised."
+                    );
+                }
                 // As below: the card's learned figure did not cover this job.
                 self.raise_learned_after_shortage(key, po2);
                 Self::mark_slot_dead(&mut slot, entry);
@@ -10481,15 +10509,18 @@ impl WorkerPool {
             // Report it to the CALLER as a memory shortage, not as a prover failure, so the retry
             // loop waits for the host instead of excluding a healthy slot and releasing the job.
             if host_oom {
-                return Err(anyhow::Error::new(
-                    zkminer_prover_protocol::types::HostMemoryShortage {
-                        attempted: true,
-                        slot_key: key.to_string(),
-                        needed: want,
-                        reserved: self.reserved_host_memory(),
-                        available: crate::memory::mem_available_bytes().unwrap_or(0),
-                    },
-                ));
+                let err = anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
+                    attempted: true,
+                    slot_key: key.to_string(),
+                    needed: want,
+                    reserved: self.reserved_host_memory(),
+                    available: crate::memory::mem_available_bytes().unwrap_or(0),
+                });
+                return Err(if outside {
+                    err.context(zkminer_prover_protocol::types::ShortageFromOutside)
+                } else {
+                    err
+                });
             }
 
             // Stopped because Windows was paging the proof off its card for another program's memory:
@@ -10592,23 +10623,30 @@ impl WorkerPool {
                          the page file; a fixed-size page file limits it. Restarting the worker.",
                         low_water.lowest().unwrap_or(0) as f64 / 1024.0 / 1024.0 / 1024.0,
                     );
-                    // The card's figure did not cover this job: charge its next proofs the
-                    // published one until a proof there succeeds again.
-                    self.raise_learned_after_shortage(key, po2);
+                    // The card's figure did not cover this job, unless the proof stayed within it
+                    // (the shortage came from elsewhere): raise it then, not otherwise.
+                    let outside = self.stayed_within_charge(key, po2, want, &low_water);
+                    if !outside {
+                        self.raise_learned_after_shortage(key, po2);
+                    }
                     entry.clear_pid();
                     if let Some(h) = slot.handle.as_mut() {
                         h.kill();
                     }
                     Self::mark_slot_dead(&mut slot, entry);
-                    return Err(anyhow::Error::new(
-                        zkminer_prover_protocol::types::HostMemoryShortage {
+                    let err =
+                        anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
                             attempted: true,
                             slot_key: key.to_string(),
                             needed: want,
                             reserved: self.reserved_host_memory(),
                             available: crate::memory::mem_available_bytes().unwrap_or(0),
-                        },
-                    ));
+                        });
+                    return Err(if outside {
+                        err.context(zkminer_prover_protocol::types::ShortageFromOutside)
+                    } else {
+                        err
+                    });
                 }
                 if matches!(kind, ErrorKind::ResourceExhausted) {
                     tracing::warn!("Worker {key} OOM — killing for respawn with clean GPU state");

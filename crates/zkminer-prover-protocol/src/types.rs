@@ -996,6 +996,23 @@ impl std::fmt::Display for HostMemoryShortage {
 
 impl std::error::Error for HostMemoryShortage {}
 
+/// Attached (as context) to a [`HostMemoryShortage`] that ran a proof (`attempted`) when the proof's
+/// own worker stayed within the memory reserved for it: the host ran short because of something
+/// else (another program, the page file not growing in time), not because of the job. Such a
+/// failure is not held against the job's program or submitter, and does not raise what its card is
+/// charged.
+#[derive(Debug, Clone, Copy)]
+pub struct ShortageFromOutside;
+
+impl std::fmt::Display for ShortageFromOutside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the host ran short of memory while the proof stayed within what was reserved for it"
+        )
+    }
+}
+
 /// Every worker/measure slot for a backend was BUSY (or down-and-not-revivable) when a cycle
 /// measurement tried to run, so nothing was attempted.
 ///
