@@ -97,6 +97,12 @@ pub enum Denied {
     /// that prefix can carry a private IPv4 address (review round 3, bypass-1; every platform
     /// since the Linux application).
     Nat64Unsettled(IpAddr),
+    /// A connection to `addr`, once made, is not the one checked ([`NetPolicy::recheck_connected`]):
+    /// it reached another address, or left from another source address than the kernel chose
+    /// for it when it was checked (the route changed between the check and the connection), so
+    /// it was dropped before any request was written on it. The Linux application of review round
+    /// 2, bypass-3 (every platform).
+    PathChanged { addr: SocketAddr, why: String },
 }
 
 /// What is wrong with a URL, apart from where it points.
@@ -263,6 +269,11 @@ impl Denied {
                  IPv6 address under that prefix can carry a private IPv4 address",
                 crate::nat64::DISCOVERY_TIMEOUT.as_secs()
             ),
+            Denied::PathChanged { addr, why } => write!(
+                f,
+                "the connection to {addr} was dropped once made: {why}, so it is not the \
+                 connection that was checked"
+            ),
             Denied::NearHop { addr, hops, what } => write!(
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
@@ -302,6 +313,69 @@ impl Denied {
                 | Denied::InternalRangesUnstated { .. }
         )
     }
+}
+
+/// What a connection was vetted as ([`NetPolicy::vet_path`]), for the check once it is made
+/// ([`NetPolicy::recheck_connected`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vetted {
+    /// The address judged, as the connection names it.
+    pub addr: SocketAddr,
+    /// The address connected to: `addr` with an IPv4-mapped address as its IPv4 address (in
+    /// tests, a loopback stand-in for it).
+    pub connect: SocketAddr,
+    /// The source address the kernel chose for a connection to `connect` right before it was
+    /// made (`None` in developer mode, which checks nothing).
+    pub source: Option<IpAddr>,
+}
+
+/// An IPv4-mapped IPv6 address as its IPv4 address (what a connection to it reaches).
+fn unmapped_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+fn unmapped(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(unmapped_ip(addr.ip()), addr.port())
+}
+
+/// The source address the kernel chooses now for a connection to `dst`: a UDP socket connected
+/// to it (UDP `connect` sends nothing; it asks the route, as a TCP connect's first step does).
+fn source_for(dst: SocketAddr) -> io::Result<IpAddr> {
+    let any: SocketAddr = if dst.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let s = std::net::UdpSocket::bind(any)?;
+    s.connect(dst)?;
+    Ok(s.local_addr()?.ip())
+}
+
+/// Whether a connection whose own addresses are `local` and `peer` is the one `vetted` describes
+/// ([`NetPolicy::recheck_connected`]): its peer must be the address connected to, and its source
+/// the one the kernel chose when it was checked (a route that moved the connection to another
+/// interface, a VPN that came up, gives it another source); why not, if not. Pure.
+pub fn connected_as_vetted(vetted: &Vetted, local: SocketAddr, peer: SocketAddr) -> Result<(), String> {
+    if unmapped(peer) != vetted.connect {
+        return Err(format!(
+            "it reached {}, not {}",
+            unmapped(peer),
+            vetted.connect
+        ));
+    }
+    if let Some(source) = vetted.source {
+        let from = unmapped_ip(local.ip());
+        if from != unmapped_ip(source) {
+            return Err(format!(
+                "it left from {from}, and the kernel chose {source} for it when it was checked \
+                 (the route changed between the check and the connection)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The single admission decision for one destination address of a connection a requester caused.
@@ -969,6 +1043,68 @@ impl NetPolicy {
                 hops,
                 what: "no answer either way".into(),
             }),
+        }
+    }
+
+    /// [`Self::vet_connection`] for a connection to `addr` that is made to `connect` (`addr`
+    /// itself, but for test seams that stand a loopback server in for it), then what the
+    /// connection must look like once made: the source address the kernel chooses for a
+    /// connection to `connect` now (a UDP socket connected to it: nothing is sent), read right
+    /// before the real connection. [`Self::recheck_connected`] checks the connection against it.
+    /// Blocking, like [`Self::vet_connection`].
+    pub fn vet_path(&self, addr: SocketAddr, connect: SocketAddr) -> Result<Vetted, Denied> {
+        self.vet_connection(addr)?;
+        let connect = unmapped(connect);
+        if self.mode == NetMode::DevPrivate {
+            return Ok(Vetted {
+                addr,
+                connect,
+                source: None,
+            });
+        }
+        let source = source_for(connect).map_err(|e| Denied::RouteQueryFailed {
+            ip: addr.ip(),
+            why: format!(
+                "a socket to it could not be connected (nothing sent): {}",
+                crate::printable(&e.to_string(), 120)
+            ),
+        })?;
+        Ok(Vetted {
+            addr,
+            connect,
+            source: Some(source),
+        })
+    }
+
+    /// The check right after a connection vetted as `vetted` is made, before anything is written
+    /// on it (the Linux application of review round 2, bypass-3; every platform): the route,
+    /// address and near-hop checks ran just before the connection, on another socket, so a route
+    /// or a VPN that changed in between was not seen for it. Now the connection's own addresses
+    /// (`local`, `peer`: `getsockname`, `getpeername`) must be what was vetted
+    /// ([`connected_as_vetted`]: the peer the address checked, the source the one the kernel
+    /// chose for it then, which only an address of the interface the route named holds), and the
+    /// destination is admitted again on the facts in force with the kernel asked afresh (no
+    /// cached verdict: the route as it is now that the connection exists). A refusal drops the
+    /// connection. Developer mode admits everything. Blocking.
+    pub fn recheck_connected(
+        &self,
+        vetted: &Vetted,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Result<(), Denied> {
+        if self.mode == NetMode::DevPrivate {
+            return Ok(());
+        }
+        connected_as_vetted(vetted, local, peer).map_err(|why| Denied::PathChanged {
+            addr: vetted.addr,
+            why,
+        })?;
+        let judge = |f: &HostFacts| admit_to(self.mode, vetted.addr, &f.without_verdicts(), &self.deny);
+        match judge(&self.facts()) {
+            Err(d) if d.depends_on_facts() && self.facts.refresh => {
+                judge(&self.facts.get_fresher_than(FORCED_REFRESH_MIN_AGE))
+            }
+            r => r,
         }
     }
 
