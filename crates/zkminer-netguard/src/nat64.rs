@@ -40,7 +40,7 @@
 //! Review round 6 (cross-1, cross-2 = parse-2, bypass-1): what an attacker on the link (forged
 //! router advertisements, spoofed DNS64 answers) leaves behind is bounded in time. A PREF64
 //! lifetime is believed up to [`MAX_PREF64_LIFETIME`]; a router's newest advertisement replaces
-//! what it named before, and a router naming too many keeps its newest; only active entries
+//! what it named before (a router naming too many in one is seen to); only active entries
 //! count against [`MAX_PER_UPLINK`]; a learned prefix that stopped being named, or whose uplink
 //! the host left, is still refused for [`STALE_GRACE`] and then forgotten (neither the predicate
 //! nor the broker's refusals read it); a DNS server no longer asked names nothing. The invariant,
@@ -1785,8 +1785,9 @@ impl Heard {
     /// Review round 6 (cross-1): a lifetime is believed up to [`MAX_PREF64_LIFETIME`]; a router's
     /// newest advertisement (its options more than [`RA_BURST`] after the last one began)
     /// replaces what it named before, so the real gateway's next advertisement ends what a forger
-    /// named from its address; and a router naming more than [`MAX_PER_ROUTER`] + 1 at once keeps
-    /// the newest (it is still seen to name too many), so its own next prefix is always heard.
+    /// named from its address, and its own prefixes are heard again; a router naming more than
+    /// [`MAX_PER_ROUTER`] + 1 in one advertisement is seen to name too many (the rest is heard
+    /// with its next advertisement, which replaces the set).
     pub(crate) fn hear(&mut self, found: &[Announced], gateways: &[(Ipv6Addr, u32)], now: Instant) {
         self.prune(now);
         let uplink = self.uplink;
@@ -1823,18 +1824,13 @@ impl Heard {
                 continue;
             }
             if self.entries.iter().filter(|e| of_key(e)).count() > MAX_PER_ROUTER {
-                // Already one more live than is believed: the newest pushes out the oldest (the
-                // router is still seen to name too many).
-                if let Some(i) = self
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| of_key(e))
-                    .min_by_key(|(_, e)| e.4)
-                    .map(|(i, _)| i)
-                {
-                    self.entries.remove(i);
-                }
+                // Already one more live than is believed in this advertisement: the router is
+                // seen to name too many; the rest of it is not kept (its next advertisement
+                // replaces the set, so its prefixes are heard again then). Not the newest
+                // pushing out the oldest: the options arrive one message each, each learned at
+                // once, so one advertisement of N options would churn N entries through the
+                // registry (fix-r6's live rogue-RA rerun).
+                continue;
             }
             let mut routers: Vec<RouterKey> =
                 self.entries.iter().map(|e| (e.0, e.1, e.5)).collect();
@@ -3872,9 +3868,10 @@ mod r6_tests {
         assert_eq!(routers.len(), MAX_ROUTERS);
     }
 
-    /// A router that names more than MAX_PER_ROUTER + 1 at once keeps its newest (review round 6:
-    /// before, the sixth and later were dropped, the real one among them, until one ran out);
-    /// lifetimes are believed up to MAX_PREF64_LIFETIME.
+    /// A router that names more than MAX_PER_ROUTER + 1 in one advertisement is seen to name too
+    /// many, and its next advertisement is heard whole (review round 6, the sixth-prefix
+    /// suspicion: before, the sixth and later were dropped until one ran out); lifetimes are
+    /// believed up to MAX_PREF64_LIFETIME.
     #[test]
     fn r6_a_router_naming_too_many_keeps_its_newest() {
         let gw = (ip6("fe80::1"), 2u32);
@@ -3885,13 +3882,16 @@ mod r6_tests {
         h.hear(&many, &[gw], t0);
         let named = &h.named_by(&[gw], t0)[0].1;
         assert_eq!(named.len(), MAX_PER_ROUTER + 1);
-        assert!(named.iter().any(|(q, _)| *q == p("2001:db8:8::/96")), "{named:?}");
         assert!(named.iter().all(|(_, l)| *l == Some(MAX_PREF64_LIFETIME)), "{named:?}");
         assert!(h.named_by(&[gw], t0 + MAX_PREF64_LIFETIME)[0].1.is_empty());
+        let next = t0 + Duration::from_secs(600);
+        h.hear(&[ann("2001:db8:8::/96", gw.0, 600)], &[gw], next);
+        assert_eq!(h.named_by(&[gw], next)[0].1, vec![(p("2001:db8:8::/96"), Some(Duration::from_secs(600)))]);
     }
 
-    /// The same, the options heard one after another within one advertisement (fix-r6 mutation
-    /// T03): the newest five stay, the oldest are pushed out.
+    /// The same, the options heard one after another within one advertisement (one netlink
+    /// message each): the first five stay and the rest is not kept, so one advertisement of many
+    /// options churns nothing through the registry (fix-r6's live rogue-RA rerun).
     #[test]
     fn r6_a_router_naming_too_many_keeps_its_newest_in_order() {
         let gw = (ip6("fe80::1"), 2u32);
@@ -3903,8 +3903,8 @@ mod r6_tests {
         }
         let mut named: Vec<Prefix> = h.named_by(&[gw], t0 + Duration::from_millis(500))[0].1.iter().map(|n| n.0).collect();
         named.sort();
-        let newest: Vec<Prefix> = (4..9u64).map(|i| p(&format!("2001:db8:{i:x}::/96"))).collect();
-        assert_eq!(named, newest);
+        let first: Vec<Prefix> = (0..5u64).map(|i| p(&format!("2001:db8:{i:x}::/96"))).collect();
+        assert_eq!(named, first);
     }
 
     /// The invariant (review round 6), on random sequences of router advertisements (forged ones
