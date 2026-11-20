@@ -8589,6 +8589,11 @@ async fn miner_brain(
             &disabled_slots_by_backend,
             disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
         );
+        // The dispatcher's figures that name no job (how many proofs fit side by side, what a job
+        // of another backend takes) charge each card's own size, not risc0's default.
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            pool.set_risc0_card_sizes(risc0_cards.iter().map(|c| (c.slot.clone(), c.po2)));
+        }
         // Not a card whose last risc0 proof found too little VRAM free and still does: a job
         // claimed for it would wait there and be released (see `WorkerPool::risc0_card_short`).
         let (risc0_cards, risc0_cards_short) = match zkminer_prover::engine::worker_pool() {
@@ -9243,25 +9248,51 @@ async fn miner_brain(
                                 } else {
                                     outstanding.saturating_sub(sp1_outstanding)
                                 };
+                            let claim_po2 = if backend == "risc0" {
+                                risc0_sizes.iter().copied().max()
+                            } else {
+                                None
+                            };
                             if !pool.backend_fits_for_claim_at_po2(
                                 want,
                                 backend,
                                 outstanding,
                                 same_backend_outstanding,
                                 max_concurrent,
-                                if backend == "risc0" {
-                                    risc0_sizes.iter().copied().max()
-                                } else {
-                                    None
-                                },
+                                claim_po2,
                             ) {
+                                // Windows: commit, not RAM, may be what is short (the remedy is the
+                                // page file, and RAM can show free meanwhile).
+                                let commit_short = pool.claim_short_of_commit(
+                                    want,
+                                    backend,
+                                    outstanding,
+                                    same_backend_outstanding,
+                                    max_concurrent,
+                                    claim_po2,
+                                );
                                 // Rate-limited to once per backend per tick. On the market this
                                 // repo documents — 298 open jobs declaring zero cycles — a
                                 // memory-wedged miner emitted ~298 of these every 5s, about 60
                                 // lines a second, which buries every other signal in the log.
                                 if memory_skips_this_tick.insert(backend.to_string()) {
                                     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-                                    let detail = format!(
+                                    let commit = zkminer_prover::memory::commit_figures()
+                                        .filter(|_| commit_short);
+                                    let detail = if let Some(c) = commit {
+                                        format!(
+                                            "Not claiming {backend} jobs: with {} job(s) \
+                                             outstanding, one more does not fit what Windows can \
+                                             commit ({:.1} GiB can still be committed of {:.1} \
+                                             GiB: RAM plus page file), though RAM may show free. \
+                                             A larger page file would let it. Claiming would mean \
+                                             waiting for memory, or releasing at a penalty.",
+                                            in_flight.len(),
+                                            c.available as f64 / GIB,
+                                            c.total as f64 / GIB,
+                                        )
+                                    } else {
+                                        format!(
                                         "Not claiming {backend} jobs: one proof needs ~{:.1} GiB \
                                          of host RAM, and with {} job(s) outstanding ({:.1} GiB \
                                          held by proofs in flight, {:.1} GiB free of {:.1} GiB) \
@@ -9276,7 +9307,8 @@ async fn miner_brain(
                                         zkminer_prover::memory::mem_total_bytes().unwrap_or(0)
                                             as f64
                                             / GIB,
-                                    );
+                                        )
+                                    };
                                     tracing::warn!("{detail}");
                                     // And on screen. Every memory message used to be
                                     // `tracing`-only, which in TUI mode is a log file the operator
@@ -9285,7 +9317,14 @@ async fn miner_brain(
                                     // showed "Queued (waiting for GPU)" about idle cards.
                                     state.write().await.add_log(LogLevel::Warn, detail);
                                 }
-                                declines.note(jid, "not enough host RAM");
+                                declines.note(
+                                    jid,
+                                    if commit_short {
+                                        "not enough commit (RAM plus page file)"
+                                    } else {
+                                        "not enough host RAM"
+                                    },
+                                );
                                 continue;
                             }
                         }
@@ -13058,17 +13097,22 @@ async fn process_job_lifecycle(
                         let behind_ours = !shortage.attempted
                             && (kept_for_another
                                 || (shortage.reserved > 0
-                                    && pool.fits_when_ours_finish(backend, shortage.needed)));
+                                    && pool.fits_when_ours_finish(
+                                        backend,
+                                        shortage.needed,
+                                        shortage.kind,
+                                    )));
                         if (!shortage.attempted || outside)
                             && (waited < HOST_MEMORY_WAIT_LIMIT || behind_ours)
                         {
                             memory_waits += 1;
                             attempt = attempt.saturating_sub(1);
                             tracing::warn!(
-                                "{} is waiting for host RAM, not failing: {msg}. Retrying the same \
+                                "{} is waiting for {}, not failing: {msg}. Retrying the same \
                                  slot in {}s at most (waited {}s of {}s, try {}); the deadline \
                                  budget decides when to give up.",
                                 short_id(job_id),
+                                shortage.kind.name(),
                                 HOST_MEMORY_BACKOFF_SECS,
                                 waited.as_secs(),
                                 HOST_MEMORY_WAIT_LIMIT.as_secs(),
@@ -13080,11 +13124,22 @@ async fn process_job_lifecycle(
                                 job_id,
                                 zkminer_tui::state::JobNoteKind::Wait,
                                 if kept_for_another {
-                                    "waiting for host memory: a job that has waited longer for it \
-                                     goes first"
+                                    format!(
+                                        "waiting for {}: a job that has waited longer for it goes \
+                                         first",
+                                        shortage.kind.name()
+                                    )
+                                } else if shortage.kind
+                                    == zkminer_prover_protocol::types::HostMemoryKind::Commit
+                                    && !behind_ours
+                                {
+                                    // RAM can look free: commit is what is short, held by more
+                                    // than our own proofs, and the page file is the remedy.
+                                    "waiting for commit (RAM plus page file) to free up; a \
+                                     larger page file would let it start"
+                                        .to_string()
                                 } else {
-                                    "waiting for host memory (RAM, or commit under Windows) to \
-                                     free up"
+                                    format!("waiting for {} to free up", shortage.kind.name())
                                 },
                             );
                             wait_note_up = true;
@@ -13107,7 +13162,7 @@ async fn process_job_lifecycle(
                         // Still not the slot's fault, so do not exclude it or call it unhealthy —
                         // but this one DOES cost an attempt, so fall through to the normal budget.
                         tracing::warn!(
-                            "{} hit a host-RAM limit that cost a real attempt ({}): {msg}",
+                            "{} hit a host-memory limit that cost a real attempt ({}): {msg}",
                             short_id(job_id),
                             if shortage.attempted {
                                 "the proof was OOM-killed mid-run"
@@ -16961,6 +17016,7 @@ mod tests {
         };
         let host = |attempted| {
             anyhow::Error::new(HostMemoryShortage {
+                kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                 attempted,
                 slot_key: "sp1:cuda:1".into(),
                 needed: 1 << 34,
@@ -17422,6 +17478,7 @@ mod tests {
     fn a_shortage_from_outside_waits_and_blames_no_one() {
         use zkminer_prover_protocol::types::{HostMemoryShortage, ShortageFromOutside};
         let shortage = || HostMemoryShortage {
+            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
             attempted: true,
             slot_key: "risc0:cuda:0".to_string(),
             needed: 8 << 30,
@@ -17456,6 +17513,7 @@ mod tests {",
         use zkminer_prover_protocol::types::HostMemoryShortage;
 
         let real: anyhow::Error = anyhow::Error::new(HostMemoryShortage {
+            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
             attempted: false,
             slot_key: "sp1:cuda:0".to_string(),
             needed: 18 << 30,

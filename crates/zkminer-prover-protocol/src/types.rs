@@ -1336,6 +1336,8 @@ pub const WORKER_DECLINED: &str = "worker declined: cannot prove on this host";
 /// precisely the loss the memory gate exists to prevent. Wait for the host instead.
 #[derive(Debug, Clone)]
 pub struct HostMemoryShortage {
+    /// Which memory was short: the operator's remedy differs (`HostMemoryKind`).
+    pub kind: HostMemoryKind,
     /// Did a proof actually RUN before this was reported?
     ///
     /// `false` for an admission refusal, which costs a `/proc/meminfo` read: nothing was attempted,
@@ -1353,31 +1355,73 @@ pub struct HostMemoryShortage {
     pub needed: u64,
     /// Bytes already reserved by proofs in flight.
     pub reserved: u64,
-    /// `MemAvailable` at the moment of the refusal.
+    /// What was free of that memory at the moment of the refusal: free RAM (`MemAvailable`), what
+    /// may still be committed (free commit plus page-file growth), or the `/dev/shm` capacity.
     pub available: u64,
+}
+
+/// The memory a `HostMemoryShortage` ran short of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMemoryKind {
+    /// Physical memory.
+    Ram,
+    /// Windows commit: RAM plus the page files, which every allocation is charged against (most of
+    /// a CUDA proof's is VRAM that is never in RAM). A larger page file adds it; RAM alone does not
+    /// show it.
+    Commit,
+    /// The `/dev/shm` tmpfs SP1's native executor stages in (x86-64 Linux).
+    SharedMemory,
+}
+
+impl HostMemoryKind {
+    /// The memory, as the operator knows it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ram => "host RAM",
+            Self::Commit => "commit (RAM plus page file)",
+            Self::SharedMemory => "/dev/shm",
+        }
+    }
+
+    /// The kind a worker that died of a host shortage ran out of: on Windows commit, which is what
+    /// an allocation fails on (RAM short only pages out; `memory::windows_failure_is_host_shortage`),
+    /// elsewhere RAM (the kernel's OOM killer).
+    pub fn of_worker_death() -> Self {
+        if cfg!(windows) {
+            Self::Commit
+        } else {
+            Self::Ram
+        }
+    }
 }
 
 impl std::fmt::Display for HostMemoryShortage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-        write!(
-            f,
-            "host RAM is short for {}: needs ~{:.1} GiB, {:.1} GiB already reserved by proofs in \
-             flight, {:.1} GiB available",
-            self.slot_key,
+        let (needed, reserved, available) = (
             self.needed as f64 / GIB,
             self.reserved as f64 / GIB,
             self.available as f64 / GIB,
-        )?;
-        // Under Windows a proof needs RAM and COMMIT (RAM plus what the page file can grow to), and
-        // either can be the one short: name both, as the operator's remedy differs.
-        if cfg!(windows) {
-            write!(
+        );
+        let slot = &self.slot_key;
+        match self.kind {
+            HostMemoryKind::Ram => write!(
                 f,
-                " (Windows: RAM, or commit: RAM plus a page file that grows unless fixed)"
-            )?;
+                "host RAM is short for {slot}: needs ~{needed:.1} GiB, {reserved:.1} GiB already \
+                 reserved by proofs in flight, {available:.1} GiB available"
+            ),
+            HostMemoryKind::Commit => write!(
+                f,
+                "Windows commit (RAM plus page file) is short for {slot}: needs ~{needed:.1} GiB, \
+                 {reserved:.1} GiB already reserved by proofs in flight, {available:.1} GiB can \
+                 still be committed. RAM may be free: a larger page file adds commit"
+            ),
+            HostMemoryKind::SharedMemory => write!(
+                f,
+                "/dev/shm is short for {slot}: needs ~{needed:.1} GiB, {reserved:.1} GiB already \
+                 staged by others, {available:.1} GiB in the tmpfs"
+            ),
         }
-        Ok(())
     }
 }
 
@@ -2412,6 +2456,7 @@ mod tests {
             // 4: nothing but the driver's reservation short of an operator-raised floor.
             gpu("sp1:cuda:0", 2, 0, 15878, Some(16000), 16303, false),
             super::HostMemoryShortage {
+                kind: super::HostMemoryKind::Ram,
                 attempted: false,
                 slot_key: "sp1:cuda:0".to_string(),
                 needed: 18 << 30,
@@ -2421,6 +2466,39 @@ mod tests {
             .to_string(),
         ];
         let has = |i: usize, what: &str| msgs[i].contains(what);
+        // A host shortage names the memory short, and the page file only where commit is.
+        let host = |kind| {
+            super::HostMemoryShortage {
+                kind,
+                attempted: false,
+                slot_key: "sp1:cuda:0".to_string(),
+                needed: 74 << 30,
+                reserved: 0,
+                available: 40 << 30,
+            }
+            .to_string()
+        };
+        let ram = host(super::HostMemoryKind::Ram);
+        assert!(ram.starts_with("host RAM is short for sp1:cuda:0"), "{ram}");
+        assert!(!ram.contains("page file"), "{ram}");
+        let commit = host(super::HostMemoryKind::Commit);
+        assert!(
+            commit.starts_with("Windows commit (RAM plus page file) is short for sp1:cuda:0"),
+            "{commit}"
+        );
+        assert!(
+            commit.contains("40.0 GiB can still be committed"),
+            "{commit}"
+        );
+        assert!(
+            commit.contains("a larger page file adds commit"),
+            "{commit}"
+        );
+        let shm = host(super::HostMemoryKind::SharedMemory);
+        assert!(shm.starts_with("/dev/shm is short for sp1:cuda:0"), "{shm}");
+        for m in [&ram, &commit, &shm] {
+            assert!(!m.contains("  "), "{m}");
+        }
         // A proof stopped part-way because Windows was paging it off the card: said as such, with
         // what was off the card and what another program held, and none of a refusal's wording.
         let stopped = super::GpuMemoryShortage {
