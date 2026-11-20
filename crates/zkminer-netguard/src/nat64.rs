@@ -1254,6 +1254,10 @@ struct OnUplink {
     /// The uplink signature of the latest round that finished on the uplink the host was on
     /// then.
     settled: Option<u64>,
+    /// The last few uplinks a round settled, when that round began and whether it found
+    /// nothing (review round 6, cross-4: a host whose gateway's link-layer address flaps between
+    /// two values ran a round, and refused IPv6 if IPv6-only, on every flip).
+    recent: Vec<(u64, Instant, bool)>,
     running: bool,
     first_done: bool,
     attempted_at: Option<Instant>,
@@ -1267,6 +1271,7 @@ static ON_UPLINK_DONE: Condvar = Condvar::new();
 static ON_UPLINK: Mutex<OnUplink> = Mutex::new(OnUplink {
     uplink: None,
     settled: None,
+    recent: Vec::new(),
     running: false,
     first_done: false,
     attempted_at: None,
@@ -1312,6 +1317,18 @@ fn next_on(d: &mut OnUplink, up: Uplink, now: Instant) -> Next {
         .attempted_at
         .map_or(Duration::MAX, |t| now.saturating_duration_since(t));
     let unsettled = d.found_nothing || d.settled != Some(up.signature);
+    if changed {
+        // Back on an uplink a round settled within DISCOVERY_TTL: settled again (its prefixes
+        // are still held: STALE_GRACE), the next round when it is due.
+        if let Some(&(_, at, nothing)) = d.recent.iter().find(|(s, at, _)| {
+            *s == up.signature && now.saturating_duration_since(*at) < DISCOVERY_TTL
+        }) {
+            d.settled = Some(up.signature);
+            d.found_nothing = nothing;
+            d.attempted_at = Some(at);
+            return Next::Nothing;
+        }
+    }
     if changed
         || since >= DISCOVERY_TTL
         || (up.ipv6_only() && unsettled && since >= RETRY_UNSETTLED)
@@ -2001,6 +2018,12 @@ fn finished(d: &mut OnUplink, up: Uplink, found_any: bool) {
     let now_on = d.uplink.unwrap_or(up);
     if now_on.signature == up.signature {
         d.settled = Some(up.signature);
+        let at = d.attempted_at.unwrap_or_else(Instant::now);
+        d.recent.retain(|(s, _, _)| *s != up.signature);
+        d.recent.push((up.signature, at, !found_any));
+        if d.recent.len() > 4 {
+            d.recent.remove(0);
+        }
     } else {
         d.running = true;
         d.attempted_at = Some(Instant::now());
@@ -2256,6 +2279,7 @@ mod tests {
         let mut d = OnUplink {
             uplink: None,
             settled: None,
+            recent: Vec::new(),
             running: false,
             first_done: false,
             attempted_at: None,
@@ -2308,6 +2332,18 @@ mod tests {
         };
         assert!(clat.ipv6_only() && clat.refuses_ipv6(false));
         assert_eq!(next_on(&mut d, clat, at(500)), Next::AskInBackground);
+        finished(&mut d, clat, true);
+        // Review round 6, cross-4: uplinks 4 and 5 settled, then flips between them: settled
+        // again, no round, until the TTL of the round that settled it.
+        assert_eq!(next_on(&mut d, v6_only(4), at(501)), Next::AskInBackground);
+        finished(&mut d, v6_only(4), true);
+        assert_eq!(next_on(&mut d, v6_only(5), at(510)), Next::AskInBackground);
+        finished(&mut d, v6_only(5), true);
+        assert_eq!(next_on(&mut d, v6_only(4), at(520)), Next::Nothing);
+        assert_eq!(d.settled, Some(4));
+        assert_eq!(next_on(&mut d, v6_only(5), at(530)), Next::Nothing);
+        assert_eq!(d.settled, Some(5));
+        assert_eq!(next_on(&mut d, v6_only(4), at(501 + 300)), Next::AskInBackground);
     }
 
     /// Review round 3, bypass-1, live (every platform since the Linux application): a new uplink
