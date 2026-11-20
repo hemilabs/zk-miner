@@ -224,6 +224,18 @@ impl GuardedClient {
         Ok((name, pinned))
     }
 
+    /// [`NetPolicy::check_url`] on the blocking pool: an IP literal is judged by `admit`, which
+    /// blocks (a facts re-read, a route query), so it never runs on a runtime worker (review round
+    /// 2, cross-3; the Linux application).
+    async fn check_url(&self, raw: &str) -> Result<url::Url, FetchError> {
+        let policy = self.policy().clone();
+        let raw = raw.to_owned();
+        tokio::task::spawn_blocking(move || policy.check_url(&raw))
+            .await
+            .map_err(|_| FetchError::BadRedirect("a URL check failed"))?
+            .map_err(FetchError::Denied)
+    }
+
     /// GETs `raw`, following up to `max_redirects` redirects (301, 302, 303, 307, 308) by hand: each
     /// target is joined to the hop it came from and checked like the first URL before anything
     /// connects to it. `budget` bounds the whole chain and the read of the final body, which the
@@ -237,7 +249,7 @@ impl GuardedClient {
     ) -> Result<reqwest::Response, FetchError> {
         // Bounded: `Instant + Duration` panics past what an Instant holds.
         let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
-        let mut url = self.policy().check_url(raw).map_err(FetchError::Denied)?;
+        let mut url = self.check_url(raw).await?;
         for hop in 0..=max_redirects {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -304,14 +316,12 @@ impl GuardedClient {
                 None
             };
             url = match raw_target {
-                Some(raw) => self.policy().check_url(&raw).map_err(FetchError::Denied)?,
+                Some(raw) => self.check_url(&raw).await?,
                 None => {
                     let next = url.join(location).map_err(|_| {
                         FetchError::BadRedirect("a redirect to an invalid Location")
                     })?;
-                    self.policy()
-                        .check_url(next.as_str())
-                        .map_err(FetchError::Denied)?
+                    self.check_url(next.as_str()).await?
                 }
             };
             tracing::debug!(
@@ -330,7 +340,7 @@ impl GuardedClient {
     /// response head; the caller bounds its read of the body.
     pub async fn post_json(&self, raw: &str, body: Vec<u8>, budget: Duration) -> Result<reqwest::Response, FetchError> {
         let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
-        let url = self.policy().check_url(raw).map_err(FetchError::Denied)?;
+        let url = self.check_url(raw).await?;
         let (name, pinned) = tokio::time::timeout(budget, self.pin(&url))
             .await
             .map_err(|_| FetchError::TimedOut)??;

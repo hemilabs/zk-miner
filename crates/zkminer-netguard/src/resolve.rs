@@ -170,19 +170,29 @@ impl GuardedResolver {
                     .map_err(ResolveError::Lookup)?
             }
         };
-        let mut admitted: Vec<IpAddr> = Vec::new();
-        let mut refused = Vec::new();
-        for ip in answers {
-            match self.policy.admit(ip) {
-                Ok(()) if !admitted.contains(&ip) => admitted.push(ip),
-                Ok(()) => {}
-                Err(d) => {
-                    if refused.len() < MAX_ADDRS {
-                        refused.push(d);
+        // `admit` blocks (a facts re-read, a route query per destination: netlink, the routing
+        // socket, the configuration daemon), so it runs on the blocking pool, never on a runtime
+        // worker (review round 2, cross-3; the Linux application).
+        let policy = self.policy.clone();
+        let (admitted, refused) = tokio::task::spawn_blocking(move || {
+            let mut admitted: Vec<IpAddr> = Vec::new();
+            let mut refused = Vec::new();
+            for ip in answers {
+                match policy.admit(ip) {
+                    Ok(()) if !admitted.contains(&ip) => admitted.push(ip),
+                    Ok(()) => {}
+                    Err(d) => {
+                        if refused.len() < MAX_ADDRS {
+                            refused.push(d);
+                        }
                     }
                 }
             }
-        }
+            (admitted, refused)
+        })
+        .await
+        .map_err(|e| ResolveError::Lookup(io::Error::other(e)))?;
+        let mut admitted = admitted;
         if admitted.is_empty() {
             return Err(ResolveError::Denied(Denied::NoAdmittedAddress {
                 host: crate::printable(host, 128),
@@ -478,5 +488,49 @@ pub(crate) mod tests {
         let got = SystemLookup.lookup("192.0.2.1").await.unwrap();
         assert_eq!(got, ips(&["192.0.2.1"]));
         assert!(r.resolve_admitted("192.0.2.1").await.is_err());
+    }
+
+    /// A route oracle that takes `delay` per answer (a slow facts re-read or route query).
+    #[derive(Debug)]
+    struct SlowOracle(Duration);
+
+    impl crate::routes::RouteOracle for SlowOracle {
+        fn route_to(
+            &self,
+            _: IpAddr,
+            _: Option<u16>,
+        ) -> std::io::Result<crate::routes::KernelAnswer> {
+            std::thread::sleep(self.0);
+            Ok(crate::routes::KernelAnswer::NoRoute)
+        }
+    }
+
+    /// Review round 2, cross-3 (the Linux application): `admit` blocks (facts re-reads, route
+    /// queries), so the resolver's admit loop runs on the blocking pool. On a single-threaded
+    /// runtime, a ticker keeps ticking while three answers take 300 ms each to judge; were the
+    /// loop on the runtime's thread, the ticker would not tick until it ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_admit_loop_runs_off_the_runtime() {
+        let facts = HostFacts::new(Vec::new(), Vec::new())
+            .with_route_oracle(Arc::new(SlowOracle(Duration::from_millis(300))));
+        let policy = NetPolicy::with_facts(NetMode::Public, facts, Vec::new());
+        let lookup = FakeLookup::with(&[("slow.example.com", &["1.1.1.1", "8.8.8.8", "9.9.9.9"])]);
+        let r = GuardedResolver::new(policy, Arc::new(lookup));
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let start = std::time::Instant::now();
+        assert!(r.resolve_admitted("slow.example.com").await.is_err());
+        let took = start.elapsed();
+        ticker.abort();
+        let n = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(took >= Duration::from_millis(900), "{took:?}");
+        // About 90 at 10 ms; well over half of them, whatever the scheduler's jitter.
+        assert!(n >= 30, "the ticker ticked {n} times in {took:?}");
     }
 }
