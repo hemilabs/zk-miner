@@ -490,6 +490,77 @@ fn macos_uplink_signature(base: u64, networks: &[String]) -> u64 {
     h.finish()
 }
 
+/// Linux: the link-layer address of each default gateway, from the neighbour table: for every
+/// default-like route through a gateway, `(gateway, interface, its link-layer address)`, the
+/// address `None` when the table holds no usable entry for that gateway on that interface
+/// (incomplete, failed, garbage-collected, never resolved yet). Sorted.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) fn gateway_identities(
+    routes: &RouteTable,
+    neighbours: &[crate::routes::Neighbour],
+) -> Vec<(IpAddr, u32, Option<Vec<u8>>)> {
+    use crate::routes::Hop;
+    let mut v: Vec<(IpAddr, u32, Option<Vec<u8>>)> = routes
+        .routes()
+        .iter()
+        .filter(|r| r.is_default_like())
+        .filter_map(|r| match r.hop {
+            Hop::Via(gw) if r.ifindex != 0 => {
+                let lladdr = neighbours
+                    .iter()
+                    .find(|n| n.ifindex == r.ifindex && n.addr == gw)
+                    .and_then(|n| n.lladdr.clone());
+                Some((gw, r.ifindex, lladdr))
+            }
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Linux: [`uplink_signature`] (`base`) and each default gateway's link-layer address
+/// ([`gateway_identities`]). Two networks whose routers have the same address on the same
+/// interface (two home networks behind 192.168.1.1) have the same routes, so `base` alone cannot
+/// tell them apart, and a public address confirmed on the first would stay confirmed on the
+/// second for up to [`crate::public::DISCOVERY_TTL`]; their routers' link-layer addresses differ
+/// (review round 2, bypass-2; Linux reads them unprivileged, unlike macOS, which redacts them).
+///
+/// A gateway whose entry is missing is hashed as missing (so its entry appearing is a change
+/// too), and must not make two networks one: when no gateway has a known link-layer address, the
+/// signature also hashes `read`, a number no other facts read has, so every such read is an
+/// uplink of its own and discovery runs again (public addresses, NAT64) until an entry is there.
+/// One is there once a packet has gone to a gateway, which discovery itself sends, so this lasts
+/// a moment after a network change (a link that goes down and up flushes the table). When some
+/// gateway is known, its address tells the networks apart, and the signature stays put: a
+/// dual-stack host whose IPv6 router is unreachable (a `FAILED` entry) keeps its IPv4 public
+/// address confirmed. Measured in the Linux VM: after `ip neigh flush`, one DNS query brought
+/// back the IPv4 gateway's entry and the IPv6 one stayed missing
+/// (`fix-linux/vm-neigh-flush.log`).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) fn linux_uplink_signature(
+    base: u64,
+    gateways: &[(IpAddr, u32, Option<Vec<u8>>)],
+    read: u64,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut h);
+    gateways.hash(&mut h);
+    if !gateways.is_empty() && gateways.iter().all(|(_, _, l)| l.is_none()) {
+        read.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Linux: a number for each facts read ([`linux_uplink_signature`]'s `read`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn next_read() -> u64 {
+    static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The enclosing /`len` of every global IPv6 address in `own` (`len` clamped to
 /// [`IPV6_SITE_PREFIX_LENS`]).
 pub fn site_prefixes(own: &[IpAddr], len: u8) -> Vec<Prefix> {
@@ -872,6 +943,24 @@ impl HostFacts {
                 let networks = macos_dns::network_signatures()?;
                 move |t: &RouteTable, i: &[u32]| {
                     macos_uplink_signature(uplink_signature(t, i), &networks)
+                }
+            };
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let uplink_signature = {
+                // Linux: the routes' signature and each default gateway's link-layer address
+                // (`uplink_signature` in here is the function above).
+                let neighbours = crate::routes::read_neighbours().map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("the neighbour table (RTM_GETNEIGH) could not be read: {e}"),
+                    )
+                })?;
+                move |t: &RouteTable, i: &[u32]| {
+                    linux_uplink_signature(
+                        uplink_signature(t, i),
+                        &gateway_identities(t, &neighbours),
+                        next_read(),
+                    )
                 }
             };
             crate::public::learned_on(uplink_signature(&table, &internet_interfaces))
@@ -2504,6 +2593,78 @@ mod tests {
                 "no IPv4 network signature"
             );
         }
+    }
+
+    /// Review round 2, bypass-2, the Linux application: two networks behind the same router
+    /// address on the same interface differ by the router's link-layer address in the neighbour
+    /// table; the same router read twice is the same uplink; a gateway with no usable entry makes
+    /// every read an uplink of its own (never one network for two), and its entry appearing is
+    /// a change too. Pure (runs on every platform).
+    #[test]
+    fn two_networks_behind_the_same_router_address_are_two_uplinks_on_linux() {
+        use crate::routes::Neighbour;
+        let gw = ip("192.168.1.1");
+        let gw6 = ip("fe80::1");
+        let table = RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), gw, 2),
+            Route::via(p("::/0"), gw6, 2),
+            Route::on_link(p("192.168.1.0/24"), 2),
+        ]);
+        let base = uplink_signature(&table, &[2]);
+        let n = |addr: IpAddr, ifindex: u32, ll: Option<&[u8]>| Neighbour {
+            ifindex,
+            addr,
+            lladdr: ll.map(<[u8]>::to_vec),
+        };
+        let home = [0xa4, 0x2b, 0xb0, 0, 0, 1];
+        let cafe = [0x3c, 0x84, 0x6a, 0, 0, 2];
+        let sig = |ns: &[Neighbour], read: u64| {
+            linux_uplink_signature(base, &gateway_identities(&table, ns), read)
+        };
+        let at_home = [n(gw, 2, Some(&home)), n(gw6, 2, Some(&home))];
+        let at_cafe = [n(gw, 2, Some(&cafe)), n(gw6, 2, Some(&cafe))];
+        assert_ne!(sig(&at_home, 1), sig(&at_cafe, 1));
+        // Known gateways: the read does not count, the order of the table does not either.
+        assert_eq!(sig(&at_home, 1), sig(&at_home, 2));
+        let mut reordered = at_home.to_vec();
+        reordered.reverse();
+        assert_eq!(sig(&reordered, 3), sig(&at_home, 1));
+        // An entry on another interface, or for another address, is not the gateway's.
+        let elsewhere = [n(gw, 3, Some(&cafe)), n(ip("192.168.1.2"), 2, Some(&cafe)), n(gw6, 2, Some(&home))];
+        assert_eq!(
+            gateway_identities(&table, &elsewhere),
+            vec![(gw, 2, None), (gw6, 2, Some(home.to_vec()))]
+        );
+        // Every gateway missing (no entry, or one without a usable address): every read differs,
+        // from each other and from every known network.
+        for missing in [vec![], vec![n(gw, 2, None), n(gw6, 2, None)]] {
+            assert_ne!(sig(&missing, 1), sig(&missing, 2));
+            assert_ne!(sig(&missing, 1), sig(&at_home, 1));
+            assert_ne!(sig(&missing, 2), sig(&at_cafe, 2));
+        }
+        // One missing, one known: the known one tells the networks apart, and the signature
+        // stays put (a dual-stack host with an unreachable IPv6 router); it differs from the
+        // same network with both known, and from another network's.
+        let v6_missing = [n(gw, 2, Some(&home)), n(gw6, 2, None)];
+        assert_eq!(sig(&v6_missing, 1), sig(&v6_missing, 2));
+        assert_ne!(sig(&v6_missing, 1), sig(&at_home, 1));
+        assert_ne!(sig(&v6_missing, 1), sig(&[n(gw, 2, Some(&cafe))], 1));
+        assert_ne!(sig(&[n(gw6, 2, Some(&home))], 1), sig(&[n(gw6, 2, Some(&cafe))], 1));
+        // A device without link-layer addresses (NOARP, an empty one) is a stable identity.
+        let tun = RouteTable::new(vec![Route::via(p("0.0.0.0/0"), ip("10.8.0.1"), 9)]);
+        let ids = gateway_identities(&tun, &[n(ip("10.8.0.1"), 9, Some(&[]))]);
+        assert_eq!(ids, vec![(ip("10.8.0.1"), 9, Some(Vec::new()))]);
+        assert_eq!(
+            linux_uplink_signature(1, &ids, 1),
+            linux_uplink_signature(1, &ids, 2)
+        );
+        // No gateway at all (an on-link default): nothing to look up, the routes decide.
+        let onlink = RouteTable::new(vec![Route::on_link(p("0.0.0.0/0"), 9)]);
+        assert!(gateway_identities(&onlink, &[]).is_empty());
+        assert_eq!(
+            linux_uplink_signature(7, &[], 1),
+            linux_uplink_signature(7, &[], 2)
+        );
     }
 
     /// bypass-2: a service's `NetworkSignature` is read strictly.
