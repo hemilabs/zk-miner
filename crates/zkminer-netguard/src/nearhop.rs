@@ -1119,6 +1119,44 @@ mod tests {
         assert_eq!(connection_info(c.as_raw_fd()).unwrap().state, 4);
     }
 
+    /// Linux, live: the kernel's `TCP_CLOSE` is read by its pending error. A connection whose FIN
+    /// was acknowledged and that then got the peer's FIN (TIME_WAIT, which Linux does not show
+    /// on the socket) reads as [`TcpState::TimeWait`]; one the peer reset reads as
+    /// [`TcpState::Closed`]. Both on loopback, waited for until the socket leaves the states
+    /// before.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_a_reset_and_a_completed_close_read_apart() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let settle = |c: &std::net::TcpStream, want: TcpState| {
+            let t = std::time::Instant::now();
+            loop {
+                let i = conn_info(c.as_raw_fd()).unwrap();
+                if i.state == want || t.elapsed() > Duration::from_secs(3) {
+                    return i.state;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        // A completed close: this side's FIN acknowledged, the peer's FIN received.
+        let c = std::net::TcpStream::connect(addr).unwrap();
+        let (mut peer, _) = l.accept().unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut b = [0u8; 8];
+        assert_eq!(peer.read(&mut b).unwrap(), 0);
+        drop(peer);
+        assert_eq!(settle(&c, TcpState::TimeWait), TcpState::TimeWait);
+        // A reset: the peer closes with linger 0.
+        let c = std::net::TcpStream::connect(addr).unwrap();
+        let (peer, _) = l.accept().unwrap();
+        socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(peer);
+        assert_eq!(settle(&c, TcpState::Closed), TcpState::Closed);
+    }
+
     /// The check connection to a listener on loopback (zero hops) and to an IPv6 one: answered,
     /// near. Its hop-limited FIN reaches them and is acknowledged.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
