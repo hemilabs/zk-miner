@@ -473,6 +473,7 @@ fn every_uplink_that_is_not_plainly_physical_needs_the_statement() {
         vec![Nexthop {
             id: 10,
             oif: 7,
+            gateway: None,
             group: vec![],
             blackhole: false,
         }],

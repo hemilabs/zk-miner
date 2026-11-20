@@ -2798,8 +2798,10 @@ mod r5_tests {
         for withdraw in [true, false] {
             let mut h = Heard::new();
             h.on(Some(7));
-            let mut r = Registry::default();
-            r.on = Some(7);
+            let mut r = Registry {
+                on: Some(7),
+                ..Registry::default()
+            };
             for i in 0..6u64 {
                 let now = t0 + Duration::from_secs(3600 * i);
                 let mut found = vec![ann(&format!("2001:db8:{:x}::/96", 0x100 + i), gw.0, 1800)];
@@ -2834,8 +2836,10 @@ mod r5_tests {
         for withdrawn in [true, false] {
             let mut h = Heard::new();
             h.on(Some(9));
-            let mut r = Registry::default();
-            r.on = Some(9);
+            let mut r = Registry {
+                on: Some(9),
+                ..Registry::default()
+            };
             let forged: Vec<Announced> = (1..=5)
                 .map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 8))
                 .collect();
@@ -2899,8 +2903,10 @@ mod r5_tests {
         let mut h = Heard::new();
         h.on(Some(1));
         h.hear(&[ann("2001:db8:a::/96", gw.0, 1800)], &[gw], t0);
-        let mut r = Registry::default();
-        r.on = Some(1);
+        let mut r = Registry {
+            on: Some(1),
+            ..Registry::default()
+        };
         round(&h, &mut r, 1, gw, t0);
         assert_eq!(in_force_of(&r, t0), vec![p("2001:db8:a::/96")]);
         let t1 = t0 + Duration::from_secs(60);
