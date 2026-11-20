@@ -3539,6 +3539,19 @@ pub async fn run(
         ),
     }
     let state = new_shared_state();
+    // A job's claim, fulfil and release transactions say what they are waiting on as it happens
+    // (`zkminer_chain::tx_events`), for its status line (`MinerState::on_tx_event`).
+    {
+        let state = state.clone();
+        zkminer_chain::tx_events::set_tx_observer(move |job_id, kind, event| {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let state = state.clone();
+                handle.spawn(async move {
+                    state.write().await.on_tx_event(job_id, kind, event);
+                });
+            }
+        });
+    }
 
     // Initialize worker pool (before TUI, after config load)
     let benchmark_timeout = config.prover.benchmark_timeout();
@@ -11392,10 +11405,21 @@ async fn process_job_lifecycle(
             Err(e) => return Err(HandBack(format!("ownership re-read failed: {e:#}")).into()),
         }
     } else {
-        match client
+        // Shown as the job's status while the claim is out (`JobNote`): sent, waiting for the chain
+        // to confirm it, sent again. The transaction's own events rewrite it.
+        state.write().await.set_job_note(
+            job_id,
+            zkminer_tui::state::JobNoteKind::Claim,
+            "claiming: sending the claim transaction",
+        );
+        let claimed = client
             .claim_job_idempotent(job_id, snapshot.current_price)
+            .await;
+        state
+            .write()
             .await
-        {
+            .clear_job_note(job_id, zkminer_tui::state::JobNoteKind::Claim);
+        match claimed {
             Ok(ClaimOutcome::Claimed(r)) => r.block,
             Ok(ClaimOutcome::LostRace) if prior_claim => {
                 return Err(HandBack("another prover reads as holding a job an earlier claim of ours may hold".into()).into());
@@ -11873,6 +11897,18 @@ async fn process_job_lifecycle(
                         j.status = zkminer_tui::state::MinerJobStatus::Queued;
                     }
                 }
+                // Not "waiting for a GPU" when it is trying again after an attempt failed. A wait
+                // for memory has set its own note (below), and a wait for a card is what Queued says.
+                if !waiting_for_card && !s.job_notes.contains_key(&job_id) {
+                    s.set_job_note(
+                        job_id,
+                        zkminer_tui::state::JobNoteKind::Wait,
+                        format!(
+                            "trying again after a failed attempt (attempt {attempt} of \
+                             {MAX_PROVE_ATTEMPTS})"
+                        ),
+                    );
+                }
             }
             retrying = true;
             // The EFFECTIVE deadline moves out while the protocol is paused or a Disabled window
@@ -12113,6 +12149,8 @@ async fn process_job_lifecycle(
                                     .record(report, now);
                             }
                         }
+                        // Proving: no longer waiting on memory or a retry.
+                        st.clear_job_note(started_id, zkminer_tui::state::JobNoteKind::Wait);
                         let Some(j) = st
                             .active_jobs
                             .iter_mut()
@@ -12279,6 +12317,13 @@ async fn process_job_lifecycle(
                                     "preferring another card"
                                 },
                             );
+                            state.write().await.set_job_note(
+                                job_id,
+                                zkminer_tui::state::JobNoteKind::Wait,
+                                format!(
+                                    "waiting for GPU memory, checking again every {GPU_MEMORY_BACKOFF_SECS}s"
+                                ),
+                            );
                             tokio::time::sleep(Duration::from_secs(GPU_MEMORY_BACKOFF_SECS)).await;
                             continue;
                         }
@@ -12380,6 +12425,11 @@ async fn process_job_lifecycle(
                                 HOST_MEMORY_BACKOFF_SECS,
                                 memory_waits,
                                 MAX_HOST_MEMORY_WAITS,
+                            );
+                            state.write().await.set_job_note(
+                                job_id,
+                                zkminer_tui::state::JobNoteKind::Wait,
+                                "waiting for host memory (RAM, or commit under Windows) to free up",
                             );
                             // Until memory is given back, or the backoff at most: a release is a
                             // wake-up, not a promise, and one before this wait began is missed.
@@ -12736,6 +12786,12 @@ async fn process_job_lifecycle(
         if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
             j.status = MinerJobStatus::Submitting;
         }
+        // Rewritten by the fulfil transaction's own events (`JobNote`).
+        s.set_job_note(
+            job_id,
+            zkminer_tui::state::JobNoteKind::Submit,
+            "submitting the proof: sending the fulfil transaction",
+        );
         s.add_log(
             LogLevel::Info,
             format!("Submitting fulfillment for {}...", short_id(job_id)),

@@ -137,6 +137,8 @@ pub(crate) fn claimed_status_text(job: &TrackedJob, state: &MinerState, now: u64
             })
     });
     let stage = match &job.status {
+        // What it is waiting on now, where the status would say something older (`JobNote`).
+        _ if state.job_note_text(job).is_some() => state.job_note_text(job).unwrap_or_default(),
         MinerJobStatus::Queued => "queued, waiting for a GPU".to_string(),
         MinerJobStatus::Proving { .. } => {
             let on = card.map(|c| format!(" on {c}")).unwrap_or_default();
@@ -173,6 +175,10 @@ pub(crate) fn claimed_status_text(job: &TrackedJob, state: &MinerState, now: u64
 /// The Status column: for an open job, why the miner did not claim it when it last looked (or that it
 /// has not looked yet); otherwise the job's state, with a skip's reason.
 pub(crate) fn job_status_text(job: &TrackedJob, state: &MinerState) -> String {
+    // Being claimed: the claim transaction's stage (`JobNote`), not why it was passed over before.
+    if let Some(note) = state.job_note_text(job) {
+        return note;
+    }
     match &job.status {
         MinerJobStatus::Open => match (
             &state.claim_outlook.held,
@@ -209,6 +215,96 @@ mod tests {
             prover_backend: String::new(),
             estimated_cycles: 0,
         }
+    }
+
+    /// While a job waits on something its status would not say (a claim or fulfil transaction the
+    /// chain has not confirmed, memory, a retry), its status line says that, with how long; the
+    /// transaction's own events rewrite it, and one arriving after its stage ended changes nothing.
+    #[test]
+    fn a_job_says_what_it_is_waiting_on() {
+        use crate::state::JobNoteKind;
+        use zkminer_chain::tx_events::{TxEvent, TxKind};
+        let mut state = MinerState {
+            open_jobs: vec![job(1, MinerJobStatus::Open)],
+            active_jobs: vec![
+                job(2, MinerJobStatus::Queued),
+                job(3, MinerJobStatus::Submitting),
+            ],
+            ..Default::default()
+        };
+        let (claiming, queued, submitting) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+        );
+        // Being claimed: the claim's stage, not why it was passed over before.
+        state.set_job_note(
+            claiming,
+            JobNoteKind::Claim,
+            "claiming: sending the claim transaction",
+        );
+        state.on_tx_event(claiming, TxKind::Claim, TxEvent::Sent { attempt: 1, of: 5 });
+        assert!(job_status_text(&state.open_jobs[0], &state)
+            .starts_with("claiming: waiting for the chain to confirm (try 1 of 5), "));
+        state.on_tx_event(
+            claiming,
+            TxKind::Claim,
+            TxEvent::Unconfirmed { attempt: 1, of: 5 },
+        );
+        assert!(job_status_text(&state.open_jobs[0], &state)
+            .starts_with("claiming: not confirmed yet, checking the chain before sending again"));
+        // A fulfil event does not touch a claim's note.
+        state.on_tx_event(
+            claiming,
+            TxKind::Fulfil,
+            TxEvent::Sent { attempt: 1, of: 5 },
+        );
+        assert!(job_status_text(&state.open_jobs[0], &state).starts_with("claiming: not confirmed"));
+        // Once the claim is over, a late event of it changes nothing.
+        state.clear_job_note(claiming, JobNoteKind::Claim);
+        state.on_tx_event(claiming, TxKind::Claim, TxEvent::Sent { attempt: 2, of: 5 });
+        assert!(!state.job_notes.contains_key(&claiming));
+        assert_eq!(
+            job_status_text(&state.open_jobs[0], &state),
+            "Open (not evaluated yet)"
+        );
+
+        // Waiting for memory, not "waiting for a GPU".
+        let now = 0;
+        assert!(
+            claimed_status_text(&state.active_jobs[0], &state, now).contains("waiting for a GPU")
+        );
+        state.set_job_note(queued, JobNoteKind::Wait, "waiting for host memory");
+        assert!(claimed_status_text(&state.active_jobs[0], &state, now)
+            .starts_with("Claimed: waiting for host memory, "));
+        // Submitting: the fulfil's stage, rate limiting included.
+        state.set_job_note(
+            submitting,
+            JobNoteKind::Submit,
+            "submitting the proof: sending",
+        );
+        state.on_tx_event(
+            submitting,
+            TxKind::Fulfil,
+            TxEvent::SendFailed {
+                attempt: 2,
+                of: 5,
+                rate_limited: true,
+            },
+        );
+        assert!(claimed_status_text(&state.active_jobs[1], &state, now).starts_with(
+            "Claimed: submitting the proof: the RPC is rate-limiting, sending again shortly (try 2 of 5)"
+        ));
+        // Proving speaks for itself: a stale note is not shown over it.
+        state.active_jobs[0].status = MinerJobStatus::Proving {
+            progress: 0.0,
+            elapsed_secs: 0,
+        };
+        assert!(state.job_note_text(&state.active_jobs[0]).is_none());
+        // Notes of jobs no longer listed go when another is set.
+        state.active_jobs.retain(|j| j.info.job_id != submitting);
+        state.set_job_note(queued, JobNoteKind::Wait, "trying again");
+        assert!(!state.job_notes.contains_key(&submitting));
     }
 
     /// Claimed jobs come first, and a job both claimed and still in the market list (the list has
