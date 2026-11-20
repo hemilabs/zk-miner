@@ -7813,9 +7813,15 @@ async fn miner_brain(
         if needing_card(&in_flight, &proved) >= claim_ceiling {
             publish_claim_hold(
                 &state,
+                // The claim limit, not the cards: jobs beyond the cards wait for one.
                 format!(
-                    "every slot is taken ({} job(s) held, limit {claim_ceiling})",
-                    needing_card(&in_flight, &proved)
+                    "holding {} job(s), the most it claims at once ({}); more as they finish",
+                    needing_card(&in_flight, &proved),
+                    if planner_active {
+                        format!("{claim_ceiling}: 3 x max_concurrent_proofs")
+                    } else {
+                        format!("max_concurrent_proofs = {claim_ceiling}")
+                    }
                 ),
                 &mut last_claim_summary,
             )
