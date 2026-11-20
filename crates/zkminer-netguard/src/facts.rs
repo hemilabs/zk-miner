@@ -816,15 +816,35 @@ pub fn parse_nameservers(text: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// The DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists, sorted.
+/// The DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists (on macOS, and of every
+/// per-domain resolver file in `/etc/resolver`), sorted.
 pub fn system_resolvers() -> Vec<IpAddr> {
     sorted(
         RESOLV_CONF_PATHS
             .iter()
             .filter_map(|p| std::fs::read_to_string(p).ok())
+            .chain(platform_resolver_files())
             .flat_map(|t| parse_nameservers(&t))
             .collect(),
     )
+}
+
+/// macOS: the per-domain resolver files (`/etc/resolver/<domain>`, resolver(5)), whose
+/// `nameserver` lines name servers the system resolver asks for those domains. (`/etc/resolv.conf`
+/// is written from the primary resolver configuration; resolvers that only the configuration
+/// daemon knows, which `scutil --dns` lists, are not read: see docs/netguard-macos.md.)
+#[cfg(target_os = "macos")]
+fn platform_resolver_files() -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir("/etc/resolver") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| std::fs::read_to_string(e.ok()?.path()).ok())
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_resolver_files() -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(unix)]
@@ -925,6 +945,7 @@ mod sys {
     ///
     /// # Safety
     /// `sa` is null or points to a sockaddr_in (`v4`) or sockaddr_in6.
+    #[cfg(not(target_os = "macos"))]
     unsafe fn sockaddr_mask(sa: *const libc::sockaddr, v4: bool) -> Option<u8> {
         if sa.is_null() {
             return None;
@@ -936,6 +957,36 @@ mod sys {
             let sin6 = &*(sa as *const libc::sockaddr_in6);
             Some(u128::from_be_bytes(sin6.sin6_addr.s6_addr).leading_ones() as u8)
         }
+    }
+
+    /// macOS: the prefix length of a netmask, read in the address's family up to its `sa_len`.
+    /// The kernel trims a netmask's trailing zero bytes (`sa_len` 7 for 255.255.255.0, 0 for an
+    /// all-zero mask) and `getifaddrs` copies `sa_len` bytes, so what lies past them is not the
+    /// mask's (the next sockaddr's, or past the list): those bytes read as zero.
+    ///
+    /// # Safety
+    /// `sa` is null or points to a sockaddr valid for its `sa_len` bytes.
+    #[cfg(target_os = "macos")]
+    unsafe fn sockaddr_mask(sa: *const libc::sockaddr, v4: bool) -> Option<u8> {
+        use std::mem::offset_of;
+        if sa.is_null() {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(sa.cast::<u8>(), usize::from((*sa).sa_len));
+        let (off, width) = if v4 {
+            (offset_of!(libc::sockaddr_in, sin_addr), 4)
+        } else {
+            (offset_of!(libc::sockaddr_in6, sin6_addr), 16)
+        };
+        let mut m = [0u8; 16];
+        for (i, b) in m[..width].iter_mut().enumerate() {
+            *b = bytes.get(off + i).copied().unwrap_or(0);
+        }
+        Some(if v4 {
+            u32::from_be_bytes([m[0], m[1], m[2], m[3]]).leading_ones() as u8
+        } else {
+            u128::from_be_bytes(m).leading_ones() as u8
+        })
     }
 }
 
