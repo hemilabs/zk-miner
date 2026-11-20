@@ -36,10 +36,14 @@
 //! The probe is closed without sending data (a reset if it connected). Unprivileged.
 //!
 //! **macOS.** A process that Local Network privacy has not been granted to gets `EHOSTUNREACH` at
-//! once for a connection into a directly attached network, before any packet is sent. The probe
-//! reads that as far, as it reads any unreachable; it changes nothing, because the real
-//! connection fails the same way, and such destinations (on-link) are refused by the address and
-//! route checks before any probe.
+//! once for a connection into a directly attached network, before any packet is sent (as does a
+//! connection a Network Extension policy denies). The probe reads an unreachable that `connect`
+//! itself reports, before the connection was in progress, as a failure (refused), not as far: no
+//! packet was answered, so it says nothing of the distance. (An ICMP "time exceeded" can only
+//! arrive after `connect` has returned `EINPROGRESS`; on this Mac every real one did, 2 ms or more
+//! later, and every Local Network denial came from `connect` itself, in under 0.4 ms: see
+//! docs/netguard-macos.md.) Such destinations are on-link, refused by the address and route
+//! checks before any probe anyway, and the real connection would fail the same way.
 //!
 //! **What it cannot help:** a probe that connects, and a check connection, still reach a near
 //! host (a SYN, a handshake, a FIN, a reset; never data) before the refusal; a near host that
@@ -276,6 +280,7 @@ fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let sock = new_socket(addr)?;
     set_hops(&sock, addr, hops)?;
@@ -284,6 +289,81 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let _ = sock.set_linger(Some(Duration::ZERO));
     drop(sock);
     r
+}
+
+/// macOS: the probe as elsewhere (`socket2::Socket::connect_timeout`'s steps), except that an
+/// unreachable `connect` reports at once, before the connection is in progress, is a failure (see
+/// the module doc).
+#[cfg(target_os = "macos")]
+fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
+    let sock = new_socket(addr)?;
+    set_hops(&sock, addr, hops)?;
+    sock.set_nonblocking(true)?;
+    let r = match sock.connect(&addr.into()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => poll_connected(&sock, timeout),
+        Err(e) => Err(unreachable_at_once(e)),
+    };
+    // Closed with a reset, never a byte of data.
+    let _ = sock.set_linger(Some(Duration::ZERO));
+    drop(sock);
+    r
+}
+
+/// macOS: an error `connect` reported before the connection was in progress. An unreachable
+/// (Local Network privacy, a Network Extension policy, no route) becomes a failure the probe does
+/// not read as "farther"; any other error is left as it is.
+#[cfg(target_os = "macos")]
+fn unreachable_at_once(e: io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(libc::EHOSTUNREACH) | Some(libc::ENETUNREACH) => io::Error::other(format!(
+            "{e}, before any packet was answered (Local Network privacy, a Network Extension \
+             policy, or no route)"
+        )),
+        _ => e,
+    }
+}
+
+/// macOS: waits for a non-blocking connect in progress, as `socket2::Socket::connect_timeout`
+/// does: connected, its error, or `TimedOut`.
+#[cfg(target_os = "macos")]
+fn poll_connected(sock: &socket2::Socket, timeout: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let start = std::time::Instant::now();
+    let mut p = libc::pollfd {
+        fd: sock.as_raw_fd(),
+        events: libc::POLLIN | libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let ms = (timeout - elapsed).as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        // SAFETY: `p` is one valid pollfd.
+        match unsafe { libc::poll(&mut p, 1, ms) } {
+            0 => return Err(io::ErrorKind::TimedOut.into()),
+            n if n > 0 => {
+                if p.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return match sock.take_error() {
+                        Ok(Some(e)) | Err(e) => Err(e),
+                        Ok(None) => Err(io::Error::other("no error set after POLLHUP")),
+                    };
+                }
+                return match sock.take_error()? {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
+            }
+            _ => {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            }
+        }
+    }
 }
 
 /// The check connection (see the module doc). Linux: the FIN's fate is read from `TCP_INFO`.
@@ -622,6 +702,43 @@ mod tests {
         accept.join().unwrap();
         // Nothing listening any more: the check connection does not connect, refused.
         assert!(matches!(decide(&Silent, addr, 2), Verdict::Failed(_)));
+    }
+
+    /// Hardening 13: on macOS an unreachable that `connect` reports at once (no packet answered:
+    /// Local Network privacy, a Network Extension policy) is a failure, refused; one that arrives
+    /// while the connection is in progress (an ICMP "time exceeded") is still far; other errors
+    /// keep their meaning.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unreachable_at_once_is_no_answer_on_macos() {
+        let at_once =
+            |e: i32| ProbeOutcome::of(Err(unreachable_at_once(io::Error::from_raw_os_error(e))));
+        for e in [libc::EHOSTUNREACH, libc::ENETUNREACH] {
+            let o = at_once(e);
+            assert!(
+                matches!(&o, ProbeOutcome::Failed(w) if w.contains("before any packet")),
+                "{o:?}"
+            );
+            assert!(matches!(o.verdict(), Verdict::Failed(_)));
+        }
+        assert_eq!(at_once(libc::ECONNREFUSED), ProbeOutcome::Refused);
+        assert_eq!(
+            ProbeOutcome::of(Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))),
+            ProbeOutcome::Unreachable
+        );
+        // This host's router (on-link): without Local Network privacy granted the probe is denied
+        // at once and refused; with it the router answers within the limit. Never far.
+        let (routes, _) = crate::routes::read_routing(&[]).unwrap();
+        if let Some(g) = routes.iter().find_map(|r| match (r.prefix.len, r.hop) {
+            (0, crate::routes::Hop::Via(g @ std::net::IpAddr::V4(_))) => Some(g),
+            _ => None,
+        }) {
+            let o = TtlProbe.probe(SocketAddr::new(g, 80), 2, PROBE_TIMEOUT);
+            eprintln!("the router, port 80, hop limit 2: {o:?}");
+            assert_ne!(o.verdict(), Verdict::Far, "{o:?}");
+        } else {
+            eprintln!("SKIPPED the router probe: no IPv4 default route");
+        }
     }
 
     /// probe-1: `TCP_CONNECTION_INFO` is read only within what the kernel wrote (112 bytes here,
