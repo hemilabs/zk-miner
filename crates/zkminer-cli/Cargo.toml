@@ -62,6 +62,11 @@ ctr = "0.9"
 hex = { workspace = true }
 libc = "0.2"
 
+# `run::segment_disk::free_bytes` (statvfs) on every Unix; Linux has it in the table above. Without it
+# the miner did not build on macOS (W11-ON37).
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Tests write keystores the way other tools do (eth-keystore), for `artifact publish` to read.
 alloy-signer-local = { version = "1", features = ["keystore"] }
