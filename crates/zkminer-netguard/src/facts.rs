@@ -405,6 +405,49 @@ fn uplink_signature(routes: &RouteTable, internet: &[u32]) -> u64 {
     h.finish()
 }
 
+/// macOS: the kernel's answer `answer`, which `routes` (these facts' table) admitted, must leave by
+/// a default path these facts hold (review round 3, bypass-3). [`RouteTable::judge`] admits any
+/// default-like route of an ordinary table whatever its gateway and interface, so an uplink that
+/// came up after the facts were read (a full-tunnel VPN's `0/1` on a `utun`, a second network's
+/// default) was admitted until the facts were read again, up to [`crate::FACTS_TTL`] later (and
+/// `REFRESH_GRACE` more while re-reads fail), and only those facts would have seen it
+/// (`[egress] internal_ranges`, the uplink signature). So each route of the answer that is
+/// default-like must be one of their default-like routes: the same family, hop and interface (a
+/// route through one of their uplinks is: an uplink is a `/0` route's gateway and interface).
+/// Otherwise it is refused as off the default path
+/// (the gateway's or the link's kind), which rests on the facts: the policy reads them again and
+/// judges once more.
+#[cfg(target_os = "macos")]
+fn default_path_known(
+    routes: &RouteTable,
+    answer: &crate::routes::KernelAnswer,
+) -> Result<(), crate::routes::RouteRefusal> {
+    use crate::routes::{Hop, KernelAnswer, RouteKind, RouteRefusal};
+    let KernelAnswer::Entry(entry) = answer else {
+        // No route and a split answer are refused by the judge already.
+        return Ok(());
+    };
+    for r in entry {
+        let held = routes.routes().iter().any(|d| {
+            d.is_default_like()
+                && d.prefix.addr.is_ipv6() == r.prefix.addr.is_ipv6()
+                && d.hop == r.hop
+                && d.ifindex == r.ifindex
+        });
+        if r.is_default_like() && !held {
+            return Err(RouteRefusal {
+                prefix: r.prefix,
+                kind: if r.hop == Hop::OnLink {
+                    RouteKind::OnLink
+                } else {
+                    RouteKind::OtherGateway
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
 /// macOS: [`uplink_signature`] (`base`) and the network each service is on, as the configuration
 /// daemon identifies it (`NetworkSignature`: the router's address and hardware address for IPv4,
 /// the prefix and the router's hardware address for IPv6; [`macos_dns::network_signatures`]).
@@ -714,6 +757,13 @@ impl HostFacts {
             Some(v) => v,
             None => {
                 let v = match oracle.route_to(dst, dport) {
+                    #[cfg(target_os = "macos")]
+                    Ok(answer) => self
+                        .routes
+                        .judge_answer(&answer)
+                        .and_then(|()| default_path_known(&self.routes, &answer))
+                        .map_err(KernelRefusal::Route),
+                    #[cfg(not(target_os = "macos"))]
                     Ok(answer) => self
                         .routes
                         .judge_answer(&answer)

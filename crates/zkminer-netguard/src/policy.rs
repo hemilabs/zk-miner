@@ -1446,8 +1446,25 @@ mod tests {
                 kind: RouteKind::OtherGateway
             })
         );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(a("93.184.216.34"), Ok(()));
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(a("1.0.0.1"), Ok(()));
+        // macOS (review round 3, bypass-3): a default-like answer must be one of these facts'
+        // default routes; the split default via the VPN and wg-quick's table on interface 9 are
+        // not (`a_new_uplink_is_refused_until_the_facts_hold_it`).
+        #[cfg(target_os = "macos")]
+        for (dst, kind) in [
+            ("93.184.216.34", RouteKind::OtherGateway),
+            ("1.0.0.1", RouteKind::OnLink),
+        ] {
+            let e = a(dst).unwrap_err();
+            assert!(
+                matches!(e, Denied::OffDefaultRoute { kind: k, .. } if k == kind),
+                "{dst}: {e:?}"
+            );
+            assert!(e.depends_on_facts());
+        }
         assert_eq!(a("172.233.157.223"), Ok(()));
         assert!(matches!(
             a("45.60.1.20"),
@@ -1489,6 +1506,108 @@ mod tests {
         // Developer mode asks nothing.
         assert_eq!(admit(NetMode::DevPrivate, ip("52.95.1.1"), &f, &[]), Ok(()));
         let _ = RouteType::Local;
+    }
+
+    /// macOS, review round 3, bypass-3 (the reviewer's `r3_a_new_uplink_passes_the_kernel_check_
+    /// of_old_facts`): the kernel's default-like answer is admitted only when these facts hold
+    /// that default route (its family, hop and interface). A full-tunnel VPN that came up after
+    /// the facts were read (`0/1` on a `utun`, or its own default via its peer) and a second
+    /// network's default are refused as off the default path, a refusal that rests on the facts
+    /// (the policy reads them again and judges once more); the facts' own default, a clone through
+    /// their uplink, and the same VPN once the facts hold it are admitted.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_uplink_is_refused_until_the_facts_hold_it() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let raw = |extra: Vec<Route>| RawFacts {
+            interface_prefixes: vec![pfx("192.168.1.0/24")],
+            interface_addresses: vec![ip("192.168.1.33")],
+            routes: [
+                vec![
+                    Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 14),
+                    Route::on_link(pfx("192.168.1.0/24"), 14),
+                ],
+                extra,
+            ]
+            .concat(),
+            ..RawFacts::default()
+        };
+        let mut staged = Staged::default();
+        let answers = [
+            (
+                "8.8.8.8",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 14),
+            ),
+            (
+                "1.1.1.1",
+                Route::via(pfx("1.1.1.1/32"), ip("192.168.1.1"), 14),
+            ),
+            ("9.9.9.9", Route::on_link(pfx("0.0.0.0/1"), 20)),
+            ("4.2.2.2", Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 20)),
+            (
+                "4.2.2.3",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.50.1"), 15),
+            ),
+            // The facts' gateway, out of another interface; another gateway on the facts'
+            // interface.
+            (
+                "4.2.2.4",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 15),
+            ),
+            (
+                "4.2.2.5",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.1.254"), 14),
+            ),
+            // A link route of the other family on the VPN's interface.
+            ("2606:4700::6810:84e5", Route::on_link(pfx("::/1"), 20)),
+        ];
+        for (d, r) in &answers {
+            staged.answers.insert(ip(d), Some(vec![*r]));
+        }
+        let staged = Arc::new(staged);
+        let old =
+            HostFacts::assemble(raw(Vec::new()), &offline()).with_route_oracle(staged.clone());
+        let a = |f: &HostFacts, s: &str| admit(NetMode::Public, ip(s), f, &[]);
+        assert_eq!(a(&old, "8.8.8.8"), Ok(()));
+        assert_eq!(a(&old, "1.1.1.1"), Ok(()));
+        for (d, kind) in [
+            ("9.9.9.9", RouteKind::OnLink),
+            ("4.2.2.2", RouteKind::OtherGateway),
+            ("4.2.2.3", RouteKind::OtherGateway),
+            ("4.2.2.4", RouteKind::OtherGateway),
+            ("4.2.2.5", RouteKind::OtherGateway),
+        ] {
+            let e = a(&old, d).unwrap_err();
+            assert!(
+                matches!(e, Denied::OffDefaultRoute { kind: k, .. } if k == kind),
+                "{d}: {e:?}"
+            );
+            assert!(e.depends_on_facts(), "{d}");
+        }
+        // Once the facts hold the VPN's routes (read after it came up), its answers are admitted.
+        let new = HostFacts::assemble(
+            raw(vec![
+                Route::on_link(pfx("0.0.0.0/1"), 20),
+                Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 20),
+            ]),
+            &FactsOptions {
+                internal_ranges: Some(Vec::new()),
+                ..offline()
+            },
+        )
+        .with_route_oracle(staged);
+        assert_eq!(a(&new, "9.9.9.9"), Ok(()));
+        assert_eq!(a(&new, "4.2.2.2"), Ok(()));
+        assert!(a(&new, "4.2.2.3").is_err());
+        // The VPN's `0/1` is IPv4's: an IPv6 `::/1` on the same interface is not held.
+        assert!(matches!(
+            a(&new, "2606:4700::6810:84e5"),
+            Err(Denied::OffDefaultRoute {
+                kind: RouteKind::OnLink,
+                ..
+            })
+        ));
     }
 
     /// Review r1 fetch F1 (PoC `facts`), inverted, on this host's real facts: neighbours in the
