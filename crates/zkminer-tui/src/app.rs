@@ -1065,8 +1065,16 @@ fn draw(f: &mut Frame, state: &MinerState) {
     left_spans.push(Span::styled(
         format!(
             "Locked: {}  Available: {}  ",
-            // Held locks hold collateral too (`kept_locks`).
-            state.active_jobs.len() + state.kept_locks.len(),
+            // Held locks hold collateral too (`kept_locks`); each job once.
+            state.active_jobs.len()
+                + state
+                    .kept_locks
+                    .iter()
+                    .filter(|k| !state
+                        .active_jobs
+                        .iter()
+                        .any(|a| a.info.job_id == k.info.job_id))
+                    .count(),
             state.open_jobs.len()
         ),
         Style::default().fg(theme::text()),

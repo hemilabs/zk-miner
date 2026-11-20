@@ -32,7 +32,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     };
     if selected.is_none() && state.selected_job_id.is_some() {
         let paragraph = Paragraph::new(Span::styled(
-            "That job is no longer listed (fulfilled, released, or claimed by another prover). \
+            "That job is no longer listed (finished a while ago, or claimed by another prover). \
              Press 2 to browse jobs.",
             theme::placeholder(),
         ))
@@ -78,10 +78,8 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     // Render outer border
     f.render_widget(block, area);
 
-    let claimed = state
-        .active_jobs
-        .iter()
-        .any(|j| j.info.job_id == job.info.job_id);
+    // Ours: claimed, held, or finished (not a market job).
+    let claimed = super::jobs::row_kind(job, state) != super::jobs::RowKind::Open;
 
     // Job info
     let info_text = vec![
@@ -95,10 +93,15 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Status:        ", theme::dim()),
-            Span::raw(if claimed {
-                super::jobs::claimed_status_text(job, state, now_unix())
-            } else {
-                super::jobs::job_status_text(job, state)
+            Span::raw(match super::jobs::row_kind(job, state) {
+                super::jobs::RowKind::Claimed => {
+                    super::jobs::claimed_status_text(job, state, now_unix())
+                }
+                super::jobs::RowKind::Held => super::jobs::held_status_text(job, state, now_unix()),
+                super::jobs::RowKind::Finished => {
+                    super::jobs::finished_status_text(job, state, now_unix())
+                }
+                super::jobs::RowKind::Open => super::jobs::job_status_text(job, state),
             }),
         ]),
         Line::from(vec![

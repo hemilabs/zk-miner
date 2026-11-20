@@ -869,7 +869,24 @@ fn render_performance(f: &mut Frame, area: Rect, state: &MinerState) {
 fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" Active Jobs ({}) ", state.active_jobs.len()),
+            // Locks held but not being proven are on the Jobs page; say they exist.
+            match state
+                .kept_locks
+                .iter()
+                .filter(|k| {
+                    !state
+                        .active_jobs
+                        .iter()
+                        .any(|a| a.info.job_id == k.info.job_id)
+                })
+                .count()
+            {
+                0 => format!(" Active Jobs ({}) ", state.active_jobs.len()),
+                held => format!(
+                    " Active Jobs ({}, +{held} held: see Jobs) ",
+                    state.active_jobs.len()
+                ),
+            },
             theme::title(),
         ))
         .borders(Borders::ALL)
@@ -942,7 +959,13 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
                 _ => "Unknown".to_string(),
             };
 
-            let price_str = format!("{} HEMI", format_token_amount(job.current_price));
+            // What the claim locked, as the Jobs page shows.
+            let price = if job.info.settled_price > 0 {
+                job.info.settled_price
+            } else {
+                job.current_price
+            };
+            let price_str = format!("{} HEMI", format_token_amount(price));
 
             Row::new(vec![
                 Cell::from(id_short).style(theme::identifier()),

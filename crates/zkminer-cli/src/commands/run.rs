@@ -4087,7 +4087,15 @@ pub async fn run(
                 MonitorEvent::JobClaimed { job_id, prover, .. } => {
                     forget_job_bound(job_id);
                     let before = s.open_jobs.len();
-                    s.open_jobs.retain(|j| j.info.job_id != job_id);
+                    // Our own claim's row stays until its lifecycle moves it to the claimed list
+                    // (a few seconds later): taken off here, it was in no list in between.
+                    let ours = s
+                        .job_notes
+                        .get(&job_id)
+                        .is_some_and(|n| n.kind == zkminer_tui::state::JobNoteKind::Claim);
+                    if !ours {
+                        s.open_jobs.retain(|j| j.info.job_id != job_id);
+                    }
                     if s.open_jobs.len() != before {
                         tracing::debug!(
                             "pruned claimed job {} from candidates (prover {})",
@@ -12223,11 +12231,13 @@ async fn process_job_lifecycle(
                         .into());
                     }
                     waiting_for_card = true;
-                    // A wait for a card is what Queued says: an earlier memory note no longer applies.
-                    state
-                        .write()
-                        .await
-                        .clear_job_note(job_id, zkminer_tui::state::JobNoteKind::Wait);
+                    // Not a queue: no enabled card can take it until the operator acts.
+                    state.write().await.set_job_note(
+                        job_id,
+                        zkminer_tui::state::JobNoteKind::Wait,
+                        "waiting: no enabled risc0 card has a job size (switch one on, or give one \
+                         a po2 under Settings, Advanced); released before its deadline otherwise",
+                    );
                     if !warned_no_card {
                         warned_no_card = true;
                         let detail = format!(
@@ -13037,6 +13047,8 @@ async fn process_job_lifecycle(
         let mut s = state.write().await;
         if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
             j.status = MinerJobStatus::Submitting;
+            // Off its card: the card is free for its next job, and its row is that job's.
+            j.gpu_bus_id = None;
         }
         // Rewritten by the fulfil transaction's own events (`JobNote`).
         s.set_job_note(
@@ -13513,11 +13525,10 @@ async fn refresh_kept_locks(
     in_flight: &HashMap<B256, u128>,
     rows: &mut HashMap<B256, zkminer_tui::state::TrackedJob>,
 ) {
-    let held: Vec<(B256, u64, bool)> = {
+    let entries: Vec<(B256, u64, bool)> = {
         let j = journal.lock().unwrap_or_else(|p| p.into_inner());
         j.entries
             .values()
-            .filter(|e| !in_flight.contains_key(&e.job_id))
             .map(|e| {
                 (
                     e.job_id,
@@ -13528,6 +13539,23 @@ async fn refresh_kept_locks(
             .collect()
     };
     let mut s = state.write().await;
+    // Held: no task works on it, or one does (a recovery release, a self-slash) without a row of
+    // its own in the claimed or market list, which would leave it in none while that runs.
+    let held: Vec<(B256, u64, bool)> = entries
+        .into_iter()
+        .filter(|(id, _, _)| {
+            !in_flight.contains_key(id)
+                || !(s.active_jobs.iter().any(|j| j.info.job_id == *id)
+                    || s.open_jobs.iter().any(|j| j.info.job_id == *id))
+        })
+        .collect();
+    // What a lock no task works on says is its reason, not a stage note left from its last task
+    // ("releasing the lock" on a lock that was kept).
+    for (id, _, _) in &held {
+        if !in_flight.contains_key(id) {
+            s.job_notes.remove(id);
+        }
+    }
     for j in &s.active_jobs {
         rows.insert(j.info.job_id, j.clone());
     }
@@ -13538,7 +13566,9 @@ async fn refresh_kept_locks(
         .iter()
         .map(|(id, _, claiming)| {
             let why = kept_reason_of(*id).unwrap_or_else(|| {
-                if *claiming {
+                if in_flight.contains_key(id) {
+                    "being recovered (re-driven or released)".to_string()
+                } else if *claiming {
                     "its claim was not confirmed; the recovery pass checks whether it holds the lock"
                         .to_string()
                 } else {
@@ -13551,20 +13581,23 @@ async fn refresh_kept_locks(
     s.kept_locks = held
         .iter()
         .map(|(id, deadline, _)| {
-            let mut row = rows
+            // Its last claimed row, else its market row (a claim that was not confirmed), else what
+            // is known: the id and deadline.
+            let known = rows
                 .get(id)
-                .cloned()
-                .unwrap_or_else(|| zkminer_tui::state::TrackedJob {
-                    info: zkminer_chain::jobs::JobInfo {
-                        job_id: *id,
-                        ..Default::default()
-                    },
-                    status: zkminer_tui::state::MinerJobStatus::Queued,
-                    current_price: 0,
-                    gpu_bus_id: None,
-                    prover_backend: String::new(),
-                    estimated_cycles: 0,
-                });
+                .or_else(|| s.open_jobs.iter().find(|j| j.info.job_id == *id))
+                .cloned();
+            let mut row = known.unwrap_or_else(|| zkminer_tui::state::TrackedJob {
+                info: zkminer_chain::jobs::JobInfo {
+                    job_id: *id,
+                    ..Default::default()
+                },
+                status: zkminer_tui::state::MinerJobStatus::Queued,
+                current_price: 0,
+                gpu_bus_id: None,
+                prover_backend: String::new(),
+                estimated_cycles: 0,
+            });
             row.info.lock_deadline = row.info.lock_deadline.max(*deadline);
             row.status = zkminer_tui::state::MinerJobStatus::Queued;
             row.gpu_bus_id = None;
@@ -14852,6 +14885,8 @@ async fn release_and_clean_with_nonce(
         zkminer_tui::state::JobNoteKind::Release,
         "releasing the lock",
     );
+    // A reason from an earlier pass no longer holds; each path that keeps the lock says its own.
+    forget_kept_reason(job_id);
     // A keep-locks stop hands every lock to the next start: a lifecycle that fails on the way out
     // (its worker stopped under it) must not release its lock. The breadcrumb stays for recovery.
     if keeping_lock(job_id) {
@@ -14896,6 +14931,10 @@ async fn release_and_clean_with_nonce(
                 if let Some(n) = pre_nonce {
                     client.abort_nonce(n);
                 }
+                note_kept_reason(job_id, "kept for the next start (its deadline leaves time)");
+                let mut s = state.write().await;
+                s.active_jobs.retain(|j| j.info.job_id != job_id);
+                s.clear_job_notes(job_id);
                 return;
             }
         }
@@ -14942,6 +14981,10 @@ async fn release_and_clean_with_nonce(
                 client.abort_nonce(n);
             }
             request_recovery();
+            note_kept_reason(
+                job_id,
+                "its governance or lock state could not be read; the recovery pass retries",
+            );
             state
                 .write()
                 .await
@@ -14974,6 +15017,11 @@ async fn release_and_clean_with_nonce(
             }
         }
         note_pause_kept(job_id);
+        note_kept_reason(
+            job_id,
+            "the router or Registry is paused (its deadline is credited); proven again after the \
+             pause",
+        );
         if let Some(n) = pre_nonce {
             client.abort_nonce(n);
         }
@@ -15007,6 +15055,11 @@ async fn release_and_clean_with_nonce(
                 // path cannot tell which, so keep the lock and let recovery re-read it.
                 Ok(false) if view_read.is_err() => {
                     request_recovery();
+                    note_kept_reason(
+                        job_id,
+                        "its adapter is Disabled and the grace release was refused; the recovery \
+                         pass reads it again",
+                    );
                     state
                         .write()
                         .await
@@ -15019,6 +15072,7 @@ async fn release_and_clean_with_nonce(
                     journal_update(journal, |j| j.remove(job_id));
                     client.settle_abandoned_nonce(job_id).await;
                     let mut s = state.write().await;
+                    s.record_finished(job_id, MinerJobStatus::Released { penalty: 0 });
                     s.active_jobs.retain(|j| j.info.job_id != job_id);
                     s.add_log(
                         LogLevel::Warn,
@@ -15036,6 +15090,11 @@ async fn release_and_clean_with_nonce(
                         short_id(job_id)
                     );
                     request_recovery();
+                    note_kept_reason(
+                        job_id,
+                        "its adapter is Disabled and the grace release failed; the recovery pass \
+                         retries",
+                    );
                     state
                         .write()
                         .await
@@ -15131,6 +15190,11 @@ async fn release_and_clean_with_nonce(
                 if let Some(n) = pre_nonce {
                     client.abort_nonce(n);
                 }
+                note_kept_reason(
+                    job_id,
+                    "another prover reads as holding it, but our lock is not provably gone; the \
+                     recovery pass checks again",
+                );
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != job_id);
                 return;
@@ -15254,8 +15318,17 @@ async fn release_and_clean_with_nonce(
             s.active_jobs.retain(|j| j.info.job_id != job_id);
             note_kept_reason(
                 job_id,
-                "past its deadline, so it cannot be released; this miner slashes it itself once \
-                 the slash opens (30 min after the deadline)",
+                if slash_opens != 0 && now >= slash_opens {
+                    "past its deadline, so it cannot be released; its slash is open and this miner \
+                     sends it on the next recovery pass"
+                        .to_string()
+                } else {
+                    format!(
+                        "past its deadline, so it cannot be released; this miner slashes it itself \
+                         from {}",
+                        zkminer_chain::exit::fmt_unix(slash_opens)
+                    )
+                },
             );
             if first {
                 s.add_log(
@@ -15316,9 +15389,22 @@ async fn release_and_clean_with_nonce(
             false
         }
     };
+    // `release_job_with_nonce` reports success whenever our lock is gone, which includes the fulfil
+    // it was displacing having mined: the history says which.
+    let fulfilled = release_ok
+        && client.get_job_status_view(job_id).await.is_ok_and(|v| {
+            v.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED && v.prover == client.address
+        });
     let mut s = state.write().await;
     if release_ok {
-        s.record_finished(job_id, MinerJobStatus::Released { penalty: 0 });
+        s.record_finished(
+            job_id,
+            if fulfilled {
+                MinerJobStatus::Fulfilled { payout: 0 }
+            } else {
+                MinerJobStatus::Released { penalty: 0 }
+            },
+        );
     }
     s.active_jobs.retain(|j| j.info.job_id != job_id);
     if release_ok {
