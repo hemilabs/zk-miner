@@ -1236,6 +1236,12 @@ impl MinerState {
     }
 
     /// Drop `job_id`'s note if it is of `kind`: that stage is over.
+    /// Drop every note of `job_id`: its lifecycle ended, or it starts over (a re-driven lock), so
+    /// nothing said about an earlier stage may show again.
+    pub fn clear_job_notes(&mut self, job_id: alloy_primitives::B256) {
+        self.job_notes.remove(&job_id);
+    }
+
     pub fn clear_job_note(&mut self, job_id: alloy_primitives::B256, kind: JobNoteKind) {
         if self.job_notes.get(&job_id).is_some_and(|n| n.kind == kind) {
             self.job_notes.remove(&job_id);
