@@ -1134,7 +1134,15 @@ impl NetPolicy {
             IpAddr::V4(_) => addr,
         };
         let hops = self.near_hop_limit();
-        match crate::nearhop::decide_until(&*self.probe, target, hops, deadline) {
+        // Review round 6, probe-3: a far verdict of the last few seconds, on the same facts, for
+        // the same destination and port (facts read from this host only).
+        let far_key = self.facts().path_key().map(|k| {
+            (target, hops, k, std::sync::Arc::as_ptr(&self.probe) as *const () as usize)
+        });
+        let verdict = crate::nearhop::decide_remembered(far_key, deadline, || {
+            crate::nearhop::decide_until(&*self.probe, target, hops, deadline)
+        });
+        match verdict {
             Verdict::Far => Ok(()),
             Verdict::Near(how) => Err(Denied::NearHop {
                 addr,
@@ -2011,6 +2019,36 @@ mod tests {
             admit(NetMode::Public, ip("1.1.1.1"), &f, &[]).err().map(|d| d.to_string().contains("NAT64")),
             Some(true)
         );
+    }
+
+    /// Review round 6, probe-3: a far verdict is remembered for the same destination and port on
+    /// the same facts (read from a host); near and failed never are, nor anything on facts given
+    /// by the caller, and other facts ask again.
+    #[test]
+    fn r6_a_far_verdict_is_remembered_on_the_same_facts_only() {
+        use crate::nearhop::{FixedProbe, ProbeOutcome};
+        let facts = |uplink: u64| HostFacts::new(vec![], vec![]).on_nat64_uplink(uplink);
+        let a: SocketAddr = "9.9.9.9:443".parse().unwrap();
+        let far = FixedProbe::far();
+        let p = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a12), vec![]).with_near_probe(far.clone());
+        assert_eq!(p.vet_connection(a), Ok(()));
+        assert_eq!(p.vet_connection(a), Ok(()));
+        assert_eq!(far.asked.lock().unwrap().len(), 1, "remembered");
+        p.vet_connection("9.9.9.9:80".parse().unwrap()).unwrap();
+        assert_eq!(far.asked.lock().unwrap().len(), 2, "another port is asked");
+        let q = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a13), vec![]).with_near_probe(far.clone());
+        q.vet_connection(a).unwrap();
+        assert_eq!(far.asked.lock().unwrap().len(), 3, "other facts ask again");
+        let given = NetPolicy::with_facts(NetMode::Public, HostFacts::new(vec![], vec![]), vec![])
+            .with_near_probe(far.clone());
+        given.vet_connection(a).unwrap();
+        given.vet_connection(a).unwrap();
+        assert_eq!(far.asked.lock().unwrap().len(), 5, "facts given by the caller: never remembered");
+        let near = FixedProbe::answering(ProbeOutcome::Connected);
+        let n = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a14), vec![]).with_near_probe(near.clone());
+        assert!(n.vet_connection(a).is_err());
+        assert!(n.vet_connection(a).is_err());
+        assert_eq!(near.asked.lock().unwrap().len(), 2, "near: asked each time");
     }
 
     /// Review round 6 (the parse lens's suspicion): a mark made between two facts reads (the

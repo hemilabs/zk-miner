@@ -1056,6 +1056,24 @@ impl HostFacts {
         self
     }
 
+    /// For facts read from this host: a value that changes with anything a path depends on (the
+    /// routes, the rules, the interfaces' addresses and prefixes, the uplink signature), which a
+    /// remembered far verdict is tied to ([`crate::nearhop::remembered_far`]); `None` for facts
+    /// given by the caller.
+    pub(crate) fn path_key(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let uplink = self.nat64_uplink?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        uplink.hash(&mut h);
+        self.routes.routes().hash(&mut h);
+        self.routes.local_routes().hash(&mut h);
+        self.routes.steered().hash(&mut h);
+        self.own.hash(&mut h);
+        self.connected.hash(&mut h);
+        self.nexthops.hash(&mut h);
+        Some(h.finish())
+    }
+
     /// These facts without the kernel's cached verdicts (a refresh failed: what the kernel
     /// answered for them is asked again).
     pub(crate) fn without_verdicts(&self) -> Self {
