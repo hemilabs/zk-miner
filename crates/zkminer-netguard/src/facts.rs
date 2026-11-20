@@ -3976,6 +3976,32 @@ mod r6_tests {
         assert!(!tunnelled_ipv4(&v4_default_links(&plain, &links, &[])));
         let utun = vec![Link { index: 2, name: "utun3".into(), kind: Some("tun".into()) }];
         assert!(tunnelled_ipv4(&v4_default_links(&plain, &utun, &[])));
+        for name in ["clat", "v4-rmnet0", "tun0"] {
+            let l = vec![Link { index: 2, name: name.into(), kind: None }];
+            assert!(tunnelled_ipv4(&v4_default_links(&plain, &l, &[])), "{name}");
+        }
+        let eth = vec![Link { index: 2, name: "eth0".into(), kind: None }];
+        assert!(!tunnelled_ipv4(&v4_default_links(&plain, &eth, &[])));
+    }
+
+    /// probe-3: a remembered far verdict is tied to the facts' path key, which changes with a
+    /// route, a rule's steering, an address and the uplink (fix-r6 mutation F13).
+    #[test]
+    fn r6_the_path_key_changes_with_what_a_path_depends_on() {
+        let facts = |routes: Vec<Route>, own: Vec<IpAddr>| {
+            HostFacts::assemble(RawFacts { routes, interface_addresses: own, ..RawFacts::default() }, &FactsOptions::default())
+                .on_uplink(UplinkId::both(7))
+        };
+        let base = facts(table().routes().to_vec(), vec![ip("192.168.1.100")]).path_key();
+        assert!(base.is_some());
+        let mut more = table().routes().to_vec();
+        more.push(Route::via(p("52.0.0.0/8"), ip("192.168.1.254"), 2));
+        assert_ne!(facts(more, vec![ip("192.168.1.100")]).path_key(), base, "a route");
+        assert_ne!(facts(table().routes().to_vec(), vec![ip("192.168.1.101")]).path_key(), base, "an address");
+        let other = HostFacts::assemble(RawFacts { routes: table().routes().to_vec(), interface_addresses: vec![ip("192.168.1.100")], ..RawFacts::default() }, &FactsOptions::default()).on_uplink(UplinkId::both(8));
+        assert_ne!(other.path_key(), base, "the uplink");
+        assert_eq!(facts(table().routes().to_vec(), vec![ip("192.168.1.100")]).path_key(), base);
+        assert_eq!(HostFacts::new(vec![], vec![]).path_key(), None, "facts given by the caller");
     }
 
     /// cross-7 V02 (Linux, live): the facts read the neighbour table (a host with an IPv4
