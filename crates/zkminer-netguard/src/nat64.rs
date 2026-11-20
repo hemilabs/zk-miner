@@ -37,6 +37,20 @@
 //! configured ones and those learned on the uplink in use, still named and within their
 //! lifetime, are synthesized with ([`in_force`]).
 //!
+//! Review round 6 (cross-1, cross-2 = parse-2, bypass-1): what an attacker on the link (forged
+//! router advertisements, spoofed DNS64 answers) leaves behind is bounded in time. A PREF64
+//! lifetime is believed up to [`MAX_PREF64_LIFETIME`]; a router's newest advertisement replaces
+//! what it named before, and a router naming too many keeps its newest; only active entries
+//! count against [`MAX_PER_UPLINK`]; a learned prefix that stopped being named, or whose uplink
+//! the host left, is still refused for [`STALE_GRACE`] and then forgotten (neither the predicate
+//! nor the broker's refusals read it); a DNS server no longer asked names nothing. The invariant,
+//! tested on random sequences (`r6_an_attacker_who_stops_causes_a_bounded_refusal`): an attacker
+//! who stops sending leaves the uplink unsettled for at most `MAX_PREF64_LIFETIME + STALE_GRACE +
+//! DISCOVERY_TTL` (95 minutes; one forged advertisement: until the gateway's next one), the real
+//! gateway's prefix is in force after each of its advertisements, and on the real network a
+//! prefix learned there is refused, or every IPv6 destination is, until STALE_GRACE after its
+//! source last named it.
+//!
 //! Every address under one of them is read as the IPv4 address it carries, laid out as RFC 6052
 //! says for the prefix's length (bits 64–71, the "u" octet, skipped): [`crate::is_global`] refuses
 //! it unless that IPv4 address is global (and the u octet is zero, as RFC 6052 requires), and
@@ -86,6 +100,24 @@ pub const MAX_PER_ANSWER: usize = 2;
 /// Most NSPs one router may announce (PREF64, RFC 8781), and the system's own NAT64 state may
 /// name; more is not believed.
 pub const MAX_PER_ROUTER: usize = 4;
+/// The longest PREF64 lifetime believed (review round 6, cross-1): RFC 8781 allows 65528 s, so one
+/// forged advertisement unsettled an uplink for 18 hours. 1800 s is RFC 4861's largest
+/// `MaxRtrAdvInterval` (and three times the default 600 s): a router that still announces a
+/// prefix does so again within it.
+pub const MAX_PREF64_LIFETIME: Duration = Duration::from_secs(1800);
+/// How long a learned NSP is still refused after it stopped being named, or after the host left
+/// the uplink it was learned on (review round 6, bypass-1, cross-2): twice RFC 4861's largest
+/// `MaxRtrAdvInterval`, so that a router that still announces it (one advertisement lost
+/// included), and every round of the new uplink, has named it again before it is forgotten.
+/// After it, the prefix no longer affects the address predicate nor the broker's refusals, and
+/// its room is free.
+pub const STALE_GRACE: Duration = Duration::from_secs(3600);
+/// The options of one router advertisement reach the PREF64 listener as one netlink message each
+/// (`ndisc_ra_useropt`), back to back; a router's messages within this of the first are one
+/// advertisement (review round 6, cross-1: a router's newest advertisement replaces what it named
+/// before). Routers send advertisements at least `MIN_DELAY_BETWEEN_RAS` (3 s) apart.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) const RA_BURST: Duration = Duration::from_secs(1);
 /// The name RFC 7050 asks for.
 pub const IPV4ONLY_ARPA: &str = "ipv4only.arpa";
 /// Its two `A` records, the well-known addresses an NSP is found by.
@@ -139,9 +171,10 @@ impl std::fmt::Display for Source {
 }
 
 /// One learned NSP: on which uplink, from which source, when last named, until when its source
-/// says it holds (a PREF64 lifetime), and whether it is still named (a source that stops naming
+/// says it holds (a PREF64 lifetime), and since when it is withdrawn (a source that stops naming
 /// it, or names it with lifetime 0, withdraws it: it is no longer synthesized with, and stays
-/// refused until another uplink's prefixes need its room; a stale prefix only refuses more).
+/// refused for [`STALE_GRACE`]; a stale prefix only refuses more), and since when the host is on
+/// another uplink than its own (`left`; review round 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     prefix: Prefix,
@@ -149,7 +182,29 @@ struct Entry {
     source: Source,
     seen: Instant,
     until: Option<Instant>,
-    active: bool,
+    withdrawn: Option<Instant>,
+    left: Option<Instant>,
+}
+
+impl Entry {
+    /// Since when the entry is inactive at `now` (withdrawn, or its lifetime ran out), if it is.
+    fn inactive_since(&self, now: Instant) -> Option<Instant> {
+        self.withdrawn
+            .or_else(|| self.until.filter(|u| *u <= now))
+    }
+
+    /// Whether its source names it at `now` and its lifetime runs.
+    fn active_at(&self, now: Instant) -> bool {
+        self.inactive_since(now).is_none()
+    }
+
+    /// Whether it no longer counts at `now` (review round 6): inactive for [`STALE_GRACE`], or
+    /// learned on an uplink the host left [`STALE_GRACE`] ago.
+    fn stale_at(&self, on: Option<u64>, now: Instant) -> bool {
+        let old = |t: Instant| now.saturating_duration_since(t) >= STALE_GRACE;
+        self.inactive_since(now).is_some_and(old)
+            || (Some(self.uplink) != on && self.left.is_some_and(old))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -165,7 +220,16 @@ struct Registry {
     /// The uplinks a round is running on, and whether anything was marked unheld there since it
     /// began ([`begin_round`], [`end_round`]).
     rounds: Vec<(u64, bool)>,
+    /// Uplinks on which a prefix withdrawn less than [`STALE_GRACE`] ago had to make room, and
+    /// until when that refuses their IPv6 destinations (review round 6: forgetting it at once
+    /// would admit what is under it; at most [`MAX_FORGOTTEN`]).
+    forgotten: Vec<(u64, Instant)>,
 }
+
+/// Most marks [`Registry::unheld`] keeps (the latest).
+pub(crate) const MAX_UNHELD: usize = 32;
+/// Most uplinks [`Registry::forgotten`] keeps (the latest).
+const MAX_FORGOTTEN: usize = 8;
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     configured: Vec::new(),
@@ -174,33 +238,76 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     gateways: Vec::new(),
     unheld: Vec::new(),
     rounds: Vec::new(),
+    forgotten: Vec::new(),
 });
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Configured ∪ learned (every uplink's, withdrawn ones included), the well-known prefix left
-/// out: what the address predicate reads. Never truncated (review round 4, bypass-1: a sorted,
-/// truncated list let 16 learned prefixes crowd the configured one out).
+/// Configured ∪ learned (every uplink's that is not stale, withdrawn ones included: see
+/// [`Entry::stale_at`]), the well-known prefix left out: what the address predicate reads. Never
+/// truncated (review round 4, bypass-1: a sorted, truncated list let 16 learned prefixes crowd
+/// the configured one out).
 static CURRENT: RwLock<Option<Arc<[Prefix]>>> = RwLock::new(None);
 
 fn publish(r: &Registry) {
-    *CURRENT.write().unwrap_or_else(|e| e.into_inner()) = Some(all_of(r).into());
+    let all: Arc<[Prefix]> = all_of(r).into();
+    let mut c = CURRENT.write().unwrap_or_else(|e| e.into_inner());
+    if c.as_deref() != Some(&*all) {
+        *c = Some(all);
+    }
 }
 
 /// What [`publish`] makes current for `r`.
 fn all_of(r: &Registry) -> Vec<Prefix> {
+    all_of_at(r, Instant::now())
+}
+
+/// [`all_of`] at `now`: stale entries left out (review round 6, bypass-1: a hostile network's
+/// DNS64 naming a public provider's /32 had it read as an NSP everywhere for the process's life).
+fn all_of_at(r: &Registry, now: Instant) -> Vec<Prefix> {
     let mut all: Vec<Prefix> = r
         .configured
         .iter()
         .copied()
-        .chain(r.learned.iter().map(|e| e.prefix))
+        .chain(
+            r.learned
+                .iter()
+                .filter(|e| !e.stale_at(r.on, now))
+                .map(|e| e.prefix),
+        )
         .filter(|p| *p != WELL_KNOWN_PREFIX)
         .collect();
     all.sort();
     all.dedup();
     all
+}
+
+/// Drops the entries that are stale at `now` ([`Entry::stale_at`]) and the forgotten marks that
+/// ran out; whether any entry went.
+fn prune(r: &mut Registry, now: Instant) -> bool {
+    let before = r.learned.len();
+    let on = r.on;
+    r.learned.retain(|e| !e.stale_at(on, now));
+    r.forgotten.retain(|(_, until)| now < *until);
+    r.learned.len() != before
+}
+
+/// Notes that the host is on uplink `signature` at `now` (review round 6): the entries of the
+/// uplink it left start their [`STALE_GRACE`], those of the one it is on stop theirs.
+fn set_on(r: &mut Registry, signature: u64, now: Instant) {
+    if r.on != Some(signature) {
+        for e in &mut r.learned {
+            if e.uplink == signature {
+                e.left = None;
+            } else if e.left.is_none() {
+                e.left = Some(now);
+            }
+        }
+        r.on = Some(signature);
+    }
+    prune(r, now);
 }
 
 /// The NSPs in force, the well-known prefix left out (empty unless configured or learned).
@@ -270,8 +377,9 @@ pub fn set_configured(prefixes: &[Prefix]) -> Result<(), String> {
 pub(crate) fn on_uplink(signature: u64, gateways: &[(Ipv6Addr, u32)]) {
     {
         let mut r = registry();
-        r.on = Some(signature);
+        set_on(&mut r, signature, Instant::now());
         r.gateways = gateways.to_vec();
+        publish(&r);
     }
     // Linux: a PREF64 prefix whose lifetime ran out is withdrawn now (review round 5, cross-1),
     // not at the next round, up to DISCOVERY_TTL later.
@@ -282,11 +390,28 @@ pub(crate) fn on_uplink(signature: u64, gateways: &[(Ipv6Addr, u32)]) {
 /// Why a prefix named on uplink `signature` could not be held, if one could not: the uplink is
 /// then unsettled ([`crate::Denied::Nat64Unsettled`]) until a round there holds everything.
 pub(crate) fn unheld(signature: u64) -> Option<String> {
-    registry()
-        .unheld
+    unheld_of(&registry(), signature, Instant::now())
+}
+
+/// [`unheld`] for `r` at `now`.
+fn unheld_of(r: &Registry, signature: u64, now: Instant) -> Option<String> {
+    r.unheld
         .iter()
         .find(|(s, _)| *s == signature)
         .map(|(_, why)| why.clone())
+        .or_else(|| {
+            r.forgotten
+                .iter()
+                .find(|(s, until)| *s == signature && now < *until)
+                .map(|(_, until)| {
+                    format!(
+                        "a NAT64 prefix withdrawn on this network less than {} s ago had to make \
+                         room for another ({} s left)",
+                        STALE_GRACE.as_secs(),
+                        until.saturating_duration_since(now).as_secs()
+                    )
+                })
+        })
 }
 
 /// Marks `uplink` unsettled for what `source` named (`why`, which begins with the source's name:
@@ -308,8 +433,11 @@ fn mark_unheld(r: &mut Registry, uplink: u64, source: Source, why: String) {
     );
     clear_unheld(r, uplink, source);
     r.unheld.push((uplink, why));
-    if r.unheld.len() > 32 {
-        r.unheld.remove(0);
+    if r.unheld.len() > MAX_UNHELD {
+        // The oldest of another uplink first (review round 6, cross-7 T24).
+        let on = r.on;
+        let i = r.unheld.iter().position(|(s, _)| Some(*s) != on).unwrap_or(0);
+        r.unheld.remove(i);
     }
 }
 
@@ -371,6 +499,14 @@ fn round_ends(r: &mut Registry, uplink: u64) {
 /// held ([`MAX_LEARNED`], [`MAX_PER_UPLINK`]), makes the uplink unsettled ([`unheld`]); what fits is
 /// held all the same (it only refuses more). Whether the prefixes changed (the caller then
 /// publishes them: [`learn_in`]).
+///
+/// Review round 6 (cross-2 = parse-2): only active entries (named, within their lifetime) count
+/// against [`MAX_PER_UPLINK`]; before, withdrawn ones did and were never evicted from the uplink
+/// in use, so 32 renumberings (or eight forged advertisements) left no room and every new prefix
+/// unsettled the uplink for good. When [`MAX_LEARNED`] entries are held, room is made
+/// ([`make_room`]) from inactive and other uplinks' entries first. Entries go stale
+/// ([`Entry::stale_at`]) and are dropped [`STALE_GRACE`] after they stopped being named or their
+/// uplink was left.
 fn learn(
     r: &mut Registry,
     uplink: u64,
@@ -388,14 +524,14 @@ fn learn(
     // now, under the same lock (review round 5, cross-1: a source that withdrew what it could not
     // hold, or whose prefixes ran out, no longer leaves its uplink unsettled until a round ends).
     clear_unheld(r, uplink, source);
-    let mut changed = false;
+    let mut changed = prune(r, now);
     for e in r
         .learned
         .iter_mut()
-        .filter(|e| e.uplink == uplink && e.source == source && e.active)
+        .filter(|e| e.uplink == uplink && e.source == source && e.withdrawn.is_none())
     {
         if !named.iter().any(|(p, _)| *p == e.prefix) {
-            e.active = false;
+            e.withdrawn = Some(now);
             changed = true;
         }
     }
@@ -413,54 +549,54 @@ fn learn(
         );
         named.truncate(source.cap());
     }
+    let active_on = |r: &Registry| {
+        r.learned
+            .iter()
+            .filter(|e| e.uplink == uplink && e.active_at(now))
+            .count()
+    };
+    let past_uplink = |p: Prefix| {
+        format!("{source} named NAT64 prefix {p}, past the {MAX_PER_UPLINK} the network guard holds for one network")
+    };
     let mut new = Vec::new();
     for (p, life) in named {
-        let active = life != Some(Duration::ZERO);
+        let withdraw = life == Some(Duration::ZERO);
         let until = life.filter(|l| !l.is_zero()).map(|l| now + l);
-        if let Some(e) = r
+        let lives = !withdraw && until.is_none_or(|u| now < u);
+        if let Some(i) = r
             .learned
-            .iter_mut()
-            .find(|e| e.uplink == uplink && e.source == source && e.prefix == p)
+            .iter()
+            .position(|e| e.uplink == uplink && e.source == source && e.prefix == p)
         {
-            changed |= e.active != active || e.until != until;
+            if lives && !r.learned[i].active_at(now) && active_on(r) >= MAX_PER_UPLINK {
+                // Named again, but no room among the active: still refused, not synthesized with.
+                mark_unheld(r, uplink, source, past_uplink(p));
+                continue;
+            }
+            let e = &mut r.learned[i];
+            let withdrawn = if withdraw { e.withdrawn.or(Some(now)) } else { None };
+            changed |= e.withdrawn != withdrawn || e.until != until;
             e.seen = now;
             e.until = until;
-            e.active = active;
+            e.withdrawn = withdrawn;
             continue;
         }
-        if r.learned.iter().filter(|e| e.uplink == uplink).count() >= MAX_PER_UPLINK {
+        if !lives {
+            // Withdrawn or run out before it was ever held: nothing to hold.
+            continue;
+        }
+        if active_on(r) >= MAX_PER_UPLINK {
+            mark_unheld(r, uplink, source, past_uplink(p));
+            continue;
+        }
+        if r.learned.len() >= MAX_LEARNED && !make_room(r, uplink, now) {
             mark_unheld(
                 r,
                 uplink,
                 source,
-                format!("{source} named NAT64 prefix {p}, past the {MAX_PER_UPLINK} the network guard holds for one network"),
+                format!("{source} named NAT64 prefix {p}, past the {MAX_LEARNED} the network guard holds"),
             );
             continue;
-        }
-        if r.learned.len() >= MAX_LEARNED {
-            // Room from another uplink's, the least recently seen first (never the uplink in use).
-            let on = r.on;
-            let victim = r
-                .learned
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.uplink != uplink && Some(e.uplink) != on)
-                .min_by_key(|(_, e)| e.seen)
-                .map(|(i, _)| i);
-            match victim {
-                Some(i) => {
-                    r.learned.remove(i);
-                }
-                None => {
-                    mark_unheld(
-                        r,
-                        uplink,
-                        source,
-                        format!("{source} named NAT64 prefix {p}, past the {MAX_LEARNED} the network guard holds"),
-                    );
-                    continue;
-                }
-            }
         }
         r.learned.push(Entry {
             prefix: p,
@@ -468,11 +604,10 @@ fn learn(
             source,
             seen: now,
             until,
-            active,
+            withdrawn: None,
+            left: (Some(uplink) != r.on).then_some(now),
         });
-        if active {
-            new.push(p.to_string());
-        }
+        new.push(p.to_string());
         changed = true;
     }
     if !new.is_empty() {
@@ -483,6 +618,74 @@ fn learn(
         );
     }
     changed
+}
+
+/// Makes room for one entry of `uplink` at `now` (review round 6): the inactive entry of another
+/// uplink that has been so longest, else the least recently seen entry of another uplink than
+/// `uplink` and the one in use (as before), else the entry of `uplink` or the uplink in use that
+/// has been inactive longest: that one was withdrawn less than [`STALE_GRACE`] ago (stale ones are
+/// gone already), so forgetting it at once could admit what is under it, and its uplink is
+/// refused IPv6 destinations until its grace would have ended ([`Registry::forgotten`]). False
+/// when every entry is active on `uplink` or the uplink in use.
+fn make_room(r: &mut Registry, uplink: u64, now: Instant) -> bool {
+    let on = r.on;
+    let other = |e: &Entry| e.uplink != uplink && Some(e.uplink) != on;
+    let pick = r
+        .learned
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| other(e))
+        .filter_map(|(i, e)| e.inactive_since(now).map(|t| (i, t)))
+        .min_by_key(|(_, t)| *t)
+        .map(|(i, _)| i)
+        .or_else(|| {
+            r.learned
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| other(e))
+                .min_by_key(|(_, e)| e.seen)
+                .map(|(i, _)| i)
+        });
+    if let Some(i) = pick {
+        r.learned.remove(i);
+        return true;
+    }
+    let Some((i, since)) = r
+        .learned
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.inactive_since(now).map(|t| (i, t)))
+        .min_by_key(|(_, t)| *t)
+    else {
+        return false;
+    };
+    let e = r.learned.remove(i);
+    let until = since + STALE_GRACE;
+    tracing::warn!(
+        "network guard: NAT64 prefix {} (withdrawn {} s ago) made room for another; IPv6 \
+         destinations are refused on its network for {} s more",
+        e.prefix,
+        now.saturating_duration_since(since).as_secs(),
+        until.saturating_duration_since(now).as_secs()
+    );
+    match r.forgotten.iter_mut().find(|(s, _)| *s == e.uplink) {
+        Some((_, u)) => *u = (*u).max(until),
+        None => {
+            r.forgotten.push((e.uplink, until));
+            if r.forgotten.len() > MAX_FORGOTTEN {
+                // Of another uplink than the one in use, the one that ends first goes.
+                let j = r
+                    .forgotten
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (s, _))| Some(*s) != on)
+                    .min_by_key(|(_, (_, u))| *u)
+                    .map_or(0, |(j, _)| j);
+                r.forgotten.remove(j);
+            }
+        }
+    }
+    true
 }
 
 /// [`learn`] on the process-wide registry `r` (locked), publishing what changed.
@@ -602,7 +805,7 @@ fn in_force_of(r: &Registry, now: Instant) -> Vec<Prefix> {
     let learned = r
         .learned
         .iter()
-        .filter(|e| Some(e.uplink) == r.on && e.active && e.until.is_none_or(|u| now < u));
+        .filter(|e| Some(e.uplink) == r.on && e.active_at(now));
     for p in r
         .configured
         .iter()
@@ -622,11 +825,33 @@ fn in_force_of(r: &Registry, now: Instant) -> Vec<Prefix> {
 /// refused IPv4 prefixes), embedded with a zero u octet, and, under a /64, every address whose u
 /// octet is not zero. Under a prefix shorter than /64 the u octet sits inside the embedded
 /// address, so its nonzero half is no set of prefixes: the whole NSP is refused to such a
-/// consumer.
+/// consumer when it is configured or learned on the uplink in use; one learned on another uplink
+/// (refused for [`STALE_GRACE`] after the host left it) only by the IPv4 ranges it would carry
+/// (review round 6, bypass-1: a hostile network's DNS64 naming a public provider's /32 had the
+/// broker refuse all of it, everywhere).
 pub fn embedded_refusals(v4_refused: &[Prefix]) -> Vec<Prefix> {
+    embedded_refusals_of(&registry(), Instant::now(), v4_refused)
+}
+
+/// [`embedded_refusals`] for `r` at `now`.
+fn embedded_refusals_of(r: &Registry, now: Instant, v4_refused: &[Prefix]) -> Vec<Prefix> {
+    let (all, local) = {
+        let local: Vec<Prefix> = r
+            .configured
+            .iter()
+            .copied()
+            .chain(
+                r.learned
+                    .iter()
+                    .filter(|e| Some(e.uplink) == r.on && !e.stale_at(r.on, now))
+                    .map(|e| e.prefix),
+            )
+            .collect();
+        (all_of_at(r, now), local)
+    };
     let mut out = Vec::new();
-    for n in current().iter() {
-        if n.len < 64 {
+    for n in &all {
+        if n.len < 64 && local.contains(n) {
             out.push(*n);
             continue;
         }
@@ -842,7 +1067,32 @@ fn ask_and_learn_at(uplink: u64, at: &[SocketAddr], timeout: Duration) -> Result
             Err(e) => mark_unheld(&mut r, uplink, source, format!("{source}: {e}")),
         }
     }
+    let asked: Vec<IpAddr> = at.iter().map(SocketAddr::ip).collect();
+    if withdraw_unasked(&mut r, uplink, &asked, Instant::now()) {
+        publish(&r);
+    }
     Ok(found_any)
+}
+
+/// Review round 6: a DNS server this host no longer asks (not among `asked`) names nothing on
+/// `uplink` any more: what it named is withdrawn (refused for [`STALE_GRACE`], not counted, never
+/// synthesized with). Whether anything changed.
+fn withdraw_unasked(r: &mut Registry, uplink: u64, asked: &[IpAddr], now: Instant) -> bool {
+    let mut unasked: Vec<Source> = r
+        .learned
+        .iter()
+        .filter(|e| e.uplink == uplink && e.withdrawn.is_none())
+        .filter_map(|e| match e.source {
+            Source::Dns64(ip) if !asked.contains(&ip) => Some(e.source),
+            _ => None,
+        })
+        .collect();
+    unasked.dedup();
+    let mut changed = false;
+    for source in unasked {
+        changed |= learn(r, uplink, source, &[], now);
+    }
+    changed
 }
 
 /// Review round 5 (the bypass lens's suspicion): on an IPv6-only host (or one behind a CLAT), a
@@ -1151,15 +1401,20 @@ fn system_prefixes(_uplink: u64) -> io::Result<Vec<(Source, Vec<(Prefix, Option<
 #[allow(clippy::type_complexity)]
 fn system_prefixes(uplink: u64) -> io::Result<Vec<(Source, Vec<(Prefix, Option<Duration>)>)>> {
     pref64::start();
-    let gateways = {
-        let r = registry();
-        if r.on == Some(uplink) {
-            r.gateways.clone()
-        } else {
-            Vec::new()
-        }
-    };
+    let gateways = round_gateways(&registry(), uplink);
     Ok(pref64::from_gateways(uplink, &gateways, Instant::now()))
+}
+
+/// The routers whose PREF64 a round on `uplink` learns: the IPv6 default gateways of the uplink
+/// in use, and none when the round is on another (one that finishes after the host moved: the
+/// gateways are the new uplink's, review round 5, parse-3; cross-7 V04 found no test of it).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+fn round_gateways(r: &Registry, uplink: u64) -> Vec<(Ipv6Addr, u32)> {
+    if r.on == Some(uplink) {
+        r.gateways.clone()
+    } else {
+        Vec::new()
+    }
 }
 
 /// See the macOS one.
@@ -1454,7 +1709,13 @@ pub(crate) struct Heard {
     entries: Vec<(Ipv6Addr, u32, Prefix, Duration, Instant, Option<u64>)>,
     /// The uplink what is heard now is heard on.
     uplink: Option<u64>,
+    /// Per router, interface and uplink: when its latest advertisement began ([`RA_BURST`]).
+    latest: Vec<(RouterKey, Instant)>,
 }
+
+/// A router heard: its address, the interface, the uplink.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+type RouterKey = (Ipv6Addr, u32, Option<u64>);
 
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 impl Heard {
@@ -1462,6 +1723,7 @@ impl Heard {
         Heard {
             entries: Vec::new(),
             uplink: None,
+            latest: Vec::new(),
         }
     }
 
@@ -1492,38 +1754,67 @@ impl Heard {
 
     /// Notes `found` at `now`, on the uplink in use ([`Self::on`]): a prefix announced with
     /// lifetime 0 is withdrawn (dropped); `gateways` are never pushed out by other routers.
+    ///
+    /// Review round 6 (cross-1): a lifetime is believed up to [`MAX_PREF64_LIFETIME`]; a router's
+    /// newest advertisement (its options more than [`RA_BURST`] after the last one began)
+    /// replaces what it named before, so the real gateway's next advertisement ends what a forger
+    /// named from its address; and a router naming more than [`MAX_PER_ROUTER`] + 1 at once keeps
+    /// the newest (it is still seen to name too many), so its own next prefix is always heard.
     pub(crate) fn hear(&mut self, found: &[Announced], gateways: &[(Ipv6Addr, u32)], now: Instant) {
         self.prune(now);
         let uplink = self.uplink;
         for a in found {
             let Some(router) = a.router else { continue };
-            let key = (router, a.ifindex, uplink);
+            let key: RouterKey = (router, a.ifindex, uplink);
             let of_key = |e: &(Ipv6Addr, u32, Prefix, Duration, Instant, Option<u64>)| {
                 (e.0, e.1, e.5) == key
             };
+            match self.latest.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, began)) if now.saturating_duration_since(*began) < RA_BURST => {}
+                Some((_, began)) => {
+                    // A new advertisement: what this router named before is replaced.
+                    *began = now;
+                    self.entries.retain(|e| !of_key(e));
+                }
+                None => {
+                    self.entries.retain(|e| !of_key(e));
+                    self.latest.push((key, now));
+                }
+            }
             if a.lifetime.is_zero() {
                 self.entries.retain(|e| !(of_key(e) && e.2 == a.prefix));
                 continue;
             }
+            let lifetime = a.lifetime.min(MAX_PREF64_LIFETIME);
             if let Some(e) = self
                 .entries
                 .iter_mut()
                 .find(|e| of_key(e) && e.2 == a.prefix)
             {
-                e.3 = a.lifetime;
+                e.3 = lifetime;
                 e.4 = now;
                 continue;
             }
             if self.entries.iter().filter(|e| of_key(e)).count() > MAX_PER_ROUTER {
-                // Already one more live than is believed: the router is seen to name too many.
-                continue;
+                // Already one more live than is believed: the newest pushes out the oldest (the
+                // router is still seen to name too many).
+                if let Some(i) = self
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| of_key(e))
+                    .min_by_key(|(_, e)| e.4)
+                    .map(|(i, _)| i)
+                {
+                    self.entries.remove(i);
+                }
             }
-            let mut routers: Vec<(Ipv6Addr, u32, Option<u64>)> =
+            let mut routers: Vec<RouterKey> =
                 self.entries.iter().map(|e| (e.0, e.1, e.5)).collect();
             routers.sort();
             routers.dedup();
             if !routers.contains(&key) && routers.len() >= MAX_ROUTERS {
-                let last_heard = |r: &(Ipv6Addr, u32, Option<u64>)| {
+                let last_heard = |r: &RouterKey| {
                     self.entries
                         .iter()
                         .filter(|e| (e.0, e.1, e.5) == *r)
@@ -1541,8 +1832,14 @@ impl Heard {
                 self.entries.retain(|e| (e.0, e.1, e.5) != victim);
             }
             self.entries
-                .push((router, a.ifindex, a.prefix, a.lifetime, now, uplink));
+                .push((router, a.ifindex, a.prefix, lifetime, now, uplink));
         }
+        // What `latest` keeps: the routers with entries, and those heard within RA_BURST.
+        let entries = &self.entries;
+        self.latest.retain(|(k, began)| {
+            now.saturating_duration_since(*began) < RA_BURST
+                || entries.iter().any(|e| (e.0, e.1, e.5) == *k)
+        });
     }
 
     /// What each of `gateways` announces at `now` on the uplink in use ([`Self::on`]): every
@@ -2833,7 +3130,7 @@ mod r5_tests {
     }
 
     fn active(r: &Registry, q: &str) -> bool {
-        r.learned.iter().any(|e| e.prefix == p(q) && e.active)
+        r.learned.iter().any(|e| e.prefix == p(q) && e.active_at(Instant::now()))
     }
 
     /// cross-1 = bypass-2 = parse-2: a gateway that renumbers its PREF64 (each old prefix
@@ -2867,10 +3164,14 @@ mod r5_tests {
             assert_eq!(h.len(), 1, "only the live prefix is held");
             assert!(active(&r, "2001:db8:105::/96"));
             assert_eq!(in_force_of(&r, now), vec![p("2001:db8:105::/96")]);
-            for i in 0..5 {
+            // Review round 6: the one before is still refused (withdrawn, or run out, less than
+            // STALE_GRACE ago); the older ones are forgotten.
+            assert!(!active(&r, "2001:db8:104::/96") && all_of_at(&r, now).contains(&p("2001:db8:104::/96")));
+            for i in 0..4 {
                 let old = format!("2001:db8:{:x}::/96", 0x100 + i);
-                assert!(!active(&r, &old) && all_of(&r).contains(&p(&old)), "{old}");
+                assert!(!all_of_at(&r, now).contains(&p(&old)), "{old}");
             }
+            assert_eq!(r.learned.len(), 2, "{:?}", r.learned);
         }
     }
 
@@ -2903,20 +3204,20 @@ mod r5_tests {
             );
             // What ran out is named by nobody, even before anything prunes it (cross-3).
             assert!(h.named_by(&[gw], t0 + Duration::from_secs(9))[0].1.is_empty());
-            // While they live, the real gateway's prefix is not heard (one more than believed
-            // is kept already).
-            h.hear(&[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], t0 + Duration::from_secs(1));
-            assert!(!h.prefixes().contains(&p("2001:db8:aaaa::/96")));
+            // Review round 6: the router's next advertisement (withdrawing them, or the real
+            // gateway's own) replaces what was named; before, the real one was not even heard
+            // while the forged ones lived.
             let later = if withdrawn {
                 let off: Vec<Announced> = (1..=5)
                     .map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 0))
                     .collect();
-                h.hear(&off, &[gw], t0 + Duration::from_secs(2));
+                h.hear(&off, &[gw], t0 + Duration::from_millis(500));
                 t0 + Duration::from_secs(2)
             } else {
-                t0 + Duration::from_secs(9)
+                t0 + Duration::from_secs(1)
             };
             h.hear(&[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], later);
+            assert_eq!(h.prefixes(), vec![p("2001:db8:aaaa::/96")]);
             round(&h, &mut r, 9, gw, later);
             assert!(r.unheld.is_empty(), "{:?}", r.unheld);
             assert!(active(&r, "2001:db8:aaaa::/96"));
@@ -3155,5 +3456,475 @@ mod r5_round_tests {
         round_ends(&mut r, 1);
         round_ends(&mut r, 2);
         assert_eq!(r.unheld, vec![(1, "test source #1. old".to_string())]);
+    }
+}
+
+/// Review round 6: the NAT64 state's robustness (cross-1, cross-2 = parse-2, bypass-1, cross-7).
+#[cfg(test)]
+mod r6_tests {
+    use super::*;
+
+    fn ip6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    fn p(s: &str) -> Prefix {
+        s.parse().unwrap()
+    }
+
+    fn ann(prefix: &str, router: Ipv6Addr, life: u64) -> Announced {
+        Announced {
+            prefix: p(prefix),
+            lifetime: Duration::from_secs(life),
+            ifindex: 2,
+            router: Some(router),
+        }
+    }
+
+    /// What the PREF64 listener does with an advertisement (`pref64::hear`): heard, and what the
+    /// gateways among its senders name learned at once.
+    fn heard(h: &mut Heard, r: &mut Registry, found: &[Announced], gateways: &[(Ipv6Addr, u32)], now: Instant) {
+        h.on(r.on);
+        h.hear(found, gateways, now);
+        let from: Vec<(Ipv6Addr, u32)> = gateways
+            .iter()
+            .copied()
+            .filter(|g| found.iter().any(|a| a.router == Some(g.0) && a.ifindex == g.1))
+            .collect();
+        if let Some(on) = r.on {
+            for (source, named) in h.named_by(&from, now) {
+                learn(r, on, source, &named, now);
+            }
+        }
+    }
+
+    /// What a facts read does (`on_uplink`, `pref64::expire`).
+    fn facts_read(h: &mut Heard, r: &mut Registry, uplink: u64, gateways: &[(Ipv6Addr, u32)], now: Instant) {
+        set_on(r, uplink, now);
+        let before = h.len();
+        h.on(Some(uplink));
+        h.prune(now);
+        if h.len() != before {
+            for (source, named) in h.named_by(gateways, now) {
+                learn(r, uplink, source, &named, now);
+            }
+        }
+    }
+
+    /// One round (`round_on`): every gateway's PREF64, then each DNS server's answer.
+    #[allow(clippy::type_complexity)]
+    fn round(
+        h: &mut Heard,
+        r: &mut Registry,
+        uplink: u64,
+        gateways: &[(Ipv6Addr, u32)],
+        answers: &[(IpAddr, Vec<Prefix>)],
+        now: Instant,
+    ) {
+        round_begins(r, uplink);
+        h.on(Some(uplink));
+        h.prune(now);
+        for (source, named) in h.named_by(gateways, now) {
+            learn(r, uplink, source, &named, now);
+        }
+        for (server, found) in answers {
+            let found: Vec<(Prefix, Option<Duration>)> = found.iter().map(|q| (*q, None)).collect();
+            learn(r, uplink, Source::Dns64(*server), &found, now);
+        }
+        let asked: Vec<IpAddr> = answers.iter().map(|a| a.0).collect();
+        withdraw_unasked(r, uplink, &asked, now);
+        round_ends(r, uplink);
+    }
+
+    /// cross-1 (`r6cross_one_forged_ra_with_the_longest_lifetime_unsettles_the_uplink_for_18_hours`,
+    /// live `r6-cross/vm-r6-ra.log` "long"): one forged advertisement from the gateway's address
+    /// naming five prefixes at the largest lifetime unsettled the uplink for 18 hours. Now the
+    /// gateway's next advertisement (10 minutes later) replaces the forged set; a gateway whose
+    /// advertisements carry no PREF64 ends it by MAX_PREF64_LIFETIME.
+    #[test]
+    fn r6_one_forged_advertisement_is_ended_by_the_gateways_next() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        for gateway_names_pref64 in [true, false] {
+            let mut h = Heard::new();
+            let mut r = Registry { on: Some(5), ..Registry::default() };
+            let forged: Vec<Announced> =
+                (1..=5).map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 65528)).collect();
+            heard(&mut h, &mut r, &forged, &[gw], t0);
+            assert!(unheld_of(&r, 5, t0).is_some());
+            let mut unheld_at = Vec::new();
+            for k in 1..=108u64 {
+                let now = t0 + Duration::from_secs(600 * k);
+                if gateway_names_pref64 {
+                    heard(&mut h, &mut r, &[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], now);
+                }
+                facts_read(&mut h, &mut r, 5, &[gw], now);
+                round(&mut h, &mut r, 5, &[gw], &[], now);
+                if unheld_of(&r, 5, now).is_some() {
+                    unheld_at.push(k * 600);
+                }
+            }
+            if gateway_names_pref64 {
+                assert!(unheld_at.is_empty(), "{unheld_at:?}");
+                assert!(in_force_of(&r, t0 + Duration::from_secs(600)).contains(&p("2001:db8:aaaa::/96")));
+            } else {
+                assert!(
+                    unheld_at.iter().all(|t| *t < MAX_PREF64_LIFETIME.as_secs()),
+                    "{unheld_at:?}"
+                );
+            }
+        }
+    }
+
+    /// cross-2 = parse-2 (`r6cross_eight_forged_ras_leave_no_room_for_the_uplinks_next_prefix`,
+    /// live `r6-cross/vm-r6-ra-fill9.log`): eight forged advertisements of four prefixes each,
+    /// left to run out, left the uplink in use no room for good. Withdrawn and expired entries no
+    /// longer count against MAX_PER_UPLINK.
+    #[test]
+    fn r6_eight_forged_advertisements_leave_room_for_the_uplinks_next_prefix() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        let mut r = Registry { on: Some(6), ..Registry::default() };
+        for k in 0..8u64 {
+            let now = t0 + Duration::from_secs(10 * k);
+            let forged: Vec<Announced> =
+                (0..4).map(|i| ann(&format!("2001:db8:{:x}::/96", 0x100 + 4 * k + i), gw.0, 8)).collect();
+            heard(&mut h, &mut r, &forged, &[gw], now);
+            assert!(r.unheld.is_empty(), "{k}: {:?}", r.unheld);
+        }
+        for hour in 1..=24u64 {
+            let now = t0 + Duration::from_secs(3600 * hour);
+            heard(&mut h, &mut r, &[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], now);
+            facts_read(&mut h, &mut r, 6, &[gw], now);
+            assert!(unheld_of(&r, 6, now).is_none(), "{hour} h: {:?}", r.unheld);
+            assert!(in_force_of(&r, now).contains(&p("2001:db8:aaaa::/96")));
+        }
+        // And the renumbering of parse-2 (`r6_parse_withdrawn_prefixes_fill_the_uplinks_room_for_good`):
+        // 40 renumberings a second apart, each withdrawing the last, then a DNS64's new prefix.
+        let mut h = Heard::new();
+        let mut r = Registry { on: Some(7), ..Registry::default() };
+        for i in 0..40u64 {
+            let now = t0 + Duration::from_secs(5 * i);
+            let mut found = vec![ann(&format!("2001:db8:{:x}::/96", 0x100 + i), gw.0, 1800)];
+            if i > 0 {
+                found.push(ann(&format!("2001:db8:{:x}::/96", 0x100 + i - 1), gw.0, 0));
+            }
+            heard(&mut h, &mut r, &found, &[gw], now);
+            assert!(r.unheld.is_empty(), "renumbering {i}: {:?}", r.unheld);
+        }
+        let now = t0 + Duration::from_secs(300);
+        learn(&mut r, 7, Source::Dns64("2001:db8::53".parse().unwrap()), &[(p("2001:db8:aaaa::/96"), None)], now);
+        assert!(r.unheld.is_empty(), "{:?}", r.unheld);
+        // Every withdrawn one is still refused (less than STALE_GRACE ago).
+        assert!(all_of_at(&r, now).contains(&p("2001:db8:100::/96")));
+    }
+
+    /// bypass-1 (`r6_a_hostile_networks_dns64_poisons_a_public_ipv6_block_for_good`): a hostile
+    /// network's DNS64 naming a public provider's /32 had it read as an NSP everywhere for the
+    /// process's life, and the broker refuse all of it. Now: while the host is on that network,
+    /// as before; after it left, the broker is handed only the IPv4 ranges it would carry, and
+    /// STALE_GRACE later nothing.
+    #[test]
+    fn r6_another_networks_prefix_is_forgotten_after_its_grace() {
+        let t0 = Instant::now();
+        let (hotspot, home) = (0x6b_6164u64, 0x6b_686fu64);
+        let block = p("2606:4700::/32");
+        let mut r = Registry::default();
+        set_on(&mut r, hotspot, t0);
+        learn(&mut r, hotspot, Source::Dns64("10.0.0.53".parse().unwrap()), &[(block, None)], t0);
+        assert!(embedded_refusals_of(&r, t0, &[]).contains(&block), "on the hotspot, all of it");
+        let t1 = t0 + Duration::from_secs(60);
+        set_on(&mut r, home, t1);
+        assert!(all_of_at(&r, t1).contains(&block), "refused for its grace");
+        let broker = embedded_refusals_of(&r, t1, &[]);
+        assert!(!broker.contains(&block), "{broker:?}");
+        assert!(broker.iter().any(|q| q.len > 32 && block.contains(q.addr)), "{broker:?}");
+        let t2 = t1 + STALE_GRACE;
+        assert!(!all_of_at(&r, t2).contains(&block));
+        assert!(embedded_refusals_of(&r, t2, &[]).is_empty());
+        set_on(&mut r, home, t2);
+        assert!(r.learned.is_empty(), "pruned: {:?}", r.learned);
+        // Back on the hotspot within the grace, it is the hotspot's again.
+        let mut r = Registry::default();
+        set_on(&mut r, hotspot, t0);
+        learn(&mut r, hotspot, Source::Dns64("10.0.0.53".parse().unwrap()), &[(block, None)], t0);
+        set_on(&mut r, home, t1);
+        set_on(&mut r, hotspot, t1 + STALE_GRACE / 2);
+        assert!(!r.learned[0].stale_at(r.on, t1 + STALE_GRACE * 2));
+        assert_eq!(in_force_of(&r, t1 + STALE_GRACE), vec![block]);
+    }
+
+    /// The registry's room (review round 6): when MAX_LEARNED entries are held and all are of the
+    /// uplink in use, a new prefix is held by forgetting the one withdrawn longest ago; it was
+    /// withdrawn less than STALE_GRACE ago, so its uplink is refused IPv6 destinations until its
+    /// grace would have ended (never admitted early).
+    #[test]
+    fn r6_a_young_withdrawn_prefix_makes_room_only_by_refusing_its_uplink() {
+        let t0 = Instant::now();
+        let mut r = Registry { on: Some(1), ..Registry::default() };
+        for i in 0..MAX_LEARNED as u64 {
+            let at = t0 + Duration::from_secs(i);
+            learn(&mut r, 1, Source::Given(i as u32), &[(p(&format!("2001:db8:{i:x}::/96")), None)], at);
+            learn(&mut r, 1, Source::Given(i as u32), &[], at);
+        }
+        assert_eq!(r.learned.len(), MAX_LEARNED);
+        let now = t0 + Duration::from_secs(100);
+        assert!(unheld_of(&r, 1, now).is_none());
+        learn(&mut r, 1, Source::Given(999), &[(p("2001:db8:ffff::/96"), None)], now);
+        assert!(in_force_of(&r, now).contains(&p("2001:db8:ffff::/96")), "the new one is held");
+        assert!(!all_of_at(&r, now).contains(&p("2001:db8:0::/96")), "the oldest made room");
+        let why = unheld_of(&r, 1, now).expect("refused until its grace would have ended");
+        assert!(why.contains("had to make room"), "{why}");
+        assert!(unheld_of(&r, 1, t0 + STALE_GRACE - Duration::from_secs(1)).is_some());
+        assert!(unheld_of(&r, 1, t0 + STALE_GRACE).is_none());
+        assert!(unheld_of(&r, 2, now).is_none(), "only its own uplink");
+    }
+
+    /// A DNS server the host no longer asks names nothing any more (its prefixes withdrawn: not
+    /// counted, still refused for their grace).
+    #[test]
+    fn r6_a_dns_server_no_longer_asked_names_nothing() {
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        let mut r = Registry { on: Some(3), ..Registry::default() };
+        let (old, new): (IpAddr, IpAddr) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        round(&mut h, &mut r, 3, &[], &[(old, vec![p("2001:db8:1::/96")])], t0);
+        assert_eq!(in_force_of(&r, t0), vec![p("2001:db8:1::/96")]);
+        let t1 = t0 + Duration::from_secs(300);
+        round(&mut h, &mut r, 3, &[], &[(new, vec![p("2001:db8:2::/96")])], t1);
+        assert_eq!(in_force_of(&r, t1), vec![p("2001:db8:2::/96")]);
+        assert!(all_of_at(&r, t1).contains(&p("2001:db8:1::/96")));
+    }
+
+    /// cross-7 V04: a round on an uplink the host has left learns no gateway's PREF64 (the
+    /// gateways known are the new uplink's).
+    #[test]
+    fn r6_a_round_on_an_old_uplink_learns_no_gateways_pref64() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let mut r = Registry { on: Some(2), gateways: vec![gw], ..Registry::default() };
+        assert_eq!(round_gateways(&r, 2), vec![gw]);
+        assert!(round_gateways(&r, 1).is_empty());
+        r.on = Some(1);
+        assert!(round_gateways(&r, 2).is_empty());
+    }
+
+    /// cross-7 T24: the unheld marks are bounded (MAX_UNHELD), and a flood of other uplinks'
+    /// marks never pushes out the uplink in use's.
+    #[test]
+    fn r6_unheld_marks_are_bounded() {
+        let mut r = Registry { on: Some(1), ..Registry::default() };
+        mark_unheld(&mut r, 1, Source::Given(0), "test source #0. kept".into());
+        for i in 1..500u32 {
+            let up = 2 + u64::from(i % 50);
+            mark_unheld(&mut r, up, Source::Given(i), format!("test source #{i}. flood"));
+            assert!(r.unheld.len() <= MAX_UNHELD);
+        }
+        assert_eq!(r.unheld.len(), MAX_UNHELD);
+        assert!(unheld_of(&r, 1, Instant::now()).is_some_and(|w| w.ends_with("kept")));
+    }
+
+    /// cross-7 V06 (`r6-cross/mut`: the listener let other routers evict the gateways' entries
+    /// and no test saw it): with MAX_ROUTERS other routers heard, the gateway's entries stay, and
+    /// its new prefix is heard; another router's goes instead.
+    #[test]
+    fn r6_other_routers_never_push_out_the_gateway() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        h.on(Some(1));
+        h.hear(&[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], t0);
+        for k in 0..3 * MAX_ROUTERS as u64 {
+            let router = Ipv6Addr::from((0xfe80u128 << 112) | u128::from(0x100 + k));
+            let now = t0 + Duration::from_secs(1 + k);
+            h.hear(&[ann(&format!("2001:db8:{:x}::/96", 0x100 + k), router, 1800)], &[gw], now);
+            assert!(h.named_by(&[gw], now)[0].1.iter().any(|(q, _)| *q == p("2001:db8:aaaa::/96")), "{k}");
+        }
+        let now = t0 + Duration::from_secs(600);
+        h.hear(&[ann("2001:db8:bbbb::/96", gw.0, 1800)], &[gw], now);
+        assert_eq!(h.named_by(&[gw], now)[0].1, vec![(p("2001:db8:bbbb::/96"), Some(Duration::from_secs(1800)))]);
+        let mut routers: Vec<_> = h.entries.iter().map(|e| (e.0, e.1)).collect();
+        routers.sort();
+        routers.dedup();
+        assert_eq!(routers.len(), MAX_ROUTERS);
+    }
+
+    /// A router that names more than MAX_PER_ROUTER + 1 at once keeps its newest (review round 6:
+    /// before, the sixth and later were dropped, the real one among them, until one ran out);
+    /// lifetimes are believed up to MAX_PREF64_LIFETIME.
+    #[test]
+    fn r6_a_router_naming_too_many_keeps_its_newest() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        h.on(Some(1));
+        let many: Vec<Announced> = (0..9).map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 65528)).collect();
+        h.hear(&many, &[gw], t0);
+        let named = &h.named_by(&[gw], t0)[0].1;
+        assert_eq!(named.len(), MAX_PER_ROUTER + 1);
+        assert!(named.iter().any(|(q, _)| *q == p("2001:db8:8::/96")), "{named:?}");
+        assert!(named.iter().all(|(_, l)| *l == Some(MAX_PREF64_LIFETIME)), "{named:?}");
+        assert!(h.named_by(&[gw], t0 + MAX_PREF64_LIFETIME)[0].1.is_empty());
+    }
+
+    /// The invariant (review round 6), on random sequences of router advertisements (forged ones
+    /// from the gateway's address and from other routers that make themselves gateways, every
+    /// lifetime up to 65528 s, up to eight prefixes each), DNS answers (spoofed ones from the
+    /// real DNS64's address and other servers'), and uplink changes, the real gateway announcing
+    /// its prefix N every 600 s and the real DNS64 naming it every round (300 s) all along:
+    ///
+    /// - always: every bound holds (MAX_LEARNED, MAX_PER_UPLINK active, MAX_UNHELD,
+    ///   MAX_FORGOTTEN, what is heard);
+    /// - security: on the real network, once N was learned there, N is refused (in the address
+    ///   predicate) or every IPv6 destination is (unheld);
+    /// - the real gateway is never prevented from being learned: once the attacker stops, N is in
+    ///   force after each of the gateway's advertisements;
+    /// - bounded refusal: the attacker's last packet at T, the uplink is not unsettled from
+    ///   T + MAX_PREF64_LIFETIME + STALE_GRACE + DISCOVERY_TTL on (`BOUND`, 5700 s).
+    #[test]
+    fn r6_an_attacker_who_stops_causes_a_bounded_refusal() {
+        const BOUND: Duration = Duration::from_secs(
+            MAX_PREF64_LIFETIME.as_secs() + STALE_GRACE.as_secs() + DISCOVERY_TTL.as_secs(),
+        );
+        let gw = (ip6("fe80::1"), 2u32);
+        let real_nsp = p("2001:db8:64::/96");
+        let dns64: IpAddr = "192.0.2.53".parse().unwrap();
+        let (home, cafe, other) = (1u64, 2u64, 3u64);
+        let mut worst = Duration::ZERO;
+        let (mut full, mut forgot, mut unsettled) = (0usize, 0usize, 0usize);
+        for seed in 1..=80u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut rnd = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let t0 = Instant::now();
+            let mut h = Heard::new();
+            let mut r = Registry::default();
+            let mut on = home;
+            let mut rogue_gateways: Vec<(Ipv6Addr, u32)> = Vec::new();
+            let stop = Duration::from_secs(4000 + rnd(30_000));
+            let end = stop + BOUND + Duration::from_secs(3600);
+            let (mut now, mut next_ra, mut next_round) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            let mut real_since_return = false;
+            let mut last_unheld = None;
+            while now < end {
+                // The attacker sends often (every few seconds); then the real network alone.
+                now += Duration::from_secs(1 + if now < stop { rnd(3 + seed % 40) } else { rnd(240) });
+                let at = t0 + now;
+                let attacking = now < stop;
+                if !attacking {
+                    on = home;
+                    rogue_gateways.clear();
+                }
+                let mut gateways = vec![gw];
+                gateways.extend(rogue_gateways.iter().copied());
+                if on != r.on.unwrap_or(home) || r.on.is_none() {
+                    real_since_return = false;
+                }
+                facts_read(&mut h, &mut r, on, &gateways, at);
+                if now >= next_ra {
+                    next_ra = now + Duration::from_secs(600);
+                    if on == home {
+                        heard(&mut h, &mut r, &[ann("2001:db8:64::/96", gw.0, 1800)], &gateways, at);
+                        real_since_return = true;
+                        if !attacking {
+                            assert!(in_force_of(&r, at).contains(&real_nsp), "seed {seed}: N not in force after the gateway's advertisement at {now:?}");
+                        }
+                    }
+                }
+                if attacking {
+                    match rnd(8) {
+                        0 | 1 => {
+                            // A forged advertisement.
+                            let router = if rnd(2) == 0 {
+                                gw.0
+                            } else {
+                                Ipv6Addr::from((0xfe80u128 << 112) | u128::from(0x100 + rnd(24)))
+                            };
+                            if router != gw.0 && rnd(2) == 0 && !rogue_gateways.contains(&(router, 2)) {
+                                rogue_gateways.push((router, 2));
+                                gateways.push((router, 2));
+                            }
+                            let found: Vec<Announced> = (0..rnd(9))
+                                .map(|_| {
+                                    ann(
+                                        &format!("2001:db8:{:x}::/96", 0x1000 + rnd(200)),
+                                        router,
+                                        [0, 8, 600, 1800, 65528][rnd(5) as usize],
+                                    )
+                                })
+                                .collect();
+                            heard(&mut h, &mut r, &found, &gateways, at);
+                        }
+                        2 => {
+                            // A spoofed DNS64 answer (the real server's address or another's).
+                            let server: IpAddr = if rnd(2) == 0 {
+                                dns64
+                            } else {
+                                format!("198.51.100.{}", rnd(40)).parse().unwrap()
+                            };
+                            let found: Vec<(Prefix, Option<Duration>)> = (0..rnd(4))
+                                .map(|_| (p(&format!("2001:db8:{:x}::/64", 0x2000 + rnd(200))), None))
+                                .collect();
+                            learn(&mut r, on, Source::Dns64(server), &found, at);
+                        }
+                        3 => on = [home, home, cafe, other][rnd(4) as usize],
+                        4 => {
+                            rogue_gateways.retain(|_| rnd(3) != 0);
+                        }
+                        _ => {}
+                    }
+                }
+                if now >= next_round {
+                    next_round = now + DISCOVERY_TTL;
+                    let answers = if on == home { vec![(dns64, vec![real_nsp])] } else { vec![] };
+                    round(&mut h, &mut r, on, &gateways, &answers, at);
+                    if on == home {
+                        real_since_return = true;
+                    }
+                }
+                // Bounds.
+                assert!(r.learned.len() <= MAX_LEARNED, "seed {seed}");
+                full += usize::from(r.learned.len() == MAX_LEARNED);
+                forgot += usize::from(!r.forgotten.is_empty());
+                unsettled += usize::from(unheld_of(&r, on, at).is_some());
+                for u in [home, cafe, other] {
+                    let active = r.learned.iter().filter(|e| e.uplink == u && e.active_at(at)).count();
+                    assert!(active <= MAX_PER_UPLINK, "seed {seed}: {active} active on {u}");
+                }
+                assert!(r.unheld.len() <= MAX_UNHELD && r.forgotten.len() <= MAX_FORGOTTEN, "seed {seed}");
+                assert!(h.len() <= MAX_ROUTERS * (MAX_PER_ROUTER + 1), "seed {seed}");
+                // Security.
+                if on == home && real_since_return {
+                    assert!(
+                        all_of_at(&r, at).contains(&real_nsp) || unheld_of(&r, home, at).is_some(),
+                        "seed {seed} at {now:?}: N neither refused nor IPv6 refused"
+                    );
+                }
+                // Bounded refusal.
+                if on == home && unheld_of(&r, home, at).is_some() {
+                    last_unheld = Some(now);
+                    if !attacking {
+                        worst = worst.max(now - stop);
+                    }
+                    assert!(
+                        now < stop + BOUND,
+                        "seed {seed}: unsettled {:?} after the attacker stopped: {:?}",
+                        now - stop,
+                        unheld_of(&r, home, at)
+                    );
+                }
+            }
+            let _ = last_unheld;
+        }
+        eprintln!(
+            "R6 worst refusal after the attacker stopped: {worst:?} (bound {BOUND:?}); steps with \
+             the registry full {full}, with a forgotten mark {forgot}, unsettled {unsettled}"
+        );
+        // The sequences reach every path the bound rests on.
+        assert!(full > 0 && forgot > 0 && unsettled > 0);
     }
 }
