@@ -172,6 +172,13 @@ impl RecheckLayer {
     }
 }
 
+fn unmapped_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 fn unmapped(a: SocketAddr) -> SocketAddr {
     match a.ip() {
         IpAddr::V6(v6) => v6
@@ -286,9 +293,9 @@ impl GuardedClient {
     }
 
     /// The addresses one hop to `url` connects to: its host resolved through the guarded
-    /// resolver (an IP literal as it is), each address vetted for the URL's port right before
-    /// the connection ([`NetPolicy::vet_connection`]; concurrently), the ones that pass in answer
-    /// order. Also the name to pin them to (`None` for an IP literal), and the check each
+    /// resolver (an IP literal as it is), its addresses vetted for the URL's port right before
+    /// the connection ([`NetPolicy::vet_connection`]), one after another in answer order until one
+    /// of each family passes. Also the name to pin them to (`None` for an IP literal), and the check each
     /// connection gets once made ([`NetPolicy::recheck_connected`]).
     async fn pin(
         &self,
@@ -309,31 +316,28 @@ impl GuardedClient {
             Some(url::Host::Ipv6(a)) => (None, vec![IpAddr::V6(a)]),
             None => return Err(FetchError::Denied(Denied::Url(UrlDenied::BadAuthority))),
         };
-        let mut checks = tokio::task::JoinSet::new();
-        for (i, ip) in ips.iter().enumerate() {
+        // One after another, in answer order, and only as far as needed: the first admitted
+        // address of each family (review round 4, probe-2: vetting every address at once sent up
+        // to 8 hop-limited probes through the same first hops, whose ICMP rate limit then
+        // dropped answers and refused the name).
+        let mut pinned = Vec::new();
+        let mut vetted: Vec<Vetted> = Vec::new();
+        let mut refused = Vec::new();
+        for ip in &ips {
+            let v4 = unmapped_ip(*ip).is_ipv4();
+            if vetted.iter().any(|v| unmapped_ip(v.addr.ip()).is_ipv4() == v4) {
+                continue;
+            }
             let policy = self.policy().clone();
             let addr = SocketAddr::new(*ip, port);
             let connect = SocketAddr::new(self.resolver.connect_ip(*ip), port);
-            checks.spawn_blocking(move || (i, policy.vet_path(addr, connect)));
-        }
-        let mut verdicts: Vec<(usize, Result<Vetted, Denied>)> = Vec::new();
-        while let Some(r) = checks.join_next().await {
-            match r {
-                Ok(v) => verdicts.push(v),
-                Err(_) => return Err(FetchError::BadRedirect("a connection check failed")),
-            }
-        }
-        verdicts.sort_by_key(|(i, _)| *i);
-        let mut pinned = Vec::new();
-        let mut vetted = Vec::new();
-        let mut refused = Vec::new();
-        for (_, v) in verdicts {
-            match v {
-                Ok(v) => {
+            match tokio::task::spawn_blocking(move || policy.vet_path(addr, connect)).await {
+                Ok(Ok(v)) => {
                     pinned.push(v.connect);
                     vetted.push(v);
                 }
-                Err(d) => refused.push(d),
+                Ok(Err(d)) => refused.push(d),
+                Err(_) => return Err(FetchError::BadRedirect("a connection check failed")),
             }
         }
         if pinned.is_empty() {
@@ -722,6 +726,47 @@ mod tests {
         assert!(head.contains("\r\naccept-encoding: identity\r\n"), "{head}");
         assert!(!head.contains("referer"), "{head}");
         assert!(head.starts_with("get /elf http/1.1\r\n"), "{head}");
+    }
+
+    /// Review round 4, probe-2: the addresses of a name are vetted one after another, and only
+    /// as far as needed: the first admitted address of each family is connected to, the rest are
+    /// never probed (all of them at once was up to 8 hop-limited probes through the same first
+    /// hops, whose ICMP rate limit then dropped answers). A refused address makes the next one
+    /// probed.
+    #[tokio::test]
+    async fn r4_only_the_addresses_needed_are_probed() {
+        let server = canned_server(&[OK_ELF, OK_ELF]);
+        let probe = crate::nearhop::FixedProbe::far();
+        let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
+        let lookup = FakeLookup::with(&[
+            (
+                "many.example.com",
+                &["93.184.216.34", "93.184.216.35", "93.184.216.36", "93.184.216.37"],
+            ),
+            ("mixed.example.com", &["10.0.0.1", "93.184.216.40", "93.184.216.41"]),
+        ]);
+        let c = guarded_client_for_test(
+            &public_policy().with_near_probe(probe.clone()),
+            Arc::new(lookup),
+            to_loopback,
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let r = c
+            .get_following_redirects(&start(&server, "many.example.com"), 0, BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let asked: Vec<IpAddr> = probe.asked.lock().unwrap().iter().map(|(a, _)| a.ip()).collect();
+        assert_eq!(asked, vec![IpAddr::from([93, 184, 216, 34])]);
+        probe.asked.lock().unwrap().clear();
+        let r = c
+            .get_following_redirects(&start(&server, "mixed.example.com"), 0, BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let asked: Vec<IpAddr> = probe.asked.lock().unwrap().iter().map(|(a, _)| a.ip()).collect();
+        assert_eq!(asked, vec![IpAddr::from([93, 184, 216, 40])]);
     }
 
     /// The point of the whole guard: nothing connects to a hop the guard refuses, whether the
