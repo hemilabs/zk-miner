@@ -162,9 +162,9 @@ struct Registry {
     gateways: Vec<(Ipv6Addr, u32)>,
     /// Uplinks on which a prefix could not be held, and why (the latest few).
     unheld: Vec<(u64, String)>,
-    /// The uplink a round is running on, and whether anything was marked unheld there since it
+    /// The uplinks a round is running on, and whether anything was marked unheld there since it
     /// began ([`begin_round`], [`end_round`]).
-    round: Option<(u64, bool)>,
+    rounds: Vec<(u64, bool)>,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
@@ -173,7 +173,7 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     on: None,
     gateways: Vec::new(),
     unheld: Vec::new(),
-    round: None,
+    rounds: Vec::new(),
 });
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
@@ -284,7 +284,7 @@ pub(crate) fn unheld(signature: u64) -> Option<String> {
 }
 
 fn mark_unheld(r: &mut Registry, uplink: u64, why: String) {
-    if let Some((on, marked)) = &mut r.round {
+    for (on, marked) in &mut r.rounds {
         if *on == uplink {
             *marked = true;
         }
@@ -332,19 +332,20 @@ fn end_round(uplink: u64) {
 
 /// [`begin_round`] on `r`.
 fn round_begins(r: &mut Registry, uplink: u64) {
-    r.round = Some((uplink, false));
+    r.rounds.retain(|(s, _)| *s != uplink);
+    r.rounds.push((uplink, false));
+    if r.rounds.len() > 8 {
+        r.rounds.remove(0);
+    }
 }
 
 /// [`end_round`] on `r`.
 fn round_ends(r: &mut Registry, uplink: u64) {
-    match r.round {
-        Some((on, marked)) if on == uplink => {
-            if !marked {
-                r.unheld.retain(|(s, _)| *s != uplink);
-            }
-            r.round = None;
+    if let Some(i) = r.rounds.iter().position(|(s, _)| *s == uplink) {
+        let (_, marked) = r.rounds.remove(i);
+        if !marked {
+            r.unheld.retain(|(s, _)| *s != uplink);
         }
-        _ => {}
     }
 }
 
@@ -821,6 +822,30 @@ fn ask_and_learn_at(uplink: u64, at: &[SocketAddr], timeout: Duration) -> Result
     Ok(found_any)
 }
 
+/// Review round 5 (the bypass lens's suspicion): on an IPv6-only host (or one behind a CLAT), a
+/// round in which the DNS servers answered and named no NAT64 prefix settles the uplink: its
+/// IPv6 destinations are judged as ordinary addresses (a host that only has IPv6 is not refused
+/// all of them for want of a translator). That is said once per uplink, not left silent: if the
+/// network does translate under a prefix of its own that its DNS servers do not reveal, every
+/// address under it carrying a private IPv4 address is admitted until it is configured.
+fn warn_nothing_found(uplink: u64) {
+    static LAST: Mutex<Option<u64>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last == Some(uplink) {
+        return;
+    }
+    *last = Some(uplink);
+    tracing::warn!(
+        "network guard: this host reaches IPv4 only through NAT64, if at all (IPv6 and no IPv4 \
+         route, or IPv4 through a CLAT), and its DNS servers named no NAT64 prefix \
+         ({IPV4ONLY_ARPA}, RFC 7050) nor did its router (PREF64); IPv6 destinations are judged as \
+         ordinary addresses. If this network translates to IPv4 under a prefix of its own, name \
+         it in [egress] nat64_prefixes (an address under it can carry a private IPv4 address); \
+         asking again every {}s",
+        RETRY_UNSETTLED.as_secs()
+    );
+}
+
 fn warn_discovery(e: &str) {
     if !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
@@ -895,21 +920,46 @@ pub const RETRY_UNSETTLED: Duration = Duration::from_secs(15);
 pub(crate) struct Uplink {
     pub signature: u64,
     pub routed: [bool; 2],
+    /// The host's IPv4 goes out through a CLAT (464XLAT, RFC 6877: [`clat_in_use`]), which
+    /// translates it to IPv6 through the network's NAT64: an IPv6-only network all the same.
+    pub clat: bool,
 }
 
 impl Uplink {
-    /// IPv6 and no IPv4 route: connections to IPv4 go through NAT64, if anywhere.
+    /// IPv6 and no IPv4 route, or IPv4 only through a CLAT: connections to IPv4 go through
+    /// NAT64, if anywhere.
     pub fn ipv6_only(&self) -> bool {
-        self.routed[1] && !self.routed[0]
+        self.routed[1] && (!self.routed[0] || self.clat)
     }
 
     /// Whether a host on this uplink refuses IPv6 destinations while discovery is not `settled`
-    /// ([`ensure_discovered_on`]): only with IPv6 and no IPv4 route. A dual-stack host is never
-    /// refused for it (its IPv4 goes out natively; an address under a prefix not learned yet is
-    /// an ordinary IPv6 address there).
+    /// ([`ensure_discovered_on`]): only an IPv6-only one ([`Self::ipv6_only`]). Review round 5,
+    /// bypass-4: a host whose IPv4 default goes through a CLAT is an IPv6-only host behind NAT64
+    /// that looked dual-stack, so `<NSP>::10.0.0.1` under a prefix not learned yet was admitted
+    /// there; it now counts as IPv6-only. A dual-stack host is still not refused for it (its IPv4
+    /// goes out natively; a NAT64 on a dual-stack network is rare, and refusing every IPv6
+    /// destination there for each new uplink's round was judged not worth it: see
+    /// docs/netguard-hardening.md, review round 5).
     pub fn refuses_ipv6(&self, settled: bool) -> bool {
         !settled && self.ipv6_only()
     }
+}
+
+/// Whether this host's IPv4 goes out through a CLAT (464XLAT, RFC 6877): an IPv4 address in the
+/// IPv4 Service Continuity Prefix `192.0.0.0/29` (RFC 7335; Android's and macOS's CLAT, clatd),
+/// or an IPv4 default route out of an interface a CLAT names (`clat*`, Android's `v4-*`). On
+/// macOS the configuration daemon's CLAT also numbers its interface from `192.0.0.0/29`.
+pub(crate) fn clat_in_use(
+    addresses: &[IpAddr],
+    v4_default_interfaces: &[String],
+) -> bool {
+    let service_continuity = Prefix::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 29);
+    addresses
+        .iter()
+        .any(|a| a.is_ipv4() && crate::ip::mask(*a, 29) == service_continuity.addr)
+        || v4_default_interfaces
+            .iter()
+            .any(|n| n.starts_with("clat") || n.starts_with("v4-"))
 }
 
 /// discovery per uplink (see [`ensure_discovered_on`]).
@@ -1044,6 +1094,9 @@ fn round_on(up: Uplink) {
         Err(e) => warn_discovery(&e),
     }
     end_round(up.signature);
+    if up.ipv6_only() && !found_any && configured().is_empty() {
+        warn_nothing_found(up.signature);
+    }
     let mut d = ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner());
     finished(&mut d, up, found_any);
     let again = d.running.then_some(d.uplink).flatten();
@@ -1819,10 +1872,12 @@ mod tests {
         let v6_only = |sig| Uplink {
             signature: sig,
             routed: [false, true],
+            clat: false,
         };
         let dual = |sig| Uplink {
             signature: sig,
             routed: [true, true],
+            clat: false,
         };
         let mut d = OnUplink {
             uplink: None,
@@ -1871,6 +1926,14 @@ mod tests {
             !dual(3).refuses_ipv6(false),
             "a dual-stack host is never refused for it"
         );
+        // Review round 5, bypass-4: one behind a CLAT is an IPv6-only host (refused while
+        // unsettled, asked again every RETRY_UNSETTLED).
+        let clat = Uplink {
+            clat: true,
+            ..dual(3)
+        };
+        assert!(clat.ipv6_only() && clat.refuses_ipv6(false));
+        assert_eq!(next_on(&mut d, clat, at(500)), Next::AskInBackground);
     }
 
     /// Review round 3, bypass-1, live (every platform since the Linux application): a new uplink
@@ -1881,6 +1944,7 @@ mod tests {
         ensure_discovered_on(Uplink {
             signature: 1,
             routed: [true, true],
+            clat: false,
         });
         let fresh = std::collections::hash_map::RandomState::new()
             .build_hasher()
@@ -1889,6 +1953,7 @@ mod tests {
         assert!(!ensure_discovered_on(Uplink {
             signature: fresh,
             routed: [true, true],
+            clat: false,
         }));
     }
 
@@ -2803,6 +2868,26 @@ mod r5_tests {
             // The forged ones stay refused.
             assert!(all_of(&r).contains(&p("2001:db8:1::/96")));
         }
+    }
+
+    /// bypass-4: a host whose IPv4 goes out through a CLAT (an address in 192.0.0.0/29, or an
+    /// IPv4 default out of a `clat*` or `v4-*` interface) is IPv6-only for NAT64; any other is
+    /// not.
+    #[test]
+    fn r5_a_clat_host_is_ipv6_only() {
+        let a = |s: &str| -> IpAddr { s.parse().unwrap() };
+        assert!(clat_in_use(&[a("192.168.1.5"), a("192.0.0.4")], &[]));
+        assert!(clat_in_use(&[a("192.0.0.2")], &["en0".into()]));
+        assert!(clat_in_use(&[], &["clat".into()]));
+        assert!(clat_in_use(&[], &["v4-wlan0".into()]));
+        assert!(!clat_in_use(&[a("192.0.0.8"), a("192.168.1.5")], &["eth0".into()]));
+        assert!(!clat_in_use(&[a("2001:db8::1")], &["wlan0".into()]));
+        let up = Uplink {
+            signature: 1,
+            routed: [true, true],
+            clat: true,
+        };
+        assert!(up.ipv6_only() && up.refuses_ipv6(false) && !up.refuses_ipv6(true));
     }
 
     /// parse-3: what a router heard on one uplink announced is not named on another, even by a
