@@ -3784,10 +3784,19 @@ mod r6_tests {
         let flood = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             let (_, from) = server.recv_from(&mut buf).unwrap();
-            while !s2.load(Ordering::SeqCst) {
-                for _ in 0..64 {
-                    let _ = server.send_to(&[0u8; 12], from);
-                }
+            // Several senders, so that the reader never finds the socket empty.
+            let senders: Vec<_> = (0..4)
+                .map(|_| {
+                    let (sock, stop) = (server.try_clone().unwrap(), s2.clone());
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::SeqCst) {
+                            let _ = sock.send_to(&[0u8; 12], from);
+                        }
+                    })
+                })
+                .collect();
+            for s in senders {
+                s.join().unwrap();
             }
         });
         let t = Instant::now();
@@ -3880,6 +3889,23 @@ mod r6_tests {
         assert!(named.iter().any(|(q, _)| *q == p("2001:db8:8::/96")), "{named:?}");
         assert!(named.iter().all(|(_, l)| *l == Some(MAX_PREF64_LIFETIME)), "{named:?}");
         assert!(h.named_by(&[gw], t0 + MAX_PREF64_LIFETIME)[0].1.is_empty());
+    }
+
+    /// The same, the options heard one after another within one advertisement (fix-r6 mutation
+    /// T03): the newest five stay, the oldest are pushed out.
+    #[test]
+    fn r6_a_router_naming_too_many_keeps_its_newest_in_order() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        h.on(Some(1));
+        for i in 0..9u64 {
+            h.hear(&[ann(&format!("2001:db8:{i:x}::/96"), gw.0, 600)], &[gw], t0 + Duration::from_millis(50 * i));
+        }
+        let mut named: Vec<Prefix> = h.named_by(&[gw], t0 + Duration::from_millis(500))[0].1.iter().map(|n| n.0).collect();
+        named.sort();
+        let newest: Vec<Prefix> = (4..9u64).map(|i| p(&format!("2001:db8:{i:x}::/96"))).collect();
+        assert_eq!(named, newest);
     }
 
     /// The invariant (review round 6), on random sequences of router advertisements (forged ones
