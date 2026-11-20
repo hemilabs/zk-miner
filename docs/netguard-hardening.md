@@ -346,3 +346,99 @@ stack one included (fail closed: a hostile DHCP server or router can make a dual
 IPv4-only). The `callers` CI job does not run the broker's integration tests (they need anvil
 and the sandboxed binary; `held_lock_fetches_pass_a_flood_of_simulations` fails under Rosetta at
 af17e48 as at HEAD).
+
+
+## Review round 5
+
+Four reviewers (bypass, parse, probe, cross; material in
+`/Users/user/zkminer/scratch/w11/NGREV/r5-*`) on 0a2d1fd. During round 5 the reviewers shared
+one `CARGO_TARGET_DIR`, so a test binary could come from another tree; every reviewer test was
+therefore rerun in this tree (the files touched first, the test names checked in the output)
+before the fixes (`fix-r5/reviewer-*-before.log`) and after (`reviewer-*-after.log`), and each
+finding was then reproduced with a failing test of mine or a live repro before it was fixed.
+Logs: `fix-r5/` (`/Users/user/zkminer/scratch/w11/NGREV/fix-r5/`).
+
+| # | finding | reproduced | fix | test |
+|---|---|---|---|---|
+| 1 | cross-1 (medium) = bypass-2 = parse-2: `Heard` kept every PREF64 prefix a gateway ever named, expired and withdrawn ones included, and counted them against the per-router cap; five renumberings, or one forged RA from the gateway's link-local address with five options, left the uplink unsettled for the process's life (all IPv6 refused, on any host); the refusal said "still being learned (at most 2s)" | the reviewers' tests fail (cross, parse) or show the bug (bypass) at 0a2d1fd (`reviewer-*-before.log`); live: `r5-cross/vm-r5-spoof.log` (refused for 340 s) | `Heard` drops a prefix withdrawn with lifetime 0 or whose lifetime ran out (prune on every hear and facts read), names and counts only live ones, and a newer prefix takes an expired one's room; the registry keeps every withdrawn prefix refused (`learn` withdraws what a source stops naming); unheld marks are kept per uplink and source, and a source's next naming clears its own mark under the same lock before judging what it names now (no window: item 5); on Linux each facts read drops what ran out and learns the gateways again; an uplink unheld is refused with `Denied::Nat64Unheld { ip, why }`, naming the source and what it named | `nat64::r5_tests::r5_a_gateway_that_renumbers_its_pref64_never_unsettles_its_uplink`, `r5_one_forged_advertisement_unsettles_its_uplink_only_while_it_lives`, `r5_a_source_that_names_what_fits_clears_its_own_mark`, `r5_pref64_that_runs_out_is_withdrawn_at_the_next_facts_read` (Linux), `policy::tests::r5_an_unheld_nat64_prefix_has_its_own_refusal_naming_the_source`; live: `vm-r5-spoof.log` (IPv6 refused, naming `the router advertisements of fe80::1`, from the forged RA until its withdrawal 3 s later, or until its 8 s ran out; admitted from then on) |
+| 2 | bypass-1 (medium): the Linux MAC debounce kept the old network's signature while a new gateway MAC held for 3 reads and 2 s, and an on-link host flipping the entry between two MACs reset it on every read: on a new network behind the same gateway address the old network's NAT64 state and public addresses stood (macOS changes at once) | the reviewer's `r5_a_move_keeps_the_old_networks_signature_for_the_debounce` shows it (`reviewer-bypass-before.log`) | the Linux signature also hashes the uplink's addressing (`uplink_addressing`: the global IPv6 on-link prefixes and IPv4 connected subnets of the uplink's interfaces, and the host's IPv4 addresses in them); another MAC than the known one is another uplink at once (public addresses relearning, IPv6 refused on an IPv6-only host until its NAT64 round ends); the debounce (3 reads, 2 s, timer reset only by the known MAC) only decides when the new MAC becomes the known one, and the signature does not change again when it does (`changed` MACs hashed, not an epoch). Round 4's rules stay: a flushed or `FAILED` entry, and a MAC first seen, change nothing | `facts::tests::two_networks_behind_the_same_router_address_are_two_uplinks_on_linux` (rewritten: the reviewer's flipping sequence never yields the old signature; a real move relearns once; flush, FAILED, first seen unchanged), `r5_the_uplinks_addressing_tells_networks_apart_on_linux`; live: `vm-r5-mac.log` (the gateway's entry replaced by another MAC: public IPv4 and IPv6 refused as relearning at once; the real MAC back: admitted again), `vm-repros.log` NF (two flushes in 20 s: no refusal) |
+| 3 | parse-4 (medium): with no gateway MAC known (the neighbour table unreadable, no usable entry) every facts read hashed its own number: a new signature per read, public addresses relearning for good, a NAT64 round per read | by reading (the reviewer's code path) | with no MAC known the routes and the addressing decide, stably, warned about once; networks the addressing tells apart are never merged | in the signature test above (`fresh`, `denied`) |
+| 4 | probe-1 (medium): the broker connector bounded each address's floor check by its share of the connect time (5 s / n), but the near-hop decision takes 3.5 s when the probe goes unanswered: with n = 2 every far address was abandoned on a path whose hop at the limit is silent, and abandoned checks kept their turn and probe slot; the probe gate's wait had no bound (parse and probe suspicions) | the new broker test fails at 0a2d1fd (`vm-broker-r5-before.log`: Unreachable after 5 s) | `nearhop::decide_until` / `NetPolicy::vet_path_until` take a deadline: the probe's turn is waited for until it, every attempt, the pause and the check connection's connects and wait are bounded by it, out of time is a failure (never far); `NearProbe::probe_until`/`confirm_until` (defaults call `probe`/`confirm`); the broker checks each address within the request's deadline and bounds only the TCP connect by the share; the guarded client's pin passes the request's deadline | broker `connector::server::tests::r5_a_slow_near_hop_check_does_not_lose_its_address` (a 3.6 s probe fake, two addresses: connected; `vm-broker-r5-after.log`), `nearhop::tests::r5_a_probe_waits_for_a_turn_only_until_its_deadline`, `client::tests::r5_the_checks_run_within_the_requests_time_one_per_family` |
+| 5 | bypass-3 (low): `begin_round` cleared the uplink's unheld mark before the round asked again: for up to 2 s every 15 s an over-naming DNS64's uplink was not unsettled | the reviewer's `r5_unheld_is_cleared_for_the_length_of_a_round` shows it | the mark stays while the round runs and is replaced when it ends (cleared only if nothing was marked there since it began); rounds tracked per uplink | `nat64::r5_round_tests::r5_unheld_is_kept_while_a_round_runs_and_replaced_when_it_ends` (the reviewer's test turned around), `r5_a_rounds_marks_replace_the_old_ones_when_it_ends` |
+| 6 | parse-3 (low): `Heard` was keyed by (router, interface) only: another network's PREF64 from a router of the same address was learned and synthesized with | the reviewer's test fails | each entry is tied to the uplink it was heard on (`Heard::on`) | `nat64::r5_tests::r5_another_networks_pref64_is_not_named_on_this_one` |
+| 7 | bypass-4 (low): a host whose IPv4 default goes through a CLAT (464XLAT) is IPv6-only behind NAT64 but looked dual-stack, so `<NSP>::10.0.0.1` was admitted while the network's prefix was not learned | by reading | `nat64::clat_in_use`: an IPv4 address in 192.0.0.0/29 (RFC 7335: Android's, macOS's, clatd's CLAT) or an IPv4 default out of a `clat*`/`v4-*` interface makes the host IPv6-only for NAT64 (refused until its round ends, asked again every 15 s). Not chosen: refusing IPv6 on every host until a new uplink's round ends (tried: it refused IPv6 on dual-stack hosts at every signature change, and a NAT64 on a dual-stack network is rare). The reviewer's suspicion (an IPv6-only host whose servers answered with no prefix counts as settled): kept (refusing all IPv6 there would leave the host nothing) and now logged once per uplink, naming `[egress] nat64_prefixes` | `nat64::r5_tests::r5_a_clat_host_is_ipv6_only`, `nat64::tests::a_new_uplink_is_asked_for_its_prefix_at_once`, `facts::tests::a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends` |
+| 8 | bypass-5 (low): the broker connector made an IPv6 socket for an IPv4-mapped address and bound it to the IPv4 source: `EINVAL` | the new test fails at 0a2d1fd (`vm-broker-r5-before.log`) | connected to the unmapped address on a socket of its family | `connector::server::tests::r5_an_ipv4_mapped_address_is_connected_as_ipv4` |
+| 9 | parse-1 (low): the TLS handshake was bounded only by the request's whole time (pr/37: by the connect timeout) | the reviewer's test and mine fail at 0a2d1fd (`hop-r5-before.log`: 8 s) | bounded by `(now + connect_timeout).min(deadline)` | `client::tests::r5_a_stalled_tls_handshake_is_bounded_by_the_connect_timeout` |
+| 10 | cross-2 (low): no happy eyeballs: sequential connects with the full timeout each, and only the last failure named; a blackholed IPv6 path added 15 s per hop | live: `r5-cross/vm-r5-happy-eyeballs.log` (27 s a fetch), rerun after the racing connect: still 27 s (`vm-r5-he.log` history in the commit): the time was in the pin, which vetted every IPv6 address (13.5 s each on a blackholed path) before IPv4 | the hop's connect races (RFC 8305: IPv6 first, the next 250 ms later or at once when the one before failed, the first that connects and passes the re-check wins, the others dropped before a byte, every failure named); the pin walks each family on its own, the two at once, and once one has an address the other gets 250 ms more | `client::hop::tests::r5_the_addresses_race_ipv6_first`, `client::tests::r5_a_blackholed_ipv6_family_does_not_hold_the_hop`; live: `vm-r5-he.log` (IPv6 SYNs dropped: 0.6-1.4 s a fetch) |
+| 11 | probe-2 (info): a control-connection reset was reported as the check connection's, and "(control connection)" fell past the 120-character cut | by reading | each failure names its connection in its own text, within the cut | `nearhop::tests::the_check_reads_only_an_acknowledged_fin_as_an_answer` |
+| 12 | cross-3: seven mutants survived | the reviewer's mutation logs | tests: the exact request line and `Host` with a port and a query, the response head within the read timeout, an https URL's first bytes a ClientHello (R12), an attempt within the deadline, the dual-family pin, the eviction order when a prefix is named again, PREF64 sources from default-like routes only | `client::tests::r5_the_request_line_and_host_are_exact`, `r5_the_response_head_is_bounded_by_the_read_timeout`, `r5_a_stalled_tls_handshake_is_bounded_by_the_connect_timeout`, `client::hop::tests::r5_an_attempt_is_bounded_by_the_deadline_too`, `client::tests::r5_the_checks_run_within_the_requests_time_one_per_family`, `nat64::r5_tests::r5_a_prefix_named_again_is_not_the_first_to_make_room`, `facts::tests::r5_a_nexthop_objects_gateways_are_the_uplinks` |
+| 13 | cross-4 (info): the workflow's callers job was not strict and had no cargo cache; with `nexthop_compat_mode` 0 the IPv4 gateway was missing from the uplinks | by reading | the callers job strict (the broker tests' skips fail under it), both jobs cache `~/.cargo` and `target`; nexthop objects' gateways (`NHA_GATEWAY`) resolved for the default routes (`default_gateways`, `routes::nexthop_gateways`) | `facts::tests::r5_a_nexthop_objects_gateways_are_the_uplinks`, `routes` `nexthop_messages_parse` (Linux); `actionlint` (with shellcheck) clean |
+| 14 | the probe lens's suspicions | | rate: the probe gate also paces SYNs, a burst of 6 then 3 a second (`PROBE_BURST`, `PROBES_PER_SECOND`); Windows ICMP: open (below) | `nearhop::tests::r5_probes_are_paced` |
+
+**Mutation run** (`fix-r5/mut/`): 55 mutants of this round's code on macOS (`muts.py`, `run.py`):
+44 killed on the first run (`summary-run1.txt`); of the 11 survivors six got tests (`7b77c6e`) and
+are killed (`summary.txt`). Five survive: `round_on` never ending its round and the gathered
+facts never passing CLAT (both glue in code that reads the real host: no unit test drives a
+round or `gather_with` with staged inputs), the check connection's connect and wait not bounded
+by the deadline (`N02`, `N08`: they run only in the real check connection, against a peer that
+answers slowly), and a failed attempt not starting the next address at once (`E07`: equivalent
+while a hop has at most two addresses, one per family, since an empty race starts the next one
+anyway). In the VM, 4 mutants of Linux-only lines (`vm_run.py`: the PREF64 expiry at a facts
+read, `NHA_GATEWAY`, the broker's mapped-address socket and its check bounded by a share
+again): all killed (`vm-summary.txt`).
+
+**Gates** (`fix-r5/gates-summary.log`, `vm-gates-summary.log`, macOS at 7b77c6e, the VM at 10a6870, which changes
+only a Linux test):
+
+- **macOS:** the netguard suite twice and with `ZKMINER_CI_STRICT=1` (236 library tests, nothing
+  skipped); the live forge test twice (308,852 queries answered while 1.29 M forged datagrams
+  arrived, none taken); `zkminer-chain` (185) and its two real downloads in public mode; clippy
+  `--all-targets -D warnings`.
+- **Linux (the VM):** the suite twice on aarch64 and once strict with `ZKMINER_CI_ALLOW_SKIP=ipv6`
+  (211, nothing skipped), clippy; under Rosetta (x86_64) the suite, `zkminer-chain` and its real
+  downloads, and the broker's library tests (138, strict). The first VM run failed
+  `a_near_listener_that_drops_syns_for_a_while_is_near` (`vm-gates-summary-run1.log`): with
+  probes paced, the probe's third attempt came after the listener drained and the probe itself
+  found it near; the test now accepts either near answer (`10a6870`), and the rerun passes.
+- **Type-checked:** `cargo check` and clippy `--all-targets -D warnings` for
+  `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` and `aarch64-linux-android` (stub C
+  compilers): no warnings; the broker's clippy for linux-gnu (13 warnings, all in files this round
+  did not touch, as in round 4).
+- **Merge:** `git merge-tree --write-tree item/W11-ON37 HEAD`: clean. `actionlint` (with
+  shellcheck) on the workflow: clean.
+- **The reviewers' tests after the fixes** (`reviewer-*-after.log`; their patches appended to
+  the files' new tails by `append_patch.py`, the bypass lens's facts test ported to the new
+  `MacHistory::signature` arguments): the three tests that asserted a bug now fail (the bugs are
+  gone), the cross and parse tests that asserted the fix pass, except parse-3's, which builds a
+  `Heard` without naming the uplink (`Heard::on`); its ported twin passes.
+
+**Live repros rerun in the VM** (`fix-r5/vm-repros.log`, `vm-r5-spoof.log`, `vm-r5-he.log`,
+`vm-r5-mac.log`): round 4's (policy rules, the `ipproto udp` rule, the hostile DNS64 with and
+without validated answers, the rogue RA of 16 PREF64 options, nexthop objects with compat 0 and
+1, neighbour flushes, the route flipping to the LAN box 150 times) behave as at 0a2d1fd
+(`vm-batch2.log` of round 4 and this round's differ in timings only; the LAN box got 0
+requests); round 5's spoofed-gateway RA and blackholed IPv6 as in items 1 and 10; the uid,
+fwmark and source rules and the nexthop member replaced (`r5-rules.sh`) as in the reviewer's
+`vm-r5-rules.log` (refused, the LAN box never reached).
+
+**Linux code paths never executed** (type-checked and unit-tested): a real IPv6-only host or a
+real CLAT (`clat_in_use` from a real facts read); a real move between two networks behind the
+same router address with different addressing (the MAC change ran live, the addressing is pure);
+a neighbour dump the kernel denies; a nexthop object's `NHA_GATEWAY` from a real dump in the
+signature (parsed from built messages; the compat-0 repro ran the route side); Android at all.
+
+**Open for the owner.**
+- **Windows and ICMP time exceeded** (the probe lens's suspicion): whether Windows surfaces an
+  ICMP "time exceeded" for a SYN in `SYN-SENT` as a failed connect (`WSAEHOSTUNREACH` /
+  `WSAENETUNREACH`) at all is unverified; if it does not, every probe times out there and, with no
+  check connection on Windows, every public host is refused. It needs a Windows runner: probe a
+  far public host with hop limit 2 and see whether the connect fails fast.
+- **CLAT detection** is by address and interface name; a CLAT numbered otherwise is not seen
+  (its host then admits `<NSP>::10.x` until the prefix is learned, as before).
+- **A flapping or spoofed gateway MAC** now makes the Linux guard learn its public addresses
+  again on each change (it fails closed; round 4 had debounced it).
+- **Probe pacing** (6, then 3 a second) adds latency only past a burst: a redirect chain of many
+  dual-stack hosts may wait for tokens.
+- Unchanged from round 4: S3 behind first hops without ICMP; caps that refuse IPv6 on a network
+  naming more NAT64 prefixes than the guard holds (now cleared as soon as the source names what
+  fits).

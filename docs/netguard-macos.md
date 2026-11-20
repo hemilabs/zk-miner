@@ -788,3 +788,26 @@ The findings and fixes, on every platform, are in
   kept per uplink; configured prefixes always in force; DNS64 answers validated (RFC 7050 §3).
 - **Probes**: a third attempt after a 1 s pause, at most two in flight, a name's addresses one
   after another; a check that cannot decide is `NearCheckFailed`.
+
+
+## Review round 5
+
+The findings and fixes, on every platform, are in
+[netguard-hardening.md](netguard-hardening.md#review-round-5). What changes on macOS:
+
+- **NAT64**: an uplink whose sources name more prefixes than the guard holds is refused with its
+  own reason (`Nat64Unheld`, naming the source: the configuration daemon's NAT64 state, a DNS
+  server), and a source's next naming that fits clears it at once; a round's mark is replaced when
+  the round ends, never cleared while it runs. A host with an address in 192.0.0.0/29 (macOS's
+  CLAT, on an IPv6-only network that offers 464XLAT) is IPv6-only for NAT64: IPv6 is refused until
+  its uplink's round ends. The macOS uplink signature (the configuration daemon's network
+  signatures) is unchanged; the Linux one now changes at once with the gateway's MAC, as the
+  macOS one always did.
+- **Near-hop checks run within the caller's deadline**: the probe's turn, its attempts and pause,
+  the check connection's connects and its wait (`TCP_CONNECTION_INFO` polling) all stop at the
+  deadline the guarded request gives them; probes are also paced (a burst of 6, then 3 a
+  second). The live check-connection tests pass here.
+- **Each hop** races its two addresses (IPv6 first, IPv4 250 ms later), vets a name's two
+  families at once, and bounds its TLS handshake by the connect timeout.
+- **The check connection's failures** name the connection (check or control) within the 120
+  characters a refusal shows.
