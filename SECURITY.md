@@ -110,7 +110,8 @@ Every connection a requester can cause goes through one guard
     source the kernel picks, then with that source; a `from` rule that sends the connection to
     another table than the first lookup used is refused. (IPv6 looks the route up once, matching
     source rules inside that lookup, and is asked once.) Answers are reused for the life of one
-    facts snapshot (about a second). Linux only;
+    facts snapshot (about a second). On Linux; macOS asks its routing socket instead (below),
+    and elsewhere every query fails, so a public-mode miner refuses every requester connection;
   - **the site around each of the host's global IPv6 addresses**: its enclosing `/32`
     (`[egress] ipv6_site_prefix_len`, 16 to 64), what an organisation (a campus, a company)
     usually holds, whose other networks hold its other machines. This also refuses the rest of
@@ -158,7 +159,8 @@ Every connection a requester can cause goes through one guard
   side, which many routers serve their admin page, DNS and UPnP on; a NAT router or NAT64
   translator hairpinning its own public address; a neighbour in the same cloud VPC; the far
   side of a tunnel) and is refused. If the probe runs out of hops (Linux reports the router's
-  "time exceeded" as host unreachable), the destination is farther and the real connection is
+  "time exceeded" as host unreachable; so does macOS while `net.inet.tcp.icmp_may_rst` is 1, its
+  default), the destination is farther and the real connection is
   made, on a new socket with the usual hop limit. **No answer in time decides nothing** (a path
   that filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
   limit, a device waking up): a **check connection** is made with the usual hop limit, and once
@@ -210,6 +212,40 @@ Every connection a requester can cause goes through one guard
 - On top of that, unchanged: every ELF is checked against its registry and content hashes,
   capped at 248 MiB, and fetched within a time budget, no compression is decoded, and the
   `User-Agent` is a constant `zkminer`.
+
+### The network guard on macOS
+
+The same decisions, from what macOS shows an unprivileged process (evidence, commands and tests:
+[docs/netguard-macos.md](docs/netguard-macos.md)):
+
+- **Routing table:** the `NET_RT_DUMP` sysctl of the BSD routing socket (a consistent snapshot,
+  read again if the table grew meanwhile), parsed from bytes with every length checked; a
+  malformed message fails the read. `RTF_GATEWAY` routes go through their gateway, others are
+  on-link; `RTF_LOCAL` and `RTF_BROADCAST` routes deliver to this host; reject, blackhole, down
+  and multicast routes and the kernel's clones are not read, as on Linux.
+- **No policy rules; scoped routes.** macOS has no `ip rule`. Interface-scoped routes
+  (`RTF_IFSCOPE`) are used only by sockets bound to their interface, so each interface's scoped
+  routes are read as a table no rule reaches: a scoped default route (the system `utun`
+  interfaces' IPv6 defaults, a second network interface's default, a VPN that does not take over
+  the default route) is no default route and no uplink, and any other scoped route off the
+  default path still refuses what it holds.
+- **The kernel per destination:** an `RTM_GET` on a fresh routing socket, matched by the
+  kernel-set `rtm_pid` and a per-process sequence number, judged exactly as the Linux answer is
+  (`ESRCH` is no route). Network Extension policies (a per-app or include-all-networks VPN, a
+  content filter) can send a socket elsewhere with no route saying so; so for an answer that could
+  be admitted, a UDP socket is connected to the destination (no packet is sent) and the source
+  address the kernel chose must be on the interface the route names, or the destination is
+  refused.
+- **Uplinks:** interface types from `getifaddrs` (Ethernet and Wi-Fi are physical, `utun` is a
+  tunnel, `ppp` always needs `[egress] internal_ranges` since macOS lists no PPPoE sessions,
+  any type the guard does not know is not physical).
+- **DNS servers:** `/etc/resolv.conf` (the primary resolvers) and `/etc/resolver/*`.
+- **Near hops:** the probe is the same hop-limited TCP connect; a check connection reads its FIN's
+  fate from `TCP_CONNECTION_INFO`. macOS does not report an ICMP "time exceeded" for the FIN, so
+  a far peer is known only when the wait ends (the same verdict, up to 1.5 s later).
+- **Not seen on macOS** (list what they reach in `[egress] deny_cidrs`): `pf` rules (`route-to`,
+  NAT), which need root to read; Network Extension policies that treat TCP differently from UDP;
+  resolvers only the configuration daemon knows (`scutil --dns` scoped or VPN resolvers).
 
 ## Developer mode: `[dev] private_network`
 
@@ -648,7 +684,8 @@ no second one):
   not the default path, and every destination rule's prefix. If you route the miner's own
   traffic by source port, mark or cgroup, list what those paths reach in `[egress] deny_cidrs`.
   A destination rule into a table that routes it out the same uplink is refused all the same
-  (refusing too much). Routes and rules are read on Linux only.
+  (refusing too much). Routes and rules are read on Linux; macOS reads its routes (it has no
+  rules; see "The network guard on macOS"); elsewhere neither.
 - **Public-address discovery depends on outside services.** If the reflectors cannot confirm
   a family's address (a firewall blocking outbound DNS and HTTPS to them, an outage), no
   requester connection goes out over that family until they can or `[egress]

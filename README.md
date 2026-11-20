@@ -245,6 +245,18 @@ Run the miner with the host's network (`--network host` in a container): inside 
 it sees only the container's interfaces and routes, so list the host's networks and addresses
 in `[egress] deny_cidrs` if it cannot.
 
+**macOS.** The guard makes the same decisions on a Mac, unprivileged: the routing table comes
+from the BSD routing socket's sysctl (what `netstat -rn` shows), the kernel is asked per
+destination with an `RTM_GET` (what `route -n get` shows), and the near-hop probe and its check
+connection work as on Linux (`TCP_CONNECTION_INFO` in place of `TCP_INFO`). macOS has no
+policy-routing rules; its interface-scoped routes (netstat's `I` flag, such as the system's
+`utun` interfaces' IPv6 defaults) carry no ordinary connection, so they are neither default
+routes nor uplinks, and a connection whose socket would leave by another interface than its
+route names (a Network Extension VPN) is refused. A `utun` or `ppp` default route needs
+`[egress] internal_ranges`, as a tunnel does on Linux. Details and residual differences:
+[docs/netguard-macos.md](docs/netguard-macos.md). Windows still refuses every requester
+connection in public mode (no route oracle there).
+
 **Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
 endpoints for builders, has no network of its own: its sandbox denies every socket call. The
 miner's *connector* makes each connection for it — the broker can only name one of the endpoints
