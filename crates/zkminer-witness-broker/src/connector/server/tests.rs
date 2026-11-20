@@ -691,3 +691,60 @@ async fn a_cancelled_read_keeps_the_partial_frame() {
     drop(theirs);
     assert!(matches!(frames.read(&ours).await, Ok(None)));
 }
+
+/// A probe that takes `delay` and then finds the destination far: a path whose hop at the limit
+/// is silent (three attempts and a pause, review round 5, probe-1).
+#[derive(Debug)]
+struct SlowFar {
+    delay: Duration,
+    asked: Mutex<Vec<SocketAddr>>,
+}
+
+impl zkminer_netguard::NearProbe for SlowFar {
+    fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::ProbeOutcome {
+        lock(&self.asked).push(addr);
+        std::thread::sleep(self.delay);
+        zkminer_netguard::ProbeOutcome::Unreachable
+    }
+
+    fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::nearhop::ConfirmOutcome {
+        zkminer_netguard::nearhop::ConfirmOutcome::Unanswered
+    }
+}
+
+/// Review round 5, probe-1: a near-hop check that takes 3.6 s (a silent hop at the limit) no
+/// longer outlives the per-address share of the connect time (5 s / 2 addresses): the check runs
+/// within the request's time, the share bounds only the TCP connect, so the first of two far
+/// addresses is connected to. Real public peers (1.1.1.1 and 1.0.0.1 on 443; skipped where
+/// unreachable), resolved by a test DNS server.
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_a_slow_near_hop_check_does_not_lose_its_address() {
+    use crate::testkit::TestDns;
+    let peers: [SocketAddr; 2] = ["1.1.1.1:443".parse().unwrap(), "1.0.0.1:443".parse().unwrap()];
+    if peers.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
+        eprintln!("SKIPPED: {peers:?} unreachable here");
+        return;
+    }
+    let dns = TestDns::start(&[("rpc.example.com", &["1.1.1.1", "1.0.0.1"])]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://rpc.example.com:443", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    assert_eq!(cfg.timeouts.connect(), Duration::from_secs(5));
+    let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
+    let probe = Arc::new(SlowFar { delay: Duration::from_millis(3600), asked: Mutex::new(Vec::new()) });
+    let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
+    let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
+    let (b, s) = session(&c);
+    let t = std::time::Instant::now();
+    let (resp, fd) = blocking(move || {
+        let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+        drop(b);
+        r
+    })
+    .await;
+    eprintln!("{resp:?} after {:?}; probed {:?}", t.elapsed(), lock(&probe.asked));
+    assert_eq!(resp.status, Status::Connected, "{resp:?}");
+    assert!(fd.is_some());
+    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+}
