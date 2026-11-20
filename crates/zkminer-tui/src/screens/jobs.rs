@@ -26,34 +26,39 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     let now = now_unix();
     let jobs = state.jobs_page_rows();
     let claimed = state.active_jobs.len();
+    let kind = |job: &TrackedJob| row_kind(job, state);
+    let held = jobs.iter().filter(|j| kind(j) == RowKind::Held).count();
+    let recent = jobs.iter().filter(|j| kind(j) == RowKind::Finished).count();
     let rows: Vec<Row> = jobs
         .iter()
         .enumerate()
         .map(|(i, job)| {
-            let ours = i < claimed;
+            let row = kind(job);
+            let ours = row != RowKind::Open;
             let id_short = format!("{}...", &format!("{}", job.info.job_id)[..8]);
             let program_short = format!("{}...", &format!("{}", job.info.descriptor_hash)[..8]);
 
-            let (price, status) = if ours {
-                // What the claim locked, once known: the auction price moves on after the claim.
-                let price = if job.info.settled_price > 0 {
-                    job.info.settled_price
-                } else {
-                    job.current_price
-                };
-                (price, claimed_status_text(job, state, now))
+            // What the claim locked, once known: the auction price moves on after the claim.
+            let locked = if job.info.settled_price > 0 {
+                job.info.settled_price
             } else {
-                (job.current_price, job_status_text(job, state))
+                job.current_price
+            };
+            let (price, status) = match row {
+                RowKind::Claimed => (locked, claimed_status_text(job, state, now)),
+                RowKind::Held => (locked, held_status_text(job, state, now)),
+                RowKind::Finished => (locked, finished_status_text(job, state, now)),
+                RowKind::Open => (job.current_price, job_status_text(job, state)),
             };
 
             let mut style = theme::striped(i);
             if i == state.selected_job_index {
                 style = style.bg(theme::overlay());
             }
-            let status_cell = if ours {
-                Cell::from(status).style(claimed_status_style(job, now))
-            } else {
-                Cell::from(status)
+            let status_cell = match row {
+                RowKind::Finished => Cell::from(status).style(theme::dim()),
+                _ if ours => Cell::from(status).style(claimed_status_style(job, now)),
+                _ => Cell::from(status),
             };
 
             Row::new(vec![
@@ -86,9 +91,18 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         Block::default()
             .title(Span::styled(
                 format!(
-                    " Jobs: {} claimed, {} open — [↑↓] select  [Enter] detail ",
-                    claimed,
-                    jobs.len() - claimed
+                    " Jobs: {claimed} claimed{}, {} open{} — [↑↓] select  [Enter] detail ",
+                    if held > 0 {
+                        format!(", {held} held but not being proven")
+                    } else {
+                        String::new()
+                    },
+                    jobs.len() - claimed - held - recent,
+                    if recent > 0 {
+                        format!(", last {recent} finished")
+                    } else {
+                        String::new()
+                    },
                 ),
                 theme::title(),
             ))
@@ -98,6 +112,58 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     );
 
     f.render_widget(table, area);
+}
+
+/// Which part of the Jobs page a row is in (`MinerState::jobs_page_rows`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowKind {
+    /// Claimed, and being proven or settled.
+    Claimed,
+    /// A lock held on-chain that nothing works on now (`MinerState::kept_locks`).
+    Held,
+    /// On the market.
+    Open,
+    /// Fulfilled or released (`MinerState::recent_finished`).
+    Finished,
+}
+
+pub(crate) fn row_kind(job: &TrackedJob, state: &MinerState) -> RowKind {
+    let id = job.info.job_id;
+    if state.active_jobs.iter().any(|j| j.info.job_id == id) {
+        RowKind::Claimed
+    } else if state.kept_reason(id).is_some() {
+        RowKind::Held
+    } else if matches!(
+        job.status,
+        MinerJobStatus::Fulfilled { .. } | MinerJobStatus::Released { .. }
+    ) {
+        RowKind::Finished
+    } else {
+        RowKind::Open
+    }
+}
+
+/// A held lock's status: why nothing works on it, and its deadline.
+pub(crate) fn held_status_text(job: &TrackedJob, state: &MinerState, now: u64) -> String {
+    let why = state.kept_reason(job.info.job_id).unwrap_or("held");
+    let deadline = match job.info.lock_deadline {
+        0 => String::new(),
+        d if d > now => format!(", deadline in {}", format_duration(d - now)),
+        _ => ", past its deadline".to_string(),
+    };
+    format!("Held, not being proven: {why}{deadline}")
+}
+
+/// A finished job's status: how it ended, and how long ago.
+pub(crate) fn finished_status_text(job: &TrackedJob, state: &MinerState, now: u64) -> String {
+    let how = match job.status {
+        MinerJobStatus::Released { .. } => "Released",
+        _ => "Fulfilled",
+    };
+    match state.finished_at.get(&job.info.job_id) {
+        Some(at) => format!("{how} {} ago", format_duration(now.saturating_sub(*at))),
+        None => how.to_string(),
+    }
 }
 
 pub(crate) fn now_unix() -> u64 {
@@ -215,6 +281,53 @@ mod tests {
             prover_backend: String::new(),
             estimated_cycles: 0,
         }
+    }
+
+    /// The page lists claimed jobs, then locks held but not worked on (with why), then the market,
+    /// then the latest finished jobs (with how they ended and when); each job once.
+    #[test]
+    fn held_locks_and_finished_jobs_are_listed() {
+        let mut state = MinerState {
+            open_jobs: vec![job(3, MinerJobStatus::Open), job(1, MinerJobStatus::Open)],
+            active_jobs: vec![
+                job(1, MinerJobStatus::Queued),
+                job(5, MinerJobStatus::Queued),
+            ],
+            kept_locks: vec![job(2, MinerJobStatus::Queued)],
+            ..Default::default()
+        };
+        state.kept_reasons.insert(
+            B256::repeat_byte(2),
+            "past its deadline, so it cannot be released".into(),
+        );
+        state.record_finished(
+            B256::repeat_byte(5),
+            MinerJobStatus::Fulfilled { payout: 0 },
+        );
+        let ids: Vec<u8> = state
+            .jobs_page_rows()
+            .iter()
+            .map(|j| j.info.job_id.0[0])
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 5]);
+        let rows = state.jobs_page_rows();
+        let kinds: Vec<RowKind> = rows.iter().map(|j| row_kind(j, &state)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                RowKind::Claimed,
+                RowKind::Held,
+                RowKind::Open,
+                RowKind::Finished
+            ]
+        );
+        let now = now_unix();
+        assert!(held_status_text(rows[1], &state, now)
+            .starts_with("Held, not being proven: past its deadline"));
+        assert!(finished_status_text(rows[3], &state, now).starts_with("Fulfilled "));
+        // A held lock taken up again is a claimed job, not a held one.
+        state.active_jobs.push(job(2, MinerJobStatus::Queued));
+        assert_eq!(state.kept_reason(B256::repeat_byte(2)), None);
     }
 
     /// While a job waits on something its status would not say (a claim or fulfil transaction the

@@ -1065,7 +1065,8 @@ fn draw(f: &mut Frame, state: &MinerState) {
     left_spans.push(Span::styled(
         format!(
             "Locked: {}  Available: {}  ",
-            state.active_jobs.len(),
+            // Held locks hold collateral too (`kept_locks`).
+            state.active_jobs.len() + state.kept_locks.len(),
             state.open_jobs.len()
         ),
         Style::default().fg(theme::text()),
