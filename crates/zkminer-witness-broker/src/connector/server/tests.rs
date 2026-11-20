@@ -38,6 +38,13 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.unwrap()
 }
 
+/// A test that cannot check what it is for here says so; under `ZKMINER_CI_STRICT=1` (CI's
+/// callers job) it fails instead (review round 5, cross-4), as netguard's own tests do.
+fn skipped(why: &str) {
+    assert_ne!(std::env::var("ZKMINER_CI_STRICT").as_deref(), Ok("1"), "SKIPPED under ZKMINER_CI_STRICT=1: {why}");
+    eprintln!("SKIPPED: {why}");
+}
+
 fn req(id: u64, endpoint: u32, port: u16) -> Request {
     Request { id, endpoint, role: Role::EvmRpc, port }
 }
@@ -360,7 +367,7 @@ async fn a_connection_is_checked_again_once_made() {
     }
     let peer: SocketAddr = "1.1.1.1:443".parse().unwrap();
     if std::net::TcpStream::connect_timeout(&peer, Duration::from_secs(5)).is_err() {
-        eprintln!("SKIPPED: {peer} unreachable here");
+        skipped(&format!("{peer} unreachable here"));
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -722,7 +729,7 @@ async fn r5_a_slow_near_hop_check_does_not_lose_its_address() {
     use crate::testkit::TestDns;
     let peers: [SocketAddr; 2] = ["1.1.1.1:443".parse().unwrap(), "1.0.0.1:443".parse().unwrap()];
     if peers.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
-        eprintln!("SKIPPED: {peers:?} unreachable here");
+        skipped(&format!("{peers:?} unreachable here"));
         return;
     }
     let dns = TestDns::start(&[("rpc.example.com", &["1.1.1.1", "1.0.0.1"])]).await;
