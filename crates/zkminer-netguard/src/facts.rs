@@ -2384,7 +2384,7 @@ mod tests {
         }
         let sandbox = std::path::Path::new("/usr/bin/sandbox-exec");
         if !sandbox.exists() {
-            eprintln!("SKIPPED: no sandbox-exec");
+            crate::skipped("no sandbox-exec");
             return;
         }
         let out = std::process::Command::new(sandbox)

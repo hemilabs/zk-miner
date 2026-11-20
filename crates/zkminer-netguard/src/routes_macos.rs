@@ -1713,7 +1713,10 @@ mod tests {
         ] {
             let d = ip(d);
             if !t.routes_family(d.is_ipv6()) {
-                eprintln!("SKIPPED {d}: no default route of its family");
+                crate::skipped(format!(
+                    "{d}: no default route of its family ({})",
+                    if d.is_ipv6() { "IPv6" } else { "IPv4" }
+                ));
                 continue;
             }
             let r = ask(d).unwrap().expect("a route");

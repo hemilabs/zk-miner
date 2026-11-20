@@ -129,6 +129,34 @@ pub(crate) fn printable(s: &str, max: usize) -> String {
     out
 }
 
+/// Tests: a test that cannot check what it is for on this host (no route of a family, no network,
+/// a missing tool) says so and passes; under `ZKMINER_CI_STRICT=1` (a CI host that must run every
+/// test: review round 3, cross-2) it fails instead, unless `ZKMINER_CI_ALLOW_SKIP` (a
+/// comma-separated list) holds a part of `why` (a CI host without IPv6 allows `"IPv6"`).
+#[cfg(test)]
+pub(crate) fn skipped(why: impl std::fmt::Display) {
+    let why = why.to_string();
+    if skip_fails(
+        std::env::var("ZKMINER_CI_STRICT").ok().as_deref(),
+        std::env::var("ZKMINER_CI_ALLOW_SKIP").ok().as_deref(),
+        &why,
+    ) {
+        panic!("SKIPPED under ZKMINER_CI_STRICT=1 (not in ZKMINER_CI_ALLOW_SKIP): {why}");
+    }
+    eprintln!("SKIPPED: {why}");
+}
+
+/// Whether a skip for `why` fails the test under `ZKMINER_CI_STRICT` (`strict`) and
+/// `ZKMINER_CI_ALLOW_SKIP` (`allow`): see [`skipped`].
+#[cfg(test)]
+fn skip_fails(strict: Option<&str>, allow: Option<&str>, why: &str) -> bool {
+    strict == Some("1")
+        && !allow
+            .unwrap_or_default()
+            .split(',')
+            .any(|a| !a.trim().is_empty() && why.contains(a.trim()))
+}
+
 #[cfg(test)]
 mod floor_tests;
 
@@ -143,5 +171,20 @@ mod tests {
         assert_eq!(super::printable("a\r\nb\x1b[0m", 50), "a\\r\\nb\\u{1b}[0m");
         assert_eq!(super::printable("x\u{202e}y", 50), "x\\u{202e}y");
         assert_eq!(super::printable("abcdef", 3), "abc…");
+    }
+
+    /// Review round 3, cross-2: under ZKMINER_CI_STRICT=1 a skip fails, unless
+    /// ZKMINER_CI_ALLOW_SKIP holds a part of its reason; without it, nothing fails.
+    #[test]
+    fn strict_ci_fails_skips_it_does_not_allow() {
+        use super::skip_fails;
+        let why = "2606:4700:4700::1111: no default route of its family (IPv6)";
+        assert!(!skip_fails(None, None, why));
+        assert!(!skip_fails(Some("0"), None, why));
+        assert!(skip_fails(Some("1"), None, why));
+        assert!(skip_fails(Some("1"), Some(""), why));
+        assert!(skip_fails(Some("1"), Some(" , sandbox"), why));
+        assert!(!skip_fails(Some("1"), Some("sandbox, IPv6"), why));
+        assert!(skip_fails(Some("1"), Some("IPv4"), why));
     }
 }
