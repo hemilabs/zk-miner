@@ -687,13 +687,55 @@ mod tests {
         (port, rx)
     }
 
+    /// cross-3 (`hop.rs:200-207`): the request line is exactly the URL's path and query (no
+    /// fragment), and `Host` carries a non-default port; nothing else comes before the head ends.
+    #[tokio::test]
+    async fn r5_the_request_line_and_host_are_exact() {
+        let (port, rx) = raw_server(
+            Some(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"),
+            Duration::from_millis(200),
+        );
+        let (c, _) = dev_client();
+        let r = c
+            .get_following_redirects(&format!("http://store.invalid:{port}/a/b.elf?x=1&y=%20z#frag"), 0, BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(r.text().await.unwrap(), "ok");
+        let head = String::from_utf8(rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert!(head.starts_with("GET /a/b.elf?x=1&y=%20z HTTP/1.1\r\n"), "{head}");
+        let host: Vec<&str> = head.lines().filter(|l| l.to_ascii_lowercase().starts_with("host:")).collect();
+        assert_eq!(host, vec![format!("host: store.invalid:{port}").as_str()], "{head}");
+        assert!(!head.contains("frag"), "{head}");
+    }
+
+    /// cross-3 (`hop.rs:226`): the response head must come within the read timeout, not only
+    /// within the request's whole time.
+    #[tokio::test]
+    async fn r5_the_response_head_is_bounded_by_the_read_timeout() {
+        let (port, _rx) = raw_server(None, Duration::from_secs(10));
+        let lookup = FakeLookup::with(&[("store.invalid", &["127.0.0.1"])]);
+        let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
+        let opts = ClientOptions {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(1),
+        };
+        let c = guarded_client_with(&dev, Arc::new(lookup), opts).unwrap();
+        let t = Instant::now();
+        let e = c
+            .get_following_redirects(&format!("http://store.invalid:{port}/x"), 0, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, FetchError::TimedOut), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    }
+
     /// parse-1: a server that accepts and never answers the ClientHello: the handshake is
     /// bounded by the connect timeout (pr/37's reqwest connector bounded TCP and TLS so), not
     /// only by the request's whole time (the reviewer's
     /// `r5_a_stalled_tls_handshake_is_bounded_by_the_connect_or_read_timeout`).
     #[tokio::test]
     async fn r5_a_stalled_tls_handshake_is_bounded_by_the_connect_timeout() {
-        let (port, _rx) = raw_server(None, Duration::from_secs(10));
+        let (port, rx) = raw_server(None, Duration::from_secs(10));
         let lookup = FakeLookup::with(&[("store.invalid", &["127.0.0.1"])]);
         let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
         let opts = ClientOptions {
@@ -708,6 +750,11 @@ mod tests {
             .unwrap_err();
         assert!(t.elapsed() < Duration::from_secs(3), "{:?}: {e}", t.elapsed());
         assert!(e.to_string().contains("TLS handshake"), "{e}");
+        // cross-3 (R12): what an `https` URL sends first is a TLS ClientHello (a handshake
+        // record), never the request in plaintext.
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.first(), Some(&0x16), "{:?}", String::from_utf8_lossy(&first));
+        assert!(!String::from_utf8_lossy(&first).contains("GET /x"));
     }
 
     /// A probe that finds every destination far and notes the deadline each probe was given.
