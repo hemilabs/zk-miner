@@ -367,7 +367,8 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         Constraint::Length(12),
         Constraint::Length(10),
         Constraint::Length(10),
-        Constraint::Length(9),
+        // The longest proof system name, and 4 more.
+        Constraint::Length(crate::state::proof_system_column_width()),
         Constraint::Length(12),
         Constraint::Min(18),
     ];
@@ -514,8 +515,8 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
 
     let gpu_job = card_job(&state.active_jobs, &gpu.pci_bus_id);
     let spill = state.gpu_spills.get(&gpu.pci_bus_id).copied();
-    // The zkVM of the job on the card: what it is proving with, or about to.
-    let zkvm_str = gpu_job.map_or("—", |job| crate::state::zkvm_label(&job.prover_backend));
+    // The zkVM and wrap of the job on the card: what it is proving with, or about to.
+    let zkvm_str = gpu_job.map_or_else(|| "—".to_string(), |job| state.job_zkvm_text(job));
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -1358,8 +1359,17 @@ mod card_job_tests {
                 elapsed_secs: 30,
             },
         );
-        sp1.prover_backend = "sp1".into();
+        // As the miner sets it once the proof starts: the worker slot.
+        sp1.prover_backend = "sp1:cuda:0".into();
         state.active_jobs = vec![sp1];
+        // Before its proof system is recorded (a lock recovered after a restart): the slot's zkVM.
+        assert_eq!(state.job_zkvm_text(&state.active_jobs[0]), "sp1");
+        state.note_proof_system(
+            alloy_primitives::B256::repeat_byte(1),
+            zkminer_chain::auction::ProofSystem::Sp1Plonk,
+        );
+        // The longest name ("risc0:Groth16") and 4 more.
+        assert_eq!(crate::state::proof_system_column_width(), 17);
         let mut term = Terminal::new(TestBackend::new(200, 50)).unwrap();
         term.draw(|f| render(f, f.area(), &state)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1379,7 +1389,8 @@ mod card_job_tests {
         };
         assert!(lines.iter().any(|l| l.contains("zkVM")), "{lines:#?}");
         assert!(!row("RTX 5090").contains("GeForce"));
-        assert!(row("RTX 5090").contains("SP1"));
+        assert!(row("RTX 5090").contains("sp1:PLONK"));
+        assert!(!row("RTX 5090").contains("sp1:cuda"));
         assert!(row("RTX 4070").contains("—"));
     }
 

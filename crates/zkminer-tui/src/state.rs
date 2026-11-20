@@ -590,6 +590,9 @@ pub struct MinerState {
         std::collections::HashMap<alloy_primitives::B256, crate::progress::AttemptProgress>,
     /// What each job is waiting on now, where its status would say something older (`JobNote`).
     pub job_notes: std::collections::HashMap<alloy_primitives::B256, JobNote>,
+    /// Each claimed job's proof system (zkVM and wrap), recorded at claim (`job_zkvm_text`).
+    pub job_proof_systems:
+        std::collections::HashMap<alloy_primitives::B256, zkminer_chain::auction::ProofSystem>,
     /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
     pub claim_outlook: ClaimOutlook,
 
@@ -765,6 +768,27 @@ pub(crate) fn zkvm_label(backend: &str) -> &str {
         "openvm" => "OpenVM",
         other => other,
     }
+}
+
+/// A proof system as the dashboard names it: the zkVM, then the wrap its seals use.
+pub fn proof_system_name(system: zkminer_chain::auction::ProofSystem) -> &'static str {
+    use zkminer_chain::auction::ProofSystem;
+    match system {
+        ProofSystem::Risc0Groth16 => "risc0:Groth16",
+        ProofSystem::Sp1Groth16 => "sp1:Groth16",
+        ProofSystem::Sp1Plonk => "sp1:PLONK",
+        ProofSystem::OpenVmHalo2 => "openvm:Halo2",
+    }
+}
+
+/// The width of a column of `proof_system_name`s: the longest there is, and 4 more.
+pub fn proof_system_column_width() -> u16 {
+    zkminer_chain::auction::ProofSystem::ALL
+        .into_iter()
+        .map(|system| proof_system_name(system).len())
+        .max()
+        .unwrap_or(0) as u16
+        + 4
 }
 
 /// Shorten a driver-reported GPU name for places that have to fit several of them on one line.
@@ -1100,6 +1124,7 @@ impl Default for MinerState {
             open_jobs: Vec::new(),
             active_jobs: Vec::new(),
             job_notes: HashMap::new(),
+            job_proof_systems: HashMap::new(),
             completed_jobs: Vec::new(),
             selected_job_index: 0,
             selected_job_id: None,
@@ -1272,6 +1297,34 @@ impl MinerState {
             note.text,
             crate::screens::dashboard::format_duration(note.since.elapsed().as_secs())
         ))
+    }
+
+    /// Record `job_id`'s proof system, at claim. The records of jobs no longer listed go.
+    pub fn note_proof_system(
+        &mut self,
+        job_id: alloy_primitives::B256,
+        system: zkminer_chain::auction::ProofSystem,
+    ) {
+        let listed: std::collections::HashSet<alloy_primitives::B256> = self
+            .open_jobs
+            .iter()
+            .chain(self.active_jobs.iter())
+            .map(|j| j.info.job_id)
+            .collect();
+        self.job_proof_systems.retain(|id, _| listed.contains(id));
+        self.job_proof_systems.insert(job_id, system);
+    }
+
+    /// The zkVM and wrap `job` proves with (`proof_system_name`), or, with no proof system recorded
+    /// (a lock recovered after a restart), the zkVM its worker slot names.
+    pub fn job_zkvm_text(&self, job: &TrackedJob) -> String {
+        match self.job_proof_systems.get(&job.info.job_id) {
+            Some(system) => proof_system_name(*system).to_string(),
+            None => match job.prover_backend.split(':').next() {
+                Some(backend) if !backend.is_empty() => backend.to_string(),
+                _ => "—".to_string(),
+            },
+        }
     }
 
     pub fn proving_secs(&self, job: &TrackedJob) -> u64 {
