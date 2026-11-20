@@ -10946,6 +10946,16 @@ fn spawn_lifecycle_task(
     tokio::spawn(async move {
         // Frees the concurrency slot on return OR panic.
         let _slot = SlotGuard(jid, done_tx);
+        // A job reserved for a claim is one of the jobs the claim limit counts from now on, while its
+        // pre-claim checks run (descriptor, binding; a minute on a slow RPC). Said so on its row, or
+        // it reads as held by the very limit it is counted in. The claim's own stage rewrites it.
+        if !already_locked {
+            state.write().await.set_job_note(
+                jid,
+                zkminer_tui::state::JobNoteKind::Claim,
+                "claiming: checking the job before claiming it",
+            );
+        }
         let outcome = process_job_lifecycle(
             &client,
             &state,
@@ -10957,6 +10967,12 @@ fn spawn_lifecycle_task(
             prefetched_descriptor,
         )
         .await;
+        // Not claimed after all (a check refused it, a lost race): its row goes back to the market's
+        // reasons. A claimed job's note was cleared when the claim landed.
+        state
+            .write()
+            .await
+            .clear_job_note(jid, zkminer_tui::state::JobNoteKind::Claim);
         if let Err(e) = outcome {
             // A lock we hold that must NOT be released (a pause / disable hold, an unreadable post-
             // claim state): keep the breadcrumb, leave the stashed fulfil nonce for the re-drive or
@@ -16423,6 +16439,45 @@ mod tests {
         );
         // The old text predicate WOULD have been fooled, which is why this matters.
         assert!(zkminer_prover_protocol::types::is_gpu_oom(&f.message));
+    }
+
+    /// A job reserved for a claim says so on its row from the moment it is reserved, through its
+    /// pre-claim checks, and the note goes when its lifecycle ends unclaimed: the jobs the claim
+    /// limit counts are always visible as such.
+    #[test]
+    fn a_reserved_job_reads_as_being_claimed() {
+        let src = include_str!("run.rs");
+        let spawn = &src[src.find("fn spawn_lifecycle_task(").unwrap()..];
+        let spawn = &spawn[..spawn.find("\n}\n").unwrap()];
+        let set = spawn
+            .find("\"claiming: checking the job before claiming it\"")
+            .expect("note set at spawn");
+        let run = spawn.find("process_job_lifecycle(").unwrap();
+        let clear = spawn
+            .find(".clear_job_note(jid, zkminer_tui::state::JobNoteKind::Claim)")
+            .expect("note cleared at the end");
+        assert!(set < run && run < clear);
+        let mut state = zkminer_tui::state::MinerState::default();
+        let id = B256::repeat_byte(7);
+        state.open_jobs.push(TrackedJob {
+            info: zkminer_chain::jobs::JobInfo {
+                job_id: id,
+                ..Default::default()
+            },
+            status: zkminer_tui::state::MinerJobStatus::Open,
+            current_price: 1,
+            gpu_bus_id: None,
+            prover_backend: String::new(),
+            estimated_cycles: 0,
+        });
+        state.claim_outlook.held = Some("holding 4 job(s)".into());
+        state.set_job_note(
+            id,
+            zkminer_tui::state::JobNoteKind::Claim,
+            "claiming: checking the job before claiming it",
+        );
+        let text = state.job_note_text(&state.open_jobs[0]).unwrap();
+        assert!(text.starts_with("claiming: checking the job"), "{text}");
     }
 
     /// A shortage the proof did not cause (`ShortageFromOutside`) is read through its marker: the
