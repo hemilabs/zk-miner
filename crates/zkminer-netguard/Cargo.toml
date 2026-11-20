@@ -14,10 +14,12 @@ client = [
     "dep:tokio",
     "dep:rustls",
     "dep:webpki-roots",
+    "dep:hyper",
     "dep:hyper-util",
     "dep:http",
-    "dep:tower-layer",
-    "dep:tower-service",
+    "dep:http-body",
+    "dep:bytes",
+    "dep:tokio-rustls",
 ]
 # Test seams for the tests of crates that depend on this one: a resolver that connects to another
 # address than the one it admitted (so a public-mode fetch can be served by a server on loopback).
@@ -38,13 +40,16 @@ tokio = { workspace = true, optional = true }
 # reqwest's rustls uses) and its compiled-in roots.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "1", optional = true }
-# The guarded client's check of each connection once made (a reqwest connector layer: tower's
-# Layer and Service, hyper-util's HttpInfo with the connection's own addresses, http's
-# Extensions). The versions reqwest already brings in; the lock gains no package.
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy"], optional = true }
+# The guarded client's own connector for each hop (review round 4, bypass-2: the TCP
+# connection checked once made, before the TLS handshake, then one HTTP/1.1 exchange): hyper's
+# HTTP/1.1 client, hyper-util's tokio glue, tokio-rustls, http's types, the body trait. The
+# versions reqwest already brings in; the lock gains no package.
+hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 http = { version = "1", optional = true }
-tower-layer = { version = "0.3", optional = true }
-tower-service = { version = "0.3", optional = true }
+http-body = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 # The near-hop probe's socket (hop limit set before connecting).
 socket2 = "0.6"
 
