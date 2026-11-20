@@ -6130,6 +6130,39 @@ fn retry_pin_after(
     }
 }
 
+/// How long a job of `cycles` takes on each of `backend`'s slots, by slot key: the cycles at that
+/// slot's card's rate (the rate observed on it this run, which reflects the size it proves at and an
+/// SP1 shard cap, else the benchmark's), plus `allowance` seconds. For `with_slot_estimates`; empty
+/// with neither rate known for any slot.
+async fn slot_estimates_for(
+    backend: &'static str,
+    cycles: u64,
+    allowance: u64,
+) -> HashMap<String, Duration> {
+    let keys = zkminer_prover::engine::worker_pool()
+        .map(|p| p.slot_keys_for(backend))
+        .unwrap_or_default();
+    let observed = observed_throughputs();
+    tokio::task::spawn_blocking(move || {
+        let suite = zkminer_prover::benchmark::load_cached_benchmark();
+        keys.into_iter()
+            .filter_map(|key| {
+                let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&key);
+                let rate = observed
+                    .get(&(device.clone(), backend.to_string()))
+                    .copied()
+                    .or_else(|| suite.as_ref()?.throughput_for(&device, backend))?;
+                (rate.is_finite() && rate > 0.0).then(|| {
+                    let secs = cycles as f64 / rate + allowance as f64;
+                    (key, Duration::from_secs_f64(secs))
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// The benchmark's fastest card (its device id, e.g. "gpu0") for `backend`, if it measured one.
 fn fastest_benchmarked_device(
     suite: &zkminer_prover::benchmark::BenchmarkSuite,
@@ -11668,35 +11701,10 @@ async fn process_job_lifecycle(
     // A job re-driven at start (recovery) was never planned this run: prefer its backend's fastest
     // card, from the benchmark, as the planner would have. Without it, a 1.1 B-cycle job kept over a
     // restart went to the first free card, a 4070, and took 28 minutes while the 5090 sat idle.
-    // How long it would take on each of its backend's slots (the benchmark rate of that slot's card,
-    // plus the fixed allowances), so the dispatcher starts it only where it can finish before its
-    // cutoff and queues it by its latest start (`with_slot_estimates`).
-    let slot_estimates: HashMap<String, Duration> = {
-        let backend_name = backend.to_string();
-        let allowance = fixed_proving_allowance_secs(backend)
-            + execute_allowance_secs(backend, snapshot.measured_execute_secs);
-        let keys = zkminer_prover::engine::worker_pool()
-            .map(|p| p.slot_keys_for(backend))
-            .unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            let Some(suite) = zkminer_prover::benchmark::load_cached_benchmark() else {
-                return HashMap::new();
-            };
-            keys.into_iter()
-                .filter_map(|key| {
-                    let device =
-                        zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&key);
-                    let rate = suite.throughput_for(&device, &backend_name)?;
-                    (rate.is_finite() && rate > 0.0).then(|| {
-                        let secs = sizing_cycles as f64 / rate + allowance as f64;
-                        (key, Duration::from_secs_f64(secs))
-                    })
-                })
-                .collect()
-        })
-        .await
-        .unwrap_or_default()
-    };
+    // What every slot's estimate adds to cycles over rate: the fixed allowances
+    // (`with_slot_estimates`).
+    let estimate_allowance = fixed_proving_allowance_secs(backend)
+        + execute_allowance_secs(backend, snapshot.measured_execute_secs);
     let mut snapshot = snapshot;
     if is_recovery && snapshot.preferred_device.is_none() {
         let backend_name = backend.to_string();
@@ -12014,7 +12022,11 @@ async fn process_job_lifecycle(
             // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
             // by value into the move closure.
             let execute_peak_for_prove = snapshot.measured_peak.unwrap_or(0);
-            let estimates_for_prove = slot_estimates.clone();
+            // How long it would take on each slot, as of this attempt (a re-benchmark, or a rate
+            // observed since, counts): the dispatcher starts it only where it can finish before its
+            // cutoff and queues it by its latest start.
+            let estimates_for_prove =
+                slot_estimates_for(backend, sizing_cycles, estimate_allowance).await;
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
@@ -15550,7 +15562,17 @@ async fn recover_claimed_jobs(
             speed_premium: view.speedPremium.to::<u128>(),
             exclusivity_duration: 0,
         };
-        let snapshot = JobStatusSnapshot::from_view(&view);
+        let mut snapshot = JobStatusSnapshot::from_view(&view);
+        // What it measured before it was claimed (the journal keeps it), so it is sized on that and
+        // not on the declared count, which its submitter chose (`with_slot_estimates`).
+        {
+            let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = j.entries.get(&jid) {
+                snapshot.measured_cycles = snapshot.measured_cycles.or(e.measured_cycles);
+                snapshot.measured_execute_secs =
+                    snapshot.measured_execute_secs.or(e.measured_execute_secs);
+            }
+        }
 
         // We need program_id to fetch the ELF — derive from the descriptor (checked fetch, handed
         // to the lifecycle so it is fetched ONCE per recovered job). Only a PERMANENT decode verdict
