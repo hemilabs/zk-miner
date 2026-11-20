@@ -45,6 +45,10 @@ use crate::resolve::{GuardedResolver, Lookup, ResolveError, SystemLookup};
 /// the build; some stores (Arweave's gateways) refuse a request without one.
 pub const USER_AGENT: &str = "zkminer";
 
+/// A family's addresses are given up after this many near-hop checks that could not tell
+/// (review round 6, cross-3).
+const MAX_UNANSWERED_PER_FAMILY: usize = 2;
+
 /// Timeouts of a guarded client.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientOptions {
@@ -247,7 +251,13 @@ impl GuardedClient {
             let policy = self.policy().clone();
             chains.spawn(async move {
                 let mut refused = Vec::new();
+                let mut unanswered = 0;
                 for (addr, connect) in list {
+                    // Review round 6, cross-3: a family whose checks could not tell twice (a
+                    // blackholed path) is given up; its other addresses would fare alike.
+                    if unanswered >= MAX_UNANSWERED_PER_FAMILY {
+                        break;
+                    }
                     let policy = policy.clone();
                     // Within the request's time (review round 5, probe-1): when the caller stops
                     // waiting, the probe it abandons stops too and gives back its turn.
@@ -257,7 +267,10 @@ impl GuardedClient {
                     .await
                     {
                         Ok(Ok(v)) => return (Some(v), refused, false),
-                        Ok(Err(d)) => refused.push(d),
+                        Ok(Err(d)) => {
+                            unanswered += usize::from(matches!(d, Denied::NearCheckFailed { .. }));
+                            refused.push(d);
+                        }
                         Err(_) => return (None, refused, true),
                     }
                 }
@@ -931,6 +944,29 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
         let asked = probe.asked.lock().unwrap().clone();
         assert!(asked.iter().any(|a| a.is_ipv4()), "{asked:?}");
+    }
+
+    /// Review round 6, cross-3: a family whose checks could not tell twice is given up (its
+    /// other addresses are never probed); refusals of another kind do not count.
+    #[tokio::test]
+    async fn r6_a_family_is_given_up_after_two_checks_that_could_not_tell() {
+        use crate::nearhop::{ConfirmOutcome, FixedProbe, ProbeOutcome};
+        let server = canned_server(&[OK_ELF]);
+        let probe = FixedProbe::with(ProbeOutcome::TimedOut, ConfirmOutcome::Failed("no answer".into()));
+        let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
+        let lookup = FakeLookup::with(&[(
+            "v6.example.com",
+            &["2606:2800:220:1::1", "2606:2800:220:1::2", "2606:2800:220:1::3", "2606:2800:220:1::4"],
+        )]);
+        let c = guarded_client_for_test(
+            &public_policy().with_near_probe(probe.clone()),
+            Arc::new(lookup),
+            to_loopback,
+            ClientOptions::default(),
+        )
+        .unwrap();
+        assert!(c.get_following_redirects(&start(&server, "v6.example.com"), 0, BUDGET).await.is_err());
+        assert_eq!(probe.asked.lock().unwrap().len(), MAX_UNANSWERED_PER_FAMILY);
     }
 
     /// Review round 4, probe-2: the addresses of a name are vetted one after another, and only
