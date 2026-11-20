@@ -231,15 +231,21 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   the default route) is no default route and no uplink, and any other scoped route off the
   default path still refuses what it holds.
 - **The kernel per destination:** an `RTM_GET` on a fresh routing socket, sent as
-  `RTM_GET_SILENT` (the answer goes to this socket alone), with a sequence number drawn for it
-  from the system CSPRNG. Only a datagram that is exactly one `RTM_GET` message (its length its
-  `rtm_msglen`) with the kernel-set `rtm_pid` of this process and that sequence number is the
-  answer: the kernel hands a write it refuses to every routing socket as written, so another
-  local process can put this process's pid and sequence number in front of it, but never in a
-  message of that exact shape (measured for 23 kinds of write). Its `RTA_IFP` must be the
+  `RTM_GET_SILENT` (the answer goes to this socket alone; a kernel that refuses that type fails
+  the query, and the destination is refused: there is no fallback to a plain `RTM_GET`, whose
+  answers every routing socket sees), with a sequence number drawn for it from the system
+  CSPRNG. Only a datagram received whole (into 16 KiB, without `MSG_TRUNC`) that is exactly one
+  `RTM_GET` message (its length its `rtm_msglen`) with the kernel-set `rtm_pid` of this process
+  and that sequence number is the answer: the kernel hands a write it refuses to every routing
+  socket as written, so another local process can put this process's pid and sequence number in
+  front of it, but never in a message of that exact shape (measured for 134 kinds of write,
+  oversized ones included). Its `RTA_IFP` must be the
   header's interface, and it is judged exactly as the Linux answer is (`ESRCH` is no route;
-  0.0.0.0 and `::` are this host). A local process that floods every routing socket can still
-  make queries time out, which refuses (fail closed). Network Extension policies (a per-app or include-all-networks VPN, a
+  0.0.0.0 and `::` are this host). A default-like answer must also be one of the facts' own
+  default routes (its gateway and interface), or it is refused until the facts are read again: a
+  VPN or network that came up since is not admitted on facts that do not know it. A local
+  process that floods every routing socket can still make queries time out, which refuses (fail
+  closed). Network Extension policies (a per-app or include-all-networks VPN, a
   content filter) can send a socket elsewhere with no route saying so; so for an answer that could
   be admitted, a UDP socket is connected to the destination (no packet is sent) and the source
   address the kernel chose must be on the interface the route names and on no other, or the
@@ -251,20 +257,28 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
 - **DNS servers:** `/etc/resolv.conf`, `/etc/resolver/*` and every resolver the configuration
   daemon knows (`State:/Network/Service/*/DNS`, `State:/Network/Global/DNS`: scoped, VPN and
   secondary-interface resolvers; `Setup:/Network/Service/*/DNS`: servers set by hand for any
-  service), each `nameserver` read as every macOS parser reads it; a configuration that cannot
-  be read (a resolver file this user may not read, a daemon that does not answer within 2 s)
-  fails the facts read.
+  service), each `nameserver` read as every macOS parser reads it (a daemon entry no parser reads,
+  which the system skips too, is skipped with a warning); a configuration that cannot be read (a
+  resolver file this user may not read, a daemon that does not answer within 2 s) fails the facts
+  read.
 - **Facts that cannot be read again:** the last good facts stay in force (without their cached
   kernel verdicts) for 2 s past their one-second life; after that every requester connection is
-  refused, naming what failed, until a re-read succeeds. One re-read runs at a time.
+  refused, naming what failed, until a re-read succeeds. One re-read runs at a time, and other
+  callers wait for it at most 500 ms (then the facts in force within their grace, or a refusal).
+- **NAT64 prefixes** are learned again whenever the network changes (and every 15 s while a host
+  with IPv6 and no IPv4 route has found none), also from the configuration daemon's NAT64 state;
+  until the new network's round has finished, such a host refuses every IPv6 destination.
 - **Near hops:** the probe is the same hop-limited TCP connect (an unreachable `connect` reports
   before the connection is in progress, as Local Network privacy does, is refused, not far); a
   check connection reads its FIN's
   fate from `TCP_CONNECTION_INFO`: only an acknowledgement of the FIN (`FIN_WAIT_2`,
   `TIME_WAIT`) is an answer; a peer that closes or resets the connection first is refused as a
   failed check, never read as far. macOS does not report an ICMP "time exceeded" for the FIN, so
-  a far peer is known only when the wait ends (the same verdict, up to 1.5 s later). An
-  IPv4-mapped destination is probed as its IPv4 address.
+  a far peer is known only when the wait ends (the same verdict, up to 1.5 s later), and only if
+  it then acknowledges the FIN's retransmission at the default hop limit (a positive control): a
+  peer that acknowledges a FIN at no hop limit (AWS S3's front ends) is a failed check, refused.
+  A probe without an answer is asked again once within its time. An IPv4-mapped destination is
+  probed as its IPv4 address.
 - **Public addresses:** a public address is confirmed for one network, which macOS identifies by
   its routes and by the configuration daemon's network signature (the router's address and
   hardware address); moving to another network behind a router of the same address learns it
