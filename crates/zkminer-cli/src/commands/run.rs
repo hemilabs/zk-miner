@@ -7686,10 +7686,15 @@ async fn miner_brain(
         // Windows: idle workers keep RAM and commit, and a proof that needs it recycles them
         // (`make_host_room`, `reserve_commit`). Braking on it would stop the dispatch that gives it
         // back, for good. Commit counts what the page file can still grow (`CommitFigures`).
+        // And what our running proofs hold: it comes back when each is done, and the claim check
+        // charges it already, so it is not the host struggling (`busy_prove_holdings`).
         let pool = zkminer_prover::engine::worker_pool();
+        let (busy_ram, busy_commit) = pool.map_or((0, 0), |pool| pool.busy_prove_holdings());
         let mem_avail = zkminer_prover::memory::pressure_available_bytes(
-            pool.map_or(0, |pool| pool.idle_reclaimable_host_bytes()),
-            pool.map_or(0, |pool| pool.idle_reclaimable_commit_bytes()),
+            pool.map_or(0, |pool| pool.idle_reclaimable_host_bytes())
+                .saturating_add(busy_ram),
+            pool.map_or(0, |pool| pool.idle_reclaimable_commit_bytes())
+                .saturating_add(busy_commit),
         );
         let mem_total = zkminer_prover::memory::mem_total_bytes();
         let pressure = match (mem_avail, mem_total) {
@@ -8355,7 +8360,7 @@ async fn miner_brain(
                 } else if !claim_predicate_now && job_is_bound(jid) {
                     Some("bound job (claim_predicate_jobs is off)")
                 } else if program_has_no_elf_source(j.info.program_id) {
-                    Some("its program has no ELF download")
+                    Some("its program's ELF has no source or could not be downloaded (checked again within 10 min)")
                 } else {
                     None
                 };
@@ -13940,6 +13945,12 @@ async fn measure_cycles(
                 // never-yet-cached measurement) is narrow — the on-disk ELF cache means a once-fetched
                 // program never hits this — and is the accepted trade-off the strike bound already made.
                 strike_out_missing();
+                // And the PROGRAM, for a while: where its ELF comes from is the program's (its
+                // registry URIs), not the input's, so every other input of it would fetch and fail
+                // three times too (seen: one program struck out every 15 s). Self-healing after the TTL.
+                if paces_claims {
+                    mark_program_no_elf_source(program_id);
+                }
             } else {
                 tracing::debug!(
                     "measure {}: ELF fetch failed #{strikes} (< {}, may be transient): {}",
@@ -13967,6 +13978,10 @@ async fn measure_cycles(
                 // deliberately stalling ELF host), so a retry TTL would reopen the same per-pair
                 // re-fetch DoS. Keep it permanent, as at HEAD (see the fetch-failure arm above).
                 strike_out_missing();
+                // The program too, for a while (see the fetch-failure arm above).
+                if paces_claims {
+                    mark_program_no_elf_source(program_id);
+                }
             } else {
                 tracing::debug!(
                     "measure {}: ELF fetch exceeded the {}s budget #{strikes} (< {}) — a later tick \

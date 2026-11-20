@@ -4040,6 +4040,32 @@ impl MeasureSetupError {
     }
 }
 
+/// Windows: after recycling workers that held `held` bytes of commit (free commit was `before`),
+/// wait until most of it is free again, 15 s at most and no later than `give_up_at`. The card's VRAM
+/// comes back within a second, but the commit those workers held can lag it, and a worker started
+/// into it died of it: every out-of-commit death on a 5090 came 6-14 s after an SP1 sibling was
+/// recycled, with commit near the limit.
+fn wait_for_commit_back(before: u64, held: u64, give_up_at: Option<Instant>) {
+    const COMMIT_BACK_WAIT: Duration = Duration::from_secs(15);
+    if held == 0 {
+        return;
+    }
+    let want = before.saturating_add(held / 8 * 7);
+    let cap = Instant::now() + COMMIT_BACK_WAIT;
+    let until = give_up_at.map_or(cap, |g| g.min(cap));
+    let started = Instant::now();
+    while Instant::now() < until {
+        if crate::memory::commit_figures().is_none_or(|c| c.free_now >= want) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tracing::info!(
+        "commit held by a recycled worker not all back after {:.1}s; going on",
+        started.elapsed().as_secs_f64()
+    );
+}
+
 impl WorkerPool {
     /// Create a new pool. Does NOT discover or spawn workers yet.
     /// `benchmark_timeout` sets the per-suite benchmark deadline (None = no timeout).
@@ -8573,6 +8599,8 @@ impl WorkerPool {
         const QUEUE_WAIT_CAP: Duration = Duration::from_secs(3600);
         let queue_deadline = Instant::now() + timeout.unwrap_or(QUEUE_WAIT_CAP);
         loop {
+            // Whether some eligible card is only BUSY (another proof holds it), not failed.
+            let mut any_busy = false;
             for key in &keys {
                 let Some(entry) = self.workers.get(key) else {
                     continue;
@@ -8581,9 +8609,14 @@ impl WorkerPool {
                     !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock))
                 });
                 if !gpu_free {
+                    any_busy = true;
                     continue;
                 }
-                if let Ok(mut slot) = entry.slot.try_lock() {
+                let Ok(mut slot) = entry.slot.try_lock() else {
+                    any_busy = true;
+                    continue;
+                };
+                {
                     let is_alive = slot.handle.as_mut().map(|h| h.is_alive()).unwrap_or(false);
                     if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
@@ -8617,7 +8650,12 @@ impl WorkerPool {
                     ));
                 }
             }
-            if Instant::now() >= queue_deadline {
+            // A job with a deadline waits for a BUSY card as long as that deadline allows (checked
+            // just above): the proof's own timeout bounds the proof, not the queue. Bounding the
+            // wait by it (93 s for a small job) failed a 3 s RISC Zero proof queued behind a 112 s
+            // SP1 one as "worker unhealthy", spending an attempt on a card that was fine. With no
+            // deadline, or no card merely busy (every slot failed), the timeout still bounds it.
+            if (abort_at.is_none() || !any_busy) && Instant::now() >= queue_deadline {
                 anyhow::bail!(
                     "no worker slot became available within {:?} (all {} slot(s) busy or \
                      failed)",
@@ -8893,6 +8931,31 @@ impl WorkerPool {
             *peak = (*peak / 8 * 9).max(published);
         }
         self.save_host_peaks();
+    }
+
+    /// What every proving worker of ours holds (Windows): `(RAM, commit)`, as their processes report
+    /// it now. For the pressure check: a proof running now hands its memory back when it is done, and
+    /// the claim check already charges it (`memory::queued_claim_fits`), so it is not the host
+    /// struggling. Counting it as pressure braked claims with PSI at 0% and two SP1 proofs running.
+    /// `(0, 0)` elsewhere.
+    pub fn busy_prove_holdings(&self) -> (u64, u64) {
+        if !cfg!(windows) {
+            return (0, 0);
+        }
+        let idle: std::collections::HashSet<String> = self
+            .idle_prove_holdings()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        self.workers
+            .keys()
+            .filter(|k| !idle.contains(*k))
+            .fold((0u64, 0u64), |(ram, commit), k| {
+                (
+                    ram.saturating_add(self.current_host_bytes_for_slot(k).unwrap_or(0)),
+                    commit.saturating_add(self.current_commit_bytes_for_slot(k).unwrap_or(0)),
+                )
+            })
     }
 
     /// What the IDLE workers have COMMITTED (Windows): for the pressure check, as
@@ -11714,11 +11777,21 @@ impl WorkerPool {
                         ));
                     }
                 }
+                // Windows: what the siblings to recycle hold in COMMIT (their VRAM included), and free
+                // commit now, to wait for that to come back too (below).
+                let commit_before = crate::memory::commit_figures().map(|c| c.free_now);
+                let commit_held: u64 = recyclable
+                    .iter()
+                    .filter_map(|k| self.current_commit_bytes_for_slot(k))
+                    .sum();
                 let gone = if recyclable.is_empty() {
                     Vec::new()
                 } else {
                     self.evict_idle_siblings(key, &recyclable, "VRAM")
                 };
+                if let (Some(before), false) = (commit_before, gone.is_empty()) {
+                    wait_for_commit_back(before, commit_held, give_up_at);
+                }
                 let freed = movable
                     .iter()
                     .filter(|(k, _)| gone.contains(k) || (k == DRAINING && plan.contains(k)))
@@ -19813,6 +19886,22 @@ mod learned_host_peak_tests {
         );
         pool.raise_learned_after_shortage("risc0:cuda:1", Some(19));
         assert!(pool.slot_commit_peak("risc0:cuda:1", Some(19)) >= after);
+    }
+
+    /// A job with a deadline waits for a busy card as long as the deadline allows: the proof's own
+    /// timeout bounds the queue only without a deadline, or when no card is merely busy.
+    #[test]
+    fn a_queued_job_waits_for_a_busy_card_until_its_deadline() {
+        let src = include_str!("dispatcher.rs");
+        let wait = &src[src.find("let queue_deadline = Instant::now()").unwrap()..];
+        let wait = &wait[..wait.find("std::thread::sleep(QUEUE_POLL);").unwrap()];
+        assert!(wait.contains("any_busy = true;"));
+        assert!(wait.contains(
+            "if (abort_at.is_none() || !any_busy) && Instant::now() >= queue_deadline {"
+        ));
+        assert!(
+            wait.find("ProofDeadlineReached").unwrap() < wait.find("queue_deadline {").unwrap()
+        );
     }
 
     /// The prove path holds the commit reservation with the RAM one, after it and before the
