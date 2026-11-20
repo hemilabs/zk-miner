@@ -770,3 +770,69 @@ async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
     let fd = connect_tcp(mapped, None).await.expect("connected without a source too");
     assert!(std::net::TcpStream::from(fd).local_addr().unwrap().is_ipv4());
 }
+
+/// A probe on a host whose IPv6 is blackholed: every IPv6 check takes `v6_delay` and cannot tell
+/// (a probe without an answer and a check connection that does not connect); IPv4 is far.
+#[derive(Debug)]
+struct V6Blackholed {
+    v6_delay: Duration,
+    asked: Mutex<Vec<SocketAddr>>,
+}
+
+impl zkminer_netguard::NearProbe for V6Blackholed {
+    fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::ProbeOutcome {
+        lock(&self.asked).push(addr);
+        if addr.is_ipv6() {
+            std::thread::sleep(self.v6_delay);
+            zkminer_netguard::ProbeOutcome::TimedOut
+        } else {
+            zkminer_netguard::ProbeOutcome::Unreachable
+        }
+    }
+
+    fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::nearhop::ConfirmOutcome {
+        zkminer_netguard::nearhop::ConfirmOutcome::ConnectFailed("timed out".into())
+    }
+}
+
+/// Review round 6, cross-6 (a regression against pr/37): two AAAA answers on a host whose IPv6
+/// is blackholed (~13.5 s a check) were vetted one after another, each with the whole 17 s
+/// budget, before IPv4 was asked: the request failed. The families are vetted at once now (the
+/// other FAMILY_DELAY later), and a family stops after MAX_UNANSWERED checks that could not
+/// tell. Real public IPv4 peers (skipped where unreachable).
+#[tokio::test(flavor = "multi_thread")]
+async fn r6_a_blackholed_ipv6_family_does_not_starve_ipv4() {
+    use crate::testkit::TestDns;
+    let peers: [SocketAddr; 2] = ["1.1.1.1:443".parse().unwrap(), "1.0.0.1:443".parse().unwrap()];
+    if peers.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
+        skipped(&format!("{peers:?} unreachable here"));
+        return;
+    }
+    let dns = TestDns::start(&[(
+        "rpc.example.com",
+        &["2606:4700:4700::1111", "2606:4700:4700::1001", "2606:4700:4700::1112", "1.1.1.1", "1.0.0.1"],
+    )])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://rpc.example.com:443", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
+    let probe = Arc::new(V6Blackholed { v6_delay: Duration::from_millis(13_500), asked: Mutex::new(Vec::new()) });
+    let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
+    let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
+    let (b, s) = session(&c);
+    let t = std::time::Instant::now();
+    let (resp, fd) = blocking(move || {
+        let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+        drop(b);
+        r
+    })
+    .await;
+    let took = t.elapsed();
+    eprintln!("{resp:?} after {took:?}; probed {:?}", lock(&probe.asked));
+    assert_eq!(resp.status, Status::Connected, "{resp:?}");
+    assert!(resp.peer.is_some_and(|p| p.is_ipv4()), "{resp:?}");
+    assert!(fd.is_some());
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+}
