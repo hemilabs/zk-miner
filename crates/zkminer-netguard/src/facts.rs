@@ -1474,8 +1474,12 @@ pub(crate) mod macos_dns {
     }
 
     /// The addresses of a DNS dictionary's `ServerAddresses` (none without one); `None` when the
-    /// value is not a dictionary, `ServerAddresses` is not an array of strings, or a string names
-    /// no address.
+    /// value is not a dictionary or `ServerAddresses` is not an array of strings. A string that
+    /// names no address (empty, a host name) is skipped with a warning (review round 3, 12(a)):
+    /// configd builds the system's resolvers from these strings with `_SC_string_to_sockaddr`
+    /// (`inet_aton`, then `inet_pton` for IPv6) and skips one that does not parse, so it names no
+    /// server the system asks; [`numeric`] reads every form those parsers read (and more), so no
+    /// server configd would use is skipped here. Round 2 failed the whole facts read for one.
     pub(crate) fn server_addresses(value: &CFPropertyList) -> Option<Vec<IpAddr>> {
         let dict = value.downcast::<CFDictionary>()?;
         let key = CFString::from_static_string("ServerAddresses");
@@ -1488,13 +1492,28 @@ pub(crate) mod macos_dns {
         for item in list.iter() {
             // SAFETY: an element of a property-list array is a property list, retained here.
             let s = unsafe { CFPropertyList::wrap_under_get_rule(*item) }.downcast::<CFString>()?;
-            let a = numeric(&s.to_string());
+            let s = s.to_string();
+            let a = numeric(&s);
             if a.is_empty() {
-                return None;
+                warn_unparsed(&s);
             }
             out.extend(a);
         }
         Some(out)
+    }
+
+    /// Warns once per entry about a `ServerAddresses` string that names no address.
+    fn warn_unparsed(entry: &str) {
+        static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let entry = crate::printable(entry, 80);
+        let mut w = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if !w.contains(&entry) && w.len() < 64 {
+            tracing::warn!(
+                "network guard: skipping the DNS server {entry:?} of the system configuration: it \
+                 names no address (the system skips it too, so it names no resolver)"
+            );
+            w.push(entry);
+        }
     }
 
     /// A call that may block for ever (a request to a daemon), made on a thread of its own and
@@ -2372,11 +2391,19 @@ mod tests {
             dict(CFString::new("192.0.2.53").as_CFType()),
             dict(mixed),
             dict(CFNumber::from(53i32).as_CFType()),
-            dict(strings(&["not-an-ip"])),
-            dict(strings(&["192.0.2.53", ""])),
         ] {
             assert_eq!(server_addresses(&bad), None);
         }
+        // Review round 3, 12(a): a string that names no address is skipped (configd skips it
+        // too), with a warning; the others are read.
+        assert_eq!(
+            server_addresses(&dict(strings(&["not-an-ip"]))),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            server_addresses(&dict(strings(&["192.0.2.53", "", " ", "dns.example"]))),
+            Some(vec![ip("192.0.2.53")])
+        );
         let good = dict(strings(&["192.0.2.53"]));
         assert_eq!(
             servers_of([
@@ -2386,11 +2413,22 @@ mod tests {
             .unwrap(),
             vec![ip("192.0.2.53")]
         );
+        assert_eq!(
+            servers_of([
+                ("State:/Network/Global/DNS".to_string(), Some(good.clone())),
+                (
+                    "Setup:/Network/Service/x/DNS".to_string(),
+                    Some(dict(strings(&["not-an-ip"]))),
+                ),
+            ])
+            .unwrap(),
+            vec![ip("192.0.2.53")]
+        );
         let e = servers_of([
             ("State:/Network/Global/DNS".to_string(), Some(good)),
             (
                 "Setup:/Network/Service/x/DNS".to_string(),
-                Some(dict(strings(&["not-an-ip"]))),
+                Some(dict(CFNumber::from(53i32).as_CFType())),
             ),
         ])
         .unwrap_err();
