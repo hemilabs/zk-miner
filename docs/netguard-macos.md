@@ -811,3 +811,31 @@ The findings and fixes, on every platform, are in
   families at once, and bounds its TLS handshake by the connect timeout.
 - **The check connection's failures** name the connection (check or control) within the 120
   characters a refusal shows.
+
+## Review round 6
+
+The findings and fixes, on every platform, are in
+[netguard-hardening.md](netguard-hardening.md#review-round-6), with the invariants each fix
+rests on and the randomised tests that back them. What changes on macOS:
+
+- **The check connection's RTO** (probe-1, the only macOS-specific finding):
+  `TCP_CONNECTION_INFO` reports `tcpi_rto` as 0 until the retransmission timer is armed, so the
+  far margin for the acknowledgement of a retransmitted FIN was ~50 ms. It is read again after the
+  FIN is sent (242 ms for a 14 ms path here, `r6-probe/exp/rto-macos.log`), the larger taken, and
+  one still zero is taken as 1 s; the control's wait follows. macOS and Linux now use the same
+  margins. `r6_the_live_check_uses_a_nonzero_rto` runs here.
+- **The probe gate** is a first-come-first-served queue per address family, never loses a
+  wakeup, gives no turn and takes no token out of time, and sheds a wait that cannot end in
+  time; one decision runs per destination, and a far verdict is remembered for 10 s for that
+  exact address and port on unchanged facts (the facts' key includes the configuration daemon's
+  network signatures, so a new network forgets them). Measured here (`fix-r6/exp/`): 64 vets at
+  once over four hosts, 17 s each: 39 → 64 admitted; 20 at 2 s: 11 → 20; AWS S3 (a check that
+  cannot decide, now followed by one more probe after 2 s): 17 → 20 of 20.
+- **NAT64** state is bounded in time as on Linux (prefixes forgotten an hour after they stopped
+  being named or the network was left, only active ones counted, a DNS server no longer asked
+  naming nothing); macOS's own NAT64 state (the configuration daemon's, `Source::System`) is read
+  without lifetimes, so its prefixes are withdrawn when the daemon stops naming them.
+- **Names with many AAAA records** keep their IPv4 addresses (interleaved before the cut to 8);
+  a family is given up after two checks that could not tell.
+- A huge client timeout no longer panics; discovery's UDP loops keep their deadline under a
+  flood; an unheld NAT64 mark counts at once.
