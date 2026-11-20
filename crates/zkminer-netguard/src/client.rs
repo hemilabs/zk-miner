@@ -226,33 +226,74 @@ impl GuardedClient {
             Some(url::Host::Ipv6(a)) => (None, vec![IpAddr::V6(a)]),
             None => return Err(FetchError::Denied(Denied::Url(UrlDenied::BadAuthority))),
         };
-        // One after another, in answer order, and only as far as needed: the first admitted
-        // address of each family (review round 4, probe-2: vetting every address at once sent up
-        // to 8 hop-limited probes through the same first hops, whose ICMP rate limit then
-        // dropped answers and refused the name).
+        // Per family, one address after another in answer order and only as far as needed: the
+        // first admitted address of each family (review round 4, probe-2: vetting every address
+        // at once sent up to 8 hop-limited probes through the same first hops, whose ICMP rate
+        // limit then dropped answers and refused the name). The two families at once, and once
+        // one has an address the other gets `hop::ATTEMPT_DELAY` more (review round 5, cross-2:
+        // on a host whose IPv6 path is blackholed every IPv6 address's check took 13.5 s, a
+        // probe without an answer and a check connection that did not connect, one after another
+        // before IPv4 was even asked). A check left behind runs on to the request's deadline.
+        let mut families: [Vec<(SocketAddr, SocketAddr)>; 2] = [Vec::new(), Vec::new()];
+        for ip in &ips {
+            let family = usize::from(unmapped_ip(*ip).is_ipv4());
+            families[family].push((
+                SocketAddr::new(*ip, port),
+                SocketAddr::new(self.resolver.connect_ip(*ip), port),
+            ));
+        }
+        let mut chains = tokio::task::JoinSet::new();
+        for list in families.into_iter().filter(|l| !l.is_empty()) {
+            let policy = self.policy().clone();
+            chains.spawn(async move {
+                let mut refused = Vec::new();
+                for (addr, connect) in list {
+                    let policy = policy.clone();
+                    // Within the request's time (review round 5, probe-1): when the caller stops
+                    // waiting, the probe it abandons stops too and gives back its turn.
+                    match tokio::task::spawn_blocking(move || {
+                        policy.vet_path_until(addr, connect, deadline)
+                    })
+                    .await
+                    {
+                        Ok(Ok(v)) => return (Some(v), refused, false),
+                        Ok(Err(d)) => refused.push(d),
+                        Err(_) => return (None, refused, true),
+                    }
+                }
+                (None, refused, false)
+            });
+        }
         let mut pinned = Vec::new();
         let mut vetted: Vec<Vetted> = Vec::new();
         let mut refused = Vec::new();
-        for ip in &ips {
-            let v4 = unmapped_ip(*ip).is_ipv4();
-            if vetted.iter().any(|v| unmapped_ip(v.addr.ip()).is_ipv4() == v4) {
-                continue;
-            }
-            let policy = self.policy().clone();
-            let addr = SocketAddr::new(*ip, port);
-            let connect = SocketAddr::new(self.resolver.connect_ip(*ip), port);
-            // Within the request's time (review round 5, probe-1): when the caller stops
-            // waiting, the probe it abandons stops too and gives back its turn.
-            match tokio::task::spawn_blocking(move || policy.vet_path_until(addr, connect, deadline))
-                .await
-            {
-                Ok(Ok(v)) => {
-                    pinned.push(v.connect);
-                    vetted.push(v);
+        let mut failed = false;
+        let mut grace: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match grace {
+                Some(by) => match tokio::time::timeout_at(by, chains.join_next()).await {
+                    Ok(next) => next,
+                    Err(_) => break,
+                },
+                None => chains.join_next().await,
+            };
+            match next {
+                None => break,
+                Some(Ok((v, r, f))) => {
+                    refused.extend(r);
+                    failed |= f;
+                    if let Some(v) = v {
+                        pinned.push(v.connect);
+                        vetted.push(v);
+                        grace.get_or_insert(tokio::time::Instant::now() + hop::ATTEMPT_DELAY);
+                    }
                 }
-                Ok(Err(d)) => refused.push(d),
-                Err(_) => return Err(FetchError::BadRedirect("a connection check failed")),
+                Some(Err(_)) => failed = true,
             }
+        }
+        drop(chains);
+        if pinned.is_empty() && failed {
+            return Err(FetchError::BadRedirect("a connection check failed"));
         }
         if pinned.is_empty() {
             return Err(FetchError::Denied(match (name.as_deref(), refused.len()) {
@@ -814,7 +855,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 200);
         let asked = probe.asked.lock().unwrap().clone();
-        let ips: Vec<IpAddr> = asked.iter().map(|(a, _)| a.ip()).collect();
+        let mut ips: Vec<IpAddr> = asked.iter().map(|(a, _)| a.ip()).collect();
+        ips.sort();
         assert_eq!(
             ips,
             vec![IpAddr::from([93, 184, 216, 34]), "2606:2800:220:1::1".parse().unwrap()]
@@ -823,6 +865,72 @@ mod tests {
             assert!(deadline <= t0 + budget + Duration::from_millis(50), "{:?}", deadline - t0);
             assert!(deadline + Duration::from_secs(1) >= t0 + budget, "{:?}", deadline - t0);
         }
+    }
+
+    /// A probe that takes `slow` for IPv6 destinations (within the deadline it is given: a
+    /// blackholed IPv6 path) and finds IPv4 ones far at once.
+    #[derive(Debug)]
+    struct SlowIpv6 {
+        slow: Duration,
+        asked: std::sync::Mutex<Vec<SocketAddr>>,
+    }
+
+    impl crate::nearhop::NearProbe for SlowIpv6 {
+        fn probe(&self, addr: SocketAddr, hops: u8, t: Duration) -> crate::nearhop::ProbeOutcome {
+            self.probe_until(addr, hops, t, Instant::now() + crate::nearhop::DECIDE_BUDGET)
+        }
+
+        fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> crate::nearhop::ConfirmOutcome {
+            crate::nearhop::ConfirmOutcome::ConnectFailed("timed out".into())
+        }
+
+        fn probe_until(
+            &self,
+            addr: SocketAddr,
+            _: u8,
+            _: Duration,
+            deadline: Instant,
+        ) -> crate::nearhop::ProbeOutcome {
+            self.asked.lock().unwrap().push(addr);
+            if addr.is_ipv6() {
+                std::thread::sleep(self.slow.min(deadline.saturating_duration_since(Instant::now())));
+                return crate::nearhop::ProbeOutcome::TimedOut;
+            }
+            crate::nearhop::ProbeOutcome::Unreachable
+        }
+    }
+
+    /// Review round 5, cross-2 (live: `r5-cross/vm-r5-happy-eyeballs.log`, 27 s a fetch with
+    /// IPv6 SYNs dropped): a name whose IPv6 addresses' checks hang does not wait for them: the
+    /// families are vetted at once, and once IPv4 has an address IPv6 gets 250 ms more.
+    #[tokio::test]
+    async fn r5_a_blackholed_ipv6_family_does_not_hold_the_hop() {
+        let server = canned_server(&[OK_ELF]);
+        let probe = Arc::new(SlowIpv6 {
+            slow: Duration::from_secs(10),
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
+        let lookup = FakeLookup::with(&[(
+            "dual.example.com",
+            &["2606:2800:220:1::1", "2606:2800:220:1::2", "93.184.216.34"],
+        )]);
+        let c = guarded_client_for_test(
+            &public_policy().with_near_probe(probe.clone()),
+            Arc::new(lookup),
+            to_loopback,
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let t = Instant::now();
+        let r = c
+            .get_following_redirects(&start(&server, "dual.example.com"), 0, BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let asked = probe.asked.lock().unwrap().clone();
+        assert!(asked.iter().any(|a| a.is_ipv4()), "{asked:?}");
     }
 
     /// Review round 4, probe-2: the addresses of a name are vetted one after another, and only
