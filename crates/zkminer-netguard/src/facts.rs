@@ -3003,6 +3003,19 @@ mod tests {
             assert_eq!(sig(&mut h, &at_cafe, t), moved, "{t}");
         }
         assert_eq!(sig(&mut h, &flushed, 6_000), moved);
+        // A spoofed address seen once before the café's: the café's network all the same (the
+        // latest address counts, not the first other one: cross-3).
+        let mut h3 = MacHistory::new();
+        sig(&mut h3, &at_home, 0);
+        sig(&mut h3, &at_spoof, 1_000);
+        assert_eq!(sig(&mut h3, &at_cafe, 1_500), moved);
+        // Three reads of another address within 2 s do not make it the known one: home again.
+        let mut h4 = MacHistory::new();
+        sig(&mut h4, &at_home, 0);
+        for t in [100, 200, 300] {
+            sig(&mut h4, &at_cafe, t);
+        }
+        assert_eq!(sig(&mut h4, &at_home, 400), home_sig, "not held for 2 s");
         // Back home: another change again (never the café's, never a merge).
         let back = sig(&mut h, &at_home, 7_000);
         assert_ne!(back, moved);
@@ -3078,6 +3091,10 @@ mod tests {
         other_if.push(Route::on_link(p("2a01:4f8:dead::/64"), 9));
         other_if.push(Route::on_link(p("fe80::/64"), 4));
         assert_eq!(home, sig(other_if, &["2a01:4f8:a:1::5"]));
+        // The uplink's link-local prefix is the same on every network: not hashed.
+        let mut no_ll = v6("2a01:4f8:a:1::/64");
+        no_ll.retain(|r| r.prefix != p("fe80::/64"));
+        assert_eq!(home, sig(no_ll, &["2a01:4f8:a:1::5"]));
         let v4 = |subnet: &str| {
             vec![
                 Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 3),
@@ -3117,7 +3134,12 @@ mod tests {
             nh(21, 2, Some("fe80::1"), vec![]),
             nh(22, 5, Some("fe80::2"), vec![]),
             nh(20, 0, None, vec![21, 22]),
+            // A nexthop with a gateway and no device names no uplink gateway (cross-3).
+            nh(23, 0, Some("fe80::3"), vec![]),
+            nh(24, 0, None, vec![23]),
         ];
+        assert!(crate::routes::nexthop_gateways(&nexthops, 24).is_empty());
+        assert!(crate::routes::nexthop_gateways(&nexthops, 23).is_empty());
         assert_eq!(
             default_gateways(&table, &nexthops),
             vec![(ip("192.168.1.1"), 2), (ip("fe80::1"), 2), (ip("fe80::2"), 5)]
