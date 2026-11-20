@@ -443,11 +443,13 @@ impl Connector {
             let addr = SocketAddr::new(ip, st.ep.port);
             // Right before connecting, wherever the floor applies: the kernel's route with the
             // port, and the near-hop probe (a destination within a few hops is this host's own
-            // network).
+            // network); and the source address the kernel picks for it, which the connection must
+            // leave from once made (below).
+            let mut vetted = None;
             if self.mode == NetMode::Public || st.ep.dns_derived() {
                 let floor = self.floor.clone();
-                match tokio::time::timeout(share, tokio::task::spawn_blocking(move || floor.vet_connection(addr))).await {
-                    Ok(Ok(Ok(()))) => {}
+                match tokio::time::timeout(share, tokio::task::spawn_blocking(move || floor.vet_path(addr, addr))).await {
+                    Ok(Ok(Ok(v))) => vetted = Some(v),
                     Ok(Ok(Err(d))) => {
                         tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
                         continue;
@@ -461,7 +463,36 @@ impl Connector {
             let share = share.saturating_sub(now.elapsed());
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             match tokio::time::timeout(share, connect_tcp(addr)).await {
-                Ok(Ok(fd)) => return (Response { id, status: Status::Connected, peer: Some(addr) }, Some(fd)),
+                Ok(Ok(fd)) => {
+                    // Once made, before the broker gets it: the connection's own addresses must be
+                    // the vetted ones and the route still admitted, the kernel asked afresh (a route
+                    // or VPN that changed between the check and the connection: review round 2,
+                    // bypass-3, the Linux application). Otherwise it is closed here.
+                    if let Some(v) = vetted {
+                        let stream = std::net::TcpStream::from(fd);
+                        let addrs = stream.local_addr().and_then(|l| Ok((l, stream.peer_addr()?)));
+                        let fd = OwnedFd::from(stream);
+                        let Ok((local, peer)) = addrs else {
+                            tracing::warn!(endpoint = %st.ep.alias, address = %addr, "connector: the connection's addresses could not be read; closed");
+                            continue;
+                        };
+                        let floor = self.floor.clone();
+                        match tokio::task::spawn_blocking(move || floor.recheck_connected(&v, local, peer)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(d)) => {
+                                tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: connection refused once made; closed");
+                                drop(fd);
+                                continue;
+                            }
+                            Err(_) => {
+                                tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: the check once connected did not finish");
+                                continue;
+                            }
+                        }
+                        return (Response { id, status: Status::Connected, peer: Some(addr) }, Some(fd));
+                    }
+                    return (Response { id, status: Status::Connected, peer: Some(addr) }, Some(fd));
+                }
                 Ok(Err(e)) => tracing::debug!(endpoint = %st.ep.alias, address = %addr, error = %e, "connector: connect failed"),
                 Err(_) => tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: connect timed out"),
             }
