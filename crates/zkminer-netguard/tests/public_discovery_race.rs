@@ -43,16 +43,19 @@ fn facts_gathered_during_the_first_discovery_wait_for_it() {
 
 /// Tests: a test that cannot check what it is for on this host (no route of a family, no network,
 /// a missing tool) says so and passes; under `ZKMINER_CI_STRICT=1` (a CI host that must run every
-/// test: review round 3, cross-2) it fails instead, unless `ZKMINER_CI_ALLOW_SKIP` (a
-/// comma-separated list) holds a part of `why` (a CI host without IPv6 allows `"IPv6"`).
+/// test: review round 3, cross-2) it fails instead, unless `why` starts with a token in brackets
+/// (`"[ipv6] …"`) that `ZKMINER_CI_ALLOW_SKIP` (comma-separated tokens) names exactly (review
+/// round 4, cross-7).
 fn skipped(why: impl std::fmt::Display) {
     let why = why.to_string();
     if std::env::var("ZKMINER_CI_STRICT").is_ok_and(|v| v == "1") {
         let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP").unwrap_or_default();
-        if !allowed
-            .split(',')
-            .any(|a| !a.trim().is_empty() && why.contains(a.trim()))
-        {
+        let token = why
+            .strip_prefix('[')
+            .and_then(|r| r.split_once(']'))
+            .map(|(t, _)| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if !token.is_some_and(|t| allowed.split(',').any(|a| a.trim() == t)) {
             panic!("SKIPPED under ZKMINER_CI_STRICT=1 (not in ZKMINER_CI_ALLOW_SKIP): {why}");
         }
     }
