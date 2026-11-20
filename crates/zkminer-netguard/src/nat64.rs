@@ -162,6 +162,9 @@ struct Registry {
     gateways: Vec<(Ipv6Addr, u32)>,
     /// Uplinks on which a prefix could not be held, and why (the latest few).
     unheld: Vec<(u64, String)>,
+    /// The uplink a round is running on, and whether anything was marked unheld there since it
+    /// began ([`begin_round`], [`end_round`]).
+    round: Option<(u64, bool)>,
 }
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
@@ -170,6 +173,7 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     on: None,
     gateways: Vec::new(),
     unheld: Vec::new(),
+    round: None,
 });
 
 fn registry() -> std::sync::MutexGuard<'static, Registry> {
@@ -280,6 +284,11 @@ pub(crate) fn unheld(signature: u64) -> Option<String> {
 }
 
 fn mark_unheld(r: &mut Registry, uplink: u64, why: String) {
+    if let Some((on, marked)) = &mut r.round {
+        if *on == uplink {
+            *marked = true;
+        }
+    }
     if r.unheld.iter().any(|(s, w)| *s == uplink && *w == why) {
         return;
     }
@@ -306,9 +315,37 @@ pub(crate) fn unheld_after_round(uplink: u64, why: &str) {
     mark_unheld(&mut registry(), uplink, why.into());
 }
 
-/// Starts a round on `uplink`: what could not be held there before is asked again.
+/// Starts a round on `uplink`: what could not be held there before is asked again. Its mark
+/// stays until the round ends ([`end_round`]): review round 5, bypass-3 (the mark was cleared
+/// here, so for as long as the round ran, up to [`DISCOVERY_TIMEOUT`] every [`RETRY_UNSETTLED`],
+/// an uplink whose DNS64 names too many prefixes was not unsettled, and an address under a
+/// prefix it could not hold was admitted).
 fn begin_round(uplink: u64) {
-    registry().unheld.retain(|(s, _)| *s != uplink);
+    round_begins(&mut registry(), uplink);
+}
+
+/// Ends the round on `uplink`: its mark is cleared only if nothing was marked there since it
+/// began (by the round, or by a router advertisement heard meanwhile).
+fn end_round(uplink: u64) {
+    round_ends(&mut registry(), uplink);
+}
+
+/// [`begin_round`] on `r`.
+fn round_begins(r: &mut Registry, uplink: u64) {
+    r.round = Some((uplink, false));
+}
+
+/// [`end_round`] on `r`.
+fn round_ends(r: &mut Registry, uplink: u64) {
+    match r.round {
+        Some((on, marked)) if on == uplink => {
+            if !marked {
+                r.unheld.retain(|(s, _)| *s != uplink);
+            }
+            r.round = None;
+        }
+        _ => {}
+    }
 }
 
 /// Learns what `source` names on `uplink` now (each prefix with the lifetime it is named with,
@@ -1006,6 +1043,7 @@ fn round_on(up: Uplink) {
         Ok(found) => found_any |= found,
         Err(e) => warn_discovery(&e),
     }
+    end_round(up.signature);
     let mut d = ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner());
     finished(&mut d, up, found_any);
     let again = d.running.then_some(d.uplink).flatten();
@@ -2501,8 +2539,11 @@ mod r4_tests {
             .any(|q| q.to_string().starts_with("2001:401:")));
         let why = unheld(up).expect("unsettled");
         assert!(why.contains("16 NAT64 prefixes"), "{why}");
-        // A new round on that uplink asks again.
+        // A new round on that uplink asks again; the mark stands until it ends (review round 5,
+        // bypass-3), and goes if that round names nothing it cannot hold.
         begin_round(up);
+        assert!(unheld(up).is_some());
+        end_round(up);
         assert_eq!(unheld(up), None);
     }
 
@@ -2789,5 +2830,97 @@ mod r5_tests {
         h.on(Some(1));
         assert_eq!(h.named_by(&[gw], t1)[0].1.len(), 1);
         assert_eq!(h.named_by(&[gw], t1)[0].1[0].0, p("2001:db8:a::/96"));
+    }
+}
+
+/// Review round 5, bypass-3: an uplink's unheld mark is replaced when its round ends, never
+/// cleared while the round runs.
+#[cfg(test)]
+mod r5_round_tests {
+    use super::*;
+
+    fn p(s: &str) -> Prefix {
+        s.parse().unwrap()
+    }
+
+    /// A DNS64 on loopback answering each query after `delay`, with `answers[i]` for the i-th.
+    fn slow_dns64(answers: Vec<Vec<Ipv6Addr>>, delay: Duration) -> (SocketAddr, std::thread::JoinHandle<()>) {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            for a in answers {
+                let mut buf = [0u8; 512];
+                let (n, from) = server.recv_from(&mut buf).unwrap();
+                std::thread::sleep(delay);
+                let mut m = buf[..n].to_vec();
+                m[2] = 0x81;
+                m[3] = 0x80;
+                m[6..8].copy_from_slice(&(a.len() as u16).to_be_bytes());
+                for x in &a {
+                    m.extend_from_slice(&[0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+                    m.extend_from_slice(&x.octets());
+                }
+                server.send_to(&m, from).unwrap();
+            }
+        });
+        (addr, t)
+    }
+
+    fn validated(nsps: &[&str]) -> Vec<Ipv6Addr> {
+        nsps.iter()
+            .flat_map(|n| [synthesize(p(n), WELL_KNOWN_V4[0]), synthesize(p(n), WELL_KNOWN_V4[1])])
+            .collect()
+    }
+
+    /// The reviewer's `r5_unheld_is_cleared_for_the_length_of_a_round`, turned around: while a
+    /// second round asks a DNS64 that over-names (three validated prefixes) and takes 1.5 s to
+    /// answer, the uplink stays unsettled; it is still once that round ends; a round whose answer
+    /// fits clears it when it ends, not before.
+    #[test]
+    fn r5_unheld_is_kept_while_a_round_runs_and_replaced_when_it_ends() {
+        let uplink = 0x5eed_0105_u64;
+        let three = validated(&["2a00:1450:1::/96", "2a00:1450:2::/96", "2a00:1450:3::/96"]);
+        let one = validated(&["2a00:1450:4::/96"]);
+        let (addr, srv) = slow_dns64(vec![three.clone(), three, one], Duration::from_millis(1500));
+        let ask = move || {
+            begin_round(uplink);
+            let r = ask_and_learn_at(uplink, &[addr], Duration::from_secs(3));
+            end_round(uplink);
+            r
+        };
+        ask().unwrap();
+        assert!(unheld(uplink).is_some());
+        let victim = IpAddr::V6(synthesize(p("2a00:1450:3::/96"), Ipv4Addr::new(10, 0, 0, 1)));
+        for expect_after in [true, false] {
+            let t = std::thread::spawn(ask);
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(unheld(uplink).is_some(), "the mark was cleared while the round ran");
+            t.join().unwrap().unwrap();
+            assert_eq!(unheld(uplink).is_some(), expect_after);
+        }
+        srv.join().unwrap();
+        eprintln!("{victim} is_global = {}", crate::is_global(victim));
+    }
+
+    /// The rule on a registry: a mark made during the round (by the round, or by a router
+    /// advertisement heard meanwhile) survives its end; a mark the round did not make again is
+    /// replaced (cleared) when it ends; a round on another uplink leaves it alone.
+    #[test]
+    fn r5_a_rounds_marks_replace_the_old_ones_when_it_ends() {
+        let mut r = Registry::default();
+        mark_unheld(&mut r, 1, "old".into());
+        round_begins(&mut r, 1);
+        assert!(r.unheld.iter().any(|(s, _)| *s == 1));
+        round_ends(&mut r, 1);
+        assert!(r.unheld.is_empty());
+        mark_unheld(&mut r, 1, "old".into());
+        round_begins(&mut r, 1);
+        mark_unheld(&mut r, 1, "old".into());
+        round_ends(&mut r, 1);
+        assert_eq!(r.unheld, vec![(1, "old".to_string())]);
+        round_begins(&mut r, 2);
+        round_ends(&mut r, 1);
+        round_ends(&mut r, 2);
+        assert_eq!(r.unheld, vec![(1, "old".to_string())]);
     }
 }
