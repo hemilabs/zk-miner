@@ -1113,6 +1113,105 @@ impl ChainClient {
         }
     }
 
+    /// `slashAndReopen(jobId)` on a lock of OUR OWN that can no longer be fulfilled or released: past
+    /// the effective deadline plus the 30-min grace, from `getJobStatusView(jobId).slashOpensAt`.
+    ///
+    /// The slash takes 100% of the lock's collateral whoever sends it, and pays the sender, a keeper
+    /// other than the job's caller, the keeper share: max(2%, 0.5 HEMI), the rest burned. Sent by the
+    /// defaulting prover itself, that share comes back to it rather than to a stranger, and the lock is
+    /// cleared now rather than whenever a keeper gets to it (INTERACTION_GUIDE §6: "a third-party
+    /// keeper, including ... the defaulting prover itself, keeps the keeper share").
+    ///
+    /// `Ok(true)`: the lock is gone (slashed by this call, or no longer ours). `Ok(false)`: the chain
+    /// refused it (not slashable yet, "Not expired yet", while a pause clock runs; not locked; a
+    /// disable or blacklist window that wants a grace release), so the caller tries again later.
+    /// `Err`: not sent or not confirmed.
+    pub async fn slash_own_expired_lock(&self, job_id: B256) -> Result<bool> {
+        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
+        let nonce = self.reserve_nonce().await?;
+        let (tip, max_fee) = self.base_fees().await;
+        // Lift over anything already at this (possibly recycled) nonce.
+        let (tip, max_fee) = match job_path_bid(
+            self.nonce_fee_floor_state(nonce),
+            tip,
+            max_fee,
+            self.fee_ceiling,
+            0,
+            u128::MAX,
+        ) {
+            JobBid::Send(t, m) | JobBid::Hold(t, m) => (t, m),
+            JobBid::Exhausted => (tip, max_fee),
+        };
+        let sent = {
+            let _guard = self.tx_lock.lock().await;
+            let mut tx = fulfill.slashAndReopen(job_id).nonce(nonce);
+            if max_fee > 0 {
+                tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
+            }
+            tx.send().await
+        };
+        let pending = match sent {
+            Ok(p) => {
+                self.note_broadcast_fee(nonce, tip, max_fee, max_fee);
+                p
+            }
+            Err(e) => {
+                self.abort_nonce(nonce);
+                // No explicit gas: a revert surfaces here, from gas estimation. A refusal from the
+                // contract is an answer for now, not a failure to retry at once.
+                if let Some(data) = crate::revert::revert_data_of(&e) {
+                    use zkminer_contracts::bindings::IHemiProveErrors::IHemiProveErrorsErrors as E;
+                    match crate::revert::decode(&data) {
+                        crate::revert::Decoded::Hemi(
+                            E::JobNotLocked(_)
+                            | E::UseGraceRelease(_)
+                            | E::UseGraceReleaseWithDescriptor(_)
+                            | E::RegistryPausedUseGracePauseRelease(_)
+                            | E::EnforcedPause(_),
+                        ) => return Ok(false),
+                        crate::revert::Decoded::Message(m) if m == "Not expired yet" => {
+                            return Ok(false)
+                        }
+                        _ => {}
+                    }
+                }
+                let msg = format!("{e:#}");
+                if is_funds_refusal(&msg) {
+                    self.note_funds_short();
+                }
+                bail!(
+                    "slashAndReopen send failed: {}",
+                    crate::programs::sanitize_log(&msg)
+                );
+            }
+        };
+        let tx_hash = *pending.tx_hash();
+        match crate::tx::await_receipt(&*self.provider, tx_hash, RELEASE_RECEIPT_WAIT).await {
+            Some(r) if r.status() => {
+                self.commit_nonce(nonce);
+                tracing::info!("Job {job_id}: slashed our own expired lock: {tx_hash:?}");
+                Ok(true)
+            }
+            Some(_) => {
+                self.commit_nonce(nonce);
+                tracing::warn!(
+                    "slashAndReopen {tx_hash:?} for {job_id} reverted; trying again later"
+                );
+                Ok(false)
+            }
+            None => {
+                if let Ok((rec, _)) = self.read_job_record(job_id, None).await {
+                    if rec.prover != self.address {
+                        self.abort_nonce(nonce);
+                        return Ok(true);
+                    }
+                }
+                self.abort_nonce(nonce);
+                bail!("slashAndReopen {tx_hash:?} not confirmed")
+            }
+        }
+    }
+
     /// `getPremiumCap(jobId)`: the most of the job's speed premium a fulfil can still earn (each
     /// release lowers it, a slash zeroes it).
     pub async fn get_premium_cap(&self, job_id: B256) -> Result<u128> {
