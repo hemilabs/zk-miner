@@ -945,9 +945,11 @@ fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
 ///   never fewer). A session that cannot be opened, a key list that cannot be read, a value that
 ///   is not what configd writes (a dictionary whose `ServerAddresses` is an array of numeric
 ///   addresses), or a daemon that does not answer within [`macos_dns::CONFIGD_TIMEOUT`] fails the
-///   read. The daemon is asked on a thread of its own, at most one at a time: SCDynamicStore has
-///   no timeout of its own, and a stuck request must not hold the facts read (and every
-///   connection waiting on it) for ever.
+///   read. Each request to the daemon is made on a thread of its own and waited for at most
+///   [`macos_dns::CONFIGD_TIMEOUT`]: SCDynamicStore has no timeout of its own, and a stuck request
+///   must not hold the facts read (and every connection waiting on it) for ever. Requests are not
+///   serialised (callers that come at once each ask on their own thread); while four timed-out
+///   requests have not returned, the next fails at once ([`macos_dns::Bounded`]).
 /// - **Not read**: the resolver configuration the daemon publishes for the system's resolver
 ///   (`dns_configuration_copy`, what `scutil --dns` prints). Its layout is in configd's private
 ///   `dnsinfo.h`, not in the SDK, and it is a tree of raw pointers whose layout is no ABI promise:
@@ -1312,7 +1314,12 @@ pub(crate) mod macos_dns {
     /// A call that may block for ever (a request to a daemon), made on a thread of its own and
     /// waited for at most a timeout. A call that timed out is abandoned (its thread finishes on
     /// its own, if ever); while `max` abandoned calls have not returned, the next call fails at
-    /// once rather than leave another thread behind (review round 2, cross-3).
+    /// once rather than leave another thread behind (review round 2, cross-3). Calls that have
+    /// not timed out are not limited: callers that come at once (the facts re-read, which runs
+    /// one at a time, and public-address and NAT64 discovery, which read the DNS servers on
+    /// threads of their own) each run on a thread of their own, concurrently. The count of
+    /// abandoned calls can be one too high for a moment (a call that returned just as it timed
+    /// out), which refuses sooner, never later.
     pub(crate) struct Bounded {
         what: &'static str,
         max: usize,
@@ -1326,6 +1333,12 @@ pub(crate) mod macos_dns {
                 max,
                 abandoned: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// How many abandoned calls have not returned (tests).
+        #[cfg(test)]
+        pub(crate) fn abandoned_now(&self) -> usize {
+            self.abandoned.load(std::sync::atomic::Ordering::Acquire)
         }
 
         /// `f`'s result, or an error when it takes longer than `timeout` or `max` abandoned calls
@@ -1365,17 +1378,22 @@ pub(crate) mod macos_dns {
             match rx.recv_timeout(timeout) {
                 Ok(r) => r,
                 Err(_) => {
+                    // Counted before it is marked abandoned, so the thread, which uncounts it once
+                    // it finds it abandoned, never uncounts it first (the count wrapped below zero
+                    // for a moment and refused calls with none outstanding: review round 3,
+                    // bypass-4).
+                    self.abandoned.fetch_add(1, Ordering::AcqRel);
                     if state
                         .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
-                        self.abandoned.fetch_add(1, Ordering::AcqRel);
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!("{} did not answer within {timeout:?}", self.what),
                         ));
                     }
-                    // It returned just now.
+                    // It returned just now: not abandoned after all.
+                    self.abandoned.fetch_sub(1, Ordering::AcqRel);
                     rx.recv()
                         .unwrap_or_else(|_| Err(io::Error::other("the call was lost")))
                 }
@@ -2457,6 +2475,62 @@ mod tests {
         for (i, t) in many.into_iter().enumerate() {
             assert_eq!(t.join().unwrap().unwrap(), i);
         }
+    }
+
+    /// Review round 3, bypass-4: calls that return right at their timeout, from several threads
+    /// at once, never make the count of abandoned calls wrap below zero (round 2 counted a call
+    /// after marking it abandoned, so its thread could uncount it first), and never refuse a call
+    /// while fewer than the cap are outstanding.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn abandoned_calls_are_counted_before_they_can_return() {
+        use super::macos_dns::Bounded;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        static B: Bounded = Bounded::new("the test daemon", 64);
+        static STOP: AtomicBool = AtomicBool::new(false);
+        static HIGHEST: AtomicUsize = AtomicUsize::new(0);
+        static REFUSED: AtomicUsize = AtomicUsize::new(0);
+        let watch = std::thread::spawn(|| {
+            while !STOP.load(Ordering::Relaxed) {
+                HIGHEST.fetch_max(B.abandoned_now(), Ordering::Relaxed);
+            }
+        });
+        let racers: Vec<_> = (0..16)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let mut timed_out = 0usize;
+                    let end = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < end {
+                        // A call that ends right at its timeout, so the race is often close.
+                        match B.run(Duration::from_micros(300), || {
+                            std::thread::sleep(Duration::from_micros(300));
+                            Ok(())
+                        }) {
+                            Err(e) if e.to_string().contains("earlier requests") => {
+                                REFUSED.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => timed_out += 1,
+                            Ok(()) => {}
+                        }
+                    }
+                    timed_out
+                })
+            })
+            .collect();
+        let timed_out: usize = racers.into_iter().map(|r| r.join().unwrap()).sum();
+        STOP.store(true, Ordering::Relaxed);
+        watch.join().unwrap();
+        let highest = HIGHEST.load(Ordering::Relaxed);
+        eprintln!(
+            "{timed_out} calls timed out; the most abandoned at once: {highest}; refused: {}",
+            REFUSED.load(Ordering::Relaxed)
+        );
+        assert!(timed_out > 100, "the race was not run: {timed_out}");
+        // Sixteen callers can have at most sixteen calls abandoned at once (plus one counted while
+        // it returns); a wrapped count is near usize::MAX.
+        assert!(highest <= 32, "the count wrapped: {highest}");
+        assert_eq!(REFUSED.load(Ordering::Relaxed), 0);
     }
 
     #[test]
