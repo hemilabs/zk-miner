@@ -638,6 +638,49 @@ fn internal_ranges_are_needed_where_the_host_says_so_and_refused() {
     ));
 }
 
+/// Review round 4, cross-5: a probe that failed, or a check connection that could not decide
+/// (a peer that never acknowledges a bare FIN, a reset, a connection that did not connect), is
+/// refused as a failed check, saying so, not as a near destination "on its own network".
+#[test]
+fn r4_a_failed_near_check_is_not_called_near() {
+    use crate::nearhop::ConfirmOutcome;
+    let facts = HostFacts::new(vec![], vec![]);
+    let addr: SocketAddr = "52.216.0.1:443".parse().unwrap();
+    for (outcome, confirmed, says) in [
+        (
+            ProbeOutcome::Failed("Operation not permitted".into()),
+            ConfirmOutcome::Unanswered,
+            "Operation not permitted",
+        ),
+        (
+            ProbeOutcome::TimedOut,
+            ConfirmOutcome::Failed("the peer acknowledged the check's FIN neither".into()),
+            "neither",
+        ),
+        (
+            ProbeOutcome::TimedOut,
+            ConfirmOutcome::ConnectFailed("timed out".into()),
+            "did not connect",
+        ),
+    ] {
+        let p = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new())
+            .with_near_probe(FixedProbe::with(outcome.clone(), confirmed));
+        let e = p.vet_connection(addr).unwrap_err();
+        assert!(
+            matches!(&e, Denied::NearCheckFailed { addr: a, hops: 2, why } if *a == addr && why.contains(says)),
+            "{outcome:?}: {e:?}"
+        );
+        let text = e.to_string();
+        assert!(text.contains("could not tell how near 52.216.0.1:443 is"), "{text}");
+        assert!(!text.contains("on its own network"), "{text}");
+    }
+    // A real near answer is still NearHop.
+    let p = NetPolicy::with_facts(NetMode::Public, facts, Vec::new()).with_near_probe(
+        FixedProbe::with(ProbeOutcome::TimedOut, ConfirmOutcome::Answered),
+    );
+    assert!(matches!(p.vet_connection(addr), Err(Denied::NearHop { .. })));
+}
+
 /// The home router's own global IPv6 address (its WAN side, outside the delegated prefix) is a
 /// global stranger to every address check, and reached through the default route. The near-hop
 /// probe refuses it: it answers within 2 hops. A far destination is connected to.
@@ -650,7 +693,6 @@ fn a_destination_within_two_hops_is_refused_before_connecting() {
         ProbeOutcome::Connected,
         ProbeOutcome::Refused,
         ProbeOutcome::Reset,
-        ProbeOutcome::Failed("Operation not permitted".into()),
     ] {
         let probe = FixedProbe::answering(outcome.clone());
         let p = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new())

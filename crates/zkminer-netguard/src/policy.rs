@@ -81,12 +81,20 @@ pub enum Denied {
     /// IPv4 address appeared: [`HostFacts::needs_internal_ranges`]), which the configuration does
     /// not state: every connection is refused until it does, or the condition clears.
     InternalRangesUnstated { ip: IpAddr, why: String },
-    /// The destination answered within `hops` hops of this host ([`crate::nearhop`]), or the
-    /// probe that asks failed: `what` says which.
+    /// The destination answered within `hops` hops of this host ([`crate::nearhop`]): `what`
+    /// says how.
     NearHop {
         addr: SocketAddr,
         hops: u8,
         what: String,
+    },
+    /// The near-hop check could not tell whether the destination is within `hops` hops (the
+    /// probe failed, or neither the probe nor the check connection decided): `why` (review round
+    /// 4, cross-5: this was a [`Denied::NearHop`], "on its own network").
+    NearCheckFailed {
+        addr: SocketAddr,
+        hops: u8,
+        why: String,
     },
     /// This host's facts could not be read again (`why`, naming what failed) and are older than
     /// [`FACTS_TTL`] and a grace of 2 s: every requester connection is refused until they can be
@@ -280,6 +288,11 @@ impl Denied {
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
                  to {hops} hops: {what})"
+            ),
+            Denied::NearCheckFailed { addr, hops, why } => write!(
+                f,
+                "could not tell how near {addr} is (whether it is within {hops} hops of this \
+                 host): {why}"
             ),
             Denied::NoAdmittedAddress { host, refused } => {
                 write!(f, "{host:?} resolves to no admitted address (")?;
@@ -1060,15 +1073,11 @@ impl NetPolicy {
                 hops,
                 what: format!("it {how}"),
             }),
-            Verdict::Failed(why) => Err(Denied::NearHop {
+            Verdict::Failed(why) => Err(Denied::NearCheckFailed { addr, hops, why }),
+            Verdict::Undecided => Err(Denied::NearCheckFailed {
                 addr,
                 hops,
-                what: format!("the probe failed: {why}"),
-            }),
-            Verdict::Undecided => Err(Denied::NearHop {
-                addr,
-                hops,
-                what: "no answer either way".into(),
+                why: "no answer either way".into(),
             }),
         }
     }
