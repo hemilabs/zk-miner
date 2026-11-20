@@ -864,6 +864,8 @@ pub struct Nexthop {
     pub id: u32,
     /// The device (`NHA_OIF`; 0 when it has none).
     pub oif: u32,
+    /// The gateway (`NHA_GATEWAY`; `None` for an on-link nexthop, a group, a blackhole).
+    pub gateway: Option<IpAddr>,
     /// The member nexthops of a group (`NHA_GROUP`).
     pub group: Vec<u32>,
     pub blackhole: bool,
@@ -898,6 +900,32 @@ pub fn nexthop_interfaces(nexthops: &[Nexthop], id: u32) -> Option<Vec<u32>> {
     out.sort();
     out.dedup();
     Some(out)
+}
+
+/// The gateways nexthop object `id` sends traffic to, each with its interface (a group's, its
+/// members'; a nexthop without a gateway or a device, and a blackhole, add none): review round
+/// 5, cross-4, so a default route through a nexthop object (`nexthop_compat_mode` 0, whose dump
+/// shows no gateway) has its gateway in the uplink's identities.
+pub fn nexthop_gateways(nexthops: &[Nexthop], id: u32) -> Vec<(IpAddr, u32)> {
+    let mut out = Vec::new();
+    if let Some(nh) = nexthops.iter().find(|n| n.id == id) {
+        let members: Vec<&Nexthop> = if nh.group.is_empty() {
+            vec![nh]
+        } else {
+            nh.group
+                .iter()
+                .filter_map(|m| nexthops.iter().find(|n| n.id == *m && n.group.is_empty()))
+                .collect()
+        };
+        for m in members {
+            if let (Some(gw), false, true) = (m.gateway, m.blackhole, m.oif != 0) {
+                out.push((gw, m.oif));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Every nexthop object (Linux 5.3 and later; none elsewhere, or where the kernel has none).
@@ -1025,6 +1053,7 @@ mod sys {
     const NHA_GROUP: u16 = 2;
     const NHA_BLACKHOLE: u16 = 4;
     const NHA_OIF: u16 = 5;
+    const NHA_GATEWAY: u16 = 6;
     const RTM_NEWRULE: u16 = 32;
     const RTM_GETRULE: u16 = 34;
     const FR_ACT_TO_TBL: u8 = 1;
@@ -1758,8 +1787,9 @@ mod sys {
         }
     }
 
-    /// One `RTM_NEWNEXTHOP`: `NHA_ID`, `NHA_OIF`, `NHA_GROUP` (an array of `struct nexthop_grp`,
-    /// 8 bytes each, the id first), `NHA_BLACKHOLE`.
+    /// One `RTM_NEWNEXTHOP`: `NHA_ID`, `NHA_OIF`, `NHA_GATEWAY` (of the message's family),
+    /// `NHA_GROUP` (an array of `struct nexthop_grp`, 8 bytes each, the id first),
+    /// `NHA_BLACKHOLE`.
     pub(super) fn parse_nexthop(p: &[u8], out: &mut Vec<Nexthop>) -> io::Result<()> {
         if p.len() < NHMSG_LEN {
             return Err(malformed());
@@ -1767,13 +1797,18 @@ mod sys {
         let mut nh = Nexthop {
             id: 0,
             oif: 0,
+            gateway: None,
             group: Vec::new(),
             blackhole: false,
         };
+        // `struct nhmsg`'s family: the gateway's (an IPv6 nexthop may carry an IPv4 gateway only
+        // with RFC 5549, which names its family the same way).
+        let family = p[0];
         for (ty, data) in attrs(&p[NHMSG_LEN..])? {
             match ty {
                 NHA_ID => nh.id = u32_at(data, 0).ok_or_else(malformed)?,
                 NHA_OIF => nh.oif = u32_at(data, 0).ok_or_else(malformed)?,
+                NHA_GATEWAY => nh.gateway = addr(family, data),
                 NHA_BLACKHOLE => nh.blackhole = true,
                 NHA_GROUP => {
                     if data.len() % 8 != 0 {
@@ -3078,24 +3113,59 @@ mod sys {
             b.extend(attr(NHA_ID, &3u32.to_ne_bytes()));
             b.extend(attr(NHA_BLACKHOLE, &[]));
             parse_nexthop(&b, &mut out).unwrap();
+            // Review round 5, cross-4: the gateway, of the message's family.
+            let mut w = vec![0u8; NHMSG_LEN];
+            w[0] = libc::AF_INET6 as u8;
+            w.extend(attr(NHA_ID, &4u32.to_ne_bytes()));
+            w.extend(attr(NHA_OIF, &2u32.to_ne_bytes()));
+            w.extend(attr(NHA_GATEWAY, &"fe80::1".parse::<Ipv6Addr>().unwrap().octets()));
+            let mut w4 = vec![0u8; NHMSG_LEN];
+            w4[0] = libc::AF_INET as u8;
+            w4.extend(attr(NHA_ID, &5u32.to_ne_bytes()));
+            w4.extend(attr(NHA_OIF, &2u32.to_ne_bytes()));
+            w4.extend(attr(NHA_GATEWAY, &[192, 168, 1, 1]));
+            let mut gw_out = Vec::new();
+            parse_nexthop(&w, &mut gw_out).unwrap();
+            parse_nexthop(&w4, &mut gw_out).unwrap();
+            assert_eq!(gw_out[0].gateway, Some("fe80::1".parse().unwrap()));
+            assert_eq!(gw_out[1].gateway, Some("192.168.1.1".parse().unwrap()));
+            gw_out.push(Nexthop {
+                id: 6,
+                oif: 0,
+                gateway: None,
+                group: vec![4, 5, 7],
+                blackhole: false,
+            });
+            gw_out.extend(out.iter().cloned());
+            assert_eq!(
+                super::super::nexthop_gateways(&gw_out, 6),
+                vec![
+                    ("192.168.1.1".parse().unwrap(), 2),
+                    ("fe80::1".parse().unwrap(), 2)
+                ]
+            );
+            assert_eq!(super::super::nexthop_gateways(&gw_out, 7), vec![]);
             assert_eq!(
                 out,
                 vec![
                     Nexthop {
                         id: 7,
                         oif: 9,
+                        gateway: None,
                         group: vec![],
                         blackhole: false
                     },
                     Nexthop {
                         id: 8,
                         oif: 0,
+                        gateway: None,
                         group: vec![7, 3],
                         blackhole: false
                     },
                     Nexthop {
                         id: 3,
                         oif: 0,
+                        gateway: None,
                         group: vec![],
                         blackhole: true
                     },
