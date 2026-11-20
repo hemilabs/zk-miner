@@ -143,11 +143,19 @@ impl ElfFetcher {
             .unknown_paths()
             .into_iter()
             .map(|path| {
-                format!(
-                    "network guard: this host's public {path} address is not known, so requester \
-                     connections over {path} are refused. To fix: {}",
-                    path.advice()
-                )
+                if facts.relearning(path) {
+                    format!(
+                        "network guard: this host moved to another network; its public {path} \
+                         address there is being learned again, and requester connections over \
+                         {path} are refused until it is"
+                    )
+                } else {
+                    format!(
+                        "network guard: this host's public {path} address is not known, so \
+                         requester connections over {path} are refused. To fix: {}",
+                        path.advice()
+                    )
+                }
             })
             .collect();
         if let Some(why) = facts.unreadable_reason() {
