@@ -955,6 +955,11 @@ pub(crate) fn ask_servers(
     while !pending.is_empty() && Instant::now() < deadline {
         let mut progressed = false;
         pending.retain(|p| loop {
+            // Review round 6 (the parse lens's suspicion): a flood of datagrams that are no
+            // answer must not keep the loop past its deadline.
+            if Instant::now() >= deadline {
+                return true;
+            }
             match p.sock.recv(&mut buf) {
                 Ok(n) => match parse_aaaa(&buf[..n], p.id) {
                     None => continue,
@@ -2002,11 +2007,24 @@ fn finished(d: &mut OnUplink, up: Uplink, found_any: bool) {
     }
 }
 
+/// Fails the next spawns of a round (tests: review round 6, parse-3).
+#[cfg(test)]
+static FAIL_SPAWN: AtomicBool = AtomicBool::new(false);
+
+/// Starts a round on `up` on a thread of its own; when none can start, the state says no round
+/// runs. Call it without holding [`ON_UPLINK`] (review round 6, parse-3: `ensure_discovered_on`
+/// held it, and a failed spawn locked it again: a self-deadlock in the facts read, which then
+/// refused everything for good).
 fn spawn_round(up: Uplink) {
-    if std::thread::Builder::new()
-        .name("netguard-nat64".into())
-        .spawn(move || round_on(up))
-        .is_err()
+    #[cfg(test)]
+    let fail = FAIL_SPAWN.load(Ordering::SeqCst);
+    #[cfg(not(test))]
+    let fail = false;
+    if fail
+        || std::thread::Builder::new()
+            .name("netguard-nat64".into())
+            .spawn(move || round_on(up))
+            .is_err()
     {
         let mut d = ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner());
         d.running = false;
@@ -2040,7 +2058,11 @@ pub(crate) fn ensure_discovered_on(up: Uplink) -> bool {
                     .0;
             }
         }
-        Next::AskInBackground => spawn_round(up),
+        Next::AskInBackground => {
+            drop(d);
+            spawn_round(up);
+            d = ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner());
+        }
         Next::Nothing => {}
     }
     d.settled == Some(up.signature)
@@ -3713,6 +3735,57 @@ mod r6_tests {
         assert!(round_gateways(&r, 1).is_empty());
         r.on = Some(1);
         assert!(round_gateways(&r, 2).is_empty());
+    }
+
+    /// The parse lens's suspicion: a server that floods datagrams that are no answer keeps
+    /// discovery no longer than its timeout.
+    #[test]
+    fn r6_a_flood_of_non_answers_ends_at_the_timeout() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (_, from) = server.recv_from(&mut buf).unwrap();
+            while !s2.load(Ordering::SeqCst) {
+                for _ in 0..64 {
+                    let _ = server.send_to(&[0u8; 12], from);
+                }
+            }
+        });
+        let t = Instant::now();
+        let (answers, errors) = ask_servers(&[addr], Duration::from_millis(300));
+        let took = t.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        flood.join().unwrap();
+        assert!(answers.is_empty() && !errors.is_empty());
+        assert!(took < Duration::from_millis(800), "{took:?}");
+    }
+
+    /// parse-3: a round that cannot be started (no thread) while the facts are read neither
+    /// deadlocks nor leaves a round marked running.
+    #[test]
+    fn r6_a_round_that_cannot_start_does_not_deadlock() {
+        {
+            let mut d = ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner());
+            if d.attempted_at.is_none() {
+                d.attempted_at = Some(Instant::now());
+            }
+            d.first_done = true;
+            d.running = false;
+            d.uplink = Some(Uplink { signature: 0x6_5ba_d0e4, routed: [true, true], clat: false });
+        }
+        FAIL_SPAWN.store(true, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let up = Uplink { signature: 0x6_5ba_d0e5, routed: [true, true], clat: false };
+            let _ = tx.send(ensure_discovered_on(up));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        FAIL_SPAWN.store(false, Ordering::SeqCst);
+        assert!(got.is_ok(), "deadlocked");
+        assert!(!ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner()).running);
     }
 
     /// cross-7 T24: the unheld marks are bounded (MAX_UNHELD), and a flood of other uplinks'
