@@ -982,12 +982,12 @@ impl std::fmt::Display for HostMemoryShortage {
             self.reserved as f64 / GIB,
             self.available as f64 / GIB,
         )?;
-        // Under Windows the figures are COMMIT (RAM plus page file), which is what runs out there,
-        // and what a larger page file raises.
+        // Under Windows a proof needs RAM and COMMIT (RAM plus what the page file can grow to), and
+        // either can be the one short: name both, as the operator's remedy differs.
         if cfg!(windows) {
             write!(
                 f,
-                " (Windows: committed memory, RAM plus page file; a larger page file raises it)"
+                " (Windows: RAM, or commit: RAM plus a page file that grows unless fixed)"
             )?;
         }
         Ok(())
