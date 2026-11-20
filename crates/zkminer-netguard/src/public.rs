@@ -627,6 +627,11 @@ fn discover() -> (FamilyFound, FamilyFound) {
             let want_v6 = fam == 1;
             let got: Option<io::Result<IpAddr>> = match &mut q.pending {
                 Pending::Dns { sock, id, .. } => loop {
+                    // Review round 6 (the parse lens's suspicion): a flood of datagrams that are
+                    // no answer must not keep the loop past its deadline.
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
                     match sock.recv(&mut buf) {
                         Ok(n) => match parse_answer(&buf[..n], *id, want_v6) {
                             Some(r) => break Some(r),
