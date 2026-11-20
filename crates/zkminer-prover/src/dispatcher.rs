@@ -2709,6 +2709,10 @@ pub struct WorkerPool {
     learned_commit: Mutex<HashMap<String, crate::memory::LearnedPeaks>>,
     /// Where the learned figures are kept across runs (`use_host_peaks`), when they are.
     host_peaks_path: Option<PathBuf>,
+    /// Jobs waiting in `prove_min_vram` for a card, so a freed card goes to the one due first
+    /// (`yields_to_waiter`) rather than whichever polled first.
+    card_waiters: Mutex<Vec<CardWaiter>>,
+    card_waiter_seq: AtomicU64,
     /// Commit in-flight proofs have laid claim to (Windows; `reserve_commit`), beside the RAM ones in
     /// `memory_ledger`.
     commit_ledger: crate::memory::MemoryLedger,
@@ -2873,6 +2877,43 @@ impl MeasureSetupError {
     }
 }
 
+/// A job waiting for a card (`WorkerPool::card_waiters`): the cards it can take, and when it is due.
+#[derive(Debug, Clone)]
+struct CardWaiter {
+    ticket: u64,
+    abort_at: Option<Instant>,
+    since: Instant,
+    keys: Vec<String>,
+}
+
+impl CardWaiter {
+    /// Its place in line: the deadline first (none last), then arrival.
+    fn order(&self) -> (bool, Option<Instant>, Instant, u64) {
+        (
+            self.abort_at.is_none(),
+            self.abort_at,
+            self.since,
+            self.ticket,
+        )
+    }
+}
+
+/// Removes a waiter from `card_waiters` when its wait ends, however it ends.
+struct CardWaitGuard<'a> {
+    pool: &'a WorkerPool,
+    ticket: u64,
+}
+
+impl Drop for CardWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .card_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| w.ticket != self.ticket);
+    }
+}
+
 /// Windows: after recycling workers that held `held` bytes of commit (free commit was `before`),
 /// wait until most of it is free again, 15 s at most and no later than `give_up_at`. The card's VRAM
 /// comes back within a second, but the commit those workers held can lag it, and a worker started
@@ -2912,6 +2953,8 @@ impl WorkerPool {
             learned_peaks: Mutex::new(HashMap::new()),
             learned_commit: Mutex::new(HashMap::new()),
             host_peaks_path: None,
+            card_waiters: Mutex::new(Vec::new()),
+            card_waiter_seq: AtomicU64::new(0),
             commit_ledger: crate::memory::MemoryLedger::default(),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
@@ -6840,6 +6883,82 @@ impl WorkerPool {
     ///   that means the dispatch fails, because the reason for disabling it may be that using it
     ///   breaks the host. See the note on the parameter.
     #[allow(clippy::too_many_arguments)]
+    /// Whether a job (`me`: its ticket when it is waiting, `None` arriving) must leave the free card
+    /// `key` to a waiting job due before it: one that can take that card (by any of its workers, as a
+    /// RISC Zero job can the card an SP1 job wants), with an earlier deadline,
+    /// or the same and waiting longer. Waiting jobs polled every 250 ms and the first to look took
+    /// the card, so a job claimed later, or one due sooner, could wait behind any number of others.
+    fn yields_to_waiter(
+        &self,
+        key: &str,
+        me: Option<u64>,
+        abort_at: Option<Instant>,
+        since: Instant,
+    ) -> bool {
+        let mine = CardWaiter {
+            ticket: me.unwrap_or(u64::MAX),
+            abort_at,
+            since,
+            keys: Vec::new(),
+        }
+        .order();
+        self.card_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|w| {
+                Some(w.ticket) != me
+                    && w.order() < mine
+                    && w.keys
+                        .iter()
+                        .any(|k| self.same_card(k, key) && self.slot_could_take(k))
+            })
+    }
+
+    /// Whether the worker of `key` could take a free card: alive or respawnable, or busy now (it
+    /// frees). A waiter whose worker there has failed must not hold the card from others.
+    fn slot_could_take(&self, key: &str) -> bool {
+        let Some(entry) = self.workers.get(key) else {
+            return false;
+        };
+        match entry.slot.try_lock() {
+            Ok(mut slot) => {
+                slot.handle.as_mut().is_some_and(|h| h.is_alive()) || Self::slot_dispatchable(&slot)
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// Whether two slot keys are on one physical card (one is RISC Zero's, the other SP1's, say):
+    /// the same key, or the same PCI bus id.
+    fn same_card(&self, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let bus = |k: &str| self.workers.get(k).and_then(|e| e.pci_bus_id.clone());
+        matches!((bus(a), bus(b)), (Some(x), Some(y)) if x == y)
+    }
+
+    /// Join the line for a card (`card_waiters`); the guard leaves it.
+    fn wait_for_card(
+        &self,
+        keys: &[String],
+        abort_at: Option<Instant>,
+    ) -> (CardWaitGuard<'_>, u64, Instant) {
+        let ticket = self.card_waiter_seq.fetch_add(1, Ordering::Relaxed);
+        let since = Instant::now();
+        self.card_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(CardWaiter {
+                ticket,
+                abort_at,
+                since,
+                keys: keys.to_vec(),
+            });
+        (CardWaitGuard { pool: self, ticket }, ticket, since)
+    }
+
     pub fn prove_min_vram(
         &self,
         backend: &str,
@@ -7026,7 +7145,12 @@ impl WorkerPool {
         // order, and a preferred card that is busy/down simply yields to the next candidate.
         let keys = Self::prefer_device_first(keys, preferred_device);
 
+        let arrived = Instant::now();
         for key in &keys {
+            // A job already waiting for this card, and due first, takes it (`yields_to_waiter`).
+            if self.yields_to_waiter(key, None, abort_at, arrived) {
+                continue;
+            }
             if let Some(entry) = self.workers.get(key) {
                 // Prefer a worker whose PHYSICAL GPU is idle: skip one whose gpu_lock
                 // is held by another backend proving on the same card, so we don't
@@ -7093,6 +7217,8 @@ impl WorkerPool {
         // honour, so fall back to a generous absolute cap rather than spinning forever.
         const QUEUE_WAIT_CAP: Duration = Duration::from_secs(3600);
         let queue_deadline = Instant::now() + timeout.unwrap_or(QUEUE_WAIT_CAP);
+        // In line for a card: a freed one goes to the waiting job due first.
+        let (in_line, ticket, since) = self.wait_for_card(&keys, abort_at);
         loop {
             // Whether some eligible card is only BUSY (another proof holds it), not failed.
             let mut any_busy = false;
@@ -7100,6 +7226,10 @@ impl WorkerPool {
                 let Some(entry) = self.workers.get(key) else {
                     continue;
                 };
+                if self.yields_to_waiter(key, Some(ticket), abort_at, since) {
+                    any_busy = true;
+                    continue;
+                }
                 let gpu_free = self.gpu_lock_for(key).is_none_or(|l| {
                     !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock))
                 });
@@ -7115,6 +7245,8 @@ impl WorkerPool {
                     let is_alive = slot.handle.as_mut().map(|h| h.is_alive()).unwrap_or(false);
                     if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
+                        // Out of line before proving: the proof must not hold other cards' places.
+                        drop(in_line);
                         *used_slot = Some(key.clone());
                         return self.prove_on_slot(
                             key,
@@ -16102,6 +16234,28 @@ mod learned_host_peak_tests {
         );
         pool.raise_learned_after_shortage("risc0:cuda:1", Some(19));
         assert!(pool.slot_commit_peak("risc0:cuda:1", Some(19)) >= after);
+    }
+
+    /// A freed card goes to the waiting job due first: a later deadline, or a later arrival with the
+    /// same one, yields; the job itself and jobs for other cards do not; a waiter that has left the
+    /// line holds nothing.
+    #[test]
+    fn a_freed_card_goes_to_the_job_due_first() {
+        let pool = pool(&["risc0:cuda:0", "risc0:cuda:1"]);
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(600);
+        let later = now + Duration::from_secs(1200);
+        let (guard, ticket, since) = pool.wait_for_card(&["risc0:cuda:0".to_string()], Some(soon));
+        // Another job due later, arriving now: it leaves card 0 to the waiter, not card 1.
+        assert!(pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now));
+        assert!(!pool.yields_to_waiter("risc0:cuda:1", None, Some(later), now));
+        // One due sooner goes first; no deadline goes last.
+        assert!(!pool.yields_to_waiter("risc0:cuda:0", None, Some(now), now));
+        assert!(pool.yields_to_waiter("risc0:cuda:0", None, None, now));
+        // The waiter does not yield to itself.
+        assert!(!pool.yields_to_waiter("risc0:cuda:0", Some(ticket), Some(soon), since));
+        drop(guard);
+        assert!(!pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now));
     }
 
     /// A job with a deadline waits for a busy card as long as the deadline allows: the proof's own
