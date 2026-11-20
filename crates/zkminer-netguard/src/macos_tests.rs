@@ -224,7 +224,7 @@ fn neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused() {
             "{global_prefixes} global connected prefixes, no neighbour"
         );
     } else {
-        crate::skipped("the global neighbours: no global connected prefix (IPv6) here");
+        crate::skipped("[ipv6] the global neighbours: no global connected prefix (IPv6) here");
     }
 }
 

@@ -131,8 +131,10 @@ pub(crate) fn printable(s: &str, max: usize) -> String {
 
 /// Tests: a test that cannot check what it is for on this host (no route of a family, no network,
 /// a missing tool) says so and passes; under `ZKMINER_CI_STRICT=1` (a CI host that must run every
-/// test: review round 3, cross-2) it fails instead, unless `ZKMINER_CI_ALLOW_SKIP` (a
-/// comma-separated list) holds a part of `why` (a CI host without IPv6 allows `"IPv6"`).
+/// test: review round 3, cross-2) it fails instead, unless `why` starts with a token in
+/// brackets (`"[ipv6] no [::1] here"`) that `ZKMINER_CI_ALLOW_SKIP` (a comma-separated list of
+/// tokens) names exactly (review round 4, cross-7: it matched any part of `why` before, so
+/// `"IPv6"` allowed every skip whose text mentioned IPv6). A CI host without IPv6 allows `ipv6`.
 #[cfg(test)]
 pub(crate) fn skipped(why: impl std::fmt::Display) {
     let why = why.to_string();
@@ -150,11 +152,20 @@ pub(crate) fn skipped(why: impl std::fmt::Display) {
 /// `ZKMINER_CI_ALLOW_SKIP` (`allow`): see [`skipped`].
 #[cfg(test)]
 fn skip_fails(strict: Option<&str>, allow: Option<&str>, why: &str) -> bool {
-    strict == Some("1")
-        && !allow
-            .unwrap_or_default()
-            .split(',')
-            .any(|a| !a.trim().is_empty() && why.contains(a.trim()))
+    strict == Some("1") && !skip_allowed(allow.unwrap_or_default(), why)
+}
+
+/// Whether `why`'s token (`[token] …`) is one `allow` (comma-separated tokens) names.
+#[cfg(test)]
+fn skip_allowed(allow: &str, why: &str) -> bool {
+    let Some(token) = why
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(t, _)| t.trim())
+    else {
+        return false;
+    };
+    !token.is_empty() && allow.split(',').any(|a| a.trim() == token)
 }
 
 #[cfg(test)]
@@ -178,13 +189,20 @@ mod tests {
     #[test]
     fn strict_ci_fails_skips_it_does_not_allow() {
         use super::skip_fails;
-        let why = "2606:4700:4700::1111: no default route of its family (IPv6)";
+        let why = "[ipv6] 2606:4700:4700::1111: no default route of its family (IPv6)";
         assert!(!skip_fails(None, None, why));
         assert!(!skip_fails(Some("0"), None, why));
         assert!(skip_fails(Some("1"), None, why));
         assert!(skip_fails(Some("1"), Some(""), why));
         assert!(skip_fails(Some("1"), Some(" , sandbox"), why));
-        assert!(!skip_fails(Some("1"), Some("sandbox, IPv6"), why));
-        assert!(skip_fails(Some("1"), Some("IPv4"), why));
+        assert!(!skip_fails(Some("1"), Some("sandbox, ipv6"), why));
+        assert!(skip_fails(Some("1"), Some("ipv4"), why));
+        // Review round 4, cross-7: an explicit token, not a part of the text.
+        assert!(skip_fails(Some("1"), Some("IPv6"), why), "a token is matched exactly");
+        assert!(skip_fails(Some("1"), Some("6"), why));
+        let untagged = "52.217.141.232:443 now acknowledges a bare FIN (no IPv6 here either)";
+        assert!(skip_fails(Some("1"), Some("ipv6,IPv6"), untagged));
+        assert!(skip_fails(Some("1"), Some("ipv6"), "[] nothing"));
+        assert!(skip_fails(Some("1"), Some("ipv6"), "[ipv6 no closing bracket"));
     }
 }
