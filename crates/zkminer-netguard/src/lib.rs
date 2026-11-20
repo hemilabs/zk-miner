@@ -185,7 +185,7 @@ mod tests {
     }
 
     /// Review round 3, cross-2: under ZKMINER_CI_STRICT=1 a skip fails, unless
-    /// ZKMINER_CI_ALLOW_SKIP holds a part of its reason; without it, nothing fails.
+    /// ZKMINER_CI_ALLOW_SKIP names its reason's token exactly (round 4); without it, nothing fails.
     #[test]
     fn strict_ci_fails_skips_it_does_not_allow() {
         use super::skip_fails;

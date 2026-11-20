@@ -2617,6 +2617,20 @@ mod r6_tests {
         }
     }
 
+    /// probe-3 (fix-r6 mutation N16): the families have gates of their own: IPv4's turns all held
+    /// leave IPv6's free.
+    #[test]
+    fn r6_each_family_has_its_own_gate() {
+        let far = Instant::now() + Duration::from_secs(30);
+        let held: Vec<ProbeGate> = (0..PROBES_AT_ONCE).filter_map(|_| ProbeGate::enter_until(far)).collect();
+        assert_eq!(held.len(), PROBES_AT_ONCE);
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let t = Instant::now();
+        let turn = Turn::enter_for(v6, t + Duration::from_secs(5));
+        assert!(matches!(turn, Some(Turn::V6(_))) && t.elapsed() < Duration::from_secs(3));
+        drop(held);
+    }
+
     /// cross-7 N14: an attempt never runs past the caller's deadline (a listener whose accept
     /// queue is full drops SYNs: the attempt would wait its whole timeout).
     #[cfg(unix)]
@@ -2627,21 +2641,27 @@ mod r6_tests {
         sock.listen(0).unwrap();
         let addr = sock.local_addr().unwrap().as_socket().unwrap();
         let mut fill = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..64 {
             let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
             s.set_nonblocking(true).unwrap();
             let _ = s.connect(&addr.into());
             fill.push(s);
         }
         std::thread::sleep(Duration::from_millis(100));
-        let t = Instant::now();
-        let r = probe_turn(addr, 64, Duration::from_secs(2), t + Duration::from_millis(300));
-        let took = t.elapsed();
-        // A full queue on loopback: dropped SYNs, or (some kernels) an answer at once.
-        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
-            assert!(took < Duration::from_millis(700), "{took:?}");
-        } else {
-            crate::skipped(format!("this kernel answered a full accept queue: {r:?}"));
+        // A full queue on loopback drops SYNs on Linux; macOS completes the connection, so there
+        // TEST-NET-1 (routed, answered by nobody: one SYN, dropped) stands in.
+        let mut silent = None;
+        for to in [addr, "192.0.2.1:9".parse().unwrap()] {
+            let t = Instant::now();
+            let r = probe_turn(to, 64, Duration::from_secs(2), t + Duration::from_millis(300));
+            if matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
+                silent = Some((to, t.elapsed()));
+                break;
+            }
+        }
+        match silent {
+            Some((to, took)) => assert!(took < Duration::from_millis(700), "{to}: {took:?}"),
+            None => crate::skipped("no destination that drops SYNs here"),
         }
     }
 
