@@ -93,6 +93,10 @@ pub struct ChainClient {
     /// otherwise get a fresh nonce and queue behind the stuck fulfill → strand).
     abandoned_fulfill_nonces:
         Arc<std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, u64>>>,
+    /// This key's hashed fulfils as the DA throttle rules track them (witness-construction-jobs
+    /// §5.5): each accepted fulfil's estimated DA bytes and first-acceptance head, and the large
+    /// fulfils replaced by a self-transfer awaiting a re-send. Shared across clones.
+    da_book: Arc<std::sync::Mutex<crate::da::DaSendBook>>,
     /// Short-TTL cache of ProgramRegistry metadata keyed by programId. Shared across clones.
     pub(crate) program_info_cache: Arc<std::sync::Mutex<ProgramInfoCache>>,
     /// Counts every JSON-RPC request sent to the endpoint (total + rolling minute).
@@ -106,6 +110,9 @@ pub struct ChainClient {
     /// from a monotonic index and reopen does not re-emit), so the cached tx IS the
     /// tx the scan would find. FIFO-bounded; a miss just uses the scan fallback.
     submit_tx_cache: Arc<std::sync::Mutex<SubmitTxCache>>,
+    /// Downloads programs' ELFs through the network guard, under the config's `[dev]` and
+    /// `[egress]` settings (see [`crate::programs::ElfFetcher`]). Shared across clones.
+    elf_fetcher: crate::programs::ElfFetcher,
 }
 
 /// FIFO-bounded programId → ProgramInfo cache (see `ChainClient::program_info_cache`) with a TTL:
@@ -322,12 +329,21 @@ impl ChainClient {
         self.watch_only
     }
 
+    /// The guarded ELF downloader every program fetch goes through.
+    pub fn elf_fetcher(&self) -> &crate::programs::ElfFetcher {
+        &self.elf_fetcher
+    }
+
     async fn connect(
         config: &ZkMinerConfig,
         signer: PrivateKeySigner,
         address: Address,
         watch_only: bool,
     ) -> Result<Self> {
+        // First: a config that would let requesters reach this host's private network on a
+        // production chain is refused before anything connects anywhere.
+        config.validate_network()?;
+        let elf_fetcher = crate::programs::ElfFetcher::from_config(config)?;
         let wallet = EthereumWallet::from(signer.clone());
 
         let rpc_url = config.chain.rpc_url.parse().context("Invalid RPC URL")?;
@@ -359,6 +375,10 @@ impl ChainClient {
         //  - ThrottleLayer (OUTERMOST, MeterLayer innermost so genuine 429s still reach
         //    the meter) paces dispatch to <=4/s, structurally preventing same-second
         //    spikes regardless of concurrency. Steady state (~1-2/s) is untouched.
+        //    Queued requests are served by priority lane (design §17.6): held-lock reads and
+        //    sends, then lock transactions, then pre-claim reads (capped at 25% of the rate),
+        //    then everything else. A request takes the lane of its `rpc_meter::with_lane`
+        //    scope; unscoped requests are all `Lane::Default`, i.e. the single FIFO limiter.
         //  - with_poll_interval(12s) widens alloy's watcher heartbeat cadence. NOTE: on
         //    the `run` path this is now DEFENSE-IN-DEPTH ONLY — no code registers the
         //    watcher anymore (every receipt wait goes through crate::tx::await_receipt,
@@ -369,11 +389,12 @@ impl ChainClient {
         // The send guard goes OUTERMOST, so a refused send is neither paced nor counted.
         let rpc_client = alloy::rpc::client::ClientBuilder::default()
             .layer(crate::send_guard::SendGuardLayer::new(watch_only))
-            .layer(crate::rpc_meter::ThrottleLayer::new(
+            .layer(crate::rpc_meter::ThrottleLayer::with_lanes(
                 config
                     .chain
                     .max_requests_per_sec
                     .unwrap_or(if watch_only { 1 } else { 4 }),
+                crate::rpc_meter::LaneConfig::default(),
             ))
             .layer(crate::rpc_meter::MeterLayer::new(rpc_meter.clone()))
             .transport(http, false)
@@ -476,8 +497,10 @@ impl ChainClient {
             head_block: Arc::new(AtomicU64::new(0)),
             program_info_cache: Arc::new(std::sync::Mutex::new(ProgramInfoCache::default())),
             submit_tx_cache: Arc::new(std::sync::Mutex::new(SubmitTxCache::default())),
+            elf_fetcher,
             nonce_mgr: Arc::new(crate::nonce::NonceManager::new()),
             abandoned_fulfill_nonces: Arc::new(std::sync::Mutex::new(Default::default())),
+            da_book: Arc::new(std::sync::Mutex::new(Default::default())),
             rpc_meter,
         })
     }
@@ -654,8 +677,57 @@ impl ChainClient {
     /// gap detector finds such a hole off the node's pending count — and a stuck fulfill's
     /// nonce is HANDED to `release_job` via the stash rather than recycled, so the release
     /// can displace it at that exact nonce.
+    ///
+    /// Once a state read has shown the operation settled, use [`settle_nonce`](Self::settle_nonce)
+    /// instead: our own transaction at the nonce may be what settled it.
     pub fn abort_nonce(&self, nonce: u64) {
         self.nonce_mgr.abort(nonce);
+    }
+
+    /// Resolve a reserved nonce once a STATE read has shown the operation settled — the job
+    /// fulfilled, locked or released by us, or no longer ours — while the receipt of what we
+    /// sent at `nonce` was never seen. Commits when our mined transaction count is past `nonce`,
+    /// aborts otherwise; returns whether it committed.
+    ///
+    /// The state alone cannot say which of our transactions caused it, so it is no proof that
+    /// `nonce` was consumed; the mined count is: on a single-signer account a count past `nonce`
+    /// means a transaction of ours at `nonce` mined (this one, a same-nonce replacement or a
+    /// filler). Recycling such a nonce hands the next reservation a guaranteed "nonce too low" —
+    /// what a fulfil whose receipt wait ended inside the block that mined it used to do. Below the
+    /// count, nothing at `nonce` has mined (yet), and the gap must be refilled: abort.
+    ///
+    /// `seen_at` is the block the state read was taken at. The count is read there first — the
+    /// same view as the state, so one lagging replica answering "latest" cannot turn a mined nonce
+    /// into a recycled one — then at the latest block. An unreadable count aborts, as before.
+    pub async fn settle_nonce(&self, nonce: u64, seen_at: Option<u64>) -> bool {
+        let at = seen_at
+            .map(alloy::eips::BlockId::number)
+            .into_iter()
+            .chain(std::iter::once(alloy::eips::BlockId::latest()));
+        for block in at {
+            if let Ok(count) = self
+                .provider
+                .get_transaction_count(self.address)
+                .block_id(block)
+                .await
+            {
+                if count > nonce {
+                    self.commit_nonce(nonce);
+                    return true;
+                }
+            }
+        }
+        self.abort_nonce(nonce);
+        false
+    }
+
+    /// Drain the fulfil nonce stashed for `job_id` (if any) on a path where no release will run
+    /// for it — the job settled or the lock is gone — through [`Self::settle_nonce`]: the stashed
+    /// fulfil may be the very transaction that settled it.
+    pub async fn settle_abandoned_nonce(&self, job_id: alloy::primitives::B256) {
+        if let Some(n) = self.take_abandoned_nonce(job_id) {
+            self.settle_nonce(n, None).await;
+        }
     }
 
     /// True if one of our txs is EXECUTABLE at the mined frontier, i.e. `pending > mined`.
@@ -1331,6 +1403,87 @@ impl ChainClient {
             .contains_key(&job_id)
     }
 
+    // ── The DA nonce rule (witness-construction-jobs §5.5) ──────────────────────────────────
+    //
+    // Hemi's sequencer leaves a transaction above the batcher's per-transaction DA cap out of its
+    // blocks, and every later nonce of its sender with it. So a LARGE fulfil goes out only as this
+    // key's highest pending nonce, and one that stays unmined is replaced at its nonce by a minimal
+    // self-transfer so later nonces proceed (`jobs::fulfill_job_hashed` drives this; `crate::da`
+    // holds the decisions and the detector).
+
+    /// This key's DA bookkeeping (see [`crate::da::DaSendBook`]). Never hold the guard across an
+    /// `.await`.
+    pub fn da_book(&self) -> std::sync::MutexGuard<'_, crate::da::DaSendBook> {
+        self.da_book.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether `nonce` is the highest nonce this process has handed out: no transaction of ours can
+    /// be pending above it. Call it under [`Self::tx_lock`] right before the send — a sibling that
+    /// reserves later sends after us, behind the lock.
+    pub fn nonce_is_highest_reserved(&self, nonce: u64) -> bool {
+        self.nonce_mgr.peek_next() == Some(nonce.saturating_add(1))
+    }
+
+    /// Use up a nonce this task reserved but must not spend on a large fulfil (siblings already hold
+    /// nonces above it, so a large fulfil there would not be the highest pending one): a 0-value,
+    /// 21,000-gas self-transfer at the ordinary fees, lifted over anything already broadcast at it.
+    /// About 100 estimated DA bytes, so the throttle never holds it, and the siblings above proceed.
+    /// The nonce is spent on success; on a refused send it is recycled.
+    pub async fn fill_reserved_nonce(&self, nonce: u64) -> Result<alloy::primitives::B256> {
+        let (base_tip, base_max_fee) = self.base_fees().await;
+        let over = |v: u128| v.saturating_add((v / 8).max(1));
+        let (tip, max_fee) = match self.nonce_mgr.fee_floor_state(nonce) {
+            Some(st) => (
+                base_tip.max(over(st.broadcast.0)),
+                base_max_fee.max(over(st.broadcast.1)),
+            ),
+            None => (base_tip, base_max_fee),
+        };
+        let max_fee = max_fee.max(tip);
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(self.address)
+            .value(alloy::primitives::U256::ZERO)
+            .nonce(nonce)
+            .gas_limit(21_000)
+            .max_priority_fee_per_gas(tip)
+            .max_fee_per_gas(max_fee);
+        let sent = {
+            let _guard = self.tx_lock.lock().await;
+            self.provider.send_transaction(tx).await
+        };
+        match sent {
+            Ok(p) => {
+                self.nonce_mgr.note_broadcast(nonce, tip, max_fee, base_max_fee);
+                tracing::info!(
+                    "DA nonce rule: nonce {nonce} sits below other reserved nonces — spent it on a \
+                     self-transfer ({:?}) so the large fulfil goes out as the highest pending nonce",
+                    p.tx_hash()
+                );
+                Ok(*p.tx_hash())
+            }
+            Err(e) => {
+                self.nonce_mgr.abort(nonce);
+                anyhow::bail!("DA nonce rule: filler self-transfer at nonce {nonce} refused: {e:#}")
+            }
+        }
+    }
+
+    /// Replace OUR pending transaction at `nonce` (a large fulfil the DA throttle may be filtering)
+    /// by a minimal self-transfer at a bumped fee, so every later nonce of this key proceeds. This is
+    /// the gap healer's fill ([`Self::heal_nonce_gap_at`]): a 21,000-gas self-transfer lifted 12.5%
+    /// over the highest fee broadcast at the nonce, within the heal ceiling. `Ok(true)` once it is
+    /// mined (or plugged in the mempool, above the frontier); `Ok(false)` if sent but unconfirmed
+    /// (the nonce stays visible to the gap watchdog); `Err` if the send was refused (e.g. "nonce too
+    /// low": the transaction mined first) or no out-bid is possible within the heal ceiling (the
+    /// nonce is then marked undisplaceable, which shuts the claim gate via
+    /// [`Self::signer_is_jammed`]).
+    pub async fn replace_with_self_transfer(&self, nonce: u64) -> Result<bool> {
+        tracing::warn!(
+            "DA nonce rule: replacing our unmined transaction at nonce {nonce} with a self-transfer"
+        );
+        self.heal_nonce_gap_at(nonce).await
+    }
+
     /// Base EIP-1559 fees used to SEED per-attempt fee escalation on tx re-broadcasts.
     /// Returns `(base_priority_fee, base_max_fee)` in wei.
     ///
@@ -1414,6 +1567,17 @@ impl ChainClient {
         // the key-wide ceiling.
         let (tip, max_fee) = hemi_fees(base, suggested.min(self.fee_ceiling / 2));
         (tip, max_fee, from_header)
+    }
+
+    /// The timestamp of block `number`: when a read made at that block was true on chain (a read at
+    /// the head of a lagging replica is as old as that head, whatever the wall clock says).
+    pub async fn block_timestamp(&self, number: u64) -> Result<u64> {
+        self.provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Number(number))
+            .await
+            .with_context(|| format!("block {number} header"))?
+            .map(|b| b.header.timestamp)
+            .ok_or_else(|| anyhow::anyhow!("the node has no block {number}"))
     }
 
     /// Read the latest block header and record its timestamp (see [`chain_now`]). Best-effort: a

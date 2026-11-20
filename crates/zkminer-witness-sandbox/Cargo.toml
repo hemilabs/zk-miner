@@ -1,0 +1,19 @@
+[package]
+name = "zkminer-witness-sandbox"
+version.workspace = true
+edition.workspace = true
+description = "Process sandbox for witness builders, execute workers and the broker (Landlock, seccomp, cgroup v2)"
+
+[[bin]]
+name = "zkminer-witness-sandbox-probe"
+path = "src/bin/zkminer-witness-sandbox-probe.rs"
+
+[dependencies]
+landlock = "=0.4.7"
+seccompiler = "0.5"
+libc = "0.2"
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

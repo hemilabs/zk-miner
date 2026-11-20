@@ -1,10 +1,13 @@
 pub mod adapter;
 pub mod auction;
 pub mod binding;
+pub mod claimability;
 pub mod client;
+pub mod da;
 pub mod deployment;
 pub mod descriptor;
 pub mod exit;
+pub mod governance;
 pub mod revert;
 pub mod jobs;
 pub mod monitor;

@@ -2233,10 +2233,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             );
             continue;
         };
-        // The ceiling is MEASURED, and replaces the estimate: above po2 20 `estimate_po2_memory` is an
-        // extrapolation (on a 4090, po2=22 died with "allocation of 14159970304 bytes for evaluated
-        // failed"), and the card's own run is the better word. An unmeasured size must not inherit a measured one's throughput and
-        // win the argmax, so no sample above it is kept either.
+        // The ceiling is MEASURED, and replaces the heuristic: `estimate_po2_memory` predicts 4 GB for
+        // po2=22 against a real ~14 GB (on a 4090, po2=22 died with "allocation of 14159970304 bytes
+        // for evaluated failed"). No size above it may win the argmax; the samples above it are kept
+        // only as the rates of the sizes they measured (see `sweep_po2`).
         if ceiling != db.max_feasible_po2 {
             tracing::info!(
                 "{key}: max_feasible_po2 {} → {ceiling} (measured)",
@@ -2249,9 +2249,14 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         // never lets it lower a default size the calibration proved) and what the TUI shows — when
         // the samples can say which is fastest (`calibration_is_usable`). One sample, or samples that
         // never split into segments, say only what fits: the ceiling is the size.
-        let usable = calibration_is_usable(&samples);
+        let within: Vec<Po2Sample> = samples
+            .iter()
+            .filter(|s| s.po2 <= ceiling)
+            .cloned()
+            .collect();
+        let usable = calibration_is_usable(&within);
         let best = if usable {
-            samples
+            within
                 .iter()
                 .max_by(|a, b| a.throughput.total_cmp(&b.throughput))
                 .map(|s| s.po2)
@@ -2282,8 +2287,15 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
     }
 }
 
-/// A card's po2 sweep for `calibrate_po2_for_suite`: the samples it keeps, all at or below the
-/// returned ceiling, or no ceiling when no size in the job range proved with headroom.
+/// A card's po2 sweep for `calibrate_po2_for_suite`: every size that proved, in order, and the ceiling,
+/// or no ceiling (and no samples) when no size in the job range proved with headroom.
+///
+/// A size above the ceiling is kept: the ceiling limits which size a calibration may choose, but a card
+/// may still prove at a size above it (its default size, which `risc0_job_po2` never lowers below a
+/// size the card proved), and is then planned at the rate measured there (`risc0_job_throughput`).
+/// Dropping it planned such a card at its slower rate one size down: an Arc A770 measured 116K c/s at
+/// po2 20, its job size, and 77K at 19, its ceiling, and was planned at 77K, which refused jobs it
+/// proves inside the watchdog.
 ///
 /// Upward from `start` to the first failure (or to `top`, or to a sample at a smaller size than asked,
 /// which `calibrate_slot_po2` returns when the card's free VRAM is short); if `start` itself failed,
@@ -2360,7 +2372,7 @@ fn sweep_po2(
             _ => return (Vec::new(), None, Some(highest)),
         }
     }
-    samples.retain(|s| s.po2 <= ceiling);
+    samples.sort_by_key(|s| s.po2);
     (samples, Some(ceiling), Some(highest))
 }
 
@@ -4793,6 +4805,18 @@ mod tests {
             risc0_job_throughput(&proved_22, 22, fit(32_607)),
             2_000_000.0
         );
+        // An Arc A770: 20 proved, 21 did not, so its ceiling is 19, but it proves at its default 20, at
+        // the rate measured there, not at 19's.
+        let (samples, ceiling, _) = sweep_po2(18, 22, |p| match p {
+            18 => Some(sample(18, 260, 46_289.0)),
+            19 => Some(sample(19, 122, 77_113.0)),
+            20 => Some(sample(20, 59, 116_003.0)),
+            _ => None,
+        });
+        assert_eq!(ceiling, Some(19));
+        let a770 = risc0_row(samples, 19, 19);
+        assert_eq!(risc0_job_throughput(&a770, 20, None), 116_003.0);
+        assert_eq!(risc0_job_throughput(&a770, 19, None), 77_113.0);
     }
 
     #[test]
@@ -4832,25 +4856,26 @@ mod tests {
 
     #[test]
     fn a_sweep_finds_each_cards_ceiling_with_a_step_of_headroom() {
-        // A 4090/5080-like card: 20 proves, 21 fails, so 19 (one step below the highest success).
+        // A 4090/5080-like card: 20 proves, 21 fails, so 19 (one step below the highest success);
+        // 20's sample is kept as the rate of a card that proves at 20.
         assert_eq!(
             sweep(18, 22, Some(20)),
-            (vec![18, 19], Some(19), vec![18, 19, 20, 21])
+            (vec![18, 19, 20], Some(19), vec![18, 19, 20, 21])
         );
-        // A 12 GB card (20 fails): 18, from a single sample, which still says what fits.
+        // A 12 GB card (20 fails): 18.
         assert_eq!(
             sweep(18, 22, Some(19)),
-            (vec![18], Some(18), vec![18, 19, 20])
+            (vec![18, 19], Some(18), vec![18, 19, 20])
         );
         // A card that fails at the start: down to the first size that proves, then its headroom
         // step, proved too.
         assert_eq!(
             sweep(18, 22, Some(17)),
-            (vec![16], Some(16), vec![18, 17, 16])
+            (vec![16, 17], Some(16), vec![18, 17, 16])
         );
         assert_eq!(
             sweep(18, 22, Some(18)),
-            (vec![17], Some(17), vec![18, 19, 17])
+            (vec![17, 18], Some(17), vec![18, 19, 17])
         );
         // Nothing in the job range with headroom: no size.
         assert_eq!(sweep(18, 22, Some(16)).1, None);
@@ -4863,7 +4888,7 @@ mod tests {
         // ...but clean to the job range's top, beyond which the prover refuses: one.
         assert_eq!(
             sweep(18, 22, Some(22)),
-            (vec![18, 19, 20, 21], Some(21), vec![18, 19, 20, 21, 22])
+            (vec![18, 19, 20, 21, 22], Some(21), vec![18, 19, 20, 21, 22])
         );
         // A sample at a smaller size than asked (free VRAM short) ends the sweep without a failure.
         let mut asked = Vec::new();

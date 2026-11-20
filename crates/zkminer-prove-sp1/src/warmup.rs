@@ -2,31 +2,26 @@
 //! (`WorkerCommand::Warmup`) rather than inside a proof's watchdog.
 //!
 //! - **Groth16 circuit artifacts** (~8 GB, downloaded once per host). The SDK's own installer
-//!   checks nothing it downloads (no hash, no HTTP status) and unpacks it with `tar -P`, which
-//!   keeps absolute and `..` member names: whoever can serve that archive can write any file this
-//!   user can. So this worker installs them itself, before the SDK or the server would: the archive
-//!   is checked against its pinned SHA-256 while it downloads, unpacked with the `tar` crate (plain
-//!   files and directories only, each inside the staging directory), and published only if its
-//!   `groth16_vk.bin` is the one the on-chain verifier was built from (its SHA-256 is that
-//!   verifier's `VERIFIER_HASH()`). An install already in place is held to the same verifying key
-//!   on every warm-up and replaced if it is not. The SDK's `.complete` marker is written with it,
-//!   so neither the SDK nor `sp1-gpu-server` downloads the circuit again over a checked copy.
-//!   Installs go into a staging directory under a lock and are renamed into place once complete,
-//!   and a torn directory is replaced.
+//!   creates the version directory first, then downloads and extracts into it, and treats any
+//!   directory it finds as installed. A download cut short, as a first proof's watchdog cuts one
+//!   on a fresh host, therefore leaves a torn directory that every later Groth16 proof fails on
+//!   until someone deletes it. Here the artifacts are installed into a staging directory under a
+//!   lock and renamed into place once complete, and a torn directory is replaced.
 //! - **The stripped circuit**, where this host's `sp1-gpu-server` runs Groth16 in a helper process
 //!   (hemilabs `sp1` from v6.8.1, `--sp1-groth16-cpu-helper`). Building it reads the full circuit:
 //!   ~26 s and ~14 GiB at peak, once per host. The server takes its own host-wide final-wrap slot
 //!   for it. Older servers prove Groth16 in-process and have nothing to build.
+//!
+//! The downloads here are the worker's only use of the network, and only before it runs any
+//! requester's guest or starts its server (see `confine_worker` in main.rs). Their clients and
+//! runtimes are dropped before `warm_up` returns, so no connection outlives them.
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use sha2::{Digest, Sha256};
+use anyhow::{anyhow, bail, Context, Result};
 use zkminer_prover_protocol::proc::{self, Outcome};
 
 /// The files a complete Groth16 artifact directory has, all non-empty.
@@ -37,20 +32,14 @@ const REQUIRED_FILES: &[&str] = &[
     "constraints.json",
 ];
 /// What the SDK's installer downloads into the directory before extracting it, and removes after:
-/// a directory that still has it was interrupted. This installer downloads under the same name.
+/// a directory that still has it was interrupted.
 const DOWNLOAD_LEFTOVER: &str = "artifacts.tar.gz";
-/// The SDK's marker of a finished install (`sp1_prover::build`'s `CIRCUIT_ARTIFACTS_COMPLETE_FILE`,
-/// which is private). Without it the SDK and `sp1-gpu-server` download the circuit again.
+/// The marker the SDK's installer writes once an install is complete
+/// (`sp1_prover::build::CIRCUIT_ARTIFACTS_COMPLETE_FILE`, private), and the only thing its
+/// `try_install_circuit_artifacts` checks before it downloads the artifacts again. `sp1-gpu-server`
+/// runs that check at every Groth16 proof, with no network (see `confine_worker` in main.rs), so a
+/// directory the warm-up calls complete must have it too.
 const SDK_COMPLETE_MARKER: &str = ".complete";
-
-/// The SP1 circuit the pins below are for. Every SDK from 6.1.0 to 6.10.0 emits it.
-const PINNED_CIRCUIT_VERSION: &str = "v6.1.0";
-/// SHA-256 of `v6.1.0-groth16.tar.gz` (hemiprove-abi/INTERACTION_GUIDE.md, prover checklist step 7).
-const GROTH16_ARCHIVE_SHA256: &str =
-    "18beebb6cd0cc9b4d4a240ee4f49511da6c2a7e51724bad4232de538a9147810";
-/// SHA-256 of the circuit's `groth16_vk.bin`: the on-chain v6.1.0 Groth16 verifier's
-/// `VERIFIER_HASH()` (zkminer-chain `deployment::pins::SP1_V6_1_0_GROTH16_VERIFIER_HASH`).
-const GROTH16_VK_SHA256: &str = "4388a21c687fdd5f218d7e3d13190cac4c5355818d3605fd5fb811df468ee696";
 
 /// The argument that makes a hemilabs `sp1-gpu-server` act as its Groth16 CPU helper.
 const CPU_HELPER_ARG: &str = "--sp1-groth16-cpu-helper";
@@ -64,9 +53,6 @@ const PREPARE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Enough of the helper's stderr to say why it failed.
 const STDERR_CAP: u64 = 64 * 1024;
 
-/// Told of a long step's progress: the step, its bytes so far, its bytes in all.
-type Progress<'a> = dyn FnMut(&str, Option<u64>, Option<u64>) + 'a;
-
 /// What the warm-up did, for the dispatcher.
 pub(crate) struct WarmupReport {
     pub summary: String,
@@ -77,20 +63,31 @@ pub(crate) struct WarmupReport {
 /// Installs the Groth16 circuit artifacts if they are not installed, and builds the stripped
 /// circuit where the server supports it. `report(step, done bytes, total bytes)` is told before
 /// each long step, and every second during a download or an unpack.
-pub(crate) fn warm_up(report: &mut Progress<'_>) -> Result<WarmupReport> {
+pub(crate) fn warm_up(
+    report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
+) -> Result<WarmupReport> {
     let dir = sp1_prover::build::groth16_circuit_artifacts_dir()
         .context("cannot locate the Groth16 circuit artifacts directory")?;
     let started = Instant::now();
-    let version = sp1_prover::SP1_CIRCUIT_VERSION.trim();
-    ensure!(
-        version == PINNED_CIRCUIT_VERSION,
-        "this SDK's SP1 circuit is {version}, but zkminer pins the Groth16 artifacts of \
-         {PINNED_CIRCUIT_VERSION} only — refusing to install unchecked artifacts"
-    );
-    let installed = ensure_installed(&dir, GROTH16_VK_SHA256, |staging| {
-        install(staging, version, report)
+    let installed = ensure_installed(&dir, |staging| {
+        // A worker that has run a requester's guest (or started its server) has no network: say so
+        // rather than fail inside the download.
+        if crate::network_denied() {
+            bail!(
+                "the Groth16 circuit artifacts are not installed in {}, and this worker cannot \
+                 download them: it has run a requester's guest, after which a worker has no \
+                 network. A fresh worker installs them in its warm-up",
+                dir.display()
+            );
+        }
+        let archive_bytes = archive_size();
+        report(DOWNLOADING, Some(0), archive_bytes);
+        with_progress(
+            report,
+            || sdk_progress(staging, archive_bytes),
+            || download(staging),
+        )
     })?;
-    mark_complete_for_sdk(&dir)?;
     let mut summary = format!(
         "Groth16 circuit artifacts {} ({}, {:.0?})",
         installed.describe(),
@@ -128,20 +125,25 @@ pub(crate) fn server_path() -> Result<PathBuf> {
         .filter(|home| !home.is_empty())
         .or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
         .ok_or_else(|| anyhow!("$HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".sp1/bin").join(format!(
-        "{}{}",
-        server_name(),
-        std::env::consts::EXE_SUFFIX
-    )))
+    Ok(PathBuf::from(home)
+        .join(".sp1/bin")
+        .join(format!("{}{}", server_name(), std::env::consts::EXE_SUFFIX)))
 }
 
 /// The build of `sp1-gpu-server` this worker's SDK runs: `SP1_GPU_SERVER_NAME` (set by the dispatcher
 /// for an AMD or Intel card, hemilabs/sp1 #19), else the SDK's default, the CUDA build.
+///
+/// Once a proving worker routes the SDK through its confining shim (`confinement`), the variable
+/// names the shim, `zkminer-confined-<build>`: this is still the build's own name.
 pub(crate) fn server_name() -> String {
-    std::env::var("SP1_GPU_SERVER_NAME")
+    let name = std::env::var("SP1_GPU_SERVER_NAME")
         .ok()
         .filter(|name| !name.is_empty() && !name.contains('/'))
-        .unwrap_or_else(|| "sp1-gpu-server".to_string())
+        .unwrap_or_else(|| "sp1-gpu-server".to_string());
+    match name.strip_prefix(crate::confinement::SHIM_PREFIX) {
+        Some(real) if !real.is_empty() => real.to_string(),
+        _ => name,
+    }
 }
 
 /// Whether this worker drives a CUDA card (the default server), rather than the HIP or SYCL build.
@@ -168,47 +170,22 @@ impl Installed {
     }
 }
 
-/// Whether `dir` holds a complete set of Groth16 circuit artifacts whose `groth16_vk.bin` has the
-/// SHA-256 `vk_sha256` (lowercase hex).
-pub(crate) fn is_complete(dir: &Path, vk_sha256: &str) -> bool {
+/// Whether `dir` holds a complete set of Groth16 circuit artifacts: one the SDK too takes as
+/// installed (its [`SDK_COMPLETE_MARKER`]), and so never downloads again in a proof.
+pub(crate) fn is_complete(dir: &Path) -> bool {
     !dir.join(DOWNLOAD_LEFTOVER).exists()
+        && dir.join(SDK_COMPLETE_MARKER).is_file()
         && REQUIRED_FILES.iter().all(|name| {
             fs::metadata(dir.join(name)).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
         })
-        && file_sha256(&dir.join("groth16_vk.bin")).is_ok_and(|got| got == vk_sha256)
 }
 
-/// The SHA-256 of the file at `path`, lowercase hex.
-fn file_sha256(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)?;
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Writes the SDK's `.complete` marker into the checked install at `dir` if it has none (an install
-/// made before this worker wrote it), so the SDK and the server take it as installed.
-fn mark_complete_for_sdk(dir: &Path) -> Result<()> {
-    let marker = dir.join(SDK_COMPLETE_MARKER);
-    if !marker.is_file() {
-        fs::write(&marker, []).with_context(|| format!("cannot write {}", marker.display()))?;
-    }
-    Ok(())
-}
-
-/// Makes `dir` a complete artifact directory whose verifying key has the SHA-256 `vk_sha256`,
-/// running `install` (which fills the empty directory it is given) if it is not one. One installer
-/// at a time per host; see the module docs.
+/// Makes `dir` a complete artifact directory, running `install` (which fills the empty directory
+/// it is given) if it is not one. One installer at a time per host; see the module docs.
 pub(crate) fn ensure_installed(
     dir: &Path,
-    vk_sha256: &str,
     install: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<Installed> {
-    let is_complete = |dir: &Path| is_complete(dir, vk_sha256);
     if is_complete(dir) {
         return Ok(Installed::AlreadyPresent);
     }
@@ -280,7 +257,7 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(1);
 /// Runs `step` on a thread of its own, passing `report` what `measure` says every second: the step
 /// and its bytes so far. For a download or an unpack whose library reports nothing itself.
 fn with_progress<T: Send>(
-    report: &mut Progress<'_>,
+    report: &mut dyn FnMut(&str, Option<u64>, Option<u64>),
     measure: impl Fn() -> (&'static str, Option<u64>, Option<u64>),
     step: impl FnOnce() -> T + Send,
 ) -> T {
@@ -301,6 +278,79 @@ fn with_progress<T: Send>(
     })
 }
 
+/// Where the SDK's install into `staging` is. It downloads `artifacts.tar.gz` into a sibling
+/// `<staging>.incomplete.*` folder, unpacks it there, then renames that folder to `staging`.
+fn sdk_progress(
+    staging: &Path,
+    archive_bytes: Option<u64>,
+) -> (&'static str, Option<u64>, Option<u64>) {
+    let prefix = format!(
+        "{}.incomplete.",
+        staging
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
+    let work = staging
+        .parent()
+        .and_then(|parent| fs::read_dir(parent).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path());
+    let Some(work) = work else {
+        return (DOWNLOADING, Some(0), archive_bytes);
+    };
+    let archive = work.join("artifacts.tar.gz");
+    let archive_done = size_on_disk(&archive);
+    let unpacking = fs::read_dir(&work)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name() != "artifacts.tar.gz");
+    if unpacking {
+        let unpacked = size_on_disk(&work).saturating_sub(archive_done);
+        (UNPACKING, Some(unpacked), None)
+    } else {
+        (DOWNLOADING, Some(archive_done), archive_bytes)
+    }
+}
+
+/// The size of the archive the SDK downloads, asked of the server, for a progress bar.
+fn archive_size() -> Option<u64> {
+    let url = format!(
+        "{}/{}-groth16.tar.gz",
+        sp1_prover::build::CIRCUIT_ARTIFACTS_URL_BASE,
+        sp1_prover::SP1_CIRCUIT_VERSION.trim()
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .ok()?;
+        let response = client
+            .head(&url)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        // The header, not `content_length()`: for a HEAD reply that is the empty body's size, 0.
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
+    })
+}
+
 /// Bytes in `path`, a file or a directory tree; what cannot be read counts as nothing.
 fn size_on_disk(path: &Path) -> u64 {
     let Ok(meta) = fs::metadata(path) else {
@@ -317,129 +367,20 @@ fn size_on_disk(path: &Path) -> u64 {
         .sum()
 }
 
-/// Downloads the pinned Groth16 archive of circuit `version` into `staging`, unpacks it there and
-/// writes the SDK's marker. `ensure_installed` then checks the verifying key before publishing it.
-fn install(staging: &Path, version: &str, report: &mut Progress<'_>) -> Result<()> {
-    let url = format!(
-        "{}/{version}-groth16.tar.gz",
-        sp1_prover::build::CIRCUIT_ARTIFACTS_URL_BASE
-    );
+/// The SDK's download and extraction, into `staging`.
+fn download(staging: &Path) -> Result<()> {
     tracing::info!(
-        "downloading the Groth16 circuit artifacts (~8 GB) from {url} into {}",
+        "downloading the Groth16 circuit artifacts (~8 GB) into {}",
         staging.display()
     );
-    let archive = staging.join(DOWNLOAD_LEFTOVER);
-    let part = staging.join(format!("{DOWNLOAD_LEFTOVER}.part"));
-    let total = AtomicU64::new(0);
-    report(DOWNLOADING, Some(0), None);
-    with_progress(
-        report,
-        || {
-            let total = total.load(Ordering::Relaxed);
-            (
-                DOWNLOADING,
-                Some(size_on_disk(&part)),
-                (total > 0).then_some(total),
-            )
-        },
-        || download(&url, GROTH16_ARCHIVE_SHA256, &part, &archive, &total),
-    )?;
-    report(UNPACKING, Some(0), None);
-    let unpacked = with_progress(
-        report,
-        || {
-            let unpacked = size_on_disk(staging).saturating_sub(size_on_disk(&archive));
-            (UNPACKING, Some(unpacked), None)
-        },
-        || unpack(&archive, staging),
-    );
-    let _ = fs::remove_file(&archive);
-    unpacked?;
-    fs::write(staging.join(SDK_COMPLETE_MARKER), [])
-        .with_context(|| format!("cannot write the marker in {}", staging.display()))?;
-    Ok(())
-}
-
-/// Downloads `url` to `part`, checking on the way that its SHA-256 is `sha256` (lowercase hex), and
-/// renames it to `to` only if it is. `total` is set to the size the server gives.
-fn download(url: &str, sha256: &str, part: &Path, to: &Path, total: &AtomicU64) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(None)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
-        .context("cannot build the HTTP client")?;
-    let mut response = client
-        .get(url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .with_context(|| format!("cannot download {url}"))?;
-    if let Some(bytes) = response.content_length() {
-        total.store(bytes, Ordering::Relaxed);
-    }
-    let fetched = (|| -> Result<(String, u64)> {
-        let mut out =
-            File::create(part).with_context(|| format!("cannot write {}", part.display()))?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut bytes = 0u64;
-        loop {
-            let n = match response.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e).context("the Groth16 circuit download was cut short"),
-            };
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])?;
-            bytes += n as u64;
-        }
-        out.sync_all()?;
-        Ok((hex(&hasher.finalize()), bytes))
-    })();
-    let (got, bytes) = match fetched {
-        Ok(fetched) => fetched,
-        Err(e) => {
-            let _ = fs::remove_file(part);
-            return Err(e);
-        }
-    };
-    if got != sha256 {
-        let _ = fs::remove_file(part);
-        bail!(
-            "{url} ({bytes} bytes) has SHA-256 {got}, not the pinned {sha256} — not installing it"
-        );
-    }
-    fs::rename(part, to).with_context(|| format!("cannot move it to {}", to.display()))?;
-    Ok(())
-}
-
-/// Unpacks the gzipped tarball `archive` into `into`: plain files and directories only, each of
-/// them inside `into` (the `tar` crate refuses absolute and `..` member paths). Anything else (a
-/// link, a device) fails the install.
-fn unpack(archive: &Path, into: &Path) -> Result<()> {
-    let file = File::open(archive).with_context(|| format!("cannot open {}", archive.display()))?;
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(BufReader::new(file)));
-    tar.set_preserve_permissions(false);
-    tar.set_unpack_xattrs(false);
-    for entry in tar.entries().context("cannot read the Groth16 archive")? {
-        let mut entry = entry.context("cannot read the Groth16 archive")?;
-        let kind = entry.header().entry_type();
-        let path = entry
-            .path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unreadable name>".to_string());
-        ensure!(
-            kind.is_file() || kind.is_dir(),
-            "the Groth16 archive has a {kind:?} member {path} — refusing it"
-        );
-        ensure!(
-            entry
-                .unpack_in(into)
-                .with_context(|| format!("cannot unpack {path}"))?,
-            "the Groth16 archive member {path} is outside the install directory — refusing it"
-        );
-    }
-    Ok(())
+        .context("cannot start a runtime for the download")?;
+    runtime.block_on(sp1_sdk::install::install_circuit_artifacts(
+        staging.to_path_buf(),
+        "groth16",
+    ))
 }
 
 /// An exclusive lock on `path`, held until the file is dropped: `flock` on Unix, `LockFileEx` on
@@ -533,19 +474,39 @@ impl Drop for TestDir {
 
 #[cfg(test)]
 mod tests {
+    /// The size the progress bar divides by, from the real server. Run by hand:
+    /// `cargo test -p zkminer-prove-sp1 archive_size -- --ignored`.
+    #[test]
+    #[ignore = "asks SP1's download server"]
+    fn the_archive_size_comes_from_the_server() {
+        let bytes = super::archive_size().expect("the server gives the archive's size");
+        assert!(bytes > 1_000_000_000, "{bytes} bytes");
+    }
+
     use super::*;
     use std::cell::Cell;
-
-    /// The SHA-256 of the verifying key `fill` writes.
-    fn vk() -> String {
-        hex(&Sha256::digest(b"x"))
-    }
 
     fn fill(dir: &Path) -> Result<()> {
         for name in REQUIRED_FILES {
             fs::write(dir.join(name), b"x")?;
         }
+        fs::write(dir.join(SDK_COMPLETE_MARKER), b"")?;
         Ok(())
+    }
+
+    /// Every file but the SDK's marker: the SDK would download the artifacts again, inside a proof,
+    /// so the warm-up replaces them now.
+    #[test]
+    fn an_install_without_the_sdks_marker_is_replaced() {
+        let root = TestDir::new();
+        let dir = root.path().join("v6.0.0");
+        fs::create_dir(&dir).unwrap();
+        fill(&dir).unwrap();
+        assert!(is_complete(&dir));
+        fs::remove_file(dir.join(SDK_COMPLETE_MARKER)).unwrap();
+        assert!(!is_complete(&dir));
+        assert_eq!(ensure_installed(&dir, fill).unwrap(), Installed::Downloaded);
+        assert!(is_complete(&dir));
     }
 
     #[test]
@@ -555,7 +516,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         fill(&dir).unwrap();
         let ran = Cell::new(false);
-        let outcome = ensure_installed(&dir, &vk(), |_| {
+        let outcome = ensure_installed(&dir, |_| {
             ran.set(true);
             Ok(())
         });
@@ -571,21 +532,15 @@ mod tests {
         let dir = root.path().join("v6.0.0");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join(DOWNLOAD_LEFTOVER), b"partial").unwrap();
-        assert!(!is_complete(&dir, &vk()));
-        assert_eq!(
-            ensure_installed(&dir, &vk(), fill).unwrap(),
-            Installed::Downloaded
-        );
-        assert!(is_complete(&dir, &vk()));
+        assert!(!is_complete(&dir));
+        assert_eq!(ensure_installed(&dir, fill).unwrap(), Installed::Downloaded);
+        assert!(is_complete(&dir));
         assert!(!dir.join(DOWNLOAD_LEFTOVER).exists());
 
         // Extracted but cut short: an empty file counts as missing.
         fs::write(dir.join("groth16_pk.bin"), b"").unwrap();
-        assert!(!is_complete(&dir, &vk()));
-        assert_eq!(
-            ensure_installed(&dir, &vk(), fill).unwrap(),
-            Installed::Downloaded
-        );
+        assert!(!is_complete(&dir));
+        assert_eq!(ensure_installed(&dir, fill).unwrap(), Installed::Downloaded);
     }
 
     /// A failed download publishes nothing and leaves no staging directory behind; staging left by
@@ -596,7 +551,7 @@ mod tests {
         let dir = root.path().join("v6.0.0");
         let stale = root.path().join(".v6.0.0.staging.999999");
         fs::create_dir(&stale).unwrap();
-        let failed = ensure_installed(&dir, &vk(), |staging| {
+        let failed = ensure_installed(&dir, |staging| {
             fs::write(staging.join("groth16_pk.bin"), b"half")?;
             Err(anyhow!("connection reset"))
         });
@@ -611,7 +566,7 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
 
         // And a download that "succeeds" without every file is not published either.
-        let short = ensure_installed(&dir, &vk(), |staging| {
+        let short = ensure_installed(&dir, |staging| {
             Ok(fs::write(staging.join("groth16_vk.bin"), b"x")?)
         });
         assert!(format!("{:#}", short.unwrap_err()).contains("incomplete"));
@@ -628,7 +583,7 @@ mod tests {
             let handles: Vec<_> = (0..3)
                 .map(|_| {
                     scope.spawn(|| {
-                        ensure_installed(&dir, &vk(), |staging| {
+                        ensure_installed(&dir, |staging| {
                             downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             std::thread::sleep(Duration::from_millis(200));
                             fill(staging)
@@ -647,118 +602,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(is_complete(&dir, &vk()));
-    }
-
-    /// An install whose verifying key is not the pinned one (another circuit, or a tampered copy) is
-    /// not complete, and is replaced.
-    #[test]
-    fn an_install_with_another_verifying_key_is_replaced() {
-        let root = TestDir::new();
-        let dir = root.path().join("v6.1.0");
-        fs::create_dir(&dir).unwrap();
-        fill(&dir).unwrap();
-        fs::write(dir.join("groth16_vk.bin"), b"another key").unwrap();
-        assert!(!is_complete(&dir, &vk()));
-        assert_eq!(
-            ensure_installed(&dir, &vk(), fill).unwrap(),
-            Installed::Downloaded
-        );
-        assert!(is_complete(&dir, &vk()));
-
-        // And an install whose key is wrong is not published.
-        fs::write(dir.join("groth16_vk.bin"), b"another key").unwrap();
-        let wrong = ensure_installed(&dir, &vk(), |staging| {
-            fill(staging)?;
-            Ok(fs::write(staging.join("groth16_vk.bin"), b"still another")?)
-        });
-        assert!(format!("{:#}", wrong.unwrap_err()).contains("incomplete"));
-        assert!(!dir.exists());
-    }
-
-    #[test]
-    fn the_sdk_marker_is_written_once() {
-        let root = TestDir::new();
-        mark_complete_for_sdk(root.path()).unwrap();
-        assert!(root.path().join(SDK_COMPLETE_MARKER).is_file());
-        mark_complete_for_sdk(root.path()).unwrap();
-    }
-
-    /// A gzipped tarball of `members`, written into `dir`: (name, kind, contents). A name is
-    /// written into the header as given, `..` and all, as a hostile archive would have it.
-    fn tarball(dir: &Path, members: &[(&str, tar::EntryType, &[u8])]) -> PathBuf {
-        let path = dir.join("test.tar.gz");
-        let gz = flate2::write::GzEncoder::new(File::create(&path).unwrap(), Default::default());
-        let mut builder = tar::Builder::new(gz);
-        for (name, kind, data) in members {
-            let mut header = tar::Header::new_gnu();
-            header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
-            header.set_entry_type(*kind);
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            if kind.is_symlink() {
-                header.set_link_name("/etc/passwd").unwrap();
-            }
-            header.set_cksum();
-            builder.append(&header, *data).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap();
-        path
-    }
-
-    #[test]
-    fn unpack_takes_plain_members_inside_the_directory_only() {
-        let root = TestDir::new();
-        let into = root.path().join("into");
-        fs::create_dir(&into).unwrap();
-        let ok = tarball(
-            root.path(),
-            &[
-                ("./", tar::EntryType::Directory, b""),
-                ("./groth16_vk.bin", tar::EntryType::Regular, b"key"),
-            ],
-        );
-        unpack(&ok, &into).unwrap();
-        assert_eq!(fs::read(into.join("groth16_vk.bin")).unwrap(), b"key");
-
-        let escaping = tarball(
-            root.path(),
-            &[("../escaped.bin", tar::EntryType::Regular, b"x")],
-        );
-        assert!(unpack(&escaping, &into).is_err());
-        assert!(!root.path().join("escaped.bin").exists());
-
-        let linked = tarball(root.path(), &[("link", tar::EntryType::Symlink, b"")]);
-        assert!(format!("{:#}", unpack(&linked, &into).unwrap_err()).contains("refusing"));
-        assert!(fs::symlink_metadata(into.join("link")).is_err());
-    }
-
-    /// The real install: downloads the pinned archive (6.2 GB), checks it, unpacks it (8.4 GB) into a
-    /// scratch directory and checks the verifying key. Run by hand:
-    /// `cargo test -p zkminer-prove-sp1 the_pinned_archive_installs -- --ignored`.
-    #[test]
-    #[ignore = "downloads 6.2 GB from SP1's artifact server"]
-    fn the_pinned_archive_installs() {
-        let root = TestDir::new();
-        let dir = root.path().join(PINNED_CIRCUIT_VERSION);
-        let installed = ensure_installed(&dir, GROTH16_VK_SHA256, |staging| {
-            install(staging, PINNED_CIRCUIT_VERSION, &mut |_, _, _| {})
-        })
-        .unwrap();
-        assert_eq!(installed, Installed::Downloaded);
-        assert!(is_complete(&dir, GROTH16_VK_SHA256));
-        assert!(dir.join(SDK_COMPLETE_MARKER).is_file());
-    }
-
-    /// The pins are for the circuit this SDK emits.
-    #[test]
-    fn the_pins_are_the_circuits() {
-        assert_eq!(
-            sp1_prover::SP1_CIRCUIT_VERSION.trim(),
-            PINNED_CIRCUIT_VERSION
-        );
-        assert_eq!(GROTH16_ARCHIVE_SHA256.len(), 64);
-        assert_eq!(GROTH16_VK_SHA256.len(), 64);
+        assert!(is_complete(&dir));
     }
 
     /// The probe tells a helper-hosting server from one that rejects the argument, as the pinned

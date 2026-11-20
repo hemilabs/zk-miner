@@ -24,12 +24,16 @@ sp1-sdk = { version = "6.0", features = ["blocking", "cuda"] }
 # Directly only for `build::groth16_circuit_artifacts_dir`, which sp1-sdk 6.8 no longer re-exports;
 # sp1-sdk depends on it already.
 sp1-prover = "6.0"
-# Installs SP1's Groth16 circuit artifacts itself (`warmup`), checked against their pinned SHA-256,
-# rather than through the SDK, which checks nothing and unpacks with `tar -P`. All three are in the
-# lockfile already (zkminer-prove-risc0 installs its Groth16 component the same way).
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-tar = "0.4"
-flate2 = "1"
+# Asks the server how big SP1's circuit download is, for its progress bar.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# For the version `sp1-gpu-server --version` must report (the SDK downloads another otherwise, which
+# a worker that has run a guest has no network for), and for a stand-in server's in the tests.
+# sp1-sdk depends on it already.
+sp1-primitives = "6.0"
+
+# Denies the worker the network before it runs a requester's guest (`deny_network`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zkminer-witness-sandbox = { workspace = true }
 
 [build-dependencies]
 sp1-build = "6.0"
@@ -38,8 +42,8 @@ sp1-build = "6.0"
 # For the error and socket path the SDK does not re-export, which this worker reads the text of and
 # mirrors: the tests hold those to the pinned SDK. sp1-sdk depends on it already.
 sp1-cuda = "6.0"
-# For the version a stand-in server must report. Also through sp1-sdk.
-sp1-primitives = "6.0"
+# tests/gpu_confined.rs: a directory for the exported guest.
+tempfile = "3"
 
 [[test]]
 name = "server_faults"

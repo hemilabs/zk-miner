@@ -975,6 +975,15 @@ fn draw(f: &mut Frame, state: &MinerState) {
         left_spans.push(Span::styled(" DISCONNECTED ", badge));
     }
 
+    // Developer mode: never on a public market, so it is never out of sight.
+    if state.dev_private_network {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            " DEV MODE: PRIVATE NETWORK ",
+            theme::badge_error(),
+        ));
+    }
+
     // Paused badge (STOPPING once the miner is shutting down: it is paused for that, and `p`
     // cannot resume it)
     if state.shutdown.is_some() {

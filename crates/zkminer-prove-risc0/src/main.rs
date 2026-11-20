@@ -6,7 +6,11 @@
 use std::io::{self, BufReader, BufWriter};
 use std::time::Instant;
 
+mod confinement;
 mod groth16_component;
+mod groth16_wrap;
+mod segments;
+mod witness;
 
 use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
@@ -63,8 +67,32 @@ fn use_shipped_level_zero_driver() {
 }
 
 fn main() {
+    // `--groth16-docker-helper`: the Docker Groth16 wrap's helper process (groth16_wrap.rs), which
+    // never runs a guest. It does not return.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(groth16_wrap::HELPER_ARG))
+    {
+        groth16_wrap::helper_main();
+    }
+
+    // `--witness-execute`: the one-shot sandboxed execute of a witness job (witness.rs). FIRST, before
+    // anything can start a thread, read a file or set up logging: it restricts itself while the
+    // process still has one thread, and runs the guest with the seed it is handed. No return.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            zkminer_prover_protocol::WITNESS_EXECUTE_ARG,
+        ))
+    {
+        witness::execute_main();
+    }
+
     #[cfg(feature = "intel")]
     use_shipped_level_zero_driver();
+
+    // A private temporary directory, named by TMPDIR from here on, while the process has one thread:
+    // the confinement lets the worker write there and almost nowhere else (confinement.rs). And the
+    // directory its proofs write their segments to, on disk (segments.rs), which it may write too.
+    confinement::prepare();
+    segments::prepare();
 
     // Direct benchmark mode runs the operator's own guests and prints a human table to the REAL
     // stdout, so it must come before the fd-1 redirect below. It speaks no IPC.
@@ -76,6 +104,11 @@ fn main() {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
+        // The benchmark proves on the GPU, so it is confined like any proof (confinement.rs).
+        if let Err(e) = confinement::confine() {
+            eprintln!("cannot confine this worker, so it proves nothing: {e}");
+            std::process::exit(1);
+        }
         let results = run_benchmarks();
         for r in &results {
             println!(
@@ -159,13 +192,52 @@ fn main() {
             )
             // Whatever RUST_LOG says: an Execute reports how often its guest read host entropy.
             .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()))
+            // And a witness proof that diverged reports its keccak requests in its cycles.
+            .with(
+                witness::keccak_assumptions::Counter
+                    .with_filter(witness::keccak_assumptions::filter()),
+            )
             .init();
     }
+    // Said on stderr before logging was up; again through it.
+    segments::log_fallback();
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Workers that run requester guests are confined: the first command that runs a guest or uses the
+/// GPU (`Execute`, `Prove`, `ProgramId`, `Benchmark`, `CalibrateSegmentLimit`, the Intel warm-up's
+/// proof) first confines this process, its threads and everything it starts, for the rest of its
+/// life (`confinement`: no sockets, Landlock, no reaching other processes). That setup (`Warmup`:
+/// the Groth16 component's download) runs before, as the miner warms a backend before it claims its
+/// jobs; a `Warmup` after refuses rather than download (`groth16_component::ensure_installed`), and
+/// the miner runs it on a fresh worker.
+///
+/// An error means the guest must not run: the caller answers the command with it.
+fn confine() -> Result<(), String> {
+    confinement::confine()
+}
+
+/// Whether this worker has confined itself ([`confine`]), and so has no network.
+fn network_denied() -> bool {
+    confinement::is_confined()
+}
+
+/// [`confine`] before a guest or GPU command, or the answer refusing it.
+fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
+    confine().map_err(|e| {
+        tracing::error!("cannot confine this worker, so it runs no guest: {e}");
+        WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!(
+                "this worker could not confine itself, so it runs no requester's guest: {e}"
+            ),
+        }
+    })
 }
 
 fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
@@ -223,6 +295,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
             WorkerCommand::Benchmark { programs, po2 } => match job_segment_po2(po2) {
                 Ok(po2) => {
                     tracing::info!("Running benchmarks at po2 {po2}...");
+                    if let Err(refused) = guest_may_run(0) {
+                        write_message(&mut stdout, &refused)?;
+                        continue;
+                    }
                     let results = run_benchmarks_streaming(&mut stdout, &programs, po2)?;
                     let resp = WorkerResponse::BenchmarkResult { results };
                     write_message(&mut stdout, &resp)?;
@@ -237,13 +313,94 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 }
             },
 
+            // A witness-construction job (plan §15.3): its input read from the bundle and checked,
+            // executed once, and proven only if it reproduces the bundle's journal.
             WorkerCommand::Prove {
                 request_id,
                 elf,
                 input_data,
                 po2,
                 program_id,
+                witness: Some(witness),
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
+                tracing::info!(
+                    "Proving witness request {request_id} ({} bytes ELF, {} bytes W, po2={po2:?})",
+                    elf.len(),
+                    witness.w_len
+                );
+                let started = WorkerResponse::Progress {
+                    request_id,
+                    fraction: 0.0,
+                    elapsed_secs: 0.0,
+                    segments: None,
+                };
+                write_message(&mut stdout, &started)?;
+                // Contained as the inline arm's is: see there.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    witness::run_witness_proof(&elf, &input_data, po2, program_id, &witness)
+                }));
+                let resp = match outcome {
+                    Ok(Ok(witness::WitnessOutcome::Proved((
+                        journal,
+                        seal,
+                        duration_secs,
+                        cycles,
+                    )))) => WorkerResponse::ProofResult {
+                        request_id,
+                        journal,
+                        seal,
+                        duration_secs,
+                        cycles,
+                    },
+                    Ok(Ok(witness::WitnessOutcome::Diverged(d))) => {
+                        tracing::warn!(
+                            "Witness request {request_id} diverged from its bundle (exit kind {}, \
+                             code {}, {} journal bytes): not proving",
+                            d.exit_kind,
+                            d.exit_code,
+                            d.journal_len
+                        );
+                        WorkerResponse::JournalDiverged {
+                            request_id,
+                            journal: d.journal,
+                            journal_len: d.journal_len,
+                            journal_sha256: d.journal_sha256,
+                            exit_kind: d.exit_kind,
+                            exit_code: d.exit_code,
+                            cycles: d.cycles,
+                        }
+                    }
+                    Ok(Err(e)) => match e.downcast_ref::<witness::WitnessRefusal>() {
+                        // Typed by the worker before any guest ran (or, for an unprovable session,
+                        // by the checks themselves): never from text.
+                        Some(refusal) => WorkerResponse::Error {
+                            request_id,
+                            kind: refusal.kind(),
+                            message: format!("{e:#}"),
+                        },
+                        None => prove_error_response(request_id, e),
+                    },
+                    Err(panic) => prove_panic_response(request_id, panic),
+                };
+                write_message(&mut stdout, &resp)?;
+            }
+
+            WorkerCommand::Prove {
+                request_id,
+                elf,
+                input_data,
+                po2,
+                program_id,
+                witness: None,
+            } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!(
                     "Proving request {request_id} ({} bytes ELF, po2={po2:?})",
                     elf.len()
@@ -288,72 +445,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                         write_message(&mut stdout, &resp)?;
                     }
                     Err(panic) => {
-                        // A prove-path panic is usually OURS: risc0's CUDA HAL panics on a failed
-                        // allocation or GPU call (`.unwrap()` / `panic!` in hal/cuda.rs). It does not
-                        // say the job is bad, so it must never be typed InvalidInput. OOM routes to a
-                        // bigger card; anything else is a sick worker to replace.
-                        let detail = panic
-                            .downcast_ref::<String>()
-                            .map(String::as_str)
-                            .or_else(|| panic.downcast_ref::<&str>().copied())
-                            .unwrap_or("");
-                        let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") {
-                            ErrorKind::ResourceExhausted
-                        } else {
-                            ErrorKind::Internal
-                        };
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind,
-                            message: format!("risc0 prover panicked: {detail}"),
-                        };
-                        write_message(&mut stdout, &resp)?;
+                        write_message(&mut stdout, &prove_panic_response(request_id, panic))?;
                     }
                     Ok(Err(e)) => {
-                        let msg = format!("{e:#}");
-                        let lower = msg.to_ascii_lowercase();
-                        // A guest-execution fault must be classified BEFORE is_gpu_oom. risc0 wraps a
-                        // guest panic as "Guest panicked: <msg>" — a host-generated prefix followed by
-                        // the guest's OWN text. Feeding that whole string to is_gpu_oom let a guest
-                        // panic with "out of memory" and steer ITSELF onto a worker kill+respawn and a
-                        // bigger-card retry — the self-classification the typed `kind` was meant to
-                        // prevent. A guest that faults in the prove-only path is a BAD JOB, not a sick
-                        // worker: classify InvalidInput and never let its text reach is_gpu_oom.
-                        // (Session-/cycle-limit are too-heavy bad jobs; their text is host-generated.)
-                        // "Unknown syscall: <name>" quotes a GUEST-chosen string (and has no panic
-                        // prefix), so it is matched here, before any classifier reads the text.
-                        let kind = if lower.contains("guest panicked")
-                            || lower.starts_with("unknown syscall")
-                            || lower.contains(": unknown syscall")
-                            || lower.contains("session limit")
-                            || lower.contains("exceeded cycle")
-                            || lower.contains("non-zero exit code")
-                        {
-                            ErrorKind::InvalidInput
-                        } else if msg.contains("does not match job programId") {
-                            // The served ELF's image id is not this job's programId — permanent for the
-                            // program. Report ProgramMismatch so the host stops claiming its jobs.
-                            ErrorKind::ProgramMismatch
-                        } else if is_gpu_oom(&msg) {
-                            // GPU OOM — host/driver text (guest faults are handled above): tag
-                            // ResourceExhausted so the dispatcher kills + respawns this worker with a
-                            // clean GPU context (a wedged/leaked context would fail every later proof).
-                            ErrorKind::ResourceExhausted
-                        } else if msg.contains("po2 value") || msg.contains("out of valid range") {
-                            // Bad job (wrong po2), not a sick worker: InvalidInput so the dispatcher
-                            // does not kill+respawn a healthy worker.
-                            ErrorKind::InvalidInput
-                        } else if msg.contains("serialize") || msg.contains("bincode") {
-                            ErrorKind::Internal
-                        } else {
-                            ErrorKind::ProofFailed
-                        };
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind,
-                            message: msg,
-                        };
-                        write_message(&mut stdout, &resp)?;
+                        write_message(&mut stdout, &prove_error_response(request_id, e))?;
                     }
                 }
             }
@@ -365,6 +460,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 program_id,
                 po2,
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!(
                     "Execute request {request_id} ({} bytes ELF, po2={po2:?})",
                     elf.len()
@@ -477,6 +576,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
             }
 
             WorkerCommand::ProgramId { request_id, elf } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // The image id alone: no execution. The ELF is submitter-controlled and reaches
                 // risc0's parser here, which can panic on a malformed one (see the Execute arm), so a
                 // panic is contained and reported as a property of the ELF. Under the same RSS
@@ -516,6 +619,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
 
             WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
                 tracing::info!("Po2 calibration requested at po2={po2}");
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 match run_po2_calibration(request_id, po2) {
                     Ok(resp) => write_message(&mut stdout, &resp)?,
                     Err(e) => {
@@ -532,6 +639,85 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The answer to a Prove whose proving panicked (inline and witness proofs alike).
+fn prove_panic_response(request_id: u64, panic: Box<dyn std::any::Any + Send>) -> WorkerResponse {
+    // A prove-path panic is usually OURS: risc0's CUDA HAL panics on a failed
+    // allocation or GPU call (`.unwrap()` / `panic!` in hal/cuda.rs). It does not
+    // say the job is bad, so it must never be typed InvalidInput. OOM routes to a
+    // bigger card; anything else is a sick worker to replace.
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") {
+        ErrorKind::ResourceExhausted
+    } else {
+        ErrorKind::Internal
+    };
+    WorkerResponse::Error {
+        request_id,
+        kind,
+        message: format!("risc0 prover panicked: {detail}"),
+    }
+}
+
+/// The answer to a Prove that failed with an error (inline and witness proofs alike).
+fn prove_error_response(request_id: u64, e: anyhow::Error) -> WorkerResponse {
+    let msg = format!("{e:#}");
+    // A full segment filesystem (or quota) is this host's, not the job's: known by the error's type
+    // (an ENOSPC or EDQUOT in its chain, or the room check's refusal), never by its text.
+    if segments::storage_exhausted(&e) {
+        return WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!("this host's segment disk is full, not the job's fault: {msg}"),
+        };
+    }
+    let lower = msg.to_ascii_lowercase();
+    // A guest-execution fault must be classified BEFORE is_gpu_oom. risc0 wraps a
+    // guest panic as "Guest panicked: <msg>" — a host-generated prefix followed by
+    // the guest's OWN text. Feeding that whole string to is_gpu_oom let a guest
+    // panic with "out of memory" and steer ITSELF onto a worker kill+respawn and a
+    // bigger-card retry — the self-classification the typed `kind` was meant to
+    // prevent. A guest that faults in the prove-only path is a BAD JOB, not a sick
+    // worker: classify InvalidInput and never let its text reach is_gpu_oom.
+    // (Session-/cycle-limit are too-heavy bad jobs; their text is host-generated.)
+    // "Unknown syscall: <name>" quotes a GUEST-chosen string (and has no panic
+    // prefix), so it is matched here, before any classifier reads the text.
+    let kind = if lower.contains("guest panicked")
+        || lower.starts_with("unknown syscall")
+        || lower.contains(": unknown syscall")
+        || lower.contains("session limit")
+        || lower.contains("exceeded cycle")
+        || lower.contains("non-zero exit code")
+    {
+        ErrorKind::InvalidInput
+    } else if msg.contains("does not match job programId") {
+        // The served ELF's image id is not this job's programId — permanent for the
+        // program. Report ProgramMismatch so the host stops claiming its jobs.
+        ErrorKind::ProgramMismatch
+    } else if is_gpu_oom(&msg) {
+        // GPU OOM — host/driver text (guest faults are handled above): tag
+        // ResourceExhausted so the dispatcher kills + respawns this worker with a
+        // clean GPU context (a wedged/leaked context would fail every later proof).
+        ErrorKind::ResourceExhausted
+    } else if msg.contains("po2 value") || msg.contains("out of valid range") {
+        // Bad job (wrong po2), not a sick worker: InvalidInput so the dispatcher
+        // does not kill+respawn a healthy worker.
+        ErrorKind::InvalidInput
+    } else if msg.contains("serialize") || msg.contains("bincode") {
+        ErrorKind::Internal
+    } else {
+        ErrorKind::ProofFailed
+    };
+    WorkerResponse::Error {
+        request_id,
+        kind,
+        message: msg,
+    }
 }
 
 fn detect_gpu() -> (bool, Option<String>) {
@@ -831,11 +1017,9 @@ fn with_rss_self_guard<T>(limit_bytes: Option<u64>, f: impl FnOnce() -> T) -> T 
 fn sys_rand_seed(image_id: &[u8; 32], input_data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
-    let mut h = Sha256::new();
-    h.update(zkminer_prover_protocol::sys_rand::SYS_RAND_DOMAIN);
-    h.update(image_id);
-    h.update(Sha256::digest(input_data));
-    h.finalize().into()
+    // The rule's one implementation, which the miner's witness path calls too.
+    let input_sha256: [u8; 32] = Sha256::digest(input_data).into();
+    zkminer_prover_protocol::sys_rand::risc0_seed(image_id, &input_sha256)
 }
 
 /// The environment every run of a job starts from: its input and its `sys_rand` seed, together, so a
@@ -1120,39 +1304,9 @@ fn run_execute(
         }
     }
 
-    // A guest that halts with no output (a zero output digest: `sys_halt` skipped `env::finalize`)
-    // executes cleanly and proves, but its receipt never verifies — a claim without an output is not
-    // what `receipt.verify(image_id)` or the chain accept. An honest guest always has one, if empty.
-    // (One that halts with a non-zero digest other than its output's, the pinned executor refuses
-    // itself, as it does a bigint2 witness its verify program rejects.)
-    let output = session
-        .receipt_claim
-        .as_ref()
-        .and_then(|c| c.output.as_value().ok())
-        .and_then(|o| o.as_ref())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "execute: the guest halted without an output — no proof of this program+input can \
-                 verify"
-            )
-        })?;
-    // Everything the proof would assume must be something it also proves: the guest's keccak root.
-    // Anything else (an `env::verify_assumption2` of an arbitrary claim) executes cleanly here and
-    // fails every proof ("no receipt available for unresolved assumption").
     let keccak = keccak.borrow();
-    let root = keccak.root();
-    let assumptions = output
-        .assumptions
-        .as_value()
-        .map_err(|_| anyhow::anyhow!("execute: the session's assumptions are pruned"))?;
-    for a in &assumptions.0 {
-        if a.as_value().ok() != root.as_ref() {
-            anyhow::bail!(
-                "execute: the guest assumes a claim no proof here resolves — every proof of this \
-                 program+input would fail"
-            );
-        }
-    }
+    let assumption_count =
+        check_claim_output(session.receipt_claim.as_ref(), keccak.root().as_ref())?;
 
     // What proving costs, and reports as `total_cycles`: every segment padded to its power of two.
     // `SessionInfo::cycles()` counts user cycles only — no paging, no padding — and a guest that
@@ -1161,7 +1315,7 @@ fn run_execute(
     // proof of its own (a 2^17-row keccak STARK, its lift and a join), priced here as a 2^20 segment.
     let cycles: u64 = session.segments.iter().map(|s| 1u64 << s.po2).sum::<u64>() + keccak.cycles;
     let host_entropy_reads =
-        reads_given_keccak(host_entropy_reads, keccak.cycles, assumptions.0.len());
+        reads_given_keccak(host_entropy_reads, keccak.cycles, assumption_count);
     // The journal the guest committed here is byte-identical to the one the later proof
     // would carry at this segment size (both are a deterministic function of (ELF, input) at the size
     // both run at, which a guest can tell — `sys_rand` included, via the shared seed — and the image-id
@@ -1178,6 +1332,86 @@ fn run_execute(
         keccak_cycles: keccak.cycles,
     })
 }
+
+/// The checks on the claim of a session that halted with code 0, which every path that executes a
+/// job applies (the measure path, the witness execute and the witness proof): it has an output, and
+/// it assumes nothing but `keccak_root`. Returns how many assumptions it makes.
+///
+/// `keccak_root` is the root of the keccak requests a [`KeccakAudit`] took. A session executed
+/// without one keeps its requests and leaves their root out of its claim's assumptions
+/// (`Session::claim`), so it passes `None` and must assume nothing at all.
+fn check_claim_output(
+    claim: Option<&risc0_zkvm::ReceiptClaim>,
+    keccak_root: Option<&risc0_zkvm::Assumption>,
+) -> anyhow::Result<usize> {
+    // A guest that halts with no output (a zero output digest: `sys_halt` skipped `env::finalize`)
+    // executes cleanly and proves, but its receipt never verifies — a claim without an output is not
+    // what `receipt.verify(image_id)` or the chain accept. An honest guest always has one, if empty.
+    // (One that halts with a non-zero digest other than its output's, the pinned executor refuses
+    // itself, as it does a bigint2 witness its verify program rejects.)
+    let output = claim
+        .and_then(|c| c.output.as_value().ok())
+        .and_then(|o| o.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "execute: the guest halted without an output — no proof of this program+input can \
+                 verify"
+            )
+        })?;
+    // Everything the proof would assume must be something it also proves: the guest's keccak root.
+    // Anything else (an `env::verify_assumption2` of an arbitrary claim) executes cleanly here and
+    // fails every proof ("no receipt available for unresolved assumption").
+    let assumptions = output
+        .assumptions
+        .as_value()
+        .map_err(|_| anyhow::anyhow!("execute: the session's assumptions are pruned"))?;
+    for a in &assumptions.0 {
+        let a = a.as_value().ok();
+        if a != keccak_root {
+            if a.is_some_and(|a| a.control_root.to_string() == RECURSION_4_0_CONTROL_ROOT) {
+                return Err(GuestBuiltWithOldRisc0.into());
+            }
+            anyhow::bail!(
+                "execute: the guest assumes a claim no proof here resolves — every proof of this \
+                 program+input would fail"
+            );
+        }
+    }
+    Ok(assumptions.0.len())
+}
+
+/// risc0-circuit-recursion 4.0's `ALLOWED_CONTROL_ROOT`, the root risc0-zkvm 3.0.x guests name.
+///
+/// A guest's keccak batcher assumes the root of two or more batches under the
+/// `ALLOWED_CONTROL_ROOT` of the recursion crate its own risc0-zkvm links. This prover is risc0-zkvm
+/// 3.1 (recursion 4.1, whose root is `risc0_zkvm::ALLOWED_CONTROL_ROOT`) and resolves those under its
+/// own root only, so a 3.0 guest that needs two batches executes cleanly and fails every proof ("no
+/// receipt available for unresolved assumption"). Its requester can fix that by rebuilding the guest,
+/// which [`GuestBuiltWithOldRisc0`] says.
+const RECURSION_4_0_CONTROL_ROOT: &str =
+    "a54dc85ac99f851c92d7c96d7318af41dbe7c0194edfcc37eb4d422a998c1f56";
+
+/// The refusal of a guest that assumes a claim under [`RECURSION_4_0_CONTROL_ROOT`]: it was built with
+/// risc0-zkvm older than 3.1. Typed, so the sandboxed witness execute reports it by an exit code of
+/// its own (`WitnessExecuteFailure::OldRisc0Guest`) and the host can name the cause without reading
+/// the worker's log.
+#[derive(Debug)]
+pub(crate) struct GuestBuiltWithOldRisc0;
+
+impl std::fmt::Display for GuestBuiltWithOldRisc0 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "execute: the guest was built with risc0-zkvm older than 3.1: it assumes a claim under \
+             risc0-circuit-recursion 4.0's control root 0x{RECURSION_4_0_CONTROL_ROOT} (what a \
+             risc0-zkvm 3.0 guest's keccak batcher names for two or more batches), which this \
+             risc0-zkvm 3.1 prover cannot resolve, so every proof of this program+input would fail. \
+             Rebuild the guest with risc0-zkvm 3.1.0 (its image id changes)"
+        )
+    }
+}
+
+impl std::error::Error for GuestBuiltWithOldRisc0 {}
 
 /// Cards with less VRAM than this release the Groth16 SRS cache after every proof.
 ///
@@ -1309,17 +1543,14 @@ impl risc0_zkvm::SessionEvents for SegmentProgress {
     }
 }
 
-/// `prove_with_opts` for a job, reporting each proven segment to the host. The same calls it makes
-/// (`LocalProver::prove_with_ctx` → `ProverServer::prove_with_ctx`), taken one level down so the
-/// session can carry a hook: the prover server first (its GPU warm-up and Groth16 key load overlap
-/// the execution), then the execution, then `prove_session`. The segment size is always set here,
-/// so the server's own choice of one, the only other thing `prove_with_ctx` does, never applies.
+/// `groth16_wrap::prove` for a job, reporting each proven segment to the host: the execution, then
+/// `groth16_wrap::prove_session`, taken one level down from `prove_with_opts` so the session can
+/// carry a hook. The segment size is always set here, so the server's own choice of one, the only
+/// other thing `prove_with_ctx` does, never applies.
 fn prove_reporting_segments(
     env: risc0_zkvm::ExecutorEnv<'_>,
     elf: &[u8],
-    opts: &risc0_zkvm::ProverOpts,
 ) -> Result<risc0_zkvm::ProveInfo> {
-    let server = risc0_zkvm::get_prover_server(opts)?;
     // A start, also on a retry inside this worker (`run_proof`): the host starts its progress over.
     send_to_host(|request_id| WorkerResponse::Progress {
         request_id,
@@ -1332,8 +1563,8 @@ fn prove_reporting_segments(
     let total = u32::try_from(session.segments.len()).unwrap_or(u32::MAX);
     report_stage(zkminer_prover_protocol::ProveStage::Prove, 0, total);
     session.add_hook(SegmentProgress { total });
-    let ctx = risc0_zkvm::VerifierContext::default().with_dev_mode(opts.dev_mode());
-    server.prove_session(&ctx, &session)
+    // In-process, or to a succinct receipt the Groth16 helper wraps (`groth16_wrap`).
+    groth16_wrap::prove_session(&session)
 }
 
 fn run_proof(
@@ -1351,6 +1582,15 @@ fn run_proof(
     }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
     let seed = sys_rand_seed(&image_id, input_data);
+    prove_with_retries(|| run_proof_once(elf, input_data, po2, seed))
+}
+
+/// Run `prove_once` (one proof) until it succeeds, re-proving only the nondeterministic
+/// invalid-proof class; shared by the inline proof and the witness proof (which re-proves one
+/// session).
+fn prove_with_retries(
+    mut prove_once: impl FnMut() -> Result<(Vec<u8>, Vec<u8>, f64, u64)>,
+) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // Retry-on-invalid mitigation for the rare (~1.5%) nondeterministic GPU
     // timing race on RTX 5090 / Blackwell (sm_120) — an intra-kernel race
     // produces an internally-invalid segment STARK, surfaced as
@@ -1369,7 +1609,7 @@ fn run_proof(
     // the host tries another card.
     let mut last_failed_segment: Option<u64> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match run_proof_once(elf, input_data, po2, seed) {
+        match prove_once() {
             Ok(result) => {
                 if attempt > 1 {
                     tracing::warn!(
@@ -1438,8 +1678,6 @@ fn run_proof_once(
     po2: Option<u8>,
     seed: [u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
-    use risc0_zkvm::ProverOpts;
-
     // TEST-ONLY: RISC0_TEST_INJECT_INVALID=N makes the first N calls return a
     // synthetic invalid-proof error before proving, to exercise the retry-on-
     // invalid wrapper deterministically (and cheaply, on any guest/GPU).
@@ -1466,24 +1704,35 @@ fn run_proof_once(
         tracing::info!("Setting session_limit = {limit} cycles (operator override)");
         env_builder.session_limit(Some(limit));
     }
+    let _segments = segments::spill_here(&mut env_builder);
+    // Not started on a disk it would fill part-way through its execution.
+    segments::check_room().context("the segment directory before a proof")?;
     let env = env_builder.build()?;
 
     // Use Groth16 receipt kind for on-chain verifiable proofs.
     // This performs STARK proving followed by Groth16 SNARK compression,
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
-    let opts = ProverOpts::groth16().with_dev_mode(false);
     let start = Instant::now();
-    let proved = prove_reporting_segments(env, elf, &opts);
+    let proved = prove_reporting_segments(env, elf);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
     let duration_secs = start.elapsed().as_secs_f64();
 
-    let receipt = prove_info.receipt;
-
     // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug)
     let image_id =
         risc0_zkvm::compute_image_id(elf).context("Failed to compute image ID for verification")?;
+    groth16_proof_output(prove_info, image_id, duration_secs)
+}
+
+/// The journal, seal, duration and cycles of a Groth16 proof of `image_id`, after checking it as every
+/// job proof is checked (inline and witness alike): halted with code 0, verifying, Groth16.
+fn groth16_proof_output(
+    prove_info: risc0_zkvm::ProveInfo,
+    image_id: risc0_zkvm::Digest,
+    duration_secs: f64,
+) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
+    let receipt = prove_info.receipt;
 
     // Defense in depth against a guest that halts with a non-zero exit code: `receipt.verify` below
     // builds the expected claim as Halted(0), so a non-zero exit deterministically fails verification
@@ -1629,11 +1878,10 @@ fn benchmark_stages(
     // At the size the host names: the one this card proves jobs at before any calibration, so its
     // throughput and host peak describe them. On a 12 GB card that is 19; at 20 its proofs spill
     // into shared memory and run several times slower than any job it proves.
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .write_slice(input)
-        .segment_limit_po2(po2 as u32)
-        .build()
-        .ok()?;
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(input).segment_limit_po2(po2 as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build().ok()?;
 
     // ONE proof, staged, so each stage is timed exactly rather than inferred from two runs.
     //
@@ -1706,10 +1954,7 @@ fn benchmark_stages(
     // (`~/.risc0/extensions/*-risc0-groth16/stark_verify_final.zkey`), so it does not depend on the
     // program at all — which is the reason to report it apart from the stages above.
     let started = Instant::now();
-    let wrapped = prover.compress(
-        &risc0_zkvm::ProverOpts::groth16().with_dev_mode(false),
-        &succinct,
-    );
+    let wrapped = groth16_wrap::compress(&prover, &succinct);
     let wrap_secs = started.elapsed().as_secs_f64();
     // Outside the stopwatch: the release is not part of the wrap, and on a card that releases, the NEXT
     // wrap pays the reload — which is that card's honest per-proof cost.
@@ -1801,18 +2046,21 @@ const CALIBRATION_ITERS: u32 = 6_000_000;
 #[cfg(feature = "intel")]
 fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     let component = groth16_component::ensure_installed(report)?;
+    // The warm-up proof runs on the GPU and fills the kernel caches a confined worker reads, so it
+    // runs confined too (confinement.rs).
+    confine().map_err(|e| anyhow::anyhow!("cannot confine this worker: {e}"))?;
     report(
         "Preparing GPU kernels for this card (a first run can take several minutes)",
         None,
         None,
     );
     let start = Instant::now();
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .write_slice(&1000u32.to_le_bytes())
-        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32)
-        .build()?;
-    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
-    let proved = local_prover().prove_with_opts(env, FIBONACCI_ELF, &opts);
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(&1000u32.to_le_bytes())
+        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build()?;
+    let proved = groth16_wrap::prove(&local_prover(), env, FIBONACCI_ELF);
     release_groth16_cache_if_tight();
     proved?
         .receipt
@@ -1833,10 +2081,10 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     let input = CALIBRATION_ITERS.to_le_bytes();
-    let env = risc0_zkvm::ExecutorEnv::builder()
-        .write_slice(&input)
-        .segment_limit_po2(po2 as u32)
-        .build()?;
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(&input).segment_limit_po2(po2 as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build()?;
 
     let start = std::time::Instant::now();
     let prover = local_prover();
@@ -1856,8 +2104,7 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     // where the real spread is 98%, leaving its argmax to be decided by noise. It also
     // under-reports MEMORY pressure: po2=21 completes composite-only but OOMs on the
     // real groth16 path, so a composite-derived max_feasible_po2 is too optimistic.
-    let opts = risc0_zkvm::ProverOpts::groth16().with_dev_mode(false);
-    let proved = prover.prove_with_opts(env, FIBONACCI_ELF, &opts);
+    let proved = groth16_wrap::prove(&prover, env, FIBONACCI_ELF);
     release_groth16_cache_if_tight();
     let prove_info = proved?;
     let duration = start.elapsed();
@@ -1872,6 +2119,18 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
         total_cycles,
         prove_duration_secs: duration.as_secs_f64(),
     })
+}
+
+/// Held by every unit test that executes a guest, so none runs while
+/// `a_guest_that_reads_no_entropy_counts_zero` counts its `sys_rand` lines. With one subscriber
+/// registered, tracing-core caches a callsite's interest from whichever thread first hits it: a guest
+/// executed concurrently on a thread with no subscriber caches the handler's line as uninteresting,
+/// and the count reads `None`. In sequence it cannot: registering the counting subscriber recomputes
+/// every cached interest.
+#[cfg(test)]
+fn serial_guest_execution() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -1998,6 +2257,65 @@ mod keccak_audit_tests {
         };
         assert_eq!(swapped.root(), audit(2).root());
     }
+
+    /// A halted claim with a journal and these assumptions.
+    fn claim_assuming(assumptions: Vec<risc0_zkvm::Assumption>) -> risc0_zkvm::ReceiptClaim {
+        let mut claim = risc0_zkvm::ReceiptClaim::ok(risc0_zkvm::Digest::ZERO, vec![1u8, 2, 3]);
+        claim.output = Some(risc0_zkvm::Output {
+            journal: vec![1u8, 2, 3].into(),
+            assumptions: risc0_zkvm::Assumptions(assumptions.into_iter().map(Into::into).collect())
+                .into(),
+        })
+        .into();
+        claim
+    }
+
+    #[test]
+    fn a_keccak_root_under_recursion_4_0_is_refused_as_a_guest_built_before_3_1() {
+        let audit = KeccakAudit {
+            requests: vec![request(1), request(2)],
+            cycles: 0,
+        };
+        let root = audit.root().expect("two requests");
+        assert_eq!(
+            check_claim_output(Some(&claim_assuming(vec![root.clone()])), Some(&root)).unwrap(),
+            1,
+            "the root this prover makes"
+        );
+        // The same union, as a risc0-zkvm 3.0 guest's batcher names it.
+        let mut root_3_0 = root.clone();
+        root_3_0.control_root = risc0_zkvm::Digest::try_from(
+            &(0..32)
+                .map(|i| {
+                    u8::from_str_radix(&RECURSION_4_0_CONTROL_ROOT[2 * i..2 * i + 2], 16).unwrap()
+                })
+                .collect::<Vec<u8>>()[..],
+        )
+        .unwrap();
+        assert_eq!(
+            root_3_0.control_root.to_string(),
+            RECURSION_4_0_CONTROL_ROOT
+        );
+        assert_ne!(root_3_0.control_root, risc0_zkvm::ALLOWED_CONTROL_ROOT);
+        let e = check_claim_output(Some(&claim_assuming(vec![root_3_0])), Some(&root)).unwrap_err();
+        assert!(
+            e.downcast_ref::<GuestBuiltWithOldRisc0>().is_some(),
+            "{e:#}"
+        );
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("built with risc0-zkvm older than 3.1")
+                && text.contains("Rebuild the guest with risc0-zkvm 3.1.0")
+                && text.contains("0xa54dc85a"),
+            "{text}"
+        );
+        // Any other claim no proof here resolves keeps the general refusal.
+        let mut other = root.clone();
+        other.control_root = risc0_zkvm::Digest::from([9u32; 8]);
+        let e = check_claim_output(Some(&claim_assuming(vec![other])), Some(&root)).unwrap_err();
+        assert!(e.downcast_ref::<GuestBuiltWithOldRisc0>().is_none());
+        assert!(format!("{e:#}").contains("no proof here resolves"), "{e:#}");
+    }
 }
 
 #[cfg(test)]
@@ -2100,6 +2418,7 @@ mod sys_rand_draw_tests {
         let image = verify_program_id(FIBONACCI_ELF, None).unwrap();
         let subscriber = tracing_subscriber::registry()
             .with(sys_rand_draws::Counter.with_filter(sys_rand_draws::filter()));
+        let _serial = serial_guest_execution();
         let outcome = tracing::subscriber::with_default(subscriber, || {
             run_execute(FIBONACCI_ELF, &10u32.to_le_bytes(), Some(image), Some(20)).unwrap()
         });
@@ -2160,5 +2479,34 @@ mod retry_tests {
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
         let err = run_execute(FIBONACCI_ELF, &[], Some(image), Some(po2)).unwrap_err();
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::{prove_error_response, ErrorKind, WorkerResponse};
+
+    fn kind(e: anyhow::Error) -> (ErrorKind, String) {
+        match prove_error_response(1, e) {
+            WorkerResponse::Error { kind, message, .. } => (kind, message),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A proof that failed because the segment filesystem (or this user's quota) is full is this
+    /// host's failure, not a failed proof of the job; a guest that only says so is still the job's.
+    #[test]
+    fn a_full_segment_disk_is_the_hosts_failure() {
+        for code in [libc::ENOSPC, libc::EDQUOT] {
+            let e = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
+                .context("writing segment 4095");
+            let (k, message) = kind(e);
+            assert!(matches!(k, ErrorKind::Internal), "{k:?}");
+            assert!(message.contains("segment disk is full"), "{message}");
+        }
+        let (k, _) = kind(anyhow::anyhow!(
+            "Guest panicked: No space left on device (os error 28)"
+        ));
+        assert!(matches!(k, ErrorKind::InvalidInput), "{k:?}");
     }
 }

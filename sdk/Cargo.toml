@@ -1,0 +1,48 @@
+# The builder SDK and its examples: their own workspace and lockfile, excluded from the zkminer
+# workspace (they target wasm32-unknown-unknown; the SDK and the example have no dependencies, the
+# realistic test builders have many). See README.md.
+[workspace]
+resolver = "2"
+members = [
+    "hemiprove-builder-sdk",
+    "examples/latest-block",
+    "examples/proxy-slots",
+    "test-builders/faults",
+    "test-builders/params-echo",
+    "test-builders/receipts-proof",
+    "test-builders/storage-proof",
+]
+# `reference` is a symlink to the zkminer repository's reference/ directory: the eth prelude and the
+# statements builders share with their guests. Through it those crates sit inside this workspace's
+# directory, so cargo identifies them by a path relative to it and a builder's bytes do not depend on
+# where the checkout is. Excluded, so they are path dependencies and not members (their host-only
+# dev-dependencies stay out of this lockfile).
+exclude = ["reference"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Builders trap on panic (the runner reports TRAP); `panic = "abort"` makes a panic a wasm
+# `unreachable` instead of unwinding machinery. One codegen unit, LTO and no debug info keep the
+# module small and the build reproducible.
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+incremental = false
+
+[profile.dev]
+panic = "abort"
+
+# The realistic test builders are built for speed, as a builder that pays for fuel would be: bigger
+# functions with more locals, the heavier case for the runner's compile-cost budget.
+[profile.release.package.receipts-proof]
+opt-level = 3
+
+[profile.release.package.storage-proof]
+opt-level = 3

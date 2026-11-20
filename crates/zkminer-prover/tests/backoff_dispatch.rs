@@ -108,7 +108,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
             None,
             None,
             None,
-            None,
+            zkminer_prover::dispatcher::JobCards::default(),
             0,
         );
         r.map(|_| ()).map_err(|e| format!("{e:#}"))
@@ -144,7 +144,7 @@ fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
         None,
         None,
         None,
-        None,
+        zkminer_prover::dispatcher::JobCards::default(),
         0,
     );
     let elapsed = t0.elapsed();

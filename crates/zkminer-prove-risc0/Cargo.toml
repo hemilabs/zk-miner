@@ -56,6 +56,12 @@ risc0-groth16 = { version = "3.0" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 liblzma = { version = "0.4", features = ["parallel"] }
 tar = "0.4"
+# The Docker Groth16 helper reads the prover image's proof (`groth16_wrap`).
+serde_json = "1"
+
+# The one-shot sandboxed witness execute (`--witness-execute`, src/witness.rs) restricts itself with it.
+[target.'cfg(target_os = "linux")'.dependencies]
+zkminer-witness-sandbox = { workspace = true }
 
 [package.metadata.risc0]
 methods = [
@@ -79,6 +85,9 @@ methods = [
 
 [dev-dependencies]
 tempfile = "3"
+# tests/witness_execute.rs drives the CPU worker's sandboxed execute through the miner's launcher.
+zkminer-prover = { workspace = true }
+zkminer-witness-sandbox = { workspace = true }
 
 [build-dependencies]
 risc0-build = "3.0"

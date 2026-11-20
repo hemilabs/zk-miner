@@ -20,21 +20,57 @@ alloy-primitives = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
+# Witness-construction jobs: the envelope tag and the record types are plain data on every platform.
+zkminer-witness = { workspace = true }
 # Only needed by the optional `sp1-demo` command; made optional so the `zkminer`
 # binary (and the RISC0 prover path) builds without the SP1 native toolchain.
 sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "820d55ef6fc30e83dea5fec1bf4c15b86bc989a9", default-features = false, features = ["blocking"], optional = true }
 
+# Serving witness-construction jobs needs the rootless sandbox (Landlock, seccomp, cgroup v2) and the
+# retention store's `*at` syscalls: Linux only. Elsewhere `[witness] enabled` is refused at startup.
+[target.'cfg(target_os = "linux")'.dependencies]
+zkminer-witness-host = { path = "../zkminer-witness-host" }
+zkminer-witness-store = { workspace = true }
+zkminer-witness-sandbox = { workspace = true }
+zkminer-witness-broker = { path = "../zkminer-witness-broker" }
+zkminer-netguard = { workspace = true, features = ["client"] }
+# `zkminer artifact publish --kind builder`: the file must parse as a WASM module (the builder's pin).
+wasmparser = { version = "=0.254.2", default-features = false, features = ["std"] }
+# `zkminer artifact publish --kind elf`: a risc0 3.x guest is a `R0BF` program binary, loaded as the
+# miners load it (the workspace's pinned fork).
+risc0-binfmt = "3.0"
+zeroize = { workspace = true }
+sha2 = "0.10"
+# `zkminer artifact publish` signs with an encrypted keystore (Web3 Secret Storage), never a raw key,
+# decrypted in `artifact::keys` with every parameter checked first and every secret zeroed (the
+# versions eth-keystore uses, so nothing new enters the tree).
+scrypt = { version = "0.10", default-features = false }
+pbkdf2 = { version = "0.11", default-features = false }
+hmac = "0.12"
+aes = "0.8"
+ctr = "0.9"
+hex = { workspace = true }
+libc = "0.2"
+
 [dev-dependencies]
+# Tests write keystores the way other tools do (eth-keystore), for `artifact publish` to read.
+alloy-signer-local = { version = "1", features = ["keystore"] }
 # The localnet test: signals and parent-death signals for the processes it starts.
 libc = "0.2"
+# The localnet test's plan §12 job: the reference statement's header, binding and journal.
+hemiprove-proxy-slots = { workspace = true }
+tempfile = "3"
+wat = "1"
 
 [features]
 default = []

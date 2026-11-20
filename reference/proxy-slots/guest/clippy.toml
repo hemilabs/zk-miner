@@ -1,0 +1,65 @@
+# Host inputs a guest must never let reach its journal or a selection (plan §8.2, §21.1 item 4):
+# randomness (sys_rand, getrandom, and the standard hash maps it seeds), cycle counts, the
+# environment and arguments, early exits, the raw syscall entry points that reach all of these
+# around their wrappers, other file descriptors, the raw keccak permutation's status, and every
+# interior-mutable type (cells, once-cells, lazies, locks, atomics): one in a `static` is what a
+# function the guards accept could read, and the guard types refuse to hold one (`static` itself
+# has no clippy lint: the source scan refuses it). `../check-guest-lints.sh` runs clippy with them denied
+# (for the zkVM target, with the risc0 toolchain); `methods/tests/guest_lints.rs` checks the sources
+# of everything the guest links from this repository and the call graph of the built ELF as well.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order seeded by sys_rand; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order seeded by sys_rand; use BTreeSet" },
+    { path = "std::hash::RandomState", reason = "seeded by sys_rand" },
+    { path = "std::collections::hash_map::RandomState", reason = "seeded by sys_rand" },
+    { path = "core::cell::Cell", reason = "a derivation that captures nothing could read it" },
+    { path = "core::cell::RefCell", reason = "a derivation that captures nothing could read it" },
+    { path = "core::cell::UnsafeCell", reason = "a derivation that captures nothing could read it" },
+    { path = "core::cell::OnceCell", reason = "a derivation that captures nothing could read it" },
+    { path = "core::cell::LazyCell", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::OnceLock", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::LazyLock", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::Mutex", reason = "a derivation that captures nothing could read it" },
+    { path = "std::sync::RwLock", reason = "a derivation that captures nothing could read it" },
+    { path = "core::sync::atomic::AtomicBool", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI8", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU8", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI16", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU16", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI32", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU32", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicI64", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicU64", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicIsize", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicUsize", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+    { path = "core::sync::atomic::AtomicPtr", reason = "a derivation that captures nothing could read it", allow-invalid = true },
+]
+disallowed-macros = [
+    { path = "std::thread_local", reason = "a derivation that captures nothing could read it" },
+    { path = "core::arch::asm", reason = "a syscall around the platform's wrappers" },
+    { path = "core::arch::global_asm", reason = "a syscall around the platform's wrappers" },
+]
+disallowed-methods = [
+    { path = "risc0_zkvm::guest::env::exit", reason = "a guest ends only by returning from main after finish()" },
+    { path = "risc0_zkvm::guest::env::pause", reason = "a guest ends only by returning from main after finish()" },
+    { path = "risc0_zkvm::guest::env::cycle_count", reason = "the prover chooses the segment size; never bound work by cycles" },
+    { path = "risc0_zkvm_platform::syscall::sys_cycle_count", reason = "the prover chooses the segment size" },
+    { path = "risc0_zkvm_platform::syscall::sys_rand", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_getenv", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_argv", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_argc", reason = "the prover's host answers it" },
+    { path = "risc0_zkvm_platform::syscall::sys_keccak", reason = "its status shows the host's keccak po2; use the batcher" },
+    { path = "risc0_zkvm_platform::syscall::syscall_0_nr", reason = "a syscall around its wrapper" },
+    { path = "risc0_zkvm_platform::syscall::syscall_1_nr", reason = "a syscall around its wrapper" },
+    { path = "risc0_zkvm_platform::syscall::syscall_2_nr", reason = "a syscall around its wrapper" },
+    { path = "risc0_zkvm_platform::syscall::syscall_3_nr", reason = "a syscall around its wrapper" },
+    { path = "risc0_zkvm_platform::syscall::syscall_4_nr", reason = "a syscall around its wrapper" },
+    { path = "risc0_zkvm_platform::syscall::syscall_5_nr", reason = "a syscall around its wrapper" },
+    { path = "risc0_zkvm::guest::env::FdReader::new", reason = "another fd: the prover's host fills it" },
+    { path = "std::env::var", reason = "the prover's host answers it" },
+    { path = "std::env::var_os", reason = "the prover's host answers it" },
+    { path = "std::env::args", reason = "the prover's host answers it" },
+    { path = "std::process::exit", reason = "a guest ends only by returning from main after finish()" },
+    { path = "getrandom::getrandom", reason = "the prover's host answers it", allow-invalid = true },
+    { path = "getrandom::fill", reason = "the prover's host answers it", allow-invalid = true },
+]

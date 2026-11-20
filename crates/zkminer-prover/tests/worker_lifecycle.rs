@@ -31,6 +31,32 @@ fn mock_env(hang_on: &str, crash_on: &str) -> HashMap<String, String> {
     env
 }
 
+// ---- Handshake ----
+
+/// A worker built for another protocol version (an old one left in `~/.zkminer/provers`, which is
+/// searched first) is a DECLINE, not a transient spawn failure: otherwise its slot stays "healthy",
+/// is respawned on every dispatch, and the miner claims jobs only a stale worker would take.
+#[test]
+fn a_worker_of_another_protocol_version_declines() {
+    let mut env = mock_env("", "");
+    env.insert(
+        "MOCK_PROTOCOL_VERSION".to_string(),
+        (zkminer_prover_protocol::PROTOCOL_VERSION - 1).to_string(),
+    );
+    let err = match zkminer_prover::worker::WorkerHandle::spawn("mock", &mock_worker_path(), &env) {
+        Ok(_) => panic!("a worker of another protocol version was accepted"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains(zkminer_prover_protocol::types::WORKER_DECLINED),
+        "not a decline: {err}"
+    );
+    assert!(err.contains("Protocol version mismatch"), "{err}");
+    // This build's version is accepted.
+    zkminer_prover::worker::WorkerHandle::spawn("mock", &mock_worker_path(), &mock_env("", ""))
+        .expect("a worker of this protocol version");
+}
+
 // ---- Benchmark timeout tests ----
 
 #[test]
@@ -99,6 +125,150 @@ fn benchmark_timeout_then_ensure_alive_respawns() {
         "respawn should produce a different PID"
     );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+/// `benchmark_timeout` bounds each step of a benchmark, not the whole run: a worker whose warm-up and
+/// suite each take 2 s (4 s in all) outlives a 3 s timeout, as an Arc A770's risc0 benchmark (over
+/// 30 minutes, no step past about 10) outlives the default 1800 s.
+#[test]
+fn a_benchmark_longer_than_its_timeout_survives_when_each_step_fits() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(3)));
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BENCHMARK_SECS".to_string(), "2".to_string());
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+    let pid = pool.test_pid("mock:generic").unwrap();
+
+    let started = std::time::Instant::now();
+    assert!(pool.benchmark("mock").is_ok());
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the benchmark should have taken both steps: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        pool.test_has_handle("mock:generic"),
+        Some(true),
+        "the worker was killed"
+    );
+    assert_eq!(pool.test_pid("mock:generic"), Some(pid));
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+// ---- Intel warm-ups ----
+
+/// The pids that warmed up, one line per `Warmup` the mock answered (`MOCK_WARMUP_LOG`).
+fn warmups(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+fn risc0_env(log: &std::path::Path, hang_on: &str) -> HashMap<String, String> {
+    let mut env = mock_env(hang_on, "");
+    env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+    env.insert("MOCK_WARMUP_LOG".to_string(), log.display().to_string());
+    env
+}
+
+fn warmup_log(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("zkminer-warmup-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("warmups")
+}
+
+/// An Intel card's kernels are compiled for it on its first proof, so each is warmed up before it
+/// proves. The startup warm-up warms every Intel card and records each: it used to warm only the
+/// first slot and record only the backend, so every Intel card warmed up again inside its first
+/// claimed proof (on a start that ran no benchmark).
+#[test]
+fn the_startup_warm_up_warms_each_intel_card_once() {
+    let log = warmup_log("each-card");
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    for key in ["risc0:intel:0", "risc0:intel:1"] {
+        pool.insert_test_worker(key, "risc0", mock_worker_path(), risc0_env(&log, ""))
+            .expect("failed to spawn mock worker");
+    }
+    pool.warm_up("risc0", Duration::from_secs(60))
+        .expect("warm up");
+    assert_eq!(warmups(&log), 2, "one warm-up per Intel card");
+    for _ in 0..4 {
+        pool.prove("risc0", &[], &[], None, Some(Duration::from_secs(10)), None)
+            .expect("a warmed card proves");
+    }
+    assert_eq!(warmups(&log), 2, "a claimed proof warmed a card up again");
+    let _ = std::fs::remove_dir_all(log.parent().unwrap());
+}
+
+/// An Intel card whose startup warm-up failed warms up before its first proof, inside the job's
+/// deadline, not inside `WARMUP_TIMEOUT` (an hour): a warm-up that hangs is cut where the proof could
+/// no longer start (15 s before the deadline), and the job fails with a deadline error.
+#[test]
+fn an_intel_warm_up_inside_a_claimed_proof_stops_at_its_deadline() {
+    let log = warmup_log("deadline");
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(
+        "risc0:cuda:0",
+        "risc0",
+        mock_worker_path(),
+        risc0_env(&log, ""),
+    )
+    .expect("failed to spawn mock worker");
+    pool.insert_test_worker(
+        "risc0:intel:0",
+        "risc0",
+        mock_worker_path(),
+        risc0_env(&log, "warmup"),
+    )
+    .expect("failed to spawn mock worker");
+    // The backend warms on the CUDA slot; the Intel card's warm-up hangs and is cut at 3 s.
+    pool.warm_up("risc0", Duration::from_secs(3))
+        .expect("the backend warms up");
+    let before = warmups(&log);
+
+    let eligible = ["gpu-intel0".to_string()];
+    let started = std::time::Instant::now();
+    let err = pool
+        .prove_min_vram(
+            "risc0",
+            &[],
+            &[],
+            None,
+            Some(Duration::from_secs(600)),
+            None,
+            None,
+            &[],
+            &[],
+            &mut None,
+            Some(started + Duration::from_secs(25)),
+            None,
+            None,
+            zkminer_prover::dispatcher::JobCards {
+                eligible: &eligible,
+                order: &eligible,
+            },
+            0,
+        )
+        .expect_err("a card that cannot warm up cannot prove");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the warm-up outlived the job: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        warmups(&log),
+        before + 1,
+        "the card warmed up inside the proof"
+    );
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
+            .is_some()
+            || format!("{err:#}").contains("deadline"),
+        "{err:#}"
+    );
+    let _ = std::fs::remove_dir_all(log.parent().unwrap());
 }
 
 // ---- Prove timeout tests ----
@@ -752,6 +922,47 @@ fn warmup_reports_what_was_done() {
         .is_err());
 }
 
+/// A worker that has run a guest has no network, so a warm-up (which may download) never runs on
+/// one: the slot gets a fresh worker for it, without counting a failure. A worker that has only
+/// shaken hands keeps its process.
+#[test]
+fn a_warmup_after_a_guest_runs_on_a_fresh_worker() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let first = pool.test_pid("mock:generic").unwrap();
+    assert_ne!(first, 0);
+    pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        pool.test_pid("mock:generic"),
+        Some(first),
+        "nothing ran before it: same worker"
+    );
+
+    // A measurement on the prove slot (a backend with no measure pool) runs the job's guest there.
+    let m = pool
+        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
+        .unwrap();
+    assert_eq!(m.cycles, 1000);
+    assert_eq!(pool.test_pid("mock:generic"), Some(first));
+    let summary = pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(summary, "nothing to warm up");
+    let fresh = pool.test_pid("mock:generic").unwrap();
+    assert!(fresh != 0 && fresh != first, "{first} -> {fresh}");
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+    // And the fresh one, warmed, serves the next job.
+    pool.prove(
+        "mock:generic",
+        &[],
+        &[],
+        None,
+        Some(Duration::from_secs(10)),
+        None,
+    )
+    .unwrap();
+    assert_eq!(pool.test_pid("mock:generic"), Some(fresh));
+}
+
 /// A warm-up that hangs (a download that stalls) is killed at its deadline, like a benchmark: the
 /// slot is cleared for a respawn and the kill is not counted as a crash.
 #[test]
@@ -774,6 +985,24 @@ fn a_hung_warmup_is_killed_at_its_deadline() {
     assert_eq!(pool.test_has_handle("mock:generic"), Some(false));
     assert_eq!(pool.test_pid("mock:generic"), Some(0));
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+/// The one-time setup is the host's, so a slot that fails it does not stop the backend: the next
+/// slot runs it.
+#[test]
+fn a_failed_warmup_moves_on_to_the_next_slot() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:a", "mock", mock_worker_path(), mock_env("", "warmup"))
+        .expect("failed to spawn mock worker");
+    pool.insert_test_worker("mock:b", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let summary = pool
+        .warm_up("mock", Duration::from_secs(10))
+        .expect("mock:b runs the setup after mock:a fails it");
+    assert_eq!(summary, "nothing to warm up");
+    assert!(pool.backend_warmed("mock"));
+    assert_eq!(pool.test_consecutive_failures("mock:a"), Some(1));
+    assert_eq!(pool.test_consecutive_failures("mock:b"), Some(0));
 }
 
 /// A worker that dies during its warm-up is an error, counted as a failure.
@@ -905,7 +1134,7 @@ fn the_segment_size_reaches_the_worker() {
             None,
             Some(&size_on),
             None,
-            None,
+            zkminer_prover::dispatcher::JobCards::default(),
             0,
         )
         .expect("proof should succeed");
@@ -932,4 +1161,62 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
         "a finished measurement must not stay registered as preemptible"
     );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+// ---- Declines expire ----
+
+/// A worker that exits `WORKER_EXIT_DECLINED` on its first guest (its executor canary failed) has its
+/// slot declined, out of use for ten minutes. Once that wait is over the slot is tried with a fresh
+/// worker, which passes its handshake and is offered again; a worker that still cannot run a guest
+/// declines again, for twice as long; and one that can proves.
+#[test]
+fn a_declined_slot_is_retried_with_a_fresh_worker() {
+    use zkminer_prover_protocol::types::{WorkerDeclined, WORKER_EXIT_DECLINED};
+    let min = |m: u64| Duration::from_secs(m * 60);
+    let declining = || {
+        let mut env = mock_env("", "prove");
+        env.insert(
+            "MOCK_CRASH_CODE".to_string(),
+            WORKER_EXIT_DECLINED.to_string(),
+        );
+        env
+    };
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), declining())
+        .expect("failed to spawn mock worker");
+    let prove = |pool: &WorkerPool| {
+        pool.prove(
+            "mock",
+            b"elf",
+            b"input",
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        )
+    };
+
+    let err = prove(&pool).expect_err("a declining worker proves nothing");
+    assert!(err.downcast_ref::<WorkerDeclined>().is_some(), "{err:#}");
+    let (_, wait) = pool.test_decline("mock:generic").expect("declined");
+    assert_eq!(wait, min(10));
+    assert!(!pool.is_backend_healthy("mock"));
+    assert_eq!(pool.retry_due_declines(), 0, "not before its wait is over");
+    assert!(prove(&pool).is_err(), "a declined slot takes no proof");
+
+    pool.test_expire_decline("mock:generic");
+    assert_eq!(pool.retry_due_declines(), 1);
+    assert!(pool.test_decline("mock:generic").is_none(), "offered again");
+    assert_eq!(pool.test_has_handle("mock:generic"), Some(true));
+    assert!(pool.is_backend_healthy("mock"));
+
+    let err = prove(&pool).expect_err("its worker still cannot run a guest");
+    assert!(err.downcast_ref::<WorkerDeclined>().is_some(), "{err:#}");
+    let (_, wait) = pool.test_decline("mock:generic").expect("declined again");
+    assert_eq!(wait, min(20));
+
+    pool.test_set_spawn_env("mock:generic", mock_env("", ""));
+    pool.test_expire_decline("mock:generic");
+    assert_eq!(pool.retry_due_declines(), 1);
+    prove(&pool).expect("a worker that can run a guest proves");
+    assert!(pool.test_decline("mock:generic").is_none());
 }

@@ -8,7 +8,8 @@
 //! risc0 job): the archive rzup itself downloads, from RISC Zero's artifact store, where it is named
 //! by its SHA-256, which is pinned here and checked; unpacked beside the final directory and renamed
 //! into place, so no proof ever sees half of it. A lock file (rzup's own) keeps two workers from
-//! installing it at once.
+//! installing it at once. The download is the worker's only use of the network, and only before it
+//! runs any requester's guest (see `confine` in main.rs).
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
@@ -58,6 +59,15 @@ pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) 
     if complete(&dir) {
         return Ok(format!("risc0-groth16 component in {}", dir.display()));
     }
+    // A worker that has run a requester's guest is confined, with no network and no write access
+    // to rzup's home (`confine` in main.rs): say so rather than fail inside the install.
+    ensure!(
+        !crate::network_denied(),
+        "the risc0-groth16 component is not installed in {}, and this worker cannot download it: \
+         it has run a requester's guest, after which a worker has no network. A fresh worker \
+         installs it in its warm-up",
+        dir.display()
+    );
     let tmp = home.join("tmp");
     fs::create_dir_all(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
     let lock = File::create(tmp.join(format!(".risc0-groth16-{VERSION}.lock")))?;
@@ -69,6 +79,15 @@ pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) 
             dir.display()
         ));
     }
+    // A worker that has run a requester's guest has no network (`confine` in main.rs): say so
+    // rather than fail inside the download.
+    ensure!(
+        !crate::network_denied(),
+        "the risc0-groth16 component is not installed in {}, and this worker cannot download it: \
+         it has run a requester's guest, after which a worker has no network. A fresh worker \
+         installs it in its warm-up",
+        dir.display()
+    );
 
     let start = Instant::now();
     tracing::info!(

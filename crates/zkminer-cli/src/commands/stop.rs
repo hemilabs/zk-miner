@@ -72,7 +72,7 @@ fn what_it_does(mode: StopMode) -> &'static str {
 
 /// What the job journal says is still held, for the report after the miner exited.
 fn held_report(mode: StopMode) -> String {
-    let journal = crate::journal::JobJournal::load();
+    let journal = crate::journal::JobJournal::peek();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

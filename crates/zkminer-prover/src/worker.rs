@@ -65,9 +65,54 @@ fn sanitize_worker_line(line: &str) -> String {
 /// prove on a host that happens to export it, and on no other.
 const GUEST_VISIBLE_ENV: &[&str] = &["DUMP_ELF_OUTPUT"];
 
-/// The environment a worker starts with: `inherited` minus secret-named variables and
-/// [`GUEST_VISIBLE_ENV`], then the dispatcher's `overrides`. Later entries win.
+/// The directories a risc0 worker's witness proofs use: the retention store (read) and the root of
+/// the segment directories (written). Passed to every risc0 worker spawned from now on
+/// (`WITNESS_READ_DIR_ENV`, `WITNESS_SEGMENT_DIR_ENV`), which confines itself to them before its
+/// first guest. Unset: a worker reads and writes neither (no witness jobs).
+static RISC0_WITNESS_DIRS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+
+/// Set the directories passed to risc0 workers spawned from now on (see `RISC0_WITNESS_DIRS`). Once
+/// per process.
+pub fn set_risc0_witness_dirs(retention: PathBuf, segments: PathBuf) {
+    let _ = RISC0_WITNESS_DIRS.set((retention, segments));
+}
+
+/// Settings of the pinned risc0 and SP1 SDKs that hand proving or execution to someone else (a
+/// remote service, an external `r0vm`, a Docker image), fetch what they prove with from elsewhere, or
+/// put them in a developer mode whose proofs are not real. No worker of the miner's uses any of them:
+/// every one proves and executes locally with real proofs, and has no network once it runs a guest
+/// (see `zkminer_witness_sandbox::confine`). So none reaches a worker, from the miner's environment
+/// or the dispatcher's overrides, and every worker gets `RISC0_PROVER=local`.
+const REMOTE_PROVER_AND_DEV_ENV: &[&str] = &[
+    // risc0-zkvm: `default_prover` / `default_executor` (Bonsai, an `r0vm` over IPC, the actor
+    // prover), dev mode (fake receipts), and skipping the prover's own check of its receipts.
+    "BONSAI_API_URL",
+    "BONSAI_API_KEY",
+    "BONSAI_POLL_INTERVAL_MS",
+    "RISC0_PROVER",
+    "RISC0_EXECUTOR",
+    "RISC0_SERVER_PATH",
+    "RISC0_DEV_MODE",
+    "RISC0_SKIP_VERIFY",
+    // sp1-sdk: `ProverClient::from_env` (the prover network and its key), its simulation skip,
+    // developer circuits (built locally or downloaded from S3), a token for downloading
+    // `sp1-gpu-server` from GitHub, gnark's Docker image, and the recursion's vk-check bypass.
+    "SP1_PROVER",
+    "NETWORK_RPC_URL",
+    "NETWORK_PRIVATE_KEY",
+    "SKIP_SIMULATION",
+    "SP1_CIRCUIT_MODE",
+    "DEV_GITHUB_TOKEN",
+    "SP1_GNARK_IMAGE",
+    "WITHOUT_VK_VERIFICATION",
+];
+
+/// The environment a worker for `backend` starts with: `inherited` minus secret-named variables and
+/// [`GUEST_VISIBLE_ENV`], then the dispatcher's `overrides`, all without
+/// [`REMOTE_PROVER_AND_DEV_ENV`]; then `RISC0_PROVER=local`, and for a risc0 worker the witness
+/// directories (see [`set_risc0_witness_dirs`]). Later entries win.
 fn worker_env(
+    backend: &str,
     inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     overrides: &HashMap<String, String>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
@@ -77,8 +122,23 @@ fn worker_env(
             !k.to_str()
                 .is_some_and(|k| is_secret_env_name(k) || GUEST_VISIBLE_ENV.contains(&k))
         })
+        .chain(overrides.iter().map(|(k, v)| (k.into(), v.into())))
+        // Exact names: they are the SDKs' own, which read them case-sensitively.
+        .filter(|(k, _)| {
+            !k.to_str()
+                .is_some_and(|n| REMOTE_PROVER_AND_DEV_ENV.contains(&n))
+        })
         .collect();
-    env.extend(overrides.iter().map(|(k, v)| (k.into(), v.into())));
+    // risc0's own default anyway (the workers call the local prover and executor directly); set so
+    // anything that asks `default_prover` gets it too.
+    env.push(("RISC0_PROVER".into(), "local".into()));
+    if backend.starts_with("risc0") {
+        if let Some((retention, segments)) = RISC0_WITNESS_DIRS.get() {
+            use zkminer_prover_protocol::types::{WITNESS_READ_DIR_ENV, WITNESS_SEGMENT_DIR_ENV};
+            env.push((WITNESS_READ_DIR_ENV.into(), retention.into()));
+            env.push((WITNESS_SEGMENT_DIR_ENV.into(), segments.into()));
+        }
+    }
     env
 }
 
@@ -155,6 +215,10 @@ const GROUP_SHM_SCAN_WAIT: Duration = Duration::from_millis(250);
 
 /// Unlink the SP1 `/dev/shm` segments a worker's process group maps. Call just before killing it.
 /// `key` is its backend or slot key: nothing else stages there, so nothing else is looked at.
+///
+/// TO REMOVE a release after the SP1 pin whose executor shares memory through descriptors: that
+/// executor names nothing in `/dev/shm`, so there is nothing for this to find. Harmless meanwhile
+/// (a scan of the group's maps that matches nothing).
 ///
 /// sp1-jit removes these when an execution ends, in a `Drop` that a signal never reaches, so otherwise
 /// they stay until a worker starting 30 s or more later sweeps them up (`reap_orphaned_sp1_shm`). The
@@ -274,6 +338,18 @@ fn exit_can_be_a_host_oom(exit: &ExitProbe) -> bool {
         } | ExitProbe::Exited {
             code: Some(zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST),
             ..
+        }
+    )
+}
+
+/// Whether a worker's exit is its decline: see `WorkerHandle::exited_declined`.
+#[cfg(unix)]
+fn exit_is_a_decline(exit: &ExitProbe) -> bool {
+    matches!(
+        exit,
+        ExitProbe::Exited {
+            signal: None,
+            code: Some(zkminer_prover_protocol::types::WORKER_EXIT_DECLINED),
         }
     )
 }
@@ -553,6 +629,11 @@ pub struct WorkerHandle {
     /// process exits, so the question has to be asked of an ancestor, which means asking it as a
     /// DELTA. See `memory::oom_kill_count`.
     oom_kills_at_spawn: Option<u64>,
+    /// Whether this worker has been sent a command that may have cost it its network: one that runs
+    /// a requester's guest, or a benchmark or calibration (which on SP1 starts the GPU server, under
+    /// the same filter). A worker confines itself before it runs a guest, for good, with no network
+    /// (see `zkminer_witness_sandbox::confine`), so a setup that downloads must run on a fresh worker.
+    may_lack_network: bool,
 }
 
 /// Request to the spawner thread: build a worker, hand back the handle.
@@ -672,7 +753,17 @@ impl WorkerHandle {
         // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
         // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
         cmd.env_clear();
-        cmd.envs(worker_env(std::env::vars_os(), env_overrides));
+        cmd.envs(worker_env(backend, std::env::vars_os(), env_overrides));
+
+        // The worker's memory ceiling, and (Linux) what ends everything it starts: a cgroup of its
+        // own below a delegated root, the reaper, the mount watch. See `containment`.
+        let ceiling =
+            crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES);
+        #[cfg(target_os = "linux")]
+        let prepared = crate::containment::prepare(ceiling)
+            .map_err(|e| anyhow::anyhow!("worker {backend}: {e}"))?;
+        #[cfg(target_os = "linux")]
+        let join_cgroup = prepared.as_ref().map(|p| p.procs_fd());
 
         // Windows: a console delivers Ctrl+C, Ctrl+Break and a window close to EVERY process
         // attached to it, and a worker sharing the miner's console has no handler, so it died at
@@ -691,7 +782,12 @@ impl WorkerHandle {
         #[cfg(target_os = "linux")]
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
+                // Into the worker's own cgroup before anything else, so everything it ever starts
+                // is in it too.
+                if let Some(fd) = join_cgroup {
+                    zkminer_witness_sandbox::join_cgroup_in_child(fd)?;
+                }
                 // Put the worker in its own process group (pgid == its own pid) so
                 // the dispatcher's watchdogs can SIGKILL the ENTIRE group via
                 // kill(-pgid) on timeout. Without this, a worker that forks a GPU
@@ -722,6 +818,10 @@ impl WorkerHandle {
                 // The raw-syscall details, and why they have to be raw here, live on
                 // `memory::volunteer_as_oom_victim`. Shared with the test that checks the value
                 // actually reaches the kernel, so that test cannot pass over a deleted call.
+                // The miner is not dumpable (it holds the signing key), and a child is not until it
+                // execs: its `/proc/self` files belong to root, and `oom_score_adj` cannot be
+                // written. It is about to exec the worker, which is dumpable again anyway.
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
                 crate::memory::volunteer_as_oom_victim();
                 Ok(())
             });
@@ -764,6 +864,8 @@ impl WorkerHandle {
                         self.1
                     );
                     let pid = child.id();
+                    #[cfg(target_os = "linux")]
+                    crate::containment::end(pid);
                     #[cfg(unix)]
                     if may_signal_group(pid) {
                         unsafe {
@@ -905,36 +1007,80 @@ impl WorkerHandle {
                 .ok()
         }).flatten();
 
-        // Kernel-enforced ceiling on this worker, best effort. Adoption of a pid we already own,
-        // NOT a wrapper process — see `memory::cap_process_memory` for why that distinction is
-        // load-bearing for every pid-keyed path in this file.
         let pid_for_cap = spawn_guard.get().id();
-        match crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
-        {
+        #[cfg(target_os = "linux")]
+        let prepared = match prepared {
+            Some(p) => {
+                let leaf = p.leaf();
+                crate::containment::started_in(pid_for_cap, p);
+                tracing::info!(
+                    "worker {backend} (PID {pid_for_cap}) runs in a cgroup of its own ({leaf}), \
+                     capped at {}, no swap",
+                    ceiling.map_or("no ceiling".to_string(), |c| format!(
+                        "{:.1} GiB of RAM",
+                        c as f64 / (1024.0 * 1024.0 * 1024.0)
+                    ))
+                );
+                true
+            }
+            None => false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let prepared = false;
+        // Otherwise: a kernel-enforced ceiling on this worker, best effort. Adoption of a pid we
+        // already own, NOT a wrapper process — see `memory::cap_process_memory` for why that
+        // distinction is load-bearing for every pid-keyed path in this file.
+        let unit = match ceiling {
+            _ if prepared => None,
             Some(ceiling) => {
                 match crate::memory::cap_process_memory(pid_for_cap, backend, ceiling) {
-                    Ok(unit) => tracing::info!(
-                        "worker {backend} (PID {pid_for_cap}) capped at {:.1} GiB of RAM, no swap \
-                         ({unit})",
-                        ceiling as f64 / (1024.0 * 1024.0 * 1024.0)
-                    ),
+                    Ok(unit) => {
+                        tracing::info!(
+                            "worker {backend} (PID {pid_for_cap}) capped at {:.1} GiB of RAM, no \
+                             swap ({unit})",
+                            ceiling as f64 / (1024.0 * 1024.0 * 1024.0)
+                        );
+                        Some(unit)
+                    }
                     // Windows has neither layer; the dispatcher's memory admission still applies.
-                    Err(why) if cfg!(windows) => tracing::info!(
-                        "worker {backend} (PID {pid_for_cap}) runs without a memory ceiling ({why})"
-                    ),
+                    Err(why) if cfg!(windows) => {
+                        tracing::info!(
+                            "worker {backend} (PID {pid_for_cap}) runs without a memory ceiling \
+                             ({why})"
+                        );
+                        None
+                    }
                     // No cap is survivable: `oom_score_adj` still points the kernel at the prover.
-                    Err(why) => tracing::warn!(
-                        "worker {backend} (PID {pid_for_cap}) could NOT be memory-capped ({why}); \
-                         it can still be OOM-killed first thanks to oom_score_adj, but one runaway \
-                         prover could now stall the host"
-                    ),
+                    Err(why) => {
+                        tracing::warn!(
+                            "worker {backend} (PID {pid_for_cap}) could NOT be memory-capped \
+                             ({why}); it can still be OOM-killed first thanks to oom_score_adj, \
+                             but one runaway prover could now stall the host"
+                        );
+                        None
+                    }
                 }
             }
-            None => tracing::warn!(
-                "cannot size a memory ceiling for worker {backend}: /proc/meminfo unreadable or \
-                 the host reserve exceeds total RAM"
-            ),
+            None => {
+                tracing::warn!(
+                    "cannot size a memory ceiling for worker {backend}: /proc/meminfo unreadable \
+                     or the host reserve exceeds total RAM"
+                );
+                None
+            }
+        };
+        // The scope is the worker's own cgroup only once systemd has moved it there: wait for
+        // that before the worker is sent anything.
+        #[cfg(target_os = "linux")]
+        if !prepared && crate::containment::started_in_scope(pid_for_cap, unit.as_deref()).is_none()
+        {
+            tracing::warn!(
+                "worker {backend} (PID {pid_for_cap}) is in no cgroup of its own: it and what it \
+                 starts are ended by process group"
+            );
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = unit;
 
         // Baseline for attributing a later SIGKILL. See `WorkerHandle::died_of_host_oom`.
         let oom_kills_at_spawn = crate::memory::oom_kill_count();
@@ -954,6 +1100,7 @@ impl WorkerHandle {
             recent_output,
             reaped: false,
             oom_kills_at_spawn,
+            may_lack_network: false,
         };
 
         // Perform Hello handshake
@@ -1060,8 +1207,15 @@ impl WorkerHandle {
                 worker_version,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
+                    // A decline, like the arm below: a worker built for another protocol version
+                    // fails this handshake every time, so its slot must not count as a healthy
+                    // one that respawns, or the miner goes on claiming jobs for it. Such a worker
+                    // is usually an old one in `~/.zkminer/provers`, which is searched before the
+                    // workers shipped beside the miner.
                     bail!(
-                        "Protocol version mismatch with {}: expected {PROTOCOL_VERSION}, got {protocol_version}",
+                        "{} Protocol version mismatch with {}: expected {PROTOCOL_VERSION}, got \
+                         {protocol_version}; replace the worker binary",
+                        zkminer_prover_protocol::types::WORKER_DECLINED,
                         self.backend
                     );
                 }
@@ -1107,7 +1261,24 @@ impl WorkerHandle {
 
     /// Send a command to the worker.
     pub fn send(&mut self, cmd: &WorkerCommand) -> Result<()> {
+        if !matches!(
+            cmd,
+            WorkerCommand::Hello { .. }
+                | WorkerCommand::Capabilities
+                | WorkerCommand::Warmup { .. }
+                | WorkerCommand::Cancel { .. }
+                | WorkerCommand::Shutdown
+        ) {
+            self.may_lack_network = true;
+        }
         write_message(&mut self.writer, cmd).map_err(|e| anyhow::anyhow!("Send error: {e}"))
+    }
+
+    /// Whether this worker may have denied itself the network: it has been sent a command other
+    /// than the handshake, capabilities, warm-up, cancel and shutdown (see the field). Its warm-up,
+    /// which may download, then needs a fresh worker.
+    pub fn may_lack_network(&self) -> bool {
+        self.may_lack_network
     }
 
     /// Receive a response from the worker.
@@ -1153,6 +1324,7 @@ impl WorkerHandle {
                     }
                 }
                 WorkerResponse::ProofResult { request_id, .. }
+                | WorkerResponse::JournalDiverged { request_id, .. }
                 | WorkerResponse::ExecuteResult { request_id, .. }
                 | WorkerResponse::ProgramIdResult { request_id, .. }
                 | WorkerResponse::Error { request_id, .. }
@@ -1320,6 +1492,22 @@ impl WorkerHandle {
         Some(exit_can_be_a_host_oom(&probe_exit_nowait(self.child.id())) && now > before)
     }
 
+    /// Whether the worker exited [`WORKER_EXIT_DECLINED`]: it found, after its handshake, that its
+    /// backend cannot run on this host. Only meaningful once it is dead; read without reaping, as
+    /// `exit_reason` does. `false` once reaped, when the pid no longer identifies it.
+    ///
+    /// [`WORKER_EXIT_DECLINED`]: zkminer_prover_protocol::types::WORKER_EXIT_DECLINED
+    pub fn exited_declined(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            !self.reaped && exit_is_a_decline(&probe_exit_nowait(self.child.id()))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     /// After EOF on the worker's pipe, wait up to `budget` for its exit to be visible, for a question
     /// about how it died (`died_of_host_oom`) to have an answer.
     ///
@@ -1431,6 +1619,10 @@ impl WorkerHandle {
         // The cost of giving up is one zombie, which is bounded by the slot count and which
         // `Drop` tries again to collect. `reaped` records what actually happened: claiming a reap
         // that did not occur would let the group-kill guards believe the pid is free to recycle.
+        #[cfg(target_os = "linux")]
+        if !self.reaped {
+            crate::containment::end(pid);
+        }
         self.reaped = reap_within(&mut self.child, DROP_REAP_BUDGET);
         if !self.reaped {
             tracing::warn!(
@@ -1481,6 +1673,8 @@ impl WorkerHandle {
                 // Gone means somebody else reaped it; there is nothing left to sweep and
                 // the pid number is no longer ours to signal.
                 ExitProbe::Gone => {
+                    #[cfg(target_os = "linux")]
+                    crate::containment::end(pid);
                     self.reaped = true;
                     return;
                 }
@@ -1495,6 +1689,8 @@ impl WorkerHandle {
                 // Sweep BEFORE reaping, while the group number is still pinned.
                 #[cfg(unix)]
                 let _ = sweep_process_group(pid, &self.backend);
+                #[cfg(target_os = "linux")]
+                crate::containment::end(pid);
                 let _ = self.child.wait();
                 self.reaped = true;
                 return;
@@ -1625,6 +1821,9 @@ impl Drop for WorkerHandle {
         // land on a process in uninterruptible sleep (a GPU helper inside a driver ioctl, or
         // paging a 236MB image in from a stalled mount). This reap is bounded for that reason,
         // like `proc::reap_briefly`.
+        // Its cgroup, whatever is left in it, and its registration with the reaper.
+        #[cfg(target_os = "linux")]
+        crate::containment::end(pid);
         #[cfg(unix)]
         {
             // Record what actually happened, not what we attempted. `reaped` is the flag every
@@ -1842,8 +2041,39 @@ mod group_shm_tests {
 
 #[cfg(all(test, unix))]
 mod exit_classification_tests {
-    use super::{await_exit_visible_of, exit_can_be_a_host_oom, probe_exit_nowait, ExitProbe};
-    use zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST;
+    use super::{
+        await_exit_visible_of, exit_can_be_a_host_oom, exit_is_a_decline, probe_exit_nowait,
+        ExitProbe,
+    };
+    use zkminer_prover_protocol::types::{WORKER_EXIT_DECLINED, WORKER_EXIT_SERVER_LOST};
+
+    /// A worker that declines after its handshake says so by its exit code alone, read off a real
+    /// child's exit; no other exit is a decline, nor is a decline a host OOM.
+    #[test]
+    fn a_decline_is_its_exit_code_and_nothing_else() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {WORKER_EXIT_DECLINED}"))
+            .spawn()
+            .unwrap();
+        await_exit_visible_of(child.id(), std::time::Duration::from_secs(5));
+        let probe = probe_exit_nowait(child.id());
+        assert!(exit_is_a_decline(&probe), "{probe:?}");
+        assert!(!exit_can_be_a_host_oom(&probe));
+        child.wait().unwrap();
+        let exited = |signal, code| ExitProbe::Exited { signal, code };
+        assert!(!exit_is_a_decline(&exited(None, Some(0))));
+        assert!(!exit_is_a_decline(&exited(
+            None,
+            Some(WORKER_EXIT_SERVER_LOST)
+        )));
+        assert!(!exit_is_a_decline(&exited(
+            Some(WORKER_EXIT_DECLINED),
+            None
+        )));
+        assert!(!exit_is_a_decline(&ExitProbe::Running));
+        assert!(!exit_is_a_decline(&ExitProbe::Gone));
+    }
 
     /// An SP1 server is what the kernel kills when the host runs out of memory, and its worker then
     /// exits with this code. Read as an ordinary failure, that would exclude a healthy card and spend
@@ -1971,6 +2201,87 @@ mod tests {
         assert!(out.len() < 10_000 && out.ends_with("…[truncated]"));
     }
 
+    /// No remote-prover, external-executor or developer-mode setting of the SDKs reaches a worker,
+    /// whether the miner's environment or the dispatcher's overrides carry it; `RISC0_PROVER` is
+    /// `local` for every worker; what a worker needs passes.
+    #[test]
+    fn remote_prover_and_dev_settings_never_reach_a_worker() {
+        let knobs = [
+            ("BONSAI_API_URL", "https://bonsai.example"),
+            ("BONSAI_API_KEY", "k"),
+            ("BONSAI_POLL_INTERVAL_MS", "10"),
+            ("RISC0_PROVER", "bonsai"),
+            ("RISC0_EXECUTOR", "ipc"),
+            ("RISC0_SERVER_PATH", "/tmp/r0vm"),
+            ("RISC0_DEV_MODE", "1"),
+            ("RISC0_SKIP_VERIFY", "1"),
+            ("SP1_PROVER", "network"),
+            ("NETWORK_RPC_URL", "https://rpc.example"),
+            ("NETWORK_PRIVATE_KEY", "0xdead"),
+            ("SKIP_SIMULATION", "true"),
+            ("SP1_CIRCUIT_MODE", "dev"),
+            ("DEV_GITHUB_TOKEN", "t"),
+            ("SP1_GNARK_IMAGE", "example/gnark"),
+            ("WITHOUT_VK_VERIFICATION", "1"),
+        ];
+        let kept = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/miner"),
+            ("RISC0_HOME", "/home/miner/.risc0"),
+            ("RISC0_GROTH16_DIR", "/opt/groth16"),
+            ("SP1_GPU_SERVER_NAME", "sp1-gpu-server-hip"),
+            ("SP1_WORKER_NUM_CORE_WORKERS", "2"),
+            // Not the SDK's spelling: kept (the names are case-sensitive to the SDKs).
+            ("risc0_dev_mode", "1"),
+        ];
+        let inherited = || {
+            knobs
+                .iter()
+                .chain(&kept)
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect::<Vec<(std::ffi::OsString, std::ffi::OsString)>>()
+        };
+        let overrides: std::collections::HashMap<String, String> = knobs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain([("CUDA_VISIBLE_DEVICES".to_string(), "1".to_string())])
+            .collect();
+        let get = |env: &[(std::ffi::OsString, std::ffi::OsString)], k: &str| {
+            env.iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+        };
+        let local: (std::ffi::OsString, std::ffi::OsString) =
+            ("RISC0_PROVER".into(), "local".into());
+        for backend in ["risc0", "sp1", "openvm"] {
+            for overrides in [&overrides, &std::collections::HashMap::new()] {
+                let env = super::worker_env(backend, inherited(), overrides);
+                for (k, _) in knobs {
+                    let values: Vec<_> = env.iter().filter(|(n, _)| n == k).collect();
+                    if k == "RISC0_PROVER" {
+                        assert_eq!(
+                            values,
+                            [&local],
+                            "{backend}: RISC0_PROVER is local, and only local"
+                        );
+                    } else {
+                        assert!(values.is_empty(), "{backend}: {k} reached the worker");
+                    }
+                }
+                for (k, v) in kept {
+                    assert_eq!(get(&env, k).as_deref(), Some(v), "{backend}: {k}");
+                }
+            }
+            let env = super::worker_env(backend, inherited(), &overrides);
+            assert_eq!(get(&env, "CUDA_VISIBLE_DEVICES").as_deref(), Some("1"));
+        }
+        assert!(knobs
+            .iter()
+            .all(|(k, _)| super::REMOTE_PROVER_AND_DEV_ENV.contains(k)));
+        assert_eq!(knobs.len(), super::REMOTE_PROVER_AND_DEV_ENV.len());
+    }
+
     #[test]
     fn secret_env_names_are_filtered_but_operational_ones_pass() {
         // Must be stripped from a worker's environment.
@@ -2015,15 +2326,20 @@ mod tests {
         .map(|(k, v)| (k.into(), v.into()));
         let overrides =
             std::collections::HashMap::from([("MEMORY_LIMIT".to_string(), "2".to_string())]);
-        let env = worker_env(inherited, &overrides);
-        let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
-        assert!(names.contains(&"PATH"), "{names:?}");
-        assert!(!names.contains(&"DUMP_ELF_OUTPUT"), "{names:?}");
-        assert!(!names.contains(&"ZKMINER_PRIVATE_KEY"), "{names:?}");
-        // `Command::envs` applies them in order, so the last MEMORY_LIMIT is the one the worker
-        // gets.
-        let last = env.iter().rev().find(|(k, _)| k == "MEMORY_LIMIT").unwrap();
-        assert_eq!(last.1, "2");
+        for backend in ["risc0", "sp1"] {
+            let env = worker_env(backend, inherited.clone(), &overrides);
+            let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+            assert!(names.contains(&"PATH"), "{backend}: {names:?}");
+            assert!(!names.contains(&"DUMP_ELF_OUTPUT"), "{backend}: {names:?}");
+            assert!(
+                !names.contains(&"ZKMINER_PRIVATE_KEY"),
+                "{backend}: {names:?}"
+            );
+            // `Command::envs` applies them in order, so the last MEMORY_LIMIT is the one the worker
+            // gets.
+            let last = env.iter().rev().find(|(k, _)| k == "MEMORY_LIMIT").unwrap();
+            assert_eq!(last.1, "2", "{backend}");
+        }
     }
 
     /// A throwaway `/proc`-shaped tree. Removed on drop.

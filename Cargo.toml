@@ -1,8 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/zkminer-witness",
+    "crates/zkminer-witness-builder",
+    "crates/zkminer-witness-broker",
+    "crates/zkminer-witness-sandbox",
+    "crates/zkminer-witness-store",
+    "crates/zkminer-witness-host",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
+    "crates/zkminer-netguard",
     "crates/zkminer-prover",
     "crates/zkminer-prover-protocol",
     "crates/zkminer-strategy",
@@ -12,23 +19,43 @@ members = [
     "crates/zkminer-prove-risc0",
     "crates/zkminer-prove-sp1",
     "crates/zkminer-e2e",
+    "reference/eth-prelude",
+    "reference/proxy-slots/statement",
+    # Not a default member: it builds a risc0 guest and links the risc0 executor.
+    "reference/proxy-slots/methods",
 ]
 default-members = [
+    "crates/zkminer-witness",
+    "crates/zkminer-witness-builder",
+    "crates/zkminer-witness-broker",
+    "crates/zkminer-witness-sandbox",
+    "crates/zkminer-witness-store",
+    "crates/zkminer-witness-host",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
+    "crates/zkminer-netguard",
     "crates/zkminer-prover",
     "crates/zkminer-prover-protocol",
     "crates/zkminer-strategy",
     "crates/zkminer-tui",
     "crates/zkminer-config",
     "crates/zkminer-cli",
+    "reference/eth-prelude",
+    "reference/proxy-slots/statement",
 ]
 exclude = [
     "crates/zkminer-prover/guests",
+    # risc0 guests, each its own workspace and lockfile (built by reference/proxy-slots/methods).
+    "reference/proxy-slots/guest",
+    "reference/proxy-slots/lint-control",
+    "reference/proxy-slots/hostdep",
     # Its own workspace and lockfile: OpenVM 1.5.0-rc.1 pins p3-field =0.4.1 and SP1 6.8.1's slop
     # crates =0.4.3-succinct, and one workspace can hold only one 0.4.x. Build it with
     # `--manifest-path crates/zkminer-prove-openvm/Cargo.toml`.
     "crates/zkminer-prove-openvm",
+    # The witness-builder SDK and its examples: their own workspace and lockfile, built for
+    # wasm32-unknown-unknown (see sdk/README.md).
+    "sdk",
 ]
 
 [workspace.package]
@@ -80,11 +107,20 @@ rand = "0.8"
 # Internal crates
 zkminer-contracts = { path = "crates/zkminer-contracts" }
 zkminer-chain = { path = "crates/zkminer-chain" }
+# Members that need the guarded HTTP client ask for `features = ["client"]`.
+zkminer-netguard = { path = "crates/zkminer-netguard", default-features = false }
 zkminer-prover = { path = "crates/zkminer-prover" }
 zkminer-prover-protocol = { path = "crates/zkminer-prover-protocol" }
 zkminer-strategy = { path = "crates/zkminer-strategy" }
 zkminer-tui = { path = "crates/zkminer-tui" }
 zkminer-config = { path = "crates/zkminer-config" }
+zkminer-witness = { path = "crates/zkminer-witness" }
+zkminer-witness-store = { path = "crates/zkminer-witness-store" }
+zkminer-witness-sandbox = { path = "crates/zkminer-witness-sandbox" }
+# The reference guest library and plan §12's statement (no_std; also built by risc0 guests and wasm32
+# builders in workspaces of their own, which name them by path).
+hemiprove-eth-prelude = { path = "reference/eth-prelude" }
+hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #

@@ -43,6 +43,15 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Whether an ELF whose verifying-key hash is `vk_hash` (as `decode_hex32` reads `bytes32()`) may be
+/// proven for a job whose on-chain `programId` is `program_id`. The canonical order only: the
+/// on-chain adapter passes `programId` straight into `verifyProof(programVKey, …)`, and the verifier
+/// reads it as `uint256(programVKey)`, the same big-endian bytes32 the SDK's `bytes32()` prints. Any
+/// other order only lets a decoy ELF through to a proof the chain then rejects.
+fn vkey_matches_program_id(vk_hash: &[u8; 32], program_id: &[u8; 32]) -> bool {
+    vk_hash == program_id
+}
+
 /// Largest number of distinct proving keys the worker keeps resident. Each entry is a large
 /// GPU-resident key, so without a bound the cache grows O(distinct ELFs a submitter sends) in host
 /// RAM and VRAM. LRU-evicted beyond this. Override with `ZKMINER_SP1_PK_CACHE_MAX`.
@@ -286,6 +295,9 @@ use zkminer_prover_protocol::{
 };
 
 mod bundled_server;
+mod confinement;
+#[cfg(target_os = "linux")]
+mod runner;
 mod warmup;
 #[cfg(windows)]
 mod windows_job;
@@ -327,6 +339,11 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // Started by the SDK as `~/.sp1/bin/zkminer-confined-<server>`: the shim that runs the real
+    // `sp1-gpu-server` confined (confinement.rs). Before anything else; it does not return.
+    #[cfg(target_os = "linux")]
+    confinement::run_if_shim();
+
     // `--export-guest <name> <path>`: write one of the embedded guests to `path` and print its vkey
     // hash (`bytes32()`), which is the `programId` of an SP1 job for it. For harnesses that submit
     // jobs this worker can serve (crates/zkminer-cli/tests/localnet.rs). Runs SP1's setup on the CPU
@@ -454,6 +471,24 @@ fn main() {
         }
     }
 
+    // Workers that run requester guests are confined, and so is their server (confinement.rs): a
+    // private temporary directory, named by TMPDIR from here on, and for a worker that proves, the
+    // SDK's server started through the confining shim. While the process has one thread.
+    #[cfg(target_os = "linux")]
+    {
+        confinement::prepare();
+        if !sp1_measure_only() {
+            if let Err(e) = confinement::route_server_through_shim() {
+                tracing::error!(
+                    "cannot start sp1-gpu-server through its confinement ({e}): this worker will \
+                     start no server"
+                );
+                // So the handshake declines SP1 (`sp1_usability`), before any job is claimed.
+                let _ = SERVER_ROUTE_FAILURE.set(e);
+            }
+        }
+    }
+
     // Direct benchmark mode: run benchmarks and print results to stderr (stdout is redirected).
     if std::env::args().any(|a| a == "--benchmark") {
         // Honour the assigned device here too. Without this, benchmarking card 1 by hand silently
@@ -489,6 +524,11 @@ fn run_benchmarks_by_hand(device: Option<u32>) -> i32 {
             return 1;
         }
     };
+    if let Err(e) = confine_worker(true) {
+        tracing::error!("cannot confine this worker, so it proves nothing: {e}");
+        return 1;
+    }
+    canary_or_decline(&*prover);
     // Discarded, as under a host: see `warmup_spec`.
     let warmup = [zkminer_prover_protocol::warmup_spec(BACKEND_SP1)];
     run_benchmarks(prover, &mut held.benchmark_keys, &warmup, &mut |_, _, _| {});
@@ -547,9 +587,27 @@ const ORPHAN_EXIT_WAIT: Duration = Duration::from_secs(10);
 /// `AssertUnwindSafe` is sound here because the panic path leaves nothing of ours half-written: the
 /// prover slot is still `None` (we only assign on success), and the SDK's own state dies with the
 /// server it failed to reach.
+///
+/// The server runs requester guests (every proof executes its guest there), so it is never started
+/// unconfined: the SDK starts it through the confining shim (`confinement`), and this refuses to
+/// build a prover otherwise. It is built before the worker confines itself (which takes `connect`
+/// away), so a worker that is already confined cannot start one: a fresh worker does. A server the SDK
+/// would download first (absent, or another version) is refused too, in so many words.
 fn build_prover(
     cuda_device_id: Option<u32>,
 ) -> std::result::Result<sp1_sdk::blocking::CudaProver, String> {
+    if network_denied() {
+        return Err(
+            "this worker is confined (it has run a requester's guest), so it can start no \
+             sp1-gpu-server: a fresh worker does"
+                .to_string(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    confinement::server_routed_through_shim().map_err(|e| {
+        format!("sp1-gpu-server would not run confined, so this worker starts none: {e}")
+    })?;
+    server_needs_no_download()?;
     reap_orphaned_gpu_servers(cuda_device_id, ORPHAN_EXIT_WAIT);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tracing::info!("Initializing SP1 CUDA prover...");
@@ -576,6 +634,222 @@ fn build_prover(
                 .unwrap_or_else(|| "default".to_string()),
         )
     })
+}
+
+/// Workers that run requester guests are confined. Before the first command that runs one or reaches
+/// the server (`Execute` and `ProgramId` on the CPU prover, `Prove`, `Benchmark`), the worker confines
+/// itself, its threads and everything it starts from then on, for the rest of its life
+/// (`confinement`): no new socket (a proving worker keeps the connection to its own server, which
+/// it makes first), Landlock, no reaching other processes. The server is confined from its start
+/// (`build_prover`). That setup (`Warmup`: the Groth16 circuit download) runs before, as the miner
+/// warms a backend before it claims or benchmarks; a `Warmup` after refuses rather than download
+/// (`warmup::warm_up`), and the miner runs it on a fresh worker.
+///
+/// An error means no guest may run: the caller answers the command with it.
+fn confine_worker(keep_server: bool) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if !confinement::is_confined() {
+        let started = Instant::now();
+        let path = runner::place_executor_runner(&std::env::temp_dir())?;
+        tracing::info!(
+            "executor runner placed at {} before the confinement ({:.2}s)",
+            path.display(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    confinement::confine(keep_server)
+}
+
+/// Whether this worker has confined itself ([`confine_worker`]), and so has no network.
+pub(crate) fn network_denied() -> bool {
+    confinement::is_confined()
+}
+
+/// [`confine_worker`] before a guest command, or the answer refusing it.
+fn guest_may_run(request_id: u64, keep_server: bool) -> std::result::Result<(), WorkerResponse> {
+    confine_worker(keep_server).map_err(|e| {
+        tracing::error!("cannot confine this worker, so it runs no guest: {e}");
+        WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!(
+                "this worker could not confine itself, so it runs no requester's guest: {e}"
+            ),
+        }
+    })
+}
+
+/// The executor canary's input: fibonacci(300), a few thousand cycles.
+const CANARY_FIB_N: u32 = 300;
+
+/// What the fibonacci guest commits for `n`: fibonacci(n) as it computes it (wrapping `u64`), in the
+/// encoding `sp1_zkvm::io::commit` writes (bincode: eight bytes, little-endian).
+fn canary_public_values(n: u32) -> Vec<u8> {
+    let (mut a, mut b) = (0u64, 1u64);
+    for _ in 0..n {
+        (a, b) = (b, a.wrapping_add(b));
+    }
+    a.to_le_bytes().to_vec()
+}
+
+/// The text of a caught panic.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic with no message".to_string())
+}
+
+/// Runs the embedded fibonacci guest (fibonacci(300)) through `prover`'s executor, the path every
+/// requester's guest takes in this worker: the executor's runner process, and the memory it shares
+/// with it. `Ok` if it ran and committed what fibonacci(300) is.
+fn run_executor_canary<P: sp1_sdk::blocking::Prover>(prover: &P) -> Result<(), String> {
+    use sp1_sdk::blocking::{Elf, SP1Stdin};
+    if FIBONACCI_SP1_GUEST_ELF.is_empty() {
+        // A build with its guests stubbed (`SP1_SKIP_PROGRAM_BUILD`) has nothing to run.
+        return Ok(());
+    }
+    let mut stdin = SP1Stdin::new();
+    stdin.write_slice(&CANARY_FIB_N.to_le_bytes());
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prover
+            .execute(Elf::from(FIBONACCI_SP1_GUEST_ELF), stdin)
+            .run()
+    }));
+    match run {
+        Ok(Ok((public_values, _)))
+            if public_values.to_vec() == canary_public_values(CANARY_FIB_N) =>
+        {
+            Ok(())
+        }
+        Ok(Ok((public_values, _))) => Err(format!(
+            "it committed {} bytes that are not fibonacci({CANARY_FIB_N})",
+            public_values.to_vec().len()
+        )),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(panic) => Err(format!("the executor panicked: {}", panic_text(&*panic))),
+    }
+}
+
+/// The executor canary's verdict, once per worker: [`run_executor_canary`] the first time a guest
+/// command reaches the point where its guest would run, once the worker is confined
+/// ([`confine_worker`]), with that command's prover. A worker that cannot run it cannot run any
+/// requester's guest either, and says so ([`decline_executor`]) before it runs one.
+fn executor_canary<P: sp1_sdk::blocking::Prover>(prover: &P) -> Result<(), String> {
+    static VERDICT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    VERDICT
+        .get_or_init(|| {
+            let started = Instant::now();
+            let verdict = run_executor_canary(prover);
+            match &verdict {
+                Ok(()) => tracing::info!(
+                    "executor canary: fibonacci({CANARY_FIB_N}) ran confined in {:.2}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(e) => tracing::error!("executor canary failed: {e}"),
+            }
+            verdict
+        })
+        .clone()
+}
+
+/// The canary before a requester's guest runs: [`executor_canary`], and [`decline_executor`] if it
+/// failed. Returns only if it ran.
+fn canary_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P) {
+    if let Err(reason) = executor_canary(prover) {
+        decline_executor(&reason);
+    }
+}
+
+/// Whether an SP1 execution failed setting up its executor's shared memory or handing it to the
+/// runner process: before any guest instruction ran, so this host's fault, not the program's. Matched
+/// on the messages of hemilabs/sp1's `sp1-core-executor-runner` (`native.rs`), which no guest
+/// writes; a match only makes the worker run its canary again ([`environment_fault_or_decline`]).
+fn is_executor_environment_fault(text: &str) -> bool {
+    const SETUP: [&str; 5] = [
+        "create shm file for",
+        "failed to create the child's stdin",
+        "failed to spawn child process",
+        "the executor runner exited before reading its input",
+        SIZING_RUNTIME_FAILED,
+    ];
+    SETUP.iter().any(|m| text.contains(m))
+}
+
+/// After an execution failed setting up its executor ([`is_executor_environment_fault`]): the canary
+/// again, now. If that fails too, this host cannot run guests any more ([`decline_executor`]);
+/// otherwise the failure was passing, and is reported as the worker's (`Internal`), never the job's.
+fn environment_fault_or_decline<P: sp1_sdk::blocking::Prover>(prover: &P, failure: &str) {
+    if let Err(reason) = run_executor_canary(prover) {
+        decline_executor(&format!("{failure}; and the canary again: {reason}"));
+    }
+    tracing::warn!(
+        "an SP1 execution could not set up its executor ({failure}), though the canary runs again: \
+         reporting it as this worker's fault, not the job's"
+    );
+}
+
+/// Ends a worker whose executor cannot run guests here: no answer to the command that found it,
+/// and the exit code [`WORKER_EXIT_DECLINED`], on which the dispatcher declines this slot as it does
+/// a worker that declines its handshake. An environment fault (the executor cannot share memory with
+/// its runner under the confinement, say), so neither the job nor its program is blamed.
+///
+/// [`WORKER_EXIT_DECLINED`]: zkminer_prover_protocol::types::WORKER_EXIT_DECLINED
+fn decline_executor(reason: &str) -> ! {
+    tracing::error!(
+        "{}: SP1's executor cannot run guests in this worker ({reason}); exiting with code {}, \
+         which declines SP1 on this slot",
+        zkminer_prover_protocol::types::WORKER_DECLINED,
+        zkminer_prover_protocol::types::WORKER_EXIT_DECLINED,
+    );
+    std::process::exit(zkminer_prover_protocol::types::WORKER_EXIT_DECLINED)
+}
+
+/// Refuses, before the SDK would try, a server the SDK would download first: none at its path, or
+/// one whose `--version` is not the SDK's (`maybe_download_server` replaces it then). With no network
+/// that download fails inside `build()` as a panic that reads like a GPU fault. A probe that cannot
+/// tell (it timed out, or did not run) is left to the SDK, as [`sp1_usability`] does.
+fn server_needs_no_download() -> std::result::Result<(), String> {
+    let server = warmup::server_path().map_err(|e| e.to_string())?;
+    if !server.exists() {
+        return Err(format!(
+            "there is no sp1-gpu-server at {}, and this worker has no network to download one \
+             with: install the one this release ships",
+            server.display()
+        ));
+    }
+    let (outcome, stdout) = proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new(&server).arg("--version"),
+        PROBE_TIMEOUT,
+        PROBE_STDERR_CAP,
+    );
+    let want = sp1_primitives::SP1_CRATE_VERSION;
+    match outcome {
+        Outcome::Ran { .. } if stdout.trim() != want => Err(format!(
+            "{} reports version {:?}, not {want:?}; the SDK would download another, and this \
+             worker has no network to: install the one this release ships",
+            server.display(),
+            stdout.trim()
+        )),
+        // And it must share memory through descriptors (`SERVER_CAPABILITY`), checked again here,
+        // with a full budget, for a handshake that could not tell: unsettled is a no here.
+        #[cfg(target_os = "linux")]
+        _ => match server_capability(&server, PROBE_TIMEOUT) {
+            Capability::Present => Ok(()),
+            Capability::Absent(why) => Err(format!(
+                "{}: {why}",
+                zkminer_prover_protocol::types::WORKER_DECLINED
+            )),
+            Capability::Unknown(why) => Err(format!(
+                "could not tell whether {} shares memory through descriptors ({why}), so this \
+                 worker starts no server",
+                server.display()
+            )),
+        },
+        #[cfg(not(target_os = "linux"))]
+        _ => Ok(()),
+    }
 }
 
 /// Parse the parent pid out of a `/proc/<pid>/stat` line.
@@ -814,7 +1088,9 @@ fn reap_orphaned_gpu_servers(our_device: Option<u32>, wait: Duration) {
         // measure-only worker has none. It starts no server, and it has no device of its own: its
         // default of 0 would name the live socket of whichever worker proves on card 0.
         if !sp1_measure_only() {
-            if let Some(own) = server_socket_path(&warmup::server_name(), our_device.unwrap_or(0)) {
+            if let Some(own) =
+                server_socket_path(&confinement::sdk_server_name(), our_device.unwrap_or(0))
+            {
                 let _ = std::fs::remove_file(own);
             }
         }
@@ -879,6 +1155,10 @@ const SP1_SHM_ORPHAN_MIN_AGE: Duration = Duration::from_secs(30);
 /// from unlinking another uid's file) and independent of whether we can read that uid's `/proc/*/maps`.
 ///
 /// Mirrors `reap_orphaned_gpu_servers`: same /proc-walk, same "only touch what is provably orphaned".
+///
+/// TO REMOVE a release after the SP1 pin whose executor shares memory through descriptors (memfds):
+/// that executor leaves nothing in `/dev/shm`, so this only still sweeps what an older worker on the
+/// same host left there. It runs unconfined, at startup, before the worker confines itself.
 #[cfg(target_os = "linux")]
 fn reap_orphaned_sp1_shm() {
     let Ok(dir) = std::fs::read_dir("/dev/shm") else {
@@ -1149,8 +1429,9 @@ fn find_cuda12_runtime_dir() -> Option<std::path::PathBuf> {
 /// miner start, when no SP1 job may ever arrive, would be a worse trade than the bug.
 ///
 /// Returns `Err(reason)` only when SP1 provably CANNOT work here. A case we cannot settle
-/// cheaply (the server binary is absent, so the SDK would download it) returns `Ok`: this
-/// must not refuse a host that would in fact work.
+/// cheaply returns `Ok`: this must not refuse a host that would in fact work. An absent server
+/// binary is no longer such a case: the SDK would download one at the first proof, but the worker
+/// starts its server only once it has denied itself the network ([`build_prover`]).
 /// True when this worker was launched as the dedicated MEASURE-ONLY slot (see
 /// `SP1_MEASURE_ONLY_ENV`): it only ever sizes cycles on the CPU executor and must never build the
 /// CudaProver / fork `sp1-gpu-server`.
@@ -1161,7 +1442,15 @@ fn sp1_measure_only() -> bool {
         == Some("1")
 }
 
+/// Why this worker cannot start its server through the confining shim, if it cannot
+/// (`confinement::route_server_through_shim`, at startup): such a worker proves nothing, so its
+/// handshake declines SP1.
+static SERVER_ROUTE_FAILURE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn sp1_usability() -> Result<(), String> {
+    if let Some(e) = SERVER_ROUTE_FAILURE.get() {
+        return Err(format!("sp1-gpu-server cannot be started confined: {e}"));
+    }
     // The SDK does `env::var("HOME").expect(...)` to locate the server (hemilabs/sp1 falls back to
     // USERPROFILE, which is all Windows sets), so an unset HOME is a panic rather than an error.
     // Systemd units routinely have no HOME.
@@ -1174,6 +1463,12 @@ fn sp1_usability() -> Result<(), String> {
             )
         }
     };
+
+    // The server this release ships beside the worker could not be installed: what runs instead is
+    // not the one this worker was built with (see `bundled_server::install_failure`).
+    if let Some(failure) = bundled_server::install_failure() {
+        return Err(failure.to_string());
+    }
 
     // SP1 here is CUDA-only: `.cuda()` is unconditional, there is no CPU path. With no
     // NVIDIA GPU at all, nothing this worker advertises can ever be proved.
@@ -1207,9 +1502,15 @@ fn sp1_usability() -> Result<(), String> {
     //    object file"
     // `--version` is what the SDK itself runs, costs milliseconds, and touches no GPU.
     if !server.exists() {
-        // Absent: the SDK downloads it on first use. We cannot verify a binary that does
-        // not exist yet, and refusing here would disable SP1 on a host where it works.
-        return Ok(());
+        // Absent. The SDK would download upstream's build at the first proof, which has none of
+        // the fork's fixes (see `bundled_server`), but cannot: the worker starts its server only
+        // after it has denied itself the network (`build_prover`). Every proof would fail, after
+        // its job was claimed.
+        return Err(format!(
+            "there is no sp1-gpu-server at {}, and a worker has no network to download one with \
+             once it proves: install the one this release ships",
+            server.display()
+        ));
     }
     // Decline ONLY on an UNREPAIRABLE failure. Being stricter than this disables hosts
     // the SDK can fix by itself.
@@ -1223,8 +1524,34 @@ fn sp1_usability() -> Result<(), String> {
     // What does NOT self-heal is a loader failure: the asset is pinned to the SDK's own
     // version, so a re-download reproduces the same libcudart.so.12 ABI gap. That, and a
     // binary that cannot be exec'd at all, is the only case worth declining.
+    let probed = Instant::now();
     match probe_server_version(&server, PROBE_TIMEOUT) {
-        Outcome::Ran { success: true, .. } => Ok(()),
+        // It runs. Then what it can do: see `server_capability`. Only here, where `--version` came
+        // back, so the two probes fit the handshake: the second has what is left of the first's
+        // budget, and at least a second (the binary is in the page cache by now).
+        #[cfg(target_os = "linux")]
+        Outcome::Ran { success: true, .. } => {
+            let timeout = PROBE_TIMEOUT
+                .saturating_sub(probed.elapsed())
+                .max(Duration::from_secs(1));
+            match server_capability(&server, timeout) {
+                Capability::Present => Ok(()),
+                Capability::Absent(why) => Err(why),
+                Capability::Unknown(why) => {
+                    tracing::warn!(
+                        "could not tell whether {} shares memory through descriptors ({why}); \
+                         leaving SP1 advertised, and checking again before its server starts",
+                        server.display()
+                    );
+                    Ok(())
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Outcome::Ran { success: true, .. } => {
+            let _ = probed;
+            Ok(())
+        }
         // Never came back inside the budget. The verdict stays `Ok` because this function's
         // contract is to decline only what provably cannot work, and a timeout is also what a
         // transiently overloaded host produces. But the warning must not pretend this is an
@@ -1303,6 +1630,68 @@ fn sp1_usability() -> Result<(), String> {
         Outcome::SpawnFailed { err, .. } => {
             Err(format!("cannot execute {}: {err}", server.display()))
         }
+    }
+}
+
+/// What a worker needs of its server, which `sp1-gpu-server --capabilities` lists: its executor
+/// shares the guest's memory and trace ring with its runner process through file descriptors, never
+/// names in `/dev/shm`. The confinement gives no SP1 process `/dev/shm`, so a server without it
+/// fails every proof, after the job is claimed. A server built before the flag reports the same
+/// `--version` and refuses `--capabilities`.
+const SERVER_CAPABILITY: &str = "fd-shared-memory";
+
+/// Whether the server has [`SERVER_CAPABILITY`].
+#[derive(Debug, PartialEq)]
+enum Capability {
+    Present,
+    /// It answered without it, or refused the flag: why, to decline with.
+    Absent(String),
+    /// The probe did not settle it (it timed out, or could not run just now): why.
+    Unknown(String),
+}
+
+/// Runs `server --capabilities`, bounded by `timeout`, and looks for [`SERVER_CAPABILITY`].
+#[cfg(target_os = "linux")]
+fn server_capability(server: &std::path::Path, timeout: Duration) -> Capability {
+    let (outcome, stdout) = proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new(server).arg("--capabilities"),
+        timeout,
+        PROBE_STDERR_CAP,
+    );
+    capability_of(server, outcome, &stdout)
+}
+
+/// [`server_capability`]'s verdict on what the probe gave.
+fn capability_of(server: &std::path::Path, outcome: Outcome, stdout: &str) -> Capability {
+    let lacks = |detail: String| {
+        Capability::Absent(format!(
+            "{} cannot share memory with its executor's runner except through /dev/shm, which no \
+             confined SP1 process may reach: {detail}. Install the sp1-gpu-server this release \
+             ships",
+            server.display()
+        ))
+    };
+    match outcome {
+        Outcome::Ran { success: true, .. } => {
+            if stdout.lines().any(|line| line.trim() == SERVER_CAPABILITY) {
+                Capability::Present
+            } else {
+                lacks(format!(
+                    "its --capabilities do not include {SERVER_CAPABILITY}"
+                ))
+            }
+        }
+        Outcome::Ran { stderr, .. } => lacks(format!(
+            "it is older than --capabilities ({})",
+            stderr.lines().next().unwrap_or("").trim()
+        )),
+        Outcome::SpawnFailed {
+            err,
+            transient: false,
+        } => lacks(format!("it cannot be run ({err})")),
+        Outcome::SpawnFailed { err, .. } => Capability::Unknown(err.to_string()),
+        Outcome::TimedOut { .. } => Capability::Unknown("--capabilities timed out".to_string()),
+        Outcome::Unsettled(e) => Capability::Unknown(e.to_string()),
     }
 }
 
@@ -1413,29 +1802,6 @@ fn element_threshold_to_apply(
         total_vram,
     );
     [computed, card_cap].into_iter().flatten().min()
-}
-
-/// The kind a failed prove reports, from its error's text. Only this binary's own wordings and the
-/// prover's are matched: no guest-chosen string reaches an SP1 prove error (the executor's are
-/// typed, guest output goes to the log). The vkey-binding bails are checked first, so a permanent
-/// program-level mismatch is never misread as a transient GPU out-of-memory.
-fn classify_prove_error(msg: &str) -> ErrorKind {
-    if msg.contains("does not match job programId") || msg.contains("could not parse SP1 vkey hash")
-    {
-        // The served ELF's verifying key cannot match this job's programId. No job for this program
-        // can ever be proved, so report it as ProgramMismatch: the host negative-caches the program
-        // and stops claiming its jobs, instead of eating a release penalty per submitted job.
-        ErrorKind::ProgramMismatch
-    } else if is_gpu_oom(msg) || msg.contains("allocation failed") {
-        // GPU OOM: tag as ResourceExhausted so the dispatcher kills + respawns this worker (and its
-        // gpu-server) with clean VRAM, and retries one shard size smaller. "allocation failed" is
-        // slop's panic when the server's device allocator gives up.
-        ErrorKind::ResourceExhausted
-    } else if msg.contains("serialize") || msg.contains("bincode") {
-        ErrorKind::Internal
-    } else {
-        ErrorKind::ProofFailed
-    }
 }
 
 fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
@@ -1948,6 +2314,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 }
                 match get_prover!(held.prover) {
                     Ok(p) => {
+                        if let Err(refused) = guest_may_run(0, true) {
+                            write_message(&mut stdout, &refused)?;
+                            continue;
+                        }
+                        canary_or_decline(&*p);
                         let run = run_benchmarks(
                             p,
                             &mut held.benchmark_keys,
@@ -2020,8 +2391,20 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 input_data,
                 po2: _, // SP1 does not use segment sizing
                 program_id,
+                witness,
             } => {
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
+                // Witness-construction jobs are risc0-only (plan §5.3): proving the empty inline
+                // input of one would prove the wrong statement.
+                if witness.is_some() {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::ProtocolError,
+                        message: "the SP1 worker does not prove witness jobs".to_string(),
+                    };
+                    write_message(&mut stdout, &resp)?;
+                    continue;
+                }
                 if sp1_measure_only() {
                     // Proving builds the CudaProver (forks sp1-gpu-server) — exactly what a
                     // measure-only worker must never do. Refuse on the protocol; the dispatcher never
@@ -2034,15 +2417,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 }
-                // Announce proof START so the miner can move the job from Queued to Proving.
-                // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
-                let started = WorkerResponse::Progress {
-                    request_id,
-                    fraction: 0.0,
-                    elapsed_secs: 0.0,
-                    segments: None,
-                };
-                write_message(&mut stdout, &started)?;
+                // The server first, then the confinement: once confined, this worker can start none.
                 let prover_for_proof = match get_prover!(held.prover) {
                     Ok(p) => p,
                     Err(message) => {
@@ -2058,6 +2433,20 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                         continue;
                     }
                 };
+                if let Err(refused) = guest_may_run(request_id, true) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
+                canary_or_decline(&*prover_for_proof);
+                // Announce proof START so the miner can move the job from Queued to Proving.
+                // Without this the job displays "Queued (waiting for GPU)" for the whole proof.
+                let started = WorkerResponse::Progress {
+                    request_id,
+                    fraction: 0.0,
+                    elapsed_secs: 0.0,
+                    segments: None,
+                };
+                write_message(&mut stdout, &started)?;
                 // `run_proof`'s prove-only SDK calls — `setup` (vkey/pk derivation) and
                 // the GPU `prove` — run on the fully attacker-controlled ELF and are NOT exercised by
                 // the Execute measurement gate, so a crafted ELF that executes cleanly (hence measures
@@ -2089,12 +2478,25 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_panic) => {
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "SP1 prover panicked on this ELF (malformed or hostile program)"
-                                .to_string(),
+                    Err(panic) => {
+                        let text = panic_text(&*panic);
+                        let resp = if is_executor_environment_fault(&text) {
+                            environment_fault_or_decline(&*prover_for_proof, &text);
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message: format!(
+                                    "SP1's executor could not be set up for this proof: {text}"
+                                ),
+                            }
+                        } else {
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::InvalidInput,
+                                message: "SP1 prover panicked on this ELF (malformed or hostile \
+                                          program)"
+                                    .to_string(),
+                            }
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2111,8 +2513,14 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                         // The vkey-binding bails are THIS binary's own host-authored strings, not
                         // guest text (the executor's errors are a typed enum with no free-form guest
                         // field), so matching them is safe — unlike matching the guest-controlled
-                        // `message` body, which nothing here does. See `classify_prove_error`.
-                        let kind = classify_prove_error(&msg);
+                        // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
+                        // permanent program-level mismatch is reported as such and never misread as a
+                        // transient GPU OOM.
+                        if is_executor_environment_fault(&msg) {
+                            // Its executor could not be set up: this worker's fault, not the job's.
+                            environment_fault_or_decline(&*prover_for_proof, &msg);
+                        }
+                        let kind = prove_error_kind(&msg);
                         let resp = WorkerResponse::Error {
                             request_id,
                             kind,
@@ -2156,6 +2564,27 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 // Runs on the CPU executor (no gpu-server), built once per worker: by the host's
                 // `Warmup` before the first request (below), else here.
                 tracing::info!("Execute (sizing) request {request_id} ({} bytes ELF)", elf.len());
+                // A worker that proves starts its server before it confines itself (which takes
+                // `connect` away); one that only measures keeps no socket at all.
+                let keep_server = !sp1_measure_only();
+                if keep_server {
+                    if let Err(message) = get_prover!(held.prover) {
+                        tracing::error!("{message}");
+                        write_message(
+                            &mut stdout,
+                            &WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message,
+                            },
+                        )?;
+                        continue;
+                    }
+                }
+                if let Err(refused) = guest_may_run(request_id, keep_server) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 let Some(cpu) = cpu_prover(&mut cpu_executor) else {
                     let resp = WorkerResponse::Error {
                         request_id,
@@ -2165,6 +2594,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 };
+                canary_or_decline(cpu);
                 // The ELF bytes are fully attacker-controlled, and SP1's parser/executor
                 // (`Elf::from` / `setup` / `execute().run()`) CAN panic on a malformed registered ELF
                 // rather than returning Err. A panic unwinding out of the loop would have the
@@ -2207,23 +2637,43 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                         // (canonicalized to "exceeded cycle limit …", which the host classifies as
                         // too-heavy), fail the vkey bind, or simply error on this input. All are
                         // properties of the job, not of this worker, so report InvalidInput and keep
-                        // the healthy worker alive.
+                        // the healthy worker alive. Unless the executor itself could not be set up,
+                        // before the guest ran: that is this worker's.
+                        let kind = if is_executor_environment_fault(&msg) {
+                            environment_fault_or_decline(cpu, &msg);
+                            ErrorKind::Internal
+                        } else {
+                            ErrorKind::InvalidInput
+                        };
                         let resp = WorkerResponse::Error {
                             request_id,
-                            kind: ErrorKind::InvalidInput,
+                            kind,
                             message: msg,
                         };
                         write_message(&mut stdout, &resp)?;
                     }
-                    Err(_) => {
+                    Err(panic) => {
                         // A panic in the attacker-data path: same InvalidInput classification, worker
-                        // stays alive (the loop continues; the slot is not scored failed).
-                        let resp = WorkerResponse::Error {
-                            request_id,
-                            kind: ErrorKind::InvalidInput,
-                            message: "SP1 executor panicked while sizing this ELF (malformed or \
-                                      hostile program)"
-                                .to_string(),
+                        // stays alive (the loop continues; the slot is not scored failed). Unless the
+                        // executor itself could not be set up, as above.
+                        let text = panic_text(&*panic);
+                        let resp = if is_executor_environment_fault(&text) {
+                            environment_fault_or_decline(cpu, &text);
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message: format!(
+                                    "SP1's executor could not be set up for sizing: {text}"
+                                ),
+                            }
+                        } else {
+                            WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::InvalidInput,
+                                message: "SP1 executor panicked while sizing this ELF (malformed \
+                                          or hostile program)"
+                                    .to_string(),
+                            }
                         };
                         write_message(&mut stdout, &resp)?;
                     }
@@ -2238,6 +2688,27 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                     "ProgramId request {request_id} ({} bytes ELF): SP1 setup on the CPU",
                     elf.len()
                 );
+                // A worker that proves starts its server before it confines itself (which takes
+                // `connect` away); one that only measures keeps no socket at all.
+                let keep_server = !sp1_measure_only();
+                if keep_server {
+                    if let Err(message) = get_prover!(held.prover) {
+                        tracing::error!("{message}");
+                        write_message(
+                            &mut stdout,
+                            &WorkerResponse::Error {
+                                request_id,
+                                kind: ErrorKind::Internal,
+                                message,
+                            },
+                        )?;
+                        continue;
+                    }
+                }
+                if let Err(refused) = guest_may_run(request_id, keep_server) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 let Some(cpu) = cpu_prover(&mut cpu_executor) else {
                     let resp = WorkerResponse::Error {
                         request_id,
@@ -2247,6 +2718,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                     write_message(&mut stdout, &resp)?;
                     continue;
                 };
+                canary_or_decline(cpu);
                 let started = Instant::now();
                 // Submitter-controlled bytes reach `setup`, which can panic on a malformed ELF: a
                 // caught panic is a property of the ELF (InvalidInput), as on the Execute arm.
@@ -2411,12 +2883,38 @@ fn parse_sp1_execute_cycle_limit(raw: Option<&str>) -> Option<u64> {
     }
 }
 
-/// Execute the guest WITHOUT proving, returning its true cycle count — the pre-claim sizing path for
-/// SP1, the analogue of the risc0 worker's `run_execute`. The count is SP1's `total_instruction_count`,
-/// the SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
+/// What an SP1 execution costs to prove, in the unit every SP1 figure the host sizes with is in (the
+/// measurement, a proof's reported cycles, the benchmark throughput): SP1's gas, which weights each
+/// operation by what it costs to prove. The instruction count counts a precompile call (keccak,
+/// sha, bigint) as one instruction, though it proves as far more, so a guest that loops one measured
+/// cheap, was claimed, and overran its proving budget on every attempt. For code without precompiles
+/// the two are close (within 0.89 to 1.06 of each other on the benchmark programs). The instruction
+/// count only where gas was not computed (it is unless an execution turns it off, which none here
+/// does).
+fn sp1_proving_cost(report: &sp1_sdk::ExecutionReport) -> u64 {
+    report
+        .gas()
+        .unwrap_or_else(|| report.total_instruction_count())
+}
+
+/// A benchmark row's cycles: [`sp1_proving_cost`], except `zkop-mix`'s, whose zkOP/s score divides
+/// `ZKOP_MIX_SP1_CYCLES`, an instruction count, by its proof's time and checks the row against it.
+/// That row sizes nothing (the host leaves it out of every throughput), so its unit is the score's.
+fn benchmark_cycles(program: &str, report: &sp1_sdk::ExecutionReport) -> u64 {
+    if program == BENCH_ZKOP_MIX {
+        report.total_instruction_count()
+    } else {
+        sp1_proving_cost(report)
+    }
+}
+
+/// Execute the guest WITHOUT proving, returning its proving cost — the pre-claim sizing path for
+/// SP1, the analogue of the risc0 worker's `run_execute`. The figure is [`sp1_proving_cost`], the
+/// SAME quantity `run_proof` reports and the SP1 benchmark suite measures throughput in, so it
 /// feeds the deadline/look-ahead math in matching units. This lets the miner size an SP1 job on a
-/// MEASURED cycle count instead of the submitter-declared `expectedCycles`, closing the input-flood
-/// under-sizing vector for SP1.
+/// MEASURED cost instead of the submitter-declared `expectedCycles`, closing the input-flood
+/// under-sizing vector for SP1, and a precompile-heavy guest no longer measures as cheap as its
+/// instruction count.
 ///
 /// Runs on a lightweight `CpuProver`, never the CUDA prover: SP1 execution is pure CPU emulation and
 /// the cycle count is deterministic in (program, input) whichever prover runs it, so routing it to the
@@ -2582,7 +3080,7 @@ fn run_execute_sp1(
     elf: &[u8],
     input_data: &[u8],
 ) -> anyhow::Result<(u64, Vec<u8>, f64, u64)> {
-    use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+    use sp1_sdk::blocking::{Prover, SP1Stdin};
 
     let started = Instant::now();
 
@@ -2590,30 +3088,27 @@ fn run_execute_sp1(
     // One input element, consumed by a single `io::read_vec` in the guest — matching `run_proof`.
     stdin.write_slice(input_data);
 
-    let mut req = cpu.execute(Elf::from(elf), stdin);
+    // What the SDK's `execute(..).cycle_limit(..).run()` does, through the node it calls: that call
+    // drops the digest the guest committed its public values under, which is checked below.
+    let mut context = sp1_sdk::SP1ContextBuilder::new();
     if let Some(limit) = sp1_execute_cycle_limit() {
-        req = req.cycle_limit(limit);
+        context.max_cycles(limit);
     }
+    let context = context.build();
+    let runtime = sizing_runtime()?;
     // Gas calculation MUST stay enabled (the builder default). With `.calculate_gas(false)`
     // the pinned SP1 build NEVER sets the executor's final VM state — `GasExecutingWorker::call`
     // short-circuits (crates/prover/src/worker/prover/execute.rs:92) so `final_vm_state` stays unset
     // and `execute_with_options`'s `.ok_or(anyhow!("Failed to extract public value digest"))?`
     // (execute.rs:321) returns Err for EVERY guest. Gas accumulation is also what populates
-    // `opcode_counts`, i.e. `total_instruction_count()`. So we do NOT disable it.
-    let (run_result, peak_host_bytes) = with_peak_rss_sampling(|| req.run());
-    let (public_values, report) =
+    // `opcode_counts`, i.e. `total_instruction_count()`, and gas is what the job is sized by
+    // (`sp1_proving_cost`). So we do NOT disable it.
+    let (run_result, peak_host_bytes) =
+        with_peak_rss_sampling(|| runtime.block_on(cpu.inner().execute(elf, stdin, context)));
+    let (public_values, committed_digest, report) =
         run_result.map_err(|e| canonicalize_sp1_execute_error(&e.to_string()))?;
-    // A guest that does not exit 0 (a panic exits 1, `halt(n)` exits n) still executes and proves, but
-    // the proof's exit code fails the SDK's verify and the on-chain verifier (`InvalidExitCode`): the
-    // (program, input) can never settle. Refuse it here, before the claim, as the risc0 worker does,
-    // so the host never locks collateral on it. Deterministic for (ELF, input).
-    if report.exit_code != 0 {
-        anyhow::bail!(
-            "execute: guest exited with code {} — a non-zero exit code can never produce an \
-             accepted proof for this program+input",
-            report.exit_code
-        );
-    }
+    refuse_unprovable_exit(report.exit_code)?;
+    refuse_non_sha256_commitment(&public_values, &committed_digest)?;
     // The public values the guest commits here are byte-identical to the journal the
     // later Groth16 proof carries (both are a deterministic function of (ELF, input), and the host's
     // elf_hash gate makes measure-ELF == prove-ELF). The host checks the job's journal binding
@@ -2621,12 +3116,117 @@ fn run_execute_sp1(
     // instead of learning either only after a full proof is wasted. `.to_vec()` matches how
     // `run_proof` extracts the journal.
     Ok((
-        report.total_instruction_count(),
+        sp1_proving_cost(&report),
         public_values.to_vec(),
         started.elapsed().as_secs_f64(),
         peak_host_bytes,
     ))
 }
+
+/// A measured guest that halted with a non-zero exit code (its own `exit(n)`, or a panic) runs to
+/// the end like one that succeeded, but no proof of it is accepted: the SDK's `verify` refuses an
+/// exit code other than 0, and so does the on-chain verifier. Without this it would be measured
+/// clean, claimed, and fail every proof attempt. Refused at measurement, as the risc0 worker refuses
+/// a session that did not halt with 0.
+fn refuse_unprovable_exit(exit_code: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        exit_code == 0,
+        "{UNPROVABLE_EXIT} {exit_code}: no proof of it verifies"
+    );
+    Ok(())
+}
+
+/// The on-chain SP1 verifier recomputes `sha256(publicValues)` and checks the proof against that.
+/// A guest may instead commit its public values under Blake3, which the SDK's `verify` also accepts:
+/// such a job would be measured, claimed, proven and verified here, and its fulfil would revert.
+/// The digest a guest commits is fixed by its execution, so it is refused at measurement: here,
+/// `committed_digest` is what the measured execution committed.
+fn refuse_non_sha256_commitment(
+    public_values: &sp1_sdk::SP1PublicValues,
+    committed_digest: &[u8; 32],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        public_values.hash() == committed_digest,
+        "{NOT_SHA256_DIGEST}, which the on-chain verifier does not accept"
+    );
+    Ok(())
+}
+
+/// After a proof: whether the digest its Groth16 public inputs commit to (`public_inputs[1]`, a
+/// decimal) is the masked SHA-256 of its public values (`hash_bn254`), the one value the on-chain
+/// verifier accepts. The measurement refuses another digest before any claim
+/// ([`refuse_non_sha256_commitment`]); this holds a job that reached a proof without one.
+fn proof_commits_sha256(proof: &sp1_sdk::SP1ProofWithPublicValues) -> bool {
+    let sp1_sdk::SP1Proof::Groth16(groth16) = &proof.proof else {
+        return false;
+    };
+    let sha256 = proof.public_values.hash_bn254();
+    groth16
+        .public_inputs
+        .get(1)
+        .and_then(|committed| committed.parse().ok())
+        == Some(sha256)
+}
+
+/// The phrase of `run_proof`'s refusal of a proof whose public values are not committed under
+/// SHA-256; the prove path reports it as [`ErrorKind::InvalidInput`] (see [`prove_error_kind`]).
+const NOT_SHA256_COMMITTED: &str = "SP1 proof's public values are not committed under SHA-256";
+
+/// The start of [`refuse_unprovable_exit`]'s refusal.
+const UNPROVABLE_EXIT: &str = "the guest halted with exit code";
+
+/// The start of [`refuse_non_sha256_commitment`]'s refusal.
+const NOT_SHA256_DIGEST: &str =
+    "the guest commits its public values under a digest other than SHA-256";
+
+/// How the prove path reports a failure of `run_proof` (its message, `msg`), from this binary's own
+/// phrases, never a guest's (the executor's errors are a typed enum with no free-form guest field):
+/// - this worker's executor could not be set up: [`ErrorKind::Internal`];
+/// - the served ELF's verifying key is not the job's programId: [`ErrorKind::ProgramMismatch`],
+///   which the host records against the program (no job of it can be fulfilled);
+/// - the job's own execution is unprovable (a non-zero exit, found by the execute before the proof),
+///   or commits its public values under a digest the chain does not accept (Blake3, found before or
+///   after the proof): [`ErrorKind::InvalidInput`]. That is this job's input, not its program: the
+///   same program may commit under SHA-256 for another input, and its verifying key is the job's;
+/// - a GPU out of memory: [`ErrorKind::ResourceExhausted`]; else [`ErrorKind::ProofFailed`].
+fn prove_error_kind(msg: &str) -> ErrorKind {
+    if is_executor_environment_fault(msg) {
+        ErrorKind::Internal
+    } else if msg.contains("does not match job programId")
+        || msg.contains("could not parse SP1 vkey hash")
+    {
+        ErrorKind::ProgramMismatch
+    } else if msg.starts_with(NOT_SHA256_COMMITTED)
+        || msg.starts_with(UNPROVABLE_EXIT)
+        || msg.starts_with(NOT_SHA256_DIGEST)
+    {
+        ErrorKind::InvalidInput
+    } else if is_gpu_oom(msg) || msg.contains("allocation failed") {
+        // GPU OOM: tag as ResourceExhausted so the dispatcher kills + respawns this worker (and its
+        // gpu-server) with clean VRAM, and retries one shard size smaller. "allocation failed" is
+        // slop's panic when the server's device allocator gives up.
+        ErrorKind::ResourceExhausted
+    } else if msg.contains("serialize") || msg.contains("bincode") {
+        ErrorKind::Internal
+    } else {
+        ErrorKind::ProofFailed
+    }
+}
+
+/// The runtime the measurement's execution runs on (`run_execute_sp1`), made on first use: the SDK's
+/// blocking calls run on a runtime of their own, which is not reachable from here.
+fn sizing_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{SIZING_RUNTIME_FAILED}: {e}"))
+}
+
+/// The start of `sizing_runtime`'s error: the worker's fault, not the job's
+/// (`is_executor_environment_fault`).
+const SIZING_RUNTIME_FAILED: &str = "could not start the runtime SP1 executions run on";
 
 /// True iff an SP1 `execute().run()` error string denotes the cycle cap being tripped
 /// (the guest is too heavy to size). The pinned build signals the cap from the gas accumulator as the
@@ -2649,6 +3249,29 @@ fn canonicalize_sp1_execute_error(raw: &str) -> anyhow::Error {
     } else {
         anyhow::anyhow!("{raw}")
     }
+}
+
+/// The execution before a proof, checked as the measurement checks it: capped at the measurement's
+/// cycle limit, and refused when no proof of it can be accepted (a non-zero exit, or public values
+/// committed under a digest other than SHA-256), before a Groth16 proof is spent on it. A lock taken
+/// on a measurement that did not check these (an older worker's, recovered across an upgrade) fails
+/// here, in an execute's time.
+fn execute_before_proof<P: sp1_sdk::blocking::Prover>(
+    prover: &P,
+    elf: &[u8],
+    stdin: &sp1_sdk::SP1Stdin,
+) -> Result<(sp1_sdk::SP1PublicValues, sp1_sdk::ExecutionReport)> {
+    let mut context = sp1_sdk::SP1ContextBuilder::new();
+    if let Some(limit) = sp1_execute_cycle_limit() {
+        context.max_cycles(limit);
+    }
+    let context = context.build();
+    let (public_values, committed_digest, report) = sizing_runtime()?
+        .block_on(prover.inner().execute(elf, stdin.clone(), context))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    refuse_unprovable_exit(report.exit_code)?;
+    refuse_non_sha256_commitment(&public_values, &committed_digest)?;
+    Ok((public_values, report))
 }
 
 fn run_proof(
@@ -2674,95 +3297,69 @@ fn run_proof(
     // so a claimed-but-hostile guest could spin the executor far past the measured budget on the
     // prove worker (where it stacks on the warm sp1-gpu-server). The same ELF+input measured feasible,
     // so the cap never trips a legitimate claimed job.
-    let mut exec = prover.execute(Elf::from(elf), stdin.clone());
-    if let Some(limit) = sp1_execute_cycle_limit() {
-        exec = exec.cycle_limit(limit);
-    }
-    // The execute runs on its own thread beside the key setup and the prove: nothing before the proof
-    // needs its result (the host measured cycles and journal before the claim), and serially it was
-    // 0.4-5 s of every job's wall time (a 212M-cycle sha job: 5 s). Its public values still bind the
-    // proof to this job's input below, after both finish. A guest that trips the cycle cap here has
-    // already passed the same cap at measure time, so letting its prove run to the end costs nothing
-    // a hostile guest could not already cost.
-    let key = elf_hash(elf);
-    let (exec_result, proved) = std::thread::scope(|s| {
-        let exec_thread = s.spawn(move || exec.run().map_err(|e| anyhow::anyhow!("{e}")));
-        let proved = (|| -> Result<_> {
-            // Get-or-create the proving key for this ELF. The key depends only on the
-            // program (not the input), so it's cached and reused across proofs — no per-proof
-            // setup() and no per-proof GPU-key leak. See `pk_cache` in run_worker_loop.
-            if pk_cache.contains(&key) {
-                pk_cache.touch(&key);
-            } else {
-                let pk = prover.setup(Elf::from(elf)).map_err(sdk_error)?;
-                // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
-                for evicted in pk_cache.insert(key, pk) {
-                    tracing::info!(
-                        "Evicting a cached SP1 proving key (cap {})",
-                        pk_cache_capacity()
-                    );
-                    evict_key(evicted)?;
-                }
-            }
-            let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
+    let (public_values, report) = execute_before_proof(prover, elf, &stdin)?;
+    let cycles = sp1_proving_cost(&report);
 
-            // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
-            // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
-            // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
-            // guaranteed revert. Reject BEFORE proving. The exact byte order of the on-chain programId vs
-            // SP1's vkey hash is deployment-defined, so accept EITHER order (a wrong ELF matches neither; a
-            // legit one never false-rejects). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
-            if let Some(pid) = program_id {
-                let skip = matches!(
-                    std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
-                        .ok()
-                        .as_deref(),
-                    Some("1") | Some("true") | Some("TRUE")
-                );
-                if !skip {
-                    // Use bytes32() (a 0x-prefixed 64-hex string, zero-padded) and decode it, NOT
-                    // bytes32_raw(): the latter does `result[1..].copy_from_slice(&digest.to_bytes_be())`,
-                    // which PANICS unless the big-endian digest is exactly 31 bytes — a condition a
-                    // submitter-crafted ELF (hence vkey) can violate, crashing the worker. bytes32() formats
-                    // via `format!("0x{:0>64}", …)` and never panics.
-                    match decode_hex32(&pk.verifying_key().bytes32()) {
-                        Some(vk_hash) => {
-                            // The native order only: the on-chain SP1 verifier checks
-                            // `vk.bytes32() == programId` as given, so a byte-reversed programId can
-                            // never verify. Accepting it would prove a job only to have the fulfil
-                            // revert `VerifierCallFailed` and the lock released at a penalty.
-                            if vk_hash != pid {
-                                anyhow::bail!(
-                                    "ELF vkey hash does not match job programId (served ELF is not the \
-                                     registered program) — refusing to prove"
-                                );
-                            }
-                        }
-                        None => {
-                            // The SDK returned a vkey string we can't parse to 32 bytes; refuse rather than
-                            // prove an unverifiable binding (a legit program's vkey always parses).
-                            anyhow::bail!("could not parse SP1 vkey hash for programId binding — refusing to prove");
-                        }
+    // Get-or-create the proving key for this ELF. The key depends only on the
+    // program (not the input), so it's cached and reused across proofs — no per-proof
+    // setup() and no per-proof GPU-key leak. See `pk_cache` in run_worker_loop.
+    let key = elf_hash(elf);
+    if pk_cache.contains(&key) {
+        pk_cache.touch(&key);
+    } else {
+        let pk = prover.setup(Elf::from(elf)).map_err(sdk_error)?;
+        // LRU-evict to bound host RAM + VRAM; free each evicted key's GPU memory in a runtime.
+        for evicted in pk_cache.insert(key, pk) {
+            tracing::info!(
+                "Evicting a cached SP1 proving key (cap {})",
+                pk_cache_capacity()
+            );
+            evict_key(evicted)?;
+        }
+    }
+    let pk = pk_cache.get(&key).expect("pk was just inserted or touched");
+
+    // Bind the served ELF to the job's on-chain programId. For SP1 the programId IS
+    // the verifying-key hash, so an ELF whose vkey hash != programId can never produce a proof the
+    // on-chain SP1 verifier accepts — proving it just burns a full GPU proof + fulfill gas on a
+    // guaranteed revert. Reject BEFORE proving, in the order the chain reads it
+    // (`vkey_matches_program_id`). Default-on; ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK=1 disables.
+    if let Some(pid) = program_id {
+        let skip = matches!(
+            std::env::var("ZKMINER_SP1_SKIP_PROGRAM_ID_CHECK")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        if !skip {
+            // Use bytes32() (a 0x-prefixed 64-hex string, zero-padded) and decode it, NOT
+            // bytes32_raw(): the latter does `result[1..].copy_from_slice(&digest.to_bytes_be())`,
+            // which PANICS unless the big-endian digest is exactly 31 bytes — a condition a
+            // submitter-crafted ELF (hence vkey) can violate, crashing the worker. bytes32() formats
+            // via `format!("0x{:0>64}", …)` and never panics.
+            match decode_hex32(&pk.verifying_key().bytes32()) {
+                Some(vk_hash) => {
+                    if !vkey_matches_program_id(&vk_hash, &pid) {
+                        anyhow::bail!(
+                            "ELF vkey hash does not match job programId (served ELF is not the \
+                             registered program) — refusing to prove"
+                        );
                     }
                 }
+                None => {
+                    // The SDK returned a vkey string we can't parse to 32 bytes; refuse rather than
+                    // prove an unverifiable binding (a legit program's vkey always parses).
+                    anyhow::bail!("could not parse SP1 vkey hash for programId binding — refusing to prove");
+                }
             }
+        }
+    }
 
-            // Generate Groth16 proof for on-chain verification.
-            // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
-            let start = Instant::now();
-            let proof = prover.prove(pk, stdin).groth16().run().map_err(sdk_error)?;
-            let duration_secs = start.elapsed().as_secs_f64();
-            Ok((proof, duration_secs))
-        })();
-        let exec_result = exec_thread
-            .join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("the SP1 execute panicked")));
-        (exec_result, proved)
-    });
-    let (public_values, report) = exec_result?;
-    let cycles = report.total_instruction_count();
-    let (proof, duration_secs) = proved?;
-    let pk = pk_cache.get(&key).expect("the prove above set this key up");
+    // Generate Groth16 proof for on-chain verification.
+    // The SP1 on-chain verifier expects: vkey_hash[0..4] || encoded_groth16_proof
+    let start = Instant::now();
+    let proof = prover.prove(pk, stdin).groth16().run().map_err(sdk_error)?;
+    let duration_secs = start.elapsed().as_secs_f64();
 
     // The proof must be of THIS job's input, which `verify` below cannot say: a valid proof of another
     // input passes it, and the SDK's requests carry no id. Execution above saw what this input commits.
@@ -2781,6 +3378,11 @@ fn run_proof(
             "Proof verification FAILED — SP1 proof is invalid: {e}"
         ));
     }
+    // `verify` also accepts public values committed under Blake3, which the on-chain verifier does
+    // not: such a proof would only revert at fulfil (`proof_commits_sha256`).
+    if !proof_commits_sha256(&proof) {
+        anyhow::bail!("{NOT_SHA256_COMMITTED}: the on-chain verifier would reject it");
+    }
 
     let journal = proof.public_values.to_vec();
     // Use bytes() which produces the on-chain format: vkey_hash[..4] || proof_bytes
@@ -2798,7 +3400,7 @@ struct BenchmarkRun {
     /// A [`ServerLost`], which ended the run where it happened. `results` still holds what came
     /// before, and a row whose wrap alone was lost.
     server_lost: Option<anyhow::Error>,
-    /// A program ran out of GPU memory (`classify_prove_error`), which also ended the run: the
+    /// A program ran out of GPU memory (`prove_error_kind`), which also ended the run: the
     /// card cannot hold this shard size, the programs after it would fail the same way, and rows
     /// measured at a size that does not fit are no measurement of the card. Answered as an
     /// out-of-memory, for the host to measure again one shard size smaller.
@@ -2913,7 +3515,7 @@ fn run_benchmarks(
                 tracing::error!("{name}: {e:#}");
                 let message = format!("{name}: {e:#}");
                 run.out_of_memory |=
-                    matches!(classify_prove_error(&message), ErrorKind::ResourceExhausted);
+                    matches!(prove_error_kind(&message), ErrorKind::ResourceExhausted);
                 run.failed.push(message);
                 if e.is::<ServerLost>() {
                     run.server_lost = Some(e);
@@ -2953,7 +3555,7 @@ fn benchmark_program(
         .execute(Elf::from(elf), stdin.clone())
         .run()
         .map_err(|e| anyhow::anyhow!("execute failed: {e}"))?;
-    let cycles = report.total_instruction_count();
+    let cycles = benchmark_cycles(name, &report);
 
     // Key setup OUTSIDE the timed region. It is not proving, and production caches the key per ELF
     // (`pk_cache` in `run_worker_loop`) so never pays it per proof. In practice the cost is
@@ -3292,6 +3894,40 @@ mod orphan_exit_tests {
             wait < start,
             "the wait must come before the SDK starts a server"
         );
+        let refused = build
+            .find("if network_denied()")
+            .expect("a confined worker starts no server");
+        let shim = build
+            .find("confinement::server_routed_through_shim()")
+            .expect("build_prover checks the server runs confined");
+        assert!(
+            refused < start && shim < start,
+            "the server must only ever start through the confining shim"
+        );
+    }
+
+    /// Every arm that hands a requester's ELF to the SDK confines the worker first (after starting
+    /// the server, for a worker that proves).
+    #[test]
+    fn every_guest_command_confines_the_worker_first() {
+        let source = include_str!("main.rs");
+        let worker_loop = source.split_once("\nfn run_worker_loop(").unwrap().1;
+        let worker_loop = &worker_loop[..worker_loop.find("\nfn ").unwrap()];
+        for (arm, sdk_call) in [
+            ("WorkerCommand::Execute {", "run_execute_sp1("),
+            ("WorkerCommand::ProgramId {", "sp1_program_id("),
+            ("WorkerCommand::Prove {", "run_proof("),
+        ] {
+            let body = worker_loop.split_once(arm).unwrap().1;
+            let confine = body.find("guest_may_run(request_id,").expect(arm);
+            let cpu = body.find("cpu_prover(").unwrap_or(usize::MAX);
+            let call = body.find(sdk_call).expect(sdk_call);
+            assert!(confine < cpu.min(call), "{arm}");
+            // The server is started (`get_prover!`) before, never after: once confined, the worker
+            // could not connect to it.
+            let gpu = body.find("get_prover!(").expect(arm);
+            assert!(gpu < confine, "{arm}");
+        }
     }
 }
 
@@ -3685,10 +4321,10 @@ mod usability_tests {
         );
     }
 
-    /// An ABSENT server must NOT be reported unusable: the SDK downloads it on first use,
-    /// and refusing here would disable SP1 on a host where it actually works.
+    /// An ABSENT server is unusable: the SDK would download one at the first proof, but the
+    /// worker starts its server only once it has no network, so SP1 must not be advertised.
     #[test]
-    fn an_absent_server_is_not_treated_as_unusable() {
+    fn an_absent_server_is_unusable() {
         let _g = super::usability_tests::env_lock().lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("sp1probe-empty-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -3700,19 +4336,199 @@ mod usability_tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         let _ = std::fs::remove_dir_all(&tmp);
-        // Ok, or the no-GPU arm on a GPU-less machine -- never "cannot run".
-        if let Err(e) = r {
-            assert!(
-                e.contains("GPU"),
-                "an absent server must not be 'cannot run': {e}"
-            );
-        }
+        // Declined (or the no-GPU arm on a GPU-less machine): the SDK cannot download a server
+        // for a worker that has no network.
+        let e = r.expect_err("an absent server must be declined");
+        assert!(
+            e.contains("no sp1-gpu-server") || e.contains("GPU"),
+            "unexpected reason: {e}"
+        );
     }
 
     /// These tests mutate the process environment, so they must not interleave.
     pub(super) fn env_lock() -> &'static std::sync::Mutex<()> {
         static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+}
+
+/// What the worker asks of its server and of its own executor before it offers SP1.
+#[cfg(all(test, target_os = "linux"))]
+mod capability_tests {
+    use super::{capability_of, Capability, Outcome};
+    use std::path::Path;
+
+    fn ran(success: bool, stderr: &str) -> Outcome {
+        Outcome::Ran {
+            success,
+            stderr: stderr.to_string(),
+        }
+    }
+
+    /// Only a server that lists `fd-shared-memory` has it; one older than `--capabilities`
+    /// refuses the flag (clap's exit 2), which is a no, as is one that cannot run at all. A probe
+    /// that did not settle it is neither.
+    #[test]
+    fn only_a_server_listing_fd_shared_memory_has_it() {
+        let server = Path::new("/x/sp1-gpu-server");
+        let listed = "fd-shared-memory\ncommit=fd8ecf573474c6fc49ccb8e249f14410a163bd33\n";
+        assert_eq!(
+            capability_of(server, ran(true, ""), listed),
+            Capability::Present
+        );
+        assert_eq!(
+            capability_of(server, ran(true, ""), "  fd-shared-memory  \n"),
+            Capability::Present
+        );
+        for stdout in ["", "fd-shared-memory-v2\n", "6.8.1\n", "commit=abc\n"] {
+            assert!(matches!(
+                capability_of(server, ran(true, ""), stdout),
+                Capability::Absent(_)
+            ));
+        }
+        let old = "error: unexpected argument '--capabilities' found\n\nUsage: sp1-gpu-server";
+        match capability_of(server, ran(false, old), "") {
+            Capability::Absent(why) => {
+                assert!(why.contains("/dev/shm") && why.contains("older"), "{why}")
+            }
+            other => panic!("an old server is not refused: {other:?}"),
+        }
+        // A server that prints the name but fails is not trusted with it either.
+        assert!(matches!(
+            capability_of(server, ran(false, ""), listed),
+            Capability::Absent(_)
+        ));
+        let not_exec = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::SpawnFailed {
+                    err: not_exec,
+                    transient: false
+                },
+                ""
+            ),
+            Capability::Absent(_)
+        ));
+        let busy = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::SpawnFailed {
+                    err: busy,
+                    transient: true
+                },
+                ""
+            ),
+            Capability::Unknown(_)
+        ));
+        assert!(matches!(
+            capability_of(
+                server,
+                Outcome::TimedOut {
+                    stderr: String::new()
+                },
+                ""
+            ),
+            Capability::Unknown(_)
+        ));
+    }
+
+    /// A server built before `--capabilities`, which answers `--version` as the right one does,
+    /// is declined at the handshake (or on the no-GPU arm, on a host without one); one that lists
+    /// the capability is not declined for it.
+    #[test]
+    fn the_handshake_declines_a_server_without_the_capability() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let version = sp1_primitives::SP1_CRATE_VERSION;
+        let old = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+             echo \"error: unexpected argument '$1' found\" >&2\nexit 2\n"
+        );
+        let new = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
+             if [ \"$1\" = --capabilities ]; then echo fd-shared-memory; exit 0; fi\nexit 2\n"
+        );
+        for (name, script, declined) in [("old", old, true), ("new", new, false)] {
+            let tmp = std::env::temp_dir().join(format!("sp1caps-{name}-{}", std::process::id()));
+            let bin = tmp.join(".sp1/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let server = bin.join("sp1-gpu-server");
+            std::fs::write(&server, script).unwrap();
+            std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let saved = std::env::var("HOME").ok();
+            unsafe { std::env::set_var("HOME", &tmp) };
+            let r = super::sp1_usability();
+            match saved {
+                Some(h) => unsafe { std::env::set_var("HOME", h) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+            match r {
+                Err(e) if e.contains("GPU") => {}
+                Err(e) => assert!(declined && e.contains("/dev/shm"), "{name}: {e}"),
+                Ok(()) => assert!(!declined, "{name}: an old server is offered"),
+            }
+        }
+    }
+
+    /// The canary's expected output is what the guest commits: fibonacci, wrapping, eight bytes
+    /// little-endian.
+    #[test]
+    fn the_canary_expects_fibonacci() {
+        assert_eq!(super::canary_public_values(0), 0u64.to_le_bytes());
+        assert_eq!(super::canary_public_values(10), 55u64.to_le_bytes());
+        assert_eq!(
+            super::canary_public_values(93),
+            12200160415121876738u64.to_le_bytes()
+        );
+        // Past u64, as the guest's `wrapping_add` does.
+        let (mut a, mut b) = (0u64, 1u64);
+        for _ in 0..super::CANARY_FIB_N {
+            (a, b) = (b, a.wrapping_add(b));
+        }
+        assert_eq!(
+            super::canary_public_values(super::CANARY_FIB_N),
+            a.to_le_bytes()
+        );
+    }
+
+    /// The canary runs the embedded guest through SP1's real executor (its runner process, and
+    /// the memory it shares with it) and accepts what it commits. CPU only, no server.
+    #[test]
+    fn the_canary_runs_on_the_real_executor() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        super::run_executor_canary(&cpu).expect("the canary runs");
+    }
+
+    /// The executor's own setup failures, in the fork's words, are the worker's; a guest's
+    /// failures are not.
+    #[test]
+    fn setup_failures_are_told_from_the_guests() {
+        for text in [
+            "task 7 panicked with message \"create shm file for memory: Os { code: 13, kind: \
+             PermissionDenied, message: \\\"Permission denied\\\" }\"",
+            "create shm file for traces: Os { code: 24 }",
+            "failed to create the child's stdin: Too many open files",
+            "failed to spawn child process: Resource temporarily unavailable",
+            "the executor runner exited before reading its input (Broken pipe)",
+        ] {
+            assert!(super::is_executor_environment_fault(text), "{text}");
+        }
+        for text in [
+            "exceeded cycle limit (SP1 executor: cycle limit reached)",
+            "Invalid memory access: LD 0x0",
+            "Child native executor terminated abnormally, code: Some(1), signal: None",
+            "the executor runner broke the trace ring's protocol: the trace ring's write index",
+            "",
+        ] {
+            assert!(!super::is_executor_environment_fault(text), "{text}");
+        }
     }
 }
 
@@ -3942,7 +4758,7 @@ mod threshold_tests {
     /// its text also says "out of memory".
     #[test]
     fn a_prove_error_is_classified_by_this_binarys_and_the_provers_wordings() {
-        use super::classify_prove_error as kind;
+        use super::prove_error_kind as kind;
         use zkminer_prover_protocol::ErrorKind;
         for oom in [
             "allocation failed on evaluated: 1728053248 bytes",
@@ -3980,7 +4796,7 @@ mod threshold_tests {
             .0;
         assert_eq!(
             production
-                .matches("let kind = classify_prove_error(&msg);")
+                .matches("let kind = prove_error_kind(&msg);")
                 .count(),
             1
         );
@@ -4027,6 +4843,19 @@ mod pk_cache_tests {
         // Malformed inputs → None (never panic).
         assert!(super::decode_hex32("0x1234").is_none()); // too short
         assert!(super::decode_hex32(&("0x".to_owned() + &"zz".repeat(32))).is_none()); // non-hex
+    }
+
+    /// The programId bind takes the order the chain verifies in, and only that one: a reversed id
+    /// is a decoy whose proof the on-chain verifier rejects, so it must be refused before the proof.
+    #[test]
+    fn the_program_id_binds_in_the_canonical_order_only() {
+        let vk = super::decode_hex32(&format!("0x{}", "0123456789abcdef".repeat(4))).unwrap();
+        let mut reversed = vk;
+        reversed.reverse();
+        assert!(super::vkey_matches_program_id(&vk, &vk));
+        assert!(!super::vkey_matches_program_id(&vk, &reversed));
+        assert!(!super::vkey_matches_program_id(&reversed, &vk));
+        assert!(!super::vkey_matches_program_id(&vk, &[0u8; 32]));
     }
 
     #[test]
@@ -4112,6 +4941,12 @@ mod pk_cache_tests {
         assert!(!transient.to_lowercase().contains("exceeded cycle limit"));
     }
 
+    /// One CPU prover for the tests that execute guests: a debug build takes minutes to make one.
+    fn test_cpu_prover() -> &'static sp1_sdk::blocking::CpuProver {
+        static CPU: std::sync::OnceLock<sp1_sdk::blocking::CpuProver> = std::sync::OnceLock::new();
+        CPU.get_or_init(|| sp1_sdk::blocking::ProverClient::builder().cpu().build())
+    }
+
     // End-to-end guard against a critical failure mode: with
     // `.calculate_gas(false)` the pinned SP1 build returns Err("Failed to extract public value
     // digest") for EVERY guest, so NO SP1 job was ever claimable. Runs a REAL CPU execution of the
@@ -4125,13 +4960,227 @@ mod pk_cache_tests {
         }
         let elf = super::FIBONACCI_SP1_GUEST_ELF;
         let input = 1000u32.to_le_bytes(); // the known-good benchmark input
-        let cpu = sp1_sdk::blocking::ProverClient::builder().cpu().build();
+        let cpu = test_cpu_prover();
 
         // Gas calculation left at its default (enabled) → a real guest returns a POSITIVE instruction
         // count. `.calculate_gas(false)` would make this return Err for every guest.
-        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(&cpu, elf, &input)
+        let (cycles, _journal, _dur, _peak) = super::run_execute_sp1(cpu, elf, &input)
             .expect("executing a valid guest must succeed and yield a cycle count");
         assert!(cycles > 0, "measured cycle count must be positive, got {cycles}");
+    }
+
+    /// The measurement keeps the digest the guest committed, and a guest that commits its public
+    /// values under SHA-256 (as every guest built with the default `sp1-zkvm` does) passes.
+    #[test]
+    fn a_sha256_committing_guest_is_measured() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        use sp1_sdk::blocking::{Prover, SP1Stdin};
+        let cpu = test_cpu_prover();
+        let mut stdin = SP1Stdin::new();
+        stdin.write_slice(&1000u32.to_le_bytes());
+        let context = sp1_sdk::SP1ContextBuilder::new().build();
+        let (public_values, digest, _) = super::sizing_runtime()
+            .unwrap()
+            .block_on(
+                cpu.inner()
+                    .execute(super::FIBONACCI_SP1_GUEST_ELF, stdin, context),
+            )
+            .unwrap();
+        assert!(super::refuse_non_sha256_commitment(&public_values, &digest).is_ok());
+        // And the measurement itself takes it.
+        super::run_execute_sp1(cpu, super::FIBONACCI_SP1_GUEST_ELF, &1000u32.to_le_bytes())
+            .unwrap();
+    }
+
+    /// A job is sized by what it costs to prove: a guest that loops precompiles (a sha256, a keccak
+    /// and a bigint call per round) measures well above its instruction count (1.94 times, measured),
+    /// where the instruction count made it look as cheap as plain code, which measures about its
+    /// instruction count (fibonacci 1.04 times). The `zkop-mix` scoring row keeps the instruction
+    /// count its score is defined in.
+    #[test]
+    fn jobs_are_sized_by_proving_cost() {
+        // Built beside the embedded guests, but not embedded (and not on every platform).
+        let Some(interleave) = option_env!("SP1_ELF_precompile-interleave-sp1-guest")
+            .and_then(|p| std::fs::read(p).ok())
+            .filter(|elf| !elf.is_empty())
+        else {
+            eprintln!("skipping: no precompile-interleave guest in this build");
+            return;
+        };
+        use sp1_sdk::blocking::{Elf, Prover, SP1Stdin};
+        let cpu = test_cpu_prover();
+        let execute = |elf: &[u8], input: u32| {
+            let mut stdin = SP1Stdin::new();
+            stdin.write_slice(&input.to_le_bytes());
+            cpu.execute(Elf::from(elf.to_vec()), stdin).run().unwrap().1
+        };
+        let precompiles = execute(&interleave, 300);
+        let plain = execute(super::FIBONACCI_SP1_GUEST_ELF, 1000);
+        let ratio = |r: &sp1_sdk::ExecutionReport| {
+            super::sp1_proving_cost(r) as f64 / r.total_instruction_count() as f64
+        };
+        assert!(
+            ratio(&precompiles) > 1.5 * ratio(&plain),
+            "precompiles cost {:.2}x their instructions, plain code {:.2}x",
+            ratio(&precompiles),
+            ratio(&plain)
+        );
+        // What the measurement reports, for the host to size the job by.
+        let (measured, ..) =
+            super::run_execute_sp1(cpu, &interleave, &300u32.to_le_bytes()).unwrap();
+        assert_eq!(measured, super::sp1_proving_cost(&precompiles));
+        assert!(measured > precompiles.total_instruction_count());
+        assert_eq!(
+            super::benchmark_cycles(super::BENCH_ZKOP_MIX, &plain),
+            plain.total_instruction_count()
+        );
+        assert_eq!(
+            super::benchmark_cycles(super::BENCH_SHA256_CHAIN, &precompiles),
+            super::sp1_proving_cost(&precompiles)
+        );
+    }
+
+    /// A Blake3 commitment (what a guest built with `sp1-zkvm`'s `blake3` feature commits) is
+    /// refused at measurement, and a proof carrying one is refused before its fulfil.
+    #[test]
+    fn a_blake3_commitment_is_refused() {
+        let public_values = sp1_sdk::SP1PublicValues::from(b"some journal");
+        let blake3: [u8; 32] = public_values.blake3_hash().try_into().unwrap();
+        let sha256: [u8; 32] = public_values.hash().try_into().unwrap();
+        assert!(super::refuse_non_sha256_commitment(&public_values, &blake3).is_err());
+        assert!(super::refuse_non_sha256_commitment(&public_values, &sha256).is_ok());
+
+        let groth16 = |committed: String| sp1_sdk::SP1ProofWithPublicValues {
+            proof: sp1_sdk::SP1Proof::Groth16(groth16_with_digest(committed)),
+            public_values: public_values.clone(),
+            sp1_version: String::new(),
+            tee_proof: None,
+        };
+        let sha = public_values.hash_bn254().to_string();
+        let blake = public_values
+            .hash_bn254_with_fn(sp1_primitives::io::blake3_hash)
+            .to_string();
+        assert!(super::proof_commits_sha256(&groth16(sha.clone())));
+        // The same number, written another way, is the same digest.
+        assert!(super::proof_commits_sha256(&groth16(format!("00{sha}"))));
+        assert!(!super::proof_commits_sha256(&groth16(blake)));
+        assert!(!super::proof_commits_sha256(&groth16(
+            "not a number".into()
+        )));
+    }
+
+    /// A Groth16 proof whose public inputs commit `digest` as their second element.
+    fn groth16_with_digest(digest: String) -> sp1_prover::Groth16Bn254Proof {
+        sp1_prover::Groth16Bn254Proof {
+            public_inputs: [
+                String::new(),
+                digest,
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            encoded_proof: String::new(),
+            raw_proof: String::new(),
+            groth16_vkey_hash: [0; 32],
+        }
+    }
+
+    /// A guest that halts with a non-zero exit code is refused at measurement, before any claim: no
+    /// proof of it verifies. Fibonacci given no `u32` to read panics in its first `io::read`.
+    #[test]
+    fn a_guest_that_exits_non_zero_is_refused_at_measurement() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let err = super::run_execute_sp1(test_cpu_prover(), super::FIBONACCI_SP1_GUEST_ELF, &[])
+            .expect_err("a guest that panicked was measured clean");
+        assert!(
+            err.to_string().contains("exit code"),
+            "refused for another reason: {err:#}"
+        );
+        assert!(super::refuse_unprovable_exit(0).is_ok());
+    }
+
+    /// The execute before a proof refuses what the measurement refuses, so a lock measured without
+    /// those checks (by an older worker, recovered across an upgrade) fails in an execute's time,
+    /// before a Groth16 proof, and as the job's input, not as a mismatch of its program.
+    #[test]
+    fn the_execute_before_a_proof_refuses_a_non_zero_exit() {
+        if super::FIBONACCI_SP1_GUEST_ELF.is_empty() {
+            eprintln!("skipping: fibonacci guest ELF is stubbed (SP1_SKIP_PROGRAM_BUILD)");
+            return;
+        }
+        let stdin = |input: &[u8]| {
+            let mut s = sp1_sdk::SP1Stdin::new();
+            s.write_slice(input);
+            s
+        };
+        let err = super::execute_before_proof(
+            test_cpu_prover(),
+            super::FIBONACCI_SP1_GUEST_ELF,
+            &stdin(&[]),
+        )
+        .expect_err("a guest that panicked passed the execute before its proof");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with(super::UNPROVABLE_EXIT), "{msg}");
+        assert!(matches!(
+            super::prove_error_kind(&msg),
+            zkminer_prover_protocol::ErrorKind::InvalidInput
+        ));
+        // A guest that halts with 0 passes, with the public values its proof will carry.
+        let (pv, report) = super::execute_before_proof(
+            test_cpu_prover(),
+            super::FIBONACCI_SP1_GUEST_ELF,
+            &stdin(&10u32.to_le_bytes()),
+        )
+        .unwrap();
+        assert_eq!(report.exit_code, 0);
+        assert!(!pv.to_vec().is_empty());
+    }
+
+    /// A proof found committing its public values under Blake3 is reported as the job's (its input
+    /// commits so), never as a mismatch of its program's verifying key, which the host would hold
+    /// against every job of the program.
+    #[test]
+    fn a_proof_failure_is_reported_as_what_it_is() {
+        use zkminer_prover_protocol::ErrorKind;
+        let kind = super::prove_error_kind;
+        let blake3 = format!(
+            "{}: the on-chain verifier would reject it",
+            super::NOT_SHA256_COMMITTED
+        );
+        assert!(
+            matches!(kind(&blake3), ErrorKind::InvalidInput),
+            "{:?}",
+            kind(&blake3)
+        );
+        let refused =
+            super::refuse_non_sha256_commitment(&sp1_sdk::SP1PublicValues::from(b"x"), &[0; 32])
+                .unwrap_err()
+                .to_string();
+        assert!(
+            matches!(kind(&refused), ErrorKind::InvalidInput),
+            "{refused}"
+        );
+        let exit = super::refuse_unprovable_exit(1).unwrap_err().to_string();
+        assert!(matches!(kind(&exit), ErrorKind::InvalidInput), "{exit}");
+        assert!(matches!(
+            kind("ELF vkey hash does not match job programId (served ELF is not the registered program) — refusing to prove"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("could not parse SP1 vkey hash for programId binding — refusing to prove"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("cudaErrorMemoryAllocation: out of memory"),
+            ErrorKind::ResourceExhausted
+        ));
+        assert!(matches!(kind("something else"), ErrorKind::ProofFailed));
     }
 }
 

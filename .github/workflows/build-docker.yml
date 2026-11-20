@@ -62,6 +62,11 @@ jobs:
             binary: zkminer
           - target: dist-cli-windows
             binary: zkminer.exe
+          # Beside zkminer, for witness jobs: the sandbox probe, the builder and broker, and the
+          # risc0 CPU worker that executes requesters' guests.
+          - target: dist-witness
+            binary: zkminer-witness-sandbox-probe
+            extras: zkminer-witness-builder zkminer-witness-broker zkminer-prove-risc0-cpu
           - target: dist-openvm
             binary: zkminer-prove-openvm
           - target: dist-sp1
@@ -209,7 +214,9 @@ jobs:
           # nvcc compiles four GPU targets at once on a large runner, one on a standard one:
           # at two, the risc0 kernels of the current pin ran a 16 GB runner out of memory after
           # 2.4 hours (risc0-circuit-rv32im-sys, 2026-11-03). Cargo's jobs cannot go below four
-          # instead (risc0's build scripts deadlock on its jobserver at 1 to 3).
+          # instead (risc0's build scripts deadlock on its jobserver at 1 to 3). One file compiles one
+          # target at a time whatever this says: risc0 recursion's step_exec.cu, 29.4 GB per target
+          # (Dockerfile.build, NVCC_ONE_TARGET_FILES).
           NVCC_THREADS: ${{ (matrix.large && vars.ZKMINER_LARGE_RUNNER) && '4' || '1' }}
           # hipcc compiles a file's AMD targets five at a time on a large runner, one at a time on a
           # standard one (the risc0 kernels' compiles run side by side already; each target multiplies
