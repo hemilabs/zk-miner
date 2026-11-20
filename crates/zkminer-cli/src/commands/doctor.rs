@@ -498,27 +498,32 @@ fn commit_check(
         let need = learned(backend)
             .map(|peak| peak / 8 * 9)
             .unwrap_or_else(|| zkminer_prover::memory::unmeasured_commit_for(backend));
+        // What the miner charges a proof is capped to what this host can admit at all
+        // (`memory::max_admissible_budget`): past it, the job is still claimed, charged the cap.
+        let charged = need.min(zkminer_prover::memory::max_admissible_budget(figures.total));
         if need.saturating_add(reserve) > figures.total {
             report.say(
                 Level::Warn,
                 "commit",
                 format!(
-                    "an {name} proof commits about {:.0} GiB, more than this host can ever \
-                     commit ({:.0} GiB with {:.0} GiB kept for Windows): its jobs are not \
-                     claimed. A larger page file fixes it (System Properties -> Advanced -> \
-                     Performance -> Virtual memory): {:.0} GB more at least",
+                    "a {name} proof commits about {:.0} GiB, more than this host can ever \
+                     commit ({:.0} GiB with {:.0} GiB kept for Windows): its jobs are claimed, \
+                     charged {:.0} GiB, and their proofs can fail for want of commit. A larger \
+                     page file fixes it (System Properties -> Advanced -> Performance -> Virtual \
+                     memory): {:.0} GB more at least",
                     gib(need),
                     gib(figures.total),
                     gib(reserve),
+                    gib(charged),
                     (gib(need.saturating_add(reserve) - figures.total) + 1.0).ceil(),
                 ),
             );
-        } else if need.saturating_add(reserve) > figures.available {
+        } else if charged.saturating_add(reserve) > figures.available {
             report.say(
                 Level::Info,
                 "commit",
                 format!(
-                    "an {name} proof commits about {:.0} GiB, more than is free now ({:.0} GiB \
+                    "a {name} proof commits about {:.0} GiB, more than is free now ({:.0} GiB \
                      with page-file growth): its jobs wait until programs give memory back",
                     gib(need),
                     gib(figures.available),
@@ -779,6 +784,7 @@ mod tests {
             .collect();
         assert_eq!(warned.len(), 1);
         assert!(warned[0].contains("SP1 proof commits about 108 GiB"));
+        assert!(warned[0].contains("claimed, charged 72 GiB"));
         assert!(warned[0].contains("12 GB more at least"));
         // RISC Zero's 30 GiB default fits.
         assert!(!report.lines.iter().any(|(_, _, d)| d.contains("RISC Zero")));
