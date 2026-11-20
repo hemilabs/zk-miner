@@ -367,7 +367,7 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         // Screen-specific keys
         KeyCode::Up | KeyCode::Char('k') => match state.current_screen {
             Screen::Jobs => {
-                state.selected_job_index = state.selected_job_index.saturating_sub(1);
+                state.move_jobs_cursor(-1);
                 // Job Detail then follows the highlight, not the job Enter picked earlier.
                 state.selected_job_id = None;
             }
@@ -384,8 +384,7 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         },
         KeyCode::Down | KeyCode::Char('j') => match state.current_screen {
             Screen::Jobs => {
-                let max = state.jobs_page_rows().len().saturating_sub(1);
-                state.selected_job_index = (state.selected_job_index + 1).min(max);
+                state.move_jobs_cursor(1);
                 state.selected_job_id = None;
             }
             Screen::Logs => {
@@ -404,7 +403,7 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
                 if key.code == KeyCode::Enter {
                     let picked = state
                         .jobs_page_rows()
-                        .get(state.selected_job_index)
+                        .get(state.jobs_cursor())
                         .map(|job| job.info.job_id);
                     if let Some(id) = picked {
                         state.selected_job_id = Some(id);
