@@ -1324,7 +1324,7 @@ fn refresh_intel_gpu(
         }
     }
 
-    // VRAM in use, from the same xe memory-regions query that sizes the card (`intel_vram`).
+    // VRAM in use, from the same driver memory-regions query that sizes the card (`intel_vram`).
     if let Some((total, used)) = zkminer_prover::discovery::intel_vram(&gpu.pci_bus_id) {
         gpu.vram_used_bytes = used;
         if gpu.vram_total_bytes == 0 {

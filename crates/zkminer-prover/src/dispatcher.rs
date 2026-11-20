@@ -791,8 +791,8 @@ fn gpu_vram_bytes(
         if cfg!(windows) {
             return crate::discovery::intel_vram_bytes(idx);
         }
-        // The xe driver's own count of the card's device memory (sysfs has none): see
-        // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
+        // The driver's own count of the card's device memory (sysfs has none), from xe or i915:
+        // see `discovery::intel_vram`.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
     }
     if gpu_tag != "cuda" {
@@ -1392,7 +1392,8 @@ fn read_drm_card_occupancy(
 
 /// What each process holds of one card's VRAM, in bytes, from the DRM fdinfo of the render and card
 /// nodes it has open (`<proc_root>/<pid>/fdinfo/<fd>`). amdgpu (ROCm's KFD memory included) and xe
-/// both report `drm-resident-vram*` per open DRM file, matched to the card by `drm-pdev`.
+/// report `drm-resident-vram*` per open DRM file, and i915 `drm-resident-local*`, matched to the card
+/// by `drm-pdev`.
 ///
 /// Only processes whose fds we may read appear: those of our own user, which every worker of ours
 /// is. Anyone else's memory stays in the card's `used` and reads as foreign, the conservative
@@ -1437,7 +1438,8 @@ fn drm_vram_by_pid(proc_root: &std::path::Path, pci_bus_id: &str) -> Vec<(u32, u
 
 /// `(drm-client-id, VRAM bytes)` from one DRM fdinfo, or `None` when it is for another card (or has
 /// no client id). The VRAM is the sum of the `drm-resident-vram<N>` regions (amdgpu: `vram`, xe:
-/// `vram0`, `vram1`, ...), or the older `drm-memory-vram` when no region is reported.
+/// `vram0`, `vram1`, ...) or i915's `drm-resident-local<N>` (its device memory; not `stolen-local`), or
+/// the older `drm-memory-vram` when no region is reported.
 fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
     let (mut pdev, mut client, mut resident, mut legacy) = (None, None, None, None);
     for line in info.lines() {
@@ -1449,9 +1451,12 @@ fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
             "drm-pdev" => pdev = Some(value.to_ascii_lowercase()),
             "drm-client-id" => client = value.parse::<u64>().ok(),
             "drm-memory-vram" => legacy = parse_drm_size(value),
-            key if key
-                .strip_prefix("drm-resident-vram")
-                .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit())) =>
+            key if ["drm-resident-vram", "drm-resident-local"]
+                .iter()
+                .any(|prefix| {
+                    key.strip_prefix(prefix)
+                        .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit()))
+                }) =>
             {
                 if let Some(bytes) = parse_drm_size(value) {
                     resident = Some(resident.unwrap_or(0u64).saturating_add(bytes));
@@ -9397,6 +9402,16 @@ mod tests {
         assert_eq!(
             parse_drm_fdinfo(xe, "0000:08:0d.0"),
             Some((41, (3 << 30) + (512 << 20)))
+        );
+
+        // An Arc A770 on i915, as measured: device memory is `local0`; `stolen-local0` is not counted.
+        let i915 = "drm-driver:\ti915\ndrm-client-id:\t12\ndrm-pdev:\t0000:01:00.0\n\
+                    drm-total-system0:\t2814168 KiB\ndrm-resident-system0:\t2814156 KiB\n\
+                    drm-total-local0:\t14316840 KiB\ndrm-resident-local0:\t14312168 KiB\n\
+                    drm-total-stolen-local0:\t0\ndrm-resident-stolen-local0:\t4 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(i915, "0000:01:00.0"),
+            Some((12, 14_312_168 << 10))
         );
 
         let old = "drm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-pdev:\t0000:03:00.0\n\
