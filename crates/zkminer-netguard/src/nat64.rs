@@ -1567,20 +1567,18 @@ pub(crate) mod pref64 {
         s.1.named_by(gateways, now)
     }
 
-    /// Drops what ran out by `now`; when anything did, what the gateways `gateways` of uplink
-    /// `uplink` name now is learned at once (a source that no longer names more than it may
-    /// clears its mark: [`super::learn`]).
+    /// Drops what ran out by `now`, and learns what the gateways `gateways` of uplink `uplink`
+    /// name now (a source that no longer names more than it may clears its mark:
+    /// [`super::learn`]). Review round 6: always, not only when this call dropped something (the
+    /// listener's own hearing prunes too, and what it pruned of a gateway that did not send was
+    /// then never learned again: its mark stood until the next round).
     pub(crate) fn expire(uplink: u64, gateways: &[(std::net::Ipv6Addr, u32)], now: Instant) {
         let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if !s.0 {
             return;
         }
-        let before = s.1.len();
         s.1.on(Some(uplink));
         s.1.prune(now);
-        if s.1.len() == before {
-            return;
-        }
         let learn = s.1.named_by(gateways, now);
         drop(s);
         for (source, prefixes) in learn {
@@ -1769,7 +1767,8 @@ impl Heard {
         self.uplink = uplink;
     }
 
-    /// How many entries are held.
+    /// How many entries are held (tests).
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
