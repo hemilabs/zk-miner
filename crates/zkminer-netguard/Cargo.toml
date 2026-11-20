@@ -35,6 +35,12 @@ socket2 = "0.6"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# macOS: the DNS servers the configuration daemon knows (SCDynamicStore), the versions reqwest's
+# system-proxy support already brings in.
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.7"
+core-foundation = "0.9"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

@@ -694,8 +694,9 @@ impl HostFacts {
     /// non-contiguous netmask counts its leading ones, which only widens the prefix), the routing
     /// tables and rules, the DNS servers, (if `opts` says so) the public addresses, and the NAT64
     /// prefixes the DNS servers reveal ([`crate::nat64`]), then [`Self::assemble`]s them, with the
-    /// kernel as the route oracle. Fails if the interfaces or the routing table cannot be read: a
-    /// public-mode policy that does not know them cannot refuse what they name.
+    /// kernel as the route oracle. Fails if the interfaces or the routing table cannot be read (on
+    /// macOS, or the DNS configuration: see [`system_resolvers`]): a public-mode policy that does
+    /// not know them cannot refuse what they name.
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
         // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
@@ -722,7 +723,7 @@ impl HostFacts {
                 interface_addresses,
                 routes,
                 rules,
-                resolvers: system_resolvers(),
+                resolvers: read_system_resolvers()?,
                 public_addresses: public.addresses,
                 public_confirmed: public.confirmed,
                 public_via_nat64: public.via_nat64,
@@ -816,35 +817,267 @@ pub fn parse_nameservers(text: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// The DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists (on macOS, and of every
-/// per-domain resolver file in `/etc/resolver`), sorted.
+/// The DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists, sorted.
+#[cfg(not(target_os = "macos"))]
 pub fn system_resolvers() -> Vec<IpAddr> {
     sorted(
         RESOLV_CONF_PATHS
             .iter()
             .filter_map(|p| std::fs::read_to_string(p).ok())
-            .chain(platform_resolver_files())
             .flat_map(|t| parse_nameservers(&t))
             .collect(),
     )
 }
 
-/// macOS: the per-domain resolver files (`/etc/resolver/<domain>`, resolver(5)), whose
-/// `nameserver` lines name servers the system resolver asks for those domains. (`/etc/resolv.conf`
-/// is written from the primary resolver configuration; resolvers that only the configuration
-/// daemon knows, which `scutil --dns` lists, are not read: see docs/netguard-macos.md.)
-#[cfg(target_os = "macos")]
-fn platform_resolver_files() -> Vec<String> {
-    let Ok(dir) = std::fs::read_dir("/etc/resolver") else {
-        return Vec::new();
-    };
-    dir.filter_map(|e| std::fs::read_to_string(e.ok()?.path()).ok())
-        .collect()
+/// The DNS servers for the facts: [`system_resolvers`], which cannot fail here.
+#[cfg(not(target_os = "macos"))]
+fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
+    Ok(system_resolvers())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn platform_resolver_files() -> Vec<String> {
-    Vec::new()
+/// macOS: the DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists, of every
+/// per-domain resolver file in `/etc/resolver` (resolver(5)), and of every resolver the
+/// configuration daemon knows (`scutil --dns`: a secondary interface's DHCP or RDNSS servers, a
+/// VPN's supplemental and split-DNS resolvers, scoped resolvers), sorted; empty when they cannot
+/// be read (the facts read then fails: [`HostFacts::gather_with`]). See [`macos_dns`].
+#[cfg(target_os = "macos")]
+pub fn system_resolvers() -> Vec<IpAddr> {
+    read_system_resolvers().unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
+    macos_dns::read().map(sorted)
+}
+
+/// macOS: where the DNS servers are read from, and how (review round 1, parse-2 and bypass-1).
+///
+/// - **Files**: `/etc/resolv.conf` (configd writes it from the primary resolvers) and every
+///   regular file in `/etc/resolver`. Read as bytes, at most [`macos_dns::MAX_FILE`] (a bigger
+///   file fails the read), invalid UTF-8 replaced (a stray byte in a comment does not hide the
+///   file's servers); a file or directory that does not exist has none, any other error to read
+///   one fails the read, and what is not a regular file (a FIFO, a device, a directory) is
+///   skipped without being opened for reading.
+/// - **`nameserver` lines** (any case, leading blanks allowed): the word after it read by every
+///   parser macOS uses for one: `getaddrinfo(AI_NUMERICHOST)` (libresolv, configd), which reads
+///   `203.0.113.053` as decimal, `inet_aton` (`203.0.113.053` octal, `3405803829`, `0xcb007135`,
+///   `10.1`), and the plain form with a zone dropped; every address any of them gives counts.
+/// - **The configuration daemon** (SCDynamicStore): the `ServerAddresses` of every
+///   `State:/Network/Service/<id>/DNS` key and of `State:/Network/Global/DNS`. A session that
+///   cannot be opened, a key list that cannot be read, or a value that is not what configd writes
+///   (a dictionary whose `ServerAddresses` is an array of numeric addresses) fails the read.
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_dns {
+    use std::ffi::CString;
+    use std::io::{self, Read};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    use core_foundation::array::CFArray;
+    use core_foundation::base::TCFType;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::propertylist::CFPropertyList;
+    use core_foundation::string::CFString;
+    use system_configuration::dynamic_store::SCDynamicStoreBuilder;
+
+    /// The largest resolver file read; a resolver file is a few lines.
+    pub(crate) const MAX_FILE: u64 = 1 << 20;
+
+    /// Every DNS server macOS knows of (see the module doc), unsorted.
+    pub(crate) fn read() -> io::Result<Vec<IpAddr>> {
+        let mut texts = Vec::new();
+        for p in super::RESOLV_CONF_PATHS {
+            texts.extend(read_file(Path::new(p))?);
+        }
+        texts.extend(resolver_dir(Path::new("/etc/resolver"))?);
+        let mut v: Vec<IpAddr> = texts.iter().flat_map(|t| parse(t)).collect();
+        v.extend(configd()?);
+        Ok(v)
+    }
+
+    /// A resolver file's text: `None` when it does not exist or is not a regular file.
+    pub(crate) fn read_file(path: &Path) -> io::Result<Option<String>> {
+        // Non-blocking, so that a FIFO put in its place is not waited on before it is seen to be
+        // one.
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        };
+        if !f.metadata()?.is_file() {
+            return Ok(None);
+        }
+        let mut b = Vec::new();
+        f.take(MAX_FILE + 1).read_to_end(&mut b)?;
+        if b.len() as u64 > MAX_FILE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is larger than {MAX_FILE} bytes", path.display()),
+            ));
+        }
+        Ok(Some(String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// The text of every regular file in a resolver directory; none when it does not exist.
+    pub(crate) fn resolver_dir(dir: &Path) -> io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", dir.display()))),
+        };
+        let mut out = Vec::new();
+        for e in entries {
+            out.extend(read_file(&e?.path())?);
+        }
+        Ok(out)
+    }
+
+    /// The servers of a resolver file's `nameserver` lines (see the module doc).
+    pub(crate) fn parse(text: &str) -> Vec<IpAddr> {
+        text.lines()
+            .filter_map(|l| {
+                let mut words = l.split_whitespace();
+                words
+                    .next()?
+                    .eq_ignore_ascii_case("nameserver")
+                    .then_some(())?;
+                words.next()
+            })
+            .flat_map(numeric)
+            .collect()
+    }
+
+    extern "C" {
+        // <arpa/inet.h>; the libc crate does not bind it.
+        fn inet_aton(cp: *const libc::c_char, inp: *mut libc::in_addr) -> libc::c_int;
+    }
+
+    /// Every address a numeric host string names to any of macOS's parsers (see the module doc),
+    /// sorted, without duplicates; empty when none reads it.
+    pub(crate) fn numeric(word: &str) -> Vec<IpAddr> {
+        // What C reads of it: up to a NUL.
+        let word = word.split('\0').next().unwrap_or_default();
+        let mut v = Vec::new();
+        if word.is_empty() {
+            return v;
+        }
+        if let Some(Ok(a)) = word.split('%').next().map(str::parse::<IpAddr>) {
+            v.push(a);
+        }
+        let Ok(c) = CString::new(word) else {
+            return v;
+        };
+        // SAFETY: a zeroed in_addr is valid; `c` is NUL-terminated.
+        let mut a: libc::in_addr = unsafe { std::mem::zeroed() };
+        if unsafe { inet_aton(c.as_ptr(), &mut a) } != 0 {
+            v.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(a.s_addr))));
+        }
+        // SAFETY: a zeroed addrinfo is valid hints (no pointers set).
+        let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+        hints.ai_flags = libc::AI_NUMERICHOST;
+        hints.ai_family = libc::AF_UNSPEC;
+        hints.ai_socktype = libc::SOCK_DGRAM;
+        let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+        // SAFETY: `c` is NUL-terminated, `hints` valid, `res` receives a list freed below.
+        if unsafe { libc::getaddrinfo(c.as_ptr(), std::ptr::null(), &hints, &mut res) } == 0 {
+            let mut cur = res;
+            while !cur.is_null() {
+                // SAFETY: a node of the list getaddrinfo returned, alive until freeaddrinfo.
+                let ai = unsafe { &*cur };
+                cur = ai.ai_next;
+                if ai.ai_addr.is_null() {
+                    continue;
+                }
+                let len = ai.ai_addrlen as usize;
+                // SAFETY: `ai_addr` holds `ai_addrlen` bytes.
+                let sa = unsafe { std::slice::from_raw_parts(ai.ai_addr.cast::<u8>(), len) };
+                match ai.ai_family {
+                    libc::AF_INET => {
+                        let o = std::mem::offset_of!(libc::sockaddr_in, sin_addr);
+                        if let Some(b) = sa.get(o..o + 4) {
+                            let b: [u8; 4] = b.try_into().unwrap_or_default();
+                            v.push(IpAddr::V4(Ipv4Addr::from(b)));
+                        }
+                    }
+                    libc::AF_INET6 => {
+                        let o = std::mem::offset_of!(libc::sockaddr_in6, sin6_addr);
+                        if let Some(b) = sa.get(o..o + 16) {
+                            let b: [u8; 16] = b.try_into().unwrap_or_default();
+                            v.push(IpAddr::V6(Ipv6Addr::from(b)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // SAFETY: `res` came from a successful getaddrinfo and is freed once.
+            unsafe { libc::freeaddrinfo(res) };
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    fn malformed(what: &str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("the system configuration's DNS settings: {what}"),
+        )
+    }
+
+    /// The `ServerAddresses` of every DNS key of the configuration daemon (see the module doc).
+    pub(crate) fn configd() -> io::Result<Vec<IpAddr>> {
+        let store = SCDynamicStoreBuilder::new("zkminer-netguard")
+            .build()
+            .ok_or_else(|| io::Error::other("could not reach the system configuration daemon"))?;
+        let mut keys = Vec::new();
+        for pattern in [
+            "State:/Network/Service/[^/]+/DNS",
+            "State:/Network/Global/DNS",
+        ] {
+            let list = store
+                .get_keys(pattern)
+                .ok_or_else(|| io::Error::other("could not list the system's DNS settings"))?;
+            keys.extend(list.iter().map(|k| k.to_string()));
+        }
+        let mut out = Vec::new();
+        for key in keys {
+            // Gone since it was listed (a service went down): it has no servers any more.
+            let Some(value) = store.get(key.as_str()) else {
+                continue;
+            };
+            out.extend(server_addresses(&value).ok_or_else(|| malformed(&key))?);
+        }
+        Ok(out)
+    }
+
+    /// The addresses of a DNS dictionary's `ServerAddresses` (none without one); `None` when the
+    /// value is not a dictionary, `ServerAddresses` is not an array of strings, or a string names
+    /// no address.
+    fn server_addresses(value: &CFPropertyList) -> Option<Vec<IpAddr>> {
+        let dict = value.downcast::<CFDictionary>()?;
+        let key = CFString::from_static_string("ServerAddresses");
+        let Some(list) = dict.find(key.as_CFTypeRef()) else {
+            return Some(Vec::new());
+        };
+        // SAFETY: a value of a property-list dictionary is a property list, retained here.
+        let list = unsafe { CFPropertyList::wrap_under_get_rule(*list) }.downcast::<CFArray>()?;
+        let mut out = Vec::new();
+        for item in list.iter() {
+            // SAFETY: an element of a property-list array is a property list, retained here.
+            let s = unsafe { CFPropertyList::wrap_under_get_rule(*item) }.downcast::<CFString>()?;
+            let a = numeric(&s.to_string());
+            if a.is_empty() {
+                return None;
+            }
+            out.extend(a);
+        }
+        Some(out)
+    }
 }
 
 #[cfg(unix)]
@@ -1301,6 +1534,146 @@ mod tests {
                 ip("2606:a300:c::7e"),
                 ip("fe80::1")
             ]
+        );
+    }
+
+    /// parse-2: nameserver words as macOS's parsers read them, every reading counted; what none
+    /// reads names nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reads_nameservers_as_its_resolvers_do() {
+        use super::macos_dns::{numeric, parse};
+        let ips = |v: &[&str]| v.iter().map(|a| ip(a)).collect::<Vec<_>>();
+        // getaddrinfo reads 053 as decimal, inet_aton as octal: both count.
+        assert_eq!(
+            numeric("203.0.113.053"),
+            ips(&["203.0.113.43", "203.0.113.53"])
+        );
+        assert_eq!(numeric("3405803829"), ips(&["203.0.113.53"]));
+        assert_eq!(numeric("0xcb007135"), ips(&["203.0.113.53"]));
+        assert_eq!(numeric("10.1"), ips(&["10.0.0.1"]));
+        assert_eq!(numeric("0x7f.1"), ips(&["127.0.0.1"]));
+        assert_eq!(numeric("fe80::1%en0"), ips(&["fe80::1"]));
+        assert_eq!(numeric("fe80::1%nosuchif9"), ips(&["fe80::1"]));
+        assert_eq!(numeric("::ffff:1.2.3.4"), ips(&["::ffff:1.2.3.4"]));
+        assert_eq!(numeric("1.2.3.4\0junk"), ips(&["1.2.3.4"]));
+        for none in [
+            "",
+            "bogus",
+            "[2001:db8::1]",
+            "203.0.113.53.53",
+            "203.0.113.53:53",
+            "1.2.3.4x",
+            "\0",
+        ] {
+            assert_eq!(numeric(none), Vec::<IpAddr>::new(), "{none:?}");
+        }
+        let text = "# caf\u{fffd}\nnameserver 203.0.113.053\n  NameServer\t3405803829 # c\n\
+                    nameserver\nnameserver bogus\nsearch x\nnameserver 2001:db8::53\n";
+        assert_eq!(
+            parse(text),
+            ips(&[
+                "203.0.113.43",
+                "203.0.113.53",
+                "203.0.113.53",
+                "2001:db8::53"
+            ])
+        );
+        // Everything the resolv.conf parser reads, this one reads too.
+        let linux = "# comment\nnameserver 1.1.1.1\n  nameserver   2606:a300:c::7d\n\
+                     nameserver fe80::1%eth0\nnameserver bogus\n";
+        for a in parse_nameservers(linux) {
+            assert!(parse(linux).contains(&a), "{a}");
+        }
+    }
+
+    /// parse-2: resolver files are read as bytes (a non-UTF-8 byte does not hide a file's
+    /// servers), up to a size; what is not a regular file is skipped without blocking; a missing
+    /// file or directory has none; any other error fails the read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_resolver_files_are_read_strictly() {
+        use super::macos_dns::{parse, read_file, resolver_dir, MAX_FILE};
+        let dir = std::env::temp_dir().join(format!("zkminer-resolver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(
+            dir.join("example.com"),
+            b"# caf\xe9\nnameserver 203.0.113.53\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("other"), b"nameserver 0xcb007136\n").unwrap();
+        let fifo = std::ffi::CString::new(dir.join("fifo").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let mut got: Vec<IpAddr> = resolver_dir(&dir)
+            .unwrap()
+            .iter()
+            .flat_map(|t| parse(t))
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![ip("203.0.113.53"), ip("203.0.113.54")]);
+        assert_eq!(read_file(&dir.join("fifo")).unwrap(), None);
+        assert_eq!(read_file(&dir.join("sub")).unwrap(), None);
+        assert_eq!(read_file(&dir.join("absent")).unwrap(), None);
+        assert_eq!(
+            resolver_dir(&dir.join("absent")).unwrap(),
+            Vec::<String>::new()
+        );
+        // Not a directory, or not readable: an error, not "no files".
+        assert!(resolver_dir(&dir.join("other")).is_err());
+        std::fs::write(dir.join("big"), vec![b'#'; MAX_FILE as usize + 1]).unwrap();
+        assert!(read_file(&dir.join("big")).is_err());
+        assert!(resolver_dir(&dir).is_err());
+        std::fs::remove_file(dir.join("big")).unwrap();
+        std::fs::write(dir.join("locked"), b"nameserver 203.0.113.55\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        assert!(read_file(&dir.join("locked")).is_err());
+        assert!(resolver_dir(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// bypass-1: every DNS server `scutil --dns` lists (the configuration daemon's resolvers,
+    /// scoped and supplemental ones included) is one of the system's DNS servers, and every
+    /// server the daemon's DNS keys name is one `scutil --dns` lists.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dns_servers_are_the_configuration_daemons() {
+        let out = std::process::Command::new("/usr/sbin/scutil")
+            .arg("--dns")
+            .output()
+            .expect("scutil --dns");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let listed: Vec<IpAddr> = text
+            .lines()
+            .filter_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim().starts_with("nameserver[").then(|| v.trim())
+            })
+            .flat_map(super::macos_dns::numeric)
+            .collect();
+        let configd = super::macos_dns::configd().expect("the configuration daemon");
+        let all = system_resolvers();
+        assert_eq!(all, read_system_resolvers().unwrap());
+        for a in &listed {
+            assert!(all.contains(a), "{a} (scutil --dns) not in {all:?}");
+        }
+        for a in &configd {
+            assert!(
+                listed.contains(a),
+                "{a} (configd) not in scutil --dns: {listed:?}"
+            );
+        }
+        assert_eq!(
+            listed.is_empty(),
+            configd.is_empty(),
+            "{listed:?} {configd:?}"
+        );
+        eprintln!(
+            "scutil --dns: {} server entries; configd keys: {configd:?}; all: {all:?}",
+            listed.len()
         );
     }
 

@@ -10687,11 +10687,13 @@ dependencies = [
 name = "zkminer-netguard"
 version = "0.1.0"
 dependencies = [
+ "core-foundation",
  "libc",
  "proptest",
  "reqwest",
  "rustls",
  "socket2 0.6.2",
+ "system-configuration",
  "tokio",
  "tracing",
  "url",
