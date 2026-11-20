@@ -1,0 +1,38 @@
+name: Network guard (Linux)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  netguard:
+    # zkminer-netguard's suite and clippy on Linux. ZKMINER_CI_STRICT=1 makes every test that
+    # cannot check what it is for here fail instead of printing SKIPPED and passing; GitHub's
+    # hosted runners have no IPv6, so skips naming it are allowed (docs/netguard-hardening.md,
+    # "CI"). The suite needs outbound DNS and HTTPS, and the near-hop probe's ICMP "time
+    # exceeded" from the runner's first two hops.
+    runs-on: ubuntu-latest
+    env:
+      ZKMINER_CI_STRICT: "1"
+      ZKMINER_CI_ALLOW_SKIP: "IPv6,[::1]"
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Toolchain (rust-toolchain.toml)"
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: "Tests"
+        run: cargo test --locked -p zkminer-netguard
+      - name: "Clippy"
+        run: cargo clippy --locked -p zkminer-netguard --all-targets -- -D warnings
