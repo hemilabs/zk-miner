@@ -34,6 +34,15 @@ jobs:
           persist-credentials: false
       - name: "Toolchain (rust-toolchain.toml)"
         run: rustup show active-toolchain || rustup toolchain install
+      - name: "Cargo cache"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: netguard-linux-netguard-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: netguard-linux-netguard-
       - name: "Tests"
         run: cargo test --locked -p zkminer-netguard
       - name: "Clippy"
@@ -43,9 +52,13 @@ jobs:
     # The guard's callers on x86_64 Linux: the program fetcher (zkminer-chain) and the witness
     # broker's connector (zkminer-witness-broker's library tests), which drive the guarded client
     # and the connector's checks before and after connecting. The broker's integration tests need
-    # anvil and run its sandboxed binary; they are not run here.
+    # anvil and run its sandboxed binary; they are not run here. Strict like the netguard job
+    # (review round 5, cross-4): a test that needs a public peer it cannot reach fails.
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      ZKMINER_CI_STRICT: "1"
+      ZKMINER_CI_ALLOW_SKIP: "ipv6"
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -53,6 +66,15 @@ jobs:
           persist-credentials: false
       - name: "Toolchain (rust-toolchain.toml)"
         run: rustup show active-toolchain || rustup toolchain install
+      - name: "Cargo cache"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: netguard-linux-callers-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: netguard-linux-callers-
       - name: "zkminer-chain"
         run: cargo test --locked -p zkminer-chain
       - name: "zkminer-witness-broker"
