@@ -402,6 +402,41 @@ impl Connector {
         }
     }
 
+    /// The floor's check of `addr` right before connecting to it ([`NetPolicy::vet_path_until`]:
+    /// the kernel's route with the port, the near-hop probe, the source the kernel picks; the
+    /// connection must leave from that source once made), within `deadline` and one of the
+    /// connector's check turns. `Err(true)` when it could not tell (no turn, out of time, a
+    /// near-hop check that failed), `Err(false)` when refused.
+    async fn vet_before_connecting(
+        &self,
+        st: &Arc<EndpointState>,
+        addr: SocketAddr,
+        deadline: Instant,
+    ) -> Result<zkminer_netguard::Vetted, bool> {
+        let floor = self.floor.clone();
+        let Ok(Ok(turn)) = tokio::time::timeout_at(deadline, self.checks.clone().acquire_owned()).await else {
+            tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: no turn for the check before connecting");
+            return Err(true);
+        };
+        // The turn is held by the blocking check until it ends, which is by the deadline.
+        let until = deadline.into_std();
+        let check = move || {
+            let _turn = turn;
+            floor.vet_path_until(addr, addr, until)
+        };
+        match tokio::time::timeout_at(deadline + CHECK_SLACK, tokio::task::spawn_blocking(check)).await {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(d))) => {
+                tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
+                Err(matches!(d, zkminer_netguard::Denied::NearCheckFailed { .. }))
+            }
+            Ok(Err(_)) | Err(_) => {
+                tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: the check before connecting did not finish");
+                Err(true)
+            }
+        }
+    }
+
     /// Serves one well-formed request for an existing endpoint (index, role and port checked).
     async fn connect_for(self: Arc<Self>, index: usize, id: u64) -> (Response, Option<OwnedFd>) {
         let deadline = Instant::now() + request_budget(self.connect_timeout);
@@ -447,42 +482,69 @@ impl Connector {
         // connector stops waiting for stops too and gives back its turn and its probe slot.
         let n = admitted.len() as u32;
         let mut connect_left = self.connect_timeout;
-        for (i, ip) in admitted.into_iter().enumerate() {
-            if Instant::now() >= deadline {
-                break;
-            }
-            let addr = SocketAddr::new(ip, st.ep.port);
-            // Right before connecting, wherever the floor applies: the kernel's route with the
-            // port, and the near-hop probe (a destination within a few hops is this host's own
-            // network); and the source address the kernel picks for it, which the connection must
-            // leave from once made (below).
-            let mut vetted = None;
-            if self.mode == NetMode::Public || st.ep.dns_derived() {
-                let floor = self.floor.clone();
-                let Ok(Ok(turn)) = tokio::time::timeout_at(deadline, self.checks.clone().acquire_owned()).await else {
-                    tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: no turn for the check before connecting");
-                    continue;
-                };
-                // The turn is held by the blocking check until it ends, which is by the deadline.
-                let until = deadline.into_std();
-                let check = move || {
-                    let _turn = turn;
-                    floor.vet_path_until(addr, addr, until)
-                };
-                match tokio::time::timeout_at(deadline + CHECK_SLACK, tokio::task::spawn_blocking(check)).await {
-                    Ok(Ok(Ok(v))) => vetted = Some(v),
-                    Ok(Ok(Err(d))) => {
-                        tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
-                        continue;
+        // Review round 6, cross-6: the two families are vetted at once (the other family
+        // FAMILY_DELAY after the first address's), each its addresses in order, as the guarded
+        // client does: one after another, each check given the whole deadline, two IPv6
+        // addresses first on a host whose IPv6 is blackholed (~13.5 s a check) left IPv4 no time.
+        // A chain hands over each address it vetted and goes on only when asked (that address's
+        // connection failed); it stops after MAX_UNANSWERED checks that could not tell.
+        let need_vet = self.mode == NetMode::Public || st.ep.dns_derived();
+        let mut families: [Vec<IpAddr>; 2] = [Vec::new(), Vec::new()];
+        let first_v6 = admitted.first().is_some_and(IpAddr::is_ipv6);
+        for ip in admitted {
+            families[usize::from(ip.is_ipv6() != first_v6)].push(ip);
+        }
+        let (tx, mut rx) = mpsc::channel::<(usize, SocketAddr, Option<zkminer_netguard::Vetted>)>(2);
+        let more = [Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0))];
+        let mut chains = JoinSet::new();
+        for (fam, list) in families.into_iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+            let (me, st, tx, more) = (self.clone(), st.clone(), tx.clone(), more[fam].clone());
+            chains.spawn(async move {
+                if fam == 1 {
+                    tokio::time::sleep_until((Instant::now() + FAMILY_DELAY).min(deadline)).await;
+                }
+                let mut unanswered = 0;
+                for ip in list {
+                    if Instant::now() >= deadline || unanswered >= MAX_UNANSWERED {
+                        break;
                     }
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: the check before connecting did not finish");
-                        continue;
+                    let addr = SocketAddr::new(ip, st.ep.port);
+                    let vetted = if need_vet {
+                        match me.vet_before_connecting(&st, addr, deadline).await {
+                            Ok(v) => Some(v),
+                            Err(could_not_tell) => {
+                                unanswered += usize::from(could_not_tell);
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if tx.send((fam, addr, vetted)).await.is_err() {
+                        return;
+                    }
+                    match more.acquire().await {
+                        Ok(p) => p.forget(),
+                        Err(_) => return,
                     }
                 }
+            });
+        }
+        drop(tx);
+        let mut i = 0u32;
+        let mut failed_family: Option<usize> = None;
+        loop {
+            // The last address's connection failed: its chain goes on to its next address.
+            if let Some(f) = failed_family.take() {
+                more[f].add_permits(1);
             }
+            let Ok(Some((fam, addr, vetted))) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                break;
+            };
+            failed_family = Some(fam);
             let now = Instant::now();
-            let share = (connect_left / (n - i as u32)).min(deadline.saturating_duration_since(now));
+            let share = (connect_left / n.saturating_sub(i).max(1)).min(deadline.saturating_duration_since(now));
+            i += 1;
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             // From the source the check vetted (the kernel's for a TCP connection: review round
             // 4, cross-3), so the connection leaves from it.
@@ -817,6 +879,11 @@ fn first_host(p: &Prefix) -> Option<IpAddr> {
 /// How long past the request's deadline the connector waits for a check that was given it
 /// (the check gives up at the deadline; this covers its last step).
 const CHECK_SLACK: Duration = Duration::from_millis(500);
+/// How much later the second family's chain starts (review round 6, cross-6; the guarded
+/// client's `ATTEMPT_DELAY`, RFC 8305's Connection Attempt Delay).
+const FAMILY_DELAY: Duration = Duration::from_millis(250);
+/// A family's chain stops after this many checks that could not tell (review round 6, cross-3).
+const MAX_UNANSWERED: usize = 2;
 
 /// A fresh TCP connection to `addr` (`socket` + `connect`, bound to `source` when given), as an
 /// owned fd. An IPv4-mapped address is connected to as its IPv4 address, on an IPv4 socket
