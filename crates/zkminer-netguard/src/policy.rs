@@ -112,6 +112,12 @@ pub enum Denied {
     /// that prefix can carry a private IPv4 address (review round 3, bypass-1; every platform
     /// since the Linux application).
     Nat64Unsettled(IpAddr),
+    /// An IPv6 destination while the network this host is on named a NAT64 prefix the guard
+    /// could not hold or does not believe (`why`: which source, and what it named;
+    /// [`crate::nat64::unheld`]): an address under it can carry a private IPv4 address. On any
+    /// host, until a round on that network holds everything it names (review round 5, cross-1:
+    /// this was [`Denied::Nat64Unsettled`], whose text said the prefix was still being learned).
+    Nat64Unheld { ip: IpAddr, why: String },
     /// A connection to `addr`, once made, is not the one checked ([`NetPolicy::recheck_connected`]):
     /// it reached another address, or left from another source address than the kernel chose
     /// for it when it was checked (the route changed between the check and the connection), so
@@ -286,12 +292,16 @@ impl Denied {
             ),
             Denied::Nat64Unsettled(ip) => write!(
                 f,
-                "{ip} cannot be judged yet: this host is on a network whose NAT64 prefix is \
-                 still being learned (RFC 7050, at most {}s, on a host with IPv6 and no IPv4 \
-                 route), or that named NAT64 prefixes the network guard does not believe or \
-                 cannot hold (the log says which), and an IPv6 address under such a prefix can \
-                 carry a private IPv4 address",
+                "{ip} cannot be judged yet: this host has just joined a network whose NAT64 \
+                 prefix is still being learned (RFC 7050, at most {}s), and an IPv6 address \
+                 under that prefix can carry a private IPv4 address",
                 crate::nat64::DISCOVERY_TIMEOUT.as_secs()
+            ),
+            Denied::Nat64Unheld { ip, why } => write!(
+                f,
+                "{ip} is refused: on this network {why}, so IPv6 destinations are refused until \
+                 it names no more than the network guard holds (an IPv6 address under a NAT64 \
+                 prefix the guard does not hold can carry a private IPv4 address)"
             ),
             Denied::PathChanged { addr, why } => write!(
                 f,
@@ -332,6 +342,7 @@ impl Denied {
             self,
             Denied::FactsUnreadable { .. }
                 | Denied::Nat64Unsettled(_)
+                | Denied::Nat64Unheld { .. }
                 | Denied::OwnAddress(_)
                 | Denied::ConnectedPrefix { .. }
                 | Denied::SitePrefix { .. }
@@ -475,8 +486,16 @@ fn admit_inner(
             why: why.to_string(),
         });
     }
-    if ip.is_ipv6() && facts.nat64_unsettled() {
-        return Err(Denied::Nat64Unsettled(ip));
+    if ip.is_ipv6() {
+        if let Some(why) = facts.nat64_unheld() {
+            return Err(Denied::Nat64Unheld {
+                ip,
+                why: crate::printable(why, 300),
+            });
+        }
+        if facts.nat64_unsettled() {
+            return Err(Denied::Nat64Unsettled(ip));
+        }
     }
     if !is_global(ip) {
         return Err(Denied::NotGlobal(ip));
@@ -1930,6 +1949,50 @@ mod tests {
         assert_eq!(
             admit(NetMode::Public, ip("2606:4700:4700::1111"), &settled, &[]),
             Ok(())
+        );
+    }
+
+    /// Review round 5, cross-1: an uplink whose network named NAT64 prefixes the guard does not
+    /// hold refuses IPv6 on any host with a refusal of its own, naming the source and what it
+    /// named; it no longer says the prefix is still being learned (at most 2 s), which was false
+    /// for as long as the source kept naming them. It rests on the facts; IPv4 is unaffected.
+    #[test]
+    fn r5_an_unheld_nat64_prefix_has_its_own_refusal_naming_the_source() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let why = "the router advertisements of fe80::1 on interface 2 (PREF64) named 5 NAT64 \
+                   prefixes, more than the 4 the network guard believes of one source";
+        let f = HostFacts::assemble(
+            RawFacts {
+                interface_prefixes: vec![pfx("2a02:db8:99::/64")],
+                interface_addresses: vec![ip("2a02:db8:99::7"), ip("192.0.2.7")],
+                routes: vec![
+                    Route::via(pfx("::/0"), ip("fe80::1"), 2),
+                    Route::via(pfx("0.0.0.0/0"), ip("192.0.2.1"), 2),
+                ],
+                nat64_unheld: Some(why.into()),
+                ..RawFacts::default()
+            },
+            &FactsOptions {
+                public_addresses: vec![ip("2a02:db8:99::7"), ip("9.9.9.7")],
+                ..offline()
+            },
+        );
+        let e = admit(NetMode::Public, ip("2606:4700:4700::1111"), &f, &[]).unwrap_err();
+        assert_eq!(
+            e,
+            Denied::Nat64Unheld {
+                ip: ip("2606:4700:4700::1111"),
+                why: why.into()
+            }
+        );
+        assert!(e.depends_on_facts());
+        let text = e.to_string();
+        assert!(text.contains(why), "{text}");
+        assert!(!text.contains("still being learned"), "{text}");
+        assert_ne!(
+            admit(NetMode::Public, ip("1.1.1.1"), &f, &[]).err().map(|d| d.to_string().contains("NAT64")),
+            Some(true)
         );
     }
 

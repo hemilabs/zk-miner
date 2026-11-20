@@ -262,6 +262,10 @@ pub struct RawFacts {
     /// now has not finished ([`crate::nat64`]): every IPv6 destination is refused until it has
     /// (review round 3, bypass-1; every platform since the Linux application).
     pub nat64_unsettled: bool,
+    /// A NAT64 prefix named on the uplink in use could not be held, or was named by a source
+    /// that is not believed: why ([`crate::nat64::unheld`]; every IPv6 destination is refused on
+    /// any host meanwhile: review round 5, cross-1).
+    pub nat64_unheld: Option<String>,
 }
 
 /// A snapshot of the host's facts (see the module doc).
@@ -292,6 +296,8 @@ pub struct HostFacts {
     unreadable: Option<String>,
     /// [`RawFacts::nat64_unsettled`].
     nat64_unsettled: bool,
+    /// [`RawFacts::nat64_unheld`].
+    nat64_unheld: Option<String>,
     /// The nexthop objects (Linux), for the default routes through one ([`default_path_known`]).
     nexthops: Vec<crate::routes::Nexthop>,
 }
@@ -480,7 +486,7 @@ fn default_path_known(
 /// is heard, and a prefix named there that the guard could not hold
 /// ([`crate::nat64::unheld`]) refuses IPv6 destinations on any host (it is a sign of a hostile
 /// network, or of a network the guard cannot judge).
-fn nat64_unsettled_on(table: &RouteTable, signature: u64) -> bool {
+fn nat64_unsettled_on(table: &RouteTable, signature: u64) -> (bool, Option<String>) {
     use crate::routes::Hop;
     let up = crate::nat64::Uplink {
         signature,
@@ -497,7 +503,7 @@ fn nat64_unsettled_on(table: &RouteTable, signature: u64) -> bool {
         .collect();
     crate::nat64::on_uplink(signature, &gateways);
     let settled = crate::nat64::ensure_discovered_on(up);
-    up.refuses_ipv6(settled) || crate::nat64::unheld(signature).is_some()
+    (up.refuses_ipv6(settled), crate::nat64::unheld(signature))
 }
 
 /// The signature of the uplink this host is on now ([`uplink_signature`], and what tells two
@@ -791,6 +797,7 @@ impl HostFacts {
             internal_ranges_stated: true,
             unreadable: None,
             nat64_unsettled: false,
+            nat64_unheld: None,
             nexthops: Vec::new(),
         }
     }
@@ -875,6 +882,7 @@ impl HostFacts {
             internal_ranges_stated: opts.internal_ranges.is_some(),
             unreadable: None,
             nat64_unsettled: raw.nat64_unsettled,
+            nat64_unheld: raw.nat64_unheld,
             nexthops: raw.nexthops,
         }
     }
@@ -904,6 +912,11 @@ impl HostFacts {
     /// route ([`RawFacts::nat64_unsettled`]).
     pub(crate) fn nat64_unsettled(&self) -> bool {
         self.nat64_unsettled
+    }
+
+    /// Why a NAT64 prefix named on the uplink could not be held ([`RawFacts::nat64_unheld`]).
+    pub(crate) fn nat64_unheld(&self) -> Option<&str> {
+        self.nat64_unheld.as_deref()
     }
 
     /// These facts without the kernel's cached verdicts (a refresh failed: what the kernel
@@ -1142,7 +1155,7 @@ impl HostFacts {
         // The NAT64 prefixes, learned again whenever the uplink changes (review round 3,
         // bypass-1; every platform since the Linux application); IPv6 destinations are refused
         // on a host with IPv6 and no IPv4 route until the new uplink's round has finished.
-        let nat64_unsettled = nat64_unsettled_on(&table, signature);
+        let (nat64_unsettled, nat64_unheld) = nat64_unsettled_on(&table, signature);
         let public = if opts.discover_public_addresses {
             // Addresses confirmed under another uplink (a new default gateway, a VPN that came
             // up) are not this one's: discovery runs again, and meanwhile they are not known.
@@ -1166,6 +1179,7 @@ impl HostFacts {
                 nexthops,
                 pppoe_sessions: crate::routes::pppoe_sessions(),
                 nat64_unsettled,
+                nat64_unheld,
             },
             opts,
         )
@@ -3146,15 +3160,16 @@ mod tests {
         // The process's first round runs on the caller's thread; the next uplinks' in the
         // background.
         nat64_unsettled_on(&dual, fresh());
-        assert!(nat64_unsettled_on(&v6_only, fresh()));
-        assert!(!nat64_unsettled_on(&dual, fresh()));
+        assert!(nat64_unsettled_on(&v6_only, fresh()).0);
+        assert!(!nat64_unsettled_on(&dual, fresh()).0);
         // Review round 4, bypass-1: a prefix named on the uplink that could not be held refuses
         // IPv6 there, on a dual-stack host too.
         let held = fresh();
         nat64_unsettled_on(&dual, held);
         crate::nat64::unheld_after_round(held, "test: one source named too many");
-        assert!(nat64_unsettled_on(&dual, held));
-        assert!(!nat64_unsettled_on(&dual, fresh()));
+        let (_, why) = nat64_unsettled_on(&dual, held);
+        assert_eq!(why.as_deref(), Some("test: one source named too many"));
+        assert!(nat64_unsettled_on(&dual, fresh()).1.is_none());
     }
 
     /// Review round 4, cross-4: with nexthop objects (`nexthop_compat_mode` 0: the dump shows no

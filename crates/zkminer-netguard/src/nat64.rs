@@ -1045,7 +1045,7 @@ fn system_prefixes(uplink: u64) -> io::Result<Vec<(Source, Vec<(Prefix, Option<D
             Vec::new()
         }
     };
-    Ok(pref64::from_gateways(&gateways, Instant::now()))
+    Ok(pref64::from_gateways(uplink, &gateways, Instant::now()))
 }
 
 /// See the macOS one.
@@ -1157,17 +1157,17 @@ pub(crate) mod pref64 {
     /// What the gateways `gateways` announce now, per gateway ([`Heard::named_by`]).
     #[allow(clippy::type_complexity)]
     pub(crate) fn from_gateways(
+        uplink: u64,
         gateways: &[(std::net::Ipv6Addr, u32)],
         now: Instant,
     ) -> Vec<(
         super::Source,
         Vec<(crate::ip::Prefix, Option<std::time::Duration>)>,
     )> {
-        STATE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .1
-            .named_by(gateways, now)
+        let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        s.1.on(Some(uplink));
+        s.1.prune(now);
+        s.1.named_by(gateways, now)
     }
 
     /// A route netlink socket in the `RTNLGRP_ND_USEROPT` group.
@@ -1261,6 +1261,7 @@ pub(crate) mod pref64 {
         };
         let now = Instant::now();
         let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        s.1.on(on);
         s.1.hear(found, &gateways, now);
         let from: Vec<(std::net::Ipv6Addr, u32)> = gateways
             .iter()
@@ -1298,15 +1299,26 @@ pub(crate) struct Announced {
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 const MAX_ROUTERS: usize = 16;
 
-/// The PREF64 options heard, per router and interface: at most [`MAX_PER_ROUTER`] + 1 prefixes
-/// each (one more than is believed, so a router that names more is seen to), from at most
-/// [`MAX_ROUTERS`] routers (review round 4, bypass-1: one sender of 16 options filled the old
-/// process-wide list).
+/// The PREF64 options heard, per router and interface, on each uplink: at most
+/// [`MAX_PER_ROUTER`] + 1 live prefixes each (one more than is believed, so a router that names
+/// more is seen to), from at most [`MAX_ROUTERS`] routers (review round 4, bypass-1: one sender of
+/// 16 options filled the old process-wide list).
+///
+/// Review round 5 (cross-1, bypass-2, parse-2): a prefix withdrawn (lifetime 0) or whose
+/// lifetime ran out is dropped here, so it is neither named nor counted against the cap any
+/// more, and a newer one takes its room; the registry keeps it refused all the same ([`learn`]
+/// withdraws what a source stops naming). Before, every prefix a gateway ever named stayed here
+/// for the process's life: five renumberings, or one forged advertisement of five, left its
+/// uplink unsettled for good. Review round 5 (parse-3): each entry is tied to the uplink it was
+/// heard on ([`Self::on`]): another network's router of the same address on the same interface
+/// (`fe80::1` is common) names nothing on this one.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 #[derive(Debug, Default)]
 pub(crate) struct Heard {
-    /// (router, interface, prefix, lifetime, when heard)
-    entries: Vec<(Ipv6Addr, u32, Prefix, Duration, Instant)>,
+    /// (router, interface, prefix, lifetime, when heard, uplink heard on)
+    entries: Vec<(Ipv6Addr, u32, Prefix, Duration, Instant, Option<u64>)>,
+    /// The uplink what is heard now is heard on.
+    uplink: Option<u64>,
 }
 
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
@@ -1314,6 +1326,7 @@ impl Heard {
     pub(crate) const fn new() -> Self {
         Heard {
             entries: Vec::new(),
+            uplink: None,
         }
     }
 
@@ -1326,54 +1339,76 @@ impl Heard {
         v
     }
 
-    /// Notes `found` at `now`; `gateways` are never pushed out by other routers.
+    /// Notes that what is heard from now on, and what [`Self::named_by`] reads, is on `uplink`.
+    pub(crate) fn on(&mut self, uplink: Option<u64>) {
+        self.uplink = uplink;
+    }
+
+    /// Drops every entry whose lifetime has run out at `now`.
+    pub(crate) fn prune(&mut self, now: Instant) {
+        self.entries
+            .retain(|e| now.saturating_duration_since(e.4) < e.3);
+    }
+
+    /// Notes `found` at `now`, on the uplink in use ([`Self::on`]): a prefix announced with
+    /// lifetime 0 is withdrawn (dropped); `gateways` are never pushed out by other routers.
     pub(crate) fn hear(&mut self, found: &[Announced], gateways: &[(Ipv6Addr, u32)], now: Instant) {
+        self.prune(now);
+        let uplink = self.uplink;
         for a in found {
             let Some(router) = a.router else { continue };
-            let key = (router, a.ifindex);
+            let key = (router, a.ifindex, uplink);
+            let of_key = |e: &(Ipv6Addr, u32, Prefix, Duration, Instant, Option<u64>)| {
+                (e.0, e.1, e.5) == key
+            };
+            if a.lifetime.is_zero() {
+                self.entries.retain(|e| !(of_key(e) && e.2 == a.prefix));
+                continue;
+            }
             if let Some(e) = self
                 .entries
                 .iter_mut()
-                .find(|e| (e.0, e.1) == key && e.2 == a.prefix)
+                .find(|e| of_key(e) && e.2 == a.prefix)
             {
                 e.3 = a.lifetime;
                 e.4 = now;
                 continue;
             }
-            if self.entries.iter().filter(|e| (e.0, e.1) == key).count() > MAX_PER_ROUTER {
-                // Already one more than is believed: the router is seen to name too many.
+            if self.entries.iter().filter(|e| of_key(e)).count() > MAX_PER_ROUTER {
+                // Already one more live than is believed: the router is seen to name too many.
                 continue;
             }
-            let mut routers: Vec<(Ipv6Addr, u32)> =
-                self.entries.iter().map(|e| (e.0, e.1)).collect();
+            let mut routers: Vec<(Ipv6Addr, u32, Option<u64>)> =
+                self.entries.iter().map(|e| (e.0, e.1, e.5)).collect();
             routers.sort();
             routers.dedup();
             if !routers.contains(&key) && routers.len() >= MAX_ROUTERS {
-                let last_heard = |r: &(Ipv6Addr, u32)| {
+                let last_heard = |r: &(Ipv6Addr, u32, Option<u64>)| {
                     self.entries
                         .iter()
-                        .filter(|e| (e.0, e.1) == *r)
+                        .filter(|e| (e.0, e.1, e.5) == *r)
                         .map(|e| e.4)
                         .max()
                 };
                 let Some(victim) = routers
                     .iter()
-                    .filter(|r| !gateways.contains(r))
+                    .filter(|r| !(r.2 == uplink && gateways.contains(&(r.0, r.1))))
                     .min_by_key(|r| last_heard(r))
                     .copied()
                 else {
                     continue;
                 };
-                self.entries.retain(|e| (e.0, e.1) != victim);
+                self.entries.retain(|e| (e.0, e.1, e.5) != victim);
             }
             self.entries
-                .push((router, a.ifindex, a.prefix, a.lifetime, now));
+                .push((router, a.ifindex, a.prefix, a.lifetime, now, uplink));
         }
     }
 
-    /// What each of `gateways` announces at `now`: every prefix it named, with what is left of
-    /// its lifetime (`Some(0)`: run out or withdrawn), as a source of its own (one with nothing
-    /// heard names nothing, which withdraws what it named before).
+    /// What each of `gateways` announces at `now` on the uplink in use ([`Self::on`]): every
+    /// prefix it named there whose lifetime has not run out, with what is left of it, as a
+    /// source of its own (one with nothing live names nothing, which withdraws what it named
+    /// before).
     #[allow(clippy::type_complexity)]
     pub(crate) fn named_by(
         &self,
@@ -1386,10 +1421,10 @@ impl Heard {
                 let named = self
                     .entries
                     .iter()
-                    .filter(|e| e.0 == router && e.1 == ifindex)
-                    .map(|e| {
+                    .filter(|e| e.0 == router && e.1 == ifindex && e.5 == self.uplink)
+                    .filter_map(|e| {
                         let left = e.3.saturating_sub(now.saturating_duration_since(e.4));
-                        (e.2, Some(left))
+                        (!left.is_zero()).then_some((e.2, Some(left)))
                     })
                     .collect();
                 (Source::Pref64 { router, ifindex }, named)
@@ -2608,5 +2643,151 @@ mod r4_tests {
         let e = pref64::listen(|| steps.pop().unwrap());
         assert_eq!(e.raw_os_error(), Some(libc::EBADF));
         assert!(pref64::seen().contains(&p("2001:db8:5e::/96")));
+    }
+}
+
+/// Review round 5: the fixes' tests (findings named in each).
+#[cfg(test)]
+mod r5_tests {
+    use super::*;
+
+    fn ip6(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
+    fn p(s: &str) -> Prefix {
+        s.parse().unwrap()
+    }
+
+    fn ann(prefix: &str, router: Ipv6Addr, life: u64) -> Announced {
+        Announced {
+            prefix: p(prefix),
+            lifetime: Duration::from_secs(life),
+            ifindex: 2,
+            router: Some(router),
+        }
+    }
+
+    /// One round's PREF64 learning on `uplink` from what `h` heard of `gw`, at `now`, as
+    /// `round_on` does it (the uplink's unheld mark cleared first).
+    fn round(h: &Heard, r: &mut Registry, uplink: u64, gw: (Ipv6Addr, u32), now: Instant) {
+        r.unheld.retain(|(s, _)| *s != uplink);
+        for (source, named) in h.named_by(&[gw], now) {
+            learn(r, uplink, source, &named, now);
+        }
+    }
+
+    fn active(r: &Registry, q: &str) -> bool {
+        r.learned.iter().any(|e| e.prefix == p(q) && e.active)
+    }
+
+    /// cross-1 = bypass-2 = parse-2: a gateway that renumbers its PREF64 (each old prefix
+    /// withdrawn with lifetime 0, or left to run out) never names more than one live prefix, and
+    /// its uplink is never unsettled for it: withdrawn and expired prefixes are neither named nor
+    /// counted; the sixth one is heard and learned; every old one stays refused (held, inactive).
+    #[test]
+    fn r5_a_gateway_that_renumbers_its_pref64_never_unsettles_its_uplink() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        for withdraw in [true, false] {
+            let mut h = Heard::new();
+            h.on(Some(7));
+            let mut r = Registry::default();
+            r.on = Some(7);
+            for i in 0..6u64 {
+                let now = t0 + Duration::from_secs(3600 * i);
+                let mut found = vec![ann(&format!("2001:db8:{:x}::/96", 0x100 + i), gw.0, 1800)];
+                if withdraw && i > 0 {
+                    found.push(ann(&format!("2001:db8:{:x}::/96", 0x100 + i - 1), gw.0, 0));
+                }
+                h.hear(&found, &[gw], now);
+                round(&h, &mut r, 7, gw, now);
+                assert!(r.unheld.is_empty(), "renumbering {i} (withdraw {withdraw}): {:?}", r.unheld);
+                let named = &h.named_by(&[gw], now)[0].1;
+                assert_eq!(named.len(), 1, "{named:?}");
+            }
+            let now = t0 + Duration::from_secs(3600 * 5);
+            assert!(active(&r, "2001:db8:105::/96"));
+            assert_eq!(in_force_of(&r, now), vec![p("2001:db8:105::/96")]);
+            for i in 0..5 {
+                let old = format!("2001:db8:{:x}::/96", 0x100 + i);
+                assert!(!active(&r, &old) && all_of(&r).contains(&p(&old)), "{old}");
+            }
+        }
+    }
+
+    /// cross-1 (live: `r5-cross/vm-r5-spoof.log`): one forged advertisement from the gateway's
+    /// address naming five prefixes unsettles the uplink while they live, and its refusal names
+    /// the source; once they are withdrawn, or run out, the next round holds everything again,
+    /// and the real gateway's next prefix (which the five had crowded out of what is heard) is
+    /// learned.
+    #[test]
+    fn r5_one_forged_advertisement_unsettles_its_uplink_only_while_it_lives() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        for withdrawn in [true, false] {
+            let mut h = Heard::new();
+            h.on(Some(9));
+            let mut r = Registry::default();
+            r.on = Some(9);
+            let forged: Vec<Announced> = (1..=5)
+                .map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 8))
+                .collect();
+            h.hear(&forged, &[gw], t0);
+            round(&h, &mut r, 9, gw, t0);
+            let why = &r.unheld.iter().find(|(s, _)| *s == 9).expect("unheld").1;
+            assert!(
+                why.contains("the router advertisements of fe80::1 on interface 2 (PREF64)")
+                    && why.contains("named 5 NAT64 prefixes"),
+                "{why}"
+            );
+            // While they live, the real gateway's prefix is not heard (one more than believed
+            // is kept already).
+            h.hear(&[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], t0 + Duration::from_secs(1));
+            assert!(!h.prefixes().contains(&p("2001:db8:aaaa::/96")));
+            let later = if withdrawn {
+                let off: Vec<Announced> = (1..=5)
+                    .map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 0))
+                    .collect();
+                h.hear(&off, &[gw], t0 + Duration::from_secs(2));
+                t0 + Duration::from_secs(2)
+            } else {
+                t0 + Duration::from_secs(9)
+            };
+            h.hear(&[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], later);
+            round(&h, &mut r, 9, gw, later);
+            assert!(r.unheld.is_empty(), "{:?}", r.unheld);
+            assert!(active(&r, "2001:db8:aaaa::/96"));
+            assert_eq!(in_force_of(&r, later), vec![p("2001:db8:aaaa::/96")]);
+            // The forged ones stay refused.
+            assert!(all_of(&r).contains(&p("2001:db8:1::/96")));
+        }
+    }
+
+    /// parse-3: what a router heard on one uplink announced is not named on another, even by a
+    /// router of the same address on the same interface; back on the first uplink, it is again.
+    #[test]
+    fn r5_another_networks_pref64_is_not_named_on_this_one() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        h.on(Some(1));
+        h.hear(&[ann("2001:db8:a::/96", gw.0, 1800)], &[gw], t0);
+        let mut r = Registry::default();
+        r.on = Some(1);
+        round(&h, &mut r, 1, gw, t0);
+        assert_eq!(in_force_of(&r, t0), vec![p("2001:db8:a::/96")]);
+        let t1 = t0 + Duration::from_secs(60);
+        h.on(Some(2));
+        r.on = Some(2);
+        assert_eq!(h.named_by(&[gw], t1)[0].1, vec![]);
+        round(&h, &mut r, 2, gw, t1);
+        assert!(in_force_of(&r, t1).is_empty());
+        h.hear(&[ann("2001:db8:b::/96", gw.0, 1800)], &[gw], t1);
+        round(&h, &mut r, 2, gw, t1);
+        assert_eq!(in_force_of(&r, t1), vec![p("2001:db8:b::/96")]);
+        h.on(Some(1));
+        assert_eq!(h.named_by(&[gw], t1)[0].1.len(), 1);
+        assert_eq!(h.named_by(&[gw], t1)[0].1[0].0, p("2001:db8:a::/96"));
     }
 }
