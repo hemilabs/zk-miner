@@ -230,10 +230,16 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   interfaces' IPv6 defaults, a second network interface's default, a VPN that does not take over
   the default route) is no default route and no uplink, and any other scoped route off the
   default path still refuses what it holds.
-- **The kernel per destination:** an `RTM_GET` on a fresh routing socket, matched by the
-  kernel-set `rtm_pid` and a per-process sequence number from a random start, its `RTA_IFP` the
-  header's interface, judged exactly as the Linux answer is (`ESRCH` is no route; 0.0.0.0 and
-  `::` are this host). Network Extension policies (a per-app or include-all-networks VPN, a
+- **The kernel per destination:** an `RTM_GET` on a fresh routing socket, sent as
+  `RTM_GET_SILENT` (the answer goes to this socket alone), with a sequence number drawn for it
+  from the system CSPRNG. Only a datagram that is exactly one `RTM_GET` message (its length its
+  `rtm_msglen`) with the kernel-set `rtm_pid` of this process and that sequence number is the
+  answer: the kernel hands a write it refuses to every routing socket as written, so another
+  local process can put this process's pid and sequence number in front of it, but never in a
+  message of that exact shape (measured for 23 kinds of write). Its `RTA_IFP` must be the
+  header's interface, and it is judged exactly as the Linux answer is (`ESRCH` is no route;
+  0.0.0.0 and `::` are this host). A local process that floods every routing socket can still
+  make queries time out, which refuses (fail closed). Network Extension policies (a per-app or include-all-networks VPN, a
   content filter) can send a socket elsewhere with no route saying so; so for an answer that could
   be admitted, a UDP socket is connected to the destination (no packet is sent) and the source
   address the kernel chose must be on the interface the route names and on no other, or the
@@ -244,15 +250,30 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   any type the guard does not know is not physical).
 - **DNS servers:** `/etc/resolv.conf`, `/etc/resolver/*` and every resolver the configuration
   daemon knows (`State:/Network/Service/*/DNS`, `State:/Network/Global/DNS`: scoped, VPN and
-  secondary-interface resolvers), each `nameserver` read as every macOS parser reads it; a
-  configuration that cannot be read fails the facts read.
+  secondary-interface resolvers; `Setup:/Network/Service/*/DNS`: servers set by hand for any
+  service), each `nameserver` read as every macOS parser reads it; a configuration that cannot
+  be read (a resolver file this user may not read, a daemon that does not answer within 2 s)
+  fails the facts read.
+- **Facts that cannot be read again:** the last good facts stay in force (without their cached
+  kernel verdicts) for 2 s past their one-second life; after that every requester connection is
+  refused, naming what failed, until a re-read succeeds. One re-read runs at a time.
 - **Near hops:** the probe is the same hop-limited TCP connect (an unreachable `connect` reports
   before the connection is in progress, as Local Network privacy does, is refused, not far); a
   check connection reads its FIN's
-  fate from `TCP_CONNECTION_INFO`. macOS does not report an ICMP "time exceeded" for the FIN, so
-  a far peer is known only when the wait ends (the same verdict, up to 1.5 s later).
+  fate from `TCP_CONNECTION_INFO`: only an acknowledgement of the FIN (`FIN_WAIT_2`,
+  `TIME_WAIT`) is an answer; a peer that closes or resets the connection first is refused as a
+  failed check, never read as far. macOS does not report an ICMP "time exceeded" for the FIN, so
+  a far peer is known only when the wait ends (the same verdict, up to 1.5 s later). An
+  IPv4-mapped destination is probed as its IPv4 address.
+- **Public addresses:** a public address is confirmed for one network, which macOS identifies by
+  its routes and by the configuration daemon's network signature (the router's address and
+  hardware address); moving to another network behind a router of the same address learns it
+  again.
 - **Not seen on macOS** (list what they reach in `[egress] deny_cidrs`): `pf` rules (`route-to`,
   NAT), which need root to read; Network Extension policies that treat TCP differently from UDP.
+  A VPN built as a Network Extension flow-divert or app proxy is expected to accept every probe
+  itself, so every requester connection is refused as near (it fails closed): see
+  docs/netguard-macos.md.
 
 ## Developer mode: `[dev] private_network`
 

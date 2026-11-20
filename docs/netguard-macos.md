@@ -25,7 +25,16 @@ changed outside macOS-only code, all of it:
   `Ok(system_resolvers())` (the same servers as before, and it cannot fail);
 - `crates/zkminer-netguard/Cargo.toml`: `system-configuration` 0.7 and `core-foundation` 0.9 for
   `cfg(target_os = "macos")` only, the versions already in `Cargo.lock` through reqwest (the lock
-  gains two dependency lines and no package).
+  gains two dependency lines and no package);
+- review round 2: lines gated `#[cfg(target_os = "macos")]` in shared items (a `Denied::FactsUnreadable`
+  variant and its `Display` arm and `depends_on_facts` case, the check at the top of
+  `admit_inner`, `FactsCell`'s refresh fields and their initialisers in `NetPolicy::build`, a
+  macOS `get_fresher_than` beside the unchanged one, now `cfg(not(target_os = "macos"))`,
+  `HostFacts`' `unreadable` field and its initialisers in `new` and `assemble`, and a shadowing
+  `uplink_signature` closure in `gather_with`). With those lines removed, each of these items is
+  byte-for-byte what PR #37 has (`gather_with` what round 1 left), which
+  `/Users/user/zkminer/scratch/w11/NGREV/fix-r2/linux-identity.py` checks alongside the Linux-only
+  blocks above.
 
 ## Mechanisms
 
@@ -68,20 +77,44 @@ refused as on-link). Nothing Linux refuses is admitted for lack of rules: with n
 ### The kernel per destination (`query`)
 
 An `RTM_GET` written to a fresh `PF_ROUTE` socket (`RTA_DST` + an empty `RTA_IFP` `sockaddr_dl`,
-as `route -n get` sends it), the reply read with a 2 s timeout. Every routing socket receives a copy
-of every routing message (other processes' queries, routing changes), so the reply is the message
-of type `RTM_GET`, version 5, whose `rtm_pid` is this process's and whose `rtm_seq` is this query's
-(a per-process atomic counter that starts at a random value, so another thread's reply is
-skipped). The reply's `RTA_IFP` must be a `sockaddr_dl` naming the header's `rtm_index` (xnu
-fills both from the route's `rt_ifp`), or it is malformed. 0.0.0.0 and `::` are answered as a
-local route without asking: `RTM_GET` answers them with the default route, while a connection to
-them goes to this host. `rtm_pid` is set by the
-kernel, not taken from the request: a request written with `rtm_pid = 1` is answered with the
-writer's real pid (measured), so no other process can forge an answer. `ESRCH` (in `write` or
-`rtm_errno`) is no route; a route that reaches nothing is no route; any other error, a truncated or
-malformed reply, or an answer whose route does not hold the destination is an error (the
-destination is refused). The answer is one `Route`, judged by the unchanged
+as `route -n get` sends it), the reply read with a 2 s timeout. Since review round 2 it is sent as
+`RTM_GET_SILENT` (0x11, xnu's private <net/route.h>): the kernel sends the answer to the asking
+socket alone (as type `RTM_GET`) instead of to every routing socket, so no other process sees
+which destinations are asked about, nor the queries' pid and sequence numbers
+(`fix-r2/rtm-get-silent.log`); a kernel that refused the type (`EPERM`, `EOPNOTSUPP`) would be
+asked with `RTM_GET` from then on. Each query's `rtm_seq` is drawn from `arc4random` on its own.
+
+The socket still receives other routing messages, and also every write the kernel refused, as it
+was written: xnu's `route_output` hands a write whose length is not its `rtm_msglen` to every
+routing socket raw, with the pid and sequence number the writer put in it, and a write refused
+before the kernel sets `rtm_pid` (another version: `EPROTONOSUPPORT`; any type but `RTM_GET`
+from an unprivileged writer: `EPERM`) with the writer's pid, its version or type kept. Round 1
+said no other process could forge an answer, because a request's `rtm_pid` is overwritten with
+the writer's; that holds for every write the kernel accepts, but not for these refused ones, and
+the reviewer's forger had 18,529 forged default routes taken (`r2-parse/spoof-run.log`). So the
+answer is the one datagram that is exactly one message (its length its `rtm_msglen`), of type
+`RTM_GET` and version 5, whose `rtm_pid` is this process's and whose `rtm_seq` is this query's;
+every other datagram is skipped without being read further (an 8-byte stub no longer fails the
+query). `fix-r2/forge-variants.log` writes 23 kinds of message with another process's pid
+(oversize, truncated, stubs, `rtm_msglen` 0, other versions and types, `RTM_ADD`/`RTM_CHANGE`/
+`RTM_DELETE`/`RTM_LOCK` refused with `EPERM`, bad sockaddrs refused with `EINVAL`, exact-length
+forged answers, `RTM_GET_SILENT`) and records what a second routing socket receives: none is
+delivered in that shape. The reply's `RTA_IFP` must be a `sockaddr_dl` naming the header's
+`rtm_index` (xnu fills both from the route's `rt_ifp`), or it is malformed. 0.0.0.0 and `::` are
+answered as a local route without asking: `RTM_GET` answers them with the default route, while a
+connection to them goes to this host. `ESRCH`, `ENETUNREACH` or `EHOSTUNREACH` (in `write` or
+`rtm_errno`) is no route; a route that reaches nothing is no route; any other error, a malformed
+answer, no answer within 2 s, or an answer whose route does not hold the destination is an error
+(the destination is refused). A local process that floods every routing socket can make queries
+time out (their answers lost when the socket's buffer is full): that refuses, a denial of
+service that fails closed. The answer is one `Route`, judged by the unchanged
 `RouteTable::judge_answer`.
+
+Considered and not adopted (round 2, parse-1 (d)): requiring the answered route to appear in the
+`NET_RT_DUMP` snapshot as well. It would not have caught the forgery that mattered: the forged
+answer was the real default route (via the real router, on the real interface), which the
+snapshot holds; and the kernel's real answers are often clones made after the snapshot (the
+1.1.1.1 row below), which would be refused or need a dump per query.
 
 **Network Extension (NECP).** macOS can send a socket into a tunnel by policy, with no route
 saying so (a per-app VPN, an include-all-networks VPN, a content filter). The unprivileged view of
@@ -123,10 +156,36 @@ objects.
   resolvers), every regular file in `/etc/resolver`, and the `ServerAddresses` of every
   `State:/Network/Service/<id>/DNS` key and of `State:/Network/Global/DNS` in configd's dynamic
   store (a secondary interface's DHCP or RDNSS servers, a VPN's supplemental and split-DNS
-  resolvers, scoped resolvers: what `scutil --dns` lists). Files are read as bytes (invalid UTF-8
-  replaced), at most 1 MiB; a non-regular file is skipped (opened `O_NONBLOCK`, then `fstat`);
-  a missing file or directory has none, and any other error, a store that cannot be read, or a
-  value configd would not write fails the facts read. Each `nameserver` word (any case) counts
+  resolvers, scoped resolvers: what `scutil --dns` lists), and since round 2 of every
+  `Setup:/Network/Service/<id>/DNS` key (servers set by hand for a service: configd's IPMonitor
+  merges them into that service's resolver for `scutil --dns` without writing them to a `State:`
+  key, so a secondary service's would otherwise be missed; an inactive service's are refused
+  needlessly, never fewer). Files are read as bytes (invalid UTF-8 replaced), at most 1 MiB; each
+  is opened `O_NONBLOCK` and `fstat`ed, and what is not a regular file is skipped without being
+  read (round 1 said "without being opened", which was wrong: it is opened, never read); a
+  missing file or directory has none; a symbolic link that loops (`ELOOP`) is skipped with a
+  warning (round 2, below); any other error, a store that cannot be read, a value configd would
+  not write, or a daemon that does not answer within 2 s fails the facts read, the message naming
+  the file or key. The daemon is asked on a thread of its own (SCDynamicStore has no timeout);
+  a call that timed out is abandoned, and while four abandoned calls have not returned, the next
+  fails at once.
+- **Facts that cannot be read again** (round 2, bypass-1): when a re-read fails, the cached
+  kernel verdicts are dropped and the last good facts stay in force for `REFRESH_GRACE` (2 s)
+  past `FACTS_TTL` (1 s); after that every requester connection is refused with
+  `Denied::FactsUnreadable` ("… this host's network facts (interfaces, routes, DNS servers) could
+  not be read again for more than 3s (the DNS resolver file /etc/resolver/x: Permission denied
+  …)"), until a re-read, tried again at most every 100 ms, succeeds. `admit` reads the refusal
+  from the facts themselves, so a caller that judges with `NetPolicy::facts()` (the witness
+  broker's floor) refuses too. One re-read runs at a time; a caller that finds one under way waits
+  for it and takes its facts.
+- **The uplink's identity** (round 2, bypass-2): public addresses are confirmed per uplink. On
+  macOS the uplink signature (default routes and internet interfaces, as on Linux) also hashes
+  configd's `NetworkSignature` of every active service (`State:/Network/Service/<id>/IPv4`:
+  `IPv4.Router=…;IPv4.RouterHardwareAddress=…`; `…/IPv6`: the prefix and the router's hardware
+  address): two networks whose routers have the same address on the same interface are two
+  uplinks. The kernel's neighbour tables cannot stand in: an unprivileged process sees no ARP
+  entry and every NDP entry's hardware address as `02:00:00:00:00:00`
+  (`fix-r2/llinfo-unprivileged.log`). Each `nameserver` word (any case) counts
   for every address any macOS parser reads in it: `getaddrinfo(AI_NUMERICHOST)` (libresolv,
   configd; reads `203.0.113.053` as decimal 53), `inet_aton` (octal 43, and `3405803829`,
   `0xcb007135`, `10.1`), and the plain form with a zone dropped.
@@ -147,8 +206,18 @@ included, with `EHOSTUNREACH`: the same outcome Linux gives. (The ON37 note's 2-
 The check connection now exists on macOS: the same steps as Linux (connect with the default hop
 limit, linger 0, lower the hop limit, `shutdown(SHUT_WR)`, wait `4 × RTT + 250 ms` clamped to
 0.3–1.5 s), reading the state from `TCP_CONNECTION_INFO` (<netinet/tcp.h>; `tcpi_srtt` /
-`tcpi_rttcur` in ms; `TCPS_FIN_WAIT_1` = 6 from <netinet/tcp_fsm.h>). A state other than
-`FIN_WAIT_1` (the FIN acknowledged, or a reset) is near; still `FIN_WAIT_1` at the deadline is far.
+`tcpi_rttcur` in ms; states from <netinet/tcp_fsm.h>). Since round 2 (probe-1) only
+`FIN_WAIT_2` or `TIME_WAIT` (reached once the FIN is acknowledged) is an answer, near;
+`FIN_WAIT_1` and `CLOSING` (the peer's FIN crossed the check's) wait; still `FIN_WAIT_1` at the
+deadline is far. A peer that closed or reset the connection on its own (not `ESTABLISHED` before
+the FIN, or `CLOSE_WAIT`/`LAST_ACK`/`CLOSED` after it, or `CLOSING` at the deadline) is a failed
+check: refused, but not read as near, and never as far. Before, any state but `FIN_WAIT_1` was
+near, so a far server that closes at once (NIST's daytime server 129.6.15.28:13, two hops out)
+was refused as near (3 of 3, `fix-r2/repro-probe1-probe2-on-HEAD.log`); it is now refused as a
+failed check (a far server that always closes first stays refused, by the check's design: it
+never lets the FIN be tested). The probe and the check connection connect to an IPv4-mapped
+address as its IPv4 address (probe-2: an IPv6 socket's hop limit does not limit the IPv4 packets
+of a mapped connection, so the probe of `[::ffff:1.1.1.1]:443` connected).
 
 ## Empirical results (this Mac: macOS 27.2, `kern.osversion` 26B131, Wi-Fi behind a home router)
 
@@ -253,13 +322,45 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
    a kind as physical; macOS has no kind to read, so an unknown name is not physical. Stricter.
 9. **DNS servers come from configd too**, and each `nameserver` word is read by every macOS
    parser; a configuration that cannot be read fails the facts read. Linux reads its
-   `resolv.conf` files as before.
+   `resolv.conf` files as before, and skips a file it cannot read.
+10. **A re-read of the facts that keeps failing refuses** every requester connection after 2 s
+    of grace; Linux keeps the last good facts for as long as the failure lasts (recommended for
+    #37, below).
+11. **The check connection reads only an acknowledged FIN as near**; a peer that closed or reset
+    first is a failed check. Linux reads any state but `FIN_WAIT1` as near (recommended for #37).
+12. **One facts re-read at a time, the configuration daemon bounded by 2 s.** Linux re-reads in
+    every caller that finds the facts stale.
+13. **The uplink signature includes configd's network signatures.** Linux's has the routes only.
 
 ## Residual risks (macOS)
 
 - **Network Extension policies that treat TCP and UDP differently** (or that apply only after
   `connect`): the UDP source check would not see them. Not testable here (no NE VPN on this Mac).
   List what such a VPN reaches in `[egress] deny_cidrs`, or set `internal_ranges`.
+- **Network Extension flow-divert and app-proxy VPNs** (round 2): such a VPN takes TCP flows in
+  the kernel and hands them to its own process, with no `utun` route for them. Each probe is
+  then expected to connect at once (the proxy accepts it locally), so every requester connection
+  is refused as near: the operator sees `refused by the network guard: <addr> is within 2 hops of
+  this host … (a probe limited to 2 hops: it accepted a connection)` for every public host while
+  the VPN is on. This fails closed; not testable here (no such VPN on this Mac). README's macOS
+  troubleshooting names it.
+- **Routers that rewrite destinations** (DNAT, hairpin NAT, a port forward on the router's WAN
+  address): a public address the router maps back into the LAN is judged by where it is
+  addressed, not where it lands. The near-hop probe refuses the router itself (it answers within
+  2 hops), and the host's own public addresses are refused; a forward to another public address
+  on a far network is not seen. Shared design (Linux the same).
+- **The time between the check and the connection** (round 2, bypass-3): the route, socket and
+  near-hop checks run just before the real connection, which is a new socket; a route or VPN
+  that changes between them is not seen for that connection. Shared design (Linux the same);
+  recommended for #37 (below): check the connected socket's `getsockname` and interface again
+  after `connect`, or connect through a connector that binds the checked source.
+- **A flood of routing messages** from a local process can make route queries time out:
+  refused (fail closed).
+- **dnsinfo** (`dns_configuration_copy`, what `scutil --dns` prints) is not read: its layout is
+  configd's private `dnsinfo.h` (not in the SDK), a tree of raw pointers with no ABI promise, so
+  no sound reader can be written against it. Its sources are read (the `State:` and `Setup:` DNS
+  keys, `/etc/resolver`), and the real-host test checks every server `scutil --dns` lists is
+  among them.
 - **`pf`** (`route-to`, `rdr`, NAT in `/etc/pf.conf` or an anchor) can reroute the miner's packets;
   its rules need root to read. The Linux equivalent (netfilter marks) is in SECURITY.md's known
   limits too.
@@ -270,9 +371,10 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
 - **`net.inet.tcp.icmp_may_rst=0`** (not the default) makes every 2-hop probe time out; the check
   connection then decides each connection (same verdicts, slower: up to 1.5 s + its connect).
 - **DNS servers that change between facts reads** (a VPN that comes up) are known from the next
-  read, as on Linux. Resolvers configd keeps under other keys than `State:/Network/Service/*/DNS`
-  and `State:/Network/Global/DNS` (none on this Mac; `scutil --dns` lists exactly these) are not
-  read.
+  read, as on Linux. Resolvers configd keeps under other keys than `State:/Network/Service/*/DNS`,
+  `State:/Network/Global/DNS` and `Setup:/Network/Service/*/DNS` are not read
+  (`this_hosts_dns_keys_are_all_read` fails if this host's configd holds another
+  `…/Network/…/DNS` key).
 - **Bridges** (`bridgeN`, `IFT_BRIDGE`) count as physical, as a Linux bridge does, so a default
   route through a VM's `bridge100` is not flagged. Other Ethernet-type interfaces of names the
   guard does not know (`feth`, `vmenet`) are not physical and are flagged.
@@ -294,20 +396,36 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
   answers judged), `a_scoped_default_is_no_default_path`, `answers_are_matched_and_judged_strictly`
   (other pids/sequence numbers/types skipped; reject, blackhole, down, `ESRCH` are no route; a
   gateway that is no address is `Unknown`; an answer not holding the destination is an error),
-  `malformed_and_truncated_input_is_an_error` (every reply cut at every length, bad lengths,
-  missing sockaddrs, an address bit past `RTAX_MAX`, a short sockaddr, a dump cut or of another
-  version or type: all errors), `netmasks_and_scopes_read_as_the_kernel_means_them`,
+  `malformed_and_truncated_input_is_an_error` (every reply cut at every length and every
+  length mismatch: no answer, since round 2; missing sockaddrs, an address bit past `RTAX_MAX`,
+  a short sockaddr, a dump cut or of another version or type: errors),
+  `netmasks_and_scopes_read_as_the_kernel_means_them`,
   `interface_types_read_as_link_kinds`, `this_hosts_kernel_answers_agree_with_its_table`,
-  `this_hosts_answers_agree_with_route_get`.
+  `this_hosts_answers_agree_with_route_get`. Round 2: `forged_and_refused_writes_are_no_answer`,
+  `forged_answers_are_never_taken` (live, ignored by default: run on its own),
+  `queries_are_answered_to_the_asking_socket_alone`,
+  `the_destination_port_reaches_the_socket_check`, `plain_clones_in_the_dump_are_not_read`.
 - `facts::tests` (macOS, review round 1): `ip_sockaddrs_are_read_within_their_length`,
   `macos_reads_nameservers_as_its_resolvers_do`, `macos_resolver_files_are_read_strictly`,
-  `macos_dns_servers_are_the_configuration_daemons` (against `scutil --dns`).
+  `macos_dns_servers_are_the_configuration_daemons` (against `scutil --dns`; round 2 adds
+  configd's, the `Setup:` keys' and `/etc/resolver`'s servers ⊆ all). Round 2:
+  `macos_dns_servers_come_from_every_source`, `configd_values_are_read_strictly`,
+  `this_hosts_dns_keys_are_all_read`, `netmasks_are_read_within_their_length`,
+  `the_facts_read_fails_without_the_configuration_daemon` (the test binary again under
+  `sandbox-exec`, configd's Mach service denied), `a_stuck_configuration_daemon_fails_the_read_in_time`,
+  `two_networks_behind_the_same_router_address_are_two_uplinks_on_macos`,
+  `network_signatures_are_read_strictly`.
+- `policy::tests` (macOS, round 2): `a_failing_refresh_refuses_after_its_grace_and_recovers`,
+  `stale_facts_are_re_read_once_for_every_caller`.
 - `nearhop::tests`: `an_unreachable_at_once_is_no_answer_on_macos` and
   `connection_info_is_read_within_what_the_kernel_wrote` (review round 1),
   `the_check_connection_finds_a_public_host_far` (now passes for real),
   `the_check_connection_finds_a_local_listener_near` (v4 and v6),
   `a_near_listener_that_gave_the_probe_no_answer_is_near_on_macos`, and the existing
-  `a_local_listener_is_near`, `outcomes_are_classified`.
+  `a_local_listener_is_near`, `outcomes_are_classified`. Round 2:
+  `the_check_reads_only_an_acknowledged_fin_as_an_answer_on_macos`,
+  `a_peer_that_closes_first_is_never_far_on_macos`,
+  `a_mapped_address_is_probed_as_its_ipv4_address_on_macos`.
 - `macos_tests` (this host's real facts): `loopback_link_local_the_lan_and_the_router_are_refused`,
   `neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused` (with the kernel's own
   on-link and local verdicts), `a_public_address_is_admitted_and_vetted`,
@@ -342,6 +460,57 @@ Each finding was first reproduced on 25764db, then fixed with a test that covers
 | 8 | probe-1 (info): libc's `tcp_connection_info` is 176 bytes, the SDK's 112 | yes: the kernel writes 112 of 176 bytes | only `tcpi_state`, `tcpi_rttcur`, `tcpi_srtt` are read, and only when the returned length covers `tcpi_srtt` (48); SDK offsets asserted | `connection_info_is_read_within_what_the_kernel_wrote` |
 | 9 | cross-2 (low): three weak real-host tests | by reading: the uplink test asserted on a table that already drops scoped defaults; the LAN test never reached macOS code; the neighbour test could pass with 0 neighbours | the raw dump is checked; router and LAN neighbour asserted `OnLink` by the kernel and the table; at least one neighbour required where a global prefix exists, else `SKIPPED` | `this_macs_uplinks_are_its_unscoped_defaults`, `loopback_link_local_the_lan_and_the_router_are_refused`, `neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused` |
 | 10 | cross-3, cross-4, cross-5 (docs) | by reading: the cross-platform nearhop test and the zkminer-cli `Cargo.toml` change (all non-Linux Unixes) were not listed; the table said a non-IP gateway is always refused; the `route -n get` test compared no mask and no LAN, neighbour or fe80 row | this note corrected (the list at the top, the routing table rows); the cross-check compares the mask and asks for a LAN neighbour, a `/64` neighbour and `fe80::1` | `this_hosts_answers_agree_with_route_get` |
-| 11 | hardening: random sequence start; check the answer is for the destination asked | adopted: the counter starts at `arc4random()`; a reply's `RTA_IFP` must name the header's `rtm_index` (all 11 captured replies and every live answer do); the destination itself was already checked (`holds`) | | `the_answers_interface_is_the_headers` |
+| 11 | hardening: random sequence start; check the answer is for the destination asked | adopted (round 2 replaced the counter: each query's number is drawn on its own, see parse-1 there): the counter starts at `arc4random()`; a reply's `RTA_IFP` must name the header's `rtm_index` (all 11 captured replies and every live answer do); the destination itself was already checked (`holds`) | | `the_answers_interface_is_the_headers` |
 | 12 | hardening: count any interface holding the UDP source, not the first | adopted: `Split` if any interface but the route's holds it; this Mac's public v4 and v6 sources are each on one interface | | `the_socket_view_decides_an_admissible_answer`, `this_hosts_sockets_leave_by_the_routes_interface` |
 | 13 | hardening: a fast unreachable as failed, not far | adopted without a timing threshold: an unreachable `connect` returns at once (before `EINPROGRESS`) is refused. A threshold was not needed: every real "time exceeded" (177 of 180 probes to 9 public hosts, v4 and v6) came after `EINPROGRESS`, at 2.18 ms or more, and every Local Network denial (40 of 40) from `connect` itself, in 0.13 to 0.35 ms; no public host is refused (`h13-*.log`). A fixed threshold, by contrast, would rest on a margin a faster network could erode (the first hop answered in 0.98 ms here at hop limit 1) | | `an_unreachable_at_once_is_no_answer_on_macos`, `real_host::public_hosts_are_far_and_reachable` |
+
+## Review round 2
+
+Four reviewers again (parse, bypass, probe, cross; material in
+`/Users/user/zkminer/scratch/w11/NGREV/r2-*`). Each finding was reproduced on 334624d first (or
+shown not to be reproducible), then fixed with a test that covers it. Logs:
+`/Users/user/zkminer/scratch/w11/NGREV/fix-r2/`. Round 1 said no other process can forge a
+route reply because the kernel sets `rtm_pid`; that was wrong for writes the kernel refuses
+(finding 1).
+
+| # | finding | reproduced on 334624d | outcome | covered by |
+|---|---|---|---|---|
+| 1 | parse-1 (medium): forged `RTM_GET` answers | yes: `rtforge` shows a 200-byte write with `rtm_msglen` 128 delivered raw, pid and sequence number as written (`repro-rtforge-on-HEAD.log`); the reviewer's forger had 18,663 of 23,550 queries for 192.168.1.50 take its default route, all admitted by the judge (`repro-parse1-parse2-on-HEAD.log`) | (a) a datagram is the answer only if its length is its `rtm_msglen`, version 5, type `RTM_GET`, this pid and this sequence number; (b) each sequence number from `arc4random`; (c) `RTM_GET_SILENT` adopted (works on this macOS: `rtm-get-silent.log`), with `RTM_GET` kept as the fallback; (d) the dump cross-check not adopted (the forged answer was the real default route, which the dump holds; real answers are often clones made after the dump). Then 23 kinds of forged write (`exp/rtvariants.c`, `forge-variants.log`): none reaches another socket in the accepted shape. Live: 324,125 queries answered by the kernel while 1,411,650 forged datagrams with this pid and the query's own sequence number arrived, none taken (`live-forge-after.log`); the reviewer's forger, rerun, saw no answer to forge from and took 0 of 2,438,375 (`reviewer-spoof-after.log`) | `forged_and_refused_writes_are_no_answer`, `forged_answers_are_never_taken` (ignored by default: run alone), `queries_are_answered_to_the_asking_socket_alone`, `the_answers_interface_is_the_headers` |
+| 2 | parse-2 (low): an 8-byte message fails queries | yes: 729,503 of 730,007 queries failed during the reviewer's flood | any datagram that is not an exact-length `RTM_GET` with this pid and sequence number is skipped; only a matching answer that does not parse is an error. Rerun: 0 of 7,449 failed. A flood that fills the socket buffer can still lose the answer: the query times out and the destination is refused (fail-closed denial of service, documented) | `forged_and_refused_writes_are_no_answer`, `malformed_and_truncated_input_is_an_error` (a datagram of the wrong length is now no answer instead of an error) |
+| 3 | bypass-1 (medium): a failed facts refresh keeps the old snapshot | yes: with the reviewer's flag-file patch the first snapshot stayed in force 5 s and 8.8.4.4 stayed admitted (`repro-bypass1-bypass2-on-HEAD.log`) | macOS: the verdict cache is dropped on a failed re-read; after `FACTS_TTL` + `REFRESH_GRACE` (1 + 2 s) every requester connection is refused with `Denied::FactsUnreadable` naming the failure; re-read retried at most every 100 ms; service resumes when it succeeds | `a_failing_refresh_refuses_after_its_grace_and_recovers` |
+| 4 | parse-3 + bypass-1 (low): one bad `/etc/resolver` entry fails every facts read | yes (`r2-bypass/resolver-conditions.log`: unreadable file, file over 1 MiB, symlink loop, unreadable directory all fail the read) | decided per condition. configd reads `/etc/resolver/*` as root (dnsinfo's flat-file resolvers, by configd's source, `dnsinfo_flatfile.c`) and publishes their servers only in dnsinfo, which the guard cannot read, never in a `State:` key: skipping a file this user cannot read, or reading only part of a big one, would leave a site resolver unrefused, so those stay fail-closed, the message naming the file, with a README troubleshooting line. A looping symlink cannot be opened by configd either, so it names no resolver: skipped with a warning. The doc sentence "skipped without being opened" corrected (opened `O_NONBLOCK`, `fstat`ed, never read) | `macos_dns_servers_come_from_every_source`, `macos_resolver_files_are_read_strictly` |
+| 5 | manual DNS on a non-primary service | not reproducible here (no `Setup:` DNS key on this Mac, and writing one needs root); by reading configd's IPMonitor, which merges `Setup:/Network/Service/<id>/DNS` into the service's resolver for dnsinfo without a `State:` key | `Setup:/Network/Service/[^/]+/DNS` read too (unprivileged). `dns_configuration_copy` evaluated: exported by `libsystem_configuration.dylib`, but its structs are configd's private `dnsinfo.h` (absent from the SDK), a pointer tree whose layout is no ABI promise; a misread is undefined behaviour, so it is not used (documented) | `this_hosts_dns_keys_are_all_read`, `macos_dns_servers_are_the_configuration_daemons` (against `scutil --dns`), mutation N06 |
+| 6 | bypass-2 (low, shared): same gateway IP, same interface, same uplink signature | yes: the reviewer's two tables give the same signature (`repro-bypass1-bypass2-on-HEAD.log`) | the gateway's link-layer address is not available unprivileged (no ARP entry at all, every NDP address `02:00:00:00:00:00`: `llinfo-unprivileged.log`), so macOS hashes configd's `NetworkSignature` of every service (router address and hardware address, IPv6 prefix and router hardware address) into the signature | `two_networks_behind_the_same_router_address_are_two_uplinks_on_macos`, `network_signatures_are_read_strictly` |
+| 7 | cross-1 / cross-2 (low): mutation survivors M16, M20, M21, M22, M25, M27, M30, M32 | yes (`r2-cross/mut/summary.txt`) | tests added (below); `server_addresses` already took a `CFPropertyList`, and `servers_of`, `signatures_of` and `read_with` make the callers testable. `fix-r2/mut/run.py` with 52 mutations (the reviewer's 32, some retargeted to moved code, and 20 for this round's decision points): 50 killed (`mut/summary.txt`). Two survive, both equivalent here: N13 (the check connection's state before its FIN unchecked: a peer that closed first then shows `LAST_ACK` or `CLOSED` after it, also a failure, so only the message differs) and N15 (the check connection not unmapping: on this kernel `IPV6_UNICAST_HOPS` does limit an established mapped connection's FIN, `repro-probe1-probe2-on-HEAD.log`; the unmapping is defence in depth) | `configd_values_are_read_strictly`, `macos_dns_servers_come_from_every_source`, `this_hosts_dns_keys_are_all_read`, `netmasks_are_read_within_their_length`, `the_facts_read_fails_without_the_configuration_daemon`, `the_destination_port_reaches_the_socket_check`, `plain_clones_in_the_dump_are_not_read`, real-host subset asserts in `macos_dns_servers_are_the_configuration_daemons` |
+| 8 | cross-3 (low, shared): blocking calls on tokio workers, no single-flight | by reading (`resolve.rs:176`, `doh.rs:449` call `policy.admit()` on the runtime) | macOS: one facts re-read at a time (callers wait for it and take its facts); configd asked on a thread of its own within 2 s, at most four abandoned calls. Moving the admit loop into `spawn_blocking` is shared code: recommended for #37 | `stale_facts_are_re_read_once_for_every_caller`, `a_stuck_configuration_daemon_fails_the_read_in_time` |
+| 9 | probe-1 (low, shared logic): a peer that closes first counts as answered | yes: NIST's daytime server 129.6.15.28:13, two hops out, read `Answered` 3 of 3 times (`repro-probe1-probe2-on-HEAD.log`) | macOS: only `FIN_WAIT_2` / `TIME_WAIT` is an answer; a peer that closed or reset first is a failed check (refused, not near, never far). (`snd_una` is not in `TCP_CONNECTION_INFO`'s 112 bytes.) Now `Failed("the peer closed the check connection …")` | `the_check_reads_only_an_acknowledged_fin_as_an_answer_on_macos`, `a_peer_that_closes_first_is_never_far_on_macos` (loopback listeners that close or reset at once, and the daytime server) |
+| 10 | probe-2 (info): the probe ignores the hop limit for v4-mapped addresses | yes: the probe of `[::ffff:1.1.1.1]:443` at hop limit 2 connected (`repro-probe1-probe2-on-HEAD.log`); not reachable through `vet_connection`, which unmaps | macOS: the probe and the check connection unmap | `a_mapped_address_is_probed_as_its_ipv4_address_on_macos` |
+| 11 | documentation | | Network Extension flow-divert / app-proxy VPNs, DNAT/hairpin routers, the time between check and connection, a routing-message flood (residual risks); `ENETUNREACH`/`EHOSTUNREACH` as no route (the query section); this section; the round-1 claim corrected | |
+
+`this_hosts_answers_agree_with_route_get` now gives `route -n get` 5 s and asks again: route(8)
+waits for its own answer with no timeout, and a routing socket whose buffer fills drops
+messages (once under the live forge test and once during the mutation run it waited for ever).
+
+### Recommended for #37 (shared code)
+
+None of these is applied on Linux; each is for the owner of #37 to decide.
+
+1. **A failed facts re-read keeps the old facts for ever** (bypass-1): Linux's `FactsCell` keeps
+   the last good snapshot, cached kernel verdicts included, for as long as the netlink re-read
+   fails. Suggest the macOS behaviour: drop the verdicts, refuse after a short grace, retry.
+2. **Single-flight re-reads and blocking calls off the runtime** (cross-3): every caller that
+   finds the facts stale re-reads them; `resolve.rs:176` and `doh.rs:449` call `policy.admit()`
+   (route queries, `getifaddrs`, netlink) on tokio workers. Suggest the macOS single-flight in
+   `FactsCell`, and the admit loops in `spawn_blocking`.
+3. **The uplink signature** (bypass-2): two networks behind the same router address on the same
+   interface share it. Linux can add the gateway's link-layer address from the neighbour table
+   (`RTM_GETNEIGH`, unprivileged and not redacted on Linux).
+4. **The check connection reads a peer's own close as an answer** (probe-1): Linux's
+   `confirm_once` returns `Answered` for any state but `FIN_WAIT1` (`CLOSE_WAIT`, `LAST_ACK`,
+   `CLOSING`, `CLOSE`). Suggest: answered only on `FIN_WAIT2` / `TIME_WAIT`, a peer that closed
+   or reset first a failure (or use `tcpi_snd_una` past the FIN, which Linux's `TCP_INFO` has).
+5. **Unmap inside the probe primitives** (probe-2): defence in depth; `vet_connection` already
+   unmaps.
+6. **The time between check and connection** (bypass-3): re-check the connected socket
+   (`getsockname`, its interface) after `connect`, or connect through a connector that binds the
+   checked source.
