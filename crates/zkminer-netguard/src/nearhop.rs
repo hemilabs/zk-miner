@@ -479,7 +479,7 @@ fn connect_result(revents: libc::c_short, error: io::Result<Option<io::Error>>) 
 /// application, redesigned in review round 4 (probe-1): two connections to the destination, both
 /// made with the default hop limit. The **check** connection's hop limit is then lowered to
 /// `hops` for the rest of its life (its FIN, every retransmission of it, its closing reset), and
-/// it is half-closed; right after, the **control** connection, at the default hop limit, is
+/// it is half-closed; then the **control** connection is made, at the default hop limit, and
 /// half-closed too. Both FINs' fates are read from the connections' TCP state ([`ConnReader`]:
 /// Linux's `TCP_INFO`, macOS's `TCP_CONNECTION_INFO`) and decided by [`Check::step`]:
 ///
@@ -488,8 +488,9 @@ fn connect_result(revents: libc::c_short, error: io::Result<Option<io::Error>>) 
 ///   acknowledges a FIN that reaches it) and the check's has stayed unacknowledged for
 ///   [`Check::far_after`]: at least the window a near peer answers in (four round trips and
 ///   250 ms, at least 300 ms), one retransmission of the check's FIN (its RTO, two round trips and
-///   250 ms), and the control's acknowledgement time again plus 250 ms (both FINs left together on
-///   the same path, so a near peer's answer to the check's would come with the control's);
+///   250 ms), and the control's acknowledgement plus its round trip again (at least 250 ms) after
+///   it (the check's FIN left first on the same path, so a near peer's answer to it would come
+///   before the control's);
 /// - the control's FIN unacknowledged within its RTO, two round trips and 250 ms (at least
 ///   500 ms), a peer that closes or resets either connection first, a wait past
 ///   [`MAX_CHECK_WAIT`]: a failure, never far.
@@ -525,44 +526,60 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     if let Err(e) = set_hops(&check, addr, hops) {
         return ConfirmOutcome::Failed(e.to_string());
     }
-    let control = match connect() {
-        Ok(s) => s,
-        Err(o) => return o,
+    let rc = ConnReader::new(check.as_raw_fd());
+    let ic = match rc.info() {
+        Ok(i) => i,
+        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
     };
-    let (rc, rk) = (ConnReader::new(check.as_raw_fd()), ConnReader::new(control.as_raw_fd()));
-    let (ic, ik) = match (rc.info(), rk.info()) {
-        (Ok(c), Ok(k)) => (c, k),
-        (Err(e), _) | (_, Err(e)) => return ConfirmOutcome::Failed(e.to_string()),
-    };
-    // The peer closed or reset a connection before the FINs were sent: what follows could not
-    // tell whether a FIN reached it (review round 2, probe-1).
-    for (i, what) in [(ic, "check"), (ik, "control")] {
-        if i.state != TcpState::Established {
-            return ConfirmOutcome::Failed(format!(
-                "{} ({what} connection)",
-                peer_closed_first(i.state)
-            ));
-        }
+    // The peer closed or reset the connection before the FIN was sent: what follows could not
+    // tell whether the FIN reached it (review round 2, probe-1).
+    if ic.state != TcpState::Established {
+        return ConfirmOutcome::Failed(peer_closed_first(ic.state));
     }
-    let mut decision = match Check::new(ic.rtt.max(ik.rtt), ic.rto.max(ik.rto)) {
+    let mut decision = match Check::new(ic.rtt, ic.rto) {
         Ok(d) => d,
         Err(o) => return o,
     };
-    // The hop-limited FIN first, the control's right after it.
+    // The hop-limited FIN first; then the control connection is made and its FIN sent. An
+    // acknowledgement of the check's FIN that comes meanwhile is near at once.
     if let Err(e) = check.shutdown(std::net::Shutdown::Write) {
         return ConfirmOutcome::Failed(e.to_string());
+    }
+    let start = std::time::Instant::now();
+    let check_state = || rc.info().map(|i| i.state);
+    let near_already = |d: &mut Check| {
+        let state = check_state();
+        matches!(state, Ok(TcpState::FinWait2 | TcpState::TimeWait))
+            .then(|| d.step(start.elapsed(), state, Ok(TcpState::FinWait1)))
+            .flatten()
+    };
+    if let Some(done) = near_already(&mut decision) {
+        return done;
+    }
+    let control = match connect() {
+        Ok(s) => s,
+        Err(o) => return near_already(&mut decision).unwrap_or(o),
+    };
+    let rk = ConnReader::new(control.as_raw_fd());
+    match rk.info() {
+        Ok(i) if i.state == TcpState::Established => {}
+        Ok(i) => {
+            return near_already(&mut decision).unwrap_or_else(|| {
+                ConfirmOutcome::Failed(format!(
+                    "{} (control connection)",
+                    peer_closed_first(i.state)
+                ))
+            })
+        }
+        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
     }
     if let Err(e) = control.shutdown(std::net::Shutdown::Write) {
         return ConfirmOutcome::Failed(e.to_string());
     }
-    let start = std::time::Instant::now();
+    decision.control_sent_at(start.elapsed());
     loop {
-        let (c, k) = (rc.info(), rk.info());
-        if let Some(done) = decision.step(
-            start.elapsed(),
-            c.map(|i| i.state),
-            k.map(|i| i.state),
-        ) {
+        let (c, k) = (check_state(), rk.info().map(|i| i.state));
+        if let Some(done) = decision.step(start.elapsed(), c, k) {
             return done;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -586,6 +603,9 @@ pub(crate) struct Check {
     min_wait: Duration,
     /// How long the control's FIN may take to be acknowledged.
     control_wait: Duration,
+    /// When the control's FIN was sent (after the check's: the control connection is made once
+    /// the check's FIN is out).
+    control_sent: Duration,
     /// When the control's FIN was acknowledged.
     control_acked: Option<Duration>,
 }
@@ -608,18 +628,26 @@ impl Check {
         Ok(Check {
             min_wait,
             control_wait,
+            control_sent: Duration::ZERO,
             control_acked: None,
         })
     }
 
-    /// How long after the FINs the check's may be read as unanswered, once the control's was
-    /// acknowledged at `acked`: [`Self::min_wait`], and the control's time again plus the margin.
-    pub(crate) fn far_after(&self, acked: Duration) -> Duration {
-        self.min_wait.max(acked + acked.max(Self::MARGIN))
+    /// Notes that the control's FIN was sent `at` (after the check's).
+    pub(crate) fn control_sent_at(&mut self, at: Duration) {
+        self.control_sent = at;
     }
 
-    /// One reading, `now` after the FINs: the check connection's state and the control's (or why
-    /// they could not be read). `Some` when decided.
+    /// How long after the check's FIN it may be read as unanswered, once the control's was
+    /// acknowledged at `acked`: [`Self::min_wait`], and the control's round trip again plus the
+    /// margin after that.
+    pub(crate) fn far_after(&self, acked: Duration) -> Duration {
+        let round_trip = acked.saturating_sub(self.control_sent);
+        self.min_wait.max(acked + round_trip.max(Self::MARGIN))
+    }
+
+    /// One reading, `now` after the check's FIN: the check connection's state and the control's
+    /// (or why they could not be read). `Some` when decided.
     pub(crate) fn step(
         &mut self,
         now: Duration,
@@ -656,7 +684,7 @@ impl Check {
                     return Some(ConfirmOutcome::Failed(format!(
                         "the peer took {} ms to acknowledge the control's FIN, too long for the \
                          check to tell how near it is",
-                        acked.as_millis()
+                        acked.saturating_sub(self.control_sent).as_millis()
                     )));
                 }
                 (now >= far_after).then(|| match check {
@@ -669,7 +697,8 @@ impl Check {
                     })),
                 })
             }
-            None => (now >= self.control_wait).then(|| ConfirmOutcome::Failed(UNACKED_FIN.into())),
+            None => (now >= self.control_sent + self.control_wait)
+                .then(|| ConfirmOutcome::Failed(UNACKED_FIN.into())),
         }
     }
 }
@@ -1101,7 +1130,7 @@ mod tests {
     }
 
     /// A near listener that drops SYNs while its accept queue is full (backlog 0, one connection
-    /// queued) gives the probe no answer; it drains its queue two seconds later and then answers
+    /// queued) gives the probe no answer; it drains its queue 4.5 seconds later and then answers
     /// a connection. The check connection connects then, and its hop-limited FIN is acknowledged:
     /// near, refused before any connection that carries data.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1119,8 +1148,9 @@ mod tests {
             TtlProbe.probe(addr, 2, PROBE_TIMEOUT),
             ProbeOutcome::TimedOut
         );
+        // Drained once the probe has had all its attempts (1 s, 0.5 s, a 1 s pause, 1 s).
         let drain = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(4500));
             let accepted = l.accept();
             std::thread::sleep(Duration::from_secs(12));
             drop((l, accepted));
@@ -1642,6 +1672,18 @@ mod tests {
             run(&[(20, FinWait1, FinWait2), (244, FinWait1, FinWait2), (245, FinWait2, FinWait2)]),
             Some((245, ConfirmOutcome::Answered))
         );
+        // The control connection made 100 ms after the check's FIN, acknowledged 20 ms after
+        // its own: far only at max(510, 120 + 250).
+        let mut c = fresh();
+        assert_eq!(c.step(ms(50), ok(FinWait1), ok(FinWait1)), None);
+        c.control_sent_at(ms(100));
+        assert_eq!(c.step(ms(120), ok(FinWait1), ok(FinWait2)), None);
+        assert_eq!(c.far_after(ms(120)), ms(510));
+        assert_eq!(c.step(ms(510), ok(FinWait1), ok(FinWait2)), Some(ConfirmOutcome::Unanswered));
+        let mut c = fresh();
+        c.control_sent_at(ms(100));
+        assert_eq!(c.step(ms(609), ok(FinWait1), ok(FinWait1)), None, "control_wait from its FIN");
+        assert_eq!(c.step(ms(610), ok(FinWait1), ok(FinWait1)), Some(ConfirmOutcome::Failed(UNACKED_FIN.into())));
         // The control never acknowledged (S3): a failure at control_wait, never far.
         let o = run(&[(0, FinWait1, FinWait1), (509, FinWait1, FinWait1), (510, FinWait1, FinWait1)]);
         assert_eq!(o, Some((510, ConfirmOutcome::Failed(UNACKED_FIN.into()))));
