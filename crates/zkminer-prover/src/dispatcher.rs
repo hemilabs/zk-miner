@@ -8536,18 +8536,23 @@ impl WorkerPool {
             expected_peak,
             backend,
             outstanding,
+            outstanding,
             max_concurrent,
             None,
         )
     }
 
     /// `backend_fits_for_claim`, with the commit half charged at `po2`: the size `expected_peak`
-    /// was taken at (for risc0, the largest a card proves at).
+    /// was taken at (for risc0, the largest a card proves at). `same_backend_outstanding`: how many
+    /// of the `outstanding` jobs are of `backend`. The memory a warm worker of `backend` holds is
+    /// credited when none is, since a job of another backend never lands on that worker: an idle
+    /// SP1 server's 11 GB counts towards an SP1 claim while a RISC Zero job is outstanding.
     pub fn backend_fits_for_claim_at_po2(
         &self,
         expected_peak: u64,
         backend: &str,
         outstanding: usize,
+        same_backend_outstanding: usize,
         max_concurrent: usize,
         po2: Option<u8>,
     ) -> bool {
@@ -8565,14 +8570,22 @@ impl WorkerPool {
             return false;
         }
         // Windows: commit too, as dispatch will test it (`reserve_commit`).
-        if !self.commit_fits_for_claim(backend, concurrent, outstanding == 0, po2, expected_peak) {
+        if !self.commit_fits_for_claim(
+            backend,
+            concurrent,
+            same_backend_outstanding == 0,
+            po2,
+            expected_peak,
+        ) {
             return false;
         }
         // And one more increment has to fit in live headroom. `resident` is credited here because a
         // proof landing on a slot whose worker is already resident costs only the difference —
         // credited ONCE, not once per candidate, which is why this takes `outstanding` rather than a
         // running total: the saving applies to whichever single proof lands on that slot.
-        let resident = if outstanding == 0 {
+        // No job of this backend outstanding: the proof lands on one of its workers, warm or not
+        // (another backend's job never uses it).
+        let resident = if same_backend_outstanding == 0 {
             self.resident_host_bytes_for_backend(backend)
         } else {
             0

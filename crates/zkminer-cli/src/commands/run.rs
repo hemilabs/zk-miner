@@ -8523,10 +8523,22 @@ async fn miner_brain(
                                     continue;
                                 }
                             }
+                            let outstanding = needing_card(&in_flight, &proved);
+                            let sp1_outstanding = sp1_in_flight
+                                .iter()
+                                .filter(|j| in_flight.contains_key(*j) && !proved.contains(*j))
+                                .count();
+                            let same_backend_outstanding =
+                                if backend == zkminer_prover_protocol::BACKEND_SP1 {
+                                    sp1_outstanding
+                                } else {
+                                    outstanding.saturating_sub(sp1_outstanding)
+                                };
                             if !pool.backend_fits_for_claim_at_po2(
                                 want,
                                 backend,
-                                needing_card(&in_flight, &proved),
+                                outstanding,
+                                same_backend_outstanding,
                                 max_concurrent,
                                 if backend == "risc0" {
                                     risc0_sizes.iter().copied().max()
@@ -8539,19 +8551,22 @@ async fn miner_brain(
                                 // memory-wedged miner emitted ~298 of these every 5s, about 60
                                 // lines a second, which buries every other signal in the log.
                                 if memory_skips_this_tick.insert(backend.to_string()) {
+                                    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
                                     let detail = format!(
                                         "Not claiming {backend} jobs: one proof needs ~{:.1} GiB \
-                                         of host RAM, {} already outstanding, and this {:.1} GiB \
-                                         box cannot run the resulting set ({:.1} GiB held by \
-                                         proofs in flight). Claiming would mean releasing at a \
-                                         penalty.",
-                                        want as f64 / (1024.0 * 1024.0 * 1024.0),
+                                         of host RAM, and with {} job(s) outstanding ({:.1} GiB \
+                                         held by proofs in flight, {:.1} GiB free of {:.1} GiB) \
+                                         it does not fit now. Claiming would mean waiting for \
+                                         memory, or releasing at a penalty.",
+                                        want as f64 / GIB,
                                         in_flight.len(),
+                                        pool.reserved_host_memory() as f64 / GIB,
+                                        zkminer_prover::memory::mem_available_bytes().unwrap_or(0)
+                                            as f64
+                                            / GIB,
                                         zkminer_prover::memory::mem_total_bytes().unwrap_or(0)
                                             as f64
-                                            / (1024.0 * 1024.0 * 1024.0),
-                                        pool.reserved_host_memory() as f64
-                                            / (1024.0 * 1024.0 * 1024.0),
+                                            / GIB,
                                     );
                                     tracing::warn!("{detail}");
                                     // And on screen. Every memory message used to be
@@ -15746,6 +15761,34 @@ mod tests {
             forged.downcast_ref::<HostMemoryShortage>().is_none(),
             "a guest must not be able to buy itself unlimited retries"
         );
+    }
+
+    /// The claim gate's memory check credits a warm worker's holdings per backend: it is told how
+    /// many outstanding jobs are of the job's own backend (SP1 from `sp1_in_flight`, the rest
+    /// otherwise), so a RISC Zero job outstanding does not withhold the idle SP1 server's memory
+    /// from an SP1 claim.
+    #[test]
+    fn the_claim_gate_credits_a_warm_worker_per_backend() {
+        let brain = body(
+            include_str!("run.rs"),
+            "
+async fn miner_brain(",
+        );
+        let count = brain
+            .find("let sp1_outstanding = sp1_in_flight")
+            .expect("the SP1 count");
+        let call = brain
+            .find("if !pool.backend_fits_for_claim_at_po2(")
+            .expect("the gate");
+        assert!(count < call);
+        assert!(brain[count..call].contains("outstanding.saturating_sub(sp1_outstanding)"));
+        assert!(brain[call..].starts_with(
+            "if !pool.backend_fits_for_claim_at_po2(
+                                want,
+                                backend,
+                                outstanding,
+                                same_backend_outstanding,"
+        ));
     }
 
     /// A lock of ours that can be neither fulfilled nor released any more is slashed by this miner
