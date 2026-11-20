@@ -23,13 +23,16 @@
 //! - **no answer in time**: no evidence either way (a path that filters ICMP, or a near host that
 //!   drops SYNs for a while: a full accept queue, a SYN rate limit, a neighbour being resolved, a
 //!   device waking up). So the destination is **checked once connected**
-//!   ([`NearProbe::confirm`]): a check connection is made with the default hop limit (no data is
-//!   ever written on it), and once it is established its hop limit is lowered to the probe's and
-//!   it is half-closed: the FIN can reach the peer only if the peer is within the limit, and a
-//!   peer that gets it acknowledges it. Acknowledged (or answered with a reset) within a few round
-//!   trips: near, refused. Unacknowledged: far, and the real connection is made. The check
-//!   connection failing to connect refuses too (the real one would fail the same way). Linux reads
-//!   the FIN's fate from `TCP_INFO`, macOS from `TCP_CONNECTION_INFO`; elsewhere there is no check
+//!   ([`NearProbe::confirm`]): a check connection and a control connection are made with the
+//!   default hop limit (no data is ever written on either); the check connection's hop limit is
+//!   then lowered to the probe's for good and both are half-closed: the check's FIN can reach the
+//!   peer only if the peer is within the limit, the control's always does, and a peer that gets a
+//!   FIN acknowledges it. The check's FIN acknowledged, whenever: near, refused. Far only once the
+//!   control's FIN was acknowledged and the check's was not for a few round trips, one
+//!   retransmission and the control's time again (review round 4, probe-1); then the real
+//!   connection is made. A control never acknowledged, a peer that closes or resets first, a check
+//!   connection that fails to connect: refused (the real one would fail the same way). Linux reads
+//!   the FINs' fate from `TCP_INFO`, macOS from `TCP_CONNECTION_INFO`; elsewhere there is no check
 //!   connection, and a probe without an answer refuses;
 //! - **any other error** (a local firewall's `EPERM`/`EACCES`, `EADDRNOTAVAIL`, …): refused.
 //!
@@ -291,7 +294,7 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
 /// rest (review round 3, probe-1; on every platform since the Linux application). A router that
 /// rate-limits its ICMP drops some "time exceeded" answers (7.5% of the reviewer's probes on a
 /// home path went unanswered: `r3-probe/sweep-h2.log`), and a probe without an answer leaves the
-/// decision to the check connection, whose positive control refuses a peer that never
+/// decision to the check connection, whose control connection refuses a peer that never
 /// acknowledges a bare FIN (every AWS S3 front end), and which does not exist on Windows (a
 /// probe without an answer is refused there). An answer comes within a round trip to the router,
 /// milliseconds.
@@ -417,137 +420,253 @@ fn connect_result(revents: libc::c_short, error: io::Result<Option<io::Error>>) 
 }
 
 /// The check connection (see the module doc), on Linux, Android and macOS alike since the Linux
-/// application: connected with the default hop limit, the hop limit lowered, half-closed, and the
-/// FIN's fate read from the connection's TCP state ([`conn_info`]: Linux's `TCP_INFO`, macOS's
-/// `TCP_CONNECTION_INFO`), as [`fin_step`] and [`fin_at_deadline`] read it, then, for a FIN
-/// still unacknowledged at the deadline, the positive control ([`positive_control`]).
+/// application, redesigned in review round 4 (probe-1): two connections to the destination, both
+/// made with the default hop limit. The **check** connection's hop limit is then lowered to
+/// `hops` for the rest of its life (its FIN, every retransmission of it, its closing reset), and
+/// it is half-closed; right after, the **control** connection, at the default hop limit, is
+/// half-closed too. Both FINs' fates are read from the connections' TCP state ([`ConnReader`]:
+/// Linux's `TCP_INFO`, macOS's `TCP_CONNECTION_INFO`) and decided by [`Check::step`]:
+///
+/// - the check's FIN acknowledged, at any time: near ([`ConfirmOutcome::Answered`]);
+/// - far ([`ConfirmOutcome::Unanswered`]) only once the control's FIN was acknowledged (the peer
+///   acknowledges a FIN that reaches it) and the check's has stayed unacknowledged for
+///   [`Check::far_after`]: at least the window a near peer answers in (four round trips and
+///   250 ms, at least 300 ms), one retransmission of the check's FIN (its RTO, two round trips and
+///   250 ms), and the control's acknowledgement time again plus 250 ms (both FINs left together on
+///   the same path, so a near peer's answer to the check's would come with the control's);
+/// - the control's FIN unacknowledged within its RTO, two round trips and 250 ms (at least
+///   500 ms), a peer that closes or resets either connection first, a wait past
+///   [`MAX_CHECK_WAIT`]: a failure, never far.
+///
+/// Before review round 4 one connection did both: its hop limit was restored after a deadline
+/// capped at 1.5 s (the "positive control"), and a late acknowledgement of the hop-limited FIN
+/// (a near peer behind a congested queue, a delayed or lost ACK) then read as the control's
+/// answer: far. Now the check connection's hop limit is never restored, and nothing it answers
+/// can read as far.
 ///
 /// Only an acknowledgement counts as an answer (review round 2, probe-1): a peer that closed or
-/// reset the connection first is a failed check, never near by mistake and never far. Before the
-/// Linux application Linux read every state but `FIN_WAIT1` as near (a peer's own close
-/// included), took an ICMP error for the FIN (`SO_ERROR`) as far at once, and had no positive
-/// control. That ICMP early answer is gone: Linux keeps an ICMP error for an established socket
-/// as a soft error `SO_ERROR` does not report unless `IP_RECVERR` is set, and a "far" from it
-/// would skip the positive control; macOS never reported it either. So both platforms decide far
-/// only by the deadline and the control.
+/// reset the connection first is a failed check, never near by mistake and never far. ICMP
+/// errors for the FIN are not read (Linux keeps them as soft errors `SO_ERROR` does not report
+/// unless `IP_RECVERR` is set; macOS never reports them).
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
     use std::os::fd::AsRawFd;
     let addr = unmapped(addr);
-    let sock = match new_socket(addr) {
+    let connect = || -> Result<socket2::Socket, ConfirmOutcome> {
+        let sock = new_socket(addr).map_err(|e| ConfirmOutcome::Failed(e.to_string()))?;
+        sock.connect_timeout(&addr.into(), timeout)
+            .map_err(|e| ConfirmOutcome::ConnectFailed(e.to_string()))?;
+        // Closed with a reset, never a byte of data.
+        let _ = sock.set_linger(Some(Duration::ZERO));
+        Ok(sock)
+    };
+    let check = match connect() {
         Ok(s) => s,
-        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+        Err(o) => return o,
     };
-    if let Err(e) = sock.connect_timeout(&addr.into(), timeout) {
-        return ConfirmOutcome::ConnectFailed(e.to_string());
-    }
-    // The hop limit the connection was made with, restored for the positive control.
-    let default_hops = match default_hops(&sock, addr) {
-        Ok(h) => h,
-        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
-    };
-    // From here on every packet of this socket — the FIN, its retransmissions, the closing
-    // reset — may cross at most `hops` hops (until the positive control).
-    let _ = sock.set_linger(Some(Duration::ZERO));
-    if let Err(e) = set_hops(&sock, addr, hops) {
+    // From here on every packet of the check connection — the FIN, its retransmissions, the
+    // closing reset — may cross at most `hops` hops.
+    if let Err(e) = set_hops(&check, addr, hops) {
         return ConfirmOutcome::Failed(e.to_string());
     }
-    let fd = sock.as_raw_fd();
-    let rtt = match conn_info(fd) {
-        // The peer closed or reset the connection before the FIN was sent: what follows could
-        // not tell whether the FIN reached it (review round 2, probe-1).
-        Ok(i) if i.state != TcpState::Established => {
-            return ConfirmOutcome::Failed(peer_closed_first(i.state))
+    let control = match connect() {
+        Ok(s) => s,
+        Err(o) => return o,
+    };
+    let (rc, rk) = (ConnReader::new(check.as_raw_fd()), ConnReader::new(control.as_raw_fd()));
+    let (ic, ik) = match (rc.info(), rk.info()) {
+        (Ok(c), Ok(k)) => (c, k),
+        (Err(e), _) | (_, Err(e)) => return ConfirmOutcome::Failed(e.to_string()),
+    };
+    // The peer closed or reset a connection before the FINs were sent: what follows could not
+    // tell whether a FIN reached it (review round 2, probe-1).
+    for (i, what) in [(ic, "check"), (ik, "control")] {
+        if i.state != TcpState::Established {
+            return ConfirmOutcome::Failed(format!(
+                "{} ({what} connection)",
+                peer_closed_first(i.state)
+            ));
         }
-        Ok(i) => i.rtt,
-        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+    }
+    let mut decision = match Check::new(ic.rtt.max(ik.rtt), ic.rto.max(ik.rto)) {
+        Ok(d) => d,
+        Err(o) => return o,
     };
-    if let Err(e) = sock.shutdown(std::net::Shutdown::Write) {
+    // The hop-limited FIN first, the control's right after it.
+    if let Err(e) = check.shutdown(std::net::Shutdown::Write) {
         return ConfirmOutcome::Failed(e.to_string());
     }
-    // A peer within the limit acknowledges the FIN within about a round trip (a delayed ACK at
-    // most a couple of hundred milliseconds later).
-    let wait = (rtt * 4 + Duration::from_millis(250))
-        .clamp(Duration::from_millis(300), Duration::from_millis(1500));
-    let deadline = std::time::Instant::now() + wait;
+    if let Err(e) = control.shutdown(std::net::Shutdown::Write) {
+        return ConfirmOutcome::Failed(e.to_string());
+    }
+    let start = std::time::Instant::now();
     loop {
-        let state = match conn_info(fd) {
-            Ok(i) => i.state,
-            Err(e) => return ConfirmOutcome::Failed(e.to_string()),
-        };
-        if let Some(done) = fin_step(state) {
+        let (c, k) = (rc.info(), rk.info());
+        if let Some(done) = decision.step(
+            start.elapsed(),
+            c.map(|i| i.state),
+            k.map(|i| i.state),
+        ) {
             return done;
-        }
-        if std::time::Instant::now() >= deadline {
-            return match fin_at_deadline(state) {
-                ConfirmOutcome::Unanswered => positive_control(&sock, addr, default_hops, rtt),
-                other => other,
-            };
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// The hop limit `sock` (to `addr`) has now, as it was connected: `IP_TTL`, or
-/// `IPV6_UNICAST_HOPS` (macOS: -1, read as `u32::MAX`, the system's default; Linux answers the
-/// hop limit in effect).
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn default_hops(sock: &socket2::Socket, addr: SocketAddr) -> io::Result<u32> {
-    if addr.is_ipv4() {
-        sock.ttl_v4()
-    } else {
-        sock.unicast_hops_v6()
+/// The longest the check connection may wait for the decision ([`Check`]); a path whose round
+/// trip asks for longer is refused (`round trip too long`), never decided with a shorter wait.
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+pub const MAX_CHECK_WAIT: Duration = Duration::from_secs(10);
+
+/// The two-connection check's decision ([`confirm_once`]), from the states read of the check
+/// connection (its FIN limited to the probe's hops) and the control connection (its FIN at the
+/// default hop limit), polled with the time since both FINs were sent. Pure: tests drive every
+/// interleaving.
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Check {
+    /// How long the check's FIN must stay unacknowledged at least before far: the window a
+    /// near peer answers in, and one retransmission of the FIN.
+    min_wait: Duration,
+    /// How long the control's FIN may take to be acknowledged.
+    control_wait: Duration,
+    /// When the control's FIN was acknowledged.
+    control_acked: Option<Duration>,
+}
+
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+impl Check {
+    /// The margin past the control's acknowledgement (a delayed ACK, jitter).
+    const MARGIN: Duration = Duration::from_millis(250);
+
+    /// The check for a connection whose round trip is `rtt` and retransmission timeout `rto`;
+    /// a failure when the waits they ask for pass [`MAX_CHECK_WAIT`].
+    pub(crate) fn new(rtt: Duration, rto: Duration) -> Result<Self, ConfirmOutcome> {
+        let window = (rtt * 4 + Self::MARGIN).max(Duration::from_millis(300));
+        let retransmission = rto + rtt * 2 + Self::MARGIN;
+        let min_wait = window.max(retransmission);
+        let control_wait = retransmission.max(Duration::from_millis(500));
+        if min_wait.max(control_wait) > MAX_CHECK_WAIT {
+            return Err(too_slow(rtt, rto));
+        }
+        Ok(Check {
+            min_wait,
+            control_wait,
+            control_acked: None,
+        })
+    }
+
+    /// How long after the FINs the check's may be read as unanswered, once the control's was
+    /// acknowledged at `acked`: [`Self::min_wait`], and the control's time again plus the margin.
+    pub(crate) fn far_after(&self, acked: Duration) -> Duration {
+        self.min_wait.max(acked + acked.max(Self::MARGIN))
+    }
+
+    /// One reading, `now` after the FINs: the check connection's state and the control's (or why
+    /// they could not be read). `Some` when decided.
+    pub(crate) fn step(
+        &mut self,
+        now: Duration,
+        check: io::Result<TcpState>,
+        control: io::Result<TcpState>,
+    ) -> Option<ConfirmOutcome> {
+        let check = match check {
+            Ok(s) => s,
+            Err(e) => return Some(ConfirmOutcome::Failed(e.to_string())),
+        };
+        // Any acknowledgement of the hop-limited FIN, whenever it comes: near.
+        if let Some(done) = fin_step(check) {
+            return Some(done);
+        }
+        if self.control_acked.is_none() {
+            match control.map(fin_step) {
+                Err(e) => return Some(ConfirmOutcome::Failed(e.to_string())),
+                Ok(Some(ConfirmOutcome::Answered)) => self.control_acked = Some(now),
+                Ok(Some(other)) => {
+                    return Some(match other {
+                        ConfirmOutcome::Failed(why) => {
+                            ConfirmOutcome::Failed(format!("{why} (control connection)"))
+                        }
+                        o => o,
+                    })
+                }
+                Ok(None) => {}
+            }
+        }
+        match self.control_acked {
+            Some(acked) => {
+                let far_after = self.far_after(acked);
+                if far_after > MAX_CHECK_WAIT {
+                    return Some(ConfirmOutcome::Failed(format!(
+                        "the peer took {} ms to acknowledge the control's FIN, too long for the \
+                         check to tell how near it is",
+                        acked.as_millis()
+                    )));
+                }
+                (now >= far_after).then(|| match check {
+                    TcpState::FinWait1 => ConfirmOutcome::Unanswered,
+                    // The peer's FIN crossed the check's, which is still unacknowledged: it
+                    // closed on its own.
+                    other => ConfirmOutcome::Failed(peer_closed_first(match other {
+                        TcpState::Closing => TcpState::LastAck,
+                        o => o,
+                    })),
+                })
+            }
+            None => (now >= self.control_wait).then(|| ConfirmOutcome::Failed(UNACKED_FIN.into())),
+        }
     }
 }
 
-/// The check connection's positive control (review round 3, probe-1; Linux too since the Linux
-/// application). Its FIN went unacknowledged within `hops` hops until the deadline, which reads as
-/// far only if the peer acknowledges a FIN at all: a peer that never acknowledges a bare FIN
-/// (every AWS S3 front end tested: `r3-probe/finack-s3.log`) would read as far at any distance.
-/// So the hop limit the connection was made with (`default_hops`) is restored and the FIN's
-/// retransmission (due within the retransmission timeout, `tcpi_rto`) is waited for:
-/// acknowledged now, the peer answers a FIN that reaches it, and the one limited to `hops` did
-/// not: far ([`fin_after_control`]); not acknowledged within the RTO, two round trips (`rtt`)
-/// and 250 ms (clamped to 0.5–4 s), or the peer closed or reset the connection meanwhile: the
-/// check cannot tell, refused ([`fin_after_control_deadline`]). Only an acknowledgement counts:
-/// a reset may come from a timer of the peer's (an S3 front end resets an idle connection),
-/// whatever reached it.
+/// Why a path is too slow for the check ([`Check::new`]).
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+fn too_slow(rtt: Duration, rto: Duration) -> ConfirmOutcome {
+    ConfirmOutcome::Failed(format!(
+        "its round trip ({} ms, retransmission timeout {} ms) is too long for the check to tell \
+         how near it is",
+        rtt.as_millis(),
+        rto.as_millis()
+    ))
+}
+
+/// Reads a connection's [`ConnInfo`] ([`conn_info`]), and remembers a reset (review round 4,
+/// parse-2): on Linux a reset is `TCP_CLOSE` with an error pending, and reading the error
+/// (`SO_ERROR`) clears it, so a later read of the same `TCP_CLOSE` would look like a completed
+/// close (acknowledged). Once a read says [`TcpState::Closed`], every later one does.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn positive_control(
-    sock: &socket2::Socket,
-    addr: SocketAddr,
-    default_hops: u32,
-    rtt: Duration,
-) -> ConfirmOutcome {
-    use std::os::fd::AsRawFd;
-    let restored = if addr.is_ipv4() {
-        sock.set_ttl_v4(default_hops)
-    } else {
-        sock.set_unicast_hops_v6(default_hops)
-    };
-    if let Err(e) = restored {
-        return ConfirmOutcome::Failed(e.to_string());
-    }
-    let rto = match conn_info(sock.as_raw_fd()) {
-        Ok(i) => i.rto,
-        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
-    };
-    let wait = (rto + rtt * 2 + Duration::from_millis(250))
-        .clamp(Duration::from_millis(500), Duration::from_secs(4));
-    let deadline = std::time::Instant::now() + wait;
-    loop {
-        let state = match conn_info(sock.as_raw_fd()) {
-            Ok(i) => i.state,
-            Err(e) => return ConfirmOutcome::Failed(e.to_string()),
-        };
-        if let Some(done) = fin_after_control(state) {
-            return done;
+struct ConnReader {
+    fd: i32,
+    closed: std::cell::Cell<Option<ConnInfo>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl ConnReader {
+    fn new(fd: i32) -> Self {
+        ConnReader {
+            fd,
+            closed: std::cell::Cell::new(None),
         }
-        if std::time::Instant::now() >= deadline {
-            return fin_after_control_deadline(state);
-        }
-        std::thread::sleep(Duration::from_millis(5));
     }
+
+    fn info(&self) -> io::Result<ConnInfo> {
+        sticky_closed(&self.closed, || conn_info(self.fd))
+    }
+}
+
+/// [`ConnReader::info`]'s rule: once `read` says [`TcpState::Closed`], `closed` keeps it.
+#[cfg(any(all(test, unix), target_os = "linux", target_os = "android", target_os = "macos"))]
+fn sticky_closed(
+    closed: &std::cell::Cell<Option<ConnInfo>>,
+    read: impl FnOnce() -> io::Result<ConnInfo>,
+) -> io::Result<ConnInfo> {
+    if let Some(i) = closed.get() {
+        return Ok(i);
+    }
+    let i = read()?;
+    if i.state == TcpState::Closed {
+        closed.set(Some(i));
+    }
+    Ok(i)
 }
 
 /// A TCP connection's state as the check connection reads it, whatever the platform's numbering
@@ -661,51 +780,9 @@ fn fin_step(state: TcpState) -> Option<ConfirmOutcome> {
     }
 }
 
-/// The check connection's state when its deadline passes: still `FIN_WAIT_1` (the FIN
-/// unacknowledged, the peer silent) goes to the positive control; `CLOSING` (the peer closed on
-/// its own while the FIN went unacknowledged) is a failure, never far.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn fin_at_deadline(state: TcpState) -> ConfirmOutcome {
-    match state {
-        TcpState::FinWait1 => ConfirmOutcome::Unanswered,
-        other => ConfirmOutcome::Failed(peer_closed_first(match other {
-            TcpState::Closing => TcpState::LastAck,
-            o => o,
-        })),
-    }
-}
-
-/// What the check connection's state decides once the default hop limit is restored
-/// ([`positive_control`]): the FIN acknowledged (`FIN_WAIT_2`, `TIME_WAIT`) only now is far;
-/// still unacknowledged (`FIN_WAIT_1`, `CLOSING`) decides nothing yet; the peer closed or reset
-/// the connection: a failure.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn fin_after_control(state: TcpState) -> Option<ConfirmOutcome> {
-    match fin_step(state)? {
-        ConfirmOutcome::Answered => Some(ConfirmOutcome::Unanswered),
-        other => Some(other),
-    }
-}
-
-/// The state when the positive control's time is up: a FIN acknowledged at no hop limit (or a
-/// peer that closed on its own meanwhile) cannot tell how near the peer is: a failure, never far.
-/// The message names the cause, so an operator who sees a store refused (an AWS S3 front end
-/// never acknowledges a bare FIN) knows why.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn fin_after_control_deadline(state: TcpState) -> ConfirmOutcome {
-    match state {
-        TcpState::FinWait1 => ConfirmOutcome::Failed(UNACKED_FIN.into()),
-        other => ConfirmOutcome::Failed(peer_closed_first(match other {
-            TcpState::Closing => TcpState::LastAck,
-            o => o,
-        })),
-    }
-}
-
-/// Why a check whose FIN no hop limit got acknowledged fails ([`fin_after_control_deadline`]):
-/// the cause within the 120 characters a refusal shows of it ([`ConfirmOutcome::verdict`]).
-/// Before the Linux application the message ended "…, so the check cannot tell how near it is"
-/// and was cut at 120 characters before naming anything.
+/// Why a check whose control FIN, at the default hop limit, was never acknowledged fails
+/// ([`Check::step`]): the cause within the 120 characters a refusal shows of it
+/// ([`ConfirmOutcome::verdict`]).
 #[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
 const UNACKED_FIN: &str = "the peer acknowledged the check's FIN neither within the hop limit \
                            nor at the default one (AWS S3 never does)";
@@ -757,6 +834,18 @@ fn linux_conn_info(b: &[u8], len: usize, so_error: impl FnOnce() -> i32) -> io::
     })
 }
 
+/// Linux: the pending error `getsockopt(SO_ERROR)` returned `rc` and `e` for: a socket whose
+/// error cannot be read (`rc != 0`) is not known to have closed cleanly, so it reads as an error
+/// (-1), which makes its `TCP_CLOSE` a reset (review round 4, cross-6).
+#[cfg(any(all(test, unix), target_os = "linux", target_os = "android"))]
+fn so_error_read(rc: i32, e: i32) -> i32 {
+    if rc != 0 {
+        -1
+    } else {
+        e
+    }
+}
+
 /// Linux: `getsockopt(TCP_INFO)` on `fd`, read as [`linux_conn_info`] says.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn conn_info(fd: i32) -> io::Result<ConnInfo> {
@@ -790,12 +879,7 @@ fn conn_info(fd: i32) -> io::Result<ConnInfo> {
                 &mut l,
             )
         };
-        // A socket whose error cannot be read is not known to have closed cleanly.
-        if rc != 0 {
-            -1
-        } else {
-            e
-        }
+        so_error_read(rc, e)
     };
     linux_conn_info(&b, len as usize, so_error)
 }
@@ -1198,9 +1282,8 @@ mod tests {
 
     /// probe-1 (macOS since review round 2, Linux since the Linux application): only an
     /// acknowledgement of the check's FIN is an answer. A peer that closed or reset the connection
-    /// on its own is a failure (refused), never near by mistake and never far; a FIN still
-    /// unacknowledged at the deadline goes to the positive control only if the peer stayed silent.
-    /// Both platforms' state numbers read as the same states.
+    /// on its own is a failure (refused), never near by mistake and never far (`Check::step`
+    /// decides the rest). Both platforms' state numbers read as the same states.
     #[test]
     fn the_check_reads_only_an_acknowledged_fin_as_an_answer() {
         use TcpState::*;
@@ -1222,12 +1305,6 @@ mod tests {
             );
             assert!(matches!(o.unwrap().verdict(), Verdict::Failed(_)));
         }
-        assert_eq!(fin_at_deadline(FinWait1), ConfirmOutcome::Unanswered);
-        let o = fin_at_deadline(Closing);
-        assert!(
-            matches!(&o, ConfirmOutcome::Failed(w) if w.contains("closed")),
-            "{o:?}"
-        );
         assert!(matches!(peer_closed_first(CloseWait), w if w.contains("closed")));
         // Linux's <net/tcp_states.h> and macOS's <netinet/tcp_fsm.h>.
         for (linux, macos, state) in [
@@ -1416,52 +1493,139 @@ mod tests {
         }
     }
 
-    /// Review round 3, probe-1 (every platform with a check connection since the Linux
-    /// application): a FIN unacknowledged within the hop limit is far only if the peer
-    /// acknowledges it once the default hop limit is restored (the positive control); a FIN
-    /// acknowledged at no hop limit, and a peer that closes or resets meanwhile, is a failure,
-    /// never far, and the refusal names the cause (S3).
+    /// Review round 4, probe-1: the two-connection check, every interleaving. An
+    /// acknowledgement of the hop-limited FIN is near whenever it comes (before the control's,
+    /// with it, after it, long after the window: the late ACK that read as far before); far only
+    /// once the control's FIN was acknowledged and the check's stayed unacknowledged for
+    /// `far_after`; the control unacknowledged (S3), a peer that closes or resets either
+    /// connection, an unreadable state, a path too slow: failures, never far.
     #[test]
-    fn a_fin_acknowledged_at_no_hop_limit_is_never_far() {
+    fn r4_the_two_connection_check_never_reads_a_late_ack_as_far() {
         use TcpState::*;
-        for acked in [FinWait2, TimeWait] {
-            assert_eq!(fin_after_control(acked), Some(ConfirmOutcome::Unanswered));
-        }
-        assert_eq!(fin_after_control(FinWait1), None);
-        assert_eq!(fin_after_control(Closing), None);
-        for state in [Closed, CloseWait, LastAck, Established] {
-            assert!(
-                matches!(fin_after_control(state), Some(ConfirmOutcome::Failed(_))),
-                "{state:?}"
-            );
-        }
-        for state in [FinWait1, Closing, Closed] {
-            let o = fin_after_control_deadline(state);
-            assert!(matches!(o, ConfirmOutcome::Failed(_)), "{state:?}: {o:?}");
-            assert!(matches!(o.verdict(), Verdict::Failed(_)));
-        }
-        let o = fin_after_control_deadline(FinWait1);
-        assert!(
-            matches!(&o, ConfirmOutcome::Failed(w) if w.contains("neither within the hop limit nor") && w.contains("S3")),
-            "{o:?}"
+        let ms = Duration::from_millis;
+        let ok = |s: TcpState| -> io::Result<TcpState> { Ok(s) };
+        // A 20 ms path, RTO 220 ms: min_wait = max(330, 220 + 40 + 250) = 510 ms.
+        let fresh = || Check::new(ms(20), ms(220)).unwrap();
+        assert_eq!(fresh().min_wait, ms(510));
+        assert_eq!(fresh().control_wait, ms(510));
+        // Drive a sequence of (time, check, control); the first decision.
+        let run = |steps: &[(u64, TcpState, TcpState)]| {
+            let mut c = fresh();
+            for &(t, a, b) in steps {
+                if let Some(o) = c.step(ms(t), ok(a), ok(b)) {
+                    return Some((t, o));
+                }
+            }
+            None
+        };
+        // Far: the control acknowledged at 20 ms, the check never.
+        assert_eq!(
+            run(&[(0, FinWait1, FinWait1), (20, FinWait1, FinWait2), (509, FinWait1, FinWait2), (510, FinWait1, FinWait2)]),
+            Some((510, ConfirmOutcome::Unanswered))
         );
-        // What the operator reads: the refusal names the cause.
-        let Verdict::Failed(why) = o.verdict() else {
-            unreachable!()
-        };
-        let d = crate::Denied::NearHop {
-            addr: "52.216.0.1:443".parse().unwrap(),
-            hops: 2,
-            what: format!("the probe failed: {why}"),
-        };
+        // Near: the check acknowledged before the control, with it, after it, and late (after
+        // the old 1.5 s window, once the control had long answered) — as long as no decision
+        // was made, and the decision waits past the control's time again.
+        for steps in [
+            vec![(10, FinWait2, FinWait1)],
+            vec![(20, FinWait2, FinWait2)],
+            vec![(20, FinWait1, FinWait2), (30, TimeWait, FinWait2)],
+            vec![(20, FinWait1, TimeWait), (400, FinWait2, Closed)],
+        ] {
+            assert_eq!(run(&steps).map(|(_, o)| o), Some(ConfirmOutcome::Answered), "{steps:?}");
+        }
+        // Bufferbloat: the control's ACK comes at 1.6 s (the RTT grew); the check's, as late,
+        // at 1.65 s: near, not far (the old design restored the hop limit at 1.5 s).
+        assert_eq!(
+            run(&[(0, FinWait1, FinWait1), (1600, FinWait1, FinWait2), (1650, FinWait2, FinWait2)]),
+            Some((1650, ConfirmOutcome::Answered))
+        );
+        let mut c = fresh();
+        assert_eq!(c.step(ms(1600), ok(FinWait1), ok(FinWait2)), None);
+        assert_eq!(c.far_after(ms(1600)), ms(3200));
+        assert_eq!(c.step(ms(3199), ok(FinWait1), ok(FinWait1)), None, "the control stays acked");
+        assert_eq!(c.step(ms(3200), ok(FinWait1), ok(Closed)), Some(ConfirmOutcome::Unanswered));
+        // A lost ACK: the check's FIN retransmitted after its RTO (220 ms) is answered at
+        // 245 ms, before min_wait.
+        assert_eq!(
+            run(&[(20, FinWait1, FinWait2), (244, FinWait1, FinWait2), (245, FinWait2, FinWait2)]),
+            Some((245, ConfirmOutcome::Answered))
+        );
+        // The control never acknowledged (S3): a failure at control_wait, never far.
+        let o = run(&[(0, FinWait1, FinWait1), (509, FinWait1, FinWait1), (510, FinWait1, FinWait1)]);
+        assert_eq!(o, Some((510, ConfirmOutcome::Failed(UNACKED_FIN.into()))));
+        // A peer that resets or closes either connection first: a failure.
+        for (a, b) in [(Closed, FinWait1), (LastAck, FinWait1), (CloseWait, FinWait1), (FinWait1, Closed), (FinWait1, LastAck), (Established, FinWait1)] {
+            let o = run(&[(5, a, b)]);
+            assert!(matches!(&o, Some((_, ConfirmOutcome::Failed(_)))), "{a:?} {b:?}: {o:?}");
+        }
+        // The peer's FIN crossed the check's (CLOSING) when the time is up: a failure.
+        let o = run(&[(20, Closing, FinWait2), (510, Closing, FinWait2)]);
+        assert!(matches!(&o, Some((510, ConfirmOutcome::Failed(w))) if w.contains("closed")), "{o:?}");
+        // An unreadable state: a failure.
+        let mut c = fresh();
+        assert!(matches!(c.step(ms(1), Err(io::Error::other("x")), ok(FinWait1)), Some(ConfirmOutcome::Failed(_))));
+        let mut c = fresh();
+        assert!(matches!(c.step(ms(1), ok(FinWait1), Err(io::Error::other("x"))), Some(ConfirmOutcome::Failed(_))));
+        // No cap shorter than the round trip: a 900 ms path waits 3.85 s; one too slow for
+        // MAX_CHECK_WAIT, or a control acknowledged too late, is refused.
+        let slow = Check::new(ms(900), ms(1100)).unwrap();
+        assert_eq!(slow.min_wait, ms(3850));
+        assert!(matches!(Check::new(ms(2600), ms(3000)), Err(ConfirmOutcome::Failed(w)) if w.contains("too long")));
+        let mut c = fresh();
+        assert!(matches!(c.step(ms(5100), ok(FinWait1), ok(FinWait2)), Some(ConfirmOutcome::Failed(w)) if w.contains("too long")));
+        // Every failure is refused, not far.
+        assert!(matches!(
+            ConfirmOutcome::Failed(UNACKED_FIN.into()).verdict(),
+            Verdict::Failed(_)
+        ));
         assert!(UNACKED_FIN.chars().count() <= 120);
-        assert!(d.to_string().contains("(AWS S3 never does)"), "{d}");
+    }
+
+    /// Review round 4, parse-2: a reset read once is a reset for good. On Linux the first read
+    /// of a reset's `TCP_CLOSE` takes its error (`SO_ERROR`, cleared by reading); a second read
+    /// would see `TCP_CLOSE` with no error, a completed close (acknowledged). Every read of the
+    /// check goes through [`sticky_closed`].
+    #[cfg(unix)]
+    #[test]
+    fn r4_a_reset_read_once_stays_a_reset() {
+        let sk_err = std::cell::Cell::new(libc::ECONNRESET);
+        let mut tcp_info = [0u8; 104];
+        tcp_info[0] = 7; // TCP_CLOSE
+        let closed = std::cell::Cell::new(None);
+        let read = || {
+            sticky_closed(&closed, || linux_conn_info(&tcp_info, 104, || sk_err.replace(0)))
+                .unwrap()
+                .state
+        };
+        assert_eq!(read(), TcpState::Closed);
+        assert_eq!(read(), TcpState::Closed, "the second read of the same TCP_CLOSE");
+        // Without it (the reviewers' race): the second read is a completed close.
+        let bare = || linux_conn_info(&tcp_info, 104, || sk_err.replace(0)).unwrap().state;
+        sk_err.set(libc::ECONNRESET);
+        assert_eq!(bare(), TcpState::Closed);
+        assert_eq!(bare(), TcpState::TimeWait);
+        // cross-6: an SO_ERROR that cannot be read is a reset, never a completed close.
+        assert_eq!(so_error_read(-1, 0), -1);
+        assert_eq!(so_error_read(0, 0), 0);
+        assert_eq!(so_error_read(0, libc::ECONNRESET), libc::ECONNRESET);
+        assert_eq!(
+            linux_conn_info(&tcp_info, 104, || so_error_read(-1, 0)).unwrap().state,
+            TcpState::Closed
+        );
+        // And the check, fed the sticky reads, fails; never far, never near.
+        let mut c = Check::new(Duration::from_millis(20), Duration::from_millis(220)).unwrap();
+        assert!(matches!(
+            c.step(Duration::from_millis(30), Ok(read()), Ok(TcpState::FinWait2)),
+            Some(ConfirmOutcome::Failed(w)) if w.contains("reset")
+        ));
     }
 
     /// Review round 3, probe-1, live: AWS S3's front ends never acknowledge a bare FIN, at any
     /// hop limit (`r3-probe/finack-s3.log`), so the check connection read them as far at any
-    /// distance; with the positive control they are a failed check (refused when the probe had no
-    /// answer: the cost, docs/netguard-macos.md). Skipped when S3 cannot be reached, or when it
+    /// distance; with the control connection (review round 4: a second connection, no longer the
+    /// check connection's own hop limit restored) they are a failed check (refused when the probe
+    /// had no answer: the cost, docs/netguard-macos.md). Skipped when S3 cannot be reached, or when it
     /// now acknowledges a bare FIN at the default hop limit.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
@@ -1601,3 +1765,4 @@ mod tests {
         }
     }
 }
+
