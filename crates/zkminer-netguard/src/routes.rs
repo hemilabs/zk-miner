@@ -65,8 +65,13 @@
 //! of any family the host routes, [`RouteTable::local_refuses_everything`] says so, and a
 //! public-mode policy refuses to start with that explanation rather than refuse every fetch.
 //!
-//! Only Linux (and Android) routing tables are read; elsewhere the table is empty and only the
-//! interfaces' own prefixes are known (put further ranges in `[egress] deny_cidrs`).
+//! Linux (and Android) routing tables are read over netlink. **macOS** reads its routing table
+//! and asks the kernel per destination over the BSD routing socket, with the same decisions; it
+//! has no policy-routing rules, and its interface-scoped routes are read as tables no rule sends
+//! this process's connections to (the `routes_macos.rs` module doc says how each part maps).
+//! Elsewhere the table is empty and only the interfaces' own prefixes are known (put further
+//! ranges in `[egress] deny_cidrs`), and every per-destination query fails, so a public-mode
+//! policy refuses every connection.
 
 use std::net::IpAddr;
 
@@ -219,6 +224,8 @@ pub enum RuleMatch {
 }
 
 impl RuleMatch {
+    // Only netlink's rule reader combines selectors; no other platform reads rules.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     fn and(self, other: RuleMatch) -> RuleMatch {
         use RuleMatch::*;
         match (self, other) {
@@ -623,8 +630,9 @@ pub trait RouteOracle: Send + Sync + std::fmt::Debug {
     fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer>;
 }
 
-/// The kernel, asked over netlink per destination (Linux; elsewhere every query fails, and a
-/// policy over gathered facts refuses everything: routes are only read on Linux anyway).
+/// The kernel, asked over netlink per destination (Linux; on macOS over the routing socket, see
+/// `routes_macos.rs`; elsewhere every query fails, and a policy over gathered facts refuses
+/// everything).
 ///
 /// Non-dump `RTM_GETROUTE`s, unprivileged, each with the destination, the destination port when
 /// known (`RTA_DPORT`), this process's uid and TCP, and `RTM_F_LOOKUP_TABLE` (without it an IPv4
@@ -877,7 +885,8 @@ pub fn count_pppoe_sessions(text: &str) -> usize {
         .count()
 }
 
-/// Every network interface, with its kind (Linux; elsewhere none).
+/// Every network interface, with its kind (Linux; macOS from `getifaddrs`, its interface types read
+/// as Linux kinds; elsewhere none).
 pub(crate) fn read_links() -> std::io::Result<Vec<Link>> {
     sys::links()
 }
@@ -2920,7 +2929,12 @@ mod sys {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// macOS: the BSD routing socket and its sysctl (see that module's doc).
+#[cfg(target_os = "macos")]
+#[path = "routes_macos.rs"]
+pub(crate) mod sys;
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 mod sys {
     pub(super) fn dump() -> std::io::Result<(Vec<super::Route>, Vec<super::Rule>)> {
         Ok((Vec::new(), Vec::new()))
