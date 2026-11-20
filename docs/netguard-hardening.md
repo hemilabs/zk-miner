@@ -31,15 +31,19 @@ they can be, so their tests run on every platform.
    missing entry is hashed as missing; when no gateway is known at all, every facts read is an
    uplink of its own (discovery runs again until an entry appears, which its own traffic
    brings), so missing never merges two networks; when some gateway is known the signature stays
-   put (a dual-stack host with an unreachable IPv6 router keeps its IPv4 address confirmed). A
-   neighbour dump that fails fails the facts read.
+   put (a dual-stack host with an unreachable IPv6 router keeps its IPv4 address confirmed).
+   Since review round 4 (cross-2, bypass-3): an entry that goes missing, or first appears, changes
+   nothing, and another known address counts only once it holds for 3 reads and 2 s; a neighbour
+   dump that fails no longer fails the facts read (the addresses are taken as unknown).
 4. **Only an acknowledged FIN answers the check connection.** One `confirm_once` for Linux,
    Android and macOS, deciding from a platform-neutral `TcpState`: `FIN_WAIT_2` / `TIME_WAIT`
    (this side's FIN acknowledged) is near; a peer that closed or reset first is a failed check,
    never near and never far. Linux never shows `TIME_WAIT` on the socket (it hands the
    connection to a timewait mini-socket and the socket reads `TCP_CLOSE`), so `TCP_CLOSE` with
    no pending error (`SO_ERROR` 0) reads as acknowledged-and-closed, with one (`ECONNRESET`,
-   `EPIPE`, …) as reset. Before, Linux read every state but `FIN_WAIT1` as near.
+   `EPIPE`, …) as reset; since review round 4 (parse-2) a reset read once stays a reset for that
+   socket, and an unreadable `SO_ERROR` is a reset. Before, Linux read every state but
+   `FIN_WAIT1` as near.
 5. **IPv4-mapped addresses are unmapped inside the probe and the check connection**, on every
    platform (Windows' probe too).
 6. **Each connection is checked again once made**, before any request byte is written (new on
@@ -49,10 +53,11 @@ they can be, so their tests run on every platform.
    `getsockname`) to be the vetted ones (`connected_as_vetted`, pure) and admits the destination
    again on the facts in force with no cached kernel verdict, so the kernel is asked how it
    routes now. A mismatch is `Denied::PathChanged` (new variant); a refused route is the usual
-   refusal; either way the connection is dropped. The guarded client installs this as a reqwest
-   connector layer, reading the addresses from hyper-util's `HttpInfo`; for `https` the TLS
-   handshake (its ClientHello names the host) runs inside reqwest's connector, before the check.
-   The witness broker's connector checks its sockets the same way before handing them over.
+   refusal; either way the connection is dropped. Since review round 4 (bypass-2, cross-3) each
+   hop's TCP connection is the guard's own (`hop.rs`), bound to the vetted source (the kernel's
+   TCP route answer on Linux), checked, and only then given its TLS handshake and request: no
+   ClientHello reaches an unchecked path. The witness broker's connector checks its sockets the
+   same way before handing them over.
 7. **NAT64 prefixes are learned per network.** The facts compute the uplink signature once per
    read and hand it to public-address discovery and to `nat64::ensure_discovered_on`: a changed
    signature starts a round at once, an IPv6-only host that found nothing asks again every 15 s,
@@ -62,14 +67,16 @@ they can be, so their tests run on every platform.
    the `resolv.conf` files' `nameserver` lines in file order, `/etc/resolv.conf` first), servers
    of an unrouted family are skipped, and the list is cut to 8 only after ordering. Linux also
    reads PREF64 (RFC 8781), below. Before, Linux learned at startup and every 300 s from the
-   first 8 of the sorted list, IPv4 first.
+   first 8 of the sorted list, IPv4 first. Since review round 4 the registry is per uplink and
+   per source, configured prefixes always in force (below).
 8. **A default-like kernel answer must be a default route the facts hold** (family, hop,
-   interface), or it is refused as off the default path, a refusal that rests on the facts (the
+   interface, and since review round 4 the same nexthop object, resolvable), or it is refused as off the default path, a refusal that rests on the facts (the
    policy reads them again at once and judges once more). Before, Linux admitted any default-like
    route of an ordinary table until the next facts read.
 9. **The positive control, and a second probe attempt.** A FIN unacknowledged within the hop
-   limit is far only if the peer acknowledges its retransmission once the default hop limit is
-   restored; otherwise a failed check, refused. The probe is asked twice within its 1.5 s (1 s,
+   limit is far only if the peer acknowledges a FIN at the default hop limit; otherwise a failed
+   check, refused. (Since review round 4, probe-1, the control is a second connection and the
+   check connection keeps its low hop limit; the probe has a third attempt: below.) The probe is asked twice within its 1.5 s (1 s,
    then 0.5 s after a timeout), on every platform, Windows included (where a probe without an
    answer is refused outright, so the second attempt saves refusals). Linux's early "far" from
    an ICMP error for the FIN (`SO_ERROR`) is gone: Linux keeps such an error as a soft error that
@@ -80,20 +87,22 @@ they can be, so their tests run on every platform.
    on a home path about 3% of attempts (each decided anew) are. The refusal now names the cause
    within the 120 characters a refusal shows of it: `the peer acknowledged the check's FIN
    neither within the hop limit nor at the default one (AWS S3 never does)` (the old text was
-   cut before it named anything). Dropping the control is a one-line change in
-   `fin_after_control_deadline` if S3-hosted programs matter more than a near device that never
-   acknowledges a bare FIN and drops the probe's SYN.
+   cut before it named anything). Dropping the control is a one-line change in `Check::step`
+   (the `None` arm) if S3-hosted programs matter more than a near device that never acknowledges
+   a bare FIN and drops the probe's SYN.
 10. **CI.** `.github/workflows/netguard-linux.yml` runs the suite with `ZKMINER_CI_STRICT=1`
-    (`ZKMINER_CI_ALLOW_SKIP="IPv6,[::1]"`: GitHub's runners have no IPv6) and clippy
-    `--all-targets -D warnings`; the macOS half is the diff below.
+    (`ZKMINER_CI_ALLOW_SKIP=ipv6`, a token a skip reason starts with: GitHub's runners have no
+    IPv6) and clippy `--all-targets -D warnings`, and since review round 4 a `callers` job
+    (`zkminer-chain`, the broker's library tests); the macOS half is the diff below.
 
 ### PREF64 on Linux
 
 The kernel hands a router advertisement's "user options" (RDNSS, DNSSL, captive portal, and
 PREF64 since Linux 5.8: `ndisc_is_useropt`) to the `RTNLGRP_ND_USEROPT` netlink group as
 `RTM_NEWNDUSEROPT` messages, and any process may join it (rtnetlink is `NL_CFG_F_NONROOT_RECV`).
-`nat64::pref64` starts a listener thread on the first NAT64 round and learns every PREF64 it
-sees (for the life of the process, as RFC 7050 prefixes are). There is no table to read: only
+`nat64::pref64` starts a listener thread on the first NAT64 round and keeps what each router
+says (since review round 4: per router and interface, at most 5 prefixes each and 16 routers,
+learned only from an IPv6 default gateway on its route's interface, with its lifetime). There is no table to read: only
 advertisements that arrive while it listens are seen (routers repeat them every few minutes), so
 RFC 7050 discovery still runs. And only advertisements the kernel processes arrive: where
 systemd-networkd (its own `IPv6AcceptRA`) or NetworkManager handle router advertisements in
@@ -155,8 +164,11 @@ Rosetta binfmt entry) and to stage conditions (`ip neigh flush`, a veth pair and
 namespace sending a router advertisement). The same suite also ran as **x86_64** Linux binaries
 (`--target x86_64-unknown-linux-gnu`, cross-linked in the VM, executed by Rosetta for Linux; the
 syscalls are the real arm64 kernel's). The VM's network: NAT through this Mac (192.168.64.0/24,
-gateway 192.168.64.1, then the home router), IPv6 only a ULA prefix (no global IPv6), so the
-IPv6 paths that need the internet skip there, as on GitHub's runners. Windows ran nothing: it is
+gateway 192.168.64.1, then the home router); IPv6 a ULA prefix with a default route through the
+Mac, translated (NAT66) to the Mac's own IPv6, so IPv6 reaches the internet from the VM
+(`ping -6 2606:4700:4700::1111` answers) though no global address is on the VM (corrected in
+review round 4, cross-7: this said "no global IPv6, so the IPv6 paths that need the internet
+skip"). Windows ran nothing: it is
 type-checked (`cargo check` and `clippy --all-targets`) with stub C compilers.
 
 | item | Linux / Android | Windows | macOS | verified |
@@ -254,3 +266,54 @@ hunk: `expanded-review.txt`).
   af17e48).
 - **Merge:** `git merge-tree --write-tree item/W11-ON37 HEAD`: clean.
 
+
+## Review round 4
+
+Four reviewers (bypass, parse, probe, cross; material in
+`/Users/user/zkminer/scratch/w11/NGREV/r4-*`) on 46ba1a0. Each finding was reproduced first
+(the reviewers' failing tests rerun on 46ba1a0: `fix-r4/prefix-reviewer-tests.log`; a failing
+test of mine where the reviewers had only a live repro; their live repros rerun in the Linux VM
+after the fix), then fixed on every platform with a test. Logs: `fix-r4/`
+(`/Users/user/zkminer/scratch/w11/NGREV/fix-r4/`).
+
+| # | finding | reproduced | fix | test |
+|---|---|---|---|---|
+| 1 | bypass-1 = parse-1 = cross-1 (high): `publish` sorted configured and learned NSPs together and kept 16, so 16 learned ones (one DNS64 answer, one rogue RA's PREF64 options) pushed the configured NSP out of what `is_global` reads while DoH synthesized with it; a full list never learned the real NSP of a later network. With parse-4 (low): learned NSPs never expired and were synthesized with on every uplink | the reviewers' four tests fail on 46ba1a0 (`prefix-reviewer-tests.log`); live: their hostile DNS64 left the configured NSP out and admitted `<NSP>::10.0.0.1` (`r4-cross/vm-r4-dns64.log`), their rogue RA evicted it (`vm-r4-rogue-ra.log`) | configured NSPs always in force, never truncated; learned ones kept per uplink and per source (a DNS server, a router and interface, the system), capped per source (2 per RFC 7050 answer, 4 per router, 8 system), 32 per uplink, 64 in all, room made from another uplink's least recently seen; a source naming more than its cap, or a prefix that cannot be held, marks the uplink unsettled (`nat64::unheld`), which refuses IPv6 there on any host (`Nat64Unsettled`, logged with the source); RFC 7050 §3: a prefix only where both 192.0.0.170 and .171 sit under it, at most 2 per answer; PREF64 kept per sender (`NDUSEROPT_SRCADDR`, ifindex) and learned only from an IPv6 default gateway on its route's interface, with its lifetime (0 withdraws: not synthesized with, still refused); synthesis (DoH, public-address discovery) only with configured prefixes and those of the uplink in use, still named and within their lifetime | `nat64::r4_tests::*` (configured never crowded out, caps, eviction, synthesis per uplink and lifetime, RFC 7050 validation, the hostile DNS64 over UDP, PREF64 from the gateway alone, the listener's ENOBUFS), `facts::tests::a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends` (unheld refuses on a dual-stack host); live in the VM: `r4_rogue_router_advertisements_never_evict_the_configured_nsp` with `repro/rogue-ra.sh` (`vm-rogue-ra.log`: 5 heard, none learned from a non-gateway; as the gateway 4 learned and the uplink unsettled; the configured NSP in force throughout), the reviewers' hostile DNS64 (`vm-dns64.log`: nothing learned, the configured NSP in force, `<NSP>::10.0.0.1` refused) and a variant answering 16 validated prefixes (`vm-dns64-validated.log`: nothing learned, IPv6 refused as unsettled) |
+| 2 | probe-1 (medium): a late ACK of the hop-limited FIN (after the deadline capped at 1.5 s) landed inside the positive control and read as far | `probe1-before.log` (`fin_after_control(FIN_WAIT_2)` is far) | two connections: the check connection keeps the low hop limit for its whole life; its FIN goes first; a control connection is then made at the default limit and half-closed. Any ACK of the check's FIN is near; far only once the control's FIN was acknowledged and the check's stayed unacknowledged for max(4 RTT + 250 ms, RTO + 2 RTT + 250 ms, control ACK + max(control round trip, 250 ms)); no cap below the round trip: waits past 10 s are refused (`MAX_CHECK_WAIT`). Linux and macOS | `nearhop::tests::r4_the_two_connection_check_never_reads_a_late_ack_as_far` (every interleaving: ACK before, with, after the control's, after the old window, bufferbloat at 1.6 s, a lost ACK answered after the RTO, S3, resets and closes on either connection, unreadable states, too slow), the live check-connection tests on macOS and in the VM |
+| 3 | parse-2 (medium): on Linux the control's RTO read consumed a reset's `SO_ERROR`, after which `TCP_CLOSE` read as an acknowledged close | the reviewers' `r4_a_reset_read_for_its_rto_then_reads_as_far` fails on 46ba1a0 | every state read of both connections goes through `ConnReader`, which keeps a `Closed` (a reset) for good; an unreadable `SO_ERROR` is a reset (`so_error_read`) | `r4_a_reset_read_once_stays_a_reset` |
+| 4 | cross-2 (medium, a regression against pr/37) + bypass-3 (low): a flushed, `FAILED` or flapping neighbour entry changed the Linux uplink signature: ~1.5 s refusals of all public IPv4 with the `public_addresses` advice | the reviewers' live `ip neigh flush` (`r4-cross/vm-r4-batch2.log` NF: two refusals in 20 s) | `MacHistory`: per routing signature the known link-layer address of each default gateway; missing keeps it; first seen changes nothing; another address counts only after 3 reads in a row and 2 s (an epoch in the signature); with none ever known every read is its own uplink (never merging); a neighbour dump that fails (denied, unsupported, interrupted) is taken as no entry, warned once, and does not fail the facts read; a refusal while the address is learned again is `Denied::PublicAddressRelearning`, saying so (also in the re-read warning and `guard_warnings`) | `facts::tests::two_networks_behind_the_same_router_address_are_two_uplinks_on_linux` (rewritten: flush, FAILED, first seen, flapping, debounce, an unreadable table, `next_read`), `policy::tests::r4_a_public_address_being_learned_again_says_so`, `public::tests::confirmations_expire_and_belong_to_their_uplink`; live: the reviewers' NF rerun (`vm-batch2.log`: no refusal in 20 s with both flushes) |
+| 5 | bypass-2 (low): for `https` the ClientHello (SNI) went out before the post-connect re-check; a refusal surfaced as an HTTP error | the reviewers' `r4_bypass_clienthello_precedes_the_recheck` passes on 46ba1a0 (the ClientHello arrives) | each hop's own connector (`hop.rs`): a tokio TCP connection to a pinned address, checked (`recheck_connected`), then tokio-rustls (ring, web roots, ALPN http/1.1), then one hyper HTTP/1.1 exchange; the response is a `reqwest::Response` (its URL set; the body bounded by the read timeout per read and the request's deadline); a refusal is `FetchError::Denied`, a transport failure the new `FetchError::Connection`. The lock gains no package | `client::tests::r4_nothing_is_written_on_a_connection_the_check_refuses` (no byte reaches the listener), every guarded fetch in the suites, `zkminer-chain`'s real downloads (macOS, and x86_64 Linux under Rosetta) |
+| 6 | cross-3 (low): the expected source came from a UDP socket, so `ip rule ipproto udp lookup 100` made every fetch `PathChanged`; parse suspicion: the re-check's route query lacked `RTA_SRC` | the reviewers' live repro (`r4-cross/vm-r4-udp-rule.log`) | the vetted source is the kernel's TCP route answer (`RouteOracle::source_for`: Linux `RTA_PREFSRC`; the UDP socket elsewhere), the hop's socket (and the broker connector's) is bound to it, and the re-check asks the kernel how it routes a connection from the socket's own source (`RouteOracle::route_from`: Linux `RTA_SRC`; only for the address judged, not a test's loopback stand-in) | `client::tests::r4_the_vetted_source_is_the_tcp_routes_and_the_recheck_asks_from_it`; live: the reviewers' repro rerun (`vm-udp-rule.log`: source 192.168.64.3, re-check passes, the fetch answered) |
+| 7 | cross-4 (low): `default_path_known` with nexthop objects (`nexthop_compat_mode` 0: no gateway, no interface) held any default-like route through any object | the reviewers' live N0 (`r4-cross/vm-r4-batch2.log`: the `0/1 nhid 30` via the LAN box passed the route checks) | the answer's route must name the same nexthop object as a default route of the facts, and that object must resolve in the facts' nexthop dump (now kept in `HostFacts`) | `facts::tests::r4_a_nexthop_object_default_is_held_only_through_the_same_object`; live: the reviewers' N0 and N1 rerun (`vm-batch2.log`: both refused as off the default path), H0-H3 (`vm-rules.log`: the defaults through objects admitted, a host route through one refused) |
+| 8 | cross-5 (low): `Verdict::Failed`/`Undecided` refused as `NearHop`, "on its own network" | by reading | `Denied::NearCheckFailed { addr, hops, why }`: "could not tell how near X is (whether it is within N hops of this host): why"; `NearHop` only for near answers | `floor_tests::r4_a_failed_near_check_is_not_called_near` |
+| 9 | parse-3 (low): DoH synthesis called `policy.facts()` on a runtime worker | `parse3-before.log` (3 s with a staged slow re-read) | `NetPolicy::facts_in_force` (no re-read) | `doh::tests::r4_synthesis_never_rereads_the_facts_on_a_worker` (`parse3-after.log`) |
+| 10 | probe-2 (low): up to 8 probes at once through the same first hops, whose ICMP rate limit then dropped answers; S3 refused intermittently | `probe2-before.log` (every address of a name probed) | a third probe attempt after a 1 s pause (1 s, 0.5 s, pause, 1 s); at most 2 probes in flight in the process (`ProbeGate`); a name's addresses vetted one after another, in answer order, until one of each family is admitted. The control stays (the owner has not decided on S3) | `client::tests::r4_only_the_addresses_needed_are_probed`, `nearhop::tests::a_probe_that_timed_out_is_asked_again`, `probes_take_turns` |
+| 11 | cross-6 (low): 7 mutants survived; no test reached the broker connector's re-check | the reviewers' VM mutation logs | tests for each: `nl_pid` (`pref64_from`, in `pref64_options_of_router_advertisements_are_read`), ENOBUFS (`r4_the_pref64_listener_survives_enobufs`, a seam), `SO_ERROR` rc != 0 (`r4_a_reset_read_once_stays_a_reset`), `next_read` (in the signature test), the peer match with two vetted addresses (`r4_a_connection_is_checked_against_its_own_vetted_address`), the missing `HttpInfo` (the layer is gone: the hop reads `getsockname`/`getpeername` itself), the PREF64 cap (`r4_pref64_is_learned_from_the_default_gateway_alone`); the broker: `connector::server::tests::a_connection_is_checked_again_once_made` (a real peer, 1.1.1.1:443, a staged route gone once connected: closed, not handed over) | as named |
+| 12 | cross-7 (info): the workflow had no timeout, ran only the netguard crate, and `ZKMINER_CI_ALLOW_SKIP` matched substrings; the docs said the VM had no global IPv6; probe suspicion: the broker's abandoned `vet_path` threads ran on | by reading; the VM reaches IPv6 (`ping -6`) | `timeout-minutes`; a `callers` job (x86_64: `zkminer-chain`, the broker's library tests); skips allowed by an explicit token (`[ipv6] …`, `ZKMINER_CI_ALLOW_SKIP=ipv6`); the VM's IPv6 described (NAT66 through the Mac); the broker's floor checks take one of 4 turns (`MAX_CHECKS_AT_ONCE`), held by the blocking work until it ends | `tests::strict_ci_fails_skips_it_does_not_allow`; `actionlint` (with shellcheck) clean (`actionlint.log`) |
+
+**Found while fixing.** Two of my own: the control connection made before the check's FIN let a
+near peer whose accept queue was full hold the control's SYN and fail the check (`681ecae`: the
+check's FIN now goes first and an acknowledgement of it is near at once); and the re-check's
+`RTA_SRC` query failed (EINVAL) for `zkminer-chain`'s loopback stand-ins (`3300ed3`). The
+reviewers' D case (`ip rule ipproto udp`) in `vm-rules.log` refused 1.1.1.1 once as "public IPv4
+address is not known" (the DNS reflectors' UDP went to the LAN box); `vm-udp-rule.log`, the
+same setup alone, admitted it: public-address discovery's timing under that rule, unchanged
+code, fails closed.
+
+**Linux code paths never executed** (type-checked and unit-tested): a real IPv6-only host
+(`Nat64Unsettled` from a real facts read, a real DNS64); a PREF64 from a router that is the real
+uplink's default gateway (the gateway case ran with the gateway list staged); a real move between
+two networks behind the same router address (`MacHistory` is pure); a neighbour dump that the
+kernel denies (the fallback's glue is tested with a staged error); Android at all (checked with
+stub compilers).
+
+**Open for the owner.** S3: the control connection still refuses a peer that never acknowledges
+a bare FIN, on a path whose first hops send no ICMP (unchanged decision). The third probe attempt
+and the gate add latency to a probe without an answer (worst case 3.5 s before the check
+connection, from 1.5 s), and a name's addresses are probed one after another (one per family
+pinned, so a connection that fails on the first IPv4 address no longer falls back to the next
+one). A network that names more NAT64 prefixes than the caps refuses IPv6 on any host, a dual-
+stack one included (fail closed: a hostile DHCP server or router can make a dual-stack host
+IPv4-only). The `callers` CI job does not run the broker's integration tests (they need anvil
+and the sandboxed binary; `held_lock_fetches_pass_a_flood_of_simulations` fails under Rosetta at
+af17e48 as at HEAD).
