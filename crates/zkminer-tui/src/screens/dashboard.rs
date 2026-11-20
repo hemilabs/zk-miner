@@ -345,6 +345,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         Cell::from("VRAM").style(theme::table_header()),
         Cell::from("Temp").style(theme::table_header()),
         Cell::from("Power").style(theme::table_header()),
+        Cell::from("zkVM").style(theme::table_header()),
         Cell::from("Job").style(theme::table_header()),
         Cell::from("Progress").style(theme::table_header()),
     ]);
@@ -357,7 +358,8 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         .collect();
 
     let widths = [
-        Constraint::Min(16),
+        // As wide as the longest name here, not a share of the spare width: Progress gets that.
+        Constraint::Length(name_column_width(&hw.gpus)),
         Constraint::Length(9),
         Constraint::Length(5),
         Constraint::Length(8),
@@ -365,6 +367,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         Constraint::Length(12),
         Constraint::Length(10),
         Constraint::Length(10),
+        Constraint::Length(9),
         Constraint::Length(12),
         Constraint::Min(18),
     ];
@@ -401,6 +404,31 @@ fn temp_cell(gpu: &GpuInfo) -> Line<'static> {
 }
 
 /// After a card's name, why it is clocking itself down (`▼ THERMAL,PL1`); nothing when it is not.
+/// The vendor tag `gpu_row` starts a card's name with.
+fn vendor_tag(vendor: &GpuVendor) -> &'static str {
+    match vendor {
+        GpuVendor::Amd => "  AMD ",
+        GpuVendor::Nvidia => " NVDA ",
+        GpuVendor::Intel => " INTC ",
+        GpuVendor::Unknown => " GPU ",
+    }
+}
+
+/// The Name column's width: the widest of its cells (vendor tag, the card's short name, any
+/// throttle marker), no narrower than its header and no wider than 32.
+fn name_column_width(gpus: &[GpuInfo]) -> u16 {
+    gpus.iter()
+        .map(|gpu| {
+            vendor_tag(&gpu.vendor).chars().count()
+                + 1
+                + crate::state::short_gpu_name(&gpu.name).chars().count()
+                + throttle_marker(&gpu.throttle_reasons).chars().count()
+        })
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 32) as u16
+}
+
 fn throttle_marker(reasons: &[String]) -> String {
     if reasons.is_empty() {
         String::new()
@@ -459,11 +487,11 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     };
     let pwr_color = theme::usage_color(pwr_pct);
 
-    let (vendor_tag, vendor_bg) = match gpu.vendor {
-        GpuVendor::Amd => ("  AMD ", theme::amd_red()),
-        GpuVendor::Nvidia => (" NVDA ", theme::nvidia_green()),
-        GpuVendor::Intel => (" INTC ", theme::intel_blue()),
-        GpuVendor::Unknown => (" GPU ", theme::overlay()),
+    let vendor_bg = match gpu.vendor {
+        GpuVendor::Amd => theme::amd_red(),
+        GpuVendor::Nvidia => theme::nvidia_green(),
+        GpuVendor::Intel => theme::intel_blue(),
+        GpuVendor::Unknown => theme::overlay(),
     };
 
     // This card's score: its SP1 and RISC Zero results blended (`benchmark::gpu_zkops`).
@@ -486,6 +514,8 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
 
     let gpu_job = card_job(&state.active_jobs, &gpu.pci_bus_id);
     let spill = state.gpu_spills.get(&gpu.pci_bus_id).copied();
+    // The zkVM of the job on the card: what it is proving with, or about to.
+    let zkvm_str = gpu_job.map_or("—", |job| crate::state::zkvm_label(&job.prover_backend));
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -538,13 +568,16 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     Row::new(vec![
         Cell::from(Line::from(vec![
             Span::styled(
-                vendor_tag,
+                vendor_tag(&gpu.vendor),
                 Style::default()
                     .fg(theme::base())
                     .bg(vendor_bg)
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
-            Span::styled(format!(" {}", gpu.name), theme::bold()),
+            Span::styled(
+                format!(" {}", crate::state::short_gpu_name(&gpu.name)),
+                theme::bold(),
+            ),
             Span::styled(throttle_marker(&gpu.throttle_reasons), theme::warning()),
         ])),
         Cell::from(zkops_str).style(theme::metric()),
@@ -564,6 +597,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
             gpu.power_watts, gpu.power_cap_watts
         ))
         .style(Style::default().fg(pwr_color)),
+        Cell::from(zkvm_str),
         Cell::from(job_str).style(theme::identifier()),
         Cell::from(progress_str).style(progress_style),
     ])
@@ -1277,6 +1311,76 @@ mod card_job_tests {
         // Another card's job, or one not yet on any card, is never shown.
         assert!(card_job(&jobs[4..], card).is_none());
         assert!(card_job(&jobs, "").is_none());
+    }
+
+    /// The GPU table names the zkVM of the job on each card (an idle card shows "—"), and the
+    /// Name column is as wide as the vendor tag and the card's short name, no wider.
+    #[test]
+    fn the_table_shows_each_cards_zkvm_and_a_short_name() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let card = |bus: &str, name: &str| crate::hardware::GpuInfo {
+            index: 0,
+            name: name.into(),
+            vendor: GpuVendor::Nvidia,
+            pci_id: String::new(),
+            pci_bus_id: bus.into(),
+            gpu_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            gpu_usage_percent: 0,
+            mem_usage_percent: 0,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            temp_edge_c: None,
+            temp_junction_c: None,
+            temp_mem_c: None,
+            fan_rpm: 0,
+            fan_max_rpm: 0,
+            power_watts: 0.0,
+            power_cap_watts: 0.0,
+            voltage_mv: 0,
+            pcie_speed: String::new(),
+            pcie_width: 0,
+            vbios: String::new(),
+            throttle_reasons: Vec::new(),
+        };
+        let mut state = MinerState::default();
+        state.hardware.gpus = vec![
+            card("0000:01:00.0", "NVIDIA GeForce RTX 5090"),
+            card("0000:03:00.0", "NVIDIA GeForce RTX 4070"),
+        ];
+        // " NVDA " + " " + "RTX 5090".
+        assert_eq!(name_column_width(&state.hardware.gpus), 15);
+        let mut sp1 = job(
+            1,
+            Some("0000:01:00.0"),
+            MinerJobStatus::Proving {
+                progress: 0.4,
+                elapsed_secs: 30,
+            },
+        );
+        sp1.prover_backend = "sp1".into();
+        state.active_jobs = vec![sp1];
+        let mut term = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        term.draw(|f| render(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let row = |name: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}: {lines:#?}"))
+                .clone()
+        };
+        assert!(lines.iter().any(|l| l.contains("zkVM")), "{lines:#?}");
+        assert!(!row("RTX 5090").contains("GeForce"));
+        assert!(row("RTX 5090").contains("SP1"));
+        assert!(row("RTX 4070").contains("—"));
     }
 
     /// A card whose proof Windows is paging off it to make room for another program's memory says
