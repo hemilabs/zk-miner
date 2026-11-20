@@ -140,6 +140,21 @@ pub struct ProgramIdDerivation {
 /// (see `WorkerPool::prove_min_vram`).
 pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
 
+/// The cards a job may run on and the order to try them in, as the claim gate planned it (see
+/// `WorkerPool::prove_min_vram`). Both lists hold benchmark device ids (e.g. `gpu0`, `gpu-rocm1`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobCards<'a> {
+    /// The cards this job may run on; empty: any. A HARD filter, like `disabled` and the job's sizes,
+    /// applied before every preference and never restored: the claim gate admitted the job only on
+    /// the cards it could finish on in time, and sized its watchdog on the slowest of them, so a card
+    /// outside it would be killed by the watchdog or miss the deadline.
+    pub eligible: &'a [String],
+    /// The cards to try first, in this order (the claim gate's: the card the job was planned for,
+    /// then the rest of `eligible`, fastest first). A preference: a busy or down card yields to the
+    /// next, and any candidate not in it follows in the usual warm-first order.
+    pub order: &'a [String],
+}
+
 /// A witness proof's execution that did not reproduce its bundle (`WorkerResponse::JournalDiverged`,
 /// plan §15.3): it did not halt with exit code 0, or its journal is not the bundle's. Nothing was
 /// proven. Built only from the worker's typed response, never from text.
@@ -4647,7 +4662,7 @@ impl WorkerPool {
             None,
             None,
             None, // program_id: convenience path (tests/benchmark) has no on-chain binding
-            None, // preferred_device: convenience path does not reserve a card
+            JobCards::default(), // any card: the convenience path does not plan one
             0,    // execute_peak_bytes: convenience path has no pre-claim measurement
         )
     }
@@ -5393,12 +5408,9 @@ impl WorkerPool {
         job_po2: Option<SlotPo2<'_>>,
         // The job's on-chain programId (risc0 image-id binding; see WorkerCommand::Prove).
         program_id: Option<[u8; 32]>,
-        // Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time.
-        // Tried FIRST when dispatchable, as a PREFERENCE only: if it is not in the candidate set or is
-        // busy/down, dispatch falls through to the usual warm-first / first-free ordering, so a job is
-        // never stranded waiting for a reserved card. Feasibility is sized for the SLOWEST eligible
-        // card, so any fallback landing still meets the deadline.
-        preferred_device: Option<&str>,
+        // The cards this job may run on, and the order to try them in: see `JobCards`. The default (no
+        // cards named) leaves every card eligible, in the usual warm-first order.
+        cards: JobCards<'_>,
         // This job's pre-claim measured execute PEAK host RSS (bytes), 0 = unknown. Forwarded verbatim
         // to `prove_on_slot`, which charges the SP1 execute spike to the host ledger (finding RH2).
         execute_peak_bytes: u64,
@@ -5417,7 +5429,7 @@ impl WorkerPool {
             abort_at,
             job_po2,
             program_id,
-            preferred_device,
+            cards,
             execute_peak_bytes,
         )? {
             SlotProof::Proved(proof) => Ok(proof),
@@ -5454,7 +5466,7 @@ impl WorkerPool {
         abort_at: Option<Instant>,
         job_po2: Option<SlotPo2<'_>>,
         program_id: Option<[u8; 32]>,
-        preferred_device: Option<&str>,
+        cards: JobCards<'_>,
         execute_peak_bytes: u64,
     ) -> Result<WitnessProveOutcome> {
         Ok(
@@ -5472,7 +5484,7 @@ impl WorkerPool {
                 abort_at,
                 job_po2,
                 program_id,
-                preferred_device,
+                cards,
                 execute_peak_bytes,
             )? {
                 SlotProof::Proved(proof) => WitnessProveOutcome::Proved(proof),
@@ -5499,7 +5511,7 @@ impl WorkerPool {
         abort_at: Option<Instant>,
         job_po2: Option<SlotPo2<'_>>,
         program_id: Option<[u8; 32]>,
-        preferred_device: Option<&str>,
+        cards: JobCards<'_>,
         execute_peak_bytes: u64,
     ) -> Result<SlotProof> {
         let mut all_keys = self.keys_for_prefix(backend);
@@ -5523,6 +5535,17 @@ impl WorkerPool {
                 bail!(
                     "no {backend} card proves at a segment size this job was measured at, so it \
                      cannot be proved here"
+                );
+            }
+        }
+        // The third: only the cards the claim gate admitted this job on. See `JobCards::eligible`.
+        if !cards.eligible.is_empty() {
+            all_keys.retain(|k| cards.eligible.contains(&Self::benchmark_device_id(k)));
+            if all_keys.is_empty() {
+                bail!(
+                    "none of the cards this job was admitted on ({}) has a usable {backend} worker, \
+                     and no other card can prove it in time",
+                    cards.eligible.join(", ")
                 );
             }
         }
@@ -5640,11 +5663,11 @@ impl WorkerPool {
             rotated
         };
 
-        // Honor a claim-time device preference (see `preferred_device`): move its slot key, if present
-        // in the candidate set, to the FRONT so the dispatch loop (and the poll-wait loop, which
-        // reuses this ordering) tries it first. Pure preference — everything else keeps its warm-first
-        // order, and a preferred card that is busy/down simply yields to the next candidate.
-        let keys = Self::prefer_device_first(keys, preferred_device);
+        // Honor the claim-time order (see `JobCards::order`): its cards first, in its order, so the
+        // dispatch loop (and the poll-wait loop, which reuses this ordering) tries the planned card,
+        // then the fastest free one. Pure preference — everything else keeps its warm-first order,
+        // and a card that is busy/down simply yields to the next candidate.
+        let keys = Self::order_by_cards(keys, cards.order);
 
         for key in &keys {
             if let Some(entry) = self.workers.get(key) {
@@ -5770,27 +5793,26 @@ impl WorkerPool {
         }
     }
 
-    /// Reorder slot keys so the key whose benchmark device id equals `preferred` (e.g. "gpu1") comes
-    /// FIRST, preserving the relative order of the rest. A PREFERENCE only: a `preferred` that is
-    /// `None` or matches no key leaves the order unchanged, and a matched-but-busy/down card simply
-    /// yields to the next candidate in the dispatch/poll loops — a job is never stranded on it.
+    /// Reorder slot keys so those whose benchmark device id is in `order` come first, in `order`'s order,
+    /// keeping the relative order of the rest (the caller's warm-first rotation). A PREFERENCE only: an
+    /// empty `order`, or one naming no key, leaves the order unchanged, and a busy/down card simply
+    /// yields to the next candidate in the dispatch/poll loops, so a job is never stranded on it.
     ///
-    /// Note: this takes precedence over the warm-slot-first ordering applied by the caller, so a COLD
-    /// preferred card is tried ahead of a warm one. Under host-memory pressure that cold card may take
-    /// a host-RAM backoff (resident pages make a warm slot cheaper to admit) before its proof starts;
-    /// the caller'"'"'s retry loop handles that. The admission estimate is sized for the slowest eligible
-    /// card regardless, so preferring any particular card never risks the deadline.
-    fn prefer_device_first(keys: Vec<String>, preferred: Option<&str>) -> Vec<String> {
-        match preferred {
-            Some(pref) => {
-                let (mut preferred, rest): (Vec<String>, Vec<String>) = keys
-                    .into_iter()
-                    .partition(|k| Self::benchmark_device_id(k) == pref);
-                preferred.extend(rest);
-                preferred
-            }
-            None => keys,
+    /// This takes precedence over the warm-slot-first ordering, so a COLD planned card is tried ahead
+    /// of a warm one. Under host-memory pressure that cold card may take a host-RAM backoff before its
+    /// proof starts; the caller's retry loop then takes that card out of the order, so the job's other
+    /// cards are tried first and it follows them (it stays eligible). Every card in the order was
+    /// admitted on its own rate, so trying any of them first never risks the deadline.
+    fn order_by_cards(mut keys: Vec<String>, order: &[String]) -> Vec<String> {
+        if order.is_empty() {
+            return keys;
         }
+        let rank = |k: &String| {
+            let id = Self::benchmark_device_id(k);
+            order.iter().position(|d| *d == id).unwrap_or(order.len())
+        };
+        keys.sort_by_key(|k| rank(k));
+        keys
     }
 
     /// Benchmark-facing device id for a slot key: `"risc0:cuda:1"` -> `"gpu1"`,
@@ -5800,7 +5822,7 @@ impl WorkerPool {
     /// `benchmark::build_gpu_device_benchmarks_from_workers` (`format!("gpu{idx}")`)
     /// and the CPU rows (`"cpu"`), otherwise a card's calibration row and Settings size silently miss
     /// and its risc0 job size quietly falls back to the VRAM rule (`benchmark::risc0_job_po2`).
-    fn benchmark_device_id(key: &str) -> String {
+    pub fn benchmark_device_id(key: &str) -> String {
         let mut parts = key.split(':');
         let _backend = parts.next();
         match (parts.next(), parts.next()) {
@@ -9059,22 +9081,76 @@ mod tests {
     }
 
     #[test]
-    fn prefer_device_first_moves_matching_key_to_front() {
+    fn the_claim_time_order_comes_first() {
         use super::WorkerPool;
-        let keys = vec![
-            "risc0:cuda:0".to_string(),
-            "risc0:cuda:1".to_string(),
-            "risc0:cuda:2".to_string(),
-        ];
-        // "gpu1" -> risc0:cuda:1 is moved first; the rest keep their relative order.
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let keys = strings(&[
+            "risc0:cuda:0",
+            "risc0:intel:0",
+            "risc0:rocm:0",
+            "risc0:rocm:1",
+        ]);
+        let ordered = |ids: &[&str]| WorkerPool::order_by_cards(keys.clone(), &strings(ids));
+        // The planned card, then the rest fastest first; a card not named keeps its place behind.
         assert_eq!(
-            WorkerPool::prefer_device_first(keys.clone(), Some("gpu1")),
-            vec!["risc0:cuda:1", "risc0:cuda:0", "risc0:cuda:2"]
+            ordered(&["gpu0", "gpu-rocm1", "gpu-rocm0"]),
+            [
+                "risc0:cuda:0",
+                "risc0:rocm:1",
+                "risc0:rocm:0",
+                "risc0:intel:0"
+            ]
         );
-        // A preference that matches nothing, or None, leaves the order unchanged (graceful fallback).
-        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), Some("gpu9")), keys);
-        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), None), keys);
+        // The A770 last, the 7900 XTX first: a slow card is tried only after every faster one.
+        assert_eq!(
+            ordered(&["gpu-rocm1", "gpu0", "gpu-intel0"]),
+            [
+                "risc0:rocm:1",
+                "risc0:cuda:0",
+                "risc0:intel:0",
+                "risc0:rocm:0"
+            ]
+        );
+        // An order that matches nothing, or none, leaves the warm-first order unchanged.
+        assert_eq!(ordered(&["gpu9"]), keys);
+        assert_eq!(ordered(&[]), keys);
     }
+
+    /// A job admitted only on cards with no worker is refused, never sent to another card.
+    #[test]
+    fn a_job_is_never_dispatched_outside_the_cards_it_was_admitted_on() {
+        let pool = pool_with_keys(&["risc0:cuda:0", "risc0:intel:0"]);
+        let mut used = None;
+        let eligible = vec!["gpu-rocm1".to_string()];
+        let err = pool
+            .prove_min_vram(
+                "risc0",
+                &[],
+                &[],
+                Some(20),
+                Some(Duration::from_secs(1)),
+                None,
+                None,
+                &[],
+                &[],
+                &mut used,
+                None,
+                None,
+                None,
+                JobCards {
+                    eligible: &eligible,
+                    order: &eligible,
+                },
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("none of the cards this job was admitted on (gpu-rocm1)"),
+            "{err:#}"
+        );
+        assert_eq!(used, None);
+    }
+
     use super::*;
 
     // ---- slot_key tests ----
@@ -9243,7 +9319,7 @@ mod tests {
                 None,
                 Some(&none),
                 None,
-                None,
+                JobCards::default(),
                 0,
             )
             .unwrap_err();
@@ -9291,7 +9367,7 @@ mod tests {
                 None,
                 Some(&only_one),
                 None,
-                None,
+                JobCards::default(),
                 0,
             );
             if attempt == 0 {

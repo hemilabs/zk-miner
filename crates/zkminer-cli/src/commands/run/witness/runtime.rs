@@ -2762,7 +2762,7 @@ impl WitnessRuntime {
                     abort_at,
                     Some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
                     Some(program_id),
-                    None,
+                    zkminer_prover::dispatcher::JobCards::default(),
                     0,
                 );
                 (r, used)

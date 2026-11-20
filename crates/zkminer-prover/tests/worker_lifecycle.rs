@@ -877,7 +877,7 @@ fn the_segment_size_reaches_the_worker() {
             None,
             Some(&size_on),
             None,
-            None,
+            zkminer_prover::dispatcher::JobCards::default(),
             0,
         )
         .expect("proof should succeed");
