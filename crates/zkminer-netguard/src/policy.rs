@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::facts::{EgressPath, FactsOptions, HostFacts};
 use crate::host::HostDenied;
@@ -1115,6 +1115,13 @@ impl NetPolicy {
     /// connection's hop-limited FIN — or the probe fails. Blocking (up to the probe's timeout, plus
     /// a check connection when it had no answer): call it off an async runtime's worker threads.
     pub fn vet_connection(&self, addr: SocketAddr) -> Result<(), Denied> {
+        self.vet_connection_until(addr, Instant::now() + crate::nearhop::DECIDE_BUDGET)
+    }
+
+    /// [`Self::vet_connection`], given up on at `deadline` (refused: review round 5, probe-1): a
+    /// caller that stops waiting passes its own, so the probe and check connection it abandons
+    /// stop too ([`crate::nearhop::decide_until`]).
+    pub fn vet_connection_until(&self, addr: SocketAddr, deadline: Instant) -> Result<(), Denied> {
         if self.mode == NetMode::DevPrivate {
             return Ok(());
         }
@@ -1127,7 +1134,7 @@ impl NetPolicy {
             IpAddr::V4(_) => addr,
         };
         let hops = self.near_hop_limit();
-        match crate::nearhop::decide(&*self.probe, target, hops) {
+        match crate::nearhop::decide_until(&*self.probe, target, hops, deadline) {
             Verdict::Far => Ok(()),
             Verdict::Near(how) => Err(Denied::NearHop {
                 addr,
@@ -1150,7 +1157,17 @@ impl NetPolicy {
     /// before the real connection. [`Self::recheck_connected`] checks the connection against it.
     /// Blocking, like [`Self::vet_connection`].
     pub fn vet_path(&self, addr: SocketAddr, connect: SocketAddr) -> Result<Vetted, Denied> {
-        self.vet_connection(addr)?;
+        self.vet_path_until(addr, connect, Instant::now() + crate::nearhop::DECIDE_BUDGET)
+    }
+
+    /// [`Self::vet_path`], given up on at `deadline` ([`Self::vet_connection_until`]).
+    pub fn vet_path_until(
+        &self,
+        addr: SocketAddr,
+        connect: SocketAddr,
+        deadline: Instant,
+    ) -> Result<Vetted, Denied> {
+        self.vet_connection_until(addr, deadline)?;
         let connect = unmapped(connect);
         if self.mode == NetMode::DevPrivate {
             return Ok(Vetted {

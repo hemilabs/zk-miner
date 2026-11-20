@@ -209,6 +209,7 @@ impl GuardedClient {
     async fn pin(
         &self,
         url: &url::Url,
+        deadline: Instant,
     ) -> Result<(Option<String>, Vec<SocketAddr>, RecheckLayer), FetchError> {
         let port = url
             .port_or_known_default()
@@ -240,7 +241,11 @@ impl GuardedClient {
             let policy = self.policy().clone();
             let addr = SocketAddr::new(*ip, port);
             let connect = SocketAddr::new(self.resolver.connect_ip(*ip), port);
-            match tokio::task::spawn_blocking(move || policy.vet_path(addr, connect)).await {
+            // Within the request's time (review round 5, probe-1): when the caller stops
+            // waiting, the probe it abandons stops too and gives back its turn.
+            match tokio::task::spawn_blocking(move || policy.vet_path_until(addr, connect, deadline))
+                .await
+            {
                 Ok(Ok(v)) => {
                     pinned.push(v.connect);
                     vetted.push(v);
@@ -303,7 +308,7 @@ impl GuardedClient {
             if remaining.is_zero() {
                 return Err(FetchError::TimedOut);
             }
-            let (_name, pinned, recheck) = tokio::time::timeout(remaining, self.pin(&url))
+            let (_name, pinned, recheck) = tokio::time::timeout(remaining, self.pin(&url, deadline))
                 .await
                 .map_err(|_| FetchError::TimedOut)??;
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -393,7 +398,7 @@ impl GuardedClient {
     pub async fn post_json(&self, raw: &str, body: Vec<u8>, budget: Duration) -> Result<reqwest::Response, FetchError> {
         let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
         let url = self.check_url(raw).await?;
-        let (_name, pinned, recheck) = tokio::time::timeout(budget, self.pin(&url))
+        let (_name, pinned, recheck) = tokio::time::timeout(budget, self.pin(&url, deadline))
             .await
             .map_err(|_| FetchError::TimedOut)??;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -652,6 +657,74 @@ mod tests {
         assert!(head.contains("\r\naccept-encoding: identity\r\n"), "{head}");
         assert!(!head.contains("referer"), "{head}");
         assert!(head.starts_with("get /elf http/1.1\r\n"), "{head}");
+    }
+
+    /// A probe that finds every destination far and notes the deadline each probe was given.
+    #[derive(Debug, Default)]
+    struct DeadlineProbe {
+        asked: std::sync::Mutex<Vec<(SocketAddr, Instant)>>,
+    }
+
+    impl crate::nearhop::NearProbe for DeadlineProbe {
+        fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> crate::nearhop::ProbeOutcome {
+            self.asked.lock().unwrap().push((addr, Instant::now() + crate::nearhop::DECIDE_BUDGET));
+            crate::nearhop::ProbeOutcome::Unreachable
+        }
+
+        fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> crate::nearhop::ConfirmOutcome {
+            crate::nearhop::ConfirmOutcome::Unanswered
+        }
+
+        fn probe_until(
+            &self,
+            addr: SocketAddr,
+            _: u8,
+            _: Duration,
+            deadline: Instant,
+        ) -> crate::nearhop::ProbeOutcome {
+            self.asked.lock().unwrap().push((addr, deadline));
+            crate::nearhop::ProbeOutcome::Unreachable
+        }
+    }
+
+    /// Review round 5 (probe-1, the parse and probe lenses' suspicion): each address's near-hop
+    /// check is given the request's deadline, so a check the request stops waiting for stops
+    /// too (before, it ran on for up to its own worst case, holding its probe turn); and one
+    /// address of each family is vetted, the first of each in answer order (cross-3: a
+    /// duplicate family skips to the next address, it does not stop the walk).
+    #[tokio::test]
+    async fn r5_the_checks_run_within_the_requests_time_one_per_family() {
+        let server = canned_server(&[OK_ELF]);
+        let probe = Arc::new(DeadlineProbe::default());
+        let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
+        let lookup = FakeLookup::with(&[(
+            "dual.example.com",
+            &["93.184.216.34", "93.184.216.35", "2606:2800:220:1::1", "2606:2800:220:1::2"],
+        )]);
+        let c = guarded_client_for_test(
+            &public_policy().with_near_probe(probe.clone()),
+            Arc::new(lookup),
+            to_loopback,
+            ClientOptions::default(),
+        )
+        .unwrap();
+        let budget = Duration::from_secs(7);
+        let t0 = Instant::now();
+        let r = c
+            .get_following_redirects(&start(&server, "dual.example.com"), 0, budget)
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let asked = probe.asked.lock().unwrap().clone();
+        let ips: Vec<IpAddr> = asked.iter().map(|(a, _)| a.ip()).collect();
+        assert_eq!(
+            ips,
+            vec![IpAddr::from([93, 184, 216, 34]), "2606:2800:220:1::1".parse().unwrap()]
+        );
+        for (_, deadline) in asked {
+            assert!(deadline <= t0 + budget + Duration::from_millis(50), "{:?}", deadline - t0);
+            assert!(deadline + Duration::from_secs(1) >= t0 + budget, "{:?}", deadline - t0);
+        }
     }
 
     /// Review round 4, probe-2: the addresses of a name are vetted one after another, and only
@@ -1335,7 +1408,7 @@ mod tests {
     async fn the_vetted_source_is_the_kernels() {
         let c = public_client(public_names());
         let url = c.policy().check_url("http://elfs.example.com:8080/").unwrap();
-        let (_, pinned, recheck) = c.pin(&url).await.unwrap();
+        let (_, pinned, recheck) = c.pin(&url, Instant::now() + Duration::from_secs(60)).await.unwrap();
         assert_eq!(pinned, vec!["127.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
         assert_eq!(recheck.vetted.len(), 1);
         let v = &recheck.vetted[0];

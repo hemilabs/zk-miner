@@ -57,7 +57,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a probe waits for an answer before it counts as no answer.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -178,21 +178,71 @@ pub trait NearProbe: Send + Sync + fmt::Debug {
     /// limit (within `timeout`), then lowers the hop limit to `hops` and half-closes, and sees
     /// whether the FIN is answered (see the module doc). Writes no data. Blocking.
     fn confirm(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome;
+
+    /// [`Self::probe`], given up on at `deadline` (a turn waited for, attempts, pauses: review
+    /// round 5, probe-1). A probe that knows no deadline (a test's fake) ignores it.
+    fn probe_until(
+        &self,
+        addr: SocketAddr,
+        hops: u8,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> ProbeOutcome {
+        let _ = deadline;
+        self.probe(addr, hops, timeout)
+    }
+
+    /// [`Self::confirm`], given up on at `deadline` (a failure, never far).
+    fn confirm_until(
+        &self,
+        addr: SocketAddr,
+        hops: u8,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> ConfirmOutcome {
+        let _ = deadline;
+        self.confirm(addr, hops, timeout)
+    }
 }
+
+/// The longest the near-hop decision takes when nothing bounds it ([`decide`]): the probe's
+/// attempts and pause, two connects of the check connection and its wait, and turns waited for.
+pub const DECIDE_BUDGET: Duration = Duration::from_secs(40);
 
 /// The near-hop decision for a connection to `addr` (see the module doc): the probe, and when it
 /// had no answer, the check connection. Blocking (up to [`PROBE_TIMEOUT`], plus
 /// [`CONFIRM_CONNECT_TIMEOUT`] and a few round trips when the probe had no answer).
 pub fn decide(probe: &dyn NearProbe, addr: SocketAddr, hops: u8) -> Verdict {
-    match probe.probe(addr, hops, PROBE_TIMEOUT).verdict() {
-        Verdict::Undecided => match probe.confirm(addr, hops, CONFIRM_CONNECT_TIMEOUT).verdict() {
-            // Never undecided twice.
-            Verdict::Undecided => Verdict::Failed("no answer either way".into()),
-            v => v,
-        },
+    decide_until(probe, addr, hops, Instant::now() + DECIDE_BUDGET)
+}
+
+/// [`decide`], given up on at `deadline` (review round 5, probe-1): a caller that stops waiting
+/// (the broker's connector, a guarded request whose budget ran out) passes its own, so the work
+/// it abandons stops too and gives back its turn ([`ProbeGate`]) instead of running on for
+/// seconds. Out of time is a failure (refused), never far.
+pub fn decide_until(probe: &dyn NearProbe, addr: SocketAddr, hops: u8, deadline: Instant) -> Verdict {
+    let left = || deadline.saturating_duration_since(Instant::now());
+    if left().is_zero() {
+        return Verdict::Failed(OUT_OF_TIME.into());
+    }
+    match probe.probe_until(addr, hops, PROBE_TIMEOUT, deadline).verdict() {
+        Verdict::Undecided => {
+            if left().is_zero() {
+                return Verdict::Failed(OUT_OF_TIME.into());
+            }
+            let timeout = CONFIRM_CONNECT_TIMEOUT.min(left());
+            match probe.confirm_until(addr, hops, timeout, deadline).verdict() {
+                // Never undecided twice.
+                Verdict::Undecided => Verdict::Failed("no answer either way".into()),
+                v => v,
+            }
+        }
         v => v,
     }
 }
+
+/// Why a decision out of time failed.
+const OUT_OF_TIME: &str = "the time for the check ran out before it could tell how near it is";
 
 /// The real probe: a fresh TCP socket with its hop limit set, connected without sending data.
 #[derive(Debug, Clone, Copy, Default)]
@@ -200,11 +250,31 @@ pub struct TtlProbe;
 
 impl NearProbe for TtlProbe {
     fn probe(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ProbeOutcome {
-        ProbeOutcome::of(probe_once(addr, hops, timeout))
+        self.probe_until(addr, hops, timeout, Instant::now() + DECIDE_BUDGET)
     }
 
     fn confirm(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
-        confirm_once(addr, hops, timeout)
+        self.confirm_until(addr, hops, timeout, Instant::now() + DECIDE_BUDGET)
+    }
+
+    fn probe_until(
+        &self,
+        addr: SocketAddr,
+        hops: u8,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> ProbeOutcome {
+        ProbeOutcome::of(probe_once(addr, hops, timeout, deadline))
+    }
+
+    fn confirm_until(
+        &self,
+        addr: SocketAddr,
+        hops: u8,
+        timeout: Duration,
+        deadline: Instant,
+    ) -> ConfirmOutcome {
+        confirm_once(addr, hops, timeout, deadline)
     }
 }
 
@@ -286,13 +356,29 @@ fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()
 /// The probe, on every platform: asked up to three times ([`probe_attempts`]), to the
 /// destination as a connection reaches it ([`unmapped`]), at most [`PROBES_AT_ONCE`] probes in
 /// the process at a time ([`ProbeGate`]).
-fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
+fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant) -> io::Result<()> {
     let addr = unmapped(addr);
-    probe_attempts(timeout, PROBE_PAUSE, std::thread::sleep, |t| {
-        let _turn = ProbeGate::enter();
-        probe_attempt(addr, hops, t)
-    })
+    let left = || deadline.saturating_duration_since(Instant::now());
+    probe_attempts(
+        timeout,
+        PROBE_PAUSE,
+        |pause| std::thread::sleep(pause.min(left())),
+        |t| {
+            // Review round 5, probe-1: within the caller's time, a turn waited for included.
+            let Some(_turn) = ProbeGate::enter_until(deadline) else {
+                return Err(io::Error::other(NO_TURN));
+            };
+            let t = t.min(left());
+            if t.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            probe_attempt(addr, hops, t)
+        },
+    )
 }
+
+/// Why a probe that got no turn before its deadline failed ([`ProbeGate::enter_until`]).
+const NO_TURN: &str = "no turn to probe before the check's time ran out (too many probes at once)";
 
 /// How long the probe pauses before its third attempt ([`probe_attempts`]): a router's ICMP rate
 /// limit refills (Linux: one "time exceeded" a second per destination after a burst of six,
@@ -332,35 +418,100 @@ fn probe_attempts(
 /// through the same first hops, whose ICMP rate limit drops answers past a small burst.
 pub const PROBES_AT_ONCE: usize = 2;
 
-/// A turn to probe: at most [`PROBES_AT_ONCE`] are held at a time; [`ProbeGate::enter`] waits for
-/// one.
+/// Most hop-limited probe SYNs sent in a burst, and how many a second after it (review round 5,
+/// the probe lens's suspicion): [`PROBES_AT_ONCE`] bounds how many are in flight, not how many a
+/// second, and a requester naming many far hosts could drain the first hops' ICMP rate limit
+/// (Linux routers: about one "time exceeded" a second per destination after a burst of six), so
+/// that ordinary probes went unanswered and fell to the check connection (which refuses every
+/// AWS S3 front end). A turn waits for a token as it waits for a slot.
+pub const PROBE_BURST: u32 = 6;
+/// See [`PROBE_BURST`].
+pub const PROBES_PER_SECOND: u32 = 3;
+
+/// A token bucket of [`PROBE_BURST`] tokens, refilled at [`PROBES_PER_SECOND`]. Pure: tests drive
+/// it with their own clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Pacer {
+    tokens: f64,
+    at: Option<Instant>,
+}
+
+impl Pacer {
+    pub(crate) const fn new() -> Self {
+        Pacer {
+            tokens: PROBE_BURST as f64,
+            at: None,
+        }
+    }
+
+    /// Takes a token at `now` (`Ok`), or says how long until one is there.
+    pub(crate) fn take(&mut self, now: Instant) -> Result<(), Duration> {
+        if let Some(at) = self.at {
+            let refill = now.saturating_duration_since(at).as_secs_f64() * f64::from(PROBES_PER_SECOND);
+            self.tokens = (self.tokens + refill).min(f64::from(PROBE_BURST));
+        }
+        self.at = Some(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64(
+                (1.0 - self.tokens) / f64::from(PROBES_PER_SECOND),
+            ))
+        }
+    }
+}
+
+/// A turn to probe: at most [`PROBES_AT_ONCE`] are held at a time, and they start at most as
+/// fast as [`Pacer`] allows; [`ProbeGate::enter_until`] waits for one until a deadline.
 struct ProbeGate;
 
-static PROBES_IN_FLIGHT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static PROBES_IN_FLIGHT: std::sync::Mutex<(usize, Pacer)> =
+    std::sync::Mutex::new((0, Pacer::new()));
 static PROBE_TURN: std::sync::Condvar = std::sync::Condvar::new();
 
 impl ProbeGate {
-    fn enter() -> Self {
-        let mut n = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        while *n >= PROBES_AT_ONCE {
-            n = PROBE_TURN.wait(n).unwrap_or_else(|e| e.into_inner());
+    /// A turn, waited for until `deadline` (review round 5: the wait had no bound, so a caller
+    /// that gave up left a thread waiting for a turn, then probing for nobody); `None` when none
+    /// came in time.
+    fn enter_until(deadline: Instant) -> Option<Self> {
+        let mut g = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let now = Instant::now();
+            let left = deadline.saturating_duration_since(now);
+            let wait = if g.0 >= PROBES_AT_ONCE {
+                left
+            } else {
+                match g.1.take(now) {
+                    Ok(()) => {
+                        g.0 += 1;
+                        return Some(ProbeGate);
+                    }
+                    Err(until_token) => until_token.min(left),
+                }
+            };
+            if left.is_zero() {
+                return None;
+            }
+            g = PROBE_TURN
+                .wait_timeout(g, wait.max(Duration::from_millis(1)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
-        *n += 1;
-        ProbeGate
     }
 
     /// Probes in flight now (tests).
     #[cfg(test)]
     fn in_flight() -> usize {
-        *PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+        PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 }
 
 impl Drop for ProbeGate {
     fn drop(&mut self) {
-        let mut n = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        *n = n.saturating_sub(1);
-        drop(n);
+        let mut g = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = g.0.saturating_sub(1);
+        drop(g);
         PROBE_TURN.notify_one();
     }
 }
@@ -506,11 +657,16 @@ fn connect_result(revents: libc::c_short, error: io::Result<Option<io::Error>>) 
 /// errors for the FIN are not read (Linux keeps them as soft errors `SO_ERROR` does not report
 /// unless `IP_RECVERR` is set; macOS never reports them).
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
+fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant) -> ConfirmOutcome {
     use std::os::fd::AsRawFd;
     let addr = unmapped(addr);
     let connect = || -> Result<socket2::Socket, ConfirmOutcome> {
         let sock = new_socket(addr).map_err(|e| ConfirmOutcome::Failed(e.to_string()))?;
+        // Review round 5, probe-1: within the caller's time too.
+        let timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+        if timeout.is_zero() {
+            return Err(ConfirmOutcome::Failed(OUT_OF_TIME.into()));
+        }
         sock.connect_timeout(&addr.into(), timeout)
             .map_err(|e| ConfirmOutcome::ConnectFailed(e.to_string()))?;
         // Closed with a reset, never a byte of data.
@@ -581,6 +737,9 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
         let (c, k) = (check_state(), rk.info().map(|i| i.state));
         if let Some(done) = decision.step(start.elapsed(), c, k) {
             return done;
+        }
+        if Instant::now() >= deadline {
+            return ConfirmOutcome::Failed(OUT_OF_TIME.into());
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1047,7 +1206,7 @@ fn connection_info(fd: i32) -> io::Result<ConnectionInfo> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn confirm_once(_: SocketAddr, _: u8, _: Duration) -> ConfirmOutcome {
+fn confirm_once(_: SocketAddr, _: u8, _: Duration, _: Instant) -> ConfirmOutcome {
     ConfirmOutcome::Failed("the check connection is supported on Linux and macOS only".into())
 }
 
@@ -1601,7 +1760,8 @@ mod tests {
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let _turn = ProbeGate::enter();
+                    let _turn = ProbeGate::enter_until(Instant::now() + Duration::from_secs(30))
+                        .expect("a turn");
                     MOST.fetch_max(ProbeGate::in_flight(), Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(30));
                 })
@@ -1612,6 +1772,58 @@ mod tests {
         }
         let most = MOST.load(Ordering::SeqCst);
         assert!((1..=PROBES_AT_ONCE).contains(&most), "{most}");
+    }
+
+    /// Review round 5 (probe-1, and the parse and probe lenses' suspicion): a turn is waited
+    /// for only until the caller's deadline; a probe that gets none in time fails (refused,
+    /// never far) without sending anything, so an abandoned check stops and gives its turn
+    /// back; a decision already out of time asks nothing.
+    #[test]
+    fn r5_a_probe_waits_for_a_turn_only_until_its_deadline() {
+        let far = Instant::now() + Duration::from_secs(30);
+        let held: Vec<ProbeGate> = (0..PROBES_AT_ONCE)
+            .map(|_| ProbeGate::enter_until(far).expect("a turn"))
+            .collect();
+        let t = Instant::now();
+        assert!(ProbeGate::enter_until(t + Duration::from_millis(200)).is_none());
+        assert!(t.elapsed() >= Duration::from_millis(190) && t.elapsed() < Duration::from_secs(2));
+        // Nothing listens there: had the probe been sent, it would have been refused (near).
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let t = Instant::now();
+        let o = TtlProbe.probe_until(addr, 2, PROBE_TIMEOUT, t + Duration::from_millis(300));
+        assert!(matches!(&o, ProbeOutcome::Failed(w) if w.contains("no turn")), "{o:?}");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let v = decide_until(&TtlProbe, addr, 2, Instant::now() + Duration::from_millis(300));
+        assert!(matches!(&v, Verdict::Failed(w) if w.contains("no turn")), "{v:?}");
+        drop(held);
+        assert!(ProbeGate::enter_until(Instant::now() + Duration::from_secs(5)).is_some());
+        let probe = FixedProbe::far();
+        let v = decide_until(&*probe, addr, 2, Instant::now() - Duration::from_millis(1));
+        assert_eq!(v, Verdict::Failed(OUT_OF_TIME.into()));
+        assert!(probe.asked.lock().unwrap().is_empty());
+        let undecided = FixedProbe::answering(ProbeOutcome::TimedOut);
+        assert_eq!(decide_until(&*undecided, addr, 2, far), Verdict::Far);
+        assert_eq!(undecided.confirms.lock().unwrap().len(), 1);
+    }
+
+    /// Review round 5 (the probe lens's suspicion): probes start at most [`PROBE_BURST`] at once
+    /// and [`PROBES_PER_SECOND`] after that, however many callers ask.
+    #[test]
+    fn r5_probes_are_paced() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new();
+        for _ in 0..PROBE_BURST {
+            assert_eq!(p.take(t0), Ok(()));
+        }
+        let wait = p.take(t0).unwrap_err();
+        let per = Duration::from_secs(1) / PROBES_PER_SECOND;
+        assert!(wait <= per && wait + Duration::from_millis(5) >= per, "{wait:?}");
+        assert_eq!(p.take(t0 + per + Duration::from_millis(1)), Ok(()));
+        assert!(p.take(t0 + per + Duration::from_millis(2)).is_err());
+        // A second's rest refills PROBES_PER_SECOND, never past the burst.
+        let later = t0 + Duration::from_secs(60);
+        let n = (0..100).take_while(|_| p.take(later).is_ok()).count();
+        assert_eq!(n, PROBE_BURST as usize);
     }
 
     /// Review round 4, probe-1: the two-connection check, every interleaving. An

@@ -35,9 +35,9 @@ use crate::fdpass::{recvmsg_once, retry_eintr, sendmsg_once};
 /// How often a host name without any admitted address is resolved again.
 pub const RETRY_UNRESOLVED_EVERY: Duration = Duration::from_secs(10);
 /// Most of the floor's blocking checks (`vet_path`, `recheck_connected`) running at once (review
-/// round 4): a check that outlives its share of the connect time is abandoned but its blocking
-/// thread runs on (a probe, a check connection: seconds), holding its turn until it ends, so a
-/// broker cannot pile up blocking threads by asking faster than checks finish.
+/// round 4): a blocking check holds its turn until it ends, so a broker cannot pile up blocking
+/// threads by asking faster than checks finish. Since review round 5 (probe-1) a check runs
+/// within the request's deadline and gives up at it, so an abandoned one ends with it.
 pub const MAX_CHECKS_AT_ONCE: usize = 4;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -440,14 +440,17 @@ impl Connector {
         if admitted.is_empty() {
             return (Response::refused(id, Status::NotAdmitted), None);
         }
-        let connect_until = deadline.min(Instant::now() + self.connect_timeout);
+        // Review round 5, probe-1: each address's check runs within the request's time (the
+        // near-hop decision takes up to seconds when the probe goes unanswered: three attempts
+        // and a pause, then a check connection), not within its share of the connect time,
+        // which only bounds the TCP connect; and the check is given that deadline, so one the
+        // connector stops waiting for stops too and gives back its turn and its probe slot.
         let n = admitted.len() as u32;
+        let mut connect_left = self.connect_timeout;
         for (i, ip) in admitted.into_iter().enumerate() {
-            let now = Instant::now();
-            if now >= connect_until {
+            if Instant::now() >= deadline {
                 break;
             }
-            let share = (connect_until - now) / (n - i as u32);
             let addr = SocketAddr::new(ip, st.ep.port);
             // Right before connecting, wherever the floor applies: the kernel's route with the
             // port, and the near-hop probe (a destination within a few hops is this host's own
@@ -456,16 +459,17 @@ impl Connector {
             let mut vetted = None;
             if self.mode == NetMode::Public || st.ep.dns_derived() {
                 let floor = self.floor.clone();
-                let Ok(Ok(turn)) = tokio::time::timeout(share, self.checks.clone().acquire_owned()).await else {
+                let Ok(Ok(turn)) = tokio::time::timeout_at(deadline, self.checks.clone().acquire_owned()).await else {
                     tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: no turn for the check before connecting");
                     continue;
                 };
-                // The turn is held by the blocking check until it ends, abandoned or not.
+                // The turn is held by the blocking check until it ends, which is by the deadline.
+                let until = deadline.into_std();
                 let check = move || {
                     let _turn = turn;
-                    floor.vet_path(addr, addr)
+                    floor.vet_path_until(addr, addr, until)
                 };
-                match tokio::time::timeout(share, tokio::task::spawn_blocking(check)).await {
+                match tokio::time::timeout_at(deadline + CHECK_SLACK, tokio::task::spawn_blocking(check)).await {
                     Ok(Ok(Ok(v))) => vetted = Some(v),
                     Ok(Ok(Err(d))) => {
                         tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
@@ -477,12 +481,15 @@ impl Connector {
                     }
                 }
             }
-            let share = share.saturating_sub(now.elapsed());
+            let now = Instant::now();
+            let share = (connect_left / (n - i as u32)).min(deadline.saturating_duration_since(now));
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             // From the source the check vetted (the kernel's for a TCP connection: review round
             // 4, cross-3), so the connection leaves from it.
             let source = vetted.as_ref().and_then(|v: &zkminer_netguard::Vetted| v.source);
-            match tokio::time::timeout(share, connect_tcp(addr, source)).await {
+            let connected = tokio::time::timeout(share, connect_tcp(addr, source)).await;
+            connect_left = connect_left.saturating_sub(now.elapsed());
+            match connected {
                 Ok(Ok(fd)) => {
                     // Once made, before the broker gets it: the connection's own addresses must be
                     // the vetted ones and the route still admitted, the kernel asked afresh (a route
@@ -806,6 +813,10 @@ fn first_host(p: &Prefix) -> Option<IpAddr> {
         _ => None,
     }
 }
+
+/// How long past the request's deadline the connector waits for a check that was given it
+/// (the check gives up at the deadline; this covers its last step).
+const CHECK_SLACK: Duration = Duration::from_millis(500);
 
 /// A fresh TCP connection to `addr` (`socket` + `connect`, no `bind`), as an owned fd.
 async fn connect_tcp(addr: SocketAddr, source: Option<IpAddr>) -> io::Result<OwnedFd> {
