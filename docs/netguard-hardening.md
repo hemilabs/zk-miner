@@ -121,20 +121,21 @@ that branch's file (`shellcheck` clean):
 ```diff
 --- a/scripts/ci/macos-cpu-tests.sh
 +++ b/scripts/ci/macos-cpu-tests.sh
-@@ -16,6 +16,12 @@
+@@ -16,6 +16,13 @@
  #    assert this Mac's GPU, input devices and power source (MACOS_HOST_TESTS below).
  # 3. scripts/ci/test-metal-tc.sh with risc0-build-kernel from the pinned risc0 checkout: the Metal
  #    compiler wrapper the kit uses, through risc0-build-kernel and cargo (compiles kernels, runs none).
 +# 4. The network guard (zkminer-netguard), with ZKMINER_CI_STRICT=1: a test that cannot check what it
 +#    is for on this runner (no IPv6, no network) fails instead of printing SKIPPED and passing, unless
-+#    ZKMINER_CI_ALLOW_SKIP (comma-separated, from the job's env) names part of its reason, such as
-+#    "IPv6" on a runner without it. Then its live forge test, on its own (it floods every routing
-+#    socket on the host). It needs outbound DNS and HTTPS and the near-hop probe's ICMP.
++#    ZKMINER_CI_ALLOW_SKIP (comma-separated tokens, from the job's env) names its reason's token
++#    exactly: "ipv6" allows a skip whose reason starts "[ipv6] " on a runner without IPv6, and no
++#    other. Then its live forge test, on its own (it floods every routing socket on the host). It
++#    needs outbound DNS and HTTPS and the near-hop probe's ICMP.
 +#    docs/netguard-hardening.md, "CI".
  set -euo pipefail
  ci=$(cd "$(dirname "$0")" && pwd)
  repo=$(cd "$ci/../.." && pwd)
-@@ -55,6 +61,12 @@
+@@ -55,6 +62,12 @@
  echo "== zkminer-prover discovery and dispatcher (without ${MACOS_HOST_TESTS[*]})"
  cargo test --locked --release -p zkminer-prover --lib -- discovery:: dispatcher:: "${host_skips[@]}"
  
@@ -149,7 +150,8 @@ that branch's file (`shellcheck` clean):
  m = json.load(sys.stdin)
 ```
 
-(Also at `/Users/user/zkminer/scratch/w11/NGREV/fix-linux/macos-ci.diff`.)
+(Also at `/Users/user/zkminer/scratch/w11/NGREV/fix-r6/macos-ci.diff`; review round 6, cross-8:
+the comment now describes the exact-token match round 4 introduced.)
 
 ## Linux application
 
@@ -442,3 +444,196 @@ signature (parsed from built messages; the compat-0 repro ran the route side); A
 - Unchanged from round 4: S3 behind first hops without ICMP; caps that refuse IPv6 on a network
   naming more NAT64 prefixes than the guard holds (now cleared as soon as the source names what
   fits).
+
+## Review round 6
+
+Four reviewers (bypass, parse, probe, cross; material in
+`/Users/user/zkminer/scratch/w11/NGREV/r6-*`) on bc48610: four mediums and ten lows after
+merging duplicates, one info, and suspicions; no reachable private or near connection and no
+memory unsafety on any platform. Every reviewer test was rerun in this tree before the fixes
+(`fix-r6/reviewer-*-before.log`: each fails or shows its bug) and after
+(`reviewer-*-after.log`, appended to the files' new tails by `reviewer-tests-after.sh`); each
+fix has a test that fails without it and, as this is the last round and earlier fixes opened
+new holes, the invariant it relies on is written below and tested on random sequences, not
+only on the example. Logs: `fix-r6/` (`/Users/user/zkminer/scratch/w11/NGREV/fix-r6/`).
+
+| # | finding | reproduced | fix | test |
+|---|---|---|---|---|
+| 1 | NAT64 state: cross-1 (medium: one forged RA at the largest lifetime, 65528 s, unsettled the uplink for 18 h and kept the real gateway's prefix out of what is heard), cross-2 = parse-2 (medium: withdrawn entries counted against `MAX_PER_UPLINK` and were never evicted from the uplink in use: after 32 renumberings or eight forged RAs every new prefix unsettled it for good), bypass-1 (low: a hostile network's DNS64 naming a provider's /32 was read as an NSP everywhere for the process's life, and handed to the broker whole), the sixth-prefix suspicion, cross-7 T24/V04/V06 | the reviewers' tests fail or show the bug (`reviewer-*-before.log`); live `r6-cross/vm-r6-ra.log`, `vm-r6-ra-fill9.log` | a PREF64 lifetime is believed up to `MAX_PREF64_LIFETIME` (1800 s, RFC 4861's largest `MaxRtrAdvInterval`); a router's newest advertisement (its options more than `RA_BURST`, 1 s, after the last began: the kernel hands each option over as a message of its own) replaces what it named before; a router naming more than 5 in one advertisement is seen to (its first five kept: keeping the newest instead churned one advertisement's 16 options through the registry, the live rogue-RA rerun), and its next advertisement is heard whole; only active entries count against `MAX_PER_UPLINK`; when 64 entries are held, room comes from other uplinks' inactive, then other uplinks' least recently seen, then the uplink in use's longest-withdrawn entry, which then refuses that uplink's IPv6 until `STALE_GRACE` after its withdrawal (`Registry::forgotten`: never admitted early); a learned prefix that stopped being named, or whose uplink the host left, is refused for `STALE_GRACE` (1 h, two of the largest RA intervals: a router still announcing it, one advertisement lost, names it again first) and then forgotten (neither the predicate nor the broker's refusals read it); the broker gets another uplink's <64 NSP as the IPv4 ranges it would carry, not whole; a DNS server no longer asked names nothing; unheld marks of the uplink in use are never pushed out by other uplinks' (32 kept) | `nat64::r6_tests::r6_an_attacker_who_stops_causes_a_bounded_refusal` (the invariant, 80 random sequences), `r6_one_forged_advertisement_is_ended_by_the_gateways_next`, `r6_eight_forged_advertisements_leave_room_for_the_uplinks_next_prefix`, `r6_another_networks_prefix_is_forgotten_after_its_grace`, `r6_a_young_withdrawn_prefix_makes_room_only_by_refusing_its_uplink`, `r6_a_dns_server_no_longer_asked_names_nothing`, `r6_unheld_marks_are_bounded`, `r6_other_routers_never_push_out_the_gateway`, `r6_a_router_naming_too_many_keeps_its_newest`, `r6_a_router_naming_too_many_keeps_its_newest_in_order`, `r6_a_round_on_an_old_uplink_learns_no_gateways_pref64`; live: `vm-r6-ra.log` (the 65528 s forgery refused IPv6 for 14 s, until the gateway's next RA; before: for good), `vm-r6-ra-fill9.log` (eight forged RAs left to run out, then a renumbering: never refused; before: refused from the renumbering on) |
+| 2 | parse-1 (medium): the probe gate's `notify_one` went to a waiter that then left without a turn, and another slept to its own deadline: a legitimate host refused after the whole budget; parse-4 = probe-2 (low): an expired caller still got a turn and took a token, a cut probe burned up to 3 tokens; cross-7 N11/N14 | `r6_parse_a_freed_turn_is_not_lost` (4/4 failed), `r6_parse_an_expired_caller_takes_no_token`, `r6_turn_after_deadline_takes_a_token` | a first-come-first-served ticket queue; every change wakes every waiter and no wait exceeds the token interval (333 ms); out of time no turn, no token, no further attempt, and an attempt never runs past the deadline; the check connection's connect within it too | `nearhop::r6_tests::r6_the_gate_never_loses_a_turn_on_random_callers` (the invariant: random callers, deadlines and holds), `r6_a_freed_turn_is_not_lost`, `r6_an_expired_caller_takes_no_token`, `r6_turns_are_first_come_first_served_and_hopeless_waits_are_shed`, `r6_a_probe_attempt_ends_at_the_deadline`, `r6_the_check_connection_is_bounded_by_the_deadline`; the reviewers' gate tests pass after (`reviewer-parse-after.log`, `reviewer-probe-after.log`) |
+| 3 | probe-1 (medium, macOS): `TCP_CONNECTION_INFO` reports `tcpi_rto` 0 until the retransmission timer is armed, so the far margin for a retransmitted FIN's ACK collapsed to ~50 ms (Linux reads the real RTO) | the reviewer's `rto-macos.log` (0 before the FIN, 242 ms after) and pure test | the RTO is read again after the FIN is sent, the larger taken; still zero is `UNKNOWN_RTO` (1 s, RFC 6298's initial); `control_wait` follows; both platforms then use the same margins | `nearhop::r6_tests::r6_the_check_never_uses_a_zero_rto`, `r6_the_live_check_uses_a_nonzero_rto` |
+| 4 | parse-3 (low): `ensure_discovered_on` held `ON_UPLINK` across `spawn_round`, whose spawn-failure branch locked it again: a self-deadlock in the facts read | by reading; the new test deadlocks with the old code | the guard is dropped first; a seam (`FAIL_SPAWN`) fails the spawn in tests | `nat64::r6_tests::r6_a_round_that_cannot_start_does_not_deadlock` |
+| 5 | bypass-2 = cross-5 (low, Linux) and the L=0 suspicion: after a move over a link that went down to a network numbered like the old one, the first reads (neighbour table emptied) were the old network's | the reviewers' tests show it (`reviewer-bypass-before.log`, `reviewer-cross-before.log`) | the base hashes the uplink interfaces' `IFLA_CARRIER_CHANGES` and the /64s of the host's global IPv6 addresses; a gateway whose MAC was known and that has no entry in a table that was read is unresolved: the read sends it one empty UDP datagram (port 9) and reads the table again for up to `RESOLVE_WAIT` (300 ms); a family still unresolved is refused as relearning. Round 4's rule kept: an ordinary flush resolves within the wait (no refusal) and an unreadable table changes nothing | `facts::r6_tests::r6_a_move_with_a_flushed_neighbour_table_is_never_the_old_network`, `r6_the_hosts_ipv6_64s_are_part_of_the_base`, `routes` `r6_carrier_changes_are_read`; `r6_asking_for_a_neighbour_makes_the_kernel_resolve_it`, `r6_the_links_read_keep_their_carrier_changes` (Linux, live); live: `vm-r6-flush.log` |
+| 6 | cross-4 (low, Linux): a spoofed IPv4 gateway MAC refused both families (one signature), a new MAC a second refused 100% and multiplied discovery traffic | live `r6-cross/vm-r6-flap.log` | the uplink is per family (`UplinkId`: IPv4's gateways for its public address, IPv6's for IPv6's and NAT64); any number of differing MACs is one unsettled state (a candidate holds only when the same MAC shows on 3 reads in a row over 2 s); public discovery keeps the last 4 uplinks' confirmed answers per family; back on an uplink a NAT64 round settled within `DISCOVERY_TTL`, no new round | `facts::r6_tests::r6_a_spoofer_of_the_ipv4_gateway_makes_one_unsettled_state` (random spoofers), `public` `r6_a_recent_uplinks_answer_stands_again`, `nat64::tests::a_new_uplink_is_asked_for_its_prefix_at_once`; live: `vm-r6-flap.log` (below) |
+| 7 | cross-3 (low): answers AAAA first cut to 8, so www.google.com kept no IPv4 and failed after ~110 s with IPv6 TCP broken (pr/37: ~19 s) | the reviewer's test fails; live `r6-cross/vm-r6-google-pristine.log` | the admitted addresses are interleaved (RFC 8305 §4) before the cut; a family is given up after two near-hop checks that could not tell | `resolve` `r6_a_name_with_eight_aaaa_keeps_its_ipv4_addresses`, `r6_interleaving_keeps_both_families` (random lists), `client` `r6_a_family_is_given_up_after_two_checks_that_could_not_tell`; live: `vm-r6-google.log` |
+| 8 | cross-6 (low, a regression against pr/37): the broker connector vetted addresses one after another, each with the whole 17 s, so a blackholed family whose addresses came first starved the other. The reviewer's case (two AAAA first) does not arise as stated: the broker's resolver answers A first; the same holds with the families swapped (IPv4 blackholed) | the new broker test with the old loop: Unreachable after 17.5 s (`vm-broker-r6-before.log`) | per-family chains (the other family 250 ms later; the first on the request's own task, nothing spawned in developer mode), each handing over each address it vetted and going on only when that address's connection failed; a chain stops after two checks that could not tell. The existing `a_broker_that_shuts_its_reading_side_is_cut_off` waited 300 ms for the first answer's write to fail, which took 290 ms under Rosetta with the whole suite: it waits 1 s | broker `connector::server::tests::r6_a_blackholed_family_does_not_starve_the_other` (Rosetta: connected over IPv6 in under 5 s, `vm-broker-r6-after.log`) |
+| 9 | probe-3 (low): the global pacer (2 in flight, 6 + 3/s) capped every connection process-wide: 64 vets at once over four hosts, 17 s, left 25-28 refused; probe-4 (low): S3 refused ~15% unloaded | measured before (`exp/burst2-*-before.log`, `exp/s3-before.log`) | per-family gates; a caller whose turns ahead need more tokens than can come before its deadline sheds at once; one decision per destination at a time, its far verdict remembered for `FAR_TTL` (10 s) for that exact address, port, hop limit, facts (routes, rules, addresses, prefixes, uplink) and probe; never a prefix (a /24 or /48 can hold both a far host and a near one: an ISP's access router and its data centre), never a near or failed verdict, never on facts given by the caller; a destination whose check connection failed is probed once more after 2 s when the deadline allows | `nearhop::r6_tests::r6_one_decision_runs_per_destination_at_a_time`, `r6_far_verdicts_are_remembered_only_for_the_same_destination_and_facts`, `r6_a_failed_check_is_followed_by_one_more_probe`, `r6_each_family_has_its_own_gate`, `policy` `r6_a_far_verdict_is_remembered_on_the_same_facts_only`; measured after (macOS): 64 at 17 s: 39 → 64 admitted (p50 14.9 s → 22 ms); 20 at 2 s: 11 → 20 (twice; one run 0 during an ICMP loss episode at hop 2, `burst2-n20-2s-after.log`); S3: 17 → 20 of 20 far |
+| 10 | cross-7 (low): mutation survivors V02, V04, V05, V06, F21, F24, T24, N11, N14 | the reviewer's mutation logs | tests | `facts::r6_tests::r6_the_facts_read_the_neighbour_table` (Linux, V02), `nat64` `r6_a_round_on_an_old_uplink_learns_no_gateways_pref64` (V04, the gateway choice now `round_gateways`), `facts` `r6_the_ipv4_defaults_interfaces_include_a_nexthop_objects` (V05, `v4_default_links`), `r6_other_routers_never_push_out_the_gateway` (V06), `r6_the_mac_history_keeps_several_bases` (F21), `r6_only_unicast_on_link_routes_are_addressing` (F24), `r6_the_path_key_changes_with_what_a_path_depends_on`, `r6_unheld_marks_are_bounded` (T24), N11 and N14 above |
+| 11 | the CLAT suspicion: no runtime warning when the IPv4 default goes through a CLAT-like interface and no NAT64 prefix is known; a nexthop object's default (ifindex 0) never matched the CLAT name test | by reading | the IPv4 default's interfaces include a nexthop object's devices; a host whose IPv4 default leaves from a `tun` device or a `clat*`/`v4-*`/`tun*` interface (or a CLAT the guard recognises) with no NAT64 prefix known is warned once to set `[egress] nat64_prefixes` | `facts::r6_tests::r6_the_ipv4_defaults_interfaces_include_a_nexthop_objects`; live `vm-r6-clat.log` (behaviour as the reviewer found; the harness shows no log) |
+| 12 | the parse lens's suspicion: `hop.rs` added huge connect and read timeouts to `Instant::now()` and panicked | by reading | `later`: saturates far in the future | `client::hop::tests::r6_a_huge_timeout_does_not_overflow` |
+| 13 | the parse lens's suspicion: `nat64::ask_servers` and public discovery read datagrams until `WouldBlock`, so a flood kept the thread past its timeout | the new test hangs with the old loop | the deadline is checked on every datagram | `nat64::r6_tests::r6_a_flood_of_non_answers_ends_at_the_timeout` |
+| 14 | the parse lens's suspicion: an unheld mark from the PREF64 listener counted only from the next facts read | by reading | facts read from the host carry their NAT64 uplink; the policy reads its marks live | `policy` `r6_an_unheld_mark_counts_before_the_next_facts_read` |
+| 15 | cross-8 (info): the macOS CI diff's text described the old substring `ZKMINER_CI_ALLOW_SKIP`; README claims on withdrawn prefixes; the callers job never ran the ignored real downloads; no paths filter; the "never executed" list | by reading | the diff below names the exact token; README corrected (round 6's bounds); the callers job runs `a_real_elf_downloads_in_public_mode` and `real_stores_that_redirect_across_hosts_are_followed`; both jobs only when the guard, its callers or what builds them changed; the list below | `actionlint` (with shellcheck) clean |
+
+**The invariants, and what backs them.**
+
+- *NAT64 (item 1).* An attacker on the link who stops sending at T leaves the uplink in use
+  unsettled (all IPv6 refused) for at most `MAX_PREF64_LIFETIME + STALE_GRACE +
+  DISCOVERY_TTL` (95 min) after T: its PREF64 entries live at most 1800 s (or until the real
+  gateway's next advertisement replaces them), its DNS answers until the next round asks the
+  real server (or a server no longer asked is withdrawn), a mark is re-judged on each naming of
+  its source and cleared at a round's end with nothing marked, and a forgotten-entry refusal
+  ends `STALE_GRACE` after the entry's withdrawal. One forged advertisement from the gateway's
+  address ends at the gateway's next one. The real gateway's prefix is in force after each of
+  its advertisements once the attacker stopped (its router key is never pushed out by other
+  routers, its own next prefix always enters, and the uplink in use's active entries never
+  exceed 32 < 64). Security: on the real network, a prefix learned there is refused, or every
+  IPv6 destination is, until `STALE_GRACE` after its source last named it. Every bound holds
+  throughout (64 entries, 32 active per uplink, 32 marks, 8 forgotten, 16 routers × 5). A facts
+  read on Linux always learns its gateways' PREF64 again (`pref64::expire`; the VM mutation run
+  showed that learning only when that read's own prune dropped something left a mark standing
+  when the listener had pruned first: fixed in `ce829d1`).
+  Tested together on 80 random sequences (forged RAs from the gateway's address and from
+  routers that make themselves gateways, every lifetime, up to 8 options; spoofed and foreign
+  DNS answers; uplink changes; the real gateway every 600 s and its DNS64 every round): worst
+  refusal after the attacker stopped 3441 s, every path reached (the registry full on 186,367
+  steps, a forgotten mark on 138,639).
+- *Probe gate (item 2).* At most `PROBES_AT_ONCE` turns per family; a turn is never given after
+  its deadline nor a token taken; a caller without one returns by its deadline; a free turn
+  with a token there is never left unclaimed by a waiter whose deadline allows it (no lost
+  wakeup). Tested on random callers.
+- *Far verdicts (item 9).* A far verdict admits only the exact (address, port, hop limit) it
+  was found for, on facts whose routes, rules, addresses, prefixes and uplink are unchanged,
+  for 10 s, from the same probe. Why it is safe: a destination's hop count changes only with
+  the path, and the path from this host changes only with the facts the key holds (or beyond
+  the first hops, which never make a far destination near within seconds without a routing
+  change here); a port is in the key because a router can send one port elsewhere (a
+  transparent proxy at hop 1); a prefix is not, because a prefix can hold both a far and a near
+  host. Near and failed verdicts are never remembered, so remembering can only skip a probe that
+  would have said far.
+- *Linux uplink identity (items 5, 6).* Per family: whenever the known MAC of the family's
+  gateway shows, the signature is the known network's; differing MACs that never hold are one
+  other signature; IPv4's gateway never moves IPv6's signature; a move over a carrier change is
+  another base at once; a known gateway missing from a readable table refuses its family until
+  it resolves (asked at once; an ordinary flush resolves within 300 ms). Tested on random
+  spoofer sequences and pure examples.
+- *Addresses (item 7).* Every address kept is one given, each family in its own order, at most
+  8, and neither family left out while it has addresses (at least min(its count, 4)). Tested on
+  random lists.
+
+**The VM live repros** (`fix-r6/vm-*.log`):
+
+- `vm-r6-ra.log`: one forged RA from the gateway's address naming five PREF64 at 65528 s: IPv6
+  refused 14 s, until the gateway's next advertisement (round 6 reviewers: 18 h); eight forged
+  RAs of four each, 1 s or 9 s apart, then the gateway renumbering: never refused
+  (`vm-r6-ra-fill9.log`; reviewers: refused from the renumbering on).
+- `vm-r6-flap.log` (the gateway's IPv4 neighbour entry set to a forged MAC, as an ARP spoofer
+  would): IPv6 never refused (before: refused with IPv4, 27-67% of samples); IPv4: a flap every
+  1 s 1.6% refused (27%), the guard's discovery traffic 92 packets (284); every 3 s 31% (31%);
+  a new MAC every second 65% (67%), 85 packets (211). The forged MAC goes nowhere here (the VM's
+  bridge drops frames to it), so IPv4 is cut off for as long as it holds: what is left of the
+  refusal is the spoof's own outage, not the guard's (a spoofer that forwards would see IPv4
+  learned once on the unsettled state).
+- `vm-r6-google.log` (www.google.com, eight AAAA records): with IPv6 SYNs dropped, fetched in
+  0.43 s over IPv4 (before: refused after ~110 s); normal and with a broken IPv6 upstream as
+  before. `vm-r6-he-redir.log`: the redirect chains of round 5's repro, HEAD and pr/37: HEAD
+  fetched every one in every condition (each fetch at most 1.9 s; the runs' totals 3.9, 26 and
+  7.0 s include abandoned checks running out at the process's end), pr/37 refused google.com
+  with IPv6 SYNs dropped (totals 11.8, 85 and 14.6 s).
+- `vm-r6-flush.log`: three `ip neigh flush` of the uplink in 35 s: nothing refused (the facts
+  read asks the gateway and its entry is back within the wait).
+- `vm-r6-nh.log` (default routes through nexthop objects, compat mode 0): the IPv4 gateway's
+  neighbour entry replaced by a spoofed MAC for 5 s refuses IPv4 only (relearning), IPv6 stays
+  admitted; a forged RA from a nexthop group member's gateway naming five PREF64 refuses IPv6
+  for its 8 s.
+- `vm-r6-clat.log` (an IPv4 default out of a staged tun numbered and named as clatd, Android
+  and tayga do, and unusually): as the reviewer found; a host the guard takes as behind a CLAT
+  whose round names no prefix is settled and admits IPv6, as decided in round 5, and now warns
+  (`warn_tunnelled_ipv4_without_nat64`; that harness installs no log subscriber, so the warning
+  is checked by the unit test only). The tun has no translator behind it, so this is not a
+  real CLAT.
+- Round 4's and 5's repros (`vm-r4r5-repros.log`: policy rules, the `ipproto udp` rule, the
+  hostile DNS64 with and without validated answers, the rogue RA of 16 PREF64 options, nexthop
+  objects, neighbour flushes, the route flipping to the LAN box; round 5's rules, spoofed
+  gateway RA, MAC change and blackholed IPv6) behave as at bc48610 (`r6-cross/vm-r4r5-repros.log`)
+  but for two differences, both intended: the MAC change (`vm-r5-mac`) refuses IPv4 only (it
+  refused both families), and the rogue RA's live test first failed on this round's
+  "newest pushes out the oldest" (16 prefixes churned through the registry) and passes since
+  `7a9ee3c` (`vm-rogue-ra-rerun.log`). The LAN box got no request.
+
+**Gates** (`fix-r6/gates-summary.log`, `vm-gates-summary.log`; code at 06359ef on both, the
+docs commit after it changes no code):
+
+- **macOS:** the netguard suite twice and with `ZKMINER_CI_STRICT=1` (275 library tests,
+  nothing skipped); the live forge test twice (312,021 queries answered while 1.32 M forged
+  datagrams arrived, none taken); `zkminer-chain` (185) and its two real downloads in public
+  mode; clippy `--all-targets -D warnings`.
+- **Linux (the VM):** the suite twice on aarch64 and once strict with `ZKMINER_CI_ALLOW_SKIP=ipv6`
+  (254, nothing skipped), clippy `-D warnings`; under Rosetta (x86_64) the suite, `zkminer-chain`
+  and its real downloads, and the broker's library tests (139, strict). The first Rosetta run
+  failed only for want of Rosetta (the VM had been started without it); the broker's
+  `a_broker_that_shuts_its_reading_side_is_cut_off` then failed under the whole suite until
+  its wait was lengthened (item 8).
+- **Type-checked:** `cargo check` and clippy `--all-targets -D warnings` for
+  `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` and `aarch64-linux-android` (stub C
+  compilers): no warnings; the broker's clippy for linux-gnu: 13 warnings, all in files this
+  round did not touch (as in rounds 4 and 5).
+- **Merge:** `git merge-tree --write-tree item/W11-ON37 HEAD`: clean. `actionlint` (with
+  shellcheck) on the workflow: clean; the macOS CI diff applies to `item/W11-ON37`'s script and
+  shellcheck passes on the result (`macos-ci-shellcheck.log`).
+- **The reviewers' tests** (`reviewer-*-before.log`, `reviewer-*-after.log`): before, every
+  finding's test fails or shows the bug; after, parse's five, cross's three NAT64/resolve tests
+  and probe's two pass; bypass's NAT64 test, which asserted the bug, fails at its last
+  assertion (the broker is no longer handed the /32 whole); the facts tests of bypass and
+  cross call `linux_signature` with round 5's arguments and are ported
+  (`facts::r6_tests::r6_a_move_with_a_flushed_neighbour_table_is_never_the_old_network`).
+
+**Mutation run** (`fix-r6/mut/`): 53 mutants of this round's code on macOS (`muts.py`,
+`run.py`, each built into the shared target and its binary copied and run): 41 killed on the
+first run (`summary-run1.txt`); of the 11 survivors, five got tests or a stronger fixture
+(`993be25`: T03, F11, F13, N07, N16, all killed in `run2.out`; F04's stronger variant F04b
+killed). Six survive: T16 (the per-datagram deadline check in `ask_servers`: the reader here
+always drains the socket before the flood refills it, and the outer loop then checks the
+deadline; the check matters only for a flood faster than parsing), F04 (a weak mutant that
+stops counting instead of counting on: F04b is the real variant), N01 and N02 (the two
+independent defences against a lost wakeup, `notify_all` and the capped wait: each mutant is
+masked by the other), N03 (the loop's own check refuses an expired caller before a token, so
+the early return is equivalent), U02 (public discovery's per-family judging in its global
+state: no seam drives `learned_inner`). In the VM, 7 mutants of Linux-only lines
+(`.r6repro/vm_mut.py`, `vm-mut.log`, `vm-mut2.log`): the neighbour table never read, carrier
+changes never kept or the wrong attribute, a round on an old uplink learning the current
+gateways: killed; three survive: the facts read not waiting for, or not asking for, a missing
+gateway (L01, L02: only a root-staged flush reaches them; the live `vm-r6-flush.log` and
+`r6_asking_for_a_neighbour_makes_the_kernel_resolve_it` cover their effect), and the PREF64
+listener's call passing no gateways (L06: `Heard`'s protection is tested; the listener's state
+is process-wide, shared with other tests). The VM run also exposed a race in
+`pref64::expire` (fixed in `ce829d1`).
+
+**Linux code paths never executed** (type-checked and unit-tested): a real IPv6-only host or a
+real CLAT (`clat_in_use` from a real facts read; the staged tun of `vm-r6-clat.log` is not a
+translator); a real move between two networks behind the same router address (the carrier
+change, the flush and the MAC change ran live, each alone); a neighbour dump the kernel
+denies; Android at all. `NHA_GATEWAY` from a real dump ran live (`r6-cross/vm-r6-nh.log`,
+`fix-r6/vm-r6-nh.log`), so it leaves the list.
+
+**Open for the owner.**
+- **Windows and ICMP time exceeded** in `SYN-SENT`: unverified (no Windows runner); if Windows
+  does not surface it, every probe times out there and, with no check connection, every public
+  host is refused.
+- **S3's positive control**: the control connection refuses a peer that never acknowledges a
+  bare FIN (every AWS S3 front end); the last probe attempt makes S3 pass when its first hops
+  answer ICMP (20/20 here), but behind first hops that never send ICMP S3 is refused every time.
+- **CLAT heuristics**: by address (192.0.0.0/29) and interface name or kind; a CLAT numbered
+  and named otherwise is not recognised; such a host is now warned, once, to set
+  `[egress] nat64_prefixes`, and admits `<NSP>::10.x` until it does (or the prefix is learned).
+- **The MAC-change fail-closed cost**: an ARP spoofer on the LAN still makes IPv4 learn its public
+  address again on its first change (one unsettled state, not one per change), and a held change
+  once more; IPv6 is no longer affected by an IPv4 spoof. A real move behind the same gateway
+  address without a carrier change relearns twice.
+- **Bounded NAT64 refusals**: an attacker who keeps sending forged RAs or DNS answers keeps
+  IPv6 refused while it sends, and up to 95 minutes after (typically until the gateway's next
+  advertisement); refusing less would admit what is under a prefix the network may still use.
+- **The far-verdict memory** trades a probe for 10 s of trust in an unchanged path; set
+  `FAR_TTL` to zero (a constant) if that is not wanted.
+- **The 4th probe attempt** adds up to 3 s to a refusal that would have come anyway (a check
+  connection that failed), only when the deadline allows.
