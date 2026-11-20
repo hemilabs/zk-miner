@@ -412,8 +412,9 @@ fn uplink_signature(routes: &RouteTable, internet: &[u32]) -> u64 {
     h.finish()
 }
 
-/// macOS: the kernel's answer `answer`, which `routes` (these facts' table) admitted, must leave by
-/// a default path these facts hold (review round 3, bypass-3). [`RouteTable::judge`] admits any
+/// The kernel's answer `answer`, which `routes` (these facts' table) admitted, must leave by a
+/// default path these facts hold (review round 3, bypass-3; on every platform since the Linux
+/// application). [`RouteTable::judge`] admits any
 /// default-like route of an ordinary table whatever its gateway and interface, so an uplink that
 /// came up after the facts were read (a full-tunnel VPN's `0/1` on a `utun`, a second network's
 /// default) was admitted until the facts were read again, up to [`crate::FACTS_TTL`] later (and
@@ -423,8 +424,9 @@ fn uplink_signature(routes: &RouteTable, internet: &[u32]) -> u64 {
 /// route through one of their uplinks is: an uplink is a `/0` route's gateway and interface).
 /// Otherwise it is refused as off the default path
 /// (the gateway's or the link's kind), which rests on the facts: the policy reads them again and
-/// judges once more.
-#[cfg(target_os = "macos")]
+/// judges once more. On Linux a default route through a nexthop object reads with its hop
+/// [`crate::routes::Hop::Unknown`] in the dump; the kernel's answer for it carries the same, so
+/// such a route is held as long as the facts hold it on that interface.
 fn default_path_known(
     routes: &RouteTable,
     answer: &crate::routes::KernelAnswer,
@@ -791,16 +793,10 @@ impl HostFacts {
             Some(v) => v,
             None => {
                 let v = match oracle.route_to(dst, dport) {
-                    #[cfg(target_os = "macos")]
                     Ok(answer) => self
                         .routes
                         .judge_answer(&answer)
                         .and_then(|()| default_path_known(&self.routes, &answer))
-                        .map_err(KernelRefusal::Route),
-                    #[cfg(not(target_os = "macos"))]
-                    Ok(answer) => self
-                        .routes
-                        .judge_answer(&answer)
                         .map_err(KernelRefusal::Route),
                     Err(e) => Err(KernelRefusal::QueryFailed(e.to_string())),
                 };
