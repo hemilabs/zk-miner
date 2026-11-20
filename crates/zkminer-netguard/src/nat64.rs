@@ -133,7 +133,7 @@ impl std::fmt::Display for Source {
             ),
             Source::System => f.write_str("the system's NAT64 state"),
             #[cfg(test)]
-            Source::Given(n) => write!(f, "test source {n}"),
+            Source::Given(n) => write!(f, "test source #{n}."),
         }
     }
 }
@@ -268,9 +268,15 @@ pub fn set_configured(prefixes: &[Prefix]) -> Result<(), String> {
 /// `gateways` (address, interface): learned prefixes are synthesized with on that uplink only,
 /// and PREF64 is heard from those routers only.
 pub(crate) fn on_uplink(signature: u64, gateways: &[(Ipv6Addr, u32)]) {
-    let mut r = registry();
-    r.on = Some(signature);
-    r.gateways = gateways.to_vec();
+    {
+        let mut r = registry();
+        r.on = Some(signature);
+        r.gateways = gateways.to_vec();
+    }
+    // Linux: a PREF64 prefix whose lifetime ran out is withdrawn now (review round 5, cross-1),
+    // not at the next round, up to DISCOVERY_TTL later.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pref64::expire(signature, gateways, Instant::now());
 }
 
 /// Why a prefix named on uplink `signature` could not be held, if one could not: the uplink is
@@ -283,7 +289,11 @@ pub(crate) fn unheld(signature: u64) -> Option<String> {
         .map(|(_, why)| why.clone())
 }
 
-fn mark_unheld(r: &mut Registry, uplink: u64, why: String) {
+/// Marks `uplink` unsettled for what `source` named (`why`, which begins with the source's name:
+/// one mark per uplink and source, review round 5: a source whose next answer fits clears its
+/// own mark, [`learn`], and no other's).
+fn mark_unheld(r: &mut Registry, uplink: u64, source: Source, why: String) {
+    debug_assert!(why.starts_with(&source.to_string()), "{why}");
     for (on, marked) in &mut r.rounds {
         if *on == uplink {
             *marked = true;
@@ -296,11 +306,17 @@ fn mark_unheld(r: &mut Registry, uplink: u64, why: String) {
         "network guard: {why}; IPv6 destinations are refused on this network until it clears \
          (an address under a NAT64 prefix the guard does not hold can carry a private IPv4 address)"
     );
-    r.unheld.retain(|(s, _)| *s != uplink);
+    clear_unheld(r, uplink, source);
     r.unheld.push((uplink, why));
-    if r.unheld.len() > 8 {
+    if r.unheld.len() > 32 {
         r.unheld.remove(0);
     }
+}
+
+/// Clears `source`'s mark on `uplink`, if it has one.
+fn clear_unheld(r: &mut Registry, uplink: u64, source: Source) {
+    let name = source.to_string();
+    r.unheld.retain(|(s, w)| !(*s == uplink && w.starts_with(&name)));
 }
 
 /// Marks `uplink` unsettled once its round has finished (tests).
@@ -312,7 +328,7 @@ pub(crate) fn unheld_after_round(uplink: u64, why: &str) {
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    mark_unheld(&mut registry(), uplink, why.into());
+    mark_unheld(&mut registry(), uplink, Source::Given(u32::MAX), format!("test source #{}. {why}", u32::MAX));
 }
 
 /// Starts a round on `uplink`: what could not be held there before is asked again. Its mark
@@ -368,6 +384,10 @@ fn learn(
             named.push((*p, *life));
         }
     }
+    // What this source named before that could not be held is judged again on what it names
+    // now, under the same lock (review round 5, cross-1: a source that withdrew what it could not
+    // hold, or whose prefixes ran out, no longer leaves its uplink unsettled until a round ends).
+    clear_unheld(r, uplink, source);
     let mut changed = false;
     for e in r
         .learned
@@ -383,6 +403,7 @@ fn learn(
         mark_unheld(
             r,
             uplink,
+            source,
             format!(
                 "{source} named {} NAT64 prefixes, more than the {} the network guard believes of \
                  one source",
@@ -411,6 +432,7 @@ fn learn(
             mark_unheld(
                 r,
                 uplink,
+                source,
                 format!("{source} named NAT64 prefix {p}, past the {MAX_PER_UPLINK} the network guard holds for one network"),
             );
             continue;
@@ -433,6 +455,7 @@ fn learn(
                     mark_unheld(
                         r,
                         uplink,
+                        source,
                         format!("{source} named NAT64 prefix {p}, past the {MAX_LEARNED} the network guard holds"),
                     );
                     continue;
@@ -816,7 +839,7 @@ fn ask_and_learn_at(uplink: u64, at: &[SocketAddr], timeout: Duration) -> Result
                     found.into_iter().map(|p| (p, None)).collect();
                 learn_in(&mut r, uplink, source, &found);
             }
-            Err(e) => mark_unheld(&mut r, uplink, format!("{source}: {e}")),
+            Err(e) => mark_unheld(&mut r, uplink, source, format!("{source}: {e}")),
         }
     }
     Ok(found_any)
@@ -1261,6 +1284,27 @@ pub(crate) mod pref64 {
         s.1.named_by(gateways, now)
     }
 
+    /// Drops what ran out by `now`; when anything did, what the gateways `gateways` of uplink
+    /// `uplink` name now is learned at once (a source that no longer names more than it may
+    /// clears its mark: [`super::learn`]).
+    pub(crate) fn expire(uplink: u64, gateways: &[(std::net::Ipv6Addr, u32)], now: Instant) {
+        let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.0 {
+            return;
+        }
+        let before = s.1.len();
+        s.1.on(Some(uplink));
+        s.1.prune(now);
+        if s.1.len() == before {
+            return;
+        }
+        let learn = s.1.named_by(gateways, now);
+        drop(s);
+        for (source, prefixes) in learn {
+            super::learn_on(uplink, source, &prefixes);
+        }
+    }
+
     /// A route netlink socket in the `RTNLGRP_ND_USEROPT` group.
     pub(crate) fn subscribe() -> io::Result<OwnedFd> {
         // SAFETY: plain socket(2); the fd is owned by the OwnedFd from here on.
@@ -1433,6 +1477,11 @@ impl Heard {
     /// Notes that what is heard from now on, and what [`Self::named_by`] reads, is on `uplink`.
     pub(crate) fn on(&mut self, uplink: Option<u64>) {
         self.uplink = uplink;
+    }
+
+    /// How many entries are held.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 
     /// Drops every entry whose lifetime has run out at `now`.
@@ -2815,6 +2864,7 @@ mod r5_tests {
                 assert_eq!(named.len(), 1, "{named:?}");
             }
             let now = t0 + Duration::from_secs(3600 * 5);
+            assert_eq!(h.len(), 1, "only the live prefix is held");
             assert!(active(&r, "2001:db8:105::/96"));
             assert_eq!(in_force_of(&r, now), vec![p("2001:db8:105::/96")]);
             for i in 0..5 {
@@ -2919,6 +2969,43 @@ mod r5_tests {
             clat: true,
         };
         assert!(up.ipv6_only() && up.refuses_ipv6(false) && !up.refuses_ipv6(true));
+    }
+
+    /// cross-1 (live: one forged advertisement, then its withdrawal): the source's next naming
+    /// clears its own mark at once, without waiting for a round; another source's mark stays.
+    #[test]
+    fn r5_a_source_that_names_what_fits_clears_its_own_mark() {
+        let gw = (ip6("fe80::1"), 2u32);
+        let t0 = Instant::now();
+        let mut h = Heard::new();
+        h.on(Some(5));
+        let mut r = Registry {
+            on: Some(5),
+            ..Registry::default()
+        };
+        let forged: Vec<Announced> = (1..=5)
+            .map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 600))
+            .collect();
+        h.hear(&forged, &[gw], t0);
+        for (source, named) in h.named_by(&[gw], t0) {
+            learn(&mut r, 5, source, &named, t0);
+        }
+        let dns = Source::Dns64("192.0.2.53".parse().unwrap());
+        mark_unheld(&mut r, 5, dns, format!("{dns}: its answer is not believed"));
+        assert_eq!(r.unheld.iter().filter(|(s, _)| *s == 5).count(), 2);
+        let off: Vec<Announced> = (1..=5)
+            .map(|i| ann(&format!("2001:db8:{i:x}::/96"), gw.0, 0))
+            .collect();
+        let t1 = t0 + Duration::from_secs(1);
+        h.hear(&off, &[gw], t1);
+        for (source, named) in h.named_by(&[gw], t1) {
+            learn(&mut r, 5, source, &named, t1);
+        }
+        let left: Vec<&String> = r.unheld.iter().filter(|(s, _)| *s == 5).map(|(_, w)| w).collect();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(left[0].starts_with("the DNS server 192.0.2.53"), "{left:?}");
+        learn(&mut r, 5, dns, &[], t1);
+        assert!(r.unheld.is_empty());
     }
 
     /// parse-3: what a router heard on one uplink announced is not named on another, even by a
@@ -3026,19 +3113,19 @@ mod r5_round_tests {
     #[test]
     fn r5_a_rounds_marks_replace_the_old_ones_when_it_ends() {
         let mut r = Registry::default();
-        mark_unheld(&mut r, 1, "old".into());
+        mark_unheld(&mut r, 1, Source::Given(1), "test source #1. old".into());
         round_begins(&mut r, 1);
         assert!(r.unheld.iter().any(|(s, _)| *s == 1));
         round_ends(&mut r, 1);
         assert!(r.unheld.is_empty());
-        mark_unheld(&mut r, 1, "old".into());
+        mark_unheld(&mut r, 1, Source::Given(1), "test source #1. old".into());
         round_begins(&mut r, 1);
-        mark_unheld(&mut r, 1, "old".into());
+        mark_unheld(&mut r, 1, Source::Given(1), "test source #1. old".into());
         round_ends(&mut r, 1);
-        assert_eq!(r.unheld, vec![(1, "old".to_string())]);
+        assert_eq!(r.unheld, vec![(1, "test source #1. old".to_string())]);
         round_begins(&mut r, 2);
         round_ends(&mut r, 1);
         round_ends(&mut r, 2);
-        assert_eq!(r.unheld, vec![(1, "old".to_string())]);
+        assert_eq!(r.unheld, vec![(1, "test source #1. old".to_string())]);
     }
 }
