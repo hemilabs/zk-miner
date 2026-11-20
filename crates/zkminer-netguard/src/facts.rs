@@ -4004,6 +4004,38 @@ mod r6_tests {
         assert_eq!(HostFacts::new(vec![], vec![]).path_key(), None, "facts given by the caller");
     }
 
+    /// Review round 6 (fix-r6 mutation L02, Linux, live): asking for a neighbour makes the kernel
+    /// resolve it (an entry appears, at least incomplete), unprivileged. An address of the IPv4
+    /// default gateway's subnet that no entry holds: one ARP request.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn r6_asking_for_a_neighbour_makes_the_kernel_resolve_it() {
+        let f = HostFacts::gather_with(&FactsOptions { discover_public_addresses: false, ..FactsOptions::default() }).unwrap();
+        let Some((gw, ifindex)) = default_gateways(f.routes(), &[]).into_iter().find(|(g, _)| g.is_ipv4()) else {
+            crate::skipped("no IPv4 default gateway here");
+            return;
+        };
+        let IpAddr::V4(g) = gw else { unreachable!() };
+        let table = crate::routes::read_neighbours().unwrap();
+        let Some(probe) = (1..255u8)
+            .rev()
+            .map(|last| IpAddr::from([g.octets()[0], g.octets()[1], g.octets()[2], last]))
+            .find(|a| *a != gw && !table.iter().any(|n| n.addr == *a) && !f.own_addresses().contains(a))
+        else {
+            crate::skipped("no free address in the gateway's /24");
+            return;
+        };
+        ask_for_neighbour(probe, ifindex);
+        let t = Instant::now();
+        while t.elapsed() < RESOLVE_WAIT {
+            if crate::routes::read_neighbours().unwrap().iter().any(|n| n.addr == probe) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no neighbour entry for {probe} after asking");
+    }
+
     /// cross-7 V02 (Linux, live): the facts read the neighbour table (a host with an IPv4
     /// default gateway has its entry, the read asking for it when missing).
     #[cfg(any(target_os = "linux", target_os = "android"))]
