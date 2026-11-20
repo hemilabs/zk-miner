@@ -941,16 +941,23 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant
     if ic.state != TcpState::Established {
         return ConfirmOutcome::Failed(peer_closed_first(ic.state, Conn::Check));
     }
-    let mut decision = match Check::new(ic.rtt, ic.rto) {
-        Ok(d) => d,
-        Err(o) => return o,
-    };
     // The hop-limited FIN first; then the control connection is made and its FIN sent. An
     // acknowledgement of the check's FIN that comes meanwhile is near at once.
     if let Err(e) = check.shutdown(std::net::Shutdown::Write) {
         return ConfirmOutcome::Failed(e.to_string());
     }
     let start = std::time::Instant::now();
+    // Review round 6, probe-1: macOS reports the retransmission timeout only while its timer is
+    // armed (0 on an idle connection, so the margin for a retransmitted FIN's acknowledgement
+    // collapsed to ~50 ms): read again now that the FIN is out, and an RTO still unknown is
+    // UNKNOWN_RTO.
+    let rto = check_rto(ic.rto, rc.info().ok().map(|i| i.rto));
+    #[cfg(test)]
+    LAST_RTO.store(rto.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
+    let mut decision = match Check::new(ic.rtt, rto) {
+        Ok(d) => d,
+        Err(o) => return o,
+    };
     let check_state = || rc.info().map(|i| i.state);
     let near_already = |d: &mut Check| {
         let state = check_state();
@@ -990,6 +997,27 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// The retransmission timeout taken when the kernel reports none (review round 6, probe-1): RFC
+/// 6298's initial RTO, more than any path the check can judge needs (Linux's minimum is 200 ms).
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+pub const UNKNOWN_RTO: Duration = Duration::from_secs(1);
+
+/// The check connection's retransmission timeout: the larger of what the kernel reported before
+/// and after the FIN was sent, [`UNKNOWN_RTO`] when both are zero (unknown, never "none").
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+fn check_rto(before: Duration, after: Option<Duration>) -> Duration {
+    let rto = before.max(after.unwrap_or_default());
+    if rto.is_zero() {
+        UNKNOWN_RTO
+    } else {
+        rto
+    }
+}
+
+/// The RTO the last check connection used, in milliseconds (tests).
+#[cfg(test)]
+static LAST_RTO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The longest the check connection may wait for the decision ([`Check`]); a path whose round
 /// trip asks for longer is refused (`round trip too long`), never decided with a shorter wait.
@@ -2642,6 +2670,38 @@ mod r6_tests {
 
     fn recording(confirm: ConfirmOutcome, last: ProbeOutcome) -> Recording {
         Recording { confirm, last, confirm_timeouts: Mutex::new(Vec::new()), lasts: Mutex::new(0) }
+    }
+
+    /// probe-1 (`r6_macos_rto_zero_reads_a_retransmitted_near_ack_as_far`, live
+    /// `r6-probe/exp/rto-macos.log`: macOS reads 0 before the FIN): an unknown RTO is never
+    /// zero, so the far margin always covers a retransmission of the FIN (macOS and Linux alike).
+    #[test]
+    fn r6_the_check_never_uses_a_zero_rto() {
+        let ms = Duration::from_millis;
+        assert_eq!(check_rto(ms(0), Some(ms(242))), ms(242));
+        assert_eq!(check_rto(ms(0), None), UNKNOWN_RTO);
+        assert_eq!(check_rto(ms(0), Some(ms(0))), UNKNOWN_RTO);
+        assert_eq!(check_rto(ms(300), Some(ms(200))), ms(300));
+        // The reviewer's case: rtt 14 ms, the near peer's ACK of the retransmitted FIN at
+        // ~rto + rtt; with the RTO read as 0 the check read far at ~306 ms.
+        let c = Check::new(ms(14), check_rto(ms(0), None)).unwrap();
+        assert!(c.far_after(ms(0)) > UNKNOWN_RTO + ms(14), "{c:?}");
+    }
+
+    /// probe-1, live: the RTO the check connection used is not zero (a local listener: near).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn r6_the_live_check_uses_a_nonzero_rto() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let _keep = std::thread::spawn(move || {
+            let held: Vec<_> = l.incoming().take(2).collect();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(held);
+        });
+        let o = confirm_once(addr, 2, Duration::from_secs(2), Instant::now() + Duration::from_secs(10));
+        assert_eq!(o, ConfirmOutcome::Answered, "{o:?}");
+        assert!(LAST_RTO.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 
     /// cross-7 N11: the check connection's connect is bounded by the caller's deadline.
