@@ -496,10 +496,17 @@ impl Connector {
         }
         let (tx, mut rx) = mpsc::channel::<(usize, SocketAddr, Option<zkminer_netguard::Vetted>)>(2);
         let more = [Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0))];
-        let mut chains = JoinSet::new();
-        for (fam, list) in families.into_iter().enumerate().filter(|(_, l)| !l.is_empty()) {
+        // Nothing to vet (developer mode, a literal): every address in order, on this task.
+        let mut direct: VecDeque<(usize, SocketAddr, Option<zkminer_netguard::Vetted>)> = VecDeque::new();
+        if !need_vet {
+            for (fam, list) in families.iter().enumerate() {
+                direct.extend(list.iter().map(|ip| (fam, SocketAddr::new(*ip, st.ep.port), None)));
+            }
+            families = [Vec::new(), Vec::new()];
+        }
+        let chain = |fam: usize, list: Vec<IpAddr>| {
             let (me, st, tx, more) = (self.clone(), st.clone(), tx.clone(), more[fam].clone());
-            chains.spawn(async move {
+            async move {
                 if fam == 1 {
                     tokio::time::sleep_until((Instant::now() + FAMILY_DELAY).min(deadline)).await;
                 }
@@ -509,26 +516,29 @@ impl Connector {
                         break;
                     }
                     let addr = SocketAddr::new(ip, st.ep.port);
-                    let vetted = if need_vet {
-                        match me.vet_before_connecting(&st, addr, deadline).await {
-                            Ok(v) => Some(v),
-                            Err(could_not_tell) => {
-                                unanswered += usize::from(could_not_tell);
-                                continue;
+                    match me.vet_before_connecting(&st, addr, deadline).await {
+                        Ok(v) => {
+                            if tx.send((fam, addr, Some(v))).await.is_err() {
+                                return;
+                            }
+                            match more.acquire().await {
+                                Ok(p) => p.forget(),
+                                Err(_) => return,
                             }
                         }
-                    } else {
-                        None
-                    };
-                    if tx.send((fam, addr, vetted)).await.is_err() {
-                        return;
-                    }
-                    match more.acquire().await {
-                        Ok(p) => p.forget(),
-                        Err(_) => return,
+                        Err(could_not_tell) => unanswered += usize::from(could_not_tell),
                     }
                 }
-            });
+            }
+        };
+        // The first family's chain runs on this task (no spawn's latency before the usual case's
+        // first connection), the other on a task of its own.
+        let [first, second] = families;
+        let mut chain0 = Box::pin(chain(0, first));
+        let mut chain0_done = !need_vet;
+        let mut chains = JoinSet::new();
+        if !second.is_empty() {
+            chains.spawn(chain(1, second));
         }
         drop(tx);
         let mut i = 0u32;
@@ -538,7 +548,19 @@ impl Connector {
             if let Some(f) = failed_family.take() {
                 more[f].add_permits(1);
             }
-            let Ok(Some((fam, addr, vetted))) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+            let next = if need_vet {
+                loop {
+                    tokio::select! {
+                        biased;
+                        item = rx.recv() => break item,
+                        () = &mut chain0, if !chain0_done => chain0_done = true,
+                        () = tokio::time::sleep_until(deadline) => break None,
+                    }
+                }
+            } else {
+                direct.pop_front().filter(|_| Instant::now() < deadline)
+            };
+            let Some((fam, addr, vetted)) = next else {
                 break;
             };
             failed_family = Some(fam);
