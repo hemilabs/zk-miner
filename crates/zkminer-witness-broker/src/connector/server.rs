@@ -818,8 +818,15 @@ fn first_host(p: &Prefix) -> Option<IpAddr> {
 /// (the check gives up at the deadline; this covers its last step).
 const CHECK_SLACK: Duration = Duration::from_millis(500);
 
-/// A fresh TCP connection to `addr` (`socket` + `connect`, no `bind`), as an owned fd.
+/// A fresh TCP connection to `addr` (`socket` + `connect`, bound to `source` when given), as an
+/// owned fd. An IPv4-mapped address is connected to as its IPv4 address, on an IPv4 socket
+/// (review round 5, bypass-5: an IPv6 socket bound to the IPv4 source the check vetted failed
+/// with `EINVAL`), as the guarded client's hops do.
 async fn connect_tcp(addr: SocketAddr, source: Option<IpAddr>) -> io::Result<OwnedFd> {
+    let addr = match addr.ip() {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, |v4| SocketAddr::new(IpAddr::V4(v4), addr.port())),
+        IpAddr::V4(_) => addr,
+    };
     let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
     if let Some(src) = source {
         sock.bind(SocketAddr::new(src, 0))?;

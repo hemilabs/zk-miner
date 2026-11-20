@@ -748,3 +748,18 @@ async fn r5_a_slow_near_hop_check_does_not_lose_its_address() {
     assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1);
     assert_eq!(s.await.unwrap(), SessionEnd::Closed);
 }
+
+/// Review round 5, bypass-5: an IPv4-mapped address is connected to on an IPv4 socket, from the
+/// IPv4 source the check vetted (an IPv6 socket bound to it failed with EINVAL).
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
+    let fd = connect_tcp(mapped, Some("127.0.0.1".parse().unwrap())).await.expect("connected");
+    let stream = std::net::TcpStream::from(fd);
+    assert_eq!(stream.peer_addr().unwrap(), format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap());
+    assert!(stream.local_addr().unwrap().is_ipv4());
+    let fd = connect_tcp(mapped, None).await.expect("connected without a source too");
+    assert!(std::net::TcpStream::from(fd).local_addr().unwrap().is_ipv4());
+}
