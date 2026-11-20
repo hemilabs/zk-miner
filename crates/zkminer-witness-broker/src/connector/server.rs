@@ -34,6 +34,11 @@ use crate::fdpass::{recvmsg_once, retry_eintr, sendmsg_once};
 
 /// How often a host name without any admitted address is resolved again.
 pub const RETRY_UNRESOLVED_EVERY: Duration = Duration::from_secs(10);
+/// Most of the floor's blocking checks (`vet_path`, `recheck_connected`) running at once (review
+/// round 4): a check that outlives its share of the connect time is abandoned but its blocking
+/// thread runs on (a probe, a check connection: seconds), holding its turn until it ends, so a
+/// broker cannot pile up blocking threads by asking faster than checks finish.
+pub const MAX_CHECKS_AT_ONCE: usize = 4;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -170,6 +175,8 @@ pub struct Connector {
     reresolve: Duration,
     connect_timeout: Duration,
     bucket: Mutex<Bucket>,
+    /// Turns for the floor's blocking checks ([`MAX_CHECKS_AT_ONCE`]).
+    checks: Arc<Semaphore>,
     pub stats: ConnectorStats,
 }
 
@@ -236,6 +243,7 @@ impl Connector {
             reresolve: cfg.dns.reresolve,
             connect_timeout: cfg.timeouts.connect(),
             bucket: Mutex::new(Bucket { tokens: f64::from(RATE_BURST), at: Instant::now() }),
+            checks: Arc::new(Semaphore::new(MAX_CHECKS_AT_ONCE)),
             stats: ConnectorStats::default(),
         }))
     }
@@ -448,7 +456,16 @@ impl Connector {
             let mut vetted = None;
             if self.mode == NetMode::Public || st.ep.dns_derived() {
                 let floor = self.floor.clone();
-                match tokio::time::timeout(share, tokio::task::spawn_blocking(move || floor.vet_path(addr, addr))).await {
+                let Ok(Ok(turn)) = tokio::time::timeout(share, self.checks.clone().acquire_owned()).await else {
+                    tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: no turn for the check before connecting");
+                    continue;
+                };
+                // The turn is held by the blocking check until it ends, abandoned or not.
+                let check = move || {
+                    let _turn = turn;
+                    floor.vet_path(addr, addr)
+                };
+                match tokio::time::timeout(share, tokio::task::spawn_blocking(check)).await {
                     Ok(Ok(Ok(v))) => vetted = Some(v),
                     Ok(Ok(Err(d))) => {
                         tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: address refused right before connecting");
@@ -462,7 +479,10 @@ impl Connector {
             }
             let share = share.saturating_sub(now.elapsed());
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
-            match tokio::time::timeout(share, connect_tcp(addr)).await {
+            // From the source the check vetted (the kernel's for a TCP connection: review round
+            // 4, cross-3), so the connection leaves from it.
+            let source = vetted.as_ref().and_then(|v: &zkminer_netguard::Vetted| v.source);
+            match tokio::time::timeout(share, connect_tcp(addr, source)).await {
                 Ok(Ok(fd)) => {
                     // Once made, before the broker gets it: the connection's own addresses must be
                     // the vetted ones and the route still admitted, the kernel asked afresh (a route
@@ -477,7 +497,15 @@ impl Connector {
                             continue;
                         };
                         let floor = self.floor.clone();
-                        match tokio::task::spawn_blocking(move || floor.recheck_connected(&v, local, peer)).await {
+                        let Ok(Ok(turn)) = tokio::time::timeout_at(deadline, self.checks.clone().acquire_owned()).await else {
+                            tracing::debug!(endpoint = %st.ep.alias, address = %addr, "connector: no turn for the check once connected; closed");
+                            continue;
+                        };
+                        let recheck = move || {
+                            let _turn = turn;
+                            floor.recheck_connected(&v, local, peer)
+                        };
+                        match tokio::task::spawn_blocking(recheck).await {
                             Ok(Ok(())) => {}
                             Ok(Err(d)) => {
                                 tracing::warn!(endpoint = %st.ep.alias, address = %addr, refusal = %d, "connector: connection refused once made; closed");
@@ -780,8 +808,11 @@ fn first_host(p: &Prefix) -> Option<IpAddr> {
 }
 
 /// A fresh TCP connection to `addr` (`socket` + `connect`, no `bind`), as an owned fd.
-async fn connect_tcp(addr: SocketAddr) -> io::Result<OwnedFd> {
+async fn connect_tcp(addr: SocketAddr, source: Option<IpAddr>) -> io::Result<OwnedFd> {
     let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+    if let Some(src) = source {
+        sock.bind(SocketAddr::new(src, 0))?;
+    }
     let stream = sock.connect(addr).await?;
     Ok(OwnedFd::from(stream.into_std()?))
 }

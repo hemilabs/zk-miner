@@ -336,6 +336,68 @@ async fn a_near_destination_is_refused_before_connecting() {
     }
 }
 
+/// Review round 4, cross-6: the connection, once made, is checked again before the broker gets
+/// it (`recheck_connected`): a route that is the default path when the address is vetted and
+/// gone once connected closes it (no socket handed over); one that stays hands it over. A real
+/// public peer (1.1.1.1:443; skipped where unreachable), a staged route oracle and probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_is_checked_again_once_made() {
+    use zkminer_netguard::routes::{KernelAnswer, Route, RouteOracle};
+    #[derive(Debug)]
+    struct Flip {
+        admitted: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+    impl RouteOracle for Flip {
+        fn route_to(&self, _: IpAddr, dport: Option<u16>) -> io::Result<KernelAnswer> {
+            let default = Route::via("0.0.0.0/0".parse().unwrap(), "192.168.1.1".parse().unwrap(), 2);
+            if dport.is_none() {
+                return Ok(KernelAnswer::Entry(vec![default]));
+            }
+            let n = self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(if n < self.admitted { KernelAnswer::Entry(vec![default]) } else { KernelAnswer::NoRoute })
+        }
+    }
+    let peer: SocketAddr = "1.1.1.1:443".parse().unwrap();
+    if std::net::TcpStream::connect_timeout(&peer, Duration::from_secs(5)).is_err() {
+        eprintln!("SKIPPED: {peer} unreachable here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://1.1.1.1:443", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    let deny = Connector::deny_for(&cfg, &[], &[]);
+    for (admitted, connected) in [(1, false), (2, true)] {
+        let facts = zkminer_netguard::HostFacts::assemble(
+            zkminer_netguard::RawFacts {
+                interface_prefixes: vec!["192.168.1.0/24".parse().unwrap()],
+                interface_addresses: vec!["192.168.1.33".parse().unwrap()],
+                routes: vec![Route::via("0.0.0.0/0".parse().unwrap(), "192.168.1.1".parse().unwrap(), 2)],
+                ..Default::default()
+            },
+            &zkminer_netguard::FactsOptions {
+                discover_public_addresses: false,
+                public_addresses: vec!["198.51.99.7".parse().unwrap()],
+                ..Default::default()
+            },
+        )
+        .with_route_oracle(Arc::new(Flip { admitted, asked: Default::default() }));
+        let floor = NetPolicy::with_facts(NetMode::Public, facts, deny.clone()).with_near_probe(zkminer_netguard::FixedProbe::far());
+        let c = Connector::with_floor(&cfg, vec![], floor).unwrap();
+        let (b, s) = session(&c);
+        let (resp, fd) = blocking(move || {
+            let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+            drop(b);
+            r
+        })
+        .await;
+        assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "connected once");
+        assert_eq!(resp.status == Status::Connected, connected, "{admitted}: {resp:?}");
+        assert_eq!(fd.is_some(), connected, "{admitted}");
+        assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+    }
+}
+
 /// A listener that accepts every connection on a thread and keeps the accepted streams, so the
 /// connector's connects complete.
 struct Endpoint {
