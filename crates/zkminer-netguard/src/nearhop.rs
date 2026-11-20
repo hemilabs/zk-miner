@@ -381,30 +381,10 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     if let Err(e) = set_hops(&sock, addr, hops) {
         return ConfirmOutcome::Failed(e.to_string());
     }
-    let info = |fd: i32| -> io::Result<libc::tcp_connection_info> {
-        // SAFETY: a zeroed tcp_connection_info (plain integers) is valid to be overwritten by
-        // getsockopt.
-        let mut i: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
-        // SAFETY: `i` and `len` are valid for the size given.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CONNECTION_INFO,
-                (&mut i as *mut libc::tcp_connection_info).cast(),
-                &mut len,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(i)
-    };
     let fd = sock.as_raw_fd();
-    let rtt = match info(fd) {
+    let rtt = match connection_info(fd) {
         // Milliseconds; the smoothed round trip, or the last one before there is one.
-        Ok(i) => Duration::from_millis(u64::from(i.tcpi_srtt.max(i.tcpi_rttcur))),
+        Ok(i) => Duration::from_millis(u64::from(i.srtt_ms.max(i.rttcur_ms))),
         Err(e) => return ConfirmOutcome::Failed(e.to_string()),
     };
     if let Err(e) = sock.shutdown(std::net::Shutdown::Write) {
@@ -417,9 +397,9 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     let deadline = std::time::Instant::now() + wait;
     const TCPS_FIN_WAIT_1: u8 = 6;
     loop {
-        match info(fd) {
+        match connection_info(fd) {
             // FIN_WAIT_2, CLOSING, TIME_WAIT, CLOSED: the FIN was acknowledged, or the peer reset.
-            Ok(i) if i.tcpi_state != TCPS_FIN_WAIT_1 => return ConfirmOutcome::Answered,
+            Ok(i) if i.state != TCPS_FIN_WAIT_1 => return ConfirmOutcome::Answered,
             Ok(_) => {}
             Err(e) => return ConfirmOutcome::Failed(e.to_string()),
         }
@@ -428,6 +408,68 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// The fields of a `struct tcp_connection_info` (<netinet/tcp.h>) the check connection reads.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConnectionInfo {
+    /// `tcpi_state`: a <netinet/tcp_fsm.h> state.
+    state: u8,
+    /// `tcpi_rttcur`, `tcpi_srtt`: the last and the smoothed round trip, in milliseconds.
+    rttcur_ms: u32,
+    srtt_ms: u32,
+}
+
+/// The bytes of a `tcp_connection_info` that must have been written for [`ConnectionInfo`] to be
+/// read: up to the end of `tcpi_srtt` (48). The libc crate's struct is 176 bytes and the SDK's
+/// 112 (the kernel writes 112: review round 1, probe-1), so only the fields within what the kernel
+/// says it wrote are read, never the libc struct's tail; the offsets are the SDK's (`tcpi_state`
+/// 0, `tcpi_rttcur` 40, `tcpi_srtt` 44), checked in the tests.
+#[cfg(target_os = "macos")]
+const CONNECTION_INFO_NEEDED: usize =
+    std::mem::offset_of!(libc::tcp_connection_info, tcpi_srtt) + 4;
+
+/// [`ConnectionInfo`] from a `tcp_connection_info` of which the kernel wrote `len` bytes; an
+/// error when that does not reach `tcpi_srtt`'s end.
+#[cfg(target_os = "macos")]
+fn connection_info_fields(i: &libc::tcp_connection_info, len: usize) -> io::Result<ConnectionInfo> {
+    if len < CONNECTION_INFO_NEEDED || len > std::mem::size_of::<libc::tcp_connection_info>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TCP_CONNECTION_INFO wrote {len} bytes, not the {CONNECTION_INFO_NEEDED} needed"
+            ),
+        ));
+    }
+    Ok(ConnectionInfo {
+        state: i.tcpi_state,
+        rttcur_ms: i.tcpi_rttcur,
+        srtt_ms: i.tcpi_srtt,
+    })
+}
+
+/// `getsockopt(TCP_CONNECTION_INFO)` on `fd`, read as [`connection_info_fields`] says.
+#[cfg(target_os = "macos")]
+fn connection_info(fd: i32) -> io::Result<ConnectionInfo> {
+    // SAFETY: a zeroed tcp_connection_info (plain integers) is valid to be overwritten by
+    // getsockopt.
+    let mut i: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: `i` and `len` are valid for the size given; the kernel writes at most `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            (&mut i as *mut libc::tcp_connection_info).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    connection_info_fields(&i, len as usize)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
@@ -580,6 +622,57 @@ mod tests {
         accept.join().unwrap();
         // Nothing listening any more: the check connection does not connect, refused.
         assert!(matches!(decide(&Silent, addr, 2), Verdict::Failed(_)));
+    }
+
+    /// probe-1: `TCP_CONNECTION_INFO` is read only within what the kernel wrote (112 bytes here,
+    /// the SDK's struct, while the libc crate's is 176), and fails when that does not reach
+    /// `tcpi_srtt`; the fields read are at the SDK's offsets.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn connection_info_is_read_within_what_the_kernel_wrote() {
+        use std::mem::offset_of;
+        use std::os::fd::AsRawFd;
+        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_state), 0);
+        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_rttcur), 40);
+        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_srtt), 44);
+        assert_eq!(CONNECTION_INFO_NEEDED, 48);
+        // SAFETY: plain integers.
+        let mut i: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+        i.tcpi_state = 4;
+        i.tcpi_srtt = 7;
+        let size = std::mem::size_of::<libc::tcp_connection_info>();
+        for len in [48, 112, size] {
+            assert_eq!(
+                connection_info_fields(&i, len).unwrap(),
+                ConnectionInfo {
+                    state: 4,
+                    rttcur_ms: 0,
+                    srtt_ms: 7
+                }
+            );
+        }
+        for len in [0, 4, 40, 47, size + 1] {
+            assert!(connection_info_fields(&i, len).is_err(), "{len}");
+        }
+        // The kernel's answer for a real connection.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let mut len = size as libc::socklen_t;
+        // SAFETY: `i` and `len` are valid for the size given.
+        let rc = unsafe {
+            libc::getsockopt(
+                c.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONNECTION_INFO,
+                (&mut i as *mut libc::tcp_connection_info).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        eprintln!("TCP_CONNECTION_INFO: the kernel wrote {len} of {size} bytes");
+        assert!(len as usize >= CONNECTION_INFO_NEEDED, "{len}");
+        // TCPS_ESTABLISHED.
+        assert_eq!(connection_info(c.as_raw_fd()).unwrap().state, 4);
     }
 
     /// The check connection to a listener on loopback (zero hops) and to an IPv6 one: answered,
