@@ -2341,7 +2341,14 @@ pub fn windows_failure_is_host_shortage(
         }
         _ => false,
     };
-    by_code || by_fall
+    // `STATUS_IN_PAGE_ERROR`: a page could not be brought in, which is what a process gets when the
+    // page file cannot back it. A host shortage when commit was at the low-water mark during the
+    // proof, even if it started there (no fall to see): 9 of 9 such deaths on a 5090 came seconds
+    // after a sibling worker was recycled with commit near the limit, and each excluded the card.
+    const STATUS_IN_PAGE_ERROR: u32 = 0xC000_0006;
+    let in_page = exit_code.is_some_and(|c| c as u32 == STATUS_IN_PAGE_ERROR)
+        && lowest.is_some_and(|l| l <= HOST_SHORT_LOW_WATER_BYTES);
+    by_code || by_fall || in_page
 }
 
 #[cfg(test)]
@@ -3629,6 +3636,19 @@ mod windows_commit_tests {
             None,
             Some(30 * GIB),
             Some(GIB)
+        ));
+        // An in-page error with commit at the low water is the host's, even with no fall (it started
+        // there); with commit above it, it is not.
+        let in_page = Some(0xC000_0006u32 as i32);
+        assert!(windows_failure_is_host_shortage(
+            in_page,
+            Some(GIB),
+            Some(GIB)
+        ));
+        assert!(!windows_failure_is_host_shortage(
+            in_page,
+            Some(GIB),
+            Some(HOST_SHORT_LOW_WATER_BYTES + GIB)
         ));
         // Not low enough.
         assert!(!windows_failure_is_host_shortage(
