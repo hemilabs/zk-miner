@@ -25,9 +25,12 @@
 //!   table only a selector reaches: a scoped default route (a system utun's or a second
 //!   interface's `default … UGScI`) is no default route and its gateway no uplink, and any other
 //!   scoped route that does not take the default path still refuses what it holds.
-//! - **the kernel per destination** ([`query`]): an `RTM_GET` for the destination on a fresh
-//!   `PF_ROUTE` socket, matched by `rtm_pid` and `rtm_seq` (every routing socket sees every
-//!   routing message), answered with the route the kernel's lookup picks (a clone on the primary
+//! - **the kernel per destination** ([`query`]): an `RTM_GET` (sent as `RTM_GET_SILENT`, so the
+//!   answer goes to this socket alone) for the destination on a fresh `PF_ROUTE` socket, with a
+//!   sequence number drawn for it from the CSPRNG; the answer is the one datagram that is exactly
+//!   an `RTM_GET` message with this process's `rtm_pid` and that `rtm_seq` (every routing socket
+//!   also receives other routing messages, and writes the kernel refused, as written:
+//!   [`parse_answer`]), answered with the route the kernel's lookup picks (a clone on the primary
 //!   interface, the network's cloning route, or a default route). macOS's Network Extension
 //!   policies (NECP: a per-app or include-all-networks VPN, a content filter) can send a socket
 //!   elsewhere without any route saying so; the closest unprivileged view of them is a real socket.
@@ -51,8 +54,7 @@ use std::io;
 use std::mem::{offset_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{Hop, KernelAnswer, Link, Nexthop, Route, RouteType, Rule, RT_TABLE_MAIN};
@@ -376,17 +378,25 @@ pub(super) fn dump() -> io::Result<(Vec<Route>, Vec<Rule>)> {
     ))
 }
 
-/// The next sequence number of this process's queries: every routing socket gets a copy of every
-/// routing message, so another thread's answer can arrive on this socket too. The first is random
-/// (`arc4random`), so no number is known ahead of the query it marks.
+/// A query's sequence number, drawn for it alone from the system's CSPRNG (`arc4random`), never
+/// a counter: every routing socket can see other processes' routing messages, and a number that
+/// follows the last one seen could be guessed (review round 2, parse-1).
 fn next_seq() -> i32 {
-    static SEQ: OnceLock<AtomicI32> = OnceLock::new();
-    SEQ.get_or_init(|| {
-        // SAFETY: arc4random takes no arguments and cannot fail.
-        AtomicI32::new(unsafe { libc::arc4random() } as i32)
-    })
-    .fetch_add(1, Ordering::Relaxed)
+    // SAFETY: arc4random takes no arguments and cannot fail.
+    unsafe { libc::arc4random() as i32 }
 }
+
+/// `RTM_GET_SILENT` (xnu's private <net/route.h>, 0x11): an `RTM_GET` whose answer the kernel
+/// sends to the asking socket alone (`sendonlytoself`), as type `RTM_GET`, instead of to every
+/// routing socket, so no other process sees which destinations this process asks about, nor
+/// its queries' pid and sequence numbers. Measured on macOS 27.2 (26B131):
+/// `fix-r2/rtm-get-silent.log`. A kernel that does not know the type refuses the write (an
+/// unknown type is `EPERM` for an unprivileged writer, as `fix-r2/forge-variants.log` shows),
+/// and the query is then asked as a plain `RTM_GET` from then on.
+const RTM_GET_SILENT: u8 = 0x11;
+
+/// Set once a kernel refused `RTM_GET_SILENT`.
+static SILENT_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// A `PF_ROUTE` socket, close-on-exec, with a receive timeout.
 fn route_socket() -> io::Result<OwnedFd> {
@@ -423,7 +433,15 @@ fn route_socket() -> io::Result<OwnedFd> {
 
 /// An `RTM_GET` request for `dst`: the header, the destination (`RTA_DST`) and an empty
 /// `sockaddr_dl` (`RTA_IFP`, so the answer names the interface), as `route -n get` sends it.
+#[cfg(test)]
 pub(super) fn request(dst: IpAddr, pid: i32, seq: i32) -> Vec<u8> {
+    request_of(libc::RTM_GET as u8, dst, pid, seq)
+}
+
+/// An `RTM_GET` request (the type `ty`: `RTM_GET` or [`RTM_GET_SILENT`]) for `dst`: the
+/// header, the destination (`RTA_DST`) and an empty `sockaddr_dl` (`RTA_IFP`, so the answer names
+/// the interface), as `route -n get` sends it.
+fn request_of(ty: u8, dst: IpAddr, pid: i32, seq: i32) -> Vec<u8> {
     let mut sa = match dst {
         IpAddr::V4(a) => {
             let mut s = vec![0u8; size_of::<libc::sockaddr_in>()];
@@ -453,7 +471,7 @@ pub(super) fn request(dst: IpAddr, pid: i32, seq: i32) -> Vec<u8> {
         &len.to_ne_bytes(),
     );
     m[offset_of!(libc::rt_msghdr, rtm_version)] = libc::RTM_VERSION as u8;
-    m[offset_of!(libc::rt_msghdr, rtm_type)] = libc::RTM_GET as u8;
+    m[offset_of!(libc::rt_msghdr, rtm_type)] = ty;
     put(
         &mut m,
         offset_of!(libc::rt_msghdr, rtm_flags),
@@ -480,31 +498,43 @@ pub(super) fn request(dst: IpAddr, pid: i32, seq: i32) -> Vec<u8> {
 }
 
 /// The answer to request (`pid`, `seq`) for `dst` in one datagram: `Some(Some(route))`,
-/// `Some(None)` for no route (`ESRCH`, or a route that reaches nothing), `None` when the datagram is
-/// another message (another process's or thread's, or a routing change). An answer whose route
-/// does not hold `dst` is an error, as is a truncated or malformed answer, and one whose
-/// interface (`RTA_IFP`, the `sockaddr_dl` the request asked for) is not the header's
-/// `rtm_index` (xnu takes both from the route's `rt_ifp`, so they always agree).
+/// `Some(None)` for no route (`ESRCH`, or a route that reaches nothing), `None` when the datagram
+/// is not the kernel's answer to this request.
+///
+/// Only a datagram that is exactly one message (its length is its `rtm_msglen`), of type
+/// `RTM_GET` and this version, whose `rtm_pid` and `rtm_seq` are this request's, is the answer
+/// (review round 2, parse-1 and parse-2). Every other datagram is skipped, whatever it holds:
+/// another process's or thread's message, a routing change, and above all a message the kernel
+/// refused. xnu's `route_output` hands a write it refuses to every routing socket as written:
+/// one whose length is not its `rtm_msglen` raw (pid and sequence number as the writer chose
+/// them), and one refused before the kernel sets `rtm_pid` (another version: `EPROTONOSUPPORT`;
+/// any type but `RTM_GET` from an unprivileged writer: `EPERM`) with its version or type kept.
+/// Every write the kernel accepts as a request has `rtm_pid` set to the writer's (measured:
+/// `fix-r2/forge-variants.log`, 23 kinds of write). So a datagram whose length matches its
+/// header, of this version and type `RTM_GET`, with this process's pid, is a message the kernel
+/// wrote for this process. The kernel copies its answer whole (`rtm_msglen` its length), so an
+/// answer is never skipped for its length.
+///
+/// The answer is an error when it does not parse: malformed, an interface (`RTA_IFP`, the
+/// `sockaddr_dl` the request asked for) that is not the header's `rtm_index` (xnu takes both
+/// from the route's `rt_ifp`, so they always agree), or a route that does not hold `dst`.
 pub(super) fn parse_answer(
     b: &[u8],
     pid: i32,
     seq: i32,
     dst: IpAddr,
 ) -> io::Result<Option<Option<Route>>> {
-    // Every routing message starts with `u_short msglen; u_char version; u_char type`; only an
-    // `RTM_GET` of this version has the header the pid and sequence number are read from.
-    if b.len() < 4 {
-        return Err(malformed());
-    }
-    if i32::from(b[2]) != libc::RTM_VERSION || i32::from(b[3]) != libc::RTM_GET {
+    if b.len() < HDR_LEN {
         return Ok(None);
     }
     let h = header(b)?;
-    if h.pid != pid || h.seq != seq {
+    if h.len != b.len()
+        || i32::from(h.version) != libc::RTM_VERSION
+        || i32::from(h.ty) != libc::RTM_GET
+        || h.pid != pid
+        || h.seq != seq
+    {
         return Ok(None);
-    }
-    if h.len < HDR_LEN || h.len > b.len() {
-        return Err(malformed());
     }
     if h.errno != 0 {
         return match h.errno {
@@ -534,17 +564,33 @@ pub(super) fn parse_answer(
     Ok(Some(Some(route)))
 }
 
-/// One `RTM_GET` for `dst` (see the module doc): the route, or `None` without one.
+/// One `RTM_GET` for `dst` (see the module doc): the route, or `None` without one. Asked as
+/// [`RTM_GET_SILENT`] unless the kernel refused that type before.
 fn ask(dst: IpAddr) -> io::Result<Option<Route>> {
+    ask_as(dst, next_seq())
+}
+
+/// [`ask`] with sequence number `seq` (tests fix it, to forge answers to it).
+fn ask_as(dst: IpAddr, seq: i32) -> io::Result<Option<Route>> {
     let sock = route_socket()?;
-    let seq = next_seq();
     // SAFETY: getpid cannot fail.
     let pid = unsafe { libc::getpid() };
-    let req = request(dst, pid, seq);
+    let silent = !SILENT_REFUSED.load(Ordering::Relaxed);
+    let ty = if silent {
+        RTM_GET_SILENT
+    } else {
+        libc::RTM_GET as u8
+    };
+    let req = request_of(ty, dst, pid, seq);
     // SAFETY: `req` is valid for its length.
     let n = unsafe { libc::write(sock.as_raw_fd(), req.as_ptr().cast(), req.len()) };
     if n < 0 {
         let e = io::Error::last_os_error();
+        if silent && matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EOPNOTSUPP)) {
+            SILENT_REFUSED.store(true, Ordering::Relaxed);
+            tracing::debug!("network guard: RTM_GET_SILENT refused ({e}); asking with RTM_GET");
+            return ask_as(dst, next_seq());
+        }
         return match e.raw_os_error() {
             Some(libc::ESRCH) | Some(libc::ENETUNREACH) | Some(libc::EHOSTUNREACH) => Ok(None),
             _ => Err(e),
@@ -599,11 +645,9 @@ fn address_interfaces() -> io::Result<Vec<(IpAddr, u32)>> {
     Ok(out)
 }
 
-/// The interfaces a connection to `dst` may leave by, as a real socket sees it: every interface
-/// that holds the source address the kernel chooses when a UDP socket is connected to `dst` (no
-/// packet is sent), sorted. `None` when the kernel will not connect a socket there (unreachable);
-/// empty when the source address is on no interface.
-fn socket_interfaces(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<Vec<u32>>> {
+/// A UDP socket connected to `dst` on `dport` (443 when none is given; UDP `connect` sends
+/// nothing); `None` when the kernel will not connect a socket there (unreachable).
+fn udp_toward(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<UdpSocket>> {
     let any: SocketAddr = match dst {
         IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
@@ -615,6 +659,17 @@ fn socket_interfaces(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<Vec<u
             _ => Err(e),
         };
     }
+    Ok(Some(sock))
+}
+
+/// The interfaces a connection to `dst` may leave by, as a real socket sees it: every interface
+/// that holds the source address the kernel chooses when a UDP socket is connected to `dst` (no
+/// packet is sent), sorted. `None` when the kernel will not connect a socket there (unreachable);
+/// empty when the source address is on no interface.
+fn socket_interfaces(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<Vec<u32>>> {
+    let Some(sock) = udp_toward(dst, dport)? else {
+        return Ok(None);
+    };
     let src = sock.local_addr()?.ip();
     let mut v: Vec<u32> = address_interfaces()?
         .into_iter()
@@ -636,7 +691,18 @@ pub(super) fn query(dst: IpAddr, dport: Option<u16>) -> io::Result<KernelAnswer>
             ..Route::local(Prefix::host(dst), 0)
         }]));
     }
-    decide(ask(dst)?, || socket_interfaces(dst, dport))
+    query_with(dst, dport, ask, socket_interfaces)
+}
+
+/// [`query`]'s steps for a destination that is not unspecified, with the kernel's route query
+/// (`ask`) and the socket's view (`socket`, asked with the destination and port) given.
+fn query_with(
+    dst: IpAddr,
+    dport: Option<u16>,
+    ask: impl FnOnce(IpAddr) -> io::Result<Option<Route>>,
+    socket: impl FnOnce(IpAddr, Option<u16>) -> io::Result<Option<Vec<u32>>>,
+) -> io::Result<KernelAnswer> {
+    decide(ask(dst)?, || socket(dst, dport))
 }
 
 /// The kernel's answer for one destination from its route (`None`: no route) and, asked only when
@@ -1190,6 +1256,38 @@ mod tests {
         );
     }
 
+    /// parse-1 (c): queries are asked as `RTM_GET_SILENT` on this kernel, so another routing
+    /// socket never sees their answers (nor their pid and sequence numbers).
+    #[test]
+    fn queries_are_answered_to_the_asking_socket_alone() {
+        let watch = route_socket().unwrap();
+        // SAFETY: F_SETFL on a valid fd.
+        unsafe { libc::fcntl(watch.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        // SAFETY: getpid cannot fail.
+        let pid = unsafe { libc::getpid() };
+        let seq = next_seq();
+        for d in ["127.0.0.1", "8.8.4.4", "::1"] {
+            assert!(ask_as(ip(d), seq).unwrap().is_some(), "{d}");
+        }
+        assert!(!SILENT_REFUSED.load(Ordering::Relaxed));
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF];
+        loop {
+            // SAFETY: `buf` is valid for its length.
+            let n = unsafe { libc::recv(watch.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+            if n <= 0 {
+                break;
+            }
+            let h = header(&buf[..n as usize]);
+            assert!(
+                !matches!(h, Ok(h) if h.pid == pid && h.seq == seq),
+                "another socket saw this query's answer"
+            );
+        }
+        // The request goes out as RTM_GET_SILENT, and the answer comes back as RTM_GET.
+        assert_eq!(request_of(RTM_GET_SILENT, ip("1.1.1.1"), 1, 2)[3], 0x11);
+    }
+
     /// A connection to 0.0.0.0 or :: goes to this host; `RTM_GET` answers the default route for
     /// them (as `route -n get 0.0.0.0` shows). The query answers them as local (bypass-2).
     #[test]
@@ -1222,7 +1320,8 @@ mod tests {
 
     /// The reply's interface (`RTA_IFP`) must be the header's (hardening): every captured reply's
     /// is; one that names another interface, or is no link-layer sockaddr, is an error. And
-    /// sequence numbers are consecutive from a random start.
+    /// each query's sequence number is drawn on its own (review round 2, parse-1: a counter from
+    /// a random start let a process that saw one answer guess the next query's).
     #[test]
     fn the_answers_interface_is_the_headers() {
         for (d, b) in replies() {
@@ -1240,29 +1339,51 @@ mod tests {
             m[off + 1] = libc::AF_INET as u8;
             assert!(parse_answer(&m, h.pid, h.seq, d).is_err(), "{d}");
         }
-        let a = next_seq();
-        assert_eq!(next_seq(), a.wrapping_add(1));
+        let seqs: Vec<i32> = (0..1000).map(|_| next_seq()).collect();
+        let follows = seqs
+            .windows(2)
+            .filter(|w| w[1] == w[0].wrapping_add(1))
+            .count();
+        let mut distinct = seqs.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert!(
+            follows <= 1,
+            "{follows} of 999 sequence numbers follow the one before"
+        );
+        assert!(distinct.len() >= 998, "{} distinct of 1000", distinct.len());
     }
 
-    /// Truncated or malformed input of every kind is an error, never a route: a reply cut short
-    /// anywhere, a message length past the datagram or below a header, a sockaddr that runs past
-    /// the message, an address bit beyond `RTAX_MAX`, an IP sockaddr too short for its address, a
-    /// reply without a destination, a dump whose message lengths do not add up.
+    /// Truncated or malformed input of every kind is never a route: a reply cut short anywhere,
+    /// or whose message length is not the datagram's (past it, short of it, below a header), is
+    /// no answer at all (review round 2, parse-1: xnu hands such a write, as written, to every
+    /// routing socket, so it is never the kernel's answer; the query then waits for the real one
+    /// and fails when none comes); a sockaddr that runs past the message, an address bit beyond
+    /// `RTAX_MAX`, an IP sockaddr too short for its address, a reply without a destination are
+    /// errors; so is a dump whose message lengths do not add up.
     #[test]
     fn malformed_and_truncated_input_is_an_error() {
         for (d, b) in replies() {
             let h = header(&b).unwrap();
             assert!(parse_answer(&b, h.pid, h.seq, d).is_ok(), "{d}");
-            for cut in 4..b.len() {
+            for cut in 0..b.len() {
                 let r = parse_answer(&b[..cut], h.pid, h.seq, d);
-                assert!(r.is_err(), "{d} cut at {cut}: {r:?}");
+                assert!(matches!(r, Ok(None)), "{d} cut at {cut}: {r:?}");
             }
-            // The header claims more than was received, or less than a header.
-            for len in [b.len() + 4, HDR_LEN - 4] {
+            // The header claims more than was received, less, or less than a header; or the
+            // datagram carries bytes past the message.
+            for len in [b.len() + 4, b.len() - 4, HDR_LEN - 4, 0] {
                 let mut m = b.clone();
                 m[0..2].copy_from_slice(&(len as u16).to_ne_bytes());
-                assert!(parse_answer(&m, h.pid, h.seq, d).is_err(), "{d} len {len}");
+                let r = parse_answer(&m, h.pid, h.seq, d);
+                assert!(matches!(r, Ok(None)), "{d} len {len}: {r:?}");
             }
+            let mut m = b.clone();
+            m.extend([0; 4]);
+            assert!(
+                matches!(parse_answer(&m, h.pid, h.seq, d), Ok(None)),
+                "{d} + 4"
+            );
             // Sockaddrs claimed that are not there.
             let mut m = b.clone();
             let o = offset_of!(libc::rt_msghdr, rtm_addrs);
@@ -1679,10 +1800,24 @@ mod tests {
         // same destination) can change the answer, so a disagreement is asked again.
         let compare = |d: IpAddr| -> Result<String, String> {
             let family = if d.is_ipv4() { "-inet" } else { "-inet6" };
-            let out = std::process::Command::new("/sbin/route")
+            // route(8) reads its routing socket until its own answer arrives, with no timeout;
+            // a routing socket drops messages when its buffer is full, and then it waits for
+            // ever. So it is given 5 s, and asked again (below) if killed.
+            let mut child = std::process::Command::new("/sbin/route")
                 .args(["-n", "get", family, &d.to_string()])
-                .output()
+                .stdout(std::process::Stdio::piped())
+                .spawn()
                 .expect("route -n get");
+            let started = Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if started.elapsed() > Duration::from_secs(5) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{d}: route -n get did not answer in 5 s"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let out = child.wait_with_output().unwrap();
             let text = String::from_utf8_lossy(&out.stdout).into_owned();
             let field = |k: &str| {
                 text.lines()
@@ -1754,5 +1889,365 @@ mod tests {
             }
             eprintln!("{}", last.unwrap_or_else(|e| panic!("{e}")));
         }
+    }
+
+    /// What an unprivileged process can make another routing socket receive with this process's
+    /// pid and a query's sequence number (review round 2, parse-1; `fix-r2/forge-variants.log`
+    /// has what xnu delivers for each write): the kernel's own answer to a query with another
+    /// destination (the captured default route), written back by a forger with its length off by
+    /// some bytes either way, its `rtm_msglen` 0, as an 8-byte stub, with another version, or as
+    /// another message type (refused with `EPERM` before the kernel sets `rtm_pid`, so delivered
+    /// with the forger's pid and `rtm_errno` set, or as written).
+    fn forged_datagrams(pid: i32, seq: i32) -> Vec<(&'static str, Vec<u8>)> {
+        let (_, mut b) = reply("8.8.4.4");
+        let put = |m: &mut Vec<u8>, o: usize, v: &[u8]| m[o..o + v.len()].copy_from_slice(v);
+        put(
+            &mut b,
+            offset_of!(libc::rt_msghdr, rtm_pid),
+            &pid.to_ne_bytes(),
+        );
+        put(
+            &mut b,
+            offset_of!(libc::rt_msghdr, rtm_seq),
+            &seq.to_ne_bytes(),
+        );
+        let len = b.len();
+        let with_len = |m: &[u8], l: usize| {
+            let mut m = m.to_vec();
+            m[0..2].copy_from_slice(&(l as u16).to_ne_bytes());
+            m
+        };
+        let mut out = vec![
+            ("4 bytes past its length", [b.clone(), vec![0; 4]].concat()),
+            (
+                "163 bytes past its length",
+                [b.clone(), vec![0; 163]].concat(),
+            ),
+            ("cut 40 bytes short", with_len(&b[..len - 40], len)),
+            ("a length 40 bytes past", with_len(&b, len + 40)),
+            ("rtm_msglen 0", with_len(&b, 0)),
+            ("a header alone", with_len(&b[..HDR_LEN], len)),
+            ("an 8-byte stub", vec![8, 0, 5, 4, 0, 0, 0, 0]),
+        ];
+        for (what, at, v) in [
+            ("version 4", 2, 4u8),
+            ("version 6", 2, 6),
+            ("type RTM_ADD", 3, libc::RTM_ADD as u8),
+            ("type RTM_CHANGE", 3, libc::RTM_CHANGE as u8),
+            ("type 0x55", 3, 0x55),
+            ("type RTM_GET_SILENT", 3, RTM_GET_SILENT),
+        ] {
+            let mut m = b.clone();
+            m[at] = v;
+            out.push((what, m.clone()));
+            let mut refused = m;
+            put(
+                &mut refused,
+                offset_of!(libc::rt_msghdr, rtm_errno),
+                &libc::EPERM.to_ne_bytes(),
+            );
+            out.push((what, refused));
+        }
+        out
+    }
+
+    /// parse-1 and parse-2: no datagram a forger can have delivered is taken as the answer, nor
+    /// fails the query: only the kernel's own answer, exactly as it wrote it, is.
+    #[test]
+    fn forged_and_refused_writes_are_no_answer() {
+        let (pid, seq) = (4242, 77);
+        for dst in ["192.168.1.50", "127.0.0.1", "10.0.0.1", "2001:db8::1"] {
+            for (what, m) in forged_datagrams(pid, seq) {
+                let r = parse_answer(&m, pid, seq, ip(dst));
+                assert!(matches!(r, Ok(None)), "{dst}: {what}: {r:?}");
+            }
+        }
+        // The reviewer's forgery (r2-parse/repro/review_r2.rs): a default route via
+        // 192.168.1.1 on index 8 in a 132-byte write of a 128-byte message.
+        let mut f = vec![0u8; 132];
+        let put = |f: &mut Vec<u8>, o: usize, v: &[u8]| f[o..o + v.len()].copy_from_slice(v);
+        put(&mut f, 0, &128u16.to_ne_bytes());
+        f[2] = libc::RTM_VERSION as u8;
+        f[3] = libc::RTM_GET as u8;
+        put(
+            &mut f,
+            offset_of!(libc::rt_msghdr, rtm_index),
+            &8u16.to_ne_bytes(),
+        );
+        put(
+            &mut f,
+            offset_of!(libc::rt_msghdr, rtm_flags),
+            &(libc::RTF_UP | libc::RTF_GATEWAY).to_ne_bytes(),
+        );
+        put(
+            &mut f,
+            offset_of!(libc::rt_msghdr, rtm_addrs),
+            &(libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK).to_ne_bytes(),
+        );
+        put(
+            &mut f,
+            offset_of!(libc::rt_msghdr, rtm_pid),
+            &pid.to_ne_bytes(),
+        );
+        put(
+            &mut f,
+            offset_of!(libc::rt_msghdr, rtm_seq),
+            &seq.to_ne_bytes(),
+        );
+        f[92] = 16;
+        f[93] = libc::AF_INET as u8;
+        f[108] = 16;
+        f[109] = libc::AF_INET as u8;
+        f[112..116].copy_from_slice(&[192, 168, 1, 1]);
+        assert!(matches!(
+            parse_answer(&f, pid, seq, ip("192.168.1.50")),
+            Ok(None)
+        ));
+        // Written at its own length, that message is a query the kernel answers with the
+        // writer's pid; were it delivered with this process's pid, it would be read (and judged).
+        assert!(parse_answer(&f[..128], pid, seq, ip("192.168.1.50"))
+            .unwrap()
+            .is_some());
+        // The kernel's answer itself is taken.
+        let (d, b) = reply("8.8.4.4");
+        let h = header(&b).unwrap();
+        assert!(parse_answer(&b, h.pid, h.seq, d)
+            .unwrap()
+            .unwrap()
+            .is_some());
+    }
+
+    /// The forger [`forged_answers_are_never_taken`] runs in a child process (`ZKMINER_TEST_FORGE
+    /// = "<pid> <seq> <seconds>"`): it writes every kind of [`forged_datagrams`] with that pid and
+    /// sequence number, as fast as it can, and watches for answers with that pid to forge the
+    /// next sequence numbers too. Does nothing without the variable.
+    #[test]
+    #[ignore = "the child process of forged_answers_are_never_taken"]
+    fn route_forger() {
+        let Some(arg) = std::env::var_os("ZKMINER_TEST_FORGE") else {
+            return;
+        };
+        let arg = arg.into_string().unwrap();
+        let v: Vec<i64> = arg.split(' ').map(|w| w.parse().unwrap()).collect();
+        let (pid, seq, secs) = (v[0] as i32, v[1] as i32, v[2] as u64);
+        let sock = route_socket().unwrap();
+        // SAFETY: F_SETFL on a valid fd.
+        unsafe { libc::fcntl(sock.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        let mut forged = forged_datagrams(pid, seq);
+        // Written at their own length, as a query: the kernel answers with this process's pid.
+        forged.push(("an exact-length answer", reply("8.8.4.4").1));
+        let end = Instant::now() + Duration::from_secs(secs);
+        let (mut written, mut seen) = (0u64, 0u64);
+        let mut buf = vec![0u8; RECV_BUF];
+        while Instant::now() < end {
+            loop {
+                // SAFETY: `buf` is valid for its length.
+                let n =
+                    unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+                if n <= 0 {
+                    break;
+                }
+                if let Ok(h) = header(&buf[..n as usize]) {
+                    if h.pid == pid
+                        && h.len == n as usize
+                        && i32::from(h.ty) == libc::RTM_GET
+                        && i32::from(h.version) == libc::RTM_VERSION
+                    {
+                        seen += 1;
+                        for next in [h.seq, h.seq.wrapping_add(1)] {
+                            forged.extend(forged_datagrams(pid, next));
+                        }
+                        forged.truncate(200);
+                    }
+                }
+            }
+            for (_, m) in &forged {
+                // SAFETY: `m` is valid for its length.
+                unsafe { libc::write(sock.as_raw_fd(), m.as_ptr().cast(), m.len()) };
+                written += 1;
+            }
+        }
+        eprintln!("forger: {written} writes; {seen} answers to pid {pid} seen");
+    }
+
+    /// parse-1, live: while another process writes every forged kind of answer with this
+    /// process's pid and the query's own sequence number (fixed here, as if guessed), and with
+    /// the next sequence numbers of any answer it sees, no forged answer is ever taken: every
+    /// query for 127.0.0.1 is answered with its local route on lo0 (or fails), never the forged
+    /// default route. The forger is effective: this process's routing socket receives its
+    /// datagrams with this pid and sequence number.
+    ///
+    /// Ignored by default: the flood reaches every routing socket on the host, and a socket
+    /// whose buffer it fills loses messages (`route -n get` in a test running alongside waited
+    /// for its lost answer for ever). Run on its own: `cargo test -p zkminer-netguard --lib
+    /// forged_answers_are_never_taken -- --ignored`.
+    #[test]
+    #[ignore = "floods every routing socket on the host; run on its own"]
+    fn forged_answers_are_never_taken() {
+        let dst = ip("127.0.0.1");
+        let real = ask(dst).unwrap().unwrap();
+        assert_eq!(
+            (real.kind, real.prefix),
+            (RouteType::Local, Prefix::host(dst))
+        );
+        // SAFETY: getpid cannot fail.
+        let pid = unsafe { libc::getpid() };
+        let seq = next_seq();
+        let watch = route_socket().unwrap();
+        // SAFETY: F_SETFL on a valid fd.
+        unsafe { libc::fcntl(watch.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "routes::sys::tests::route_forger",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ZKMINER_TEST_FORGE", format!("{pid} {seq} 4"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let (mut answered, mut failed, mut forged_seen) = (0u32, 0u32, 0u64);
+        let mut last_err = String::new();
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut buf = vec![0u8; RECV_BUF];
+        let mut i = 0u32;
+        while Instant::now() < end {
+            i += 1;
+            let r = if i.is_multiple_of(2) {
+                ask_as(dst, seq)
+            } else {
+                ask(dst)
+            };
+            match r {
+                Ok(Some(r)) => {
+                    assert_eq!(
+                        (r.kind, r.prefix, r.ifindex),
+                        (real.kind, real.prefix, real.ifindex),
+                        "a forged answer was taken: {r:?}"
+                    );
+                    answered += 1;
+                }
+                Ok(None) => panic!("no route to 127.0.0.1: a forged ESRCH was taken"),
+                Err(e) => {
+                    failed += 1;
+                    last_err = e.to_string();
+                }
+            }
+            loop {
+                // SAFETY: `buf` is valid for its length.
+                let n =
+                    unsafe { libc::recv(watch.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+                if n <= 0 {
+                    break;
+                }
+                if let Ok(h) = header(&buf[..n as usize]) {
+                    forged_seen += u64::from(h.pid == pid && h.seq == seq);
+                }
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        eprintln!(
+            "{answered} queries answered by the kernel, {failed} failed (last: {last_err}); \
+             {forged_seen} forged datagrams with this pid and sequence number seen"
+        );
+        assert!(
+            forged_seen > 1000,
+            "the forger was not effective: {forged_seen}"
+        );
+        assert!(answered > 100, "{answered} answered, {failed} failed");
+    }
+
+    /// cross-2: the destination port reaches the socket check (a Network Extension policy may
+    /// select by port), and the socket is connected to that port (443 when none is given).
+    #[test]
+    fn the_destination_port_reaches_the_socket_check() {
+        let r = answer("8.8.4.4").unwrap();
+        for port in [Some(8443), Some(53), None] {
+            let mut asked = None;
+            let a = query_with(
+                ip("8.8.4.4"),
+                port,
+                |d| {
+                    assert_eq!(d, ip("8.8.4.4"));
+                    Ok(Some(r))
+                },
+                |d, p| {
+                    asked = Some((d, p));
+                    Ok(Some(vec![8]))
+                },
+            )
+            .unwrap();
+            assert_eq!(a, KernelAnswer::Entry(vec![r]));
+            assert_eq!(asked, Some((ip("8.8.4.4"), port)));
+        }
+        for (port, want) in [(Some(8443), 8443), (None, 443)] {
+            if let Some(s) = udp_toward(ip("127.0.0.1"), port).unwrap() {
+                assert_eq!(s.peer_addr().unwrap().port(), want);
+            }
+        }
+    }
+
+    /// cross-2 (M16): a plain clone in the dump (`RTF_WASCLONED`: an ARP entry, a per-destination
+    /// copy of its parent route) is not read, as Linux skips `RTM_F_CLONED`; one a redirect
+    /// changed (`RTF_DYNAMIC`, `RTF_MODIFIED`) or that delivers locally is.
+    #[test]
+    fn plain_clones_in_the_dump_are_not_read() {
+        // The captured default route's message, made a host route for 10.99.0.1 through
+        // 192.0.2.99 (no uplink), with `flags`.
+        let clone = |flags: i32| {
+            let (_, mut m) = reply("8.8.4.4");
+            let h = header(&m).unwrap();
+            let o = offset_of!(libc::rt_msghdr, rtm_flags);
+            m[o..o + 4].copy_from_slice(&flags.to_ne_bytes());
+            let a = offset_of!(libc::sockaddr_in, sin_addr);
+            let (dst, gw) = {
+                let sas = sockaddrs(&m[HDR_LEN..h.len], h.addrs).unwrap();
+                let at = |i: usize| sas[i].unwrap().as_ptr() as usize - m.as_ptr() as usize;
+                (at(libc::RTAX_DST as usize), at(libc::RTAX_GATEWAY as usize))
+            };
+            m[dst + a..dst + a + 4].copy_from_slice(&[10, 99, 0, 1]);
+            m[gw + a..gw + a + 4].copy_from_slice(&[192, 0, 2, 99]);
+            m
+        };
+        let base = libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_HOST | libc::RTF_WASCLONED;
+        let host = Prefix::host(ip("10.99.0.1"));
+        for (extra, kept) in [
+            (0, false),
+            (libc::RTF_DYNAMIC, true),
+            (libc::RTF_MODIFIED, true),
+            (libc::RTF_LOCAL, true),
+        ] {
+            let mut dump = dump_fixture();
+            let n = parse_dump(&dump).unwrap().len();
+            dump.extend(clone(base | extra));
+            let routes = parse_dump(&dump).unwrap();
+            let found = routes.iter().any(|r| r.prefix == host);
+            assert_eq!(found, kept, "flags {:#x}", base | extra);
+            assert_eq!(routes.len(), n + usize::from(kept));
+            let t = RouteTable::with_rules(
+                routes,
+                vec![
+                    Rule::lookup(false, RT_TABLE_MAIN),
+                    Rule::lookup(true, RT_TABLE_MAIN),
+                ],
+            );
+            assert_eq!(
+                t.off_default_path(ip("10.99.0.1")).is_some(),
+                kept,
+                "flags {:#x}",
+                base | extra
+            );
+        }
+        // The same clone, asked for (an answer, not the dump), is read.
+        let m = clone(base);
+        let h = header(&m).unwrap();
+        let r = parse_answer(&m, h.pid, h.seq, ip("10.99.0.1"))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!((r.prefix, r.hop), (host, Hop::Via(ip("192.0.2.99"))));
     }
 }
