@@ -1883,6 +1883,39 @@ const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 /// `/tmp/<name>-<device>.sock`); see `discovery::sp1_server_name`.
 const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
 
+/// Level Zero's V2 adapter for a risc0 worker on an Alchemist card (Arc A-series, Xe-HPG), unless the
+/// operator chose an adapter (`SYCL_UR_USE_LEVEL_ZERO_V2`, inherited).
+///
+/// The loader picks V2 only when a visible device supports it, so an Alchemist card alone (the
+/// worker's `ZE_AFFINITY_MASK`) got the legacy adapter, whose copy engine there reads results before
+/// the kernels writing them have finished. On an Arc A770, risc0's Groth16 seal came out invalid (a
+/// point off the curve) in 12 of 40 proofs on the legacy adapter, and in 0 of 40 on V2, whose Groth16
+/// step also took 5.3 s instead of 14.4 (the legacy adapter with its copy engine off was right too, at
+/// 14.7 s).
+///
+/// Not SP1: its SYCL server picks the legacy adapter on Linux itself, and on V2 an A770 proof waited
+/// forever (the GPU idle, one host thread spinning) after five programs had proved.
+fn alchemist_level_zero_env(env: &mut HashMap<String, String>, backend: &str, alchemist: bool) {
+    const V2: &str = "SYCL_UR_USE_LEVEL_ZERO_V2";
+    if alchemist
+        && backend == zkminer_prover_protocol::BACKEND_RISC0
+        && std::env::var_os(V2).is_none()
+    {
+        env.insert(V2.into(), "1".into());
+    }
+}
+
+/// The SP1 SYCL server's cap on the freed device memory it keeps cached for reuse, in MiB.
+const SP1_ALLOC_CACHE_MB_ENV: &str = "SP1_GPU_ALLOC_CACHE_MB";
+
+/// `SP1_ALLOC_CACHE_MB_ENV` for an Alchemist card (Arc A-series, Xe-HPG). The server's default keeps up
+/// to three quarters of the card cached, and frees it only when one of its own allocations fails,
+/// not when the driver needs memory for a kernel. On a 16 GB Arc A770 that failed SP1 proofs: a Level
+/// Zero allocation or kernel launch ran out of memory mid-proof, after which the server's next proof
+/// hung (the GPU idle) or failed. With 4 GiB the benchmark suite proved and verified at the card's own
+/// shard size, `zkop-mix` included, with nothing failed or retried.
+const ALCHEMIST_SP1_ALLOC_CACHE_MB: u64 = 4096;
+
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
 /// Groth16 component 2.3 GB.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -2330,6 +2363,11 @@ impl WorkerPool {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
                 }
+                alchemist_level_zero_env(
+                    &mut env,
+                    backend,
+                    pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist),
+                );
                 // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
                 // Groth16 proving key cached on the GPU between proofs only on a card it knows has
                 // room (`release_groth16_cache_if_tight`).
@@ -2353,6 +2391,17 @@ impl WorkerPool {
         {
             if let Some(name) = crate::discovery::sp1_server_name(gpu_tag) {
                 env.insert(SP1_GPU_SERVER_NAME_ENV.into(), name.into());
+            }
+            // An Alchemist card's SP1 server keeps less freed device memory cached: see
+            // `ALCHEMIST_SP1_ALLOC_CACHE_MB`. An operator's own setting, inherited, wins.
+            if gpu_tag == "intel"
+                && std::env::var_os(SP1_ALLOC_CACHE_MB_ENV).is_none()
+                && pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist)
+            {
+                env.insert(
+                    SP1_ALLOC_CACHE_MB_ENV.into(),
+                    ALCHEMIST_SP1_ALLOC_CACHE_MB.to_string(),
+                );
             }
             env.insert(
                 "MEMORY_LIMIT".into(),
@@ -9293,6 +9342,26 @@ mod tests {
         }
         if std::env::var_os("ZE_ENABLE_PCI_ID_DEVICE_ORDER").is_none() {
             assert_eq!(env.get("ZE_ENABLE_PCI_ID_DEVICE_ORDER").unwrap(), "1");
+        }
+    }
+
+    /// An Alchemist card's risc0 workers get Level Zero's V2 adapter; SP1's, and any other card's, are
+    /// left as they were.
+    #[test]
+    fn alchemist_risc0_workers_get_the_v2_adapter() {
+        if std::env::var_os("SYCL_UR_USE_LEVEL_ZERO_V2").is_some() {
+            return; // the operator's choice wins, and is inherited as it is
+        }
+        let mut env = HashMap::new();
+        alchemist_level_zero_env(&mut env, "risc0", true);
+        assert_eq!(
+            env.get("SYCL_UR_USE_LEVEL_ZERO_V2").map(String::as_str),
+            Some("1")
+        );
+        for (backend, alchemist) in [("sp1", true), ("risc0", false), ("sp1", false)] {
+            let mut env = HashMap::new();
+            alchemist_level_zero_env(&mut env, backend, alchemist);
+            assert!(env.is_empty(), "{backend} {alchemist}");
         }
     }
 

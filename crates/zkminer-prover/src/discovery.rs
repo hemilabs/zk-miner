@@ -796,6 +796,23 @@ fn parse_i915_mem_regions(b: &[u8]) -> Option<(u64, u64)> {
     (total > 0).then_some((total, used))
 }
 
+/// Whether the Intel card at `pci_bus_id` is an Alchemist (Xe-HPG: Arc A-series, Arc Pro A, Flex)
+/// part, by its PCI device id (`0x56xx`). False where sysfs has no answer (not Linux, or no such card).
+pub fn intel_is_alchemist(pci_bus_id: &str) -> bool {
+    let dev = Path::new("/sys/bus/pci/devices").join(pci_bus_id.to_ascii_lowercase());
+    let read = |f: &str| std::fs::read_to_string(dev.join(f)).ok();
+    let hex = |s: String| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    read("vendor").and_then(hex) == Some(0x8086)
+        && read("device")
+            .and_then(hex)
+            .is_some_and(is_alchemist_device_id)
+}
+
+/// Alchemist's PCI device ids, `0x5690`..=`0x56ff` (Arc A770 `0x56a0`, A750 `0x56a1`, A380 `0x56a5`, ...).
+fn is_alchemist_device_id(id: u32) -> bool {
+    (0x5690..=0x56ff).contains(&id)
+}
+
 /// Read Intel GPU name from sysfs, with fallbacks.
 fn read_intel_gpu_name(device_dir: &Path) -> String {
     // Try product_name (available on some cards via xe driver)
@@ -2042,6 +2059,17 @@ mod tests {
         igpu.extend(0u32.to_ne_bytes());
         igpu.extend(region(0, 0, 1 << 34, 0));
         assert_eq!(parse_xe_mem_regions(&igpu), None);
+    }
+
+    #[test]
+    fn alchemist_device_ids() {
+        for id in [0x5690, 0x56a0, 0x56a1, 0x56a5, 0x56b0, 0x56c0] {
+            assert!(is_alchemist_device_id(id), "{id:#x}");
+        }
+        // Battlemage (Arc B580 0xe20b), Lunar Lake (0x64a0), DG1 (0x4905): not Alchemist.
+        for id in [0xe20b, 0xe211, 0x64a0, 0x4905, 0x568f] {
+            assert!(!is_alchemist_device_id(id), "{id:#x}");
+        }
     }
 
     /// The layout an Arc A770 (i915) answers with, as measured: system memory, then 15.9 GiB of device
