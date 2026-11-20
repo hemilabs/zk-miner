@@ -469,6 +469,9 @@ struct ProbeGate;
 static PROBES_IN_FLIGHT: std::sync::Mutex<(usize, Pacer)> =
     std::sync::Mutex::new((0, Pacer::new()));
 static PROBE_TURN: std::sync::Condvar = std::sync::Condvar::new();
+/// How many times a turn waited for a token (tests).
+#[cfg(test)]
+static PACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl ProbeGate {
     /// A turn, waited for until `deadline` (review round 5: the wait had no bound, so a caller
@@ -487,7 +490,11 @@ impl ProbeGate {
                         g.0 += 1;
                         return Some(ProbeGate);
                     }
-                    Err(until_token) => until_token.min(left),
+                    Err(until_token) => {
+                        #[cfg(test)]
+                        PACED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        until_token.min(left)
+                    }
                 }
             };
             if left.is_zero() {
@@ -1848,6 +1855,17 @@ mod tests {
         let later = t0 + Duration::from_secs(60);
         let n = (0..100).take_while(|_| p.take(later).is_ok()).count();
         assert_eq!(n, PROBE_BURST as usize);
+    }
+
+    /// The gate paces: past a burst, turns wait for tokens (other tests' probes only take more).
+    #[test]
+    fn r5_the_gate_paces_past_a_burst() {
+        let before = PACED.load(std::sync::atomic::Ordering::SeqCst);
+        let t = Instant::now();
+        for _ in 0..PROBE_BURST + 3 {
+            drop(ProbeGate::enter_until(t + Duration::from_secs(30)).expect("a turn"));
+        }
+        assert!(PACED.load(std::sync::atomic::Ordering::SeqCst) > before, "no turn waited for a token");
     }
 
     /// Review round 4, probe-1: the two-connection check, every interleaving. An

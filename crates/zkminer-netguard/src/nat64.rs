@@ -2901,6 +2901,8 @@ mod r5_tests {
                     && why.contains("named 5 NAT64 prefixes"),
                 "{why}"
             );
+            // What ran out is named by nobody, even before anything prunes it (cross-3).
+            assert!(h.named_by(&[gw], t0 + Duration::from_secs(9))[0].1.is_empty());
             // While they live, the real gateway's prefix is not heard (one more than believed
             // is kept already).
             h.hear(&[ann("2001:db8:aaaa::/96", gw.0, 1800)], &[gw], t0 + Duration::from_secs(1));
