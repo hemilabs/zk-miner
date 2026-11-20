@@ -220,7 +220,8 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
 
 - **Routing table:** the `NET_RT_DUMP` sysctl of the BSD routing socket (a consistent snapshot,
   read again if the table grew meanwhile), parsed from bytes with every length checked; a
-  malformed message fails the read. `RTF_GATEWAY` routes go through their gateway, others are
+  malformed message (a non-contiguous netmask included) fails the read. `RTF_GATEWAY` routes go
+  through their gateway, others are
   on-link; `RTF_LOCAL` and `RTF_BROADCAST` routes deliver to this host; reject, blackhole, down
   and multicast routes and the kernel's clones are not read, as on Linux.
 - **No policy rules; scoped routes.** macOS has no `ip rule`. Interface-scoped routes
@@ -230,22 +231,28 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   the default route) is no default route and no uplink, and any other scoped route off the
   default path still refuses what it holds.
 - **The kernel per destination:** an `RTM_GET` on a fresh routing socket, matched by the
-  kernel-set `rtm_pid` and a per-process sequence number, judged exactly as the Linux answer is
-  (`ESRCH` is no route). Network Extension policies (a per-app or include-all-networks VPN, a
+  kernel-set `rtm_pid` and a per-process sequence number from a random start, its `RTA_IFP` the
+  header's interface, judged exactly as the Linux answer is (`ESRCH` is no route; 0.0.0.0 and
+  `::` are this host). Network Extension policies (a per-app or include-all-networks VPN, a
   content filter) can send a socket elsewhere with no route saying so; so for an answer that could
   be admitted, a UDP socket is connected to the destination (no packet is sent) and the source
-  address the kernel chose must be on the interface the route names, or the destination is
-  refused.
-- **Uplinks:** interface types from `getifaddrs` (Ethernet and Wi-Fi are physical, `utun` is a
-  tunnel, `ppp` always needs `[egress] internal_ranges` since macOS lists no PPPoE sessions,
+  address the kernel chose must be on the interface the route names and on no other, or the
+  destination is refused.
+- **Uplinks:** interface types from `getifaddrs` (Apple's own Ethernet and Wi-Fi interfaces, by
+  name, are physical; another Ethernet-type interface such as ZeroTier's `feth` is not; `utun` is
+  a tunnel, `ppp` always needs `[egress] internal_ranges` since macOS lists no PPPoE sessions,
   any type the guard does not know is not physical).
-- **DNS servers:** `/etc/resolv.conf` (the primary resolvers) and `/etc/resolver/*`.
-- **Near hops:** the probe is the same hop-limited TCP connect; a check connection reads its FIN's
+- **DNS servers:** `/etc/resolv.conf`, `/etc/resolver/*` and every resolver the configuration
+  daemon knows (`State:/Network/Service/*/DNS`, `State:/Network/Global/DNS`: scoped, VPN and
+  secondary-interface resolvers), each `nameserver` read as every macOS parser reads it; a
+  configuration that cannot be read fails the facts read.
+- **Near hops:** the probe is the same hop-limited TCP connect (an unreachable `connect` reports
+  before the connection is in progress, as Local Network privacy does, is refused, not far); a
+  check connection reads its FIN's
   fate from `TCP_CONNECTION_INFO`. macOS does not report an ICMP "time exceeded" for the FIN, so
   a far peer is known only when the wait ends (the same verdict, up to 1.5 s later).
 - **Not seen on macOS** (list what they reach in `[egress] deny_cidrs`): `pf` rules (`route-to`,
-  NAT), which need root to read; Network Extension policies that treat TCP differently from UDP;
-  resolvers only the configuration daemon knows (`scutil --dns` scoped or VPN resolvers).
+  NAT), which need root to read; Network Extension policies that treat TCP differently from UDP.
 
 ## Developer mode: `[dev] private_network`
 
