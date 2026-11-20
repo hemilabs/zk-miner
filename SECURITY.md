@@ -34,9 +34,14 @@ Every connection a requester can cause goes through one guard
   **network-specific NAT64 prefix** — RFC 6052, any /32 to /96 a network picks for its
   translator) is judged by that IPv4 address, which the translator would connect to from its
   own IPv4 side; IPv4-compatible addresses are refused. The network-specific prefix is learned
-  at startup and every 5 minutes by asking the host's own DNS servers for `ipv4only.arpa`
-  (RFC 7050: a DNS64 resolver answers under its prefix), or named in `[egress]
-  nat64_prefixes`. Deny CIDRs and the host's prefixes match every such spelling too
+  per network by asking the host's own DNS servers for `ipv4only.arpa` (RFC 7050: a DNS64
+  resolver answers under its prefix; the servers in use first, those of a family the host does
+  not route skipped), at startup, at once whenever the uplink changes, every 15 seconds while a
+  host with IPv6 and no IPv4 route has found none, and every 5 minutes; also from a router
+  advertisement's PREF64 option (RFC 8781: macOS's configuration daemon, and on Linux the
+  advertisements the kernel processes); or named in `[egress] nat64_prefixes`. Until the round
+  for a new network has finished, a host with IPv6 and no IPv4 route refuses every IPv6
+  destination (an address under a prefix not learned yet can carry a private IPv4 one). Deny CIDRs and the host's prefixes match every such spelling too
   (`64:ff9b::808:808/128` denies `8.8.8.8`, and a deny of `64:ff9b::/64` holds the addresses it
   holds as written).
 - **Not this host, not its neighbours, not its site.** Refused, whatever the spelling:
@@ -55,8 +60,12 @@ Every connection a requester can cause goes through one guard
     of the host's own DNS servers (an intercepting resolver reporting itself) confirms nothing
     either. A confirmation lasts 10 minutes (two discovery rounds): a family no round has
     confirmed for that long is unknown again. Discovery also runs again at once when the host's
-    uplink changes (its default routes, or the interface its internet traffic leaves by), and
-    until it has, nothing confirmed on the old uplink counts. Only a confirmed address gives
+    uplink changes (its default routes, or the interface its internet traffic leaves by; and the
+    router behind them: on Linux each default gateway's link-layer address from the neighbour
+    table, on macOS the configuration daemon's network signature, so two networks whose routers
+    have the same address are two uplinks; on Linux a gateway with no neighbour entry makes every
+    facts read an uplink of its own until one appears), and until it has, nothing confirmed on
+    the old uplink counts. Only a confirmed address gives
     its IPv6 site (below), so one forged answer cannot refuse someone else's whole site. Facts
     read while the first discovery runs wait for it. `[egress] public_addresses` states the
     public addresses instead (or as well); `[egress] discover_public_addresses = false` turns the
@@ -105,7 +114,10 @@ Every connection a requester can cause goes through one guard
     routing entry matched" and "which table matched" flags), which applies every rule exactly,
     port rules included; only a unicast route through a default route's gateway, or a default
     route of an ordinary table, is admitted (a local route, no route, a default route a
-    selector picks, an on-link route or another gateway is refused). For IPv4 it is asked twice,
+    selector picks, an on-link route or another gateway is refused); a default route must also
+    be one of the facts' own default routes (its family, gateway and interface), or it is
+    refused until the facts, read again at once, hold it (a VPN or a network that came up since
+    the facts were read is not admitted on facts that do not know it). For IPv4 it is asked twice,
     as a `connect` does (`ip_route_connect`): once without a source address, which tells the
     source the kernel picks, then with that source; a `from` rule that sends the connection to
     another table than the first lookup used is refused. (IPv6 looks the route up once, matching
@@ -146,7 +158,12 @@ Every connection a requester can cause goes through one guard
     `127.0.0.53` stub), which may answer only their own customers.
 
   These facts are read again once they are a second old, and again before any refusal that
-  rests on them. **Run the miner on the host's network:** a containerized miner sees only the
+  rests on them. A re-read that fails (a netlink, `getifaddrs` or configuration-daemon error)
+  leaves the last good facts in force, without their cached kernel answers, for 2 seconds past
+  their one-second life; after that **every requester connection is refused**, naming what
+  failed, until a re-read succeeds (tried again at most every 100 ms). One re-read runs at a
+  time; other callers wait for it at most 500 ms. The checks run off the async runtime's
+  worker threads. **Run the miner on the host's network:** a containerized miner sees only the
   container's interfaces and routes, so use host networking (`--network host`), or list the
   host's networks and addresses in `[egress] deny_cidrs`.
 - **Nothing within two hops.** Right before every connection (each hop of the ELF fetch, and
@@ -166,10 +183,17 @@ Every connection a requester can cause goes through one guard
   limit, a device waking up): a **check connection** is made with the usual hop limit, and once
   it is established its hop limit is lowered to the probe's and it is half-closed, without a
   byte written. Its FIN reaches the peer only if the peer is within the limit, and a peer that
-  gets it acknowledges it: acknowledged (or reset) within a few round trips, refused; a "time
-  exceeded" or no acknowledgement, farther, and the real connection is made. A check connection
-  that does not connect refuses. Any other probe error (a local firewall's) refuses.
-  Unprivileged; developer mode sends no probe.
+  gets it acknowledges it: acknowledged within a few round trips, refused. A peer that closes or
+  resets the connection first is a failed check, refused (never read as near or far). No
+  acknowledgement within the limit is far only if the peer acknowledges the FIN's
+  retransmission once the usual hop limit is restored (a positive control: a peer that
+  acknowledges a bare FIN at no hop limit, as AWS S3's front ends, is refused, the message
+  saying so); then the real connection is made. The probe is asked twice within its 1.5 s (a
+  router rate-limiting its ICMP answers the second), and an IPv4-mapped destination is probed
+  as its IPv4 address. Linux reads the FIN's fate from `TCP_INFO`, macOS from
+  `TCP_CONNECTION_INFO`; Windows has no check connection (a probe without an answer refuses
+  there). A check connection that does not connect refuses. Any other probe error (a local
+  firewall's) refuses. Unprivileged; developer mode sends no probe.
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
   (`home.arpa`), `corp`, `intranet`, `private`, `localdomain`, `svc`, `consul`, `test`,
@@ -201,7 +225,12 @@ Every connection a requester can cause goes through one guard
   kernel asked with the port, the near-hop probe), and the hop's HTTP client is pinned to
   exactly the addresses that passed (it resolves nothing itself), so a name that answers
   differently a moment later (DNS rebinding) cannot move the connection. An IP-literal URL is
-  checked the same way.
+  checked the same way. **Once the connection is made**, before any request is written on it
+  (for `https`, after the TLS handshake, which reqwest's connector makes), its own peer and
+  source addresses must be the checked ones (the source the kernel chose for it right before,
+  which only the route's interface holds) and the destination is admitted again with the kernel
+  asked afresh; otherwise it is dropped: a route or VPN that changed between the check and the
+  connection is seen. The witness connector checks its connections the same way.
 - **No proxies, no automatic redirects:** proxy settings are ignored (a proxy would resolve
   the name itself). Redirects are followed by hand, at most 5, each target checked like the
   first URL before anything connects to it, within one time budget.
@@ -288,6 +317,20 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   A VPN built as a Network Extension flow-divert or app proxy is expected to accept every probe
   itself, so every requester connection is refused as near (it fails closed): see
   docs/netguard-macos.md.
+
+### The same hardening on every platform
+
+What the macOS review rounds added to shared decisions applies on Linux (and Android), and on
+Windows where it has the code path (details, what was run on Linux and what was only
+type-checked: [docs/netguard-hardening.md](docs/netguard-hardening.md)): facts that cannot be
+read again refuse after their grace; one re-read at a time, callers waiting at most 500 ms, and
+the checks off the async runtime's workers; the uplink signature tells two networks behind the
+same router address apart (Linux: the gateways' link-layer addresses); only an acknowledged FIN
+is a check connection's answer, with the positive control; the probe asked twice and
+IPv4-mapped addresses unmapped (Windows too); a default-like kernel answer must be a default
+route the facts hold; NAT64 prefixes learned per network (Linux also from router
+advertisements' PREF64), IPv6 refused on an IPv6-only host until the new network's round ends;
+and every connection checked again once made (macOS too: new everywhere).
 
 ## Developer mode: `[dev] private_network`
 
@@ -742,10 +785,14 @@ no second one):
   caught at the next discovery, at most 5 minutes later; while the reflectors are unreachable,
   the last confirmed address counts for at most 10 minutes after it was confirmed.
 - **The facts can be a second stale.** A host that just joined a network is judged on facts at
-  most a second old (a refusal re-reads them at once).
+  most a second old (a refusal re-reads them at once, and every connection is checked again once
+  made). Facts that cannot be read again are trusted for 2 seconds more, then refuse.
 - **NAT64 prefixes the host cannot learn.** A network-specific NAT64 prefix is learned from
   the host's DNS servers (RFC 7050); a translator reached without DNS64 (a static route to a
-  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On an
+  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On Linux
+  a router's PREF64 is read only from advertisements the kernel processes while the miner runs
+  (none where systemd-networkd or NetworkManager handle router advertisements themselves, which
+  keep it to their own interfaces). On an
   IPv6-only host, addresses under a prefix are refused until the translator's IPv4 address is
   learned through it (or stated in `public_addresses`). The
   witness broker learns the prefix itself at startup and also gets, from the miner, the
