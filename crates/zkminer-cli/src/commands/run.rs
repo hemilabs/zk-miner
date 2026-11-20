@@ -11598,6 +11598,10 @@ async fn process_job_lifecycle(
             prover_backend: String::new(),
             estimated_cycles: view.expectedCycles,
         });
+        // Its zkVM and wrap, for the dashboard's zkVM column.
+        if let Some(system) = zkminer_chain::auction::ProofSystem::from_id(view.proofSystemId) {
+            s.note_proof_system(job_id, system);
+        }
         s.add_log(
             LogLevel::Success,
             format!("Job {} claimed", short_id(job_id)),
