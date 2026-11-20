@@ -41,7 +41,17 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 /// A test that cannot check what it is for here says so; under `ZKMINER_CI_STRICT=1` (CI's
 /// callers job) it fails instead (review round 5, cross-4), as netguard's own tests do.
 fn skipped(why: &str) {
-    assert_ne!(std::env::var("ZKMINER_CI_STRICT").as_deref(), Ok("1"), "SKIPPED under ZKMINER_CI_STRICT=1: {why}");
+    // A reason that starts with a token ZKMINER_CI_ALLOW_SKIP names exactly ("[ipv6] ...": a CI
+    // host without IPv6) is allowed, as in netguard's own tests.
+    let token = why.strip_prefix('[').and_then(|r| r.split_once(']')).map(|(t, _)| t.trim().to_string());
+    let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .any(|a| token.as_deref().is_some_and(|t| !t.is_empty() && a.trim() == t));
+    assert!(
+        allowed || std::env::var("ZKMINER_CI_STRICT").as_deref() != Ok("1"),
+        "SKIPPED under ZKMINER_CI_STRICT=1: {why}"
+    );
     eprintln!("SKIPPED: {why}");
 }
 
@@ -539,7 +549,10 @@ async fn a_broker_that_shuts_its_reading_side_is_cut_off() {
             b.shutdown(std::net::Shutdown::Read).unwrap();
             let mut w = &b;
             w.write_all(&req(1, 0, port).encode()).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            // Time for the first answer's write to fail (the connector then serves nothing more).
+            // Review round 6: 300 ms was too little under Rosetta with the whole suite running
+            // (the first request answered after 290 ms: fix-r6/vm-gate-x86-broker-run*.log).
+            std::thread::sleep(Duration::from_millis(1000));
             if misuse_after {
                 // More requests for the endpoint, then misuse past the bound.
                 for id in 2..7 {
@@ -771,19 +784,21 @@ async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
     assert!(std::net::TcpStream::from(fd).local_addr().unwrap().is_ipv4());
 }
 
-/// A probe on a host whose IPv6 is blackholed: every IPv6 check takes `v6_delay` and cannot tell
-/// (a probe without an answer and a check connection that does not connect); IPv4 is far.
+/// A probe on a host one of whose families is blackholed: every check of an address of that
+/// family takes `delay` and cannot tell (a probe without an answer and a check connection that
+/// does not connect); the other family is far.
 #[derive(Debug)]
-struct V6Blackholed {
-    v6_delay: Duration,
+struct Blackholed {
+    v6: bool,
+    delay: Duration,
     asked: Mutex<Vec<SocketAddr>>,
 }
 
-impl zkminer_netguard::NearProbe for V6Blackholed {
+impl zkminer_netguard::NearProbe for Blackholed {
     fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::ProbeOutcome {
         lock(&self.asked).push(addr);
-        if addr.is_ipv6() {
-            std::thread::sleep(self.v6_delay);
+        if addr.is_ipv6() == self.v6 {
+            std::thread::sleep(self.delay);
             zkminer_netguard::ProbeOutcome::TimedOut
         } else {
             zkminer_netguard::ProbeOutcome::Unreachable
@@ -795,29 +810,31 @@ impl zkminer_netguard::NearProbe for V6Blackholed {
     }
 }
 
-/// Review round 6, cross-6 (a regression against pr/37): two AAAA answers on a host whose IPv6
-/// is blackholed (~13.5 s a check) were vetted one after another, each with the whole 17 s
-/// budget, before IPv4 was asked: the request failed. The families are vetted at once now (the
-/// other FAMILY_DELAY later), and a family stops after MAX_UNANSWERED checks that could not
-/// tell. Real public IPv4 peers (skipped where unreachable).
+/// Review round 6, cross-6 (a regression against pr/37): the connector vetted an endpoint's
+/// addresses one after another, each check given the whole 17 s budget, so a blackholed family
+/// whose addresses came first (~13.5 s a check) left the other no time. The resolver answers A
+/// first, so the staged case is a blackholed IPv4 path with IPv6 working (the reviewer's IPv6
+/// case is the same with the families swapped). The families are vetted at once now (the other
+/// FAMILY_DELAY later), and a family stops after MAX_UNANSWERED checks that could not tell.
+/// Real public peers (skipped where unreachable: `[ipv6]` where this host has no IPv6).
 #[tokio::test(flavor = "multi_thread")]
-async fn r6_a_blackholed_ipv6_family_does_not_starve_ipv4() {
+async fn r6_a_blackholed_family_does_not_starve_the_other() {
     use crate::testkit::TestDns;
-    let peers: [SocketAddr; 2] = ["1.1.1.1:443".parse().unwrap(), "1.0.0.1:443".parse().unwrap()];
-    if peers.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
-        skipped(&format!("{peers:?} unreachable here"));
+    let v6: [SocketAddr; 2] = ["[2606:4700:4700::1111]:443".parse().unwrap(), "[2606:4700:4700::1001]:443".parse().unwrap()];
+    if v6.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
+        skipped(&format!("[ipv6] {v6:?} unreachable here"));
         return;
     }
     let dns = TestDns::start(&[(
         "rpc.example.com",
-        &["2606:4700:4700::1111", "2606:4700:4700::1001", "2606:4700:4700::1112", "1.1.1.1", "1.0.0.1"],
+        &["1.1.1.1", "1.0.0.1", "1.1.1.2", "2606:4700:4700::1111", "2606:4700:4700::1001"],
     )])
     .await;
     let dir = tempfile::tempdir().unwrap();
     let text = evm("p", "https://rpc.example.com:443", "");
     let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
     let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
-    let probe = Arc::new(V6Blackholed { v6_delay: Duration::from_millis(13_500), asked: Mutex::new(Vec::new()) });
+    let probe = Arc::new(Blackholed { v6: false, delay: Duration::from_millis(13_500), asked: Mutex::new(Vec::new()) });
     let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
     let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
     let (b, s) = session(&c);
@@ -831,7 +848,7 @@ async fn r6_a_blackholed_ipv6_family_does_not_starve_ipv4() {
     let took = t.elapsed();
     eprintln!("{resp:?} after {took:?}; probed {:?}", lock(&probe.asked));
     assert_eq!(resp.status, Status::Connected, "{resp:?}");
-    assert!(resp.peer.is_some_and(|p| p.is_ipv4()), "{resp:?}");
+    assert!(resp.peer.is_some_and(|p| p.is_ipv6()), "{resp:?}");
     assert!(fd.is_some());
     assert!(took < Duration::from_secs(5), "{took:?}");
     assert_eq!(s.await.unwrap(), SessionEnd::Closed);
