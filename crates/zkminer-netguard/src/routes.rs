@@ -2975,6 +2975,28 @@ mod sys {
             assert_eq!(v6[2], 0);
         }
 
+        /// Review round 6 (fix-r6 mutation L03): the links read keep each interface's carrier
+        /// changes, as sysfs shows them.
+        #[test]
+        fn r6_the_links_read_keep_their_carrier_changes() {
+            let links = super::super::read_links().unwrap();
+            let kept = super::super::carrier_changes();
+            let mut compared = 0;
+            for l in &links {
+                let Ok(t) = std::fs::read_to_string(format!("/sys/class/net/{}/carrier_changes", l.name)) else {
+                    continue;
+                };
+                let Ok(n) = t.trim().parse::<u32>() else { continue };
+                let k = kept.iter().find(|(i, _)| *i == l.index).map(|(_, c)| *c);
+                // It may have changed since the dump; never by much.
+                assert!(k.is_some_and(|k| k <= n && n - k <= 2), "{}: kept {k:?}, sysfs {n}", l.name);
+                compared += 1;
+            }
+            if compared == 0 {
+                crate::skipped("no carrier_changes in sysfs here");
+            }
+        }
+
         /// Review round 6: a link message's `IFLA_CARRIER_CHANGES` (35) is read; one without it
         /// says nothing; a short one is not read.
         #[test]
