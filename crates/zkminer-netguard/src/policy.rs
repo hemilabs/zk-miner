@@ -491,6 +491,11 @@ pub const FORCED_REFRESH_MIN_AGE: Duration = Duration::from_millis(100);
 #[cfg(target_os = "macos")]
 pub const REFRESH_GRACE: Duration = Duration::from_secs(2);
 
+/// macOS: how long a caller that finds the facts being re-read waits for that re-read (review
+/// round 3, 12(b)); a normal re-read takes tens of milliseconds.
+#[cfg(target_os = "macos")]
+pub const REFRESH_WAIT: Duration = Duration::from_millis(500);
+
 /// The host facts a policy judges with: gathered and re-read once older than [`FACTS_TTL`] (or
 /// on a facts-dependent refusal, [`FORCED_REFRESH_MIN_AGE`]), or fixed by the caller.
 #[derive(Debug)]
@@ -506,6 +511,9 @@ struct FactsCell {
     /// with the last re-read's failure, if it failed.
     #[cfg(target_os = "macos")]
     refreshing: std::sync::Mutex<Option<RefreshFailure>>,
+    /// macOS: when the re-read under way started, if one is (see [`Self::lock_refresh`]).
+    #[cfg(target_os = "macos")]
+    refresh_started: std::sync::Mutex<Option<std::time::Instant>>,
     /// macOS tests: a failure to stage in place of the next re-reads, and their count.
     #[cfg(all(test, target_os = "macos"))]
     seam: RefreshSeam,
@@ -541,7 +549,8 @@ impl FactsCell {
     /// without their cached kernel verdicts, for [`REFRESH_GRACE`] past [`FACTS_TTL`]; after
     /// that, and until a re-read succeeds, the facts in force refuse every requester connection
     /// ([`Denied::FactsUnreadable`], naming the failure). A failed re-read is tried again on a
-    /// later call, at most every [`FORCED_REFRESH_MIN_AGE`].
+    /// later call, at most every [`FORCED_REFRESH_MIN_AGE`]. A caller waits for a re-read under way
+    /// at most [`REFRESH_WAIT`] ([`Self::lock_refresh`]).
     #[cfg(target_os = "macos")]
     fn get_fresher_than(&self, max_age: Duration) -> Arc<HostFacts> {
         let read = || {
@@ -554,7 +563,10 @@ impl FactsCell {
         if !self.refresh || current.gathered_at().elapsed() < max_age {
             return current;
         }
-        let mut failure = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failure = match self.lock_refresh() {
+            Ok(failure) => failure,
+            Err(facts) => return facts,
+        };
         // Re-read by another caller while this one waited.
         let current = read();
         if current.gathered_at().elapsed() < max_age {
@@ -564,7 +576,16 @@ impl FactsCell {
             .as_ref()
             .is_none_or(|f| f.at.elapsed() >= FORCED_REFRESH_MIN_AGE);
         if retry {
-            match self.gather() {
+            let started = |at| {
+                *self
+                    .refresh_started
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = at
+            };
+            started(Some(std::time::Instant::now()));
+            let gathered = self.gather();
+            started(None);
+            match gathered {
                 Ok(fresh) => {
                     let fresh = Arc::new(fresh);
                     if let Some(f) = failure.take() {
@@ -616,6 +637,50 @@ impl FactsCell {
         let refusing = Arc::new(current.refusing(f.why.clone()));
         *self.current.write().unwrap_or_else(|e| e.into_inner()) = refusing.clone();
         refusing
+    }
+
+    /// macOS: the re-read lock, waited for until the re-read under way is [`REFRESH_WAIT`] old
+    /// (review round 3, 12(b)). A re-read that takes longer (a configuration daemon that answers
+    /// just within its 2 s, or not at all) holds only the caller that runs it: the others get,
+    /// without waiting further, the
+    /// facts in force while those are within [`FACTS_TTL`] + [`REFRESH_GRACE`], and after that
+    /// those facts made to refuse every requester connection, saying why
+    /// ([`Denied::FactsUnreadable`]).
+    #[cfg(target_os = "macos")]
+    fn lock_refresh(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<RefreshFailure>>, Arc<HostFacts>> {
+        let first = std::time::Instant::now();
+        loop {
+            match self.refreshing.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            let since = self
+                .refresh_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or(first);
+            if since.elapsed() >= REFRESH_WAIT {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let current = self
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if current.unreadable().is_some()
+            || current.gathered_at().elapsed() < FACTS_TTL + REFRESH_GRACE
+        {
+            return Err(current);
+        }
+        Err(Arc::new(current.refusing(format!(
+            "a re-read of them has not finished within {}s",
+            (FACTS_TTL + REFRESH_GRACE).as_secs()
+        ))))
     }
 
     /// macOS: one re-read of the facts (tests stage a failure, a delay, and count them).
@@ -840,6 +905,8 @@ impl NetPolicy {
                 warned_gaps: std::sync::Mutex::new(Vec::new()),
                 #[cfg(target_os = "macos")]
                 refreshing: std::sync::Mutex::new(None),
+                #[cfg(target_os = "macos")]
+                refresh_started: std::sync::Mutex::new(None),
                 #[cfg(all(test, target_os = "macos"))]
                 seam: RefreshSeam::default(),
             }),
@@ -1865,6 +1932,73 @@ mod tests {
         let got: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
         assert_eq!(p.facts.seam.gathers.load(Ordering::SeqCst) - before, 1);
         assert!(got.iter().all(|g| *g == got[0]));
+    }
+
+    /// Review round 3, 12(b): a re-read that takes longer than [`REFRESH_WAIT`] (a configuration
+    /// daemon answering just after its 2 s, again and again) holds only the caller that runs it.
+    /// The others wait for it at most [`REFRESH_WAIT`], then judge with the facts in force while
+    /// they are within their grace, and are refused at once after it (round 2 held each of them
+    /// for the whole re-read, every time).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_slow_refresh_holds_only_the_caller_that_runs_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+        let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
+        let public = ip("8.8.4.4");
+        if let Err(e) = p.admit(public) {
+            crate::skipped(format!("{public} is not admitted on this host: {e}"));
+            return;
+        }
+        // Longer than the grace, so callers come past it while the first re-read still runs.
+        *p.facts.seam.delay.lock().unwrap() = Duration::from_millis(3500);
+        *p.facts.seam.fail.lock().unwrap() = Some("staged: configd answered late".into());
+        let before = p.facts.seam.gathers.load(Ordering::SeqCst);
+        let start = Instant::now();
+        static SLOW: AtomicUsize = AtomicUsize::new(0);
+        static ADMITTED_LATE: AtomicUsize = AtomicUsize::new(0);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let mut calls = 0;
+                    while start.elapsed() < Duration::from_secs(7) {
+                        let t = Instant::now();
+                        let f = p.facts();
+                        let r = p.admit(public);
+                        if t.elapsed() > REFRESH_WAIT + Duration::from_millis(400) {
+                            SLOW.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if r.is_ok()
+                            && f.gathered_at().elapsed()
+                                > FACTS_TTL + REFRESH_GRACE + Duration::from_millis(300)
+                        {
+                            ADMITTED_LATE.fetch_add(1, Ordering::SeqCst);
+                        }
+                        calls += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    calls
+                })
+            })
+            .collect();
+        let calls: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        let gathers = p.facts.seam.gathers.load(Ordering::SeqCst) - before;
+        let slow = SLOW.load(Ordering::SeqCst);
+        eprintln!("{calls} calls, {gathers} re-reads, {slow} calls slower than the wait");
+        // Each re-read holds the caller that runs it (and admit's forced re-read can be a
+        // second); every other caller is answered within the wait.
+        assert!(
+            slow <= 2 * gathers,
+            "{slow} slow calls for {gathers} re-reads"
+        );
+        assert!(calls > 100, "{calls}");
+        assert_eq!(ADMITTED_LATE.load(Ordering::SeqCst), 0);
+        // And past the grace, refused.
+        assert!(matches!(
+            p.admit(public),
+            Err(Denied::FactsUnreadable { .. })
+        ));
     }
 
     /// Review r2 R2-NG-1: local routes that hold every public address the host routes stop a
