@@ -98,59 +98,136 @@ fn failed_with(what: &str, e: &(dyn std::error::Error + 'static)) -> FetchError 
     failed(what, text)
 }
 
-/// A TCP connection to the first of `pinned` that connects (each within the connect timeout and
-/// `deadline`), from the source address it was vetted with (review round 4, cross-3: the source
-/// the kernel chose for the vetted path, so a rule that picks a path by protocol cannot make the
-/// check's source and the connection's differ), checked once made ([`RecheckLayer::check`]),
-/// before anything is written on it.
+/// How long after one address's attempt the next one starts while the first has neither
+/// connected nor failed (RFC 8305's connection attempt delay, 250 ms).
+pub(super) const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// When one attempt's connect must have finished: its connect timeout from `now`, within the
+/// request's `deadline`.
+pub(super) fn attempt_limit(
+    now: tokio::time::Instant,
+    connect_timeout: Duration,
+    deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    (now + connect_timeout).min(deadline)
+}
+
+/// A TCP connection to one of `pinned` (at most one per family: [`super::GuardedClient`]'s pin),
+/// raced as RFC 8305 says (review round 5, cross-2): IPv6 first, the next address
+/// [`ATTEMPT_DELAY`] later or as soon as the one before failed, each within its own connect
+/// timeout and `deadline`, from the source address it was vetted with (review round 4, cross-3:
+/// the source the kernel chose for the vetted path, so a rule that picks a path by protocol
+/// cannot make the check's source and the connection's differ), and checked once made
+/// ([`RecheckLayer::check`]) before anything is written on it. The first that connects and
+/// passes the check is used; every other attempt is dropped then (closed before a byte is
+/// written). A check that refuses a connection refuses the hop (a path that changed is not
+/// retried elsewhere). When none connects, the error names every address's failure. Before
+/// round 5 the addresses were tried one after another with the whole connect timeout each, so a
+/// blackholed IPv6 path added 15 s to every hop.
 pub(super) async fn connect_checked(
     pinned: &[SocketAddr],
     recheck: &RecheckLayer,
     options: &ClientOptions,
     deadline: tokio::time::Instant,
 ) -> Result<tokio::net::TcpStream, FetchError> {
-    let mut last = None;
-    for addr in pinned {
-        let source = recheck.source_of(*addr);
-        let connect = async {
-            let sock = if addr.is_ipv4() {
-                tokio::net::TcpSocket::new_v4()?
-            } else {
-                tokio::net::TcpSocket::new_v6()?
-            };
-            if let Some(src) = source {
-                sock.bind(SocketAddr::new(src, 0))?;
-            }
-            sock.connect(*addr).await
-        };
-        let limit = (tokio::time::Instant::now() + options.connect_timeout).min(deadline);
-        let tcp = match tokio::time::timeout_at(limit, connect).await {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(e)) => {
-                last = Some(failed(&format!("connecting to {addr}"), e));
-                continue;
-            }
-            Err(_) => {
-                last = Some(failed(&format!("connecting to {addr}"), "timed out"));
-                continue;
-            }
-        };
-        let (local, peer) = match (tcp.local_addr(), tcp.peer_addr()) {
-            (Ok(l), Ok(p)) => (l, p),
-            _ => {
-                return Err(FetchError::Denied(Denied::PathChanged {
-                    addr: *addr,
-                    why: "the connection's own addresses could not be read".into(),
-                }))
-            }
-        };
-        recheck
-            .check(local, peer)
-            .await
-            .map_err(FetchError::Denied)?;
-        return Ok(tcp);
+    let recheck = recheck.clone();
+    let options = *options;
+    race(pinned, ATTEMPT_DELAY, move |addr| {
+        let recheck = recheck.clone();
+        async move { attempt(addr, &recheck, &options, deadline).await }
+    })
+    .await
+}
+
+/// The race of [`connect_checked`] over `pinned` (IPv6 first), each address's `attempt` started
+/// `delay` after the one before, or at once when that one failed.
+pub(super) async fn race<T, F, Fut>(
+    pinned: &[SocketAddr],
+    delay: Duration,
+    attempt: F,
+) -> Result<T, FetchError>
+where
+    T: Send + 'static,
+    F: Fn(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T, FetchError>> + Send + 'static,
+{
+    let mut order: Vec<SocketAddr> = pinned.to_vec();
+    order.sort_by_key(|a| !super::unmapped(*a).is_ipv6());
+    let mut running = tokio::task::JoinSet::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut next = 0;
+    let mut start_next = tokio::time::Instant::now();
+    loop {
+        if next < order.len() && (running.is_empty() || tokio::time::Instant::now() >= start_next)
+        {
+            running.spawn(attempt(order[next]));
+            next += 1;
+            start_next = tokio::time::Instant::now() + delay;
+        }
+        if running.is_empty() {
+            break;
+        }
+        tokio::select! {
+            done = running.join_next() => match done {
+                Some(Ok(Ok(won))) => return Ok(won),
+                Some(Ok(Err(FetchError::Connection(why)))) => {
+                    failures.push(why);
+                    // The next address at once.
+                    start_next = tokio::time::Instant::now();
+                }
+                Some(Ok(Err(e))) => return Err(e),
+                Some(Err(e)) => failures.push(format!("a connection attempt did not finish: {e}")),
+                None => {}
+            },
+            _ = tokio::time::sleep_until(start_next), if next < order.len() => {}
+        }
     }
-    Err(last.unwrap_or(FetchError::BadRedirect("no address to connect to")))
+    Err(if failures.is_empty() {
+        FetchError::BadRedirect("no address to connect to")
+    } else {
+        FetchError::Connection(crate::printable(&failures.join("; "), 600))
+    })
+}
+
+/// One address's attempt of [`connect_checked`]: the connection, then its check.
+async fn attempt(
+    addr: SocketAddr,
+    recheck: &RecheckLayer,
+    options: &ClientOptions,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::net::TcpStream, FetchError> {
+    let source = recheck.source_of(addr);
+    let connect = async {
+        let sock = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        if let Some(src) = source {
+            sock.bind(SocketAddr::new(src, 0))?;
+        }
+        sock.connect(addr).await
+    };
+    let limit = attempt_limit(tokio::time::Instant::now(), options.connect_timeout, deadline);
+    let tcp = match tokio::time::timeout_at(limit, connect).await {
+        Ok(Ok(tcp)) => tcp,
+        Ok(Err(e)) => return Err(failed(&format!("connecting to {addr}"), e)),
+        Err(_) => return Err(failed(&format!("connecting to {addr}"), "timed out")),
+    };
+    let (local, peer) = match (tcp.local_addr(), tcp.peer_addr()) {
+        (Ok(l), Ok(p)) => (l, p),
+        _ => {
+            return Err(FetchError::Denied(Denied::PathChanged {
+                addr,
+                why: "the connection's own addresses could not be read".into(),
+            }))
+        }
+    };
+    recheck
+        .check(local, peer)
+        .await
+        .map_err(FetchError::Denied)?;
+    Ok(tcp)
 }
 
 /// One request on a connection of its own (see the module doc): `method` to `url` (whose host
@@ -349,6 +426,100 @@ mod tests {
                 None => return Ok(n),
             }
         }
+    }
+
+    /// Review round 5, cross-2: the hop's addresses race (RFC 8305): IPv6 first, IPv4
+    /// [`ATTEMPT_DELAY`] later (or at once when IPv6 failed); the first to connect and pass its
+    /// check wins and the other attempt is dropped; a refusal by the check refuses the hop; when
+    /// every address fails, every failure is named.
+    #[tokio::test]
+    async fn r5_the_addresses_race_ipv6_first() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+        let v6: SocketAddr = "[2606:2800:220:1::1]:443".parse().unwrap();
+        let v4: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        // A blackholed IPv6 path: the IPv4 attempt starts 250 ms later and wins; the IPv6 one is
+        // dropped.
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started: Arc<Mutex<Vec<(SocketAddr, Duration)>>> = Arc::default();
+        let t0 = tokio::time::Instant::now();
+        let (d, st) = (dropped.clone(), started.clone());
+        let won = race(&[v4, v6], ATTEMPT_DELAY, move |a| {
+            let (d, st) = (d.clone(), st.clone());
+            async move {
+                st.lock().unwrap().push((a, t0.elapsed()));
+                if a.is_ipv6() {
+                    let _f = Flag(d);
+                    std::future::pending::<()>().await;
+                }
+                Ok(a)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(won, v4);
+        let started = started.lock().unwrap().clone();
+        assert_eq!(started[0].0, v6, "IPv6 first");
+        assert!(started[1].1 >= ATTEMPT_DELAY && started[1].1 < Duration::from_secs(2), "{started:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(dropped.load(Ordering::SeqCst), "the losing attempt was dropped");
+        // IPv6 fails at once: IPv4 starts at once.
+        let t0 = tokio::time::Instant::now();
+        let won = race(&[v6, v4], Duration::from_secs(5), |a| async move {
+            if a.is_ipv6() {
+                Err(FetchError::Connection(format!("connecting to {a}: refused")))
+            } else {
+                Ok(a)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(won, v4);
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        // Both fail: both named.
+        let e = race(&[v6, v4], ATTEMPT_DELAY, |a| async move {
+            Err::<SocketAddr, _>(FetchError::Connection(format!("connecting to {a}: timed out")))
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains(&v6.to_string()) && e.contains(&v4.to_string()), "{e}");
+        // The check refuses the first connection: the hop is refused, the other never used.
+        let e = race(&[v6, v4], ATTEMPT_DELAY, |a| async move {
+            if a.is_ipv6() {
+                Err(FetchError::Denied(Denied::PathChanged {
+                    addr: a,
+                    why: "test".into(),
+                }))
+            } else {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(a)
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(e.is_denied(), "{e}");
+        // One address: just it.
+        assert_eq!(race(&[v4], ATTEMPT_DELAY, |a| async move { Ok(a) }).await.unwrap(), v4);
+    }
+
+    /// cross-3 (`hop.rs:126`): an attempt's connect is bounded by its connect timeout and by
+    /// the request's deadline, whichever comes first.
+    #[test]
+    fn r5_an_attempt_is_bounded_by_the_deadline_too() {
+        let now = tokio::time::Instant::now();
+        let soon = now + Duration::from_secs(2);
+        assert_eq!(attempt_limit(now, Duration::from_secs(15), soon), soon);
+        assert_eq!(
+            attempt_limit(now, Duration::from_secs(1), soon),
+            now + Duration::from_secs(1)
+        );
     }
 
     /// The body's read timeout counts from the last read (a body that keeps coming, a chunk
