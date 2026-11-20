@@ -257,6 +257,17 @@ route names (a Network Extension VPN) is refused. A `utun` or `ppp` default rout
 [docs/netguard-macos.md](docs/netguard-macos.md). Windows still refuses every requester
 connection in public mode (no route oracle there).
 
+*Troubleshooting (macOS):* if every requester connection is refused with `this host's network
+facts ... could not be read again`, the message names what failed. A file in `/etc/resolver`
+that this user may not read (`Permission denied`) or that is larger than 1 MiB stops the guard,
+because the system reads that file's DNS servers and the guard must refuse them: make it
+readable (`sudo chmod 644 /etc/resolver/<name>`) or remove it. A symbolic link there that loops
+is skipped with a warning. `the system configuration daemon did not answer` means `configd` is
+not responding (restarting the Mac clears it). Every requester connection refused as near
+(`within 2 hops ... accepted a connection`) while a VPN app is on that adds no `utun` route
+points to a Network Extension proxy VPN (flow divert, app proxy): it is expected to accept every
+connection itself, so every probe connects, and the guard cannot see past it.
+
 **Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
 endpoints for builders, has no network of its own: its sandbox denies every socket call. The
 miner's *connector* makes each connection for it — the broker can only name one of the endpoints
