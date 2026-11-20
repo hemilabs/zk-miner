@@ -196,9 +196,14 @@ Every connection a requester can cause goes through one guard
   connection is made. A peer that closes or resets either connection first is a failed check,
   refused (never read as near or far). A refusal that is not a near answer says `could not tell
   how near ... is`. The probe is asked up to three times (1 s, 0.5 s, and after a 1 s pause
-  1 s: a router rate-limiting its ICMP answers a later one), at most two probes at a time in the
-  process, a name's addresses one after another until one of each family passes, and an
-  IPv4-mapped destination is probed as its IPv4 address. Linux reads the FIN's fate from `TCP_INFO`, macOS from
+  1 s: a router rate-limiting its ICMP answers a later one), and once more after 2 s when the
+  check connection could not tell (AWS S3); at most two probes at a time per address family,
+  started at most six in a burst and three a second, first come first served; a name's
+  addresses one after another per family (the two families at once, a family given up after
+  two checks that could not tell) until one of each family passes; and an IPv4-mapped
+  destination is probed as its IPv4 address. A far verdict is remembered for 10 s for that exact
+  address, port and hop limit on unchanged facts (routes, rules, addresses, uplink), never for a
+  prefix and never a near or failed one. Linux reads the FIN's fate from `TCP_INFO`, macOS from
   `TCP_CONNECTION_INFO`; Windows has no check connection (a probe without an answer refuses
   there). A check connection that does not connect refuses. Any other probe error (a local
   firewall's) refuses. Unprivileged; developer mode sends no probe.
