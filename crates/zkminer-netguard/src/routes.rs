@@ -891,6 +891,25 @@ pub(crate) fn read_links() -> std::io::Result<Vec<Link>> {
     sys::links()
 }
 
+/// One entry of the kernel's neighbour table (ARP, NDP): the interface, the neighbour's address,
+/// and its link-layer address when the entry holds a usable one (`None`: the entry is incomplete,
+/// failed, or names none).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Neighbour {
+    pub ifindex: u32,
+    pub addr: IpAddr,
+    pub lladdr: Option<Vec<u8>>,
+}
+
+/// Linux: every IPv4 and IPv6 neighbour entry (`RTM_GETNEIGH` dumps, unprivileged; proxy entries
+/// left out). The uplink signature reads the default gateways' link-layer addresses from it
+/// ([`crate::HostFacts::gather_with`]; the Linux application of review round 2, bypass-2).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn read_neighbours() -> std::io::Result<Vec<Neighbour>> {
+    sys::neighbours()
+}
+
 /// The interfaces the kernel sends this host's internet traffic out of: its answer for a
 /// connection to a fixed public address of each family (Cloudflare's resolver; nothing is sent).
 /// A family without a route has none.
@@ -953,6 +972,17 @@ mod sys {
     const IFLA_IFNAME: u16 = 3;
     const IFLA_LINKINFO: u16 = 18;
     const IFLA_INFO_KIND: u16 = 1;
+    const RTM_NEWNEIGH: u16 = 28;
+    const RTM_GETNEIGH: u16 = 30;
+    const NDMSG_LEN: usize = 12;
+    const NDA_DST: u16 = 1;
+    const NDA_LLADDR: u16 = 2;
+    /// `ndm_flags`: a proxy entry (`ip neigh add proxy`), which names no neighbour of this host.
+    const NTF_PROXY: u8 = 0x08;
+    /// `ndm_state`s whose link-layer address is usable (`NUD_VALID`, <net/neighbour.h>:
+    /// `PERMANENT | NOARP | REACHABLE | PROBE | STALE | DELAY`); `INCOMPLETE`, `FAILED` and `NONE`
+    /// hold none.
+    const NUD_VALID: u16 = 0x80 | 0x40 | 0x02 | 0x10 | 0x04 | 0x08;
     const RTM_NEWNEXTHOP: u16 = 104;
     const RTM_GETNEXTHOP: u16 = 106;
     const NHMSG_LEN: usize = 8;
@@ -1704,6 +1734,57 @@ mod sys {
             }
         }
         out.push(nh);
+        Ok(())
+    }
+
+    /// Every IPv4 and IPv6 neighbour entry: an `RTM_GETNEIGH` dump per family (unprivileged).
+    pub(super) fn neighbours() -> io::Result<Vec<super::Neighbour>> {
+        let mut out = Vec::new();
+        for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+            // `struct ndmsg`: family, pad, pad, ifindex, state, flags, type.
+            let mut hdr = [0u8; NDMSG_LEN];
+            hdr[0] = family;
+            out.extend(dump_consistent_with(
+                RTM_GETNEIGH,
+                RTM_NEWNEIGH,
+                &hdr,
+                parse_neighbour,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// One `RTM_NEWNEIGH`: `ndm_family`, `ndm_ifindex`, `ndm_state`, `ndm_flags`, `NDA_DST`,
+    /// `NDA_LLADDR`. A proxy entry, or one without an IP destination of its family, is skipped;
+    /// the link-layer address is kept only for a state that holds a usable one ([`NUD_VALID`]).
+    pub(super) fn parse_neighbour(p: &[u8], out: &mut Vec<super::Neighbour>) -> io::Result<()> {
+        if p.len() < NDMSG_LEN {
+            return Err(malformed());
+        }
+        let family = p[0];
+        let ifindex = u32_at(p, 4).ok_or_else(malformed)?;
+        let state = u16_at(p, 8).ok_or_else(malformed)?;
+        let flags = p[10];
+        if flags & NTF_PROXY != 0 {
+            return Ok(());
+        }
+        let mut dst = None;
+        let mut lladdr = None;
+        for (ty, data) in attrs(&p[NDMSG_LEN..])? {
+            match ty {
+                NDA_DST => dst = addr(family, data),
+                NDA_LLADDR => lladdr = Some(data.to_vec()),
+                _ => {}
+            }
+        }
+        let Some(addr) = dst else {
+            return Ok(());
+        };
+        out.push(super::Neighbour {
+            ifindex,
+            addr,
+            lladdr: lladdr.filter(|_| state & NUD_VALID != 0),
+        });
         Ok(())
     }
 
@@ -2808,6 +2889,95 @@ mod sys {
             };
             assert!(!ppp.is_tunnel(), "a PPPoE uplink is no tunnel");
             assert!(parse_link(&[0u8; 4], &mut out).is_err());
+        }
+
+        /// Neighbour messages (the Linux application of review round 2, bypass-2) parse to their
+        /// interface, address and link-layer address, kept only for a state that holds a usable
+        /// one; proxy entries and entries without an address of their family are skipped.
+        #[test]
+        fn neighbour_messages_parse() {
+            let entry = |family: u8, ifindex: u32, state: u16, flags: u8, dst: &[u8], ll: Option<&[u8]>| {
+                let mut p = vec![0u8; NDMSG_LEN];
+                p[0] = family;
+                p[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+                p[8..10].copy_from_slice(&state.to_ne_bytes());
+                p[10] = flags;
+                p.extend(attr(NDA_DST, dst));
+                if let Some(ll) = ll {
+                    p.extend(attr(NDA_LLADDR, ll));
+                }
+                p
+            };
+            let mac = [0xa4, 0x2b, 0xb0, 0, 0, 1];
+            let v4 = libc::AF_INET as u8;
+            let v6 = libc::AF_INET6 as u8;
+            let mut out = Vec::new();
+            // REACHABLE, STALE, DELAY, PROBE, PERMANENT, NOARP: usable.
+            for state in [0x02u16, 0x04, 0x08, 0x10, 0x80, 0x40] {
+                parse_neighbour(&entry(v4, 2, state, 0, &[192, 168, 1, 1], Some(&mac)), &mut out).unwrap();
+                assert_eq!(out.pop().unwrap().lladdr, Some(mac.to_vec()), "{state:#x}");
+            }
+            // INCOMPLETE, FAILED, NONE: none (a FAILED entry keeps its last address).
+            for state in [0x01u16, 0x20, 0x00] {
+                parse_neighbour(&entry(v4, 2, state, 0, &[192, 168, 1, 1], Some(&mac)), &mut out).unwrap();
+                assert_eq!(out.pop().unwrap().lladdr, None, "{state:#x}");
+            }
+            // A NOARP entry of a device without link-layer addresses (a tun): an empty one.
+            parse_neighbour(&entry(v4, 9, 0x40, 0, &[10, 8, 0, 1], Some(&[])), &mut out).unwrap();
+            assert_eq!(out.pop().unwrap().lladdr, Some(Vec::new()));
+            let gw6: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+            parse_neighbour(&entry(v6, 3, 0x04, 0, &gw6.octets(), Some(&mac)), &mut out).unwrap();
+            assert_eq!(
+                out.pop().unwrap(),
+                crate::routes::Neighbour { ifindex: 3, addr: IpAddr::V6(gw6), lladdr: Some(mac.to_vec()) }
+            );
+            // Proxy entries, and an address of the wrong length for its family: skipped.
+            parse_neighbour(&entry(v4, 2, 0x80, NTF_PROXY, &[192, 168, 1, 7], None), &mut out).unwrap();
+            parse_neighbour(&entry(v4, 2, 0x02, 0, &gw6.octets(), Some(&mac)), &mut out).unwrap();
+            assert!(out.is_empty(), "{out:?}");
+            assert!(parse_neighbour(&[0u8; 8], &mut out).is_err());
+        }
+
+        /// The neighbour table is read unprivileged, and every default gateway this host has
+        /// talked to has an entry; with a link-layer address unless its device has none.
+        #[test]
+        fn this_hosts_neighbour_table_is_read() {
+            let n = super::neighbours().expect("RTM_GETNEIGH is unprivileged");
+            eprintln!("{} neighbour entries", n.len());
+            let (routes, _) = super::dump().unwrap();
+            let gws: Vec<(IpAddr, u32)> = routes
+                .iter()
+                .filter(|r| r.prefix.len == 0 && r.table == super::super::RT_TABLE_MAIN)
+                .filter_map(|r| match r.hop {
+                    Hop::Via(g) => Some((g, r.ifindex)),
+                    _ => None,
+                })
+                .collect();
+            if gws.is_empty() {
+                crate::skipped("no default route through a gateway here");
+                return;
+            }
+            // Traffic to the internet goes to the gateway (nothing is sent: a UDP connect asks
+            // the route and, for IPv4, the kernel resolves the gateway only when sending; so
+            // send one DNS query).
+            if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if s.connect("1.1.1.1:53").is_ok() {
+                    let _ = s.send(&[0u8; 12]);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let n = super::neighbours().unwrap();
+            for (g, ifindex) in gws {
+                let e = n.iter().find(|e| e.addr == g && e.ifindex == ifindex);
+                eprintln!("gateway {g} on {ifindex}: {e:?}");
+                match e {
+                    Some(e) => assert!(e.lladdr.is_some(), "{e:?}"),
+                    None if g.is_ipv6() => {
+                        crate::skipped(format!("no neighbour entry for the IPv6 gateway {g}"))
+                    }
+                    None => panic!("no neighbour entry for the IPv4 gateway {g} after traffic to it"),
+                }
+            }
         }
 
         /// Nexthop messages parse to their id, device, group members and blackhole flag.
