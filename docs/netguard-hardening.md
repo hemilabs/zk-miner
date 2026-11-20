@@ -291,6 +291,35 @@ after the fix), then fixed on every platform with a test. Logs: `fix-r4/`
 | 11 | cross-6 (low): 7 mutants survived; no test reached the broker connector's re-check | the reviewers' VM mutation logs | tests for each: `nl_pid` (`pref64_from`, in `pref64_options_of_router_advertisements_are_read`), ENOBUFS (`r4_the_pref64_listener_survives_enobufs`, a seam), `SO_ERROR` rc != 0 (`r4_a_reset_read_once_stays_a_reset`), `next_read` (in the signature test), the peer match with two vetted addresses (`r4_a_connection_is_checked_against_its_own_vetted_address`), the missing `HttpInfo` (the layer is gone: the hop reads `getsockname`/`getpeername` itself), the PREF64 cap (`r4_pref64_is_learned_from_the_default_gateway_alone`); the broker: `connector::server::tests::a_connection_is_checked_again_once_made` (a real peer, 1.1.1.1:443, a staged route gone once connected: closed, not handed over) | as named |
 | 12 | cross-7 (info): the workflow had no timeout, ran only the netguard crate, and `ZKMINER_CI_ALLOW_SKIP` matched substrings; the docs said the VM had no global IPv6; probe suspicion: the broker's abandoned `vet_path` threads ran on | by reading; the VM reaches IPv6 (`ping -6`) | `timeout-minutes`; a `callers` job (x86_64: `zkminer-chain`, the broker's library tests); skips allowed by an explicit token (`[ipv6] …`, `ZKMINER_CI_ALLOW_SKIP=ipv6`); the VM's IPv6 described (NAT66 through the Mac); the broker's floor checks take one of 4 turns (`MAX_CHECKS_AT_ONCE`), held by the blocking work until it ends | `tests::strict_ci_fails_skips_it_does_not_allow`; `actionlint` (with shellcheck) clean (`actionlint.log`) |
 
+**Mutation run** (`fix-r4/mut/`): 59 mutants of the round 4 code on macOS (`muts.py`,
+`run.py`): 55 killed on the first run (`summary-run1.txt`); the 4 survivors (the non-kernel
+port, the control's round trip from its own FIN, the hop's bind to the vetted source, the body's
+read timeout reset by a read) got tests (`23ad4e2`) and are killed (`summary.txt`). In the VM, 6
+mutants of Linux-only lines (`vm_muts.py`): 2 killed at once; `sys::source` and `query_from`
+survived, got the live test `the_tcp_source_is_the_kernels_and_routes_are_asked_from_it`
+(`dac69a2`) and are killed (`vm-summary-2.txt`); 2 survive: the broker connector's
+bind to the vetted source (the source is the same either way on a host with no rule that tells
+TCP from UDP) and its turns for blocking checks (no test makes checks outlive their share).
+
+**Gates** (`fix-r4/gates-summary.log`, `vm-gates-summary.log`, at 23ad4e2):
+
+- **macOS:** the netguard suite twice and with `ZKMINER_CI_STRICT=1` (215 library tests,
+  nothing skipped); the live forge test twice (about 310,000 queries answered while 1.31 M
+  forged datagrams arrived, none taken); `zkminer-chain` (185) and its two real downloads in
+  public mode; clippy `--all-targets -D warnings`.
+- **Linux (the VM):** the suite twice on aarch64 and once strict with `ZKMINER_CI_ALLOW_SKIP=ipv6`
+  (189, nothing skipped), clippy; under Rosetta (x86_64) the suite, `zkminer-chain` and its real
+  downloads, and the broker's library tests (136, the connector's re-check test among them). The
+  broker's integration tests need anvil (not installed in the VM) and a sandboxed binary that
+  finds no x86_64 `libgcc_s` under Rosetta; `held_lock_fetches_pass_a_flood_of_simulations`
+  fails there at af17e48 as at HEAD.
+- **Type-checked:** `cargo check` and clippy `--all-targets -D warnings` for
+  `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` and `aarch64-linux-android` (stub C
+  compilers): no warnings; the broker's clippy for linux-gnu (its warnings are in files this
+  round did not touch).
+- **Merge:** `git merge-tree --write-tree item/W11-ON37 HEAD`: clean. `actionlint` 1.7.7 with
+  shellcheck 0.9.0 on the workflow: clean.
+
 **Found while fixing.** Two of my own: the control connection made before the check's FIN let a
 near peer whose accept queue was full hold the control's SYN and fail the check (`681ecae`: the
 check's FIN now goes first and an acknowledgement of it is near at once); and the re-check's
