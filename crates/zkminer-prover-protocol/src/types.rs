@@ -1391,6 +1391,20 @@ impl std::error::Error for HostMemoryShortage {}
 #[derive(Debug, Clone, Copy)]
 pub struct ShortageFromOutside;
 
+/// Context on a `HostMemoryShortage` refused only to keep memory for a job that has waited longer
+/// for it (the dispatcher's memory line): the memory is there, but taking it would hold that job up.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryKeptForWaiter;
+
+impl std::fmt::Display for MemoryKeptForWaiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the memory is kept for a job that has waited longer for it, and is due first"
+        )
+    }
+}
+
 impl std::fmt::Display for ShortageFromOutside {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

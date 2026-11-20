@@ -3881,8 +3881,16 @@ pub struct WorkerPool {
     card_waiters: Mutex<Vec<CardWaiter>>,
     card_waiter_seq: AtomicU64,
     /// When each busy card (`card_of`) should be free again: set as a proof with an estimate starts
-    /// there (`with_slot_estimates`), cleared when it ends. For `better_card_soon`.
-    card_eta: Mutex<HashMap<String, Instant>>,
+    /// there (`with_slot_estimates`), moved as its progress reports come in (`eta_from_progress`),
+    /// cleared when it ends. For `better_card_soon`.
+    card_eta: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Jobs refused for host memory, in the order it goes to them (`memory_held_for_waiter`): a
+    /// big SP1 proof otherwise lost every byte that came back to the small RISC Zero proofs that
+    /// asked first.
+    memory_waiters: Mutex<Vec<MemoryWaiter>>,
+    /// How long each slot's last proof spent after its STARK (`ProveStage::Finish`): the rest of a
+    /// proof once its STARK is done (`eta_from_progress`).
+    proof_tails: Arc<Mutex<HashMap<String, Duration>>>,
     /// Commit in-flight proofs have laid claim to (Windows; `reserve_commit`), beside the RAM ones in
     /// `memory_ledger`.
     commit_ledger: crate::memory::MemoryLedger,
@@ -4069,6 +4077,85 @@ pub fn with_slot_estimates<R>(estimates: HashMap<String, Duration>, f: impl FnOn
     f()
 }
 
+thread_local! {
+    /// The job being dispatched on this thread (`with_job_tag`), for the memory line.
+    static JOB_TAG: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` (a `prove_min_vram` call) as job `tag`: refused for host memory, it keeps its place in
+/// the memory line across its retries (`memory_held_for_waiter`), each a new call.
+pub fn with_job_tag<R>(tag: u64, f: impl FnOnce() -> R) -> R {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            JOB_TAG.with(|t| t.set(None));
+        }
+    }
+    JOB_TAG.with(|t| t.set(Some(tag)));
+    let _clear = Clear;
+    f()
+}
+
+/// A job waiting for host memory (`WorkerPool::memory_waiters`).
+#[derive(Debug, Clone)]
+struct MemoryWaiter {
+    job: u64,
+    /// Its place in line: the latest it can start (else its cutoff), then arrival.
+    order: Option<Instant>,
+    since: Instant,
+    /// When it last asked: one that stops asking (released, proved elsewhere) leaves the line.
+    seen: Instant,
+    /// What it needs beyond what its worker holds: RAM, and commit (Windows).
+    ram: u64,
+    commit: u64,
+}
+
+impl MemoryWaiter {
+    fn place(&self) -> (bool, Option<Instant>, Instant, u64) {
+        (self.order.is_none(), self.order, self.since, self.job)
+    }
+}
+
+/// How long a memory waiter keeps its place without asking again: a job waiting for memory asks at
+/// least every 15 s (`HOST_MEMORY_BACKOFF_SECS` in the miner), sooner when memory is given back.
+const MEMORY_WAITER_TTL: Duration = Duration::from_secs(40);
+
+/// Whether taking `mine` bytes now, for a proof that ends at `my_finish` (unknown: never), holds up
+/// a waiter needing `need`, with `room` free for proofs now and `returns` (when each proof of ours
+/// running ends, and what it gives back) to come. The waiter fits when `room` and what has come back
+/// cover `need`: now, or when enough of our proofs end. If they never do, something else holds the
+/// memory and nothing is kept for it. It is held up when this proof would still be running then and
+/// what is left beside it is short.
+fn holds_up_waiter(
+    room: u64,
+    need: u64,
+    mine: u64,
+    returns: &[(Instant, u64)],
+    my_finish: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if need == 0 || mine == 0 {
+        return false;
+    }
+    let mut returns = returns.to_vec();
+    returns.sort();
+    let mut have = room;
+    let mut fits_at = (have >= need).then_some(now);
+    for (at, bytes) in returns {
+        if fits_at.is_some() {
+            break;
+        }
+        have = have.saturating_add(bytes);
+        if have >= need {
+            fits_at = Some(at.max(now));
+        }
+    }
+    let Some(fits_at) = fits_at else {
+        return false;
+    };
+    my_finish.is_none_or(|f| f > fits_at) && have.saturating_sub(mine) < need
+}
+
 /// This thread's estimate for `key` (`with_slot_estimates`).
 fn slot_estimate(key: &str) -> Option<Duration> {
     SLOT_ESTIMATES.with(|e| e.borrow().get(key).copied())
@@ -4108,6 +4195,14 @@ impl CardWaiter {
             self.ticket,
         )
     }
+}
+
+/// A job as the card line weighs it (`WorkerPool::hands_off`): its slots, how long it takes on each,
+/// and its cutoff.
+struct JobView<'a> {
+    keys: &'a [String],
+    estimates: &'a HashMap<String, Duration>,
+    cutoff: Option<Instant>,
 }
 
 /// Removes a waiter from `card_waiters` when its wait ends, however it ends.
@@ -4150,6 +4245,65 @@ const WORKER_SWITCH_COST: Duration = Duration::from_secs(20);
 
 /// How much sooner a busy card must finish a job than the free one for it to wait for it.
 const BETTER_CARD_MARGIN: Duration = Duration::from_secs(15);
+
+/// What a proof's progress reports have shown so far, for `eta_from_progress`.
+#[derive(Debug, Default, Clone, Copy)]
+struct EtaTrack {
+    /// When the STARK first reported a count, and the count then.
+    first_count: Option<(Instant, u32)>,
+    /// The STARK's time so far, extrapolated over every unit counted (for the default tail).
+    stark_secs: Option<Duration>,
+    /// When the stage after the STARK began.
+    finish_began: Option<Instant>,
+}
+
+/// What is left of a proof after its STARK when its slot has not shown it yet: SP1's shrink and
+/// wrap, from the slowest measured card (RTX 4070, 17 s) with room for its setup; risc0's lift, join
+/// and wrap, a tenth of its STARK and a few seconds.
+fn default_proof_tail(backend: &str, stark: Option<Duration>) -> Duration {
+    if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(4) + stark.unwrap_or_default() / 10
+    }
+}
+
+/// When a proof should end, from the report it just sent (`ProveStage`): through the rest of its
+/// STARK at the rate it has counted since its first count, then `tail`; in the stage after the STARK,
+/// `tail` from when that began. `None` when the report tells nothing new (no count yet, or SP1's
+/// shard total not final). The estimate a proof started with is from the benchmark; this is from the
+/// proof itself, so a card slower or faster than benchmarked, or a job whose estimate was off, shows
+/// when it really frees (`better_card_soon`), where an overdue card counted as unknown.
+fn eta_from_progress(
+    track: &mut EtaTrack,
+    report: zkminer_prover_protocol::types::StageReport,
+    now: Instant,
+    tail: impl Fn(Option<Duration>) -> Duration,
+) -> Option<Instant> {
+    use zkminer_prover_protocol::types::ProveStage;
+    match report.stage {
+        ProveStage::Prove => {
+            let Some((began, first)) = track.first_count else {
+                track.first_count = Some((now, report.done));
+                return None;
+            };
+            let counted = report.done.checked_sub(first).filter(|n| *n > 0)?;
+            let spent = now.saturating_duration_since(began);
+            let per_unit = spent.as_secs_f64() / f64::from(counted);
+            track.stark_secs = Some(Duration::from_secs_f64(per_unit * f64::from(report.done)));
+            if !report.total_final || report.total < report.done {
+                return None;
+            }
+            let left = Duration::from_secs_f64(per_unit * f64::from(report.total - report.done));
+            Some(now + left + tail(track.stark_secs))
+        }
+        ProveStage::Finish => {
+            let began = *track.finish_began.get_or_insert(now);
+            Some(began + tail(track.stark_secs))
+        }
+        _ => None,
+    }
+}
 
 /// Windows: after recycling workers that held `held` bytes of commit (free commit was `before`),
 /// wait until most of it is free again, or `need` (what the proof starting will commit) is, 15 s at
@@ -4194,7 +4348,9 @@ impl WorkerPool {
             host_peaks_path: None,
             card_waiters: Mutex::new(Vec::new()),
             card_waiter_seq: AtomicU64::new(0),
-            card_eta: Mutex::new(HashMap::new()),
+            card_eta: Arc::new(Mutex::new(HashMap::new())),
+            memory_waiters: Mutex::new(Vec::new()),
+            proof_tails: Arc::new(Mutex::new(HashMap::new())),
             commit_ledger: crate::memory::MemoryLedger::default(),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
@@ -8346,18 +8502,24 @@ impl WorkerPool {
         physical_gpu_id(key).unwrap_or_else(|| key.to_string())
     }
 
-    /// A proof with an estimate (`with_slot_estimates`) is starting on `key`: record when its card
-    /// should be free again, until the guard drops.
+    /// A proof is starting on `key`: record when its card should be free again, from its estimate
+    /// (`with_slot_estimates`) when it has one, until the guard drops. Its progress reports move it
+    /// (`eta_from_progress`), and give one to a proof that had no estimate.
     fn note_card_eta(&self, key: &str) -> CardEtaGuard<'_> {
-        let card = slot_estimate(key).map(|takes| {
-            let card = Self::card_of(key);
-            self.card_eta
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(card.clone(), Instant::now() + takes);
-            card
-        });
-        CardEtaGuard { pool: self, card }
+        let card = Self::card_of(key);
+        let mut etas = self.card_eta.lock().unwrap_or_else(|e| e.into_inner());
+        match slot_estimate(key) {
+            Some(takes) => {
+                etas.insert(card.clone(), Instant::now() + takes);
+            }
+            None => {
+                etas.remove(&card);
+            }
+        }
+        CardEtaGuard {
+            pool: self,
+            card: Some(card),
+        }
     }
 
     /// Whether the worker of `key` is running (no spawn, nor a sibling stopped, before it proves).
@@ -8418,14 +8580,19 @@ impl WorkerPool {
     /// RISC Zero job can the card an SP1 job wants), with an earlier deadline,
     /// or the same and waiting longer. Waiting jobs polled every 250 ms and the first to look took
     /// the card, so a job claimed later, or one due sooner, could wait behind any number of others.
+    ///
+    /// With `mine` (the job's own slots and cutoff, its estimates this thread's), a card also changes
+    /// hands by what it is worth to each (`hands_off`): a job due later takes it when the one due
+    /// first loses less by going to its other card than it gains, and the one due first leaves it so.
     fn yields_to_waiter(
         &self,
         key: &str,
         me: Option<u64>,
         abort_at: Option<Instant>,
         since: Instant,
+        mine: Option<(&[String], Option<Instant>)>,
     ) -> bool {
-        let mine = CardWaiter {
+        let my_order = CardWaiter {
             ticket: me.unwrap_or(u64::MAX),
             abort_at,
             since,
@@ -8435,23 +8602,126 @@ impl WorkerPool {
         }
         .order();
         let now = Instant::now();
-        self.card_waiters
+        let my_estimates: HashMap<String, Duration> = mine
+            .map(|(keys, _)| {
+                keys.iter()
+                    .filter_map(|k| Some((k.clone(), slot_estimate(k)?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let my_view = mine.map(|(keys, cutoff)| JobView {
+            keys,
+            estimates: &my_estimates,
+            cutoff,
+        });
+        // A copy: deciding reads card and slot locks, which must not be taken under the line's.
+        let waiters = self
+            .card_waiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        waiters.iter().any(|w| {
+            if Some(w.ticket) == me {
+                return false;
+            }
+            let theirs = JobView {
+                keys: &w.keys,
+                estimates: &w.estimates,
+                cutoff: w.cutoff,
+            };
+            // Only a card it can take and finish on by its cutoff.
+            if self.finish_here(&theirs, key, now).is_none() {
+                return false;
+            }
+            match &my_view {
+                Some(mine) if w.order() < my_order => !self.hands_off(&theirs, mine, key, now),
+                Some(mine) => self.hands_off(mine, &theirs, key, now),
+                None => w.order() < my_order,
+            }
+        })
+    }
+
+    /// How long `job` takes on the card of `key` (by its slot there), if it can take that card and
+    /// finish by its cutoff. Without an estimate there, `Duration::ZERO`: it counts as able.
+    fn finish_here(&self, job: &JobView<'_>, key: &str, now: Instant) -> Option<Duration> {
+        job.keys
             .iter()
-            .any(|w| {
-                Some(w.ticket) != me
-                    && w.order() < mine
-                    && w.keys.iter().any(|k| {
-                        self.same_card(k, key)
-                            && self.slot_could_take(k)
-                            // Only a card it can finish on by its cutoff.
-                            && match (w.cutoff, w.estimates.get(k)) {
-                                (Some(cutoff), Some(takes)) => now + *takes <= cutoff,
-                                _ => true,
-                            }
-                    })
+            .filter(|k| self.same_card(k, key) && self.slot_could_take(k))
+            .find_map(|k| match (job.cutoff, job.estimates.get(k)) {
+                (Some(cutoff), Some(takes)) => (now + *takes <= cutoff).then_some(*takes),
+                (None, Some(takes)) => Some(*takes),
+                _ => Some(Duration::ZERO),
             })
+    }
+
+    /// When `job`, not taking the card of `key`, would finish on its best other card: when that one
+    /// frees (now, or its `card_eta` still ahead), plus a switch when its worker is not running, plus
+    /// its estimate there; only by its cutoff. `None` when no other card is known to do it.
+    fn finish_elsewhere(&self, job: &JobView<'_>, key: &str, now: Instant) -> Option<Instant> {
+        let etas = self
+            .card_eta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        job.keys
+            .iter()
+            .filter(|k| !self.same_card(k, key) && self.slot_could_take(k))
+            .filter_map(|k| {
+                let takes = *job.estimates.get(k)?;
+                let free_now = self.gpu_lock_for(k).is_none_or(|l| {
+                    !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+                });
+                let free_at = if free_now {
+                    now
+                } else {
+                    *etas.get(&Self::card_of(k)).filter(|at| **at > now)?
+                };
+                let switch = if self.slot_running(k) {
+                    Duration::ZERO
+                } else {
+                    WORKER_SWITCH_COST
+                };
+                let finish = free_at + switch + takes;
+                job.cutoff.is_none_or(|c| finish <= c).then_some(finish)
+            })
+            .min()
+    }
+
+    /// Whether `holder`, due first for the card of `key`, should leave it to `other`: `other` gains
+    /// more by it (its finish on its next best card, or after `holder` here, against its finish here)
+    /// than `holder` loses by going to its own next best card (`finish_elsewhere`, which keeps it
+    /// inside its cutoff), by `BETTER_CARD_MARGIN`. A 5090 is ~4.5x a 4070 for RISC Zero and ~2.6x for
+    /// SP1: with an SP1 and a RISC Zero job both waiting, the SP1 one took the 5090 by its deadline,
+    /// and the RISC Zero one ran four times as long on the 4070. Both need estimates.
+    fn hands_off(
+        &self,
+        holder: &JobView<'_>,
+        other: &JobView<'_>,
+        key: &str,
+        now: Instant,
+    ) -> bool {
+        let estimate_here = |job: &JobView<'_>| {
+            job.keys
+                .iter()
+                .filter(|k| self.same_card(k, key))
+                .find_map(|k| job.estimates.get(k).copied())
+        };
+        let (Some(holder_here), Some(other_here)) = (estimate_here(holder), estimate_here(other))
+        else {
+            return false;
+        };
+        if self.finish_here(other, key, now).is_none() {
+            return false;
+        }
+        let Some(holder_elsewhere) = self.finish_elsewhere(holder, key, now) else {
+            return false;
+        };
+        let loss = holder_elsewhere.saturating_duration_since(now + holder_here);
+        let other_elsewhere = self
+            .finish_elsewhere(other, key, now)
+            .unwrap_or(now + holder_here + other_here);
+        let gain = other_elsewhere.saturating_duration_since(now + other_here);
+        gain > loss + BETTER_CARD_MARGIN
     }
 
     /// Whether the worker of `key` could take a free card: alive or respawnable, or busy now (it
@@ -8508,6 +8778,220 @@ impl WorkerPool {
                 estimates,
             });
         (CardWaitGuard { pool: self, ticket }, ticket, since)
+    }
+
+    /// Whether the memory a proof on `key` would take now (`want` RAM at `po2`) must be left to a job
+    /// ahead of it in the memory line (`memory_waiters`, by latest start, then arrival): taking it
+    /// would hold that job up (`holds_up_waiter`), in RAM or (Windows) commit. Then the typed shortage
+    /// to return, marked `MemoryKeptForWaiter`. A small proof that ends before the memory a waiter
+    /// needs has come back still goes ahead of it.
+    fn memory_held_for_waiter(
+        &self,
+        key: &str,
+        want: u64,
+        po2: Option<u8>,
+        abort_at: Option<Instant>,
+    ) -> Option<anyhow::Error> {
+        let me = JOB_TAG.with(|t| t.get());
+        let now = Instant::now();
+        let ahead: Vec<MemoryWaiter> = {
+            let mut line = self
+                .memory_waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            line.retain(|w| now.saturating_duration_since(w.seen) < MEMORY_WAITER_TTL);
+            if line.iter().all(|w| Some(w.job) == me) {
+                return None;
+            }
+            let order = abort_at.map(|a| {
+                slot_estimate(key)
+                    .and_then(|takes| a.checked_sub(takes))
+                    .unwrap_or(a)
+            });
+            let since = line
+                .iter()
+                .find(|w| Some(w.job) == me)
+                .map_or(now, |w| w.since);
+            let mine = MemoryWaiter {
+                job: me.unwrap_or(u64::MAX),
+                order,
+                since,
+                seen: now,
+                ram: 0,
+                commit: 0,
+            }
+            .place();
+            line.iter()
+                .filter(|w| Some(w.job) != me && w.place() < mine)
+                .cloned()
+                .collect()
+        };
+        if ahead.is_empty() {
+            return None;
+        }
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        let my_finish = slot_estimate(key).map(|takes| now + takes);
+        // What our proofs running on other cards give back, and when (`card_eta`).
+        let etas = self
+            .card_eta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let running: Vec<(String, Instant)> = self
+            .workers
+            .iter()
+            .filter(|(k, e)| !self.same_card(k, key) && e.slot.try_lock().is_err())
+            .filter_map(|(k, _)| {
+                let at = *etas.get(&Self::card_of(k))?;
+                Some((k.clone(), at))
+            })
+            .collect();
+        let returns = |held: &dyn Fn(&str) -> Option<u64>| -> Vec<(Instant, u64)> {
+            running
+                .iter()
+                .filter_map(|(k, at)| Some((*at, held(k)?)))
+                .collect()
+        };
+        let ram_mine = want.saturating_sub(self.current_host_bytes_for_slot(key).unwrap_or(0));
+        let ram = self.admission_available().map(|available| {
+            (
+                available.saturating_sub(reserve),
+                returns(&|k| self.current_host_bytes_for_slot(k)),
+            )
+        });
+        let commit = crate::memory::commit_figures().map(|c| {
+            let pending = self
+                .commit_ledger
+                .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
+            (
+                c.available.saturating_sub(pending).saturating_sub(reserve),
+                returns(&|k| self.current_commit_bytes_for_slot(k)),
+                self.slot_commit_peak_in(key, po2, c.total)
+                    .saturating_sub(self.current_commit_bytes_for_slot(key).unwrap_or(0)),
+            )
+        });
+        let held_up = ahead.iter().find(|w| {
+            ram.as_ref().is_some_and(|(room, back)| {
+                holds_up_waiter(*room, w.ram, ram_mine, back, my_finish, now)
+            }) || commit.as_ref().is_some_and(|(room, back, mine)| {
+                holds_up_waiter(*room, w.commit, *mine, back, my_finish, now)
+            })
+        })?;
+        tracing::debug!(
+            "{key}: leaving host memory to a job waiting longer for it ({:.1} GiB RAM, {:.1} GiB \
+             commit)",
+            held_up.ram as f64 / (1u64 << 30) as f64,
+            held_up.commit as f64 / (1u64 << 30) as f64,
+        );
+        Some(
+            anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
+                attempted: false,
+                slot_key: key.to_string(),
+                needed: want,
+                reserved: self.reserved_host_memory(),
+                available: crate::memory::mem_available_bytes().unwrap_or(0),
+            })
+            .context(zkminer_prover_protocol::types::MemoryKeptForWaiter),
+        )
+    }
+
+    /// The job on this thread (`with_job_tag`) was refused host memory for a proof on `key` at `po2`:
+    /// keep or take its place in the memory line, with what it needs there now.
+    fn note_memory_waiter(
+        &self,
+        key: &str,
+        po2: Option<u8>,
+        abort_at: Option<Instant>,
+        execute_peak_bytes: u64,
+    ) {
+        let Some(job) = JOB_TAG.with(|t| t.get()) else {
+            return;
+        };
+        let now = Instant::now();
+        let ram = self
+            .host_want(key, po2, execute_peak_bytes)
+            .saturating_sub(self.current_host_bytes_for_slot(key).unwrap_or(0));
+        let commit = crate::memory::commit_figures().map_or(0, |c| {
+            self.slot_commit_peak_in(key, po2, c.total)
+                .saturating_sub(self.current_commit_bytes_for_slot(key).unwrap_or(0))
+        });
+        let order = abort_at.map(|a| {
+            slot_estimate(key)
+                .and_then(|takes| a.checked_sub(takes))
+                .unwrap_or(a)
+        });
+        let mut line = self
+            .memory_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match line.iter_mut().find(|w| w.job == job) {
+            Some(w) => {
+                w.order = order;
+                w.seen = now;
+                w.ram = ram;
+                w.commit = commit;
+            }
+            None => line.push(MemoryWaiter {
+                job,
+                order,
+                since: now,
+                seen: now,
+                ram,
+                commit,
+            }),
+        }
+    }
+
+    /// The job on this thread (`with_job_tag`) no longer waits for memory: admitted, or its attempt
+    /// ended otherwise.
+    fn leave_memory_line(&self) {
+        if let Some(job) = JOB_TAG.with(|t| t.get()) {
+            self.memory_waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|w| w.job != job);
+        }
+    }
+
+    /// `prove_on_slot` for `prove_min_vram`, keeping the job's place in the memory line: refused host
+    /// memory (nothing ran), it takes or keeps one (`note_memory_waiter`); otherwise it leaves.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_in_memory_line(
+        &self,
+        key: &str,
+        elf: &[u8],
+        input_data: &[u8],
+        po2: Option<u8>,
+        timeout: Option<Duration>,
+        on_progress: Option<SlotProgress>,
+        abort_at: Option<Instant>,
+        job_po2: Option<SlotPo2<'_>>,
+        program_id: Option<[u8; 32]>,
+        execute_peak_bytes: u64,
+    ) -> Result<ProofOutput> {
+        let result = self.prove_on_slot(
+            key,
+            elf,
+            input_data,
+            po2,
+            timeout,
+            on_progress,
+            abort_at,
+            job_po2,
+            program_id,
+            execute_peak_bytes,
+        );
+        let refused = result.as_ref().err().is_some_and(|e| {
+            e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+                .is_some_and(|s| !s.attempted)
+        });
+        if refused {
+            let po2 = job_po2.and_then(|size_of| size_of(key)).or(po2);
+            self.note_memory_waiter(key, po2, abort_at, execute_peak_bytes);
+        } else {
+            self.leave_memory_line();
+        }
+        result
     }
 
     /// Like [`prove`], but with three extra controls used by the miner's retry loop:
@@ -8785,10 +9269,16 @@ impl WorkerPool {
                 .gpu_lock_for(&keys[0])
                 .is_none_or(|l| !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock)))
             && finishes_in_time(&keys[0], abort_at)
-            && !self.yields_to_waiter(&keys[0], None, abort_at, Instant::now());
+            && !self.yields_to_waiter(
+                &keys[0],
+                None,
+                abort_at,
+                Instant::now(),
+                Some((&keys, abort_at)),
+            );
         if shortcut {
             *used_slot = Some(keys[0].clone());
-            return self.prove_on_slot(
+            return self.prove_in_memory_line(
                 &keys[0],
                 elf,
                 input,
@@ -8855,7 +9345,7 @@ impl WorkerPool {
                 continue;
             }
             // A job already waiting for this card, and due first, takes it (`yields_to_waiter`).
-            if self.yields_to_waiter(key, None, latest_start, arrived) {
+            if self.yields_to_waiter(key, None, latest_start, arrived, Some((&keys, abort_at))) {
                 continue;
             }
             // Not when a busy card frees soon enough to finish it well before this one would.
@@ -8884,7 +9374,7 @@ impl WorkerPool {
                     if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
                         *used_slot = Some(key.clone());
-                        return self.prove_on_slot(
+                        return self.prove_in_memory_line(
                             key,
                             elf,
                             input,
@@ -8941,7 +9431,13 @@ impl WorkerPool {
                 if !finishes_in_time(key, abort_at) {
                     continue;
                 }
-                if self.yields_to_waiter(key, Some(ticket), latest_start, since) {
+                if self.yields_to_waiter(
+                    key,
+                    Some(ticket),
+                    latest_start,
+                    since,
+                    Some((&keys, abort_at)),
+                ) {
                     any_busy = true;
                     continue;
                 }
@@ -8967,7 +9463,7 @@ impl WorkerPool {
                         // Out of line before proving: the proof must not hold other cards' places.
                         drop(in_line);
                         *used_slot = Some(key.clone());
-                        return self.prove_on_slot(
+                        return self.prove_in_memory_line(
                             key,
                             elf,
                             input,
@@ -9495,35 +9991,46 @@ impl WorkerPool {
             .commit_ledger
             .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
         let idle = self.idle_commit_holdings_except(Some(backend));
-        let room = crate::memory::plan_host_room(
-            want,
-            self.current_commit_bytes_for_slot(key).unwrap_or(0),
-            self.commit_ledger.reserved_bytes(),
-            figures.available.saturating_sub(pending),
-            figures.total,
-            reserve,
-            &idle,
-            MIN_RECLAIMABLE_HOST,
-        );
-        // And what brings free commit, without growth, up to the host part and the margin:
-        // recycling for the room alone may not, since the room counts the page file's growth.
-        let margin = crate::memory::plan_host_room(
-            host_need(),
-            0,
-            0,
-            figures.free_now,
-            u64::MAX,
-            0,
-            &idle,
-            MIN_RECLAIMABLE_HOST,
-        );
-        let plan = room.zip(margin).map(|(mut room, margin)| {
-            for key in margin {
-                if !room.contains(&key) {
-                    room.push(key);
+        let plan_with = |idle: &[(String, u64)]| {
+            let room = crate::memory::plan_host_room(
+                want,
+                self.current_commit_bytes_for_slot(key).unwrap_or(0),
+                self.commit_ledger.reserved_bytes(),
+                figures.available.saturating_sub(pending),
+                figures.total,
+                reserve,
+                idle,
+                MIN_RECLAIMABLE_HOST,
+            );
+            // And what brings free commit, without growth, up to the host part and the margin:
+            // recycling for the room alone may not, since the room counts the page file's growth.
+            let margin = crate::memory::plan_host_room(
+                host_need(),
+                0,
+                0,
+                figures.free_now,
+                u64::MAX,
+                0,
+                idle,
+                MIN_RECLAIMABLE_HOST,
+            );
+            room.zip(margin).map(|(mut room, margin)| {
+                for key in margin {
+                    if !room.contains(&key) {
+                        room.push(key);
+                    }
                 }
-            }
-            room
+                room
+            })
+        };
+        // Other backends' idle workers first; then its own backend's on other cards as well
+        // (`idle_same_backend_elsewhere`).
+        let plan = plan_with(&idle).or_else(|| {
+            let mut wider = idle.clone();
+            wider.extend(
+                self.idle_same_backend_elsewhere(key, |k| self.current_commit_bytes_for_slot(k)),
+            );
+            plan_with(&wider)
         });
         let too_late = abort_at
             .is_some_and(|a| too_late_to_make_room(a.saturating_duration_since(Instant::now())));
@@ -10132,6 +10639,41 @@ impl WorkerPool {
             .collect()
     }
 
+    /// Idle workers of `key`'s own backend on OTHER cards, with what `held` says each holds: what a
+    /// proof on `key` recycles last for memory (`make_host_room`, `reserve_commit`), after every other
+    /// backend's idle worker. An idle SP1 worker on the 4070 keeps ~34 GiB committed, and an SP1 proof
+    /// on the 5090 short of commit could not have it, as it was never offered. Not one a job waiting
+    /// in the card line can take: that one is about to be used.
+    fn idle_same_backend_elsewhere(
+        &self,
+        key: &str,
+        held: impl Fn(&str) -> Option<u64>,
+    ) -> Vec<(String, u64)> {
+        let backend = key.split(':').next().unwrap_or(key);
+        let wanted: HashSet<String> = self
+            .card_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flat_map(|w| w.keys.iter().cloned())
+            .collect();
+        self.workers
+            .iter()
+            .filter(|(k, _)| {
+                k.split(':').next() == Some(backend)
+                    && !self.same_card(k, key)
+                    && !wanted.contains(*k)
+            })
+            .filter(|(_, entry)| {
+                entry
+                    .slot
+                    .try_lock()
+                    .is_ok_and(|slot| slot.handle.is_some())
+            })
+            .filter_map(|(k, _)| Some((k.clone(), held(k)?)))
+            .collect()
+    }
+
     /// Host RAM held by every IDLE PROVE worker, ANY backend — what `make_measure_room` may recycle to
     /// fit a cycle MEASUREMENT. A CPU measurement (SP1 on its CpuProver, risc0 on its default executor)
     /// needs NONE of the GPU provers' resident state, so any idle prove worker of any backend is fair
@@ -10322,8 +10864,10 @@ impl WorkerPool {
     /// The host-RAM counterpart of the room `check_vram_budget` makes on a card, and wider: a worker
     /// on ANY card holds host RAM. On this 28 GB box an idle `sp1-gpu-server` keeps ~23 GB, so until
     /// its worker was recycled for some other reason, no risc0 proof fitted on either card. A worker
-    /// of the proof's own backend is never chosen: another SP1 slot's resident server is what
-    /// `prove_min_vram`'s warm-slot preference routes to, not something to destroy.
+    /// of the proof's own backend is chosen only when other backends' are not enough, and only on
+    /// another card with no job in line for it (`idle_same_backend_elsewhere`): a warm worker is
+    /// what `prove_min_vram`'s warm-slot preference routes to, worth keeping while anything else
+    /// will do.
     ///
     /// `None` when it cannot be done — recycling would not make the proof fit (`plan_host_room`), a
     /// planned worker's slot is busy, too little time is left before `abort_at` to be worth
@@ -10342,16 +10886,27 @@ impl WorkerPool {
             return None;
         };
         let resident = self.current_host_bytes_for_slot(key).unwrap_or(0);
-        let plan = crate::memory::plan_host_room(
-            want,
-            resident,
-            self.reserved_host_memory(),
-            available,
-            total,
-            crate::memory::DEFAULT_HOST_RESERVE_BYTES,
-            &self.idle_host_holdings_except(backend),
-            MIN_RECLAIMABLE_HOST,
-        )?;
+        let others = self.idle_host_holdings_except(backend);
+        let plan_with = |idle: &[(String, u64)]| {
+            crate::memory::plan_host_room(
+                want,
+                resident,
+                self.reserved_host_memory(),
+                available,
+                total,
+                crate::memory::DEFAULT_HOST_RESERVE_BYTES,
+                idle,
+                MIN_RECLAIMABLE_HOST,
+            )
+        };
+        // Other backends' idle workers first; then its own backend's on other cards as well.
+        let plan = plan_with(&others).or_else(|| {
+            let mut wider = others.clone();
+            wider.extend(
+                self.idle_same_backend_elsewhere(key, |k| self.current_host_bytes_for_slot(k)),
+            );
+            plan_with(&wider)
+        })?;
         if plan.is_empty() {
             // It fits now: memory came back between the refusal and this reading.
             return self.reserve_host_memory(want, key);
@@ -12622,6 +13177,10 @@ impl WorkerPool {
         // executor shares its memory through memfds, host RAM charged here, so `/dev/shm` takes no
         // reservation.
         let committed = abort_at.is_some();
+        // Not memory a job waiting longer for it is due (`memory_held_for_waiter`).
+        if let Some(kept) = self.memory_held_for_waiter(key, want, po2, abort_at) {
+            return Err(kept);
+        }
         let _memory_reservation = match self
             .reserve_host_memory(want, key)
             .or_else(|| self.make_host_room(key, want, abort_at))
@@ -12724,6 +13283,8 @@ impl WorkerPool {
                 return Err(anyhow::Error::new(shortage));
             }
         };
+        // Admitted: out of the memory line.
+        self.leave_memory_line();
 
         self.ensure_alive(&mut slot, entry)?;
 
@@ -12843,11 +13404,36 @@ impl WorkerPool {
         // without it the TUI could not attribute a running job to a GPU row at all,
         // and every proof rendered as "CPU" on an idle-looking card.
         let key_for_cb = key.to_string();
-        let on_progress: Option<Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>> =
-            on_progress.map(|cb| {
-                Box::new(move |e: zkminer_prover_protocol::ProveEvent| cb(e, &key_for_cb))
-                    as Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>
-            });
+        // Each stage report also moves the card's expected free time (`eta_from_progress`).
+        let eta_track = Arc::new(Mutex::new(EtaTrack::default()));
+        let on_progress: Option<Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>> = {
+            let track = eta_track.clone();
+            let etas = self.card_eta.clone();
+            let tails = self.proof_tails.clone();
+            let card = Self::card_of(key);
+            let backend = key.split(':').next().unwrap_or(key).to_string();
+            Some(Box::new(move |e: zkminer_prover_protocol::ProveEvent| {
+                if let zkminer_prover_protocol::ProveEvent::Stage(report) = e {
+                    let learned = tails
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&key_for_cb)
+                        .copied();
+                    let tail =
+                        |stark| learned.unwrap_or_else(|| default_proof_tail(&backend, stark));
+                    let mut track = track.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(at) = eta_from_progress(&mut track, report, Instant::now(), tail) {
+                        etas.lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(card.clone(), at);
+                    }
+                }
+                if let Some(cb) = on_progress.as_ref() {
+                    cb(e, &key_for_cb);
+                }
+            })
+                as Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>)
+        };
         // Windows: how low host memory fell during the proof, to tell a failure for want of host
         // memory from the card's or the prover's (`memory::windows_failure_is_host_shortage`).
         let low_water = crate::memory::LowWater::start(Some((
@@ -13049,6 +13635,19 @@ impl WorkerPool {
         }
         if matches!(proof_response, Ok(WorkerResponse::ProofResult { .. })) {
             Self::note_guest_ran(&mut slot, key);
+        }
+        // How long its stage after the STARK took, for the next proof's expected end here.
+        if let Ok(WorkerResponse::ProofResult { .. }) = &proof_response {
+            let began = eta_track
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .finish_began;
+            if let Some(began) = began {
+                self.proof_tails
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key.to_string(), began.elapsed());
+            }
         }
 
         match proof_response? {
@@ -20398,8 +20997,166 @@ mod learned_host_peak_tests {
         let _in_line =
             with_slot_estimates(estimates, || pool.wait_for_card(&keys, Some(now), cutoff).0);
         let later = Some(now + Duration::from_secs(3600));
-        assert!(pool.yields_to_waiter("sp1:cuda:0", None, later, now));
-        assert!(!pool.yields_to_waiter("sp1:cuda:1", None, later, now));
+        assert!(pool.yields_to_waiter("sp1:cuda:0", None, later, now, None));
+        assert!(!pool.yields_to_waiter("sp1:cuda:1", None, later, now, None));
+    }
+
+    /// A card changes hands by what it is worth: an SP1 job due first leaves the 5090 to a waiting
+    /// RISC Zero job that gains more by it than the SP1 job loses on the 4070, and the RISC Zero job,
+    /// due later, takes it rather than yield; not when the 4070 would miss the SP1 job's cutoff.
+    #[test]
+    fn a_card_goes_to_the_job_it_helps_most() {
+        let pool = pool(&["sp1:cuda:0", "sp1:cuda:1", "risc0:cuda:0", "risc0:cuda:1"]);
+        let now = Instant::now();
+        let sp1_keys = vec!["sp1:cuda:0".to_string(), "sp1:cuda:1".to_string()];
+        let sp1_takes = HashMap::from([
+            ("sp1:cuda:0".to_string(), Duration::from_secs(100)),
+            ("sp1:cuda:1".to_string(), Duration::from_secs(260)),
+        ]);
+        let r0_keys = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let r0_takes = HashMap::from([
+            ("risc0:cuda:0".to_string(), Duration::from_secs(60)),
+            ("risc0:cuda:1".to_string(), Duration::from_secs(270)),
+        ]);
+        let far = Some(now + Duration::from_secs(3600));
+        let early = Some(now + Duration::from_secs(10));
+        let late = Some(now + Duration::from_secs(600));
+        // The RISC Zero job waits; the SP1 job, due first, arrives at the free 5090.
+        let in_line = with_slot_estimates(r0_takes.clone(), || {
+            pool.wait_for_card(&r0_keys, late, far).0
+        });
+        let sp1_yields = |cutoff| {
+            with_slot_estimates(sp1_takes.clone(), || {
+                pool.yields_to_waiter("sp1:cuda:0", None, early, now, Some((&sp1_keys, cutoff)))
+            })
+        };
+        assert!(
+            sp1_yields(far),
+            "it loses 180 s on the 4070; the other gains 230 s"
+        );
+        // Not when the 4070 would end past its cutoff.
+        assert!(!sp1_yields(Some(now + Duration::from_secs(200))));
+        // Without the weighing, the one due first keeps it.
+        assert!(!pool.yields_to_waiter("sp1:cuda:0", None, early, now, None));
+        drop(in_line);
+
+        // The other way round: the SP1 job waits, due first; the RISC Zero job does not yield the
+        // 5090 to it, as the SP1 job would leave it.
+        let _in_line = with_slot_estimates(sp1_takes.clone(), || {
+            pool.wait_for_card(&sp1_keys, early, far).0
+        });
+        let r0_yields = with_slot_estimates(r0_takes, || {
+            pool.yields_to_waiter("risc0:cuda:0", None, late, now, Some((&r0_keys, far)))
+        });
+        assert!(!r0_yields);
+        // A job gaining as little as the waiter loses still yields to it.
+        let even = HashMap::from([
+            ("risc0:cuda:0".to_string(), Duration::from_secs(100)),
+            ("risc0:cuda:1".to_string(), Duration::from_secs(150)),
+        ]);
+        let r0_yields = with_slot_estimates(even, || {
+            pool.yields_to_waiter("risc0:cuda:0", None, late, now, Some((&r0_keys, far)))
+        });
+        assert!(r0_yields);
+    }
+
+    /// A card's expected free time follows its proof: the STARK at the rate it counts, then the
+    /// tail; nothing from a first count or an SP1 total not yet final.
+    #[test]
+    fn a_proofs_end_follows_its_progress() {
+        use zkminer_prover_protocol::types::{ProveStage, StageReport};
+        let report = |stage, done, total, total_final| StageReport {
+            stage,
+            done,
+            total,
+            total_final,
+        };
+        let tail = |_: Option<Duration>| Duration::from_secs(5);
+        let t0 = Instant::now();
+        let mut track = EtaTrack::default();
+        assert_eq!(
+            eta_from_progress(&mut track, report(ProveStage::Prove, 0, 40, true), t0, tail),
+            None
+        );
+        // 10 of 40 in 20 s: 60 s to go, then the tail.
+        let at = t0 + Duration::from_secs(20);
+        assert_eq!(
+            eta_from_progress(
+                &mut track,
+                report(ProveStage::Prove, 10, 40, true),
+                at,
+                tail
+            ),
+            Some(at + Duration::from_secs(65))
+        );
+        // SP1 before its shard total is final: nothing.
+        let mut sp1 = EtaTrack::default();
+        eta_from_progress(&mut sp1, report(ProveStage::Prove, 1, 3, false), t0, tail);
+        assert_eq!(
+            eta_from_progress(&mut sp1, report(ProveStage::Prove, 2, 5, false), at, tail),
+            None
+        );
+        // After the STARK: the tail from when it began.
+        let fin = t0 + Duration::from_secs(80);
+        assert_eq!(
+            eta_from_progress(
+                &mut track,
+                report(ProveStage::Finish, 0, 0, false),
+                fin,
+                tail
+            ),
+            Some(fin + Duration::from_secs(5))
+        );
+        assert_eq!(track.finish_began, Some(fin));
+        assert_eq!(
+            default_proof_tail("risc0", Some(Duration::from_secs(100))),
+            Duration::from_secs(14)
+        );
+    }
+
+    /// Memory a job waiting longer is due is not taken from it: when it fits now, or when our proofs
+    /// end, by a proof still running then; a proof ending before is let in; nothing is kept for a
+    /// waiter our proofs never make room for.
+    #[test]
+    fn memory_is_kept_for_the_job_waiting_longer() {
+        const G: u64 = 1 << 30;
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(60);
+        let returns = [(soon, 30 * G)];
+        // It fits now and would not beside this one.
+        assert!(holds_up_waiter(40 * G, 30 * G, 15 * G, &[], None, now));
+        // Both fit.
+        assert!(!holds_up_waiter(50 * G, 30 * G, 15 * G, &[], None, now));
+        // It fits in 60 s, as a proof of ours ends; one taking 15 GiB for 20 s is let in, one for
+        // 120 s, or for as long as it is unknown, is not.
+        let in_20 = Some(now + Duration::from_secs(20));
+        let in_120 = Some(now + Duration::from_secs(120));
+        assert!(!holds_up_waiter(
+            10 * G,
+            30 * G,
+            15 * G,
+            &returns,
+            in_20,
+            now
+        ));
+        assert!(holds_up_waiter(
+            10 * G,
+            30 * G,
+            15 * G,
+            &returns,
+            in_120,
+            now
+        ));
+        assert!(holds_up_waiter(10 * G, 30 * G, 15 * G, &returns, None, now));
+        // Our proofs never give it enough: something else holds it, and nothing is kept.
+        assert!(!holds_up_waiter(
+            10 * G,
+            60 * G,
+            15 * G,
+            &returns,
+            None,
+            now
+        ));
     }
 
     /// A freed card goes to the waiting job due first: a later deadline, or a later arrival with the
@@ -20414,15 +21171,15 @@ mod learned_host_peak_tests {
         let (guard, ticket, since) =
             pool.wait_for_card(&["risc0:cuda:0".to_string()], Some(soon), Some(soon));
         // Another job due later, arriving now: it leaves card 0 to the waiter, not card 1.
-        assert!(pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now));
-        assert!(!pool.yields_to_waiter("risc0:cuda:1", None, Some(later), now));
+        assert!(pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now, None));
+        assert!(!pool.yields_to_waiter("risc0:cuda:1", None, Some(later), now, None));
         // One due sooner goes first; no deadline goes last.
-        assert!(!pool.yields_to_waiter("risc0:cuda:0", None, Some(now), now));
-        assert!(pool.yields_to_waiter("risc0:cuda:0", None, None, now));
+        assert!(!pool.yields_to_waiter("risc0:cuda:0", None, Some(now), now, None));
+        assert!(pool.yields_to_waiter("risc0:cuda:0", None, None, now, None));
         // The waiter does not yield to itself.
-        assert!(!pool.yields_to_waiter("risc0:cuda:0", Some(ticket), Some(soon), since));
+        assert!(!pool.yields_to_waiter("risc0:cuda:0", Some(ticket), Some(soon), since, None));
         drop(guard);
-        assert!(!pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now));
+        assert!(!pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now, None));
     }
 
     /// A job with a deadline waits for a busy card as long as the deadline allows: the proof's own

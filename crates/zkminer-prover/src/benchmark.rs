@@ -3212,35 +3212,47 @@ fn gpu_fingerprint() -> String {
     }
 }
 
-/// Read total physical memory in bytes from `/proc/meminfo` (on macOS, `sysctl hw.memsize`).
-///
-/// Returns 0 on other platforms or if the figure can't be read.
+/// Total physical memory in bytes (`memory::mem_total_bytes`: `/proc/meminfo` on Linux, `sysctl
+/// hw.memsize` on macOS, the system's memory status on Windows), 0 where it cannot be read. Read
+/// from `/proc/meminfo` only, it was 0 on Windows, and every Windows fingerprint said "0GiB".
 pub fn get_total_memory_bytes() -> u64 {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(bytes) = crate::memory::mem_total_bytes() {
-            return bytes;
-        }
+    crate::memory::mem_total_bytes().unwrap_or(0)
+}
+
+/// Whether a saved hardware fingerprint names this machine (`current`): the same, or the same but
+/// for a RAM field of "0GiB", which every Windows build wrote before it could read the RAM size
+/// (`get_total_memory_bytes`). Without that, the fix would have discarded every Windows benchmark.
+fn same_hardware(saved: &str, current: &str) -> bool {
+    if saved == current {
+        return true;
     }
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-            for line in contents.lines() {
-                if let Some(rest) = line.strip_prefix("MemTotal:") {
-                    // Format: "MemTotal:       16384000 kB"
-                    let rest = rest.trim();
-                    if let Some(kb_str) =
-                        rest.strip_suffix("kB").or_else(|| rest.strip_suffix("KB"))
-                    {
-                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
-                            return kb * 1024;
-                        }
-                    }
-                }
-            }
-        }
+    let (s, c): (Vec<&str>, Vec<&str>) = (saved.split('|').collect(), current.split('|').collect());
+    s.len() == c.len()
+        && s.len() > 2
+        && s[2] == "0GiB"
+        && s.iter()
+            .zip(&c)
+            .enumerate()
+            .all(|(i, (a, b))| i == 2 || a == b)
+}
+
+#[cfg(test)]
+mod fingerprint_ram_tests {
+    use super::same_hardware;
+
+    /// A fingerprint saved with the "0GiB" RAM field matches this machine's but for the RAM; any
+    /// other difference does not.
+    #[test]
+    fn a_fingerprint_without_its_ram_size_still_matches() {
+        let now = "Ryzen|16|64GiB|RTX 5090,RTX 4070|580.1";
+        assert!(same_hardware(now, now));
+        assert!(same_hardware("Ryzen|16|0GiB|RTX 5090,RTX 4070|580.1", now));
+        assert!(!same_hardware("Ryzen|16|0GiB|RTX 5090|580.1", now));
+        assert!(!same_hardware(
+            "Ryzen|16|32GiB|RTX 5090,RTX 4070|580.1",
+            now
+        ));
     }
-    0
 }
 
 /// Returns the path to the benchmark cache file: `~/.zkminer/benchmarks.json`.
@@ -3365,7 +3377,7 @@ pub(crate) fn load_cached_benchmark_from(
         return None;
     }
 
-    if saved.hardware_fingerprint != current_fp {
+    if !same_hardware(&saved.hardware_fingerprint, &current_fp) {
         tracing::info!(
             "Hardware changed (saved: {}, current: {current_fp}), re-benchmarking needed",
             saved.hardware_fingerprint,
@@ -5321,18 +5333,6 @@ mod tests {
             risc0_job_throughput(&calibrated, 17, None),
             1_500_000.0 * 0.25
         );
-        // An Arc A770: 20 proved, 21 did not, so its ceiling is 19, but it proves at its default 20, at
-        // the rate measured there, not at 19's.
-        let (samples, ceiling, _) = sweep_po2(18, 22, |p| match p {
-            18 => Some(sample(18, 260, 46_289.0)),
-            19 => Some(sample(19, 122, 77_113.0)),
-            20 => Some(sample(20, 59, 116_003.0)),
-            _ => None,
-        });
-        assert_eq!(ceiling, Some(19));
-        let a770 = risc0_row(samples, 19, 19);
-        assert_eq!(risc0_job_throughput(&a770, 20, None), 116_003.0);
-        assert_eq!(risc0_job_throughput(&a770, 19, None), 77_113.0);
         // A 12 GB card benchmarked at its own 19: that rate is its jobs' rate, with nothing
         // credited above it and the same charge per step below.
         let at_19 = DeviceBenchmark {
@@ -5393,6 +5393,18 @@ mod tests {
             risc0_job_throughput(&proved_22, 22, fit(32_607)),
             2_000_000.0
         );
+        // An Arc A770: 20 proved, 21 did not, so its ceiling is 19, but it proves at its default 20, at
+        // the rate measured there, not at 19's.
+        let (samples, ceiling, _) = sweep_po2(18, 22, |p| match p {
+            18 => Some(sample(18, 260, 46_289.0)),
+            19 => Some(sample(19, 122, 77_113.0)),
+            20 => Some(sample(20, 59, 116_003.0)),
+            _ => None,
+        });
+        assert_eq!(ceiling, Some(19));
+        let a770 = risc0_row(samples, 19, 19);
+        assert_eq!(risc0_job_throughput(&a770, 20, None), 116_003.0);
+        assert_eq!(risc0_job_throughput(&a770, 19, None), 77_113.0);
     }
 
     #[test]
@@ -5866,6 +5878,7 @@ mod power_state_tests {
             entries,
             vram_bytes: Some(28 << 30),
             host_peak_bytes: None,
+            benchmark_po2: None,
         }
     }
 
