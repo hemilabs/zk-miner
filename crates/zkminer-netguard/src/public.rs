@@ -138,6 +138,10 @@ pub struct Learned {
     pub confirmed: Vec<IpAddr>,
     /// The NAT64 prefixes through which an IPv4 address was confirmed (an IPv6-only host's).
     pub via_nat64: Vec<Prefix>,
+    /// [IPv4, IPv6]: the family's address was confirmed on another uplink, recently, and is
+    /// being learned again on this one ([`learned_on`]; review round 4, cross-2: such a refusal
+    /// says so, not that `[egress] public_addresses` should be set).
+    pub relearning: [bool; 2],
 }
 
 /// One family's last good answer.
@@ -285,9 +289,25 @@ fn learned_inner(uplink: Option<u64>) -> Learned {
         if still_confirmed(s.confirmed_at[i], s.uplink_of[i], s.uplink, now) {
             out.confirmed.extend(&f.confirmed);
             out.via_nat64.extend(&f.via_nat64);
+        } else {
+            out.relearning[i] = relearning(s.confirmed_at[i], s.uplink_of[i], uplink, now);
         }
     }
     out
+}
+
+/// Whether a family whose confirmation does not count on `uplink` ([`still_confirmed`]) is being
+/// learned again: confirmed within [`CONFIRMATION_LIFETIME`], on another uplink than the one the
+/// caller names.
+fn relearning(
+    confirmed_at: Option<Instant>,
+    learned_on: Option<u64>,
+    uplink: Option<u64>,
+    now: Instant,
+) -> bool {
+    uplink.is_some()
+        && learned_on != uplink
+        && still_confirmed(confirmed_at, None, None, now)
 }
 
 /// Whether a family's confirmation still counts at `now`: confirmed within
@@ -1380,6 +1400,14 @@ mod tests {
             "a caller that names no uplink"
         );
         assert_eq!(CONFIRMATION_LIFETIME, DISCOVERY_TTL * 2);
+        // Review round 4, cross-2: confirmed recently on another uplink is being learned again
+        // (its refusal says so); expired, never confirmed, or a caller naming no uplink is not.
+        assert!(relearning(ago(10), Some(1), Some(2), now));
+        assert!(relearning(ago(10), None, Some(2), now));
+        assert!(!relearning(ago(10), Some(2), Some(2), now));
+        assert!(!relearning(ago(600), Some(1), Some(2), now));
+        assert!(!relearning(None, Some(1), Some(2), now));
+        assert!(!relearning(ago(10), Some(1), None, now));
     }
 
     /// An HTTPS reflector query that connects, to something that does not speak TLS for

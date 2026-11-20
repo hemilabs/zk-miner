@@ -77,6 +77,13 @@ pub enum Denied {
     /// This host's public address on the path a connection to `ip` takes is not known (see
     /// [`HostFacts::unknown_paths`]): it could be this host or its router, reached by hairpin.
     PublicAddressUnknown { ip: IpAddr, path: EgressPath },
+    /// This host's public address on the path a connection to `ip` takes is being learned
+    /// again: the host just moved to another uplink (its default routes, or a default gateway's
+    /// link-layer address, changed), and until the address is known there it could be this host
+    /// or its router, reached by hairpin (review round 4, cross-2: this was a
+    /// [`Denied::PublicAddressUnknown`], whose advice to set `[egress] public_addresses` did not
+    /// apply).
+    PublicAddressRelearning { ip: IpAddr, path: EgressPath },
     /// The host's facts now need `[egress] internal_ranges` (a tunnel became the uplink, a global
     /// IPv4 address appeared: [`HostFacts::needs_internal_ranges`]), which the configuration does
     /// not state: every connection is refused until it does, or the condition clears.
@@ -256,6 +263,13 @@ impl Denied {
                     )
                 }
             }
+            Denied::PublicAddressRelearning { ip, path } => write!(
+                f,
+                "{ip} is reached over {path}, and this host just moved to another network (its \
+                 default routes or default gateway changed): its public {path} address there is \
+                 being learned again (a few seconds), and until it is it could be this host or \
+                 its router, reached by hairpin"
+            ),
             Denied::InternalRangesUnstated { ip, why } => write!(
                 f,
                 "{ip} is not connected to: {why}, so this host now needs `internal_ranges = \
@@ -325,6 +339,7 @@ impl Denied {
                 | Denied::OffDefaultRoute { .. }
                 | Denied::RouteQueryFailed { .. }
                 | Denied::PublicAddressUnknown { .. }
+                | Denied::PublicAddressRelearning { .. }
                 | Denied::InternalRangesUnstated { .. }
         )
     }
@@ -489,7 +504,13 @@ fn admit_inner(
     facts.kernel_verdict(ip, dport)?;
     facts
         .path_known(ip)
-        .map_err(|path| Denied::PublicAddressUnknown { ip, path })?;
+        .map_err(|path| {
+            if facts.relearning(path) {
+                Denied::PublicAddressRelearning { ip, path }
+            } else {
+                Denied::PublicAddressUnknown { ip, path }
+            }
+        })?;
     // Re-judged with every snapshot: a tunnel that became the uplink after startup is refused
     // like one there at startup.
     let gaps = facts.config_gaps();
@@ -843,6 +864,14 @@ impl FactsCell {
             return;
         }
         for path in &now {
+            if facts.relearning(*path) {
+                tracing::info!(
+                    "network guard: this host moved to another network; its public {path} \
+                     address there is being learned again, and requester-caused connections over \
+                     {path} are refused until it is"
+                );
+                continue;
+            }
             tracing::warn!(
                 "network guard: this host's public {path} address is not known, so every \
                  requester-caused connection over {path} is refused (it could reach this host or \
@@ -1877,6 +1906,48 @@ mod tests {
             admit(NetMode::Public, ip("2606:4700:4700::1111"), &settled, &[]),
             Ok(())
         );
+    }
+
+    /// Review round 4, cross-2: an address refused because the host just moved to another
+    /// network, whose public address is being learned again, says so, and does not tell the
+    /// operator to set `[egress] public_addresses`; it rests on the facts (judged again once
+    /// they are read again).
+    #[test]
+    fn r4_a_public_address_being_learned_again_says_so() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let facts = |relearning: [bool; 2]| {
+            HostFacts::assemble(
+                RawFacts {
+                    interface_prefixes: vec![pfx("192.168.1.0/24")],
+                    interface_addresses: vec![ip("192.168.1.7")],
+                    routes: vec![Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2)],
+                    public_relearning: relearning,
+                    ..RawFacts::default()
+                },
+                &FactsOptions {
+                    discover_public_addresses: true,
+                    ..FactsOptions::default()
+                },
+            )
+        };
+        let dst = ip("93.184.216.34");
+        let e = admit(NetMode::Public, dst, &facts([true, false]), &[]).unwrap_err();
+        assert_eq!(
+            e,
+            Denied::PublicAddressRelearning {
+                ip: dst,
+                path: EgressPath::Ipv4
+            }
+        );
+        assert!(e.depends_on_facts());
+        let text = e.to_string();
+        assert!(text.contains("being learned again"), "{text}");
+        assert!(!text.contains("public_addresses"), "{text}");
+        // Not being learned again: the advice stands.
+        let e = admit(NetMode::Public, dst, &facts([false, false]), &[]).unwrap_err();
+        assert!(matches!(e, Denied::PublicAddressUnknown { .. }));
+        assert!(e.to_string().contains("public_addresses"), "{e}");
     }
 
     /// Review r1 fetch F1 (PoC `facts`), inverted, on this host's real facts: neighbours in the
