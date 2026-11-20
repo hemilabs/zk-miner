@@ -3008,6 +3008,32 @@ mod r5_tests {
         assert!(r.unheld.is_empty());
     }
 
+    /// cross-1, Linux (the live repro's second half: `fix-r5/vm-r5-spoof.log`, "expire"): a
+    /// forged advertisement's prefixes that run out without a withdrawal stop unsettling the
+    /// uplink at the next facts read (`on_uplink`), not at the next round.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn r5_pref64_that_runs_out_is_withdrawn_at_the_next_facts_read() {
+        let uplink = 0x5eed_0e71_u64;
+        let gw = (ip6("fe80::5e:1"), 4242u32);
+        pref64::start();
+        on_uplink(uplink, &[gw]);
+        let forged: Vec<Announced> = (1..=5)
+            .map(|i| Announced {
+                prefix: p(&format!("2001:db8:e71:{i:x}::/96")),
+                lifetime: Duration::from_secs(1),
+                ifindex: gw.1,
+                router: Some(gw.0),
+            })
+            .collect();
+        pref64::hear(&forged);
+        assert!(unheld(uplink).is_some_and(|w| w.contains("fe80::5e:1")), "{:?}", unheld(uplink));
+        std::thread::sleep(Duration::from_millis(1100));
+        on_uplink(uplink, &[gw]);
+        assert_eq!(unheld(uplink), None);
+        assert!(learned().contains(&p("2001:db8:e71:1::/96")), "still refused");
+    }
+
     /// parse-3: what a router heard on one uplink announced is not named on another, even by a
     /// router of the same address on the same interface; back on the first uplink, it is again.
     #[test]
