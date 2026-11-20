@@ -447,6 +447,12 @@ fn clear_unheld(r: &mut Registry, uplink: u64, source: Source) {
     r.unheld.retain(|(s, w)| !(*s == uplink && w.starts_with(&name)));
 }
 
+/// Marks `uplink` unsettled now (tests).
+#[cfg(test)]
+pub(crate) fn mark_unheld_now(uplink: u64, why: &str) {
+    mark_unheld(&mut registry(), uplink, Source::Given(u32::MAX - 1), format!("test source #{}. {why}", u32::MAX - 1));
+}
+
 /// Marks `uplink` unsettled once its round has finished (tests).
 #[cfg(test)]
 pub(crate) fn unheld_after_round(uplink: u64, why: &str) {
