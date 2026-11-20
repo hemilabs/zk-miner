@@ -214,7 +214,6 @@ impl GuardedResolver {
         })
         .await
         .map_err(|e| ResolveError::Lookup(io::Error::other(e)))?;
-        let admitted = admitted;
         if admitted.is_empty() {
             return Err(ResolveError::Denied(Denied::NoAdmittedAddress {
                 host: crate::printable(host, 128),

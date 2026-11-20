@@ -3774,12 +3774,12 @@ mod r6_tests {
             }
             d.first_done = true;
             d.running = false;
-            d.uplink = Some(Uplink { signature: 0x6_5ba_d0e4, routed: [true, true], clat: false });
+            d.uplink = Some(Uplink { signature: 0x65ba_d0e4, routed: [true, true], clat: false });
         }
         FAIL_SPAWN.store(true, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let up = Uplink { signature: 0x6_5ba_d0e5, routed: [true, true], clat: false };
+            let up = Uplink { signature: 0x65ba_d0e5, routed: [true, true], clat: false };
             let _ = tx.send(ensure_discovered_on(up));
         });
         let got = rx.recv_timeout(Duration::from_secs(5));
