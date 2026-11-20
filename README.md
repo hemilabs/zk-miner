@@ -273,17 +273,22 @@ routing-socket call the guard needs (none known among those the miner supports).
 *Troubleshooting (Linux and macOS):* the hardening the macOS reviews added applies on every
 platform ([docs/netguard-hardening.md](docs/netguard-hardening.md)). If every requester
 connection is refused with `this host's network facts ... could not be read again`, the message
-names what failed (on Linux a netlink read: the interfaces, routes, rules, neighbour table). A
-download refused with `the peer acknowledged the check's FIN neither within the hop limit nor at
-the default one (AWS S3 never does)` comes from a store whose servers never acknowledge a bare
+names what failed (on Linux a netlink read: the interfaces, routes, rules). A download refused
+with `could not tell how near ... is (whether it is within 2 hops of this host): the peer
+acknowledged the check's FIN neither within the hop limit nor at the default one (AWS S3 never
+does)` comes from a store whose servers never acknowledge a bare
 TCP FIN (AWS S3) on a path whose first two routers did not answer the hop-limited probe (they
 filter or rate-limit ICMP, as many cloud and corporate networks do): the guard cannot tell how
 near such a server is, so it refuses (another attempt usually gets the probe answered; on a
 host whose first hops never send ICMP, S3 is refused every time). Right after a host with IPv6
 and no IPv4 joins a network, IPv6 destinations are refused for up to 2 s (`NAT64 prefix is still
-being learned`); on Linux also for a moment after a link change while the router's neighbour
-entry is missing. `the connection to ... was dropped once made` means the route changed between
-the check and the connection (a VPN coming up): the next attempt is judged on the new route.
+being learned`); on any host they are refused while the network names NAT64 prefixes the guard
+does not believe or cannot hold (more than two in one DNS answer, more than four in one router's
+advertisements: the log names the source). `its public ... address there is being learned again`
+follows a move to another network (on Linux also a default gateway whose link-layer address
+changed and held for 2 s): it clears by itself within seconds. `the connection to ... was dropped
+once made` means the route changed between the check and the connection (a VPN coming up): the
+next attempt is judged on the new route.
 
 **Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
 endpoints for builders, has no network of its own: its sandbox denies every socket call. The

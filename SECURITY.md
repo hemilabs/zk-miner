@@ -39,7 +39,12 @@ Every connection a requester can cause goes through one guard
   not route skipped), at startup, at once whenever the uplink changes, every 15 seconds while a
   host with IPv6 and no IPv4 route has found none, and every 5 minutes; also from a router
   advertisement's PREF64 option (RFC 8781: macOS's configuration daemon, and on Linux the
-  advertisements the kernel processes); or named in `[egress] nat64_prefixes`. Until the round
+  advertisements the kernel processes, from the IPv6 default gateway only); or named in
+  `[egress] nat64_prefixes`, which are always in force. A DNS answer reveals a prefix only where
+  both of `ipv4only.arpa`'s addresses sit under it, at most two per answer; a router names at
+  most four; learned prefixes are kept per network and source and synthesized with only on the
+  network they were learned on (every one is still refused). A source that names more, or a
+  prefix that cannot be held, refuses every IPv6 destination on that network. Until the round
   for a new network has finished, a host with IPv6 and no IPv4 route refuses every IPv6
   destination (an address under a prefix not learned yet can carry a private IPv4 one). Deny CIDRs and the host's prefixes match every such spelling too
   (`64:ff9b::808:808/128` denies `8.8.8.8`, and a deny of `64:ff9b::/64` holds the addresses it
@@ -181,16 +186,19 @@ Every connection a requester can cause goes through one guard
   made, on a new socket with the usual hop limit. **No answer in time decides nothing** (a path
   that filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
   limit, a device waking up): a **check connection** is made with the usual hop limit, and once
-  it is established its hop limit is lowered to the probe's and it is half-closed, without a
-  byte written. Its FIN reaches the peer only if the peer is within the limit, and a peer that
-  gets it acknowledges it: acknowledged within a few round trips, refused. A peer that closes or
-  resets the connection first is a failed check, refused (never read as near or far). No
-  acknowledgement within the limit is far only if the peer acknowledges the FIN's
-  retransmission once the usual hop limit is restored (a positive control: a peer that
-  acknowledges a bare FIN at no hop limit, as AWS S3's front ends, is refused, the message
-  saying so); then the real connection is made. The probe is asked twice within its 1.5 s (a
-  router rate-limiting its ICMP answers the second), and an IPv4-mapped destination is probed
-  as its IPv4 address. Linux reads the FIN's fate from `TCP_INFO`, macOS from
+  it is established its hop limit is lowered to the probe's for good and it is half-closed,
+  without a byte written. Its FIN reaches the peer only if the peer is within the limit, and a
+  peer that gets it acknowledges it: acknowledged, whenever, refused. Then a second, **control**
+  connection is made at the usual hop limit and half-closed the same way: far only once the
+  control's FIN is acknowledged and the check's is not, for a few round trips, one
+  retransmission and the control's own round trip again (a peer that acknowledges a bare FIN at
+  no hop limit, as AWS S3's front ends, is refused, the message saying so); then the real
+  connection is made. A peer that closes or resets either connection first is a failed check,
+  refused (never read as near or far). A refusal that is not a near answer says `could not tell
+  how near ... is`. The probe is asked up to three times (1 s, 0.5 s, and after a 1 s pause
+  1 s: a router rate-limiting its ICMP answers a later one), at most two probes at a time in the
+  process, a name's addresses one after another until one of each family passes, and an
+  IPv4-mapped destination is probed as its IPv4 address. Linux reads the FIN's fate from `TCP_INFO`, macOS from
   `TCP_CONNECTION_INFO`; Windows has no check connection (a probe without an answer refuses
   there). A check connection that does not connect refuses. Any other probe error (a local
   firewall's) refuses. Unprivileged; developer mode sends no probe.
@@ -303,10 +311,10 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   fate from `TCP_CONNECTION_INFO`: only an acknowledgement of the FIN (`FIN_WAIT_2`,
   `TIME_WAIT`) is an answer; a peer that closes or resets the connection first is refused as a
   failed check, never read as far. macOS does not report an ICMP "time exceeded" for the FIN, so
-  a far peer is known only when the wait ends (the same verdict, up to 1.5 s later), and only if
-  it then acknowledges the FIN's retransmission at the default hop limit (a positive control): a
-  peer that acknowledges a FIN at no hop limit (AWS S3's front ends) is a failed check, refused.
-  A probe without an answer is asked again once within its time. An IPv4-mapped destination is
+  a far peer is known only when the wait ends, and only if it acknowledges the control
+  connection's FIN at the default hop limit: a peer that acknowledges a FIN at no hop limit (AWS
+  S3's front ends) is a failed check, refused. A probe without an answer is asked again, up to
+  three times. An IPv4-mapped destination is
   probed as its IPv4 address.
 - **Public addresses:** a public address is confirmed for one network, which macOS identifies by
   its routes and by the configuration daemon's network signature (the router's address and
@@ -326,11 +334,13 @@ type-checked: [docs/netguard-hardening.md](docs/netguard-hardening.md)): facts t
 read again refuse after their grace; one re-read at a time, callers waiting at most 500 ms, and
 the checks off the async runtime's workers; the uplink signature tells two networks behind the
 same router address apart (Linux: the gateways' link-layer addresses); only an acknowledged FIN
-is a check connection's answer, with the positive control; the probe asked twice and
-IPv4-mapped addresses unmapped (Windows too); a default-like kernel answer must be a default
-route the facts hold; NAT64 prefixes learned per network (Linux also from router
-advertisements' PREF64), IPv6 refused on an IPv6-only host until the new network's round ends;
-and every connection checked again once made (macOS too: new everywhere).
+is a check connection's answer, with a control connection; the probe asked up to three times
+and IPv4-mapped addresses unmapped (Windows too); a default-like kernel answer must be a default
+route the facts hold (on Linux, through the same nexthop object); NAT64 prefixes learned per
+network (Linux also from the default gateway's PREF64), configured ones always in force, IPv6
+refused on an IPv6-only host until the new network's round ends; and every connection checked
+again once made, from the source the kernel chose for it, before anything (a TLS ClientHello
+included) is written on it (macOS too: new everywhere).
 
 ## Developer mode: `[dev] private_network`
 
@@ -790,9 +800,11 @@ no second one):
 - **NAT64 prefixes the host cannot learn.** A network-specific NAT64 prefix is learned from
   the host's DNS servers (RFC 7050); a translator reached without DNS64 (a static route to a
   NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On Linux
-  a router's PREF64 is read only from advertisements the kernel processes while the miner runs
-  (none where systemd-networkd or NetworkManager handle router advertisements themselves, which
-  keep it to their own interfaces). On an
+  a router's PREF64 is read only from advertisements the kernel processes while the miner runs,
+  and only from the IPv6 default gateway (none where systemd-networkd or NetworkManager handle
+  router advertisements themselves, which keep it to their own interfaces; none from a default
+  route through a nexthop object, whose gateway the guard does not see). A DNS64 that answers
+  `ipv4only.arpa` with one of its two addresses only reveals nothing. On an
   IPv6-only host, addresses under a prefix are refused until the translator's IPv4 address is
   learned through it (or stated in `public_addresses`). The
   witness broker learns the prefix itself at startup and also gets, from the miner, the
