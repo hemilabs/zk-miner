@@ -181,9 +181,12 @@ pub(super) async fn send(
             _ => rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|e| failed("the host name for TLS", e))?,
         };
-        let tls = tokio_rustls::TlsConnector::from(tls.clone())
-            .connect(name, tcp)
+        // Review round 5, parse-1: the handshake within the connect timeout (as reqwest's
+        // connector bounded it before round 4), not only the request's whole time.
+        let by = (tokio::time::Instant::now() + options.connect_timeout).min(deadline);
+        let tls = tokio::time::timeout_at(by, tokio_rustls::TlsConnector::from(tls.clone()).connect(name, tcp))
             .await
+            .map_err(|_| failed("the TLS handshake", "timed out"))?
             .map_err(|e| failed_with("the TLS handshake", &e))?;
         Ok(Stream::Tls(Box::new(tls)))
     };
