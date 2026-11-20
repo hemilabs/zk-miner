@@ -459,12 +459,28 @@ fn default_path_known(
 /// ([`crate::nat64::ensure_discovered_on`]); whether IPv6 destinations are refused meanwhile (a
 /// host with IPv6 and no IPv4 route whose uplink's round has not finished: review round 3,
 /// bypass-1; on every platform since the Linux application).
+/// Review round 4 (bypass-1): the uplink's IPv6 default gateways are the routers whose PREF64
+/// is heard, and a prefix named there that the guard could not hold
+/// ([`crate::nat64::unheld`]) refuses IPv6 destinations on any host (it is a sign of a hostile
+/// network, or of a network the guard cannot judge).
 fn nat64_unsettled_on(table: &RouteTable, signature: u64) -> bool {
+    use crate::routes::Hop;
     let up = crate::nat64::Uplink {
         signature,
         routed: [table.routes_family(false), table.routes_family(true)],
     };
-    up.refuses_ipv6(crate::nat64::ensure_discovered_on(up))
+    let gateways: Vec<(std::net::Ipv6Addr, u32)> = table
+        .routes()
+        .iter()
+        .filter(|r| r.is_default_like() && r.ifindex != 0)
+        .filter_map(|r| match r.hop {
+            Hop::Via(IpAddr::V6(gw)) => Some((gw, r.ifindex)),
+            _ => None,
+        })
+        .collect();
+    crate::nat64::on_uplink(signature, &gateways);
+    let settled = crate::nat64::ensure_discovered_on(up);
+    up.refuses_ipv6(settled) || crate::nat64::unheld(signature).is_some()
 }
 
 /// The signature of the uplink this host is on now ([`uplink_signature`], and what tells two
@@ -2624,7 +2640,11 @@ mod tests {
         reordered.reverse();
         assert_eq!(sig(&reordered, 3), sig(&at_home, 1));
         // An entry on another interface, or for another address, is not the gateway's.
-        let elsewhere = [n(gw, 3, Some(&cafe)), n(ip("192.168.1.2"), 2, Some(&cafe)), n(gw6, 2, Some(&home))];
+        let elsewhere = [
+            n(gw, 3, Some(&cafe)),
+            n(ip("192.168.1.2"), 2, Some(&cafe)),
+            n(gw6, 2, Some(&home)),
+        ];
         assert_eq!(
             gateway_identities(&table, &elsewhere),
             vec![(gw, 2, None), (gw6, 2, Some(home.to_vec()))]
@@ -2643,7 +2663,10 @@ mod tests {
         assert_eq!(sig(&v6_missing, 1), sig(&v6_missing, 2));
         assert_ne!(sig(&v6_missing, 1), sig(&at_home, 1));
         assert_ne!(sig(&v6_missing, 1), sig(&[n(gw, 2, Some(&cafe))], 1));
-        assert_ne!(sig(&[n(gw6, 2, Some(&home))], 1), sig(&[n(gw6, 2, Some(&cafe))], 1));
+        assert_ne!(
+            sig(&[n(gw6, 2, Some(&home))], 1),
+            sig(&[n(gw6, 2, Some(&cafe))], 1)
+        );
         // A device without link-layer addresses (NOARP, an empty one) is a stable identity.
         let tun = RouteTable::new(vec![Route::via(p("0.0.0.0/0"), ip("10.8.0.1"), 9)]);
         let ids = gateway_identities(&tun, &[n(ip("10.8.0.1"), 9, Some(&[]))]);
@@ -2901,7 +2924,11 @@ mod tests {
     fn a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends() {
         use crate::routes::Route;
         use std::hash::{BuildHasher, Hasher};
-        let fresh = || std::collections::hash_map::RandomState::new().build_hasher().finish();
+        let fresh = || {
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        };
         let v6_only = RouteTable::new(vec![Route::via(p("::/0"), ip("fe80::1"), 4)]);
         let dual = RouteTable::new(vec![
             Route::via(p("::/0"), ip("fe80::1"), 4),
@@ -2911,6 +2938,13 @@ mod tests {
         // background.
         nat64_unsettled_on(&dual, fresh());
         assert!(nat64_unsettled_on(&v6_only, fresh()));
+        assert!(!nat64_unsettled_on(&dual, fresh()));
+        // Review round 4, bypass-1: a prefix named on the uplink that could not be held refuses
+        // IPv6 there, on a dual-stack host too.
+        let held = fresh();
+        nat64_unsettled_on(&dual, held);
+        crate::nat64::unheld_after_round(held, "test: one source named too many");
+        assert!(nat64_unsettled_on(&dual, held));
         assert!(!nat64_unsettled_on(&dual, fresh()));
     }
 
