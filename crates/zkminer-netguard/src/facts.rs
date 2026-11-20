@@ -3123,6 +3123,14 @@ mod tests {
             vec![(ip("192.168.1.1"), 2), (ip("fe80::1"), 2), (ip("fe80::2"), 5)]
         );
         assert!(default_gateways(&table, &[]).is_empty());
+        // cross-3 (`facts.rs:488`): a route that is not default-like names no uplink gateway (nor
+        // a router whose PREF64 is heard).
+        let mixed = RouteTable::new(vec![
+            Route::via(p("::/0"), ip("fe80::1"), 2),
+            Route::via(p("2a01:4f8::/32"), ip("fe80::9"), 2),
+            Route::via(p("10.9.0.0/16"), ip("192.168.1.254"), 2),
+        ]);
+        assert_eq!(default_gateways(&mixed, &[]), vec![(ip("fe80::1"), 2)]);
         let mac = [1u8, 2, 3, 4, 5, 6];
         let ids = gateway_identities(
             &table,

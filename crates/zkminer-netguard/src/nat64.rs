@@ -2874,6 +2874,33 @@ mod r5_tests {
         }
     }
 
+    /// cross-3 (`nat64.rs:370`): a prefix named again is seen again, so when room is made the
+    /// least recently seen of another uplink's goes, not one its source still names.
+    #[test]
+    fn r5_a_prefix_named_again_is_not_the_first_to_make_room() {
+        let t0 = Instant::now();
+        let mut r = Registry {
+            on: Some(99),
+            ..Registry::default()
+        };
+        let q = |u: u64, i: u64| p(&format!("2001:db8:{u:x}:{i:x}::/64"));
+        for u in [1u64, 2] {
+            for i in 0..MAX_PER_UPLINK as u64 {
+                let at = t0 + Duration::from_millis(100 * u + i);
+                learn(&mut r, u, Source::Given((u * 100 + i) as u32), &[(q(u, i), None)], at);
+            }
+        }
+        assert_eq!(r.learned.len(), MAX_LEARNED);
+        // Uplink 1's oldest is named again.
+        learn(&mut r, 1, Source::Given(100), &[(q(1, 0), None)], t0 + Duration::from_secs(5));
+        // A new uplink's prefix makes room: uplink 1's next oldest goes, not the one named again.
+        learn(&mut r, 3, Source::Given(300), &[(q(3, 0), None)], t0 + Duration::from_secs(6));
+        let held: Vec<Prefix> = r.learned.iter().map(|e| e.prefix).collect();
+        assert!(held.contains(&q(1, 0)) && held.contains(&q(3, 0)));
+        assert!(!held.contains(&q(1, 1)), "the least recently seen made room");
+        assert_eq!(r.learned.len(), MAX_LEARNED);
+    }
+
     /// bypass-4: a host whose IPv4 goes out through a CLAT (an address in 192.0.0.0/29, or an
     /// IPv4 default out of a `clat*` or `v4-*` interface) is IPv6-only for NAT64; any other is
     /// not.
