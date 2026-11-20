@@ -2707,6 +2707,9 @@ pub struct WorkerPool {
     learned_peaks: Mutex<HashMap<String, crate::memory::LearnedPeaks>>,
     /// The same for COMMIT (Windows, `memory::CommitFigures`): what the slot's proofs committed.
     learned_commit: Mutex<HashMap<String, crate::memory::LearnedPeaks>>,
+    /// Slot key -> the segment size its card proves risc0 jobs at (`set_risc0_card_sizes`), for the
+    /// figures that name no job: a card proving at po2 21 takes twice what the default 20 is charged.
+    risc0_card_po2: Mutex<HashMap<String, u8>>,
     /// Where the learned figures are kept across runs (`use_host_peaks`), when they are.
     host_peaks_path: Option<PathBuf>,
     /// Jobs waiting in `prove_min_vram` for a card, so a freed card goes to the one due first
@@ -3225,6 +3228,7 @@ impl WorkerPool {
             expected_peaks: Mutex::new(HashMap::new()),
             learned_peaks: Mutex::new(HashMap::new()),
             learned_commit: Mutex::new(HashMap::new()),
+            risc0_card_po2: Mutex::new(HashMap::new()),
             host_peaks_path: None,
             card_waiters: Mutex::new(Vec::new()),
             card_waiter_seq: AtomicU64::new(0),
@@ -5060,6 +5064,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -5266,6 +5271,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -5589,6 +5595,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -5609,6 +5616,7 @@ impl WorkerPool {
                     None => {
                         return Err(anyhow::Error::new(
                             zkminer_prover_protocol::types::HostMemoryShortage {
+                                kind: zkminer_prover_protocol::types::HostMemoryKind::SharedMemory,
                                 attempted: false,
                                 slot_key: key.to_string(),
                                 needed: crate::memory::sp1_measure_cap_bytes(
@@ -6037,6 +6045,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -6057,6 +6066,7 @@ impl WorkerPool {
                     None => {
                         return Err(anyhow::Error::new(
                             zkminer_prover_protocol::types::HostMemoryShortage {
+                                kind: zkminer_prover_protocol::types::HostMemoryKind::SharedMemory,
                                 attempted: false,
                                 slot_key: key.to_string(),
                                 needed: crate::memory::sp1_measure_cap_bytes(
@@ -6680,6 +6690,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::SharedMemory,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: crate::memory::sp1_measure_cap_bytes(
@@ -6726,6 +6737,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -6760,6 +6772,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -7048,6 +7061,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: want,
@@ -7615,12 +7629,19 @@ impl WorkerPool {
                     .saturating_sub(self.current_commit_bytes_for_slot(key).unwrap_or(0)),
             )
         });
-        let held_up = ahead.iter().find(|w| {
-            ram.as_ref().is_some_and(|(room, back)| {
+        // The waiter it would hold up, and which of its memory: RAM if that, else commit.
+        let (held_up, kind) = ahead.iter().find_map(|w| {
+            if ram.as_ref().is_some_and(|(room, back)| {
                 holds_up_waiter(*room, w.ram, ram_mine, back, my_finish, now)
-            }) || commit.as_ref().is_some_and(|(room, back, mine)| {
+            }) {
+                Some((w, zkminer_prover_protocol::types::HostMemoryKind::Ram))
+            } else if commit.as_ref().is_some_and(|(room, back, mine)| {
                 holds_up_waiter(*room, w.commit, *mine, back, my_finish, now)
-            })
+            }) {
+                Some((w, zkminer_prover_protocol::types::HostMemoryKind::Commit))
+            } else {
+                None
+            }
         })?;
         tracing::debug!(
             "{key}: leaving host memory to a job waiting longer for it ({:.1} GiB RAM, {:.1} GiB \
@@ -7628,15 +7649,30 @@ impl WorkerPool {
             held_up.ram as f64 / (1u64 << 30) as f64,
             held_up.commit as f64 / (1u64 << 30) as f64,
         );
-        Some(
-            anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
+        let shortage = match kind {
+            zkminer_prover_protocol::types::HostMemoryKind::Commit => {
+                let figures = crate::memory::commit_figures();
+                zkminer_prover_protocol::types::HostMemoryShortage {
+                    kind,
+                    attempted: false,
+                    slot_key: key.to_string(),
+                    needed: self.slot_commit_peak(key, po2),
+                    reserved: self.commit_ledger.reserved_bytes(),
+                    available: figures.map_or(0, |c| c.available),
+                }
+            }
+            _ => zkminer_prover_protocol::types::HostMemoryShortage {
+                kind,
                 attempted: false,
                 slot_key: key.to_string(),
                 needed: want,
                 reserved: self.reserved_host_memory(),
                 available: crate::memory::mem_available_bytes().unwrap_or(0),
-            })
-            .context(zkminer_prover_protocol::types::MemoryKeptForWaiter),
+            },
+        };
+        Some(
+            anyhow::Error::new(shortage)
+                .context(zkminer_prover_protocol::types::MemoryKeptForWaiter),
         )
     }
 
@@ -8394,6 +8430,47 @@ impl WorkerPool {
             .unwrap_or_else(|| self.published_host_peak_at_po2(backend, po2))
     }
 
+    /// The segment size each risc0 card proves jobs at, by slot key (the miner's, from its config,
+    /// Settings and calibration), replacing what was set before.
+    pub fn set_risc0_card_sizes(&self, sizes: impl IntoIterator<Item = (String, u8)>) {
+        *self
+            .risc0_card_po2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = sizes.into_iter().collect();
+    }
+
+    /// The size a job on `key` is proved at when no job names one: its card's risc0 size, `None`
+    /// (the backend's default) for another backend or a card not set.
+    fn card_po2(&self, key: &str) -> Option<u8> {
+        self.risc0_card_po2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+    }
+
+    /// `backend_host_peak` for the job each card proves (`card_po2`): what `backend`'s proofs take
+    /// with no job in mind, for counts of proofs to come (how many fit side by side, what another
+    /// backend's job takes), where the default size undercounted a card set to prove larger ones.
+    fn backend_host_peak_as_proved(&self, backend: &str) -> u64 {
+        self.workers
+            .keys()
+            .filter(|key| key.split(':').next() == Some(backend))
+            .map(|key| self.slot_host_peak(key, self.card_po2(key)))
+            .max()
+            .unwrap_or_else(|| self.published_host_peak_at_po2(backend, None))
+    }
+
+    /// `backend_commit_peak_in` for the job each card proves (`backend_host_peak_as_proved`).
+    fn backend_commit_peak_as_proved(&self, backend: &str, total: u64) -> u64 {
+        self.workers
+            .keys()
+            .filter(|key| key.split(':').next() == Some(backend))
+            .map(|key| self.slot_commit_peak_in(key, self.card_po2(key), total))
+            .max()
+            .unwrap_or_else(|| crate::memory::unmeasured_commit_for(backend))
+    }
+
     /// Whether a proof on `key` at `po2` stayed, at its peak (`low_water`), within what was reserved
     /// for it: `ram_charge` of RAM, and the slot's commit figure. A host shortage it died in then
     /// came from outside the job (`ShortageFromOutside`). Unknown peaks are not within.
@@ -8502,12 +8579,23 @@ impl WorkerPool {
             })
     }
 
-    /// Whether a proof of `backend` refused `needed` bytes of host RAM would fit once the proofs of
+    /// Whether a proof of `backend` refused `needed` bytes of `kind` would fit once the proofs of
     /// ours running now are done: what is free now (net of their growth still to come), plus what
     /// their workers hold now, plus what idle workers of other backends could be recycled for, covers
-    /// it with the OS slice; and on Windows the same for its commit figure. Then it is waiting its
-    /// turn behind our own work, which its deadline bounds; otherwise something else holds the memory.
-    pub fn fits_when_ours_finish(&self, backend: &str, needed: u64) -> bool {
+    /// it with the OS slice; and on Windows the same for commit. The memory not refused is charged as
+    /// the backend's cards prove (`backend_host_peak_as_proved`): a commit refusal's `needed` is not
+    /// RAM. Then it is waiting its turn behind our own work, which its deadline bounds; otherwise
+    /// something else holds the memory.
+    pub fn fits_when_ours_finish(
+        &self,
+        backend: &str,
+        needed: u64,
+        kind: zkminer_prover_protocol::types::HostMemoryKind,
+    ) -> bool {
+        let ram_need = match kind {
+            zkminer_prover_protocol::types::HostMemoryKind::Ram => needed,
+            _ => self.backend_host_peak_as_proved(backend),
+        };
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         let idle: std::collections::HashSet<String> = self
             .idle_prove_holdings()
@@ -8523,11 +8611,14 @@ impl WorkerPool {
             .iter()
             .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
         let ram_ok = self.admission_available().is_none_or(|available| {
-            needed.saturating_add(reserve)
+            ram_need.saturating_add(reserve)
                 <= available.saturating_add(held_ram).saturating_add(idle_ram)
         });
         let commit_ok = crate::memory::commit_figures().is_none_or(|c| {
-            let want = self.backend_commit_peak_in(backend, None, c.total);
+            let want = match kind {
+                zkminer_prover_protocol::types::HostMemoryKind::Commit => needed,
+                _ => self.backend_commit_peak_as_proved(backend, c.total),
+            };
             let pending = self
                 .commit_ledger
                 .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
@@ -8607,6 +8698,7 @@ impl WorkerPool {
         let want = self.slot_commit_peak(key, po2);
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         let shortage = |available: u64| zkminer_prover_protocol::types::HostMemoryShortage {
+            kind: zkminer_prover_protocol::types::HostMemoryKind::Commit,
             attempted: false,
             slot_key: key.to_string(),
             needed: want,
@@ -9079,8 +9171,9 @@ impl WorkerPool {
                 .iter()
                 .fold(0u64, |sum, (_, m)| sum.saturating_add(bytes(m)))
         };
-        let refusal = |needed, reserved, available| {
+        let refusal = |kind, needed, reserved, available| {
             Some(zkminer_prover_protocol::types::HostMemoryShortage {
+                kind,
                 attempted: false,
                 slot_key: key.to_string(),
                 needed,
@@ -9096,7 +9189,12 @@ impl WorkerPool {
                 let capacity = shm.saturating_sub(crate::memory::SP1_DEV_SHM_POLL_MARGIN_BYTES);
                 let held = self.shm_ledger.reserved_bytes();
                 if beyond_committed_room(held, preemptable(|m| m.shm_bytes), need, 0, capacity) {
-                    return refusal(need, held, shm);
+                    return refusal(
+                        zkminer_prover_protocol::types::HostMemoryKind::SharedMemory,
+                        need,
+                        held,
+                        shm,
+                    );
                 }
             }
         }
@@ -9104,7 +9202,12 @@ impl WorkerPool {
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         if beyond_committed_room(held, preemptable(|m| m.host_bytes), want, reserve, total?) {
             let available = crate::memory::mem_available_bytes().unwrap_or(0);
-            return refusal(want, held, available);
+            return refusal(
+                zkminer_prover_protocol::types::HostMemoryKind::Ram,
+                want,
+                held,
+                available,
+            );
         }
         None
     }
@@ -9775,10 +9878,13 @@ impl WorkerPool {
             }
         };
         let ram = crate::memory::mem_total_bytes().map_or(usize::MAX, |total| {
-            fit(total, self.backend_host_peak(backend, None))
+            fit(total, self.backend_host_peak_as_proved(backend))
         });
         let commit = crate::memory::commit_figures().map_or(usize::MAX, |c| {
-            fit(c.total, self.backend_commit_peak_in(backend, None, c.total))
+            fit(
+                c.total,
+                self.backend_commit_peak_as_proved(backend, c.total),
+            )
         });
         ram.min(commit).max(1)
     }
@@ -9839,7 +9945,7 @@ impl WorkerPool {
         let other_peak = self
             .other_backends(backend)
             .iter()
-            .map(|b| self.backend_commit_peak_in(b, None, figures.total))
+            .map(|b| self.backend_commit_peak_as_proved(b, figures.total))
             .max()
             .unwrap_or(0);
         let set = crate::memory::claim_set_bytes(want, same, other, other_peak, slots);
@@ -9991,6 +10097,32 @@ impl WorkerPool {
         )
     }
 
+    /// Whether `backend_fits_for_claim_at_po2`, with the same arguments, refuses for commit
+    /// (Windows): its commit half alone does not fit. For the operator's message, as the remedy (a
+    /// larger page file) is not RAM's, and RAM can show free meanwhile.
+    pub fn claim_short_of_commit(
+        &self,
+        expected_peak: u64,
+        backend: &str,
+        outstanding: usize,
+        same_backend_outstanding: usize,
+        max_concurrent: usize,
+        po2: Option<u8>,
+    ) -> bool {
+        let slots = self.claim_slots(max_concurrent);
+        let other = outstanding.saturating_sub(same_backend_outstanding);
+        let side_by_side = self.backend_side_by_side(backend);
+        let same_in_set = same_backend_outstanding.min(side_by_side - 1);
+        let queued = outstanding >= slots || same_backend_outstanding >= side_by_side;
+        !self.commit_fits_for_claim(
+            backend,
+            (same_in_set, other, slots, queued),
+            same_backend_outstanding == 0,
+            po2,
+            expected_peak,
+        )
+    }
+
     /// `backend_fits_for_claim`, with the commit half charged at `po2`: the size `expected_peak`
     /// was taken at (for risc0, the largest a card proves at). `same_backend_outstanding`: how many
     /// of the `outstanding` jobs are of `backend`. The memory a warm worker of `backend` holds is
@@ -10019,7 +10151,7 @@ impl WorkerPool {
         let other_peak = self
             .other_backends(backend)
             .iter()
-            .map(|b| self.backend_host_peak(b, None))
+            .map(|b| self.backend_host_peak_as_proved(b))
             .max()
             .unwrap_or(0);
         // No more of this backend in the set than run side by side here: the rest wait their turn
@@ -11546,6 +11678,7 @@ impl WorkerPool {
                 None => {
                     return Err(anyhow::Error::new(
                         zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::SharedMemory,
                             attempted: false,
                             slot_key: key.to_string(),
                             needed: crate::memory::sp1_measure_cap_bytes(
@@ -11641,6 +11774,7 @@ impl WorkerPool {
                         // no guest-supplied text can forge it. See `HostMemoryShortage`.
                         return Err(anyhow::Error::new(
                             zkminer_prover_protocol::types::HostMemoryShortage {
+                                kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                                 attempted: false,
                                 slot_key: key.to_string(),
                                 needed: want,
@@ -11935,6 +12069,7 @@ impl WorkerPool {
             // loop waits for the host instead of excluding a healthy slot and releasing the job.
             if host_oom {
                 let err = anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
+                    kind: zkminer_prover_protocol::types::HostMemoryKind::of_worker_death(),
                     attempted: true,
                     slot_key: key.to_string(),
                     needed: want,
@@ -12074,6 +12209,7 @@ impl WorkerPool {
                     Self::mark_slot_dead(&mut slot, entry);
                     let err =
                         anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
+                            kind: zkminer_prover_protocol::types::HostMemoryKind::of_worker_death(),
                             attempted: true,
                             slot_key: key.to_string(),
                             needed: want,
@@ -17256,6 +17392,36 @@ mod learned_host_peak_tests {
             pool.workers.insert(key.to_string(), entry(backend, 0, 0));
         }
         pool
+    }
+
+    /// Figures that name no job charge each risc0 card the size it proves at: a card set to po2 21
+    /// is counted at po2 21, not the default, in how many proofs fit side by side. Figures for a
+    /// job of a given size, and the benchmark's, are unchanged.
+    #[test]
+    fn counts_with_no_job_charge_each_cards_own_size() {
+        let pool = pool(&["risc0:cuda:0", "risc0:cuda:1"]);
+        let published = |po2| pool.published_host_peak_at_po2("risc0", po2);
+        assert_eq!(pool.backend_host_peak_as_proved("risc0"), published(None));
+        let before = pool.backend_side_by_side("risc0");
+        pool.set_risc0_card_sizes([
+            ("risc0:cuda:0".to_string(), 21),
+            ("risc0:cuda:1".to_string(), 19),
+        ]);
+        // The larger card's size decides.
+        assert_eq!(
+            pool.backend_host_peak_as_proved("risc0"),
+            published(Some(21))
+        );
+        assert!(published(Some(21)) > published(None));
+        assert!(pool.backend_side_by_side("risc0") <= before);
+        assert_eq!(pool.expected_host_peak("risc0"), published(None));
+        assert_eq!(
+            pool.expected_host_peak_at_po2("risc0", Some(20)),
+            published(Some(20))
+        );
+        // Replaced, not merged.
+        pool.set_risc0_card_sizes([("risc0:cuda:1".to_string(), 18)]);
+        assert_eq!(pool.backend_host_peak_as_proved("risc0"), published(None));
     }
 
     /// Each card is charged what its own proofs reached; a card with none, and a figure with no
