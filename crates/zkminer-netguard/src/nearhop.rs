@@ -192,6 +192,21 @@ pub trait NearProbe: Send + Sync + fmt::Debug {
         self.probe(addr, hops, timeout)
     }
 
+    /// Review round 6, probe-4: one more probe attempt, after `pause`, for a destination whose
+    /// probe had no answer and whose check connection could not decide (every AWS S3 front end
+    /// resets or never acknowledges it: a router's ICMP loss can outlast the probe's three
+    /// attempts). A probe that knows no such attempt (a test's fake) has no answer.
+    fn probe_last_until(
+        &self,
+        addr: SocketAddr,
+        hops: u8,
+        pause: Duration,
+        deadline: Instant,
+    ) -> ProbeOutcome {
+        let _ = (addr, hops, pause, deadline);
+        ProbeOutcome::TimedOut
+    }
+
     /// [`Self::confirm`], given up on at `deadline` (a failure, never far).
     fn confirm_until(
         &self,
@@ -234,12 +249,28 @@ pub fn decide_until(probe: &dyn NearProbe, addr: SocketAddr, hops: u8, deadline:
             match probe.confirm_until(addr, hops, timeout, deadline).verdict() {
                 // Never undecided twice.
                 Verdict::Undecided => Verdict::Failed("no answer either way".into()),
+                Verdict::Failed(why) => {
+                    // Review round 6, probe-4: the probe once more, when the time allows it.
+                    if left() < PROBE_LAST_PAUSE + PROBE_TIMEOUT {
+                        return Verdict::Failed(why);
+                    }
+                    match probe
+                        .probe_last_until(addr, hops, PROBE_LAST_PAUSE, deadline)
+                        .verdict()
+                    {
+                        Verdict::Undecided => Verdict::Failed(why),
+                        v => v,
+                    }
+                }
                 v => v,
             }
         }
         v => v,
     }
 }
+
+/// How long the probe's last attempt waits ([`NearProbe::probe_last_until`]).
+pub const PROBE_LAST_PAUSE: Duration = Duration::from_secs(2);
 
 /// Why a decision out of time failed.
 const OUT_OF_TIME: &str = "the time for the check ran out before it could tell how near it is";
@@ -276,6 +307,107 @@ impl NearProbe for TtlProbe {
     ) -> ConfirmOutcome {
         confirm_once(addr, hops, timeout, deadline)
     }
+
+    fn probe_last_until(
+        &self,
+        addr: SocketAddr,
+        hops: u8,
+        pause: Duration,
+        deadline: Instant,
+    ) -> ProbeOutcome {
+        std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+        ProbeOutcome::of(probe_turn(unmapped(addr), hops, PROBE_TIMEOUT * 2 / 3, deadline))
+    }
+}
+
+/// How long a far verdict is remembered ([`remembered_far`]).
+pub const FAR_TTL: Duration = Duration::from_secs(10);
+/// Most far verdicts remembered.
+const MAX_FAR: usize = 256;
+
+/// A far verdict's key: the destination (address and port: a router can send one port elsewhere,
+/// a transparent proxy), the hop limit, the facts the path was judged on (their routes, rules,
+/// addresses and uplink signature: [`crate::HostFacts`]), and the probe.
+pub(crate) type FarKey = (SocketAddr, u8, u64, usize);
+
+/// The far verdicts of the last [`FAR_TTL`] (review round 6, probe-3: the pacer let 2 probes at
+/// once and 3 a second through, process-wide, so 64 connections at once to four hosts left 28
+/// refused after 17 s). Only far is remembered (near and failed never are), for one exact
+/// destination and port, never a prefix: a /24 or /48 can hold both a far host and a near one
+/// (an ISP's access router and its data centre), so a far verdict for one would admit the other.
+/// Any change of the facts (a route, a rule, an address, the uplink) is another key.
+static FAR: std::sync::Mutex<Vec<(FarKey, Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `key` was found far within [`FAR_TTL`] of `now`.
+pub(crate) fn remembered_far(key: FarKey, now: Instant) -> bool {
+    let mut far = FAR.lock().unwrap_or_else(|e| e.into_inner());
+    far.retain(|(_, at)| now.saturating_duration_since(*at) < FAR_TTL);
+    far.iter().any(|(k, _)| *k == key)
+}
+
+/// The keys a decision is running for ([`decide_remembered`]).
+static DECIDING: std::sync::Mutex<Vec<FarKey>> = std::sync::Mutex::new(Vec::new());
+static DECIDED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// `decide` (the near-hop decision for `key`'s destination), unless a far verdict for `key` is
+/// remembered ([`remembered_far`]); a far one is remembered. One decision runs per key at a
+/// time: a caller that finds one running waits for it (until `deadline`), then takes its far
+/// verdict, or decides itself (review round 6, probe-3: 64 connections at once to four hosts
+/// each sent their own probes). `None` (facts given by the caller): `decide`, nothing remembered.
+pub(crate) fn decide_remembered(
+    key: Option<FarKey>,
+    deadline: Instant,
+    decide: impl FnOnce() -> Verdict,
+) -> Verdict {
+    let Some(key) = key else { return decide() };
+    let mut g = DECIDING.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let now = Instant::now();
+        if remembered_far(key, now) {
+            return Verdict::Far;
+        }
+        if !g.contains(&key) {
+            g.push(key);
+            break;
+        }
+        let left = deadline.saturating_duration_since(now);
+        if left.is_zero() {
+            return Verdict::Failed(OUT_OF_TIME.into());
+        }
+        g = DECIDED
+            .wait_timeout(g, left.min(TOKEN_INTERVAL))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    drop(g);
+    /// Gives the key back however `decide` ends (a panic included).
+    struct Done(FarKey);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            DECIDING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|k| *k != self.0);
+            DECIDED.notify_all();
+        }
+    }
+    let done = Done(key);
+    let v = decide();
+    if v == Verdict::Far {
+        remember_far(key, Instant::now());
+    }
+    drop(done);
+    v
+}
+
+/// Remembers that `key` was found far at `now`.
+pub(crate) fn remember_far(key: FarKey, now: Instant) {
+    let mut far = FAR.lock().unwrap_or_else(|e| e.into_inner());
+    far.retain(|(k, at)| *k != key && now.saturating_duration_since(*at) < FAR_TTL);
+    if far.len() >= MAX_FAR {
+        far.remove(0);
+    }
+    far.push((key, now));
 }
 
 /// A probe that answers the same every time, and records what it was asked: for tests, where a
@@ -362,19 +494,27 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant) 
     probe_attempts(
         timeout,
         PROBE_PAUSE,
+        left,
         |pause| std::thread::sleep(pause.min(left())),
-        |t| {
-            // Review round 5, probe-1: within the caller's time, a turn waited for included.
-            let Some(_turn) = ProbeGate::enter_until(deadline) else {
-                return Err(io::Error::other(NO_TURN));
-            };
-            let t = t.min(left());
-            if t.is_zero() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            probe_attempt(addr, hops, t)
-        },
+        |t| probe_turn(addr, hops, t, deadline),
     )
+}
+
+/// One attempt of the probe, within `t` and the caller's `deadline` (review round 5, probe-1: a
+/// turn waited for included; review round 6, parse-4 = probe-2, cross-7 N14: out of time, it
+/// neither waits for a turn nor takes a token, and an attempt never runs past the deadline).
+fn probe_turn(addr: SocketAddr, hops: u8, t: Duration, deadline: Instant) -> io::Result<()> {
+    if deadline <= Instant::now() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    let Some(_turn) = Turn::enter_for(addr, deadline) else {
+        return Err(io::Error::other(NO_TURN));
+    };
+    let t = t.min(deadline.saturating_duration_since(Instant::now()));
+    if t.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    probe_attempt(addr, hops, t)
 }
 
 /// Why a probe that got no turn before its deadline failed ([`ProbeGate::enter_until`]).
@@ -394,23 +534,30 @@ pub const PROBE_PAUSE: Duration = Duration::from_secs(1);
 /// refuses a peer that never acknowledges a bare FIN (every AWS S3 front end), and which does
 /// not exist on Windows (a probe without an answer is refused there). An answer comes within a
 /// round trip to the router, milliseconds.
+///
+/// Review round 6 (parse-4 = probe-2): once the caller's time is out (`left`), no further attempt
+/// is made.
 fn probe_attempts(
     timeout: Duration,
     pause: Duration,
+    left: impl Fn() -> Duration,
     sleep: impl FnOnce(Duration),
     mut attempt: impl FnMut(Duration) -> io::Result<()>,
 ) -> io::Result<()> {
     let first = timeout * 2 / 3;
     let timed_out = |r: &io::Result<()>| matches!(r, Err(e) if e.kind() == io::ErrorKind::TimedOut);
     let r = attempt(first);
-    if !timed_out(&r) {
+    if !timed_out(&r) || left().is_zero() {
         return r;
     }
     let r = attempt(timeout - first);
-    if !timed_out(&r) {
+    if !timed_out(&r) || left().is_zero() {
         return r;
     }
     sleep(pause);
+    if left().is_zero() {
+        return r;
+    }
     attempt(first)
 }
 
@@ -444,6 +591,16 @@ impl Pacer {
         }
     }
 
+    /// The tokens there at `now` (fractional).
+    pub(crate) fn available(&self, now: Instant) -> f64 {
+        match self.at {
+            Some(at) => (self.tokens
+                + now.saturating_duration_since(at).as_secs_f64() * f64::from(PROBES_PER_SECOND))
+            .min(f64::from(PROBE_BURST)),
+            None => self.tokens,
+        }
+    }
+
     /// Takes a token at `now` (`Ok`), or says how long until one is there.
     pub(crate) fn take(&mut self, now: Instant) -> Result<(), Duration> {
         if let Some(at) = self.at {
@@ -462,49 +619,124 @@ impl Pacer {
     }
 }
 
-/// A turn to probe: at most [`PROBES_AT_ONCE`] are held at a time, and they start at most as
-/// fast as [`Pacer`] allows; [`ProbeGate::enter_until`] waits for one until a deadline.
+/// A family's gate: turns in flight, the pacer, the callers waiting (their tickets, first come
+/// first served) and the next ticket. A tuple so tests can stage it.
+#[derive(Debug)]
+pub(crate) struct GateState(usize, Pacer, std::collections::VecDeque<u64>, u64);
+
+impl GateState {
+    const fn new() -> Self {
+        GateState(0, Pacer::new(), std::collections::VecDeque::new(), 0)
+    }
+}
+
+/// The interval at which tokens come ([`PROBES_PER_SECOND`]): the longest a waiter sleeps before
+/// it looks again (review round 6, parse-1: a wakeup handed to a waiter that then left was lost,
+/// and another slept to its own deadline).
+const TOKEN_INTERVAL: Duration = Duration::from_millis(1000 / PROBES_PER_SECOND as u64);
+
+/// A turn to probe an IPv4 destination: at most [`PROBES_AT_ONCE`] are held at a time, and they
+/// start at most as fast as [`Pacer`] allows; [`ProbeGate::enter_until`] waits for one until a
+/// deadline. IPv6 destinations have a gate of their own ([`ProbeGateV6`]; review round 6,
+/// probe-3: the first hops keep their ICMP and ICMPv6 rate limits apart, Linux's `icmp_ratelimit`
+/// and `icmp/ratelimit`, and each family has its own default route, its own uplink).
 struct ProbeGate;
 
-static PROBES_IN_FLIGHT: std::sync::Mutex<(usize, Pacer)> =
-    std::sync::Mutex::new((0, Pacer::new()));
+/// A turn to probe an IPv6 destination (see [`ProbeGate`]).
+struct ProbeGateV6;
+
+static PROBES_IN_FLIGHT: std::sync::Mutex<GateState> = std::sync::Mutex::new(GateState::new());
 static PROBE_TURN: std::sync::Condvar = std::sync::Condvar::new();
+static PROBES_IN_FLIGHT_V6: std::sync::Mutex<GateState> = std::sync::Mutex::new(GateState::new());
+static PROBE_TURN_V6: std::sync::Condvar = std::sync::Condvar::new();
 /// How many times a turn waited for a token (tests).
 #[cfg(test)]
 static PACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// A turn of either family.
+#[allow(dead_code)] // held for its Drop
+enum Turn {
+    V4(ProbeGate),
+    V6(ProbeGateV6),
+}
+
+impl Turn {
+    /// A turn for a probe of `addr`, waited for until `deadline`.
+    fn enter_for(addr: SocketAddr, deadline: Instant) -> Option<Self> {
+        if addr.is_ipv4() {
+            ProbeGate::enter_until(deadline).map(Turn::V4)
+        } else {
+            ProbeGateV6::enter_until(deadline).map(Turn::V6)
+        }
+    }
+}
+
+/// Waits for a turn of the gate `m` (woken by `cv`) until `deadline` (review round 6, parse-1,
+/// parse-4 = probe-2, probe-3): first come, first served (a ticket queue); none when the deadline
+/// has passed, before a token is taken; none at once when the turns ahead need more tokens than
+/// can come before the deadline (the caller sheds its load instead of waiting its whole budget
+/// for a refusal); every change wakes every waiter, and none sleeps longer than
+/// [`TOKEN_INTERVAL`], so a wakeup is never lost.
+fn enter_gate(m: &std::sync::Mutex<GateState>, cv: &std::sync::Condvar, deadline: Instant) -> bool {
+    if deadline <= Instant::now() {
+        return false;
+    }
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let ticket = g.3;
+    g.3 = g.3.wrapping_add(1);
+    g.2.push_back(ticket);
+    loop {
+        let now = Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        let mut wait = left.min(TOKEN_INTERVAL);
+        let ahead = g.2.iter().position(|t| *t == ticket).unwrap_or(0);
+        if ahead == 0 && g.0 < PROBES_AT_ONCE && !left.is_zero() {
+            match g.1.take(now) {
+                Ok(()) => {
+                    g.0 += 1;
+                    g.2.pop_front();
+                    drop(g);
+                    cv.notify_all();
+                    return true;
+                }
+                Err(until_token) => {
+                    #[cfg(test)]
+                    PACED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    wait = wait.min(until_token);
+                }
+            }
+        }
+        // At least one token for each turn ahead and this one: when they cannot come in time,
+        // none will (unless one ahead gives up first: rare, and a refusal either way).
+        let needed = (ahead + 1) as f64 - g.1.available(now);
+        let expected = Duration::from_secs_f64(needed.max(0.0) / f64::from(PROBES_PER_SECOND));
+        if left.is_zero() || expected > left {
+            g.2.retain(|t| *t != ticket);
+            drop(g);
+            cv.notify_all();
+            return false;
+        }
+        g = cv
+            .wait_timeout(g, wait.max(Duration::from_millis(1)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+/// Gives a turn of the gate `m` back.
+fn leave_gate(m: &std::sync::Mutex<GateState>, cv: &std::sync::Condvar) {
+    let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+    g.0 = g.0.saturating_sub(1);
+    drop(g);
+    cv.notify_all();
+}
+
 impl ProbeGate {
     /// A turn, waited for until `deadline` (review round 5: the wait had no bound, so a caller
     /// that gave up left a thread waiting for a turn, then probing for nobody); `None` when none
-    /// came in time.
+    /// came in time ([`enter_gate`]).
     fn enter_until(deadline: Instant) -> Option<Self> {
-        let mut g = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            let now = Instant::now();
-            let left = deadline.saturating_duration_since(now);
-            let wait = if g.0 >= PROBES_AT_ONCE {
-                left
-            } else {
-                match g.1.take(now) {
-                    Ok(()) => {
-                        g.0 += 1;
-                        return Some(ProbeGate);
-                    }
-                    Err(until_token) => {
-                        #[cfg(test)]
-                        PACED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        until_token.min(left)
-                    }
-                }
-            };
-            if left.is_zero() {
-                return None;
-            }
-            g = PROBE_TURN
-                .wait_timeout(g, wait.max(Duration::from_millis(1)))
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
+        enter_gate(&PROBES_IN_FLIGHT, &PROBE_TURN, deadline).then_some(ProbeGate)
     }
 
     /// Probes in flight now (tests).
@@ -514,12 +746,22 @@ impl ProbeGate {
     }
 }
 
+impl ProbeGateV6 {
+    /// See [`ProbeGate::enter_until`].
+    fn enter_until(deadline: Instant) -> Option<Self> {
+        enter_gate(&PROBES_IN_FLIGHT_V6, &PROBE_TURN_V6, deadline).then_some(ProbeGateV6)
+    }
+}
+
 impl Drop for ProbeGate {
     fn drop(&mut self) {
-        let mut g = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        g.0 = g.0.saturating_sub(1);
-        drop(g);
-        PROBE_TURN.notify_one();
+        leave_gate(&PROBES_IN_FLIGHT, &PROBE_TURN);
+    }
+}
+
+impl Drop for ProbeGateV6 {
+    fn drop(&mut self) {
+        leave_gate(&PROBES_IN_FLIGHT_V6, &PROBE_TURN_V6);
     }
 }
 
@@ -1746,6 +1988,7 @@ mod tests {
         let r = probe_attempts(
             timeout,
             pause,
+            || Duration::from_secs(60),
             |p| asked.borrow_mut().push(format!("pause {}", p.as_millis())),
             |t| {
                 asked.borrow_mut().push(format!("probe {}", t.as_millis()));
@@ -1760,7 +2003,7 @@ mod tests {
         for answered_at in 1..=3 {
             let mut n = 0;
             let mut paused = false;
-            let r = probe_attempts(timeout, pause, |_| paused = true, |_| {
+            let r = probe_attempts(timeout, pause, || Duration::from_secs(60), |_| paused = true, |_| {
                 n += 1;
                 if n < answered_at {
                     Err(io::ErrorKind::TimedOut.into())
@@ -1779,7 +2022,7 @@ mod tests {
         ] {
             let mut first = Some(first);
             let mut n = 0;
-            let _ = probe_attempts(timeout, pause, |_| {}, |_| {
+            let _ = probe_attempts(timeout, pause, || Duration::from_secs(60), |_| {}, |_| {
                 n += 1;
                 first.take().unwrap()
             });
@@ -1822,7 +2065,9 @@ mod tests {
             .collect();
         let t = Instant::now();
         assert!(ProbeGate::enter_until(t + Duration::from_millis(200)).is_none());
-        assert!(t.elapsed() >= Duration::from_millis(190) && t.elapsed() < Duration::from_secs(2));
+        // Review round 6: at its deadline at the latest (sooner when the turns ahead cannot all
+        // come in time: it sheds).
+        assert!(t.elapsed() < Duration::from_secs(2));
         // Nothing listens there: had the probe been sent, it would have been refused (near).
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let t = Instant::now();
@@ -2163,3 +2408,339 @@ mod tests {
     }
 }
 
+
+/// Review round 6: the probe gate (parse-1, parse-4 = probe-2, probe-3), the deadlines (cross-7
+/// N11, N14), the last attempt (probe-4) and the far verdicts remembered (probe-3).
+#[cfg(test)]
+mod r6_tests {
+    use super::*;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// A gate of the test's own (the process's are shared with every other test).
+    fn gate() -> &'static (Mutex<GateState>, Condvar) {
+        Box::leak(Box::new((Mutex::new(GateState::new()), Condvar::new())))
+    }
+
+    fn stage(g: &(Mutex<GateState>, Condvar), in_flight: usize, tokens: f64) {
+        let mut s = g.0.lock().unwrap();
+        s.0 = in_flight;
+        s.1 = Pacer { tokens, at: Some(Instant::now()) };
+    }
+
+    /// parse-1 (`r6_parse_a_freed_turn_is_not_lost`, 4/4 failed before): both turns held, no
+    /// token; W1 (deadline 200 ms) then W2 (deadline 3 s) wait; a turn is freed at 100 ms. W1
+    /// leaves at its deadline without a turn; W2 must get the freed one once a token is there
+    /// (~333 ms), not sleep to its own deadline.
+    #[test]
+    fn r6_a_freed_turn_is_not_lost() {
+        for _ in 0..4 {
+            let g = gate();
+            stage(g, PROBES_AT_ONCE, 0.0);
+            let t0 = Instant::now();
+            let waiter = |d: Duration| {
+                std::thread::spawn(move || {
+                    let got = enter_gate(&g.0, &g.1, t0 + d);
+                    (got, t0.elapsed())
+                })
+            };
+            let w1 = waiter(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(20));
+            let w2 = waiter(Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(80));
+            leave_gate(&g.0, &g.1);
+            let (r1, r2) = (w1.join().unwrap(), w2.join().unwrap());
+            assert!(!r1.0, "{r1:?}");
+            assert!(r2.0 && r2.1 < Duration::from_millis(1000), "W1 {r1:?}, W2 {r2:?}");
+        }
+    }
+
+    /// parse-4 = probe-2 (`r6_parse_an_expired_caller_takes_no_token`,
+    /// `r6_turn_after_deadline_takes_a_token`): a caller whose deadline has passed gets no turn
+    /// and takes no token, and a probe out of time sends nothing.
+    #[test]
+    fn r6_an_expired_caller_takes_no_token() {
+        let g = gate();
+        stage(g, 0, f64::from(PROBE_BURST));
+        let past = Instant::now() - Duration::from_millis(1);
+        for _ in 0..4 {
+            assert!(!enter_gate(&g.0, &g.1, past));
+        }
+        let s = g.0.lock().unwrap();
+        assert!(s.1.tokens >= f64::from(PROBE_BURST) - 0.01 && s.0 == 0 && s.2.is_empty(), "{s:?}");
+        drop(s);
+        // Nothing listens there: had a probe been sent, it would have been refused at once.
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let r = probe_turn(addr, 2, PROBE_TIMEOUT, past);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let asked = std::cell::Cell::new(0);
+        let r = probe_attempts(PROBE_TIMEOUT, PROBE_PAUSE, || Duration::ZERO, |_| {}, |_| {
+            asked.set(asked.get() + 1);
+            Err(io::ErrorKind::TimedOut.into())
+        });
+        assert!(r.is_err());
+        assert_eq!(asked.get(), 1, "out of time: no further attempt");
+    }
+
+    /// probe-3: first come, first served; a caller whose turn cannot come in time (the turns
+    /// ahead need more tokens than come before its deadline) gives up at once.
+    #[test]
+    fn r6_turns_are_first_come_first_served_and_hopeless_waits_are_shed() {
+        let g = gate();
+        stage(g, PROBES_AT_ONCE, f64::from(PROBE_BURST));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let hs: Vec<_> = (0..5)
+            .map(|i| {
+                let order = order.clone();
+                let h = std::thread::spawn(move || {
+                    assert!(enter_gate(&g.0, &g.1, t0 + Duration::from_secs(10)));
+                    order.lock().unwrap().push(i);
+                    leave_gate(&g.0, &g.1);
+                });
+                std::thread::sleep(Duration::from_millis(30));
+                h
+            })
+            .collect();
+        leave_gate(&g.0, &g.1);
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+        // Six callers wait for tokens (none there); a seventh with half a second sheds at once.
+        let g = gate();
+        stage(g, 0, 0.0);
+        let hs: Vec<_> = (0..6)
+            .map(|_| {
+                let h = std::thread::spawn(move || {
+                    if enter_gate(&g.0, &g.1, Instant::now() + Duration::from_secs(10)) {
+                        leave_gate(&g.0, &g.1);
+                    }
+                });
+                std::thread::sleep(Duration::from_millis(5));
+                h
+            })
+            .collect();
+        let t = Instant::now();
+        assert!(!enter_gate(&g.0, &g.1, t + Duration::from_millis(500)));
+        assert!(t.elapsed() < Duration::from_millis(100), "{:?}", t.elapsed());
+        for h in hs {
+            h.join().unwrap();
+        }
+    }
+
+    /// The gate's invariant, on random callers (random deadlines and hold times, arriving at
+    /// random): never more than PROBES_AT_ONCE turns held; a turn is never given after its
+    /// deadline; a caller that gets none returns by its deadline; nobody waits for a turn that
+    /// is free with a token there (no lost wakeup: every caller whose deadline leaves room for
+    /// every token ahead of it, and their holds, gets one); tokens stay within the burst.
+    #[test]
+    fn r6_the_gate_never_loses_a_turn_on_random_callers() {
+        for seed in 1..=4u64 {
+            let g = gate();
+            let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut rnd = move |n: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % n
+            };
+            let t0 = Instant::now();
+            let hs: Vec<_> = (0..24)
+                .map(|i| {
+                    let deadline = Duration::from_millis(50 + rnd(4000));
+                    let hold = Duration::from_millis(rnd(60));
+                    let most = most.clone();
+                    std::thread::sleep(Duration::from_millis(rnd(40)));
+                    let arrived = t0.elapsed();
+                    let h = std::thread::spawn(move || {
+                        let start = Instant::now();
+                        let got = enter_gate(&g.0, &g.1, start + deadline);
+                        let took = start.elapsed();
+                        if got {
+                            let n = g.0.lock().unwrap().0;
+                            most.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(hold);
+                            leave_gate(&g.0, &g.1);
+                        }
+                        (i, arrived, deadline, got, took)
+                    });
+                    (h, deadline)
+                })
+                .collect();
+            let mut results: Vec<_> = hs.into_iter().map(|(h, _)| h.join().unwrap()).collect();
+            results.sort_by_key(|r| r.1);
+            assert!(most.load(std::sync::atomic::Ordering::SeqCst) <= PROBES_AT_ONCE);
+            // The burst covers the first PROBE_BURST; then PROBES_PER_SECOND; every hold is
+            // short (60 ms), so the k-th arrival's turn can come by about (k - burst) / rate.
+            for (k, (i, _, deadline, got, took)) in results.iter().enumerate() {
+                if *got {
+                    assert!(*took <= *deadline + Duration::from_millis(5), "seed {seed} #{i}: {took:?} > {deadline:?}");
+                } else {
+                    assert!(*took <= *deadline + Duration::from_millis(50), "seed {seed} #{i}: {took:?}");
+                }
+                let room = (k as f64 + 1.0 - f64::from(PROBE_BURST)).max(0.0) / f64::from(PROBES_PER_SECOND);
+                if deadline.as_secs_f64() > room + 0.1 * k as f64 + 1.0 {
+                    assert!(*got, "seed {seed} #{i} (arrival {k}): no turn within {deadline:?} ({results:?})");
+                }
+            }
+            let s = g.0.lock().unwrap();
+            assert!(s.0 == 0 && s.2.is_empty() && s.1.tokens <= f64::from(PROBE_BURST), "{s:?}");
+        }
+    }
+
+    /// cross-7 N14: an attempt never runs past the caller's deadline (a listener whose accept
+    /// queue is full drops SYNs: the attempt would wait its whole timeout).
+    #[cfg(unix)]
+    #[test]
+    fn r6_a_probe_attempt_ends_at_the_deadline() {
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into()).unwrap();
+        sock.listen(0).unwrap();
+        let addr = sock.local_addr().unwrap().as_socket().unwrap();
+        let mut fill = Vec::new();
+        for _ in 0..8 {
+            let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            s.set_nonblocking(true).unwrap();
+            let _ = s.connect(&addr.into());
+            fill.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        let r = probe_turn(addr, 64, Duration::from_secs(2), t + Duration::from_millis(300));
+        let took = t.elapsed();
+        // A full queue on loopback: dropped SYNs, or (some kernels) an answer at once.
+        if matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
+            assert!(took < Duration::from_millis(700), "{took:?}");
+        } else {
+            crate::skipped(format!("this kernel answered a full accept queue: {r:?}"));
+        }
+    }
+
+    /// A probe that records what it was asked.
+    #[derive(Debug)]
+    struct Recording {
+        confirm: ConfirmOutcome,
+        last: ProbeOutcome,
+        confirm_timeouts: Mutex<Vec<Duration>>,
+        lasts: Mutex<usize>,
+    }
+
+    impl NearProbe for Recording {
+        fn probe(&self, _: SocketAddr, _: u8, _: Duration) -> ProbeOutcome {
+            ProbeOutcome::TimedOut
+        }
+        fn confirm(&self, _: SocketAddr, _: u8, timeout: Duration) -> ConfirmOutcome {
+            self.confirm_timeouts.lock().unwrap().push(timeout);
+            self.confirm.clone()
+        }
+        fn probe_last_until(&self, _: SocketAddr, _: u8, _: Duration, _: Instant) -> ProbeOutcome {
+            *self.lasts.lock().unwrap() += 1;
+            self.last.clone()
+        }
+    }
+
+    fn recording(confirm: ConfirmOutcome, last: ProbeOutcome) -> Recording {
+        Recording { confirm, last, confirm_timeouts: Mutex::new(Vec::new()), lasts: Mutex::new(0) }
+    }
+
+    /// cross-7 N11: the check connection's connect is bounded by the caller's deadline.
+    #[test]
+    fn r6_the_check_connection_is_bounded_by_the_deadline() {
+        let p = recording(ConfirmOutcome::Unanswered, ProbeOutcome::TimedOut);
+        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        assert_eq!(decide_until(&p, addr, 2, Instant::now() + Duration::from_secs(1)), Verdict::Far);
+        let t = p.confirm_timeouts.lock().unwrap();
+        assert!(t.len() == 1 && t[0] <= Duration::from_secs(1), "{t:?}");
+    }
+
+    /// probe-4: a destination whose probe had no answer and whose check connection failed (every
+    /// AWS S3 front end) is probed once more when the time allows; its answer decides.
+    #[test]
+    fn r6_a_failed_check_is_followed_by_one_more_probe() {
+        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let reset = ConfirmOutcome::Failed("the peer reset the control connection".into());
+        let far = Instant::now() + Duration::from_secs(30);
+        let p = recording(reset.clone(), ProbeOutcome::Unreachable);
+        assert_eq!(decide_until(&p, addr, 2, far), Verdict::Far);
+        assert_eq!(*p.lasts.lock().unwrap(), 1);
+        let p = recording(reset.clone(), ProbeOutcome::Connected);
+        assert!(matches!(decide_until(&p, addr, 2, far), Verdict::Near(_)));
+        let p = recording(reset.clone(), ProbeOutcome::TimedOut);
+        assert!(matches!(decide_until(&p, addr, 2, far), Verdict::Failed(w) if w.contains("reset")));
+        // Not when the time left cannot hold it.
+        let p = recording(reset, ProbeOutcome::Unreachable);
+        let soon = Instant::now() + PROBE_LAST_PAUSE;
+        assert!(matches!(decide_until(&p, addr, 2, soon), Verdict::Failed(_)));
+        assert_eq!(*p.lasts.lock().unwrap(), 0);
+        // A check that decided is never followed by it.
+        let p = recording(ConfirmOutcome::Answered, ProbeOutcome::Unreachable);
+        assert!(matches!(decide_until(&p, addr, 2, far), Verdict::Near(_)));
+        assert_eq!(*p.lasts.lock().unwrap(), 0);
+    }
+
+    /// probe-3: callers deciding the same key at once wait for the one decision running; a
+    /// verdict other than far is not shared (each decides again).
+    #[test]
+    fn r6_one_decision_runs_per_destination_at_a_time() {
+        let key = ("203.0.113.77:443".parse().unwrap(), 2, 0xfa_0002u64, 9);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let ran = ran.clone();
+                std::thread::spawn(move || {
+                    decide_remembered(Some(key), Instant::now() + Duration::from_secs(5), || {
+                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(100));
+                        Verdict::Far
+                    })
+                })
+            })
+            .collect();
+        for h in hs {
+            assert_eq!(h.join().unwrap(), Verdict::Far);
+        }
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let key = ("203.0.113.78:443".parse().unwrap(), 2, 0xfa_0002u64, 9);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                let ran = ran.clone();
+                std::thread::spawn(move || {
+                    decide_remembered(Some(key), Instant::now() + Duration::from_secs(5), || {
+                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Verdict::Near("answered".into())
+                    })
+                })
+            })
+            .collect();
+        for h in hs {
+            assert!(matches!(h.join().unwrap(), Verdict::Near(_)));
+        }
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    /// probe-3: a far verdict is remembered for FAR_TTL, for its exact destination and port, hop
+    /// limit, facts and probe.
+    #[test]
+    fn r6_far_verdicts_are_remembered_only_for_the_same_destination_and_facts() {
+        let a: SocketAddr = "198.51.100.7:443".parse().unwrap();
+        let facts = 0xfa_0001u64;
+        let t0 = Instant::now();
+        let key = (a, 2, facts, 1);
+        assert!(!remembered_far(key, t0));
+        remember_far(key, t0);
+        assert!(remembered_far(key, t0 + FAR_TTL - Duration::from_millis(1)));
+        assert!(!remembered_far(key, t0 + FAR_TTL));
+        remember_far(key, t0);
+        for other in [
+            ("198.51.100.8:443".parse().unwrap(), 2, facts, 1),
+            ("198.51.100.7:80".parse().unwrap(), 2, facts, 1),
+            (a, 3, facts, 1),
+            (a, 2, facts, 2),
+        ] {
+            assert!(!remembered_far(other, t0), "{other:?}");
+        }
+        assert!(!remembered_far((a, 2, facts + 1, 1), t0), "other facts");
+    }
+}
