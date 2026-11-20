@@ -264,9 +264,11 @@ impl Denied {
             ),
             Denied::Nat64Unsettled(ip) => write!(
                 f,
-                "{ip} cannot be judged yet: this host, with IPv6 and no IPv4 route, is on a new \
-                 network whose NAT64 prefix is still being learned (RFC 7050, at most {}s), and an \
-                 IPv6 address under that prefix can carry a private IPv4 address",
+                "{ip} cannot be judged yet: this host is on a network whose NAT64 prefix is \
+                 still being learned (RFC 7050, at most {}s, on a host with IPv6 and no IPv4 \
+                 route), or that named NAT64 prefixes the network guard does not believe or \
+                 cannot hold (the log says which), and an IPv6 address under such a prefix can \
+                 carry a private IPv4 address",
                 crate::nat64::DISCOVERY_TIMEOUT.as_secs()
             ),
             Denied::PathChanged { addr, why } => write!(
@@ -358,7 +360,11 @@ fn source_for(dst: SocketAddr) -> io::Result<IpAddr> {
 /// ([`NetPolicy::recheck_connected`]): its peer must be the address connected to, and its source
 /// the one the kernel chose when it was checked (a route that moved the connection to another
 /// interface, a VPN that came up, gives it another source); why not, if not. Pure.
-pub fn connected_as_vetted(vetted: &Vetted, local: SocketAddr, peer: SocketAddr) -> Result<(), String> {
+pub fn connected_as_vetted(
+    vetted: &Vetted,
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> Result<(), String> {
     if unmapped(peer) != vetted.connect {
         return Err(format!(
             "it reached {}, not {}",
@@ -1099,7 +1105,8 @@ impl NetPolicy {
             addr: vetted.addr,
             why,
         })?;
-        let judge = |f: &HostFacts| admit_to(self.mode, vetted.addr, &f.without_verdicts(), &self.deny);
+        let judge =
+            |f: &HostFacts| admit_to(self.mode, vetted.addr, &f.without_verdicts(), &self.deny);
         match judge(&self.facts()) {
             Err(d) if d.depends_on_facts() && self.facts.refresh => {
                 judge(&self.facts.get_fresher_than(FORCED_REFRESH_MIN_AGE))
