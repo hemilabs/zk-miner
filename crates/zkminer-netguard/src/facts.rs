@@ -282,9 +282,8 @@ pub struct HostFacts {
     global_v4_interfaces: Vec<IpAddr>,
     /// Whether `[egress] internal_ranges` is stated (facts given by the caller: true).
     internal_ranges_stated: bool,
-    /// macOS: why these facts can no longer be judged with (a refresh failed and they outlived
-    /// their time): every requester connection is refused ([`crate::Denied::FactsUnreadable`]).
-    #[cfg(target_os = "macos")]
+    /// Why these facts can no longer be judged with (a refresh failed and they outlived their
+    /// time): every requester connection is refused ([`crate::Denied::FactsUnreadable`]).
     unreadable: Option<String>,
     /// macOS: [`RawFacts::nat64_unsettled`].
     #[cfg(target_os = "macos")]
@@ -532,7 +531,6 @@ impl HostFacts {
             uplink_reasons: Vec::new(),
             global_v4_interfaces: Vec::new(),
             internal_ranges_stated: true,
-            #[cfg(target_os = "macos")]
             unreadable: None,
             #[cfg(target_os = "macos")]
             nat64_unsettled: false,
@@ -616,15 +614,14 @@ impl HostFacts {
             uplink_reasons,
             global_v4_interfaces,
             internal_ranges_stated: opts.internal_ranges.is_some(),
-            #[cfg(target_os = "macos")]
             unreadable: None,
             #[cfg(target_os = "macos")]
             nat64_unsettled: raw.nat64_unsettled,
         }
     }
 
-    /// How many kernel verdicts these facts hold (macOS tests).
-    #[cfg(all(test, target_os = "macos"))]
+    /// How many kernel verdicts these facts hold (tests).
+    #[cfg(test)]
     pub(crate) fn cached_verdicts(&self) -> usize {
         self.verdicts
             .lock()
@@ -632,23 +629,14 @@ impl HostFacts {
             .len()
     }
 
-    /// Why these facts refuse every requester connection, if they do: on macOS, their re-read
-    /// kept failing past its grace (`Denied::FactsUnreadable`, naming the failure; review round 3,
-    /// cross-6: for the operator's warnings). Always `None` on other platforms, which keep the last
-    /// good facts.
+    /// Why these facts refuse every requester connection, if they do: their re-read kept failing
+    /// past its grace (`Denied::FactsUnreadable`, naming the failure; review round 3, cross-6: for
+    /// the operator's warnings). On every platform since the Linux application.
     pub fn unreadable_reason(&self) -> Option<&str> {
-        #[cfg(target_os = "macos")]
-        {
-            self.unreadable.as_deref()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
+        self.unreadable.as_deref()
     }
 
-    /// macOS: why these facts may not be judged with, if so (see [`Self::refusing`]).
-    #[cfg(target_os = "macos")]
+    /// Why these facts may not be judged with, if so (see [`Self::refusing`]).
     pub(crate) fn unreadable(&self) -> Option<&str> {
         self.unreadable.as_deref()
     }
@@ -660,9 +648,8 @@ impl HostFacts {
         self.nat64_unsettled
     }
 
-    /// macOS: these facts without the kernel's cached verdicts (a refresh failed: what the kernel
+    /// These facts without the kernel's cached verdicts (a refresh failed: what the kernel
     /// answered for them is asked again).
-    #[cfg(target_os = "macos")]
     pub(crate) fn without_verdicts(&self) -> Self {
         HostFacts {
             verdicts: Arc::default(),
@@ -670,9 +657,8 @@ impl HostFacts {
         }
     }
 
-    /// macOS: these facts, which may no longer be judged with: `why` they could not be read
-    /// again. [`crate::admit`] refuses every destination with them.
-    #[cfg(target_os = "macos")]
+    /// These facts, which may no longer be judged with: `why` they could not be read again.
+    /// [`crate::admit`] refuses every destination with them.
     pub(crate) fn refusing(&self, why: String) -> Self {
         HostFacts {
             unreadable: Some(why),

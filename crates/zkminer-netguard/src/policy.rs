@@ -88,10 +88,9 @@ pub enum Denied {
         hops: u8,
         what: String,
     },
-    /// macOS: this host's facts could not be read again (`why`, naming what failed) and are
-    /// older than [`FACTS_TTL`] and a grace of 2 s: every requester connection is refused
-    /// until they can be read (review round 2, bypass-1).
-    #[cfg(target_os = "macos")]
+    /// This host's facts could not be read again (`why`, naming what failed) and are older than
+    /// [`FACTS_TTL`] and a grace of 2 s: every requester connection is refused until they can be
+    /// read (review round 2, bypass-1; on every platform since the Linux application).
     FactsUnreadable { ip: IpAddr, why: String },
     /// macOS: an IPv6 destination while this host, with IPv6 and no IPv4 route, has just joined a
     /// network whose NAT64 prefix is still being learned ([`crate::nat64`]): an address under
@@ -250,7 +249,6 @@ impl Denied {
                  `[]` if there are none), which the config does not state. Every connection is \
                  refused until it does"
             ),
-            #[cfg(target_os = "macos")]
             Denied::FactsUnreadable { ip, why } => write!(
                 f,
                 "{ip} cannot be judged: this host's network facts (interfaces, routes, DNS \
@@ -292,15 +290,13 @@ impl Denied {
     /// read), rather than on the address alone or the operator's deny CIDRs.
     pub fn depends_on_facts(&self) -> bool {
         #[cfg(target_os = "macos")]
-        if matches!(
-            self,
-            Denied::FactsUnreadable { .. } | Denied::Nat64Unsettled(_)
-        ) {
+        if matches!(self, Denied::Nat64Unsettled(_)) {
             return true;
         }
         matches!(
             self,
-            Denied::OwnAddress(_)
+            Denied::FactsUnreadable { .. }
+                | Denied::OwnAddress(_)
                 | Denied::ConnectedPrefix { .. }
                 | Denied::SitePrefix { .. }
                 | Denied::DnsServer(_)
@@ -356,7 +352,6 @@ fn admit_inner(
     if mode == NetMode::DevPrivate {
         return Ok(());
     }
-    #[cfg(target_os = "macos")]
     if let Some(why) = facts.unreadable() {
         return Err(Denied::FactsUnreadable {
             ip,
@@ -484,16 +479,14 @@ pub const FACTS_TTL: Duration = Duration::from_secs(1);
 /// this: a host that just changed networks is judged on its new facts.
 pub const FORCED_REFRESH_MIN_AGE: Duration = Duration::from_millis(100);
 
-/// macOS: how long after [`FACTS_TTL`] facts whose refresh failed are still judged with (review
-/// round 2, bypass-1): a failure that clears within it (a resolver file being rewritten) refuses
-/// nothing; one that lasts longer refuses every requester connection
-/// ([`Denied::FactsUnreadable`]) until the facts can be read again.
-#[cfg(target_os = "macos")]
+/// How long after [`FACTS_TTL`] facts whose refresh failed are still judged with (review round 2,
+/// bypass-1): a failure that clears within it (a resolver file being rewritten) refuses nothing;
+/// one that lasts longer refuses every requester connection ([`Denied::FactsUnreadable`]) until
+/// the facts can be read again.
 pub const REFRESH_GRACE: Duration = Duration::from_secs(2);
 
-/// macOS: how long a caller that finds the facts being re-read waits for that re-read (review
-/// round 3, 12(b)); a normal re-read takes tens of milliseconds.
-#[cfg(target_os = "macos")]
+/// How long a caller that finds the facts being re-read waits for that re-read (review round 3,
+/// 12(b)); a normal re-read takes tens of milliseconds.
 pub const REFRESH_WAIT: Duration = Duration::from_millis(500);
 
 /// The host facts a policy judges with: gathered and re-read once older than [`FACTS_TTL`] (or
@@ -507,20 +500,17 @@ struct FactsCell {
     warned: std::sync::Mutex<Vec<EgressPath>>,
     /// The configuration gaps last warned about ([`HostFacts::config_gaps`]).
     warned_gaps: std::sync::Mutex<Vec<String>>,
-    /// macOS: held while the facts are re-read (one re-read at a time: review round 2, cross-3),
-    /// with the last re-read's failure, if it failed.
-    #[cfg(target_os = "macos")]
+    /// Held while the facts are re-read (one re-read at a time: review round 2, cross-3), with
+    /// the last re-read's failure, if it failed.
     refreshing: std::sync::Mutex<Option<RefreshFailure>>,
-    /// macOS: when the re-read under way started, if one is (see [`Self::lock_refresh`]).
-    #[cfg(target_os = "macos")]
+    /// When the re-read under way started, if one is (see [`Self::lock_refresh`]).
     refresh_started: std::sync::Mutex<Option<std::time::Instant>>,
-    /// macOS tests: a failure to stage in place of the next re-reads, and their count.
-    #[cfg(all(test, target_os = "macos"))]
+    /// Tests: a failure to stage in place of the next re-reads, and their count.
+    #[cfg(test)]
     seam: RefreshSeam,
 }
 
-/// macOS: the last re-read of the facts failed.
-#[cfg(target_os = "macos")]
+/// The last re-read of the facts failed.
 #[derive(Debug)]
 struct RefreshFailure {
     /// When it was tried.
@@ -529,7 +519,7 @@ struct RefreshFailure {
     why: String,
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct RefreshSeam {
     fail: std::sync::Mutex<Option<String>>,
@@ -542,7 +532,7 @@ impl FactsCell {
         self.get_fresher_than(FACTS_TTL)
     }
 
-    /// macOS: the facts, re-read first if they are older than `max_age` (and the cell refreshes),
+    /// The facts, re-read first if they are older than `max_age` (and the cell refreshes),
     /// one re-read at a time: a caller that finds one under way waits for it and takes its facts.
     /// A re-read that fails (an `/etc/resolver` file that cannot be read, a configuration daemon
     /// that does not answer: review round 2, bypass-1) leaves the last good facts in force,
@@ -550,8 +540,9 @@ impl FactsCell {
     /// that, and until a re-read succeeds, the facts in force refuse every requester connection
     /// ([`Denied::FactsUnreadable`], naming the failure). A failed re-read is tried again on a
     /// later call, at most every [`FORCED_REFRESH_MIN_AGE`]. A caller waits for a re-read under way
-    /// at most [`REFRESH_WAIT`] ([`Self::lock_refresh`]).
-    #[cfg(target_os = "macos")]
+    /// at most [`REFRESH_WAIT`] ([`Self::lock_refresh`]). On every platform since the Linux
+    /// application (before it, Linux kept the last good facts, cached verdicts included, for as
+    /// long as the re-read failed, and every stale caller re-read them itself).
     fn get_fresher_than(&self, max_age: Duration) -> Arc<HostFacts> {
         let read = || {
             self.current
@@ -639,14 +630,13 @@ impl FactsCell {
         refusing
     }
 
-    /// macOS: the re-read lock, waited for until the re-read under way is [`REFRESH_WAIT`] old
+    /// The re-read lock, waited for until the re-read under way is [`REFRESH_WAIT`] old
     /// (review round 3, 12(b)). A re-read that takes longer (a configuration daemon that answers
     /// just within its 2 s, or not at all) holds only the caller that runs it: the others get,
     /// without waiting further, the
     /// facts in force while those are within [`FACTS_TTL`] + [`REFRESH_GRACE`], and after that
     /// those facts made to refuse every requester connection, saying why
     /// ([`Denied::FactsUnreadable`]).
-    #[cfg(target_os = "macos")]
     fn lock_refresh(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, Option<RefreshFailure>>, Arc<HostFacts>> {
@@ -683,8 +673,7 @@ impl FactsCell {
         ))))
     }
 
-    /// macOS: one re-read of the facts (tests stage a failure, a delay, and count them).
-    #[cfg(target_os = "macos")]
+    /// One re-read of the facts (tests stage a failure, a delay, and count them).
     fn gather(&self) -> io::Result<HostFacts> {
         #[cfg(test)]
         {
@@ -697,33 +686,6 @@ impl FactsCell {
             }
         }
         HostFacts::gather_with(&self.options)
-    }
-
-    /// The facts, re-read first if they are older than `max_age` (and the cell refreshes).
-    #[cfg(not(target_os = "macos"))]
-    fn get_fresher_than(&self, max_age: Duration) -> Arc<HostFacts> {
-        let current = self
-            .current
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if !self.refresh || current.gathered_at().elapsed() < max_age {
-            return current;
-        }
-        match HostFacts::gather_with(&self.options) {
-            Ok(fresh) => {
-                let fresh = Arc::new(fresh);
-                self.warn_unknown(&fresh);
-                *self.current.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
-                fresh
-            }
-            Err(e) => {
-                // The last good facts stay in force (an interface read that fails says nothing about
-                // the interfaces), and the next call tries again.
-                tracing::warn!("network guard: re-reading this host's interfaces failed: {e}");
-                current
-            }
-        }
     }
 }
 
@@ -903,11 +865,9 @@ impl NetPolicy {
                 options,
                 warned: std::sync::Mutex::new(Vec::new()),
                 warned_gaps: std::sync::Mutex::new(Vec::new()),
-                #[cfg(target_os = "macos")]
                 refreshing: std::sync::Mutex::new(None),
-                #[cfg(target_os = "macos")]
                 refresh_started: std::sync::Mutex::new(None),
-                #[cfg(all(test, target_os = "macos"))]
+                #[cfg(test)]
                 seam: RefreshSeam::default(),
             }),
             deny: deny.into(),
@@ -1834,13 +1794,12 @@ mod tests {
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());
     }
 
-    /// Review round 2, bypass-1 (macOS): a re-read of the facts that keeps failing (here a
+    /// Review round 2, bypass-1 (every platform since the Linux application): a re-read of the facts that keeps failing (here a
     /// staged `/etc/resolver` error) refuses every requester connection once the facts are older
     /// than `FACTS_TTL` and `REFRESH_GRACE`, naming the failure; within that time the last good
     /// facts are judged with (without their cached kernel verdicts); and once a re-read succeeds
     /// again, connections are admitted again. Before this change the first facts stayed in force
     /// for as long as the failure lasted (`r2-bypass/frozen-facts.log`).
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_failing_refresh_refuses_after_its_grace_and_recovers() {
         use std::time::Instant;
@@ -1909,9 +1868,8 @@ mod tests {
         assert!(p.facts().gathered_at() > start);
     }
 
-    /// Review round 2, cross-3 (macOS): stale facts are re-read once however many callers find
+    /// Review round 2, cross-3 (every platform since the Linux application): stale facts are re-read once however many callers find
     /// them stale at the same time; the others wait for that re-read and take its facts.
-    #[cfg(target_os = "macos")]
     #[test]
     fn stale_facts_are_re_read_once_for_every_caller() {
         use std::sync::atomic::Ordering;
@@ -1939,7 +1897,6 @@ mod tests {
     /// The others wait for it at most [`REFRESH_WAIT`], then judge with the facts in force while
     /// they are within their grace, and are refused at once after it (round 2 held each of them
     /// for the whole re-read, every time).
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_slow_refresh_holds_only_the_caller_that_runs_it() {
         use std::sync::atomic::{AtomicUsize, Ordering};
