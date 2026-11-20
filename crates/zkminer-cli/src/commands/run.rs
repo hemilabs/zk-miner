@@ -2444,8 +2444,9 @@ fn job_tag(job_id: B256) -> u64 {
 
 /// How a lock of ours that is gone ended, for the history (`MinerState::record_finished`), judged
 /// from its record before that is dropped and from the job's view (`status`, `prover`) when read:
-/// fulfilled by us; else gone after its deadline (a keeper slashed it); else released. `None` for a
-/// claim never confirmed ours (it may never have landed).
+/// fulfilled by us; else gone after its recorded deadline (`EndedPastDeadline`: a keeper's slash,
+/// or a release of ours that landed after a forced exit, which the view does not tell apart); else
+/// released. `None` for a claim never confirmed ours (it may never have landed).
 fn lock_end(
     journal: &SharedJournal,
     job_id: B256,
@@ -2462,7 +2463,7 @@ fn lock_end(
     }) {
         Some(MinerJobStatus::Fulfilled { payout: 0 })
     } else if held && past {
-        Some(MinerJobStatus::Slashed { by_us: false })
+        Some(MinerJobStatus::EndedPastDeadline)
     } else if held {
         Some(MinerJobStatus::Released { penalty: 0 })
     } else {
@@ -2483,9 +2484,10 @@ async fn record_lock_ends(
     let mut s = state.write().await;
     for (job_id, end) in ended {
         let (level, what) = match end {
-            MinerJobStatus::Slashed { .. } => (
+            MinerJobStatus::EndedPastDeadline => (
                 LogLevel::Warn,
-                "was slashed after its deadline: its collateral is lost",
+                "ended after its deadline: slashed (its collateral lost), or released by a send \
+                 that landed late",
             ),
             MinerJobStatus::Fulfilled { .. } => (LogLevel::Info, "was fulfilled"),
             _ => (LogLevel::Info, "is no longer locked to this miner"),
@@ -2586,6 +2588,14 @@ fn forget_kept_reason(job_id: B256) {
         .as_mut()
     {
         m.remove(&job_id);
+    }
+    // Kept again later for the same reason (paused, lifted, paused again), it is logged again.
+    if let Some((said, _)) = KEPT_ANNOUNCED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        said.remove(&job_id);
     }
 }
 
@@ -4703,6 +4713,17 @@ pub async fn run(
                     .collect(),
             )
         };
+        // Locks held that nothing works on (`MinerState::kept_locks` without a claimed row): a drain
+        // cannot finish them, so once only they are left it waited out its whole budget for
+        // nothing. They go to the abandon step's re-check at once instead, as at the timeout.
+        let idle_held: std::collections::HashSet<B256> = {
+            let s = state.read().await;
+            s.kept_locks
+                .iter()
+                .map(|j| j.info.job_id)
+                .filter(|id| !s.active_jobs.iter().any(|j| j.info.job_id == *id))
+                .collect()
+        };
         let now_s = zkminer_chain::client::chain_now();
         // "Already past" decisions use the LOWER estimate, and only ABANDON can re-read the live
         // (pause-credited) deadline of an entry that merely LOOKS past.
@@ -4757,6 +4778,14 @@ pub async fn run(
                     outstanding.push(id);
                 }
             }
+        }
+        if !outstanding.is_empty() && outstanding.iter().all(|id| idle_held.contains(id)) {
+            tracing::warn!(
+                "drain: only {} lock(s) nothing is working on remain — to the abandon step",
+                outstanding.len()
+            );
+            abandoned = true;
+            break;
         }
         // A stale zero-deadline breadcrumb has no lifecycle behind it and is INVISIBLE to the
         // nearest-deadline cut below (which filters `d > now_s`), so it must never leave by the
@@ -5849,15 +5878,11 @@ const OBSERVED_THROUGHPUT_WEIGHT: f64 = 0.3;
 fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration) {
     let backend = slot.split(':').next().unwrap_or(slot);
     let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(slot);
-    let fixed = zkminer_prover::benchmark::load_cached_benchmark()
-        .and_then(|suite| {
-            let row = suite
-                .device_benchmarks
-                .iter()
-                .find(|d| d.device_id == device && d.prover_backend == backend)
-                .cloned();
-            card_fixed_secs(backend, row.as_ref())
-        })
+    let fixed = CARD_FIXED_SECS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(device, backend.to_string())).copied())
         .unwrap_or(0.0);
     let stark = duration
         .saturating_sub(Duration::from_secs_f64(fixed))
@@ -6268,6 +6293,12 @@ fn retry_pin_after(
     }
 }
 
+/// Each card's fixed seconds by `(device id, backend)` (`card_fixed_secs`), noted where the benchmark
+/// is loaded for the estimates (`slot_estimates_for`, off the async runtime), for
+/// `note_observed_throughput`, which runs on it after every proof and must not load the file.
+static CARD_FIXED_SECS: std::sync::Mutex<Option<HashMap<(String, String), f64>>> =
+    std::sync::Mutex::new(None);
+
 /// Seconds an SP1 proof spends before its first shard: the server's setup for the program.
 const SP1_PROOF_SETUP_SECS: f64 = 15.0;
 
@@ -6308,9 +6339,9 @@ fn card_estimate_secs(
     let positive = |r: &f64| r.is_finite() && *r > 0.0;
     let fixed = card_fixed_secs(backend, row);
     let secs = if let Some(rate) = observed.filter(positive) {
-        // The guest's execute too: a job's own (its measurement says how slow) is not the average
-        // the observed rate holds.
-        cycles as f64 / rate + fixed.unwrap_or(0.0) + execute as f64
+        // The observed rate holds a proof's execute at the average: a third of the allowance (which
+        // is three times this job's measured execute) on top, for a guest slower than its cycles.
+        cycles as f64 / rate + fixed.unwrap_or(0.0) + execute as f64 / 3.0
     } else {
         let row = row?;
         let stark = row
@@ -6354,6 +6385,13 @@ async fn slot_estimates_for(
                         .iter()
                         .find(|d| d.device_id == device && d.prover_backend == backend)
                 });
+                if let Some(fixed) = card_fixed_secs(backend, row) {
+                    CARD_FIXED_SECS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(HashMap::new)
+                        .insert((device.clone(), backend.to_string()), fixed);
+                }
                 let secs = card_estimate_secs(backend, cycles, execute, rate, row)?;
                 Some((key, Duration::from_secs_f64(secs)))
             })
@@ -6881,6 +6919,11 @@ async fn miner_brain(
     // (with no collateral: theirs is already in the on-chain figures).
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<B256>();
     let mut in_flight: HashMap<B256, u128> = HashMap::new();
+    // Each claimed job's last row, for the held locks' rows (`refresh_kept_locks`).
+    let mut kept_rows: HashMap<B256, zkminer_tui::state::TrackedJob> = HashMap::new();
+    // The journal's locks listed before the startup recovery pass, so one it finds gone (slashed
+    // while the miner was down) has a row to move to the history (`record_lock_ends`).
+    refresh_kept_locks(&state, &journal, &in_flight, &mut kept_rows).await;
     // The jobs in `in_flight` known to be of a backend other than risc0, so the rest can be held to
     // the risc0 cards (see `risc0_bypass_room`). Pruned to `in_flight` each tick; a job of unknown backend (a
     // recovered lock) counts as risc0, the safe direction.
@@ -7122,8 +7165,6 @@ async fn miner_brain(
     }
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
-    // Each claimed job's last row, for the held locks' rows (`refresh_kept_locks`).
-    let mut kept_rows: HashMap<B256, zkminer_tui::state::TrackedJob> = HashMap::new();
     if !initial_queue_horizon.is_zero() {
         tracing::info!(
             "queue look-ahead: up to {}s of work queued per GPU (deadline-checked from the \
@@ -7902,7 +7943,8 @@ async fn miner_brain(
                     if planner_active {
                         format!("{claim_ceiling}: 3 x max_concurrent_proofs")
                     } else {
-                        format!("max_concurrent_proofs = {claim_ceiling}")
+                        // Its value in effect: 0 in the config means one per GPU.
+                        format!("max_concurrent_proofs, in effect {claim_ceiling}")
                     }
                 ),
                 &mut last_claim_summary,
@@ -11055,12 +11097,12 @@ fn spawn_lifecycle_task(
                     jid,
                     format!("kept ({}); the recovery pass takes it up again", h.0),
                 );
-                let mut s = state.write().await;
-                s.active_jobs.retain(|j| j.info.job_id != jid);
-                s.add_log(
-                    zkminer_tui::state::LogLevel::Warn,
-                    format!("Job {} kept: {}", short_id(jid), h.0),
-                );
+                // The activity log says why at the next tick (`note_kept_reason`).
+                state
+                    .write()
+                    .await
+                    .active_jobs
+                    .retain(|j| j.info.job_id != jid);
                 request_recovery();
                 return;
             }
@@ -15148,8 +15190,8 @@ async fn release_and_clean_with_nonce(
                 client.address,
             );
             let why = match &ended {
-                Some(MinerJobStatus::Slashed { .. }) => {
-                    "slashed after its deadline: its collateral is lost"
+                Some(MinerJobStatus::EndedPastDeadline) => {
+                    "ended after its deadline (slashed, or a late release)"
                 }
                 Some(MinerJobStatus::Fulfilled { .. }) => "fulfilled",
                 _ if not_ours => {
@@ -15175,7 +15217,7 @@ async fn release_and_clean_with_nonce(
                 client.abort_nonce(n);
             }
             let mut s = state.write().await;
-            let slashed = matches!(ended, Some(MinerJobStatus::Slashed { .. }));
+            let slashed = matches!(ended, Some(MinerJobStatus::EndedPastDeadline));
             if let Some(ended) = ended {
                 s.record_finished(job_id, ended);
             }
@@ -15632,13 +15674,19 @@ async fn recover_claimed_jobs(
                     jid
                 );
                 journal_update(journal, |j| j.mark_claimed(*jid, None, d));
-            } else if d != 0 {
+            } else {
                 // Backfill the authoritative (pause-credited) deadline onto an EXISTING breadcrumb
                 // too: every shutdown decision keys off it. Field-level write, not `mark_claimed`:
-                // that would regress a Proving/Fulfilling entry's state back to Claimed.
+                // that would regress a Proving/Fulfilling entry's state back to Claimed. A claim
+                // never confirmed is confirmed now: this view proves the lock ours.
                 journal_update(journal, |j| {
                     if let Some(e) = j.entries.get_mut(jid) {
-                        e.lock_deadline = d;
+                        if d != 0 {
+                            e.lock_deadline = d;
+                        }
+                        if e.state == crate::journal::JournalState::Claiming {
+                            e.state = crate::journal::JournalState::Claimed;
+                        }
                     }
                 });
             }
@@ -15836,6 +15884,14 @@ async fn recover_claimed_jobs(
             );
             journal_update(journal, |j| j.mark_claimed(jid, None, lock_deadline));
         }
+        // Ours and Locked, read just now: a claim never confirmed is confirmed (see the batch arm).
+        journal_update(journal, |j| {
+            if let Some(e) = j.entries.get_mut(&jid) {
+                if e.state == crate::journal::JournalState::Claiming {
+                    e.state = crate::journal::JournalState::Claimed;
+                }
+            }
+        });
         journal_update(journal, |j| j.note_lock_seen(jid, None, view.reopenCount));
         // A lock KEPT through this pause after its lifecycle failed: re-driving it now would repeat
         // the failure (the fulfil cannot land until the lift) and releasing would burn the penalty

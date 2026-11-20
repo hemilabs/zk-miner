@@ -65,10 +65,30 @@ pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
             .count(),
         ..HeldJobs::default()
     };
-    for job in &state.active_jobs {
-        match job.status {
+    // Held locks nothing works on count as queued ones do for the penalty and the keep (Abandon and
+    // Keep locks act on them too), but as `held_idle`, not `proving`.
+    let idle = state.kept_locks.iter().filter(|k| {
+        !state
+            .active_jobs
+            .iter()
+            .any(|j| j.info.job_id == k.info.job_id)
+    });
+    for (job, is_idle) in state
+        .active_jobs
+        .iter()
+        .map(|j| (j, false))
+        .chain(idle.map(|j| (j, true)))
+    {
+        let status = if is_idle {
+            &MinerJobStatus::Queued
+        } else {
+            &job.status
+        };
+        match status {
             MinerJobStatus::Queued | MinerJobStatus::Proving { .. } => {
-                held.proving += 1;
+                if !is_idle {
+                    held.proving += 1;
+                }
                 // Both known, or the 5% floor would understate it (the penalty scales up to 30%
                 // with the time left in the fulfilment window).
                 if job.info.locked_collateral > 0 && job.info.fulfillment_timeout > 0 {
@@ -91,7 +111,7 @@ pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
             _ => continue,
         }
         if matches!(
-            job.status,
+            status,
             MinerJobStatus::Queued | MinerJobStatus::Proving { .. }
         ) && job.info.lock_deadline > now
             && state.keep_horizon_secs > 0
@@ -129,7 +149,7 @@ fn fmt_penalty(held: &HeldJobs) -> String {
     let known = zkminer_chain::staking::fmt_hemi_ceil(held.release_penalty);
     match held.penalty_unknown {
         0 => format!("≈ {known} HEMI"),
-        n if n == held.proving => "5-30% of each lock's collateral".to_string(),
+        n if n == held.proving + held.held_idle => "5-30% of each lock's collateral".to_string(),
         n => format!("≈ {known} HEMI + 5-30% of {n} more lock(s)"),
     }
 }
@@ -312,9 +332,16 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
                 Line::from(""),
                 key_line(
                     "d",
-                    "Drain: finish them, get paid, then exit (as long as the proofs take; after \
-                     ~50 min whatever is left is released, at a penalty)"
-                        .into(),
+                    if held.proving + held.submitting == 0 {
+                        // Nothing to finish: a drain hands held locks to the release step at once.
+                        "Drain: nothing is being proven; the held locks are released (a penalty), \
+                         or kept where they cannot be, then exit"
+                            .into()
+                    } else {
+                        "Drain: finish them, get paid, then exit (as long as the proofs take; \
+                         after ~50 min whatever is left is released, at a penalty)"
+                            .into()
+                    },
                 ),
                 key_line(
                     "k",
@@ -324,7 +351,7 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
                     ),
                 ),
             ];
-            if held.proving > 0 {
+            if held.proving + held.held_idle > 0 {
                 lines.push(key_line(
                     "a",
                     format!("Abandon: release them now, penalty {}", fmt_penalty(&held)),
@@ -337,7 +364,7 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
             " Abandon? ",
             vec![Line::from(format!(
                 " Release {} job(s) now, penalty {}? Proofs being submitted are left to finish.",
-                held.proving,
+                held.proving + held.held_idle,
                 fmt_penalty(&held)
             ))],
         ),
@@ -347,7 +374,7 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
                 " Stop claiming and exit within minutes, leaving {} lock(s) for the next start\
                  {restart_by}{too_close}? A lock nobody finishes or releases before its deadline \
                  is slashed.",
-                held.proving.saturating_sub(held.too_close_to_keep)
+                (held.proving + held.held_idle).saturating_sub(held.too_close_to_keep)
             ))],
         ),
         StopPrompt::Confirm(StopMode::Force) => (

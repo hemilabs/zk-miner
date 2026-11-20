@@ -331,9 +331,12 @@ pub enum MinerJobStatus {
     Fulfilled { payout: u128 },
     /// Job was released.
     Released { penalty: u128 },
-    /// The lock ran past its deadline and was slashed: by this miner (`by_us`, the keeper share
-    /// coming back to it) or by a keeper. Its collateral is lost.
+    /// The lock ran past its deadline and this miner slashed it itself (`by_us`; the keeper share
+    /// comes back to it). Its collateral is lost.
     Slashed { by_us: bool },
+    /// The lock was found gone after its deadline: a keeper's slash, or a release of ours that
+    /// landed late; the job's state does not tell which.
+    EndedPastDeadline,
     /// Job evaluation resulted in skip.
     Skipped { reason: String },
 }
