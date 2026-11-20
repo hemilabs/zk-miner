@@ -132,6 +132,9 @@ pub(crate) fn printable(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod floor_tests;
 
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests;
+
 #[cfg(test)]
 mod tests {
     #[test]
