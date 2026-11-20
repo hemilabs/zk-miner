@@ -1971,6 +1971,12 @@ const SP1_ALLOC_CACHE_MB_ENV: &str = "SP1_GPU_ALLOC_CACHE_MB";
 /// shard size, `zkop-mix` included, with nothing failed or retried.
 const ALCHEMIST_SP1_ALLOC_CACHE_MB: u64 = 4096;
 
+/// Whether `key` is a slot on an Intel card, whose kernels are compiled for it on first use (see
+/// `WorkerPool::ensure_warmed`).
+fn is_intel_slot(key: &str) -> bool {
+    key.split(':').nth(1) == Some("intel")
+}
+
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
 /// Groth16 component 2.3 GB.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -3598,59 +3604,118 @@ impl WorkerPool {
 
     /// Runs `backend`'s one-time setup on one of its workers and records the backend as warmed:
     /// for SP1, installing the Groth16 circuit artifacts and, where its server supports it,
-    /// building the stripped circuit. Takes a host-memory reservation for it, and kills the worker
-    /// if it runs past `timeout`. Returns what was done.
+    /// building the stripped circuit. Then warms each of its other Intel cards, whose kernels are
+    /// compiled per card (see `ensure_warmed`), so none does it inside its first claimed proof; one
+    /// that fails is warmed before its first proof instead. Takes a host-memory reservation for it,
+    /// and kills the worker if it runs past `timeout`. Returns what was done.
     pub fn warm_up(&self, backend: &str, timeout: Duration) -> Result<String> {
         let mut keys = self.keys_for_prefix(backend);
         keys.sort();
         let key = keys
             .first()
             .ok_or_else(|| anyhow::anyhow!("no {backend} worker to warm up"))?;
-        let summary = self.warm_up_slot(key, timeout)?;
-        self.warmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(backend.to_string());
+        let summary = self.warm_up_slot(key, timeout, None, false)?;
+        self.mark_warmed(key);
+        for other in keys.iter().skip(1).filter(|k| is_intel_slot(k)) {
+            if self.slot_warmed(other) {
+                continue;
+            }
+            match self.warm_up_slot(other, timeout, None, true) {
+                Ok(done) => {
+                    self.mark_warmed(other);
+                    tracing::info!("{other} warmed up: {done}");
+                }
+                Err(e) => tracing::warn!(
+                    "{other}: its warm-up failed, so it warms up before its first proof instead: {e:#}"
+                ),
+            }
+        }
         Ok(summary)
+    }
+
+    /// Whether `key` is ready for a proof: its backend warmed (see `backend_warmed`) and, on an Intel
+    /// card, the card itself (see `ensure_warmed`).
+    fn slot_warmed(&self, key: &str) -> bool {
+        let backend = key.split(':').next().unwrap_or(key);
+        self.backend_warmed(backend)
+            && (!is_intel_slot(key)
+                || self
+                    .warmed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(key))
+    }
+
+    /// Records a warm-up on `key`: its backend, and the card for an Intel one. Before, the startup
+    /// warm-up recorded only the backend, so an Intel card warmed up again inside its first claimed
+    /// proof on every start that ran no benchmark.
+    fn mark_warmed(&self, key: &str) {
+        let backend = key.split(':').next().unwrap_or(key);
+        let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+        warmed.insert(backend.to_string());
+        if is_intel_slot(key) {
+            warmed.insert(key.to_string());
+        }
     }
 
     /// Warms `key` up first if it needs it, for a path that would otherwise do the setup inside its
     /// own watchdog: SP1's backend (a benchmark proves Groth16 too), and each Intel card, whose SYCL
     /// kernels are compiled for the device on first use (about 8 minutes on an Arc B580, longer than
     /// a benchmark's whole budget) and cached on disk for every later process.
-    fn ensure_warmed(&self, key: &str) -> Result<()> {
-        let backend = key.split(':').next().unwrap_or(key);
-        let intel = key.split(':').nth(1) == Some("intel");
-        let backend_ready = self.backend_warmed(backend);
-        let slot_ready = !intel
-            || self
-                .warmed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(key);
-        if backend_ready && slot_ready {
+    ///
+    /// `abort_at` is a claimed proof's deadline: a warm-up inside one (an Intel card whose startup
+    /// warm-up failed or has not finished) stops where the proof could no longer start (see
+    /// `acquire_gpu_guard`), not at `WARMUP_TIMEOUT`, as does its wait for the card.
+    fn ensure_warmed(&self, key: &str, abort_at: Option<Instant>) -> Result<()> {
+        if self.slot_warmed(key) {
             return Ok(());
         }
-        let summary = self.warm_up_slot(key, WARMUP_TIMEOUT)?;
-        {
-            let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
-            warmed.insert(backend.to_string());
-            if intel {
-                warmed.insert(key.to_string());
+        let deadline = |detail: String| {
+            anyhow::Error::new(zkminer_prover_protocol::types::ProofDeadlineReached { detail })
+        };
+        let give_up_at = abort_at.map(|at| at.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(at));
+        let timeout = match give_up_at {
+            None => WARMUP_TIMEOUT,
+            Some(at) => match at.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => left.min(WARMUP_TIMEOUT),
+                _ => {
+                    return Err(deadline(format!(
+                        "{key} has not warmed up, and too little of the job's time is left for it"
+                    )))
+                }
+            },
+        };
+        let summary = match self.warm_up_slot(key, timeout, abort_at, true) {
+            Ok(summary) => summary,
+            Err(e) if give_up_at.is_some_and(|at| Instant::now() >= at) => {
+                return Err(deadline(format!(
+                    "{key}'s warm-up ran to the job's deadline: {e:#}"
+                )))
             }
-        }
+            Err(e) => return Err(e),
+        };
+        self.mark_warmed(key);
         tracing::info!("{key} warmed up: {summary}");
         Ok(())
     }
 
-    fn warm_up_slot(&self, key: &str, timeout: Duration) -> Result<String> {
+    /// Warms `key` up. `if_cold`: not if it was warmed while this waited for its card (the startup
+    /// warm-up, or another proof's); an explicit warm-up (`warm_up`) always runs.
+    fn warm_up_slot(
+        &self,
+        key: &str,
+        timeout: Duration,
+        abort_at: Option<Instant>,
+        if_cold: bool,
+    ) -> Result<String> {
         let backend = key.split(':').next().unwrap_or(key);
         // An Intel card's warm-up is a proof (see `ensure_warmed`), so it takes the card's guard like
         // any other work on it.
-        let gpu_lock = (key.split(':').nth(1) == Some("intel"))
-            .then(|| self.gpu_lock_for(key))
-            .flatten();
-        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, Some(timeout))?;
+        let gpu_lock = is_intel_slot(key).then(|| self.gpu_lock_for(key)).flatten();
+        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, Some(timeout))?;
+        if if_cold && self.slot_warmed(key) {
+            return Ok("already warmed up".to_string());
+        }
         let entry = self
             .workers
             .get(key)
@@ -3907,7 +3972,7 @@ impl WorkerPool {
 
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
-        self.ensure_warmed(key)?;
+        self.ensure_warmed(key, None)?;
 
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
@@ -4282,7 +4347,7 @@ impl WorkerPool {
         on_progress: &dyn Fn(BenchmarkProgressEvent),
     ) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
-        self.ensure_warmed(key)?;
+        self.ensure_warmed(key, None)?;
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
         // the SAME physical card, each side's VRAM invisible to the other — the double-booking the
@@ -7733,9 +7798,10 @@ impl WorkerPool {
         };
 
         // A card whose kernels are compiled on first use (Intel) is warmed up before its first proof,
-        // outside this proof's watchdog; a no-op for every other slot and for a warmed one.
-        if key.split(':').nth(1) == Some("intel") {
-            self.ensure_warmed(key)?;
+        // outside this proof's watchdog but inside its deadline; a no-op for every other slot and for
+        // a warmed one (the startup warm-up warms every Intel card; see `warm_up`).
+        if is_intel_slot(key) {
+            self.ensure_warmed(key, abort_at)?;
         }
 
         // Per-physical-GPU guard (see `gpu_locks`): serialize proofs across different
