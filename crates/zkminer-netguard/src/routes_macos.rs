@@ -714,14 +714,21 @@ fn socket_interfaces(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<Vec<u
         return Ok(None);
     };
     let src = sock.local_addr()?.ip();
-    let mut v: Vec<u32> = address_interfaces()?
-        .into_iter()
+    Ok(Some(interfaces_holding(&address_interfaces()?, src)))
+}
+
+/// Every interface of `addresses` (address, interface index) that holds `src`, sorted, each
+/// once: all of them, not the first (an address on two interfaces is on both: review round 1,
+/// #12; round 3, cross-3).
+fn interfaces_holding(addresses: &[(IpAddr, u32)], src: IpAddr) -> Vec<u32> {
+    let mut v: Vec<u32> = addresses
+        .iter()
         .filter(|(a, _)| *a == src)
-        .map(|(_, i)| i)
+        .map(|(_, i)| *i)
         .collect();
     v.sort();
     v.dedup();
-    Ok(Some(v))
+    v
 }
 
 /// How the kernel would route a connection from this process to `dst` (see the module doc).
@@ -1297,6 +1304,35 @@ mod tests {
                 entry: vec![half]
             }
         );
+    }
+
+    /// Review round 3, cross-3 (mutant X41): the interfaces holding the socket's source address
+    /// are every one that holds it, each once; with [`decide`], a source on the route's interface
+    /// and on another one is a split answer.
+    #[test]
+    fn every_interface_holding_the_source_counts() {
+        let src = ip("192.0.2.7");
+        let addrs = [
+            (ip("192.0.2.9"), 4),
+            (src, 9),
+            (ip("fe80::1"), 4),
+            (src, 4),
+            (src, 9),
+        ];
+        assert_eq!(interfaces_holding(&addrs, src), vec![4, 9]);
+        assert_eq!(interfaces_holding(&addrs, ip("192.0.2.9")), vec![4]);
+        assert!(interfaces_holding(&addrs, ip("192.0.2.8")).is_empty());
+        let r = answer("8.8.4.4").unwrap();
+        let both = interfaces_holding(&[(src, r.ifindex), (src, r.ifindex + 1)], src);
+        assert!(matches!(
+            decide(Some(r), || Ok(Some(both))).unwrap(),
+            KernelAnswer::Split { .. }
+        ));
+        let alone = interfaces_holding(&[(src, r.ifindex)], src);
+        assert!(matches!(
+            decide(Some(r), || Ok(Some(alone))).unwrap(),
+            KernelAnswer::Entry(_)
+        ));
     }
 
     /// parse-1 (c): queries are asked as `RTM_GET_SILENT` on this kernel, so another routing
