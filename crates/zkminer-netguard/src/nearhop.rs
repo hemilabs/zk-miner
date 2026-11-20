@@ -296,6 +296,7 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
 /// the module doc).
 #[cfg(target_os = "macos")]
 fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
+    let addr = unmapped(addr);
     let sock = new_socket(addr)?;
     set_hops(&sock, addr, hops)?;
     sock.set_nonblocking(true)?;
@@ -308,6 +309,23 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let _ = sock.set_linger(Some(Duration::ZERO));
     drop(sock);
     r
+}
+
+/// macOS: an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as its IPv4 address, which is what a
+/// connection to it reaches. An IPv6 socket connected to a mapped address sends IPv4 packets, and
+/// `IPV6_UNICAST_HOPS` does not limit them (they leave with the default TTL, so the probe of a
+/// far host connects and reads it as near: `r2-probe/mapped.log`); an IPv4 socket with `IP_TTL`
+/// set limits them. Review round 2, probe-2 ([`crate::NetPolicy::vet_connection`] already
+/// unmaps before it asks; the probe and the check connection no longer rely on it).
+#[cfg(target_os = "macos")]
+fn unmapped(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(a) => match a.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), a.port()),
+            None => addr,
+        },
+        v4 => v4,
+    }
 }
 
 /// macOS: an error `connect` reported before the connection was in progress. An unreachable
@@ -442,12 +460,14 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
 
 /// The check connection (see the module doc). macOS: the FIN's fate is read from
 /// `TCP_CONNECTION_INFO` (<netinet/tcp.h>, the public counterpart of Linux's `TCP_INFO`; its
-/// states are <netinet/tcp_fsm.h>'s). macOS keeps an ICMP "time exceeded" for the FIN as a soft
-/// error it never reports (`SO_ERROR` stays 0), so a far peer is found only by the deadline
-/// passing: the same verdict as on Linux, without Linux's early answer.
+/// states are <netinet/tcp_fsm.h>'s), as [`fin_step`] and [`fin_at_deadline`] read it. macOS
+/// keeps an ICMP "time exceeded" for the FIN as a soft error it never reports (`SO_ERROR` stays
+/// 0), so a far peer is found only by the deadline passing: the same verdict as on Linux, without
+/// Linux's early answer.
 #[cfg(target_os = "macos")]
 fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
     use std::os::fd::AsRawFd;
+    let addr = unmapped(addr);
     let sock = match new_socket(addr) {
         Ok(s) => s,
         Err(e) => return ConfirmOutcome::Failed(e.to_string()),
@@ -463,6 +483,11 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     }
     let fd = sock.as_raw_fd();
     let rtt = match connection_info(fd) {
+        // The peer closed or reset the connection before the FIN was sent: what follows could
+        // not tell whether the FIN reached it (review round 2, probe-1).
+        Ok(i) if i.state != TCPS_ESTABLISHED => {
+            return ConfirmOutcome::Failed(peer_closed_first(i.state))
+        }
         // Milliseconds; the smoothed round trip, or the last one before there is one.
         Ok(i) => Duration::from_millis(u64::from(i.srtt_ms.max(i.rttcur_ms))),
         Err(e) => return ConfirmOutcome::Failed(e.to_string()),
@@ -475,18 +500,81 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     let wait = (rtt * 4 + Duration::from_millis(250))
         .clamp(Duration::from_millis(300), Duration::from_millis(1500));
     let deadline = std::time::Instant::now() + wait;
-    const TCPS_FIN_WAIT_1: u8 = 6;
     loop {
-        match connection_info(fd) {
-            // FIN_WAIT_2, CLOSING, TIME_WAIT, CLOSED: the FIN was acknowledged, or the peer reset.
-            Ok(i) if i.state != TCPS_FIN_WAIT_1 => return ConfirmOutcome::Answered,
-            Ok(_) => {}
+        let state = match connection_info(fd) {
+            Ok(i) => i.state,
             Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+        };
+        if let Some(done) = fin_step(state) {
+            return done;
         }
         if std::time::Instant::now() >= deadline {
-            return ConfirmOutcome::Unanswered;
+            return fin_at_deadline(state);
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// TCP states (<netinet/tcp_fsm.h>).
+#[cfg(target_os = "macos")]
+const TCPS_CLOSED: u8 = 0;
+#[cfg(target_os = "macos")]
+const TCPS_ESTABLISHED: u8 = 4;
+#[cfg(target_os = "macos")]
+const TCPS_CLOSE_WAIT: u8 = 5;
+#[cfg(target_os = "macos")]
+const TCPS_FIN_WAIT_1: u8 = 6;
+#[cfg(target_os = "macos")]
+const TCPS_CLOSING: u8 = 7;
+#[cfg(target_os = "macos")]
+const TCPS_LAST_ACK: u8 = 8;
+#[cfg(target_os = "macos")]
+const TCPS_FIN_WAIT_2: u8 = 9;
+#[cfg(target_os = "macos")]
+const TCPS_TIME_WAIT: u8 = 10;
+
+/// macOS: why the check fails when the peer closed (`CLOSE_WAIT`, then `LAST_ACK` once this side
+/// sends its FIN) or reset (`CLOSED`) the connection before its FIN was acknowledged.
+#[cfg(target_os = "macos")]
+fn peer_closed_first(state: u8) -> String {
+    let how = match state {
+        TCPS_CLOSE_WAIT | TCPS_LAST_ACK => "closed",
+        TCPS_CLOSED => "reset",
+        _ => return format!("the check connection is in TCP state {state}"),
+    };
+    format!(
+        "the peer {how} the check connection before its hop-limited FIN was acknowledged, so \
+         the check cannot tell how near it is"
+    )
+}
+
+/// macOS: what the check connection's state, polled after its FIN was sent, decides (review
+/// round 2, probe-1): `FIN_WAIT_2` or `TIME_WAIT` (only reached once the FIN was acknowledged;
+/// `TIME_WAIT` also from `CLOSING`) is an answer, near; `FIN_WAIT_1` (the FIN not yet
+/// acknowledged) and `CLOSING` (the peer's FIN crossed this side's, which is still not
+/// acknowledged) decide nothing yet; a peer that closed or reset the connection on its own
+/// (`LAST_ACK`, `CLOSE_WAIT`, `CLOSED`: no acknowledgement of the FIN) is a failure, refused but
+/// not read as near, and never as far.
+#[cfg(target_os = "macos")]
+fn fin_step(state: u8) -> Option<ConfirmOutcome> {
+    match state {
+        TCPS_FIN_WAIT_2 | TCPS_TIME_WAIT => Some(ConfirmOutcome::Answered),
+        TCPS_FIN_WAIT_1 | TCPS_CLOSING => None,
+        other => Some(ConfirmOutcome::Failed(peer_closed_first(other))),
+    }
+}
+
+/// macOS: the check connection's state when its deadline passes: still `FIN_WAIT_1` (the FIN
+/// unacknowledged, the peer silent) is far; `CLOSING` (the peer closed on its own while the FIN
+/// went unacknowledged) is a failure, never far.
+#[cfg(target_os = "macos")]
+fn fin_at_deadline(state: u8) -> ConfirmOutcome {
+    match state {
+        TCPS_FIN_WAIT_1 => ConfirmOutcome::Unanswered,
+        other => ConfirmOutcome::Failed(peer_closed_first(match other {
+            TCPS_CLOSING => TCPS_LAST_ACK,
+            o => o,
+        })),
     }
 }
 
@@ -825,6 +913,127 @@ mod tests {
         match TtlProbe.confirm(addr, 2, Duration::from_secs(5)) {
             ConfirmOutcome::ConnectFailed(e) => eprintln!("SKIPPED: {addr} unreachable here: {e}"),
             other => assert_eq!(other, ConfirmOutcome::Unanswered),
+        }
+    }
+
+    /// probe-1: macOS reads only an acknowledgement of the check's FIN as an answer. A peer that
+    /// closed or reset the connection on its own is a failure (refused), never near by mistake
+    /// and never far; a FIN still unacknowledged at the deadline is far only if the peer stayed
+    /// silent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_check_reads_only_an_acknowledged_fin_as_an_answer_on_macos() {
+        assert_eq!(fin_step(TCPS_FIN_WAIT_2), Some(ConfirmOutcome::Answered));
+        assert_eq!(fin_step(TCPS_TIME_WAIT), Some(ConfirmOutcome::Answered));
+        assert_eq!(fin_step(TCPS_FIN_WAIT_1), None);
+        assert_eq!(fin_step(TCPS_CLOSING), None);
+        for (state, how) in [
+            (TCPS_LAST_ACK, "closed"),
+            (TCPS_CLOSE_WAIT, "closed"),
+            (TCPS_CLOSED, "reset"),
+            (TCPS_ESTABLISHED, "TCP state 4"),
+        ] {
+            let o = fin_step(state);
+            assert!(
+                matches!(&o, Some(ConfirmOutcome::Failed(w)) if w.contains(how)),
+                "{state}: {o:?}"
+            );
+            assert!(matches!(o.unwrap().verdict(), Verdict::Failed(_)));
+        }
+        assert_eq!(fin_at_deadline(TCPS_FIN_WAIT_1), ConfirmOutcome::Unanswered);
+        let o = fin_at_deadline(TCPS_CLOSING);
+        assert!(
+            matches!(&o, ConfirmOutcome::Failed(w) if w.contains("closed")),
+            "{o:?}"
+        );
+        assert!(matches!(peer_closed_first(TCPS_CLOSE_WAIT), w if w.contains("closed")));
+    }
+
+    /// probe-1, live: a loopback peer that closes, or resets, each connection as soon as it
+    /// accepts it is never found far, and is refused either way (near when the FIN was
+    /// acknowledged before the peer's close, a failure when the peer closed first). And a far
+    /// public peer that closes each connection at once (a NIST daytime server, port 13): its FIN
+    /// crosses the check's, which dies two hops out; the check is a failure, refused but not
+    /// near (before this change it was read as near). Skipped where that server is unreachable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peer_that_closes_first_is_never_far_on_macos() {
+        for (bind, reset) in [
+            ("127.0.0.1:0", false),
+            ("127.0.0.1:0", true),
+            ("[::1]:0", false),
+        ] {
+            let Ok(l) = std::net::TcpListener::bind(bind) else {
+                eprintln!("SKIPPED: no {bind} here");
+                continue;
+            };
+            let addr = l.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                for _ in 0..5 {
+                    let Ok((c, _)) = l.accept() else { return };
+                    if reset {
+                        let _ = socket2::SockRef::from(&c).set_linger(Some(Duration::ZERO));
+                    }
+                    drop(c);
+                }
+            });
+            for _ in 0..5 {
+                let o = TtlProbe.confirm(addr, 2, Duration::from_secs(5));
+                eprintln!("{addr} (reset {reset}): {o:?}");
+                // Near when the FIN was acknowledged before the peer's close, a failure when the
+                // peer closed first (or, under load, the connection was refused): never far.
+                assert_ne!(o, ConfirmOutcome::Unanswered, "{addr}");
+                assert_ne!(o.verdict(), Verdict::Far, "{addr}: {o:?}");
+            }
+            server.join().unwrap();
+        }
+        let far: SocketAddr = "129.6.15.28:13".parse().unwrap();
+        let o = TtlProbe.confirm(far, 2, Duration::from_secs(5));
+        eprintln!("{far}, hop limit 2: {o:?}");
+        match o {
+            ConfirmOutcome::ConnectFailed(e) => eprintln!("SKIPPED: {far} unreachable here: {e}"),
+            o => assert!(
+                matches!(&o, ConfirmOutcome::Failed(w) if w.contains("closed")),
+                "{far}: {o:?}"
+            ),
+        }
+    }
+
+    /// probe-2: the probe and the check connection connect to an IPv4-mapped address as its
+    /// IPv4 address, so the hop limit holds (an IPv6 socket's hop limit does not limit the IPv4
+    /// packets a mapped connection sends: the probe of a far host connected). Skipped where
+    /// 1.1.1.1 is unreachable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mapped_address_is_probed_as_its_ipv4_address_on_macos() {
+        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:1.1.1.1]:443".parse().unwrap();
+        assert_eq!(unmapped(mapped), v4);
+        assert_eq!(unmapped(v4), v4);
+        let v6: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        assert_eq!(unmapped(v6), v6);
+        // A listener on 127.0.0.1 is still reached through its mapped address.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local: SocketAddr = format!("[::ffff:127.0.0.1]:{}", l.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        assert_eq!(
+            TtlProbe.probe(local, 2, PROBE_TIMEOUT),
+            ProbeOutcome::Connected
+        );
+        drop(l);
+        if TtlProbe.probe(v4, 64, PROBE_TIMEOUT) != ProbeOutcome::Connected {
+            eprintln!("SKIPPED: {v4} unreachable here");
+            return;
+        }
+        for _ in 0..3 {
+            let o = TtlProbe.probe(mapped, 2, PROBE_TIMEOUT);
+            eprintln!("{mapped}, hop limit 2: {o:?}");
+            assert_ne!(o, ProbeOutcome::Connected, "the hop limit did not hold");
+        }
+        match TtlProbe.confirm(mapped, 2, Duration::from_secs(5)) {
+            ConfirmOutcome::ConnectFailed(e) => eprintln!("SKIPPED the check connection: {e}"),
+            c => assert_eq!(c, ConfirmOutcome::Unanswered, "{c:?}"),
         }
     }
 }
