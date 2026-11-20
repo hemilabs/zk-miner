@@ -224,7 +224,7 @@ fn neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused() {
             "{global_prefixes} global connected prefixes, no neighbour"
         );
     } else {
-        eprintln!("SKIPPED the global neighbours: no global connected prefix here");
+        crate::skipped("the global neighbours: no global connected prefix (IPv6) here");
     }
 }
 
@@ -338,7 +338,7 @@ fn this_macs_uplinks_are_its_unscoped_defaults() {
         })
         .count();
     if utun_scoped == 0 {
-        eprintln!("SKIPPED the scoped utun defaults: this Mac has none");
+        crate::skipped("the scoped utun defaults: this Mac has none");
     }
     eprintln!(
         "{} scoped defaults in the dump ({utun_scoped} on utun), none a default route",

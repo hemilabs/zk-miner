@@ -24,7 +24,7 @@ fn facts_gathered_during_the_first_discovery_wait_for_it() {
         "{waited:?}"
     );
     if first.addresses.is_empty() {
-        eprintln!("SKIPPED: no reflector answered here; nothing to race for");
+        skipped("no reflector answered here; nothing to race for");
         return;
     }
     for ip in &first.addresses {
@@ -39,4 +39,22 @@ fn facts_gathered_during_the_first_discovery_wait_for_it() {
         "concurrent facts waited {waited:?} and refuse {:?}",
         first.addresses
     );
+}
+
+/// Tests: a test that cannot check what it is for on this host (no route of a family, no network,
+/// a missing tool) says so and passes; under `ZKMINER_CI_STRICT=1` (a CI host that must run every
+/// test: review round 3, cross-2) it fails instead, unless `ZKMINER_CI_ALLOW_SKIP` (a
+/// comma-separated list) holds a part of `why` (a CI host without IPv6 allows `"IPv6"`).
+fn skipped(why: impl std::fmt::Display) {
+    let why = why.to_string();
+    if std::env::var("ZKMINER_CI_STRICT").is_ok_and(|v| v == "1") {
+        let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP").unwrap_or_default();
+        if !allowed
+            .split(',')
+            .any(|a| !a.trim().is_empty() && why.contains(a.trim()))
+        {
+            panic!("SKIPPED under ZKMINER_CI_STRICT=1 (not in ZKMINER_CI_ALLOW_SKIP): {why}");
+        }
+    }
+    eprintln!("SKIPPED: {why}");
 }

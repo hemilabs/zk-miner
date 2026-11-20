@@ -621,7 +621,7 @@ mod tests {
                 }
                 eprintln!("NAT64 prefixes here: {found:?}");
             }
-            Err(e) => eprintln!("no DNS server answered here: {e}"),
+            Err(e) => crate::skipped(format!("no DNS server answered here: {e}")),
         }
         assert!(t.elapsed() < DISCOVERY_TIMEOUT + Duration::from_millis(500));
     }

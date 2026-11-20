@@ -1581,7 +1581,7 @@ mod tests {
         let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
         let public = ip("8.8.4.4");
         if let Err(e) = p.admit(public) {
-            eprintln!("SKIPPED: {public} is not admitted on this host: {e}");
+            crate::skipped(format!("{public} is not admitted on this host: {e}"));
             return;
         }
         let start = p.facts().gathered_at();

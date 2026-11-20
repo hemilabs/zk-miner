@@ -2895,7 +2895,7 @@ mod sys {
         fn this_hosts_two_ipv4_lookups_agree() {
             let dst: IpAddr = "8.8.8.8".parse().unwrap();
             let Some((_, first)) = ask(dst, None, Some(443), false).unwrap() else {
-                eprintln!("SKIPPED: no IPv4 route here");
+                crate::skipped("no IPv4 route here");
                 return;
             };
             let src = first.prefsrc.expect("the kernel chose a source");
