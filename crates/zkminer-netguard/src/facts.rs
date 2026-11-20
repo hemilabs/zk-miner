@@ -966,8 +966,10 @@ pub fn system_resolvers() -> Vec<IpAddr> {
     read_system_resolvers().unwrap_or_default()
 }
 
+/// macOS: the DNS servers for the facts and for discovery ([`system_resolvers`]'s, or why they
+/// cannot be read).
 #[cfg(target_os = "macos")]
-fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
+pub(crate) fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
     macos_dns::read().map(sorted)
 }
 
