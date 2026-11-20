@@ -441,6 +441,17 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     if survey.gpus.iter().any(|g| g.gpu_tag == "cuda") {
         sysmem_fallback_check(report);
     }
+    #[cfg(windows)]
+    if let Some(figures) = zkminer_prover::memory::commit_figures() {
+        let learned = zkminer_prover::host_peaks::load(&zkminer_prover::host_peaks::default_path());
+        commit_check(report, figures, |backend| {
+            learned
+                .values()
+                .filter(|c| c.card.split('@').next() == Some(backend))
+                .flat_map(|c| c.commit.values().copied())
+                .max()
+        });
+    }
     sp1_shard_caps_check(report, zkminer_prover::sp1_shard_caps::default_path());
     report.say(
         Level::Info,
@@ -456,6 +467,64 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
              `zkminer benchmark --calibrate` beforehand; a plain `zkminer benchmark` saves \
              nothing)",
         );
+    }
+}
+
+/// Windows: whether this host can commit what a proof of each zkVM commits (`memory::CommitFigures`):
+/// the most its proofs here took (`learned`, raw, with an eighth added as the miner charges it), else
+/// the default. A host that cannot is never given that zkVM's jobs, and says nothing about it
+/// unless asked: on a ~100 GB commit limit an SP1 proof (63 GB at once on a 5090) fits only with most
+/// of it free, so the page file decides.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn commit_check(
+    report: &mut Report,
+    figures: zkminer_prover::memory::CommitFigures,
+    learned: impl Fn(&str) -> Option<u64>,
+) {
+    const GIB: f64 = (1u64 << 30) as f64;
+    let gib = |b: u64| b as f64 / GIB;
+    let reserve = zkminer_prover::memory::DEFAULT_HOST_RESERVE_BYTES;
+    report.say(
+        Level::Info,
+        "commit",
+        format!(
+            "limit {:.0} GiB now, at most {:.0} GiB as the page files grow; {:.0} GiB free now",
+            gib(figures.limit),
+            gib(figures.total),
+            gib(figures.free_now),
+        ),
+    );
+    for (backend, name) in [("sp1", "SP1"), ("risc0", "RISC Zero")] {
+        let need = learned(backend)
+            .map(|peak| peak / 8 * 9)
+            .unwrap_or_else(|| zkminer_prover::memory::unmeasured_commit_for(backend));
+        if need.saturating_add(reserve) > figures.total {
+            report.say(
+                Level::Warn,
+                "commit",
+                format!(
+                    "an {name} proof commits about {:.0} GiB, more than this host can ever \
+                     commit ({:.0} GiB with {:.0} GiB kept for Windows): its jobs are not \
+                     claimed. A larger page file fixes it (System Properties -> Advanced -> \
+                     Performance -> Virtual memory): {:.0} GB more at least",
+                    gib(need),
+                    gib(figures.total),
+                    gib(reserve),
+                    (gib(need.saturating_add(reserve) - figures.total) + 1.0).ceil(),
+                ),
+            );
+        } else if need.saturating_add(reserve) > figures.available {
+            report.say(
+                Level::Info,
+                "commit",
+                format!(
+                    "an {name} proof commits about {:.0} GiB, more than is free now ({:.0} GiB \
+                     with page-file growth): its jobs wait until programs give memory back",
+                    gib(need),
+                    gib(figures.available),
+                ),
+            );
+        }
     }
 }
 
@@ -687,6 +756,32 @@ mod tests {
         assert_eq!(unreadable.warnings, 1);
         assert_eq!(unreadable.lines.len(), 1);
         assert!(unreadable.lines[0].2.contains("no card's cap is applied"));
+    }
+
+    /// A host that can never commit what a zkVM's proof commits is told so, with the page file to set.
+    #[test]
+    fn doctor_says_when_a_proof_cannot_ever_be_committed() {
+        const G: u64 = 1 << 30;
+        let figures = zkminer_prover::memory::CommitFigures {
+            available: 90 * G,
+            total: 100 * G,
+            free_now: 60 * G,
+            limit: 100 * G,
+        };
+        // A learned SP1 peak of 96 GiB is charged 108: past the 100 GiB limit.
+        let mut report = Report::default();
+        commit_check(&mut report, figures, |b| (b == "sp1").then_some(96 * G));
+        let warned: Vec<&String> = report
+            .lines
+            .iter()
+            .filter(|(l, w, _)| *l == Level::Warn && w == "commit")
+            .map(|(_, _, d)| d)
+            .collect();
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].contains("SP1 proof commits about 108 GiB"));
+        assert!(warned[0].contains("12 GB more at least"));
+        // RISC Zero's 30 GiB default fits.
+        assert!(!report.lines.iter().any(|(_, _, d)| d.contains("RISC Zero")));
     }
 
     /// What doctor says of GPU memory under Windows: the measured behaviour, not a driver setting

@@ -2795,29 +2795,47 @@ fn gpu_fingerprint() -> String {
     }
 }
 
-/// Read total physical memory in bytes from `/proc/meminfo`.
-///
-/// Returns 0 on non-Linux or if the file can't be parsed.
+/// Total physical memory in bytes (`memory::mem_total_bytes`: `/proc/meminfo` on Linux, the
+/// system's memory status on Windows), 0 where it cannot be read. Read from `/proc/meminfo` only, it
+/// was 0 on Windows, and every Windows fingerprint said "0GiB".
 pub fn get_total_memory_bytes() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
-            for line in contents.lines() {
-                if let Some(rest) = line.strip_prefix("MemTotal:") {
-                    // Format: "MemTotal:       16384000 kB"
-                    let rest = rest.trim();
-                    if let Some(kb_str) =
-                        rest.strip_suffix("kB").or_else(|| rest.strip_suffix("KB"))
-                    {
-                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
-                            return kb * 1024;
-                        }
-                    }
-                }
-            }
-        }
+    crate::memory::mem_total_bytes().unwrap_or(0)
+}
+
+/// Whether a saved hardware fingerprint names this machine (`current`): the same, or the same but
+/// for a RAM field of "0GiB", which every Windows build wrote before it could read the RAM size
+/// (`get_total_memory_bytes`). Without that, the fix would have discarded every Windows benchmark.
+fn same_hardware(saved: &str, current: &str) -> bool {
+    if saved == current {
+        return true;
     }
-    0
+    let (s, c): (Vec<&str>, Vec<&str>) = (saved.split('|').collect(), current.split('|').collect());
+    s.len() == c.len()
+        && s.len() > 2
+        && s[2] == "0GiB"
+        && s.iter()
+            .zip(&c)
+            .enumerate()
+            .all(|(i, (a, b))| i == 2 || a == b)
+}
+
+#[cfg(test)]
+mod fingerprint_ram_tests {
+    use super::same_hardware;
+
+    /// A fingerprint saved with the "0GiB" RAM field matches this machine's but for the RAM; any
+    /// other difference does not.
+    #[test]
+    fn a_fingerprint_without_its_ram_size_still_matches() {
+        let now = "Ryzen|16|64GiB|RTX 5090,RTX 4070|580.1";
+        assert!(same_hardware(now, now));
+        assert!(same_hardware("Ryzen|16|0GiB|RTX 5090,RTX 4070|580.1", now));
+        assert!(!same_hardware("Ryzen|16|0GiB|RTX 5090|580.1", now));
+        assert!(!same_hardware(
+            "Ryzen|16|32GiB|RTX 5090,RTX 4070|580.1",
+            now
+        ));
+    }
 }
 
 /// Returns the path to the benchmark cache file: `~/.zkminer/benchmarks.json`.
@@ -2888,7 +2906,7 @@ pub(crate) fn load_cached_benchmark_from(
         return None;
     }
 
-    if saved.hardware_fingerprint != current_fp {
+    if !same_hardware(&saved.hardware_fingerprint, &current_fp) {
         tracing::info!(
             "Hardware changed (saved: {}, current: {current_fp}), re-benchmarking needed",
             saved.hardware_fingerprint,
