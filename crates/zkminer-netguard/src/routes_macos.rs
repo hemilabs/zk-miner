@@ -1614,7 +1614,9 @@ mod tests {
     }
 
     /// The parser against `route -n get` (/sbin/route, unprivileged) for this host's own
-    /// destinations: destination, mask, gateway, interface and flags agree.
+    /// destinations, public ones, a LAN neighbour, a neighbour in a global on-link /64 and a
+    /// link-local address: destination, mask (as the prefix length), gateway, interface and
+    /// flags agree.
     #[test]
     fn this_hosts_answers_agree_with_route_get() {
         let (routes, _) = dump().unwrap();
@@ -1632,6 +1634,35 @@ mod tests {
             ip("2606:4700:4700::1111"),
         ];
         dsts.extend(gw);
+        // Neighbours: in the LAN that holds the IPv4 router, and in each global on-link /64 (review
+        // round 1, cross-5); and link-local.
+        let own: Vec<IpAddr> = address_interfaces()
+            .unwrap()
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect();
+        let mut neighbours = 0;
+        for r in routes.iter().filter(|r| {
+            r.hop == Hop::OnLink && r.kind == RouteType::Unicast && r.table == RT_TABLE_MAIN
+        }) {
+            let n = match r.prefix.addr {
+                IpAddr::V4(a) if r.prefix.len <= 29 && gw.is_some_and(|g| r.holds(g)) => {
+                    IpAddr::V4(Ipv4Addr::from(u32::from(a) | 0x4d))
+                }
+                IpAddr::V6(a) if r.prefix.len == 64 && crate::is_global(r.prefix.addr) => {
+                    IpAddr::V6(Ipv6Addr::from(u128::from(a) | 0x5ee))
+                }
+                _ => continue,
+            };
+            if !own.contains(&n) && Some(n) != gw {
+                dsts.push(n);
+                neighbours += 1;
+            }
+        }
+        if gw.is_some() {
+            assert!(neighbours > 0, "no LAN neighbour in {routes:?}");
+        }
+        dsts.push(ip("fe80::1"));
         dsts.extend(
             address_interfaces()
                 .unwrap()
@@ -1699,6 +1730,18 @@ mod tests {
                 dest.split('%').next().unwrap().parse().unwrap()
             };
             check(r.prefix.addr == dest, "the destination")?;
+            // The mask: none shown for a host route, `default` for a zero-length one.
+            let width = if d.is_ipv4() { 32 } else { 128 };
+            let shown_len = match field("mask").as_deref() {
+                None => width,
+                Some("default") => 0,
+                Some(m) => match m.parse::<IpAddr>() {
+                    Ok(IpAddr::V4(m)) => u32::from(m).leading_ones() as u8,
+                    Ok(IpAddr::V6(m)) => u128::from(m).leading_ones() as u8,
+                    Err(_) => return Err(format!("{d}: an unreadable mask in {text}")),
+                },
+            };
+            check(r.prefix.len == shown_len, "the mask")?;
             Ok(format!("{d}: {r:?} agrees with route -n get"))
         };
         for d in dsts {
