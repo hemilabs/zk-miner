@@ -8738,6 +8738,28 @@ impl WorkerPool {
         self.reserve_host_memory(want, key)
     }
 
+    /// How many proofs of `backend` this host can run side by side: as many of its peaks as fit what
+    /// can ever be held, in RAM and (Windows) commit, with the OS slice; at least one. Two SP1 proofs
+    /// (2 x 74 GiB of commit) do not fit a 100 GiB host, so a second SP1 claim waits for the first
+    /// rather than being refused as if both had to run at once.
+    pub fn backend_side_by_side(&self, backend: &str) -> usize {
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        let fit = |total: u64, peak: u64| {
+            if peak == 0 {
+                usize::MAX
+            } else {
+                (total.saturating_sub(reserve) / peak) as usize
+            }
+        };
+        let ram = crate::memory::mem_total_bytes().map_or(usize::MAX, |total| {
+            fit(total, self.backend_host_peak(backend, None))
+        });
+        let commit = crate::memory::commit_figures().map_or(usize::MAX, |c| {
+            fit(c.total, self.backend_commit_peak_in(backend, None, c.total))
+        });
+        ram.min(commit).max(1)
+    }
+
     /// How many proofs can run at once, for a claim's set (`memory::claim_set_bytes`): one per card
     /// with a worker, no more than `max_concurrent`; `max_concurrent` when no card is known.
     fn claim_slots(&self, max_concurrent: usize) -> usize {
@@ -8778,8 +8800,9 @@ impl WorkerPool {
     fn commit_fits_for_claim(
         &self,
         backend: &str,
-        // The outstanding jobs of this backend and of others, and how many proofs run at once.
-        (same, other, slots): (usize, usize, usize),
+        // The outstanding jobs of this backend (no more than run side by side) and of others, how
+        // many proofs run at once, and whether this one waits for a card or its turn.
+        (same, other, slots, queued): (usize, usize, usize, bool),
         credit_resident: bool,
         po2: Option<u8>,
         ram_want: u64,
@@ -8802,7 +8825,7 @@ impl WorkerPool {
         // Waits for a card (see `backend_fits_for_claim_at_po2`): what will be free when it starts,
         // the commit our proofs and idle workers hand back included. Dispatch grows the page file
         // for its RAM part then (`reserve_commit`).
-        if same.saturating_add(other) >= slots {
+        if queued {
             let pending = self
                 .commit_ledger
                 .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
@@ -8939,20 +8962,21 @@ impl WorkerPool {
             .map(|b| self.backend_host_peak(b, None))
             .max()
             .unwrap_or(0);
-        let committed = crate::memory::claim_set_bytes(
-            expected_peak,
-            same_backend_outstanding,
-            other,
-            other_peak,
-            slots,
-        );
+        // No more of this backend in the set than run side by side here: the rest wait their turn
+        // (dispatch admits by memory), so they are queued claims, not a set that must fit at once.
+        let side_by_side = self.backend_side_by_side(backend);
+        let same_in_set = same_backend_outstanding.min(side_by_side - 1);
+        let committed =
+            crate::memory::claim_set_bytes(expected_peak, same_in_set, other, other_peak, slots);
         if committed.saturating_add(reserve) > total {
             return false;
         }
         // Windows: commit too, as dispatch will test it (`reserve_commit`).
+        // It waits (every card has a job ahead of it, or as many of its backend as run side by side).
+        let queued = outstanding >= slots || same_backend_outstanding >= side_by_side;
         if !self.commit_fits_for_claim(
             backend,
-            (same_backend_outstanding, other, slots),
+            (same_in_set, other, slots, queued),
             same_backend_outstanding == 0,
             po2,
             expected_peak,
@@ -8971,9 +8995,10 @@ impl WorkerPool {
             0
         };
         let reserved = self.reserved_host_memory();
-        // Every card already has a job ahead of this one: it waits for a card, and starts only once a
-        // proof running now is done. Charged against what will be free then.
-        if outstanding >= slots {
+        // Every card already has a job ahead of this one, or as many of its backend as run side by
+        // side: it waits, and starts only once a proof running now is done. Charged against what
+        // will be free then.
+        if queued {
             let idle = self
                 .idle_host_holdings_except(backend)
                 .iter()
