@@ -8915,15 +8915,27 @@ async fn miner_brain(
                     }
                     if !sim_mode {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                            // Reserve for the largest size a card proves risc0 jobs at, so a job
-                            // claimed here is one the PROVE gate can admit on any of them.
-                            let want = if backend == "risc0" {
-                                pool.expected_host_peak_at_po2(
+                            // risc0: charged for the cards it can start on now, at each card's
+                            // size (`risc0_claim_charge`): the most of those, so the PROVE gate
+                            // admits it on whichever it takes. Not a card another job proves on:
+                            // a free 4070 sat idle while SP1 proved on the 5090, its risc0 claims
+                            // charged the 5090's figure.
+                            let risc0_charge = if backend == "risc0" {
+                                let cards: Vec<(String, u8)> = risc0_cards
+                                    .iter()
+                                    .map(|c| (c.slot.clone(), c.po2))
+                                    .collect();
+                                pool.risc0_claim_charge(&cards)
+                            } else {
+                                None
+                            };
+                            let want = match &risc0_charge {
+                                Some((bytes, _, _)) => *bytes,
+                                None if backend == "risc0" => pool.expected_host_peak_at_po2(
                                     backend,
                                     risc0_sizes.iter().copied().max(),
-                                )
-                            } else {
-                                pool.expected_host_peak(backend)
+                                ),
+                                None => pool.expected_host_peak(backend),
                             };
                             // `in_flight` — claims outstanding, spawned or not — and the real
                             // concurrency bound. NOT a per-tick accumulator: claimed jobs prove
@@ -8955,10 +8967,12 @@ async fn miner_brain(
                                 } else {
                                     outstanding.saturating_sub(sp1_outstanding)
                                 };
-                            let claim_po2 = if backend == "risc0" {
-                                risc0_sizes.iter().copied().max()
-                            } else {
-                                None
+                            let (claim_po2, claim_slot) = match &risc0_charge {
+                                Some((_, slot, po2)) => (Some(*po2), Some(slot.as_str())),
+                                None if backend == "risc0" => {
+                                    (risc0_sizes.iter().copied().max(), None)
+                                }
+                                None => (None, None),
                             };
                             if !pool.backend_fits_for_claim_at_po2(
                                 want,
@@ -8967,6 +8981,7 @@ async fn miner_brain(
                                 same_backend_outstanding,
                                 max_concurrent,
                                 claim_po2,
+                                claim_slot,
                             ) {
                                 // Windows: commit, not RAM, may be what is short (the remedy is the
                                 // page file, and RAM can show free meanwhile).
@@ -8977,6 +8992,7 @@ async fn miner_brain(
                                     same_backend_outstanding,
                                     max_concurrent,
                                     claim_po2,
+                                    claim_slot,
                                 );
                                 // Rate-limited to once per backend per tick. On the market this
                                 // repo documents — 298 open jobs declaring zero cycles — a

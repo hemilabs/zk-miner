@@ -9936,12 +9936,17 @@ impl WorkerPool {
         credit_resident: bool,
         po2: Option<u8>,
         ram_want: u64,
+        on_slot: Option<&str>,
     ) -> bool {
         let Some(figures) = crate::memory::commit_figures() else {
             return true;
         };
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
-        let want = self.backend_commit_peak_in(backend, po2, figures.total);
+        // The card it starts on, when known (`risc0_claim_charge`), else the most any card takes.
+        let want = match on_slot {
+            Some(slot) => self.slot_commit_peak_in(slot, po2, figures.total),
+            None => self.backend_commit_peak_in(backend, po2, figures.total),
+        };
         let other_peak = self
             .other_backends(backend)
             .iter()
@@ -9973,16 +9978,18 @@ impl WorkerPool {
                 returning,
             );
         }
-        // The warm worker it lands on (a first claim of its backend): what it already holds.
-        let resident = if credit_resident {
-            self.workers
+        // The warm worker it lands on (a first claim of its backend): what it already holds; the
+        // named card's own when there is one.
+        let resident = match (credit_resident, on_slot) {
+            (false, _) => 0,
+            (true, Some(slot)) => self.current_commit_bytes_for_slot(slot).unwrap_or(0),
+            (true, None) => self
+                .workers
                 .keys()
                 .filter(|key| key.split(':').next() == Some(backend))
                 .filter_map(|key| self.current_commit_bytes_for_slot(key))
                 .max()
-                .unwrap_or(0)
-        } else {
-            0
+                .unwrap_or(0),
         };
         // The whole set against what is live: jobs claimed but not started yet (fetching, measuring,
         // in a line) are in neither `reserved` nor `available`, and checking this proof alone let an
@@ -10094,12 +10101,36 @@ impl WorkerPool {
             outstanding,
             max_concurrent,
             None,
+            None,
         )
+    }
+
+    /// What a risc0 job claimed now is charged in host memory, and the card it is charged for
+    /// (slot, size): the most any of `cards` (slot, the size it proves risc0 jobs at) it can start
+    /// on now would take (`slot_host_peak`), among those whose GPU is not proving; all of them when
+    /// every one is. A job claimed while SP1 proves on the 5090 starts on the free 4070 (or waits
+    /// for the 5090, which SP1 has then given back); charging it the 5090's 18 GiB beside SP1's 42
+    /// left the free card idle. `None` for no card.
+    pub fn risc0_claim_charge(&self, cards: &[(String, u8)]) -> Option<(u64, String, u8)> {
+        let proving = |slot: &str| {
+            self.gpu_lock_for(slot)
+                .is_some_and(|lock| lock.try_lock().is_err())
+        };
+        let free: Vec<&(String, u8)> = cards.iter().filter(|(s, _)| !proving(s)).collect();
+        let from: Vec<&(String, u8)> = if free.is_empty() {
+            cards.iter().collect()
+        } else {
+            free
+        };
+        from.into_iter()
+            .map(|(slot, po2)| (self.slot_host_peak(slot, Some(*po2)), slot.clone(), *po2))
+            .max_by_key(|(bytes, _, _)| *bytes)
     }
 
     /// Whether `backend_fits_for_claim_at_po2`, with the same arguments, refuses for commit
     /// (Windows): its commit half alone does not fit. For the operator's message, as the remedy (a
     /// larger page file) is not RAM's, and RAM can show free meanwhile.
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_short_of_commit(
         &self,
         expected_peak: u64,
@@ -10108,6 +10139,7 @@ impl WorkerPool {
         same_backend_outstanding: usize,
         max_concurrent: usize,
         po2: Option<u8>,
+        on_slot: Option<&str>,
     ) -> bool {
         let slots = self.claim_slots(max_concurrent);
         let other = outstanding.saturating_sub(same_backend_outstanding);
@@ -10120,6 +10152,7 @@ impl WorkerPool {
             same_backend_outstanding == 0,
             po2,
             expected_peak,
+            on_slot,
         )
     }
 
@@ -10128,6 +10161,9 @@ impl WorkerPool {
     /// of the `outstanding` jobs are of `backend`. The memory a warm worker of `backend` holds is
     /// credited when none is, since a job of another backend never lands on that worker: an idle
     /// SP1 server's 11 GB counts towards an SP1 claim while a RISC Zero job is outstanding.
+    /// `on_slot`: the card the job starts on, when the caller knows it (`risc0_claim_charge`): its
+    /// commit figure and its warm worker are the ones counted, not the backend's largest.
+    #[allow(clippy::too_many_arguments)]
     pub fn backend_fits_for_claim_at_po2(
         &self,
         expected_peak: u64,
@@ -10136,6 +10172,7 @@ impl WorkerPool {
         same_backend_outstanding: usize,
         max_concurrent: usize,
         po2: Option<u8>,
+        on_slot: Option<&str>,
     ) -> bool {
         let (Some(available), Some(total)) =
             (self.admission_available(), crate::memory::mem_total_bytes())
@@ -10172,6 +10209,7 @@ impl WorkerPool {
             same_backend_outstanding == 0,
             po2,
             expected_peak,
+            on_slot,
         ) {
             return false;
         }
@@ -10181,10 +10219,10 @@ impl WorkerPool {
         // running total: the saving applies to whichever single proof lands on that slot.
         // No job of this backend outstanding: the proof lands on one of its workers, warm or not
         // (another backend's job never uses it).
-        let resident = if same_backend_outstanding == 0 {
-            self.resident_host_bytes_for_backend(backend)
-        } else {
-            0
+        let resident = match (same_backend_outstanding, on_slot) {
+            (0, Some(slot)) => self.current_host_bytes_for_slot(slot).unwrap_or(0),
+            (0, None) => self.resident_host_bytes_for_backend(backend),
+            _ => 0,
         };
         let reserved = self.reserved_host_memory();
         // Every card already has a job ahead of this one, or as many of its backend as run side by
@@ -17422,6 +17460,56 @@ mod learned_host_peak_tests {
         // Replaced, not merged.
         pool.set_risc0_card_sizes([("risc0:cuda:1".to_string(), 18)]);
         assert_eq!(pool.backend_host_peak_as_proved("risc0"), published(None));
+    }
+
+    /// A risc0 claim is charged for the cards it can start on now: while another backend proves on
+    /// one card, the other's figure; with every card proving (or none), the largest.
+    #[test]
+    fn a_risc0_claim_is_charged_for_the_free_card() {
+        let pool = pool(&["risc0:cuda:0", "risc0:cuda:1", "sp1:cuda:0"]);
+        let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+        for (slot, po2, bytes) in [
+            ("risc0:cuda:0", 20, 16 * GIB),
+            ("risc0:cuda:1", 19, 5 * GIB),
+        ] {
+            crate::memory::note_learned_peak(
+                pool.learned_peaks
+                    .lock()
+                    .unwrap()
+                    .entry(slot.to_string())
+                    .or_default(),
+                Some(po2),
+                bytes,
+            );
+        }
+        let cards = vec![
+            ("risc0:cuda:0".to_string(), 20),
+            ("risc0:cuda:1".to_string(), 19),
+        ];
+        let big = pool.slot_host_peak("risc0:cuda:0", Some(20));
+        let small = pool.slot_host_peak("risc0:cuda:1", Some(19));
+        assert!(big > small, "{big} {small} {total}");
+        // Both free: the larger, as before.
+        assert_eq!(
+            pool.risc0_claim_charge(&cards),
+            Some((big, "risc0:cuda:0".to_string(), 20))
+        );
+        // SP1 proving on card 0: the free card 1's.
+        let lock = pool.gpu_lock_for("sp1:cuda:0").unwrap();
+        let busy = lock.lock().unwrap();
+        assert_eq!(
+            pool.risc0_claim_charge(&cards),
+            Some((small, "risc0:cuda:1".to_string(), 19))
+        );
+        // Both proving: the larger again.
+        let lock1 = pool.gpu_lock_for("risc0:cuda:1").unwrap();
+        let busy1 = lock1.lock().unwrap();
+        assert_eq!(
+            pool.risc0_claim_charge(&cards),
+            Some((big, "risc0:cuda:0".to_string(), 20))
+        );
+        drop((busy, busy1));
+        assert_eq!(pool.risc0_claim_charge(&[]), None);
     }
 
     /// Each card is charged what its own proofs reached; a card with none, and a figure with no
