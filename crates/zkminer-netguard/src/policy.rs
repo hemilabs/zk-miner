@@ -1183,10 +1183,13 @@ impl NetPolicy {
             why,
         })?;
         // The kernel asked how it routes a connection from the connection's own source (a rule
-        // that selects by source sees it: review round 4).
-        let src = unmapped_ip(local.ip());
-        let judge = |f: &HostFacts| {
-            admit_from(self.mode, vetted.addr, src, &f.without_verdicts(), &self.deny)
+        // that selects by source sees it: review round 4), when the connection is to the address
+        // judged (a test's loopback stand-in for a public address leaves from loopback, a source
+        // the kernel refuses for that address).
+        let src = (vetted.connect == unmapped(vetted.addr)).then(|| unmapped_ip(local.ip()));
+        let judge = |f: &HostFacts| match src {
+            Some(src) => admit_from(self.mode, vetted.addr, src, &f.without_verdicts(), &self.deny),
+            None => admit_to(self.mode, vetted.addr, &f.without_verdicts(), &self.deny),
         };
         match judge(&self.facts()) {
             Err(d) if d.depends_on_facts() && self.facts.refresh => {
