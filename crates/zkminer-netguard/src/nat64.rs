@@ -2020,7 +2020,9 @@ mod tests {
             vec![(WELL_KNOWN_PREFIX, Duration::ZERO)]
         );
         // Not from the kernel: nothing.
-        assert!(pref64_from(4242, &msg(134, &pref64("2001:db8::", 5, 600))).is_empty());
+        for pid in [1, 4242, u32::MAX] {
+            assert!(pref64_from(pid, &msg(134, &pref64("2001:db8::", 5, 600))).is_empty());
+        }
         assert_eq!(
             pref64_from(0, &msg(134, &pref64("2001:db8::", 5, 600))).len(),
             1

@@ -103,7 +103,7 @@ fn failed_with(what: &str, e: &(dyn std::error::Error + 'static)) -> FetchError 
 /// the kernel chose for the vetted path, so a rule that picks a path by protocol cannot make the
 /// check's source and the connection's differ), checked once made ([`RecheckLayer::check`]),
 /// before anything is written on it.
-async fn connect_checked(
+pub(super) async fn connect_checked(
     pinned: &[SocketAddr],
     recheck: &RecheckLayer,
     options: &ClientOptions,
@@ -315,3 +315,63 @@ where
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body whose frames come from a channel.
+    struct Chan(tokio::sync::mpsc::Receiver<bytes::Bytes>);
+
+    impl http_body::Body for Chan {
+        type Data = bytes::Bytes;
+        type Error = io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<bytes::Bytes>, io::Error>>> {
+            self.0
+                .poll_recv(cx)
+                .map(|b| b.map(|b| Ok(http_body::Frame::data(b))))
+        }
+    }
+
+    async fn read_all(b: &mut Bounded<Chan>) -> Result<usize, String> {
+        use http_body::Body;
+        let mut n = 0;
+        loop {
+            match std::future::poll_fn(|cx| Pin::new(&mut *b).poll_frame(cx)).await {
+                Some(Ok(f)) => n += f.into_data().map_or(0, |d| d.len()),
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Ok(n),
+            }
+        }
+    }
+
+    /// The body's read timeout counts from the last read (a body that keeps coming, a chunk
+    /// every 300 ms, outlives a 500 ms read timeout); one silent for longer fails; the
+    /// request's deadline bounds the whole.
+    #[tokio::test]
+    async fn the_body_is_bounded_per_read_and_in_all() {
+        let feed = |gap: u64, n: usize| {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                for _ in 0..n {
+                    tokio::time::sleep(Duration::from_millis(gap)).await;
+                    if tx.send(bytes::Bytes::from_static(b"abc")).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Chan(rx)
+        };
+        let far = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut b = Bounded::new(feed(300, 4), Duration::from_millis(500), far);
+        assert_eq!(read_all(&mut b).await, Ok(12));
+        let mut b = Bounded::new(feed(800, 2), Duration::from_millis(500), far);
+        assert!(read_all(&mut b).await.unwrap_err().contains("timed out"));
+        let soon = tokio::time::Instant::now() + Duration::from_millis(700);
+        let mut b = Bounded::new(feed(300, 4), Duration::from_millis(500), soon);
+        assert!(read_all(&mut b).await.unwrap_err().contains("time ran out"));
+    }
+}
