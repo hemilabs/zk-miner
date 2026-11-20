@@ -9,7 +9,16 @@ description = "zkminer's network guard: nothing a requester controls makes the m
 default = ["client"]
 # The guarded DNS resolver and HTTP client (reqwest, tokio). Without it, only the pure parts: the
 # address predicate, host-name hygiene, URL checks, the admission decision and the host's facts.
-client = ["dep:reqwest", "dep:tokio", "dep:rustls", "dep:webpki-roots"]
+client = [
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:hyper-util",
+    "dep:http",
+    "dep:tower-layer",
+    "dep:tower-service",
+]
 # Test seams for the tests of crates that depend on this one: a resolver that connects to another
 # address than the one it admitted (so a public-mode fetch can be served by a server on loopback).
 # Only ever enabled from a `[dev-dependencies]` entry; nothing in a release build turns it on.
@@ -29,6 +38,13 @@ tokio = { workspace = true, optional = true }
 # reqwest's rustls uses) and its compiled-in roots.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "1", optional = true }
+# The guarded client's check of each connection once made (a reqwest connector layer: tower's
+# Layer and Service, hyper-util's HttpInfo with the connection's own addresses, http's
+# Extensions). The versions reqwest already brings in; the lock gains no package.
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy"], optional = true }
+http = { version = "1", optional = true }
+tower-layer = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }
 # The near-hop probe's socket (hop limit set before connecting).
 socket2 = "0.6"
 

@@ -69,8 +69,8 @@ pub use host::{check_host_name, HostDenied, INTERNAL_SUFFIXES};
 pub use ip::{canonical_ip, is_global, prefix_is_global, Prefix, PrefixParseError};
 pub use nearhop::{NearProbe, ProbeOutcome, TtlProbe};
 pub use policy::{
-    admit, admit_prefix, admit_to, Denied, NetMode, NetPolicy, RouteKind, UrlDenied, FACTS_TTL,
-    FORCED_REFRESH_MIN_AGE,
+    admit, admit_prefix, admit_to, connected_as_vetted, Denied, NetMode, NetPolicy, RouteKind,
+    UrlDenied, Vetted, FACTS_TTL, FORCED_REFRESH_MIN_AGE,
 };
 pub use routes::{
     Hop, KernelAnswer, KernelRoutes, Link, Route, RouteOracle, RouteRefusal, RouteTable, RouteType,
