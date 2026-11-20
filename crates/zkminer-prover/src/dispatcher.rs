@@ -4087,9 +4087,15 @@ fn finishes_in_time(key: &str, abort_at: Option<Instant>) -> bool {
 #[derive(Debug, Clone)]
 struct CardWaiter {
     ticket: u64,
+    /// Its place in line: the latest it can start (else its cutoff).
     abort_at: Option<Instant>,
     since: Instant,
     keys: Vec<String>,
+    /// Its cutoff, and how long it takes on each of its slots (`with_slot_estimates`): it holds a
+    /// card from others only where it can finish by the cutoff. A job that needed the 5090 kept the
+    /// 4070 from every job behind it, though it would never take the 4070.
+    cutoff: Option<Instant>,
+    estimates: HashMap<String, Duration>,
 }
 
 impl CardWaiter {
@@ -8364,9 +8370,9 @@ impl WorkerPool {
         })
     }
 
-    /// Whether a job about to take the free slot `key` would finish sooner on another of its `keys`
-    /// whose card is busy now but due free (`card_eta`, still ahead), by `BETTER_CARD_MARGIN`: then
-    /// it waits for that card. Each finish is when the card frees (now, for `key`), plus a switch
+    /// Whether a job about to take the free slot `key` would finish sooner on another of its `keys`,
+    /// free now or busy but due free (`card_eta`, still ahead), by `BETTER_CARD_MARGIN`: then it takes
+    /// that card, or waits for it. Each finish is when the card frees (now, for `key`), plus a switch
     /// when its worker is not running, plus the job's estimate there. A RISC Zero job is ~4.5x
     /// slower on a 4070 than on a 5090, and took the 4070 whenever it was free: a 1 B-cycle job ran
     /// 15 minutes there instead of 3 on the 5090 a few seconds later. Without estimates, or with
@@ -8392,7 +8398,15 @@ impl WorkerPool {
         keys.iter()
             .filter(|k| Self::card_of(k) != Self::card_of(key))
             .filter_map(|k| {
-                let free_at = *etas.get(&Self::card_of(k)).filter(|at| **at > now)?;
+                // Free now (and its worker able to take it): from now; busy: from when it frees.
+                let free_now = self.gpu_lock_for(k).is_none_or(|l| {
+                    !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+                }) && self.slot_could_take(k);
+                let free_at = if free_now {
+                    now
+                } else {
+                    *etas.get(&Self::card_of(k)).filter(|at| **at > now)?
+                };
                 let finish = free_at + switch(k) + slot_estimate(k)?;
                 abort_at.is_none_or(|a| finish <= a).then_some(finish)
             })
@@ -8416,8 +8430,11 @@ impl WorkerPool {
             abort_at,
             since,
             keys: Vec::new(),
+            cutoff: None,
+            estimates: HashMap::new(),
         }
         .order();
+        let now = Instant::now();
         self.card_waiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -8425,9 +8442,15 @@ impl WorkerPool {
             .any(|w| {
                 Some(w.ticket) != me
                     && w.order() < mine
-                    && w.keys
-                        .iter()
-                        .any(|k| self.same_card(k, key) && self.slot_could_take(k))
+                    && w.keys.iter().any(|k| {
+                        self.same_card(k, key)
+                            && self.slot_could_take(k)
+                            // Only a card it can finish on by its cutoff.
+                            && match (w.cutoff, w.estimates.get(k)) {
+                                (Some(cutoff), Some(takes)) => now + *takes <= cutoff,
+                                _ => true,
+                            }
+                    })
             })
     }
 
@@ -8464,9 +8487,15 @@ impl WorkerPool {
         &self,
         keys: &[String],
         abort_at: Option<Instant>,
+        cutoff: Option<Instant>,
     ) -> (CardWaitGuard<'_>, u64, Instant) {
         let ticket = self.card_waiter_seq.fetch_add(1, Ordering::Relaxed);
         let since = Instant::now();
+        // What this thread's job takes on each of its slots (`with_slot_estimates`).
+        let estimates = keys
+            .iter()
+            .filter_map(|k| Some((k.clone(), slot_estimate(k)?)))
+            .collect();
         self.card_waiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -8475,6 +8504,8 @@ impl WorkerPool {
                 abort_at,
                 since,
                 keys: keys.to_vec(),
+                cutoff,
+                estimates,
             });
         (CardWaitGuard { pool: self, ticket }, ticket, since)
     }
@@ -8715,7 +8746,9 @@ impl WorkerPool {
                 .filter(|k| !exclude.contains(*k))
                 .cloned()
                 .collect();
-            if pruned.is_empty() {
+            // Nor when what is left cannot finish it before its cutoff (`with_slot_estimates`): the
+            // card it failed on can, and a release is worse than a retry there.
+            if pruned.is_empty() || pruned.iter().all(|k| !finishes_in_time(k, abort_at)) {
                 vram_keys
             } else {
                 pruned
@@ -8896,7 +8929,7 @@ impl WorkerPool {
         const QUEUE_WAIT_CAP: Duration = Duration::from_secs(3600);
         let queue_deadline = Instant::now() + timeout.unwrap_or(QUEUE_WAIT_CAP);
         // In line for a card: a freed one goes to the waiting job due first.
-        let (in_line, ticket, since) = self.wait_for_card(&keys, latest_start);
+        let (in_line, ticket, since) = self.wait_for_card(&keys, latest_start, abort_at);
         loop {
             // Whether some eligible card is only BUSY (another proof holds it), not failed.
             let mut any_busy = false;
@@ -20325,7 +20358,12 @@ mod learned_host_peak_tests {
             ("risc0:cuda:1".to_string(), Duration::from_secs(300)),
         ]);
         with_slot_estimates(estimates, || {
-            // The fast card's free time is not known: take the slow free one.
+            // Both free: the fast one, not whichever comes first.
+            assert!(pool.better_card_soon("risc0:cuda:1", &keys, None));
+            assert!(!pool.better_card_soon("risc0:cuda:0", &keys, None));
+            // The fast card busy, its free time not known: take the slow free one.
+            let lock = pool.gpu_lock_for("risc0:cuda:0").unwrap();
+            let _busy = lock.lock().unwrap();
             assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None));
             // Due free in 60 s: done there by ~140 s against ~320 s here.
             pool.card_eta.lock().unwrap().insert(
@@ -20336,8 +20374,6 @@ mod learned_host_peak_tests {
             // Not if finishing there would miss the cutoff.
             let soon = Some(Instant::now() + Duration::from_secs(100));
             assert!(!pool.better_card_soon("risc0:cuda:1", &keys, soon));
-            // Not on the card it is choosing.
-            assert!(!pool.better_card_soon("risc0:cuda:0", &keys, None));
             // Overdue: nothing is known.
             pool.card_eta.lock().unwrap().insert(
                 "cuda:0".to_string(),
@@ -20345,6 +20381,25 @@ mod learned_host_peak_tests {
             );
             assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None));
         });
+    }
+
+    /// A waiter holds a card from later jobs only where it can finish by its cutoff: one that needs
+    /// the fast card leaves the slow one to them.
+    #[test]
+    fn a_waiter_holds_only_the_cards_it_can_use() {
+        let pool = pool(&["sp1:cuda:0", "sp1:cuda:1"]);
+        let keys = vec!["sp1:cuda:0".to_string(), "sp1:cuda:1".to_string()];
+        let now = Instant::now();
+        let cutoff = Some(now + Duration::from_secs(400));
+        let estimates = HashMap::from([
+            ("sp1:cuda:0".to_string(), Duration::from_secs(130)),
+            ("sp1:cuda:1".to_string(), Duration::from_secs(720)),
+        ]);
+        let _in_line =
+            with_slot_estimates(estimates, || pool.wait_for_card(&keys, Some(now), cutoff).0);
+        let later = Some(now + Duration::from_secs(3600));
+        assert!(pool.yields_to_waiter("sp1:cuda:0", None, later, now));
+        assert!(!pool.yields_to_waiter("sp1:cuda:1", None, later, now));
     }
 
     /// A freed card goes to the waiting job due first: a later deadline, or a later arrival with the
@@ -20356,7 +20411,8 @@ mod learned_host_peak_tests {
         let now = Instant::now();
         let soon = now + Duration::from_secs(600);
         let later = now + Duration::from_secs(1200);
-        let (guard, ticket, since) = pool.wait_for_card(&["risc0:cuda:0".to_string()], Some(soon));
+        let (guard, ticket, since) =
+            pool.wait_for_card(&["risc0:cuda:0".to_string()], Some(soon), Some(soon));
         // Another job due later, arriving now: it leaves card 0 to the waiter, not card 1.
         assert!(pool.yields_to_waiter("risc0:cuda:0", None, Some(later), now));
         assert!(!pool.yields_to_waiter("risc0:cuda:1", None, Some(later), now));
