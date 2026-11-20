@@ -2,6 +2,7 @@
 #
 # Usage:
 #   make cli          Build the main zkminer binary
+#   make witness      Build what witness jobs run beside it (sandbox probe, builder, broker, CPU executor)
 #   make cuda         Build RISC Zero CUDA prover
 #   make rocm         Build RISC Zero ROCm prover
 #   make sp1          Build SP1 prover
@@ -34,7 +35,7 @@ DOCKER_BUILD = docker build -f Dockerfile.build \
 	--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
 	--build-arg FOUNDRY_VERSION=$(FOUNDRY_VERSION)
 
-.PHONY: all cli cli-windows cuda rocm intel sp1 openvm clean distclean help test test-integration e2e
+.PHONY: all cli cli-windows witness cuda rocm intel sp1 openvm clean distclean help test test-integration e2e
 
 all: cli cuda rocm sp1 openvm
 
@@ -63,12 +64,18 @@ dist/zkminer-prove-openvm: FORCE
 	$(DOCKER_BUILD) --target dist-openvm --output type=local,dest=dist/ .
 	cd dist && sha256sum zkminer-prove-openvm > zkminer-prove-openvm.sha256
 
+dist/zkminer-witness-sandbox-probe: FORCE
+	$(DOCKER_BUILD) --target dist-witness --output type=local,dest=dist/ .
+	cd dist && sha256sum zkminer-witness-sandbox-probe zkminer-witness-builder zkminer-witness-broker \
+		zkminer-prove-risc0-cpu > zkminer-witness.sha256
+
 dist/zkminer.exe: FORCE
 	$(DOCKER_BUILD) --target dist-cli-windows --output type=local,dest=dist/ .
 	cd dist && sha256sum zkminer.exe > zkminer.exe.sha256
 
 cli: dist/zkminer
 cli-windows: dist/zkminer.exe
+witness: dist/zkminer-witness-sandbox-probe
 cuda: dist/zkminer-prove-risc0-cuda
 rocm: dist/zkminer-prove-risc0-rocm
 # intel: dist/zkminer-prove-risc0-intel  # uncomment when sppark SYCL port is ready
@@ -99,6 +106,7 @@ help:
 	@echo "Build targets:"
 	@echo "  cli         - zkminer CLI binary (Linux)"
 	@echo "  cli-windows - zkminer CLI binary (Windows .exe, cross-compiled)"
+	@echo "  witness  - what witness jobs run beside zkminer (Linux)"
 	@echo "  cuda     - RISC Zero CUDA prover (~2h build)"
 	@echo "  rocm     - RISC Zero ROCm prover (~7h build)"
 	@echo "  intel    - Intel GPU prover (placeholder, pending sppark SYCL port)"

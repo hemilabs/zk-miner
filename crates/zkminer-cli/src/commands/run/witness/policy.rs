@@ -324,6 +324,54 @@ impl ProvePlan {
     }
 }
 
+/// One card that may prove a witness job, and its proof's plan there.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CardPlan {
+    /// Its benchmark device id (`gpu0`, `gpu-rocm1`, `cpu`), as the dispatcher's `JobCards` name it.
+    pub device: String,
+    /// Cycles per second at its size (its benchmark row, else the floor for its kind).
+    pub cps: f64,
+    /// [`fixed_allowance_secs`] for it.
+    pub fixed_secs: u64,
+}
+
+impl CardPlan {
+    /// The plan for a proof on this card alone.
+    pub(crate) fn plan(&self, margin: f64) -> ProvePlan {
+        let margin = if margin.is_finite() && margin >= 1.0 { margin } else { 1.0 };
+        ProvePlan::over([(self.cps, self.fixed_secs)], margin).unwrap_or(ProvePlan {
+            cps: 1.0,
+            fixed_secs: self.fixed_secs,
+            margin,
+        })
+    }
+}
+
+/// The cards a witness proof of `cycles` (its execute taking `execute_secs`) may run on: each whose own
+/// estimate ([`estimate_prove_secs`] on its plan alone) fits the per-attempt watchdog and passes
+/// `fits_window` (the job's deadline gate), fastest first. The job is sized on the slowest of these
+/// ([`ProvePlan::over`]) and the dispatcher sends it to no other card, so a slow card neither caps
+/// the jobs a faster one can take nor takes one it cannot finish. Empty when no card can.
+pub(crate) fn eligible_cards(
+    cards: &[CardPlan],
+    margin: f64,
+    cycles: u64,
+    execute_secs: u64,
+    proving_timeout_secs: u64,
+    fits_window: impl Fn(u64) -> bool,
+) -> Vec<CardPlan> {
+    let mut eligible: Vec<CardPlan> = cards
+        .iter()
+        .filter(|c| {
+            let need = estimate_prove_secs(cycles, &c.plan(margin), execute_secs);
+            watchdog_admits(need, proving_timeout_secs) && fits_window(need)
+        })
+        .cloned()
+        .collect();
+    eligible.sort_by(|a, b| b.cps.total_cmp(&a.cps));
+    eligible
+}
+
 /// The expected seconds of one proof attempt of a witness lock: its sized cycles at the plan's rate
 /// plus the fixed allowance (the Groth16 wrap), both times the safety margin (as the inline gate
 /// sizes a job: the fixed part slows down on a loaded host as much as the rest), plus the execute
@@ -371,6 +419,17 @@ pub(crate) fn deadline_fits(window_secs: u64, prove_secs: u64, fulfil_margin_sec
 /// job can be proven here, and every one is refused at the static gates rather than simulated. The
 /// claim gate then checks each job's measured cycles and execute.
 pub(crate) fn host_max_guest_cycles(plan: &ProvePlan, proving_timeout_secs: u64) -> u64 {
+    host_max_guest_cycles_at(plan, proving_timeout_secs)
+}
+
+/// [`host_max_guest_cycles`] over the cards that may prove a witness job: the most any one of them can
+/// prove inside the watchdog, since a job is proven on a card it fits ([`eligible_cards`]), not on the
+/// slowest. Zero without a card.
+pub(crate) fn host_max_guest_cycles_over(cards: &[CardPlan], margin: f64, proving_timeout_secs: u64) -> u64 {
+    cards.iter().map(|c| host_max_guest_cycles_at(&c.plan(margin), proving_timeout_secs)).max().unwrap_or(0)
+}
+
+fn host_max_guest_cycles_at(plan: &ProvePlan, proving_timeout_secs: u64) -> u64 {
     const MAX: u64 = 1 << 34; // `zkminer_witness_host::pipeline::MAX_HOST_GUEST_CYCLES` (a Linux-only crate)
     let cps = if plan.cps.is_finite() && plan.cps > 0.0 { plan.cps } else { 0.0 };
     // The watchdog admits an estimate strictly below it: (cycles / cps + fixed) x margin <= T - 1.
@@ -820,6 +879,32 @@ mod tests {
         assert_eq!(p, ProvePlan { cps: 2e5, fixed_secs: 600, margin: 1.5 });
         assert_eq!(ProvePlan::over([], 1.5), None);
         assert_eq!(ProvePlan::over([(1e6, 0)], 0.5).unwrap().margin, 1.0, "never below 1");
+    }
+
+    /// An RX 7900 XTX (2.2M c/s, a 30 s wrap) and an Arc A770 (116K c/s, a 60 s wrap): a job the
+    /// A770 cannot prove in time is still proven on the XTX, and sized there, not refused.
+    #[test]
+    fn a_witness_job_is_proven_on_the_cards_it_fits() {
+        let card = |device: &str, cps, fixed_secs| CardPlan { device: device.to_string(), cps, fixed_secs };
+        let cards = [card("gpu-intel0", 116e3, 60), card("gpu-rocm1", 2.2e6, 30)];
+        let any = |_| true;
+        // 20M cycles: both, fastest first ((20M / 116K + 60) x 1.5 = 349 s < 600).
+        let both = eligible_cards(&cards, 1.5, 20_000_000, 2, 600, any);
+        assert_eq!(both.iter().map(|c| c.device.as_str()).collect::<Vec<_>>(), ["gpu-rocm1", "gpu-intel0"]);
+        // 60M cycles: the XTX only (the A770 would need ~866 s).
+        let xtx = eligible_cards(&cards, 1.5, 60_000_000, 2, 600, any);
+        assert_eq!(xtx.iter().map(|c| c.device.as_str()).collect::<Vec<_>>(), ["gpu-rocm1"]);
+        let plan = ProvePlan::over(xtx.iter().map(|c| (c.cps, c.fixed_secs)), 1.5).unwrap();
+        assert!(watchdog_admits(estimate_prove_secs(60_000_000, &plan, 2), 600));
+        // The window binds too, and nothing fits a 10 s one.
+        assert!(eligible_cards(&cards, 1.5, 20_000_000, 2, 600, |need| need <= 10).is_empty());
+        // The host maximum is the fastest card's, not the slowest's.
+        assert_eq!(
+            host_max_guest_cycles_over(&cards, 1.5, 600),
+            host_max_guest_cycles(&cards[1].plan(1.5), 600)
+        );
+        assert!(host_max_guest_cycles_over(&cards, 1.5, 600) > host_max_guest_cycles(&cards[0].plan(1.5), 600));
+        assert_eq!(host_max_guest_cycles_over(&[], 1.5, 600), 0);
     }
 
     #[test]

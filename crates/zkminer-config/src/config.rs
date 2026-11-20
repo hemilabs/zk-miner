@@ -446,8 +446,9 @@ pub struct ProverConfig {
     /// 0 = no timeout (not recommended for production).
     #[serde(default = "default_proving_timeout")]
     pub proving_timeout_secs: u64,
-    /// Maximum time (seconds) for the entire benchmark suite on one worker.
-    /// Worker is killed after this. 0 = no timeout.
+    /// Maximum time (seconds) for one step of a worker's benchmark: its warm-up, each program,
+    /// each zkOP/s proof, each calibration proof. The worker is killed when a step runs past it,
+    /// so a slow card's whole benchmark may take longer. 0 = no timeout.
     #[serde(default = "default_benchmark_timeout")]
     pub benchmark_timeout_secs: u64,
     /// Additional directories to search for prover worker binaries.
@@ -518,7 +519,9 @@ fn default_proving_timeout() -> u64 {
     600
 }
 fn default_benchmark_timeout() -> u64 {
-    // The suite plus the zkOP/s proofs is about 10 minutes on an Arc A770's RISC Zero worker.
+    // A bound on each step of a benchmark (its warm-up, each program, each zkOP/s proof), not on the
+    // whole run: an Arc A770's RISC Zero suite and score take over 30 minutes, and its slowest
+    // step about 10 (the scored zkOP/s proof); its slowest calibration proof, at po2 18, 25.
     BENCHMARK_TIMEOUT_DEFAULT_SECS
 }
 
@@ -527,7 +530,7 @@ const BENCHMARK_TIMEOUT_DEFAULT_SECS: u64 = 1800;
 const BENCHMARK_TIMEOUT_OLD_DEFAULT_SECS: u64 = 600;
 
 impl ProverConfig {
-    /// The per-worker benchmark deadline, or `None` for no deadline.
+    /// The deadline of each step of a worker's benchmark, or `None` for no deadline.
     ///
     /// A config still carrying the old default gets the new one: that value was never a choice, and
     /// the worker would be killed partway through scoring a slower card.

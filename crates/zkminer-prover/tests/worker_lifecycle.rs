@@ -127,6 +127,150 @@ fn benchmark_timeout_then_ensure_alive_respawns() {
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
+/// `benchmark_timeout` bounds each step of a benchmark, not the whole run: a worker whose warm-up and
+/// suite each take 2 s (4 s in all) outlives a 3 s timeout, as an Arc A770's risc0 benchmark (over
+/// 30 minutes, no step past about 10) outlives the default 1800 s.
+#[test]
+fn a_benchmark_longer_than_its_timeout_survives_when_each_step_fits() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(3)));
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BENCHMARK_SECS".to_string(), "2".to_string());
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+    let pid = pool.test_pid("mock:generic").unwrap();
+
+    let started = std::time::Instant::now();
+    assert!(pool.benchmark("mock").is_ok());
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the benchmark should have taken both steps: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        pool.test_has_handle("mock:generic"),
+        Some(true),
+        "the worker was killed"
+    );
+    assert_eq!(pool.test_pid("mock:generic"), Some(pid));
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+// ---- Intel warm-ups ----
+
+/// The pids that warmed up, one line per `Warmup` the mock answered (`MOCK_WARMUP_LOG`).
+fn warmups(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+fn risc0_env(log: &std::path::Path, hang_on: &str) -> HashMap<String, String> {
+    let mut env = mock_env(hang_on, "");
+    env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+    env.insert("MOCK_WARMUP_LOG".to_string(), log.display().to_string());
+    env
+}
+
+fn warmup_log(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("zkminer-warmup-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("warmups")
+}
+
+/// An Intel card's kernels are compiled for it on its first proof, so each is warmed up before it
+/// proves. The startup warm-up warms every Intel card and records each: it used to warm only the
+/// first slot and record only the backend, so every Intel card warmed up again inside its first
+/// claimed proof (on a start that ran no benchmark).
+#[test]
+fn the_startup_warm_up_warms_each_intel_card_once() {
+    let log = warmup_log("each-card");
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    for key in ["risc0:intel:0", "risc0:intel:1"] {
+        pool.insert_test_worker(key, "risc0", mock_worker_path(), risc0_env(&log, ""))
+            .expect("failed to spawn mock worker");
+    }
+    pool.warm_up("risc0", Duration::from_secs(60))
+        .expect("warm up");
+    assert_eq!(warmups(&log), 2, "one warm-up per Intel card");
+    for _ in 0..4 {
+        pool.prove("risc0", &[], &[], None, Some(Duration::from_secs(10)), None)
+            .expect("a warmed card proves");
+    }
+    assert_eq!(warmups(&log), 2, "a claimed proof warmed a card up again");
+    let _ = std::fs::remove_dir_all(log.parent().unwrap());
+}
+
+/// An Intel card whose startup warm-up failed warms up before its first proof, inside the job's
+/// deadline, not inside `WARMUP_TIMEOUT` (an hour): a warm-up that hangs is cut where the proof could
+/// no longer start (15 s before the deadline), and the job fails with a deadline error.
+#[test]
+fn an_intel_warm_up_inside_a_claimed_proof_stops_at_its_deadline() {
+    let log = warmup_log("deadline");
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(
+        "risc0:cuda:0",
+        "risc0",
+        mock_worker_path(),
+        risc0_env(&log, ""),
+    )
+    .expect("failed to spawn mock worker");
+    pool.insert_test_worker(
+        "risc0:intel:0",
+        "risc0",
+        mock_worker_path(),
+        risc0_env(&log, "warmup"),
+    )
+    .expect("failed to spawn mock worker");
+    // The backend warms on the CUDA slot; the Intel card's warm-up hangs and is cut at 3 s.
+    pool.warm_up("risc0", Duration::from_secs(3))
+        .expect("the backend warms up");
+    let before = warmups(&log);
+
+    let eligible = ["gpu-intel0".to_string()];
+    let started = std::time::Instant::now();
+    let err = pool
+        .prove_min_vram(
+            "risc0",
+            &[],
+            &[],
+            None,
+            Some(Duration::from_secs(600)),
+            None,
+            None,
+            &[],
+            &[],
+            &mut None,
+            Some(started + Duration::from_secs(25)),
+            None,
+            None,
+            zkminer_prover::dispatcher::JobCards {
+                eligible: &eligible,
+                order: &eligible,
+            },
+            0,
+        )
+        .expect_err("a card that cannot warm up cannot prove");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the warm-up outlived the job: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        warmups(&log),
+        before + 1,
+        "the card warmed up inside the proof"
+    );
+    assert!(
+        err.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
+            .is_some()
+            || format!("{err:#}").contains("deadline"),
+        "{err:#}"
+    );
+    let _ = std::fs::remove_dir_all(log.parent().unwrap());
+}
+
 // ---- Prove timeout tests ----
 
 #[test]
@@ -895,7 +1039,7 @@ fn the_segment_size_reaches_the_worker() {
             None,
             Some(&size_on),
             None,
-            None,
+            zkminer_prover::dispatcher::JobCards::default(),
             0,
         )
         .expect("proof should succeed");
