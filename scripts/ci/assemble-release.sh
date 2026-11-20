@@ -6,6 +6,8 @@
 # <artifacts dir> holds one directory per build-docker.yml target (dist-cli/, dist-rocm/, ...), as
 # actions/download-artifact leaves them. The release gets:
 # - the CLI and the NVIDIA and OpenVM provers as single files, as before;
+# - what witness jobs run beside the CLI, as single files: the sandbox probe, the builder and
+#   broker, and the risc0 CPU worker that executes requesters' guests (dist-witness);
 # - zkminer-provers-amd-linux-x86_64.tar.zst: the risc0 ROCm worker with ROCm 7.1's HIP runtime
 #   (zkminer-rocm/), and the SP1 HIP server with ROCm 10.1's (sp1-gpu-server-hip-lib/);
 # - zkminer-provers-intel-linux-x86_64.tar.zst: the risc0 Intel worker, the SP1 SYCL server, and
@@ -39,6 +41,8 @@ modes() { # <dir>
 
 echo "== single files"
 for f in dist-cli/zkminer dist-cli-windows/zkminer.exe dist-openvm/zkminer-prove-openvm \
+         dist-witness/zkminer-witness-sandbox-probe dist-witness/zkminer-witness-builder \
+         dist-witness/zkminer-witness-broker dist-witness/zkminer-prove-risc0-cpu \
          dist-cuda/zkminer-prove-risc0-cuda dist-sp1/zkminer-prove-sp1 dist-sp1-server/sp1-gpu-server \
          dist-sp1-server/libcudart.so.12 dist-sp1-server/libcudart.so.12.LICENSE.txt; do
   need "$in/$f"
