@@ -6328,29 +6328,40 @@ fn fastest_benchmarked_device(
 }
 
 /// How long, in seconds, a job of `backend` claimed now waits before it can start, with the planner
-/// off: the work already claimed and not yet proven (`outstanding`, cycles and backend, at each
-/// backend's fastest rate) spread over the `cards`, once every card has a job; or the work of its own
-/// backend spread over the `side_by_side` that fit in memory together, once that many are claimed.
-/// The larger of the two; 0 while a card and a turn are free. Pessimistic (a running job counts in
-/// full), as a deadline estimate should be.
+/// off. Once every one of the `cards` has a job, the work already claimed and not yet proven
+/// (`outstanding`: cycles and backend) at all the cards' combined rate for each backend (`rates`, each
+/// card's, fastest first). Once as many of its own backend as fit side by side (`side_by_side`) are
+/// claimed, that backend's work at the combined rate of that many fastest cards. The larger of the
+/// two; 0 while a card and a turn are free. A running job counts in full, as a deadline estimate
+/// should. (Spreading the work at the fastest card's rate assumed every card was that fast: 40% low
+/// for RISC Zero on a 5090 beside a 4070.)
 fn expected_queue_wait_secs(
     outstanding: &[(u64, &str)],
     backend: &str,
     cards: usize,
     side_by_side: usize,
-    rate: impl Fn(&str) -> Option<f64>,
+    rates: impl Fn(&str) -> Vec<f64>,
 ) -> u64 {
-    let secs = |(cycles, b): &(u64, &str)| rate(b).map_or(0.0, |r| *cycles as f64 / r);
+    let capacity = |b: &str, n: usize| -> f64 { rates(b).into_iter().take(n).sum() };
+    let secs = |(cycles, b): &(u64, &str), n: usize| {
+        let c = capacity(b, n);
+        if c > 0.0 {
+            *cycles as f64 / c
+        } else {
+            0.0
+        }
+    };
     let cards = cards.max(1);
     let card_wait = if outstanding.len() >= cards {
-        outstanding.iter().map(secs).sum::<f64>() / cards as f64
+        outstanding.iter().map(|w| secs(w, cards)).sum::<f64>()
     } else {
         0.0
     };
     let side_by_side = side_by_side.max(1);
     let same: Vec<&(u64, &str)> = outstanding.iter().filter(|(_, b)| *b == backend).collect();
     let turn_wait = if same.len() >= side_by_side {
-        same.iter().map(|w| secs(w)).sum::<f64>() / side_by_side as f64
+        let n = side_by_side.min(cards);
+        same.iter().map(|w| secs(w, n)).sum::<f64>()
     } else {
         0.0
     };
@@ -9169,13 +9180,13 @@ async fn miner_brain(
                     cards.len().clamp(1, max_concurrent.max(1)),
                     side_by_side,
                     |b| {
-                        device_backend_throughputs
+                        let mut rates: Vec<f64> = device_backend_throughputs
                             .iter()
                             .filter(|(_, rb, t)| rb == b && t.is_finite() && *t > 0.0)
                             .map(|(_, _, t)| *t)
-                            .fold(None, |best: Option<f64>, t| {
-                                Some(best.map_or(t, |x| x.max(t)))
-                            })
+                            .collect();
+                        rates.sort_by(|x, y| y.total_cmp(x));
+                        rates
                     },
                 );
                 prove_window.saturating_sub(wait)
@@ -11992,6 +12003,35 @@ async fn process_job_lifecycle(
     // A job re-driven at start (recovery) was never planned this run: prefer its backend's fastest
     // card, from the benchmark, as the planner would have. Without it, a 1.1 B-cycle job kept over a
     // restart went to the first free card, a 4070, and took 28 minutes while the 5090 sat idle.
+    // How long it would take on each of its backend's slots (the benchmark rate of that slot's card,
+    // plus the fixed allowances), so the dispatcher starts it only where it can finish before its
+    // cutoff and queues it by its latest start (`with_slot_estimates`).
+    let slot_estimates: HashMap<String, Duration> = {
+        let backend_name = backend.to_string();
+        let allowance = fixed_proving_allowance_secs(backend)
+            + execute_allowance_secs(backend, snapshot.measured_execute_secs);
+        let keys = zkminer_prover::engine::worker_pool()
+            .map(|p| p.slot_keys_for(backend))
+            .unwrap_or_default();
+        tokio::task::spawn_blocking(move || {
+            let Some(suite) = zkminer_prover::benchmark::load_cached_benchmark() else {
+                return HashMap::new();
+            };
+            keys.into_iter()
+                .filter_map(|key| {
+                    let device =
+                        zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&key);
+                    let rate = suite.throughput_for(&device, &backend_name)?;
+                    (rate.is_finite() && rate > 0.0).then(|| {
+                        let secs = sizing_cycles as f64 / rate + allowance as f64;
+                        (key, Duration::from_secs_f64(secs))
+                    })
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
     let mut snapshot = snapshot;
     if is_recovery && snapshot.preferred_device.is_none() {
         let backend_name = backend.to_string();
@@ -12060,7 +12100,9 @@ async fn process_job_lifecycle(
         // deliberately refunds the attempt it would otherwise have spent.
         let mut memory_waits = 0u32;
         // When this job first waited for host memory: its waits end `HOST_MEMORY_WAIT_LIMIT` after.
+        // Cleared once a pass is not a memory wait (an attempt ran): a later shortage is a new one.
         let mut memory_wait_since: Option<std::time::Instant> = None;
+        let mut memory_waited_last = false;
         // Free VRAM waits, counted separately from `memory_waits`: the two shortages have different
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
@@ -12120,6 +12162,10 @@ async fn process_job_lifecycle(
                 }
             }
             failed_last = false;
+            if !memory_waited_last {
+                memory_wait_since = None;
+            }
+            memory_waited_last = false;
             retrying = true;
             // The EFFECTIVE deadline moves out while the protocol is paused or a Disabled window
             // lasts (and on a downtime extension): refresh it each attempt, so a proof is never cut
@@ -12312,6 +12358,7 @@ async fn process_job_lifecycle(
             // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
             // by value into the move closure.
             let execute_peak_for_prove = snapshot.measured_peak.unwrap_or(0);
+            let estimates_for_prove = slot_estimates.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
@@ -12402,28 +12449,31 @@ async fn process_job_lifecycle(
                     let _ = events_tx.send((event, slot_key.to_string()));
                 };
                 let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
-                let r = pool.prove_min_vram(
-                    &backend_str,
-                    &elf_clone,
-                    &input_clone,
-                    None,
-                    Some(effective_timeout),
-                    Some(Box::new(mark_started)),
-                    mv,
-                    &excl,
-                    &disabled_for_prove,
-                    &mut used,
-                    abort_at,
-                    job_sizes
-                        .is_some()
-                        .then_some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
-                    program_id_bytes,
-                    zkminer_prover::dispatcher::JobCards {
-                        eligible: &eligible_for_prove,
-                        order: &order_for_prove,
-                    },
-                    execute_peak_for_prove,
-                );
+                let r =
+                    zkminer_prover::dispatcher::with_slot_estimates(estimates_for_prove, || {
+                        pool.prove_min_vram(
+                            &backend_str,
+                            &elf_clone,
+                            &input_clone,
+                            None,
+                            Some(effective_timeout),
+                            Some(Box::new(mark_started)),
+                            mv,
+                            &excl,
+                            &disabled_for_prove,
+                            &mut used,
+                            abort_at,
+                            job_sizes
+                                .is_some()
+                                .then_some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
+                            program_id_bytes,
+                            zkminer_prover::dispatcher::JobCards {
+                                eligible: &eligible_for_prove,
+                                order: &order_for_prove,
+                            },
+                            execute_peak_for_prove,
+                        )
+                    });
                 (r, used)
             })
             .await
@@ -12649,8 +12699,7 @@ async fn process_job_lifecycle(
                         // first waits the first's few minutes.
                         let behind_ours = !shortage.attempted
                             && shortage.reserved > 0
-                            && shortage.available.saturating_add(shortage.reserved)
-                                >= shortage.needed;
+                            && pool.fits_when_ours_finish(backend, shortage.needed);
                         if (!shortage.attempted || outside)
                             && (waited < HOST_MEMORY_WAIT_LIMIT || behind_ours)
                         {
@@ -12686,6 +12735,7 @@ async fn process_job_lifecycle(
                                 HOST_MEMORY_MIN_RETRY.saturating_sub(began.elapsed()),
                             )
                             .await;
+                            memory_waited_last = true;
                             continue;
                         }
                         // Still not the slot's fault, so do not exclude it or call it unhealthy —
@@ -13516,9 +13566,10 @@ async fn end_attempt_display(state: &zkminer_tui::state::SharedState, job_id: B2
     }
 }
 
-/// Rebuild the Jobs page's held locks (`MinerState::kept_locks`): the claim journal's locks with no
-/// task working on them (not in `in_flight`), each with why (`note_kept_reason`, else what its journal
-/// state implies). `rows` keeps each claimed job's last row, so a held one keeps its terms.
+/// Rebuild the Jobs page's held locks (`MinerState::kept_locks`): the claim journal's locks that no
+/// task works on, or that one works on (a recovery release) without a claimed or market row, each
+/// with why (`note_kept_reason`, else what its journal state implies). `rows` keeps each claimed
+/// job's last row, so a held one keeps its terms.
 async fn refresh_kept_locks(
     state: &zkminer_tui::state::SharedState,
     journal: &SharedJournal,
@@ -16840,32 +16891,31 @@ mod tests {
     /// once as many of its backend as fit side by side are claimed; nothing while both are free.
     #[test]
     fn a_queued_claim_is_charged_the_work_ahead_of_it() {
-        let rate = |b: &str| match b {
-            "sp1" => Some(10_000_000.0),
-            "risc0" => Some(5_000_000.0),
-            _ => None,
+        // A 5090 and a 4070: SP1 13 and 5 Mc/s, RISC Zero 5 and 1 Mc/s.
+        let rates = |b: &str| match b {
+            "sp1" => vec![13_000_000.0, 5_000_000.0],
+            "risc0" => vec![5_000_000.0, 1_000_000.0],
+            _ => Vec::new(),
         };
-        // One SP1 job (100 s) out, two cards, two SP1 fit: a card and a turn are free.
+        let sp1_job = (1_800_000_000u64, "sp1");
+        // One SP1 job out, two cards, two SP1 fit: a card and a turn are free.
+        assert_eq!(expected_queue_wait_secs(&[sp1_job], "sp1", 2, 2, rates), 0);
+        // Only one SP1 fits in memory: a second waits the first, at the fastest card's rate.
         assert_eq!(
-            expected_queue_wait_secs(&[(1_000_000_000, "sp1")], "sp1", 2, 2, rate),
-            0
-        );
-        // Only one SP1 fits in memory: a second waits the first's 100 s.
-        assert_eq!(
-            expected_queue_wait_secs(&[(1_000_000_000, "sp1")], "sp1", 2, 1, rate),
-            100
+            expected_queue_wait_secs(&[sp1_job], "sp1", 2, 1, rates),
+            139
         );
         // A RISC Zero job is not behind SP1's turn while a card is free...
         assert_eq!(
-            expected_queue_wait_secs(&[(1_000_000_000, "sp1")], "risc0", 2, 4, rate),
+            expected_queue_wait_secs(&[sp1_job], "risc0", 2, 4, rates),
             0
         );
-        // ...but once both cards have work, it waits for their work spread over the two.
-        let both = [(1_000_000_000, "sp1"), (500_000_000, "risc0")];
-        assert_eq!(expected_queue_wait_secs(&both, "risc0", 2, 4, rate), 100);
+        // ...but once both cards have work, it waits for it at both cards' combined rate.
+        let both = [sp1_job, (600_000_000, "risc0")];
+        assert_eq!(expected_queue_wait_secs(&both, "risc0", 2, 4, rates), 200);
         // A backend with no rate counts nothing.
         assert_eq!(
-            expected_queue_wait_secs(&[(9, "openvm"), (9, "openvm")], "sp1", 1, 1, rate),
+            expected_queue_wait_secs(&[(9, "openvm"), (9, "openvm")], "sp1", 1, 1, rates),
             0
         );
     }
