@@ -35,6 +35,8 @@
 //! - `MOCK_SETUP_SECS`: a one-time setup of this many seconds (default 0), paid by the first
 //!   Warmup, Execute or ProgramId, as SP1's measure worker builds its CPU prover on first use.
 //! - `MOCK_WARMUP_LOG`: a file each Warmup appends a line to, so a test can count them.
+//! - `MOCK_BENCHMARK_SECS`: how long each Benchmark request takes (default 0): a benchmark is several
+//!   (the warm-up, the suite), so a test can make the whole run outlast a per-step deadline.
 //! - `MOCK_PROTOCOL_VERSION`: the protocol version the HelloAck reports, as a worker built for
 //!   another version would. Default: this build's.
 
@@ -90,6 +92,12 @@ fn main() {
     let seal = hex_env("MOCK_SEAL_HEX");
     let prove_delay = Duration::from_secs(
         std::env::var("MOCK_PROVE_DELAY_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    );
+    let benchmark_delay = Duration::from_secs(
+        std::env::var("MOCK_BENCHMARK_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
@@ -158,6 +166,7 @@ fn main() {
                         std::thread::sleep(Duration::from_secs(3600));
                     }
                 }
+                std::thread::sleep(benchmark_delay);
                 let resp = WorkerResponse::BenchmarkResult { results: vec![] };
                 write_message(&mut stdout, &resp).unwrap();
             }

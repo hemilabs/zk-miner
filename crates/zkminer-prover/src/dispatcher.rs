@@ -140,6 +140,21 @@ pub struct ProgramIdDerivation {
 /// (see `WorkerPool::prove_min_vram`).
 pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
 
+/// The cards a job may run on and the order to try them in, as the claim gate planned it (see
+/// `WorkerPool::prove_min_vram`). Both lists hold benchmark device ids (e.g. `gpu0`, `gpu-rocm1`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JobCards<'a> {
+    /// The cards this job may run on; empty: any. A HARD filter, like `disabled` and the job's sizes,
+    /// applied before every preference and never restored: the claim gate admitted the job only on
+    /// the cards it could finish on in time, and sized its watchdog on the slowest of them, so a card
+    /// outside it would be killed by the watchdog or miss the deadline.
+    pub eligible: &'a [String],
+    /// The cards to try first, in this order (the claim gate's: the card the job was planned for,
+    /// then the rest of `eligible`, fastest first). A preference: a busy or down card yields to the
+    /// next, and any candidate not in it follows in the usual warm-first order.
+    pub order: &'a [String],
+}
+
 /// A witness proof's execution that did not reproduce its bundle (`WorkerResponse::JournalDiverged`,
 /// plan §15.3): it did not halt with exit code 0, or its journal is not the bundle's. Nothing was
 /// proven. Built only from the worker's typed response, never from text.
@@ -614,6 +629,28 @@ impl WorkerEntry {
     }
 }
 
+/// A watchdog's clock: its deadline is the last `touch` plus its timeout. A benchmark touches it as each
+/// step completes (the warm-up, each program, each scoring proof), so `benchmark_timeout` bounds a step
+/// rather than the whole run, which a slow card cannot finish in it (an Arc A770's risc0 suite and
+/// score take over 30 minutes, no step more than about 10), while a wedged step is still caught as
+/// soon.
+#[derive(Clone)]
+struct WatchdogClock(Arc<Mutex<Instant>>);
+
+impl WatchdogClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// RAII guard that kills a worker process after a deadline.
 /// Drop cancels the watchdog thread.
 struct ProvingWatchdog {
@@ -628,11 +665,30 @@ impl ProvingWatchdog {
     /// handler knows not to count it as a consecutive failure.
     fn new(
         pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_clock(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            WatchdogClock::new(),
+        )
+    }
+
+    /// [`new`](Self::new) with a deadline of `clock`'s last touch plus `timeout`, re-read every second.
+    fn with_clock(
+        pid_ref: Arc<AtomicU32>,
         // Only the identity-checked group kill reads it, and that is Unix-only.
         #[cfg_attr(not(unix), allow(unused_variables))] starttime_ref: Arc<AtomicU64>,
         timeout: Duration,
         slot_key: String,
         intentional_kill: Arc<AtomicBool>,
+        clock: WatchdogClock,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -646,8 +702,7 @@ impl ProvingWatchdog {
             std::thread::Builder::new()
                 .name(format!("prove-watchdog-{slot_key}"))
                 .spawn(move || {
-                    let deadline = Instant::now() + timeout;
-                    while Instant::now() < deadline {
+                    while Instant::now() < clock.last() + timeout {
                         std::thread::sleep(Duration::from_secs(1));
                         if cancel_clone.load(Ordering::Relaxed) {
                             return;
@@ -791,8 +846,8 @@ fn gpu_vram_bytes(
         if cfg!(windows) {
             return crate::discovery::intel_vram_bytes(idx);
         }
-        // The xe driver's own count of the card's device memory (sysfs has none): see
-        // `discovery::intel_vram`. Unknown on i915, which keeps the unsized behaviour.
+        // The driver's own count of the card's device memory (sysfs has none), from xe or i915:
+        // see `discovery::intel_vram`.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
     }
     if gpu_tag != "cuda" {
@@ -1392,7 +1447,8 @@ fn read_drm_card_occupancy(
 
 /// What each process holds of one card's VRAM, in bytes, from the DRM fdinfo of the render and card
 /// nodes it has open (`<proc_root>/<pid>/fdinfo/<fd>`). amdgpu (ROCm's KFD memory included) and xe
-/// both report `drm-resident-vram*` per open DRM file, matched to the card by `drm-pdev`.
+/// report `drm-resident-vram*` per open DRM file, and i915 `drm-resident-local*`, matched to the card
+/// by `drm-pdev`.
 ///
 /// Only processes whose fds we may read appear: those of our own user, which every worker of ours
 /// is. Anyone else's memory stays in the card's `used` and reads as foreign, the conservative
@@ -1437,7 +1493,8 @@ fn drm_vram_by_pid(proc_root: &std::path::Path, pci_bus_id: &str) -> Vec<(u32, u
 
 /// `(drm-client-id, VRAM bytes)` from one DRM fdinfo, or `None` when it is for another card (or has
 /// no client id). The VRAM is the sum of the `drm-resident-vram<N>` regions (amdgpu: `vram`, xe:
-/// `vram0`, `vram1`, ...), or the older `drm-memory-vram` when no region is reported.
+/// `vram0`, `vram1`, ...) or i915's `drm-resident-local<N>` (its device memory; not `stolen-local`), or
+/// the older `drm-memory-vram` when no region is reported.
 fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
     let (mut pdev, mut client, mut resident, mut legacy) = (None, None, None, None);
     for line in info.lines() {
@@ -1449,9 +1506,12 @@ fn parse_drm_fdinfo(info: &str, pci_bus_id: &str) -> Option<(u64, u64)> {
             "drm-pdev" => pdev = Some(value.to_ascii_lowercase()),
             "drm-client-id" => client = value.parse::<u64>().ok(),
             "drm-memory-vram" => legacy = parse_drm_size(value),
-            key if key
-                .strip_prefix("drm-resident-vram")
-                .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit())) =>
+            key if ["drm-resident-vram", "drm-resident-local"]
+                .iter()
+                .any(|prefix| {
+                    key.strip_prefix(prefix)
+                        .is_some_and(|region| region.bytes().all(|b| b.is_ascii_digit()))
+                }) =>
             {
                 if let Some(bytes) = parse_drm_size(value) {
                     resident = Some(resident.unwrap_or(0u64).saturating_add(bytes));
@@ -1877,6 +1937,45 @@ const SP1_QUEUE_DIR_ENV: &str = "SP1_GROTH16_QUEUE_DIR";
 /// Which build of `sp1-gpu-server` the SP1 SDK runs (`~/.sp1/bin/<name>`, socket
 /// `/tmp/<name>-<device>.sock`); see `discovery::sp1_server_name`.
 const SP1_GPU_SERVER_NAME_ENV: &str = "SP1_GPU_SERVER_NAME";
+
+/// Level Zero's V2 adapter for a risc0 worker on an Alchemist card (Arc A-series, Xe-HPG), unless the
+/// operator chose an adapter (`SYCL_UR_USE_LEVEL_ZERO_V2`, inherited).
+///
+/// The loader picks V2 only when a visible device supports it, so an Alchemist card alone (the
+/// worker's `ZE_AFFINITY_MASK`) got the legacy adapter, whose copy engine there reads results before
+/// the kernels writing them have finished. On an Arc A770, risc0's Groth16 seal came out invalid (a
+/// point off the curve) in 12 of 40 proofs on the legacy adapter, and in 0 of 40 on V2, whose Groth16
+/// step also took 5.3 s instead of 14.4 (the legacy adapter with its copy engine off was right too, at
+/// 14.7 s).
+///
+/// Not SP1: its SYCL server picks the legacy adapter on Linux itself, and on V2 an A770 proof waited
+/// forever (the GPU idle, one host thread spinning) after five programs had proved.
+fn alchemist_level_zero_env(env: &mut HashMap<String, String>, backend: &str, alchemist: bool) {
+    const V2: &str = "SYCL_UR_USE_LEVEL_ZERO_V2";
+    if alchemist
+        && backend == zkminer_prover_protocol::BACKEND_RISC0
+        && std::env::var_os(V2).is_none()
+    {
+        env.insert(V2.into(), "1".into());
+    }
+}
+
+/// The SP1 SYCL server's cap on the freed device memory it keeps cached for reuse, in MiB.
+const SP1_ALLOC_CACHE_MB_ENV: &str = "SP1_GPU_ALLOC_CACHE_MB";
+
+/// `SP1_ALLOC_CACHE_MB_ENV` for an Alchemist card (Arc A-series, Xe-HPG). The server's default keeps up
+/// to three quarters of the card cached, and frees it only when one of its own allocations fails,
+/// not when the driver needs memory for a kernel. On a 16 GB Arc A770 that failed SP1 proofs: a Level
+/// Zero allocation or kernel launch ran out of memory mid-proof, after which the server's next proof
+/// hung (the GPU idle) or failed. With 4 GiB the benchmark suite proved and verified at the card's own
+/// shard size, `zkop-mix` included, with nothing failed or retried.
+const ALCHEMIST_SP1_ALLOC_CACHE_MB: u64 = 4096;
+
+/// Whether `key` is a slot on an Intel card, whose kernels are compiled for it on first use (see
+/// `WorkerPool::ensure_warmed`).
+fn is_intel_slot(key: &str) -> bool {
+    key.split(':').nth(1) == Some("intel")
+}
 
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
 /// Groth16 component 2.3 GB.
@@ -2325,6 +2424,11 @@ impl WorkerPool {
                         env.insert("ONEAPI_DEVICE_SELECTOR".into(), "level_zero:*".into());
                     }
                 }
+                alchemist_level_zero_env(
+                    &mut env,
+                    backend,
+                    pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist),
+                );
                 // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
                 // Groth16 proving key cached on the GPU between proofs only on a card it knows has
                 // room (`release_groth16_cache_if_tight`).
@@ -2348,6 +2452,17 @@ impl WorkerPool {
         {
             if let Some(name) = crate::discovery::sp1_server_name(gpu_tag) {
                 env.insert(SP1_GPU_SERVER_NAME_ENV.into(), name.into());
+            }
+            // An Alchemist card's SP1 server keeps less freed device memory cached: see
+            // `ALCHEMIST_SP1_ALLOC_CACHE_MB`. An operator's own setting, inherited, wins.
+            if gpu_tag == "intel"
+                && std::env::var_os(SP1_ALLOC_CACHE_MB_ENV).is_none()
+                && pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist)
+            {
+                env.insert(
+                    SP1_ALLOC_CACHE_MB_ENV.into(),
+                    ALCHEMIST_SP1_ALLOC_CACHE_MB.to_string(),
+                );
             }
             env.insert(
                 "MEMORY_LIMIT".into(),
@@ -3489,59 +3604,118 @@ impl WorkerPool {
 
     /// Runs `backend`'s one-time setup on one of its workers and records the backend as warmed:
     /// for SP1, installing the Groth16 circuit artifacts and, where its server supports it,
-    /// building the stripped circuit. Takes a host-memory reservation for it, and kills the worker
-    /// if it runs past `timeout`. Returns what was done.
+    /// building the stripped circuit. Then warms each of its other Intel cards, whose kernels are
+    /// compiled per card (see `ensure_warmed`), so none does it inside its first claimed proof; one
+    /// that fails is warmed before its first proof instead. Takes a host-memory reservation for it,
+    /// and kills the worker if it runs past `timeout`. Returns what was done.
     pub fn warm_up(&self, backend: &str, timeout: Duration) -> Result<String> {
         let mut keys = self.keys_for_prefix(backend);
         keys.sort();
         let key = keys
             .first()
             .ok_or_else(|| anyhow::anyhow!("no {backend} worker to warm up"))?;
-        let summary = self.warm_up_slot(key, timeout)?;
-        self.warmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(backend.to_string());
+        let summary = self.warm_up_slot(key, timeout, None, false)?;
+        self.mark_warmed(key);
+        for other in keys.iter().skip(1).filter(|k| is_intel_slot(k)) {
+            if self.slot_warmed(other) {
+                continue;
+            }
+            match self.warm_up_slot(other, timeout, None, true) {
+                Ok(done) => {
+                    self.mark_warmed(other);
+                    tracing::info!("{other} warmed up: {done}");
+                }
+                Err(e) => tracing::warn!(
+                    "{other}: its warm-up failed, so it warms up before its first proof instead: {e:#}"
+                ),
+            }
+        }
         Ok(summary)
+    }
+
+    /// Whether `key` is ready for a proof: its backend warmed (see `backend_warmed`) and, on an Intel
+    /// card, the card itself (see `ensure_warmed`).
+    fn slot_warmed(&self, key: &str) -> bool {
+        let backend = key.split(':').next().unwrap_or(key);
+        self.backend_warmed(backend)
+            && (!is_intel_slot(key)
+                || self
+                    .warmed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(key))
+    }
+
+    /// Records a warm-up on `key`: its backend, and the card for an Intel one. Before, the startup
+    /// warm-up recorded only the backend, so an Intel card warmed up again inside its first claimed
+    /// proof on every start that ran no benchmark.
+    fn mark_warmed(&self, key: &str) {
+        let backend = key.split(':').next().unwrap_or(key);
+        let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+        warmed.insert(backend.to_string());
+        if is_intel_slot(key) {
+            warmed.insert(key.to_string());
+        }
     }
 
     /// Warms `key` up first if it needs it, for a path that would otherwise do the setup inside its
     /// own watchdog: SP1's backend (a benchmark proves Groth16 too), and each Intel card, whose SYCL
     /// kernels are compiled for the device on first use (about 8 minutes on an Arc B580, longer than
     /// a benchmark's whole budget) and cached on disk for every later process.
-    fn ensure_warmed(&self, key: &str) -> Result<()> {
-        let backend = key.split(':').next().unwrap_or(key);
-        let intel = key.split(':').nth(1) == Some("intel");
-        let backend_ready = self.backend_warmed(backend);
-        let slot_ready = !intel
-            || self
-                .warmed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(key);
-        if backend_ready && slot_ready {
+    ///
+    /// `abort_at` is a claimed proof's deadline: a warm-up inside one (an Intel card whose startup
+    /// warm-up failed or has not finished) stops where the proof could no longer start (see
+    /// `acquire_gpu_guard`), not at `WARMUP_TIMEOUT`, as does its wait for the card.
+    fn ensure_warmed(&self, key: &str, abort_at: Option<Instant>) -> Result<()> {
+        if self.slot_warmed(key) {
             return Ok(());
         }
-        let summary = self.warm_up_slot(key, WARMUP_TIMEOUT)?;
-        {
-            let mut warmed = self.warmed.lock().unwrap_or_else(|e| e.into_inner());
-            warmed.insert(backend.to_string());
-            if intel {
-                warmed.insert(key.to_string());
+        let deadline = |detail: String| {
+            anyhow::Error::new(zkminer_prover_protocol::types::ProofDeadlineReached { detail })
+        };
+        let give_up_at = abort_at.map(|at| at.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(at));
+        let timeout = match give_up_at {
+            None => WARMUP_TIMEOUT,
+            Some(at) => match at.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => left.min(WARMUP_TIMEOUT),
+                _ => {
+                    return Err(deadline(format!(
+                        "{key} has not warmed up, and too little of the job's time is left for it"
+                    )))
+                }
+            },
+        };
+        let summary = match self.warm_up_slot(key, timeout, abort_at, true) {
+            Ok(summary) => summary,
+            Err(e) if give_up_at.is_some_and(|at| Instant::now() >= at) => {
+                return Err(deadline(format!(
+                    "{key}'s warm-up ran to the job's deadline: {e:#}"
+                )))
             }
-        }
+            Err(e) => return Err(e),
+        };
+        self.mark_warmed(key);
         tracing::info!("{key} warmed up: {summary}");
         Ok(())
     }
 
-    fn warm_up_slot(&self, key: &str, timeout: Duration) -> Result<String> {
+    /// Warms `key` up. `if_cold`: not if it was warmed while this waited for its card (the startup
+    /// warm-up, or another proof's); an explicit warm-up (`warm_up`) always runs.
+    fn warm_up_slot(
+        &self,
+        key: &str,
+        timeout: Duration,
+        abort_at: Option<Instant>,
+        if_cold: bool,
+    ) -> Result<String> {
         let backend = key.split(':').next().unwrap_or(key);
         // An Intel card's warm-up is a proof (see `ensure_warmed`), so it takes the card's guard like
         // any other work on it.
-        let gpu_lock = (key.split(':').nth(1) == Some("intel"))
-            .then(|| self.gpu_lock_for(key))
-            .flatten();
-        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, Some(timeout))?;
+        let gpu_lock = is_intel_slot(key).then(|| self.gpu_lock_for(key)).flatten();
+        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, Some(timeout))?;
+        if if_cold && self.slot_warmed(key) {
+            return Ok("already warmed up".to_string());
+        }
         let entry = self
             .workers
             .get(key)
@@ -3685,6 +3859,9 @@ impl WorkerPool {
         key: &str,
         on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
         on_warmed: &dyn Fn(),
+        // Called as each step completes (the warm-up, each program, each scoring proof): the
+        // benchmark's watchdog clock (see `WatchdogClock`).
+        progress: &dyn Fn(),
     ) -> BenchmarkRequests {
         use zkminer_prover_protocol::{
             benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BACKEND_SP1,
@@ -3693,7 +3870,9 @@ impl WorkerPool {
         let backend = handle.backend.clone();
         // The worker's one-off first-proof costs land here, not on the first program's row. A
         // warm-up that fails costs only that; the suite still runs.
-        match Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {}) {
+        let warmup = Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {});
+        progress();
+        match warmup {
             Err(e) => {
                 return BenchmarkRequests {
                     results: Err(e),
@@ -3707,6 +3886,7 @@ impl WorkerPool {
         let programs = benchmark_suite(&backend);
         let total = programs.len() as u32 + 1;
         let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
+            progress();
             on_done(row, index, total)
         }) {
             Err(e) => {
@@ -3735,7 +3915,9 @@ impl WorkerPool {
         let mut lost: Option<anyhow::Error> = None;
         let scored = measure_zkop_mix(|iterations| {
             let rows = vec![zkop_mix_spec(iterations)];
-            match Self::benchmark_request(handle, rows, &|_, _, _| {}) {
+            let answer = Self::benchmark_request(handle, rows, &|_, _, _| {});
+            progress();
+            match answer {
                 Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
                 Ok(Err(message)) => {
                     tracing::error!("{key}: {BENCH_ZKOP_MIX}: {message}");
@@ -3790,7 +3972,7 @@ impl WorkerPool {
 
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
-        self.ensure_warmed(key)?;
+        self.ensure_warmed(key, None)?;
 
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
@@ -3885,18 +4067,21 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        // Start benchmark timeout watchdog if configured.
+        // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
+        let clock = WatchdogClock::new();
         let _watchdog = self.benchmark_timeout.map(|t| {
-            ProvingWatchdog::new(
+            ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
                 t,
                 key.to_string(),
                 entry.intentional_kill.clone(),
+                clock.clone(),
             )
         });
 
-        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {});
+        let requests =
+            Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {}, &|| clock.touch());
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -4162,7 +4347,7 @@ impl WorkerPool {
         on_progress: &dyn Fn(BenchmarkProgressEvent),
     ) -> Result<Vec<BenchmarkEntry>> {
         // A benchmark proves Groth16 on SP1: set it up first, outside this benchmark's watchdog.
-        self.ensure_warmed(key)?;
+        self.ensure_warmed(key, None)?;
         // The per-card guard, like every other path that puts work on a GPU. Without it, a benchmark
         // started from the TUI's `[b]` or from `zkminer benchmark` ran concurrently with a proof on
         // the SAME physical card, each side's VRAM invisible to the other — the double-booking the
@@ -4262,14 +4447,16 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        // Start benchmark timeout watchdog if configured.
+        // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
+        let clock = WatchdogClock::new();
         let _watchdog = self.benchmark_timeout.map(|t| {
-            ProvingWatchdog::new(
+            ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
                 t,
                 key.to_string(),
                 entry.intentional_kill.clone(),
+                clock.clone(),
             )
         });
 
@@ -4291,7 +4478,7 @@ impl WorkerPool {
         };
         let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
-        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed);
+        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed, &|| clock.touch());
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -4593,7 +4780,7 @@ impl WorkerPool {
             None,
             None,
             None, // program_id: convenience path (tests/benchmark) has no on-chain binding
-            None, // preferred_device: convenience path does not reserve a card
+            JobCards::default(), // any card: the convenience path does not plan one
             0,    // execute_peak_bytes: convenience path has no pre-claim measurement
         )
     }
@@ -5339,12 +5526,9 @@ impl WorkerPool {
         job_po2: Option<SlotPo2<'_>>,
         // The job's on-chain programId (risc0 image-id binding; see WorkerCommand::Prove).
         program_id: Option<[u8; 32]>,
-        // Benchmark device id (e.g. "gpu1") of the card this job was sized/planned for at claim time.
-        // Tried FIRST when dispatchable, as a PREFERENCE only: if it is not in the candidate set or is
-        // busy/down, dispatch falls through to the usual warm-first / first-free ordering, so a job is
-        // never stranded waiting for a reserved card. Feasibility is sized for the SLOWEST eligible
-        // card, so any fallback landing still meets the deadline.
-        preferred_device: Option<&str>,
+        // The cards this job may run on, and the order to try them in: see `JobCards`. The default (no
+        // cards named) leaves every card eligible, in the usual warm-first order.
+        cards: JobCards<'_>,
         // This job's pre-claim measured execute PEAK host RSS (bytes), 0 = unknown. Forwarded verbatim
         // to `prove_on_slot`, which charges the SP1 execute spike to the host ledger (finding RH2).
         execute_peak_bytes: u64,
@@ -5363,7 +5547,7 @@ impl WorkerPool {
             abort_at,
             job_po2,
             program_id,
-            preferred_device,
+            cards,
             execute_peak_bytes,
         )? {
             SlotProof::Proved(proof) => Ok(proof),
@@ -5400,7 +5584,7 @@ impl WorkerPool {
         abort_at: Option<Instant>,
         job_po2: Option<SlotPo2<'_>>,
         program_id: Option<[u8; 32]>,
-        preferred_device: Option<&str>,
+        cards: JobCards<'_>,
         execute_peak_bytes: u64,
     ) -> Result<WitnessProveOutcome> {
         Ok(
@@ -5418,7 +5602,7 @@ impl WorkerPool {
                 abort_at,
                 job_po2,
                 program_id,
-                preferred_device,
+                cards,
                 execute_peak_bytes,
             )? {
                 SlotProof::Proved(proof) => WitnessProveOutcome::Proved(proof),
@@ -5445,7 +5629,7 @@ impl WorkerPool {
         abort_at: Option<Instant>,
         job_po2: Option<SlotPo2<'_>>,
         program_id: Option<[u8; 32]>,
-        preferred_device: Option<&str>,
+        cards: JobCards<'_>,
         execute_peak_bytes: u64,
     ) -> Result<SlotProof> {
         let mut all_keys = self.keys_for_prefix(backend);
@@ -5469,6 +5653,17 @@ impl WorkerPool {
                 bail!(
                     "no {backend} card proves at a segment size this job was measured at, so it \
                      cannot be proved here"
+                );
+            }
+        }
+        // The third: only the cards the claim gate admitted this job on. See `JobCards::eligible`.
+        if !cards.eligible.is_empty() {
+            all_keys.retain(|k| cards.eligible.contains(&Self::benchmark_device_id(k)));
+            if all_keys.is_empty() {
+                bail!(
+                    "none of the cards this job was admitted on ({}) has a usable {backend} worker, \
+                     and no other card can prove it in time",
+                    cards.eligible.join(", ")
                 );
             }
         }
@@ -5586,11 +5781,11 @@ impl WorkerPool {
             rotated
         };
 
-        // Honor a claim-time device preference (see `preferred_device`): move its slot key, if present
-        // in the candidate set, to the FRONT so the dispatch loop (and the poll-wait loop, which
-        // reuses this ordering) tries it first. Pure preference — everything else keeps its warm-first
-        // order, and a preferred card that is busy/down simply yields to the next candidate.
-        let keys = Self::prefer_device_first(keys, preferred_device);
+        // Honor the claim-time order (see `JobCards::order`): its cards first, in its order, so the
+        // dispatch loop (and the poll-wait loop, which reuses this ordering) tries the planned card,
+        // then the fastest free one. Pure preference — everything else keeps its warm-first order,
+        // and a card that is busy/down simply yields to the next candidate.
+        let keys = Self::order_by_cards(keys, cards.order);
 
         for key in &keys {
             if let Some(entry) = self.workers.get(key) {
@@ -5716,27 +5911,26 @@ impl WorkerPool {
         }
     }
 
-    /// Reorder slot keys so the key whose benchmark device id equals `preferred` (e.g. "gpu1") comes
-    /// FIRST, preserving the relative order of the rest. A PREFERENCE only: a `preferred` that is
-    /// `None` or matches no key leaves the order unchanged, and a matched-but-busy/down card simply
-    /// yields to the next candidate in the dispatch/poll loops — a job is never stranded on it.
+    /// Reorder slot keys so those whose benchmark device id is in `order` come first, in `order`'s order,
+    /// keeping the relative order of the rest (the caller's warm-first rotation). A PREFERENCE only: an
+    /// empty `order`, or one naming no key, leaves the order unchanged, and a busy/down card simply
+    /// yields to the next candidate in the dispatch/poll loops, so a job is never stranded on it.
     ///
-    /// Note: this takes precedence over the warm-slot-first ordering applied by the caller, so a COLD
-    /// preferred card is tried ahead of a warm one. Under host-memory pressure that cold card may take
-    /// a host-RAM backoff (resident pages make a warm slot cheaper to admit) before its proof starts;
-    /// the caller'"'"'s retry loop handles that. The admission estimate is sized for the slowest eligible
-    /// card regardless, so preferring any particular card never risks the deadline.
-    fn prefer_device_first(keys: Vec<String>, preferred: Option<&str>) -> Vec<String> {
-        match preferred {
-            Some(pref) => {
-                let (mut preferred, rest): (Vec<String>, Vec<String>) = keys
-                    .into_iter()
-                    .partition(|k| Self::benchmark_device_id(k) == pref);
-                preferred.extend(rest);
-                preferred
-            }
-            None => keys,
+    /// This takes precedence over the warm-slot-first ordering, so a COLD planned card is tried ahead
+    /// of a warm one. Under host-memory pressure that cold card may take a host-RAM backoff before its
+    /// proof starts; the caller's retry loop then takes that card out of the order, so the job's other
+    /// cards are tried first and it follows them (it stays eligible). Every card in the order was
+    /// admitted on its own rate, so trying any of them first never risks the deadline.
+    fn order_by_cards(mut keys: Vec<String>, order: &[String]) -> Vec<String> {
+        if order.is_empty() {
+            return keys;
         }
+        let rank = |k: &String| {
+            let id = Self::benchmark_device_id(k);
+            order.iter().position(|d| *d == id).unwrap_or(order.len())
+        };
+        keys.sort_by_key(|k| rank(k));
+        keys
     }
 
     /// Benchmark-facing device id for a slot key: `"risc0:cuda:1"` -> `"gpu1"`,
@@ -5746,7 +5940,7 @@ impl WorkerPool {
     /// `benchmark::build_gpu_device_benchmarks_from_workers` (`format!("gpu{idx}")`)
     /// and the CPU rows (`"cpu"`), otherwise a card's calibration row and Settings size silently miss
     /// and its risc0 job size quietly falls back to the VRAM rule (`benchmark::risc0_job_po2`).
-    fn benchmark_device_id(key: &str) -> String {
+    pub fn benchmark_device_id(key: &str) -> String {
         let mut parts = key.split(':');
         let _backend = parts.next();
         match (parts.next(), parts.next()) {
@@ -7604,9 +7798,10 @@ impl WorkerPool {
         };
 
         // A card whose kernels are compiled on first use (Intel) is warmed up before its first proof,
-        // outside this proof's watchdog; a no-op for every other slot and for a warmed one.
-        if key.split(':').nth(1) == Some("intel") {
-            self.ensure_warmed(key)?;
+        // outside this proof's watchdog but inside its deadline; a no-op for every other slot and for
+        // a warmed one (the startup warm-up warms every Intel card; see `warm_up`).
+        if is_intel_slot(key) {
+            self.ensure_warmed(key, abort_at)?;
         }
 
         // Per-physical-GPU guard (see `gpu_locks`): serialize proofs across different
@@ -9005,22 +9200,76 @@ mod tests {
     }
 
     #[test]
-    fn prefer_device_first_moves_matching_key_to_front() {
+    fn the_claim_time_order_comes_first() {
         use super::WorkerPool;
-        let keys = vec![
-            "risc0:cuda:0".to_string(),
-            "risc0:cuda:1".to_string(),
-            "risc0:cuda:2".to_string(),
-        ];
-        // "gpu1" -> risc0:cuda:1 is moved first; the rest keep their relative order.
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let keys = strings(&[
+            "risc0:cuda:0",
+            "risc0:intel:0",
+            "risc0:rocm:0",
+            "risc0:rocm:1",
+        ]);
+        let ordered = |ids: &[&str]| WorkerPool::order_by_cards(keys.clone(), &strings(ids));
+        // The planned card, then the rest fastest first; a card not named keeps its place behind.
         assert_eq!(
-            WorkerPool::prefer_device_first(keys.clone(), Some("gpu1")),
-            vec!["risc0:cuda:1", "risc0:cuda:0", "risc0:cuda:2"]
+            ordered(&["gpu0", "gpu-rocm1", "gpu-rocm0"]),
+            [
+                "risc0:cuda:0",
+                "risc0:rocm:1",
+                "risc0:rocm:0",
+                "risc0:intel:0"
+            ]
         );
-        // A preference that matches nothing, or None, leaves the order unchanged (graceful fallback).
-        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), Some("gpu9")), keys);
-        assert_eq!(WorkerPool::prefer_device_first(keys.clone(), None), keys);
+        // The A770 last, the 7900 XTX first: a slow card is tried only after every faster one.
+        assert_eq!(
+            ordered(&["gpu-rocm1", "gpu0", "gpu-intel0"]),
+            [
+                "risc0:rocm:1",
+                "risc0:cuda:0",
+                "risc0:intel:0",
+                "risc0:rocm:0"
+            ]
+        );
+        // An order that matches nothing, or none, leaves the warm-first order unchanged.
+        assert_eq!(ordered(&["gpu9"]), keys);
+        assert_eq!(ordered(&[]), keys);
     }
+
+    /// A job admitted only on cards with no worker is refused, never sent to another card.
+    #[test]
+    fn a_job_is_never_dispatched_outside_the_cards_it_was_admitted_on() {
+        let pool = pool_with_keys(&["risc0:cuda:0", "risc0:intel:0"]);
+        let mut used = None;
+        let eligible = vec!["gpu-rocm1".to_string()];
+        let err = pool
+            .prove_min_vram(
+                "risc0",
+                &[],
+                &[],
+                Some(20),
+                Some(Duration::from_secs(1)),
+                None,
+                None,
+                &[],
+                &[],
+                &mut used,
+                None,
+                None,
+                None,
+                JobCards {
+                    eligible: &eligible,
+                    order: &eligible,
+                },
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("none of the cards this job was admitted on (gpu-rocm1)"),
+            "{err:#}"
+        );
+        assert_eq!(used, None);
+    }
+
     use super::*;
 
     // ---- slot_key tests ----
@@ -9189,7 +9438,7 @@ mod tests {
                 None,
                 Some(&none),
                 None,
-                None,
+                JobCards::default(),
                 0,
             )
             .unwrap_err();
@@ -9237,7 +9486,7 @@ mod tests {
                 None,
                 Some(&only_one),
                 None,
-                None,
+                JobCards::default(),
                 0,
             );
             if attempt == 0 {
@@ -9288,6 +9537,26 @@ mod tests {
         }
         if std::env::var_os("ZE_ENABLE_PCI_ID_DEVICE_ORDER").is_none() {
             assert_eq!(env.get("ZE_ENABLE_PCI_ID_DEVICE_ORDER").unwrap(), "1");
+        }
+    }
+
+    /// An Alchemist card's risc0 workers get Level Zero's V2 adapter; SP1's, and any other card's, are
+    /// left as they were.
+    #[test]
+    fn alchemist_risc0_workers_get_the_v2_adapter() {
+        if std::env::var_os("SYCL_UR_USE_LEVEL_ZERO_V2").is_some() {
+            return; // the operator's choice wins, and is inherited as it is
+        }
+        let mut env = HashMap::new();
+        alchemist_level_zero_env(&mut env, "risc0", true);
+        assert_eq!(
+            env.get("SYCL_UR_USE_LEVEL_ZERO_V2").map(String::as_str),
+            Some("1")
+        );
+        for (backend, alchemist) in [("sp1", true), ("risc0", false), ("sp1", false)] {
+            let mut env = HashMap::new();
+            alchemist_level_zero_env(&mut env, backend, alchemist);
+            assert!(env.is_empty(), "{backend} {alchemist}");
         }
     }
 
@@ -9397,6 +9666,16 @@ mod tests {
         assert_eq!(
             parse_drm_fdinfo(xe, "0000:08:0d.0"),
             Some((41, (3 << 30) + (512 << 20)))
+        );
+
+        // An Arc A770 on i915, as measured: device memory is `local0`; `stolen-local0` is not counted.
+        let i915 = "drm-driver:\ti915\ndrm-client-id:\t12\ndrm-pdev:\t0000:01:00.0\n\
+                    drm-total-system0:\t2814168 KiB\ndrm-resident-system0:\t2814156 KiB\n\
+                    drm-total-local0:\t14316840 KiB\ndrm-resident-local0:\t14312168 KiB\n\
+                    drm-total-stolen-local0:\t0\ndrm-resident-stolen-local0:\t4 KiB\n";
+        assert_eq!(
+            parse_drm_fdinfo(i915, "0000:01:00.0"),
+            Some((12, 14_312_168 << 10))
         );
 
         let old = "drm-driver:\tamdgpu\ndrm-client-id:\t7\ndrm-pdev:\t0000:03:00.0\n\
@@ -11023,6 +11302,33 @@ mod tests {
         drop(watchdog);
         // intentional_kill SHOULD be set (kill was attempted, PID unchanged)
         assert!(ik.load(Ordering::Acquire));
+    }
+
+    /// A watchdog on a clock fires its timeout after the clock's last touch, not after it started:
+    /// touched for 4 s with a 1.5 s timeout it holds, and fires once the touches stop.
+    #[test]
+    fn a_watchdog_on_a_clock_fires_its_timeout_after_the_last_touch() {
+        let ik = Arc::new(AtomicBool::new(false));
+        let clock = WatchdogClock::new();
+        let watchdog = ProvingWatchdog::with_clock(
+            Arc::new(AtomicU32::new(99999)),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(1500),
+            "test:generic".to_string(),
+            ik.clone(),
+            clock.clone(),
+        );
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(500));
+            clock.touch();
+        }
+        assert!(!ik.load(Ordering::Acquire), "fired while touched");
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(
+            ik.load(Ordering::Acquire),
+            "did not fire after the touches stopped"
+        );
+        drop(watchdog);
     }
 
     // ---- backoff-aware dispatch (job-loss on a dead slot inside its backoff window) ----

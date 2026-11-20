@@ -110,7 +110,7 @@ fn a_relative_vram_floor_routes_off_the_smallest_card() {
         None,
         None,
         None,
-        None,
+        zkminer_prover::dispatcher::JobCards::default(),
         0,
     );
     assert!(

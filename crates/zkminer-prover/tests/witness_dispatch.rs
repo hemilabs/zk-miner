@@ -54,7 +54,7 @@ fn prove(pool: &WorkerPool, used: &mut Option<String>) -> anyhow::Result<Witness
         None,
         None,
         Some([4; 32]),
-        None,
+        zkminer_prover::dispatcher::JobCards::default(),
         0,
     )
 }
