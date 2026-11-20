@@ -298,6 +298,9 @@ pub struct HostFacts {
     nat64_unsettled: bool,
     /// [`RawFacts::nat64_unheld`].
     nat64_unheld: Option<String>,
+    /// The uplink signature NAT64 discovery runs on for facts read from this host, whose unheld
+    /// marks are read live ([`Self::nat64_unheld`]).
+    nat64_uplink: Option<u64>,
     /// The nexthop objects (Linux), for the default routes through one ([`default_path_known`]).
     nexthops: Vec<crate::routes::Nexthop>,
 }
@@ -919,6 +922,7 @@ impl HostFacts {
             unreadable: None,
             nat64_unsettled: false,
             nat64_unheld: None,
+            nat64_uplink: None,
             nexthops: Vec::new(),
         }
     }
@@ -1004,6 +1008,7 @@ impl HostFacts {
             unreadable: None,
             nat64_unsettled: raw.nat64_unsettled,
             nat64_unheld: raw.nat64_unheld,
+            nat64_uplink: None,
             nexthops: raw.nexthops,
         }
     }
@@ -1035,9 +1040,20 @@ impl HostFacts {
         self.nat64_unsettled
     }
 
-    /// Why a NAT64 prefix named on the uplink could not be held ([`RawFacts::nat64_unheld`]).
-    pub(crate) fn nat64_unheld(&self) -> Option<&str> {
-        self.nat64_unheld.as_deref()
+    /// Why a NAT64 prefix named on the uplink could not be held ([`RawFacts::nat64_unheld`]),
+    /// or, for facts read from this host, is not held now (review round 6, the parse lens's
+    /// suspicion: a mark a router advertisement made between two facts reads counted only from
+    /// the next one; it is read live from [`crate::nat64::unheld`]).
+    pub(crate) fn nat64_unheld(&self) -> Option<String> {
+        self.nat64_unheld
+            .clone()
+            .or_else(|| self.nat64_uplink.and_then(crate::nat64::unheld))
+    }
+
+    /// These facts, read on NAT64 uplink `signature` (whose unheld marks are read live).
+    pub(crate) fn on_nat64_uplink(mut self, signature: u64) -> Self {
+        self.nat64_uplink = Some(signature);
+        self
     }
 
     /// These facts without the kernel's cached verdicts (a refresh failed: what the kernel
@@ -1319,7 +1335,8 @@ impl HostFacts {
             },
             opts,
         )
-        .with_route_oracle(Arc::new(crate::routes::KernelRoutes)))
+        .with_route_oracle(Arc::new(crate::routes::KernelRoutes))
+        .on_nat64_uplink(signature))
     }
 
     /// The connected prefixes (interfaces and on-link routes), sorted.

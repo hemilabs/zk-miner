@@ -490,7 +490,7 @@ fn admit_inner(
         if let Some(why) = facts.nat64_unheld() {
             return Err(Denied::Nat64Unheld {
                 ip,
-                why: crate::printable(why, 300),
+                why: crate::printable(&why, 300),
             });
         }
         if facts.nat64_unsettled() {
@@ -2011,6 +2011,22 @@ mod tests {
             admit(NetMode::Public, ip("1.1.1.1"), &f, &[]).err().map(|d| d.to_string().contains("NAT64")),
             Some(true)
         );
+    }
+
+    /// Review round 6 (the parse lens's suspicion): a mark made between two facts reads (the
+    /// PREF64 listener hears a router naming too many) refuses IPv6 at once, not from the next
+    /// read; facts given by the caller (no uplink) are not affected.
+    #[test]
+    fn r6_an_unheld_mark_counts_before_the_next_facts_read() {
+        let uplink = 0x06_0001_6e71_u64;
+        let f = HostFacts::new(vec![], vec![]).on_nat64_uplink(uplink);
+        let plain = HostFacts::new(vec![], vec![]);
+        let v6 = ip("2606:4700:4700::1111");
+        assert_eq!(admit(NetMode::Public, v6, &f, &[]), Ok(()));
+        crate::nat64::mark_unheld_now(uplink, "test: named too many");
+        assert!(matches!(admit(NetMode::Public, v6, &f, &[]), Err(Denied::Nat64Unheld { .. })));
+        assert_eq!(admit(NetMode::Public, v6, &plain, &[]), Ok(()));
+        assert_eq!(admit(NetMode::Public, ip("1.1.1.1"), &f, &[]), Ok(()));
     }
 
     /// Review round 4, cross-2: an address refused because the host just moved to another
