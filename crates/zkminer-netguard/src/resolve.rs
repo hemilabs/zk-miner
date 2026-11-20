@@ -104,6 +104,28 @@ pub fn absolute_name(host: &str) -> String {
 /// Most addresses handed to reqwest for one connection.
 const MAX_ADDRS: usize = 8;
 
+/// `addrs` with the families interleaved (RFC 8305 §4: the first address's family first), cut to
+/// `max` (review round 6, cross-3: answers are AAAA first, so a name with eight AAAA records,
+/// www.google.com, kept no IPv4 address, and on a host whose IPv6 TCP was broken it failed
+/// after ~110 s; pr/37 fell back to IPv4 in ~19 s). Each family keeps its own order.
+pub(crate) fn interleaved(addrs: Vec<IpAddr>, max: usize) -> Vec<IpAddr> {
+    let first_v6 = addrs.first().is_some_and(IpAddr::is_ipv6);
+    let (mut a, mut b): (std::collections::VecDeque<IpAddr>, std::collections::VecDeque<IpAddr>) =
+        addrs.into_iter().partition(|ip| ip.is_ipv6() == first_v6);
+    let mut out = Vec::new();
+    while out.len() < max && !(a.is_empty() && b.is_empty()) {
+        if let Some(ip) = a.pop_front() {
+            out.push(ip);
+        }
+        if out.len() < max {
+            if let Some(ip) = b.pop_front() {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
 /// A test seam: the address actually connected to for an admitted one.
 #[cfg(any(test, feature = "test-util"))]
 pub type ConnectMap = Arc<dyn Fn(IpAddr) -> IpAddr + Send + Sync>;
@@ -206,8 +228,7 @@ impl GuardedResolver {
                 crate::printable(host, 128)
             );
         }
-        admitted.truncate(MAX_ADDRS);
-        Ok(admitted)
+        Ok(interleaved(admitted, MAX_ADDRS))
     }
 
     /// The address connected to for the admitted `ip`: `ip` itself (in test builds, what the
@@ -532,5 +553,55 @@ pub(crate) mod tests {
         assert!(took >= Duration::from_millis(900), "{took:?}");
         // About 90 at 10 ms; well over half of them, whatever the scheduler's jitter.
         assert!(n >= 30, "the ticker ticked {n} times in {took:?}");
+    }
+
+    /// Review round 6, cross-3 (`r6cross_a_name_with_eight_aaaa_keeps_its_ipv4_addresses`): a
+    /// name with eight AAAA records keeps its IPv4 addresses (interleaved, RFC 8305 §4).
+    #[tokio::test]
+    async fn r6_a_name_with_eight_aaaa_keeps_its_ipv4_addresses() {
+        let v6: Vec<String> = (0..8).map(|i| format!("2607:f8b0:4001:c10::{:x}", 0x60 + i)).collect();
+        let mut all: Vec<&str> = v6.iter().map(String::as_str).collect();
+        all.extend(["142.251.150.119", "142.251.156.119"]);
+        let f = FakeLookup::with(&[("www.example.com", &all)]);
+        let r = GuardedResolver::new(public_policy(), Arc::new(f));
+        let got = r.resolve_admitted("www.example.com").await.unwrap();
+        assert_eq!(got.len(), MAX_ADDRS);
+        assert_eq!(got.iter().filter(|ip| ip.is_ipv4()).count(), 2, "{got:?}");
+        assert!(got[0].is_ipv6() && got[1].is_ipv4(), "{got:?}");
+    }
+
+    /// The interleaving, on random lists: every address kept is one given, each family in its own
+    /// order, at most `max`, and neither family is left out while it has addresses and room is
+    /// left (min(its count, max / 2) at least).
+    #[test]
+    fn r6_interleaving_keeps_both_families() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..2000 {
+            let n = rnd(20) as usize;
+            let addrs: Vec<IpAddr> = (0..n)
+                .map(|i| {
+                    if rnd(2) == 0 {
+                        IpAddr::from([10, 0, 0, i as u8])
+                    } else {
+                        IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16])
+                    }
+                })
+                .collect();
+            let max = 1 + rnd(10) as usize;
+            let got = interleaved(addrs.clone(), max);
+            assert!(got.len() == n.min(max));
+            for v6 in [false, true] {
+                let of = |v: &[IpAddr]| v.iter().copied().filter(|ip| ip.is_ipv6() == v6).collect::<Vec<_>>();
+                let (given, kept) = (of(&addrs), of(&got));
+                assert_eq!(kept[..], given[..kept.len()], "order kept");
+                assert!(kept.len() >= given.len().min(max / 2), "{addrs:?} {max} -> {got:?}");
+            }
+        }
     }
 }
