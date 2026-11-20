@@ -2957,12 +2957,15 @@ mod sys {
                 crate::skipped("no default route through a gateway here");
                 return;
             }
-            // Traffic to the internet goes to the gateway (nothing is sent: a UDP connect asks
-            // the route and, for IPv4, the kernel resolves the gateway only when sending; so
-            // send one DNS query).
-            if let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                if s.connect("1.1.1.1:53").is_ok() {
-                    let _ = s.send(&[0u8; 12]);
+            // Traffic to the internet goes to the gateway (a UDP connect alone sends nothing,
+            // and the kernel resolves a gateway only when sending; so send one datagram per
+            // family to a public DNS server).
+            let mut sent_v6 = false;
+            for (bind, dst) in [("0.0.0.0:0", "1.1.1.1:53"), ("[::]:0", "[2606:4700:4700::1111]:53")] {
+                if let Ok(s) = std::net::UdpSocket::bind(bind) {
+                    if s.connect(dst).is_ok() && s.send(&[0u8; 12]).is_ok() {
+                        sent_v6 |= dst.starts_with('[');
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2971,11 +2974,12 @@ mod sys {
                 let e = n.iter().find(|e| e.addr == g && e.ifindex == ifindex);
                 eprintln!("gateway {g} on {ifindex}: {e:?}");
                 match e {
-                    Some(e) => assert!(e.lladdr.is_some(), "{e:?}"),
-                    None if g.is_ipv6() => {
-                        crate::skipped(format!("no neighbour entry for the IPv6 gateway {g}"))
+                    // An IPv6 router can be unreachable (a FAILED entry) while IPv4 works.
+                    Some(e) => assert!(e.lladdr.is_some() || g.is_ipv6(), "{e:?}"),
+                    None if g.is_ipv6() && !sent_v6 => {
+                        crate::skipped(format!("no IPv6 traffic could be sent to the gateway {g}"))
                     }
-                    None => panic!("no neighbour entry for the IPv4 gateway {g} after traffic to it"),
+                    None => panic!("no neighbour entry for the gateway {g} after traffic to it"),
                 }
             }
         }

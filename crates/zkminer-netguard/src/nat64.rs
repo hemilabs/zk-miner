@@ -746,6 +746,12 @@ pub(crate) mod pref64 {
         }
     }
 
+    /// Whether the listener was started (tests).
+    #[cfg(test)]
+    pub(crate) fn started() -> bool {
+        STATE.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
     /// Every PREF64 prefix seen so far.
     pub(crate) fn seen() -> Vec<Prefix> {
         STATE.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
@@ -1355,6 +1361,23 @@ mod tests {
         );
     }
 
+    /// Off macOS the servers asked first are every `nameserver` line of the resolv.conf files,
+    /// in file order, `/etc/resolv.conf` first.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_active_servers_are_the_resolv_conf_files_in_order() {
+        let want: Vec<IpAddr> = crate::facts::RESOLV_CONF_PATHS
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .flat_map(|t| crate::facts::parse_nameservers(&t))
+            .collect();
+        if want.is_empty() {
+            crate::skipped("no nameserver in this host's resolv.conf files");
+            return;
+        }
+        assert_eq!(active_servers().unwrap(), want);
+    }
+
     /// The Linux application (RFC 8781): `RTM_NEWNDUSEROPT` messages carrying a router
     /// advertisement's PREF64 option give its prefix, at the length its PLC names; other options,
     /// other ICMP types, invalid PLCs and malformed options give nothing.
@@ -1433,6 +1456,9 @@ mod tests {
     #[test]
     fn the_pref64_listener_joins_unprivileged() {
         let sock = pref64::subscribe().expect("RTNLGRP_ND_USEROPT is open to every process");
+        // A NAT64 round asks the system's prefixes, which starts the listener.
+        system_prefixes().unwrap();
+        assert!(pref64::started());
         let Ok(want) = std::env::var("ZKMINER_TEST_PREF64") else {
             eprintln!("subscribed; no staged router advertisement (ZKMINER_TEST_PREF64) to wait for");
             return;
