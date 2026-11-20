@@ -825,7 +825,7 @@ mod tests {
             eprintln!("the router, port 80, hop limit 2: {o:?}");
             assert_ne!(o.verdict(), Verdict::Far, "{o:?}");
         } else {
-            eprintln!("SKIPPED the router probe: no IPv4 default route");
+            crate::skipped("the router probe: no IPv4 default route");
         }
     }
 
@@ -887,7 +887,7 @@ mod tests {
     fn the_check_connection_finds_a_local_listener_near() {
         for bind in ["127.0.0.1:0", "[::1]:0"] {
             let Ok(l) = std::net::TcpListener::bind(bind) else {
-                eprintln!("SKIPPED: no {bind} here");
+                crate::skipped(format!("no {bind} here"));
                 continue;
             };
             let addr = l.local_addr().unwrap();
@@ -911,7 +911,9 @@ mod tests {
     fn the_check_connection_finds_a_public_host_far() {
         let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
         match TtlProbe.confirm(addr, 2, Duration::from_secs(5)) {
-            ConfirmOutcome::ConnectFailed(e) => eprintln!("SKIPPED: {addr} unreachable here: {e}"),
+            ConfirmOutcome::ConnectFailed(e) => {
+                crate::skipped(format!("{addr} unreachable here: {e}"))
+            }
             other => assert_eq!(other, ConfirmOutcome::Unanswered),
         }
     }
@@ -964,7 +966,7 @@ mod tests {
             ("[::1]:0", false),
         ] {
             let Ok(l) = std::net::TcpListener::bind(bind) else {
-                eprintln!("SKIPPED: no {bind} here");
+                crate::skipped(format!("no {bind} here"));
                 continue;
             };
             let addr = l.local_addr().unwrap();
@@ -991,7 +993,9 @@ mod tests {
         let o = TtlProbe.confirm(far, 2, Duration::from_secs(5));
         eprintln!("{far}, hop limit 2: {o:?}");
         match o {
-            ConfirmOutcome::ConnectFailed(e) => eprintln!("SKIPPED: {far} unreachable here: {e}"),
+            ConfirmOutcome::ConnectFailed(e) => {
+                crate::skipped(format!("{far} unreachable here: {e}"))
+            }
             o => assert!(
                 matches!(&o, ConfirmOutcome::Failed(w) if w.contains("closed")),
                 "{far}: {o:?}"
@@ -1023,7 +1027,7 @@ mod tests {
         );
         drop(l);
         if TtlProbe.probe(v4, 64, PROBE_TIMEOUT) != ProbeOutcome::Connected {
-            eprintln!("SKIPPED: {v4} unreachable here");
+            crate::skipped(format!("{v4} unreachable here"));
             return;
         }
         for _ in 0..3 {
@@ -1032,7 +1036,9 @@ mod tests {
             assert_ne!(o, ProbeOutcome::Connected, "the hop limit did not hold");
         }
         match TtlProbe.confirm(mapped, 2, Duration::from_secs(5)) {
-            ConfirmOutcome::ConnectFailed(e) => eprintln!("SKIPPED the check connection: {e}"),
+            ConfirmOutcome::ConnectFailed(e) => {
+                crate::skipped(format!("the check connection: {e}"))
+            }
             c => assert_eq!(c, ConfirmOutcome::Unanswered, "{c:?}"),
         }
     }
