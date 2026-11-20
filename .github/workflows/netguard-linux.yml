@@ -20,11 +20,13 @@ jobs:
     # cannot check what it is for here fail instead of printing SKIPPED and passing; GitHub's
     # hosted runners have no IPv6, so skips naming it are allowed (docs/netguard-hardening.md,
     # "CI"). The suite needs outbound DNS and HTTPS, and the near-hop probe's ICMP "time
-    # exceeded" from the runner's first two hops.
+    # exceeded" from the runner's first two hops. ZKMINER_CI_ALLOW_SKIP names skip tokens exactly
+    # (a skip reason starting "[ipv6] "), not parts of a reason's text.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       ZKMINER_CI_STRICT: "1"
-      ZKMINER_CI_ALLOW_SKIP: "IPv6,[::1]"
+      ZKMINER_CI_ALLOW_SKIP: "ipv6"
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,3 +38,21 @@ jobs:
         run: cargo test --locked -p zkminer-netguard
       - name: "Clippy"
         run: cargo clippy --locked -p zkminer-netguard --all-targets -- -D warnings
+
+  callers:
+    # The guard's callers on x86_64 Linux: the program fetcher (zkminer-chain) and the witness
+    # broker's connector (zkminer-witness-broker), whose tests drive the guarded client and the
+    # connector's checks before and after connecting.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Toolchain (rust-toolchain.toml)"
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: "zkminer-chain"
+        run: cargo test --locked -p zkminer-chain
+      - name: "zkminer-witness-broker"
+        run: cargo test --locked -p zkminer-witness-broker

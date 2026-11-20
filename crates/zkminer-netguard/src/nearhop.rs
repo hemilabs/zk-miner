@@ -1305,7 +1305,8 @@ mod tests {
     fn the_check_connection_finds_a_local_listener_near() {
         for bind in ["127.0.0.1:0", "[::1]:0"] {
             let Ok(l) = std::net::TcpListener::bind(bind) else {
-                crate::skipped(format!("no {bind} here"));
+                let tag = if bind.starts_with('[') { "[ipv6] " } else { "" };
+                crate::skipped(format!("{tag}no {bind} here"));
                 continue;
             };
             let addr = l.local_addr().unwrap();
@@ -1778,7 +1779,8 @@ mod tests {
             ("[::1]:0", false),
         ] {
             let Ok(l) = std::net::TcpListener::bind(bind) else {
-                crate::skipped(format!("no {bind} here"));
+                let tag = if bind.starts_with('[') { "[ipv6] " } else { "" };
+                crate::skipped(format!("{tag}no {bind} here"));
                 continue;
             };
             let addr = l.local_addr().unwrap();

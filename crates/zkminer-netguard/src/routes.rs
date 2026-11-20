@@ -3028,7 +3028,7 @@ mod sys {
                     // An IPv6 router can be unreachable (a FAILED entry) while IPv4 works.
                     Some(e) => assert!(e.lladdr.is_some() || g.is_ipv6(), "{e:?}"),
                     None if g.is_ipv6() && !sent_v6 => {
-                        crate::skipped(format!("no IPv6 traffic could be sent to the gateway {g}"))
+                        crate::skipped(format!("[ipv6] no IPv6 traffic could be sent to the gateway {g}"))
                     }
                     None => panic!("no neighbour entry for the gateway {g} after traffic to it"),
                 }
