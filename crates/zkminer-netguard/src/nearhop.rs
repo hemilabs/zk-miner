@@ -296,6 +296,30 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
 /// the module doc).
 #[cfg(target_os = "macos")]
 fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
+    probe_twice(timeout, |t| probe_attempt(addr, hops, t))
+}
+
+/// macOS: the probe asked at most twice within `timeout`: two thirds of it, then, after a timeout,
+/// the rest (review round 3, probe-1). A router that rate-limits its ICMP drops some "time
+/// exceeded" answers (7.5% of the reviewer's probes here went unanswered:
+/// `r3-probe/sweep-h2.log`), and a probe without an answer leaves the decision to the check
+/// connection, whose positive control refuses a peer that never acknowledges a bare FIN (every
+/// AWS S3 front end). An answer comes within a round trip to the router, milliseconds.
+#[cfg(target_os = "macos")]
+fn probe_twice(
+    timeout: Duration,
+    mut attempt: impl FnMut(Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    let first = timeout * 2 / 3;
+    match attempt(first) {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => attempt(timeout - first),
+        r => r,
+    }
+}
+
+/// macOS: one probe (see [`probe_once`]).
+#[cfg(target_os = "macos")]
+fn probe_attempt(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let addr = unmapped(addr);
     let sock = new_socket(addr)?;
     set_hops(&sock, addr, hops)?;
@@ -1111,6 +1135,47 @@ mod tests {
         }
         assert_eq!(o, ProbeOutcome::TimedOut);
         assert_eq!(o.verdict(), Verdict::Undecided);
+    }
+
+    /// Review round 3, probe-1: a probe that timed out is asked once more within the same time
+    /// (two thirds, then the rest); any other outcome of the first attempt stands.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_probe_that_timed_out_is_asked_again_once_on_macos() {
+        let timeout = Duration::from_millis(1500);
+        let mut asked = Vec::new();
+        let r = probe_twice(timeout, |t| {
+            asked.push(t);
+            Err(io::ErrorKind::TimedOut.into())
+        });
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            asked,
+            [Duration::from_millis(1000), Duration::from_millis(500)]
+        );
+        let mut n = 0;
+        let r = probe_twice(timeout, |_| {
+            n += 1;
+            if n == 1 {
+                Err(io::ErrorKind::TimedOut.into())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))
+            }
+        });
+        assert_eq!(ProbeOutcome::of(r), ProbeOutcome::Unreachable);
+        for first in [
+            Ok(()),
+            Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH)),
+            Err(io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+        ] {
+            let mut first = Some(first);
+            let mut n = 0;
+            let _ = probe_twice(timeout, |_| {
+                n += 1;
+                first.take().unwrap()
+            });
+            assert_eq!(n, 1);
+        }
     }
 
     /// Review round 3, probe-1: a FIN unacknowledged within the hop limit is far only if the
