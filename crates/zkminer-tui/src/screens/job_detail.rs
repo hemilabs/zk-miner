@@ -15,20 +15,25 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     // The job Enter picked, by id: the open list reorders by price every pass, so its index alone
     // would show a different job a moment later.
     // Any row the Jobs page lists: claimed, held, open, or recently finished.
+    // and any finished job still in the history, beyond the few the page lists.
     let by_id = |id| {
         state
             .jobs_page_rows()
             .into_iter()
             .find(|j| j.info.job_id == id)
+            .or_else(|| {
+                state
+                    .completed_jobs
+                    .iter()
+                    .rev()
+                    .find(|j| j.info.job_id == id)
+            })
     };
     // A job picked by id that is no longer listed (fulfilled, released, claimed by another prover)
     // is reported as such: falling back to the index would show a different job as if it were it.
     let selected = match state.selected_job_id {
         Some(id) => by_id(id),
-        None => state
-            .jobs_page_rows()
-            .get(state.selected_job_index)
-            .copied(),
+        None => state.jobs_page_rows().get(state.jobs_cursor()).copied(),
     };
     if selected.is_none() && state.selected_job_id.is_some() {
         let paragraph = Paragraph::new(Span::styled(
@@ -80,6 +85,15 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
 
     // Ours: claimed, held, or finished (not a market job).
     let claimed = super::jobs::row_kind(job, state) != super::jobs::RowKind::Open;
+    // Known only from the claim journal (after a restart): its terms are not known, "-", not 0.
+    let unknown = claimed && job.info.fulfillment_timeout == 0;
+    let amount = |a: u128| {
+        if unknown {
+            "-".to_string()
+        } else {
+            format_token_amount(a)
+        }
+    };
 
     // Job info
     let info_text = vec![
@@ -89,7 +103,14 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Caller:        ", theme::dim()),
-            Span::styled(format!("{}", job.info.caller), theme::identifier()),
+            Span::styled(
+                if unknown {
+                    "-".to_string()
+                } else {
+                    format!("{}", job.info.caller)
+                },
+                theme::identifier(),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Status:        ", theme::dim()),
@@ -106,23 +127,46 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Descriptor:    ", theme::dim()),
-            Span::raw(format!("{}", job.info.descriptor_hash)),
+            Span::raw(if unknown {
+                "-".to_string()
+            } else {
+                format!("{}", job.info.descriptor_hash)
+            }),
         ]),
         Line::from(vec![
-            Span::styled("Current Price: ", theme::dim()),
-            Span::styled(format_token_amount(job.current_price), theme::positive()),
+            // Ours: what the claim locked, as the Jobs page shows; a market job: its price now.
+            Span::styled(
+                if claimed {
+                    "Locked Price:  "
+                } else {
+                    "Current Price: "
+                },
+                theme::dim(),
+            ),
+            Span::styled(
+                amount(if claimed && job.info.settled_price > 0 {
+                    job.info.settled_price
+                } else {
+                    job.current_price
+                }),
+                theme::positive(),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Min Price:     ", theme::dim()),
-            Span::raw(format_token_amount(job.info.min_price)),
+            Span::raw(amount(job.info.min_price)),
         ]),
         Line::from(vec![
             Span::styled("Max Price:     ", theme::dim()),
-            Span::raw(format_token_amount(job.info.max_price)),
+            Span::raw(amount(job.info.max_price)),
         ]),
         Line::from(vec![
             Span::styled("Timeout:       ", theme::dim()),
-            Span::raw(format_duration(job.info.fulfillment_timeout)),
+            Span::raw(if unknown {
+                "-".to_string()
+            } else {
+                format_duration(job.info.fulfillment_timeout)
+            }),
         ]),
         Line::from(vec![
             Span::styled("Curve:         ", theme::dim()),
@@ -171,7 +215,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
         ]),
         Line::from(vec![
             Span::styled("Bonus:        ", theme::dim()),
-            Span::styled(format_token_amount(job.info.bonus_amount), theme::warning()),
+            Span::styled(amount(job.info.bonus_amount), theme::warning()),
         ]),
         Line::from(vec![
             Span::styled("Speed Premium:", theme::dim()),

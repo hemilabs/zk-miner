@@ -27,6 +27,8 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     let jobs = state.jobs_page_rows();
     let claimed = state.active_jobs.len();
     let kind = |job: &TrackedJob| row_kind(job, state);
+    // The highlighted job, wherever its row moved.
+    let cursor = state.jobs_cursor();
     let held = jobs.iter().filter(|j| kind(j) == RowKind::Held).count();
     let recent = jobs.iter().filter(|j| kind(j) == RowKind::Finished).count();
     let rows: Vec<Row> = jobs
@@ -52,7 +54,7 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
             };
 
             let mut style = theme::striped(i);
-            if i == state.selected_job_index {
+            if i == cursor {
                 style = style.bg(theme::overlay());
             }
             let status_cell = match row {
@@ -61,8 +63,9 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                 _ => Cell::from(status),
             };
 
-            // A held lock known only from the journal (after a restart) has no terms: "-", not 0.
-            let unknown = row == RowKind::Held && job.info.fulfillment_timeout == 0;
+            // A lock known only from the journal (after a restart), held or finished, has no terms:
+            // "-", not 0.
+            let unknown = row != RowKind::Open && job.info.fulfillment_timeout == 0;
             let amount = |a: u128| {
                 if unknown {
                     "-".to_string()
@@ -374,6 +377,28 @@ mod tests {
             .insert(B256::repeat_byte(4), "kept".into());
         state.active_jobs.push(job(4, MinerJobStatus::Queued));
         assert_eq!(state.kept_reason(B256::repeat_byte(4)), None);
+    }
+
+    /// The highlight stays on its job as rows move between sections (claimed, finished).
+    #[test]
+    fn the_highlight_follows_its_job() {
+        let mut state = MinerState {
+            open_jobs: vec![job(1, MinerJobStatus::Open), job(2, MinerJobStatus::Open)],
+            ..Default::default()
+        };
+        state.move_jobs_cursor(1);
+        assert_eq!(state.jobs_cursor(), 1);
+        // Job 2 is claimed: its row moves to the top, and the highlight with it.
+        state.active_jobs.push(job(2, MinerJobStatus::Queued));
+        assert_eq!(state.jobs_page_rows()[0].info.job_id, B256::repeat_byte(2));
+        assert_eq!(state.jobs_cursor(), 0);
+        // Finished: to the bottom, still highlighted.
+        state.record_finished(
+            B256::repeat_byte(2),
+            MinerJobStatus::Fulfilled { payout: 0 },
+        );
+        let rows = state.jobs_page_rows();
+        assert_eq!(rows[state.jobs_cursor()].info.job_id, B256::repeat_byte(2));
     }
 
     /// While a job waits on something its status would not say (a claim or fulfil transaction the

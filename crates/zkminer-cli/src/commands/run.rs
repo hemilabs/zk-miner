@@ -2573,10 +2573,28 @@ static KEPT_REASON: std::sync::Mutex<Option<std::collections::HashMap<B256, Stri
     std::sync::Mutex::new(None);
 
 fn note_kept_reason(job_id: B256, reason: impl Into<String>) {
-    let mut g = KEPT_REASON.lock().unwrap_or_else(|p| p.into_inner());
-    let m = g.get_or_insert_with(Default::default);
-    bounded_insert(m, job_id, reason.into(), MEASURED_CYCLES_CAP);
+    let reason = reason.into();
+    {
+        let mut g = KEPT_REASON.lock().unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        bounded_insert(m, job_id, reason.clone(), MEASURED_CYCLES_CAP);
+    }
+    // For the activity log and the row's notes, at the next brain tick (`refresh_kept_locks`), once
+    // per reason: a recovery pass keeps a lock for the same reason every few minutes.
+    let mut g = KEPT_ANNOUNCED.lock().unwrap_or_else(|p| p.into_inner());
+    let (said, pending) = g.get_or_insert_with(Default::default);
+    if said.get(&job_id) != Some(&reason) {
+        bounded_insert(said, job_id, reason.clone(), MEASURED_CYCLES_CAP);
+        pending.push((job_id, reason));
+    }
 }
+
+/// The last reason the activity log gave for each kept lock, and those still to log
+/// (`note_kept_reason`, drained by `refresh_kept_locks`).
+#[allow(clippy::type_complexity)]
+static KEPT_ANNOUNCED: std::sync::Mutex<
+    Option<(std::collections::HashMap<B256, String>, Vec<(B256, String)>)>,
+> = std::sync::Mutex::new(None);
 
 fn forget_kept_reason(job_id: B256) {
     if let Some(m) = KEPT_REASON
@@ -4089,10 +4107,10 @@ pub async fn run(
                     let before = s.open_jobs.len();
                     // Our own claim's row stays until its lifecycle moves it to the claimed list
                     // (a few seconds later): taken off here, it was in no list in between.
-                    let ours = s
-                        .job_notes
-                        .get(&job_id)
-                        .is_some_and(|n| n.kind == zkminer_tui::state::JobNoteKind::Claim);
+                    let ours = prover == backfill_client.address
+                        && s.job_notes
+                            .get(&job_id)
+                            .is_some_and(|n| n.kind == zkminer_tui::state::JobNoteKind::Claim);
                     if !ours {
                         s.open_jobs.retain(|j| j.info.job_id != job_id);
                     }
@@ -11435,6 +11453,13 @@ async fn process_job_lifecycle(
                 note_transient_preclaim_failure(job_id);
                 if note_preclaim_elf_failure(job_id) < MAX_PRECLAIM_ELF_FAILURES {
                     requeue_open_job(state, requeue_job.clone()).await;
+                } else {
+                    // Past the limit: off the market list (it stays listed while it is claimed).
+                    state
+                        .write()
+                        .await
+                        .open_jobs
+                        .retain(|j| j.info.job_id != job_id);
                 }
                 return Ok(());
             }
@@ -11606,10 +11631,13 @@ async fn process_job_lifecycle(
         let claimed = client
             .claim_job_idempotent(job_id, snapshot.current_price)
             .await;
-        state
-            .write()
-            .await
-            .clear_job_note(job_id, zkminer_tui::state::JobNoteKind::Claim);
+        // Still being claimed until its row moves to the claimed list (it reads the lock's deadline
+        // first, seconds under a rate limit): cleared there, or when the lifecycle ends.
+        state.write().await.set_job_note(
+            job_id,
+            zkminer_tui::state::JobNoteKind::Claim,
+            "claiming: confirming the lock",
+        );
         match claimed {
             Ok(ClaimOutcome::Claimed(r)) => r.block,
             Ok(ClaimOutcome::LostRace) if prior_claim => {
@@ -12388,7 +12416,7 @@ async fn process_job_lifecycle(
                     zkminer_prover_protocol::ProveEvent,
                     String,
                 )>();
-                started_runtime.spawn(async move {
+                let events_task = started_runtime.spawn(async move {
                     while let Some((event, slot_key)) = events_rx.recv().await {
                         // Which physical card took this attempt. Resolved through the pool rather
                         // than any index, so the dashboard can attribute the job to the right GPU
@@ -12474,11 +12502,18 @@ async fn process_job_lifecycle(
                             execute_peak_for_prove,
                         )
                     });
-                (r, used)
+                (r, used, events_task)
             })
             .await
             {
-                Ok(pair) => pair,
+                Ok((r, used, events_task)) => {
+                    // Its last events applied before anything resets its row: one arriving after
+                    // (a stage report still queued) put a job back to "proving on GPUx" while it
+                    // waited for memory or was being released. Bounded: the task ends once the
+                    // attempt's callback is dropped.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), events_task).await;
+                    (r, used)
+                }
                 Err(e) => return Err(anyhow::anyhow!("prove task panicked: {e}")),
             };
 
@@ -13589,7 +13624,22 @@ async fn refresh_kept_locks(
             })
             .collect()
     };
+    let announced: Vec<(B256, String)> = KEPT_ANNOUNCED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .map(|(_, pending)| std::mem::take(pending))
+        .unwrap_or_default();
     let mut s = state.write().await;
+    // A lock just kept: its stage note ("releasing the lock") no longer holds, and the activity log
+    // says why it was kept.
+    for (id, why) in announced {
+        s.job_notes.remove(&id);
+        s.add_log(
+            LogLevel::Warn,
+            format!("Job {} kept, not released: {why}", short_id(id)),
+        );
+    }
     // Held: no task works on it, or one does (a recovery release, a self-slash) without a row of
     // its own in the claimed or market list, which would leave it in none while that runs.
     let held: Vec<(B256, u64, bool)> = entries
@@ -16218,7 +16268,17 @@ fn spawn_recovery_actions(
                 Some(descriptor),
             ),
             RecoveryAction::Release(jid) => {
-                let (c, st, jr, done) = (client.clone(), state.clone(), journal.clone(), done_tx.clone());
+                // A release needs no card: not one of the jobs the claim limit counts.
+                CARDS_FREED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(jid);
+                let (c, st, jr, done) = (
+                    client.clone(),
+                    state.clone(),
+                    journal.clone(),
+                    done_tx.clone(),
+                );
                 tokio::spawn(async move {
                     let _slot = SlotGuard(jid, done);
                     if let Some(r) = &witness_release {

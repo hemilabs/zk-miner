@@ -601,6 +601,9 @@ pub struct MinerState {
     pub kept_reasons: std::collections::HashMap<alloy_primitives::B256, String>,
     /// When each job in `completed_jobs` finished (unix seconds), for the Jobs page's history.
     pub finished_at: std::collections::HashMap<alloy_primitives::B256, u64>,
+    /// The job the Jobs page's highlight is on (`jobs_cursor`): rows move between sections as jobs
+    /// are claimed, held and finished, so a row number alone lands on another job.
+    pub selected_row_id: Option<alloy_primitives::B256>,
     /// Each claimed job's proof system (zkVM and wrap), recorded at claim (`job_zkvm_text`).
     pub job_proof_systems:
         std::collections::HashMap<alloy_primitives::B256, zkminer_chain::auction::ProofSystem>,
@@ -1141,6 +1144,7 @@ impl Default for MinerState {
             kept_locks: Vec::new(),
             kept_reasons: HashMap::new(),
             finished_at: HashMap::new(),
+            selected_row_id: None,
             job_proof_systems: HashMap::new(),
             completed_jobs: Vec::new(),
             selected_job_index: 0,
@@ -1453,6 +1457,24 @@ impl MinerState {
         rows
     }
 
+    /// The Jobs page's highlighted row: the highlighted job's, wherever it moved, else the row number.
+    pub fn jobs_cursor(&self) -> usize {
+        let rows = self.jobs_page_rows();
+        self.selected_row_id
+            .and_then(|id| rows.iter().position(|j| j.info.job_id == id))
+            .unwrap_or_else(|| self.selected_job_index.min(rows.len().saturating_sub(1)))
+    }
+
+    /// Move the Jobs page's highlight by `step` rows, onto that row's job.
+    pub fn move_jobs_cursor(&mut self, step: isize) {
+        let rows = self.jobs_page_rows();
+        let last = rows.len().saturating_sub(1);
+        let at = self.jobs_cursor().saturating_add_signed(step).min(last);
+        let id = rows.get(at).map(|j| j.info.job_id);
+        self.selected_job_index = at;
+        self.selected_row_id = id;
+    }
+
     /// Why a lock is held but not worked on, if it is one (`kept_locks`) and not being worked on.
     pub fn kept_reason(&self, job_id: alloy_primitives::B256) -> Option<&str> {
         if self.active_jobs.iter().any(|j| j.info.job_id == job_id) {
@@ -1489,6 +1511,8 @@ impl MinerState {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         self.finished_at.insert(job_id, now);
+        // Not held any more: no held reason may make its history row read as one.
+        self.kept_reasons.remove(&job_id);
         // Bounded, for a long run.
         const COMPLETED_JOBS_CAP: usize = 500;
         if self.completed_jobs.len() > COMPLETED_JOBS_CAP {
