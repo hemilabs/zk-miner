@@ -11,6 +11,13 @@
 //!   ([`crate::nearhop`]), and connects only to the addresses that pass: each hop gets an HTTP
 //!   client pinned to exactly those addresses (reqwest resolves nothing itself, and an IP-literal
 //!   host is vetted the same way);
+//! - **checks each connection once made**, before any request byte is written on it
+//!   ([`NetPolicy::recheck_connected`], a connector layer: the connection's own peer and source
+//!   addresses must be the vetted ones, and the destination is admitted again with the kernel
+//!   asked afresh), and drops it otherwise: a route or VPN that changed between the check and the
+//!   connection is seen (the Linux application of review round 2, bypass-3, every platform). For
+//!   `https` the TLS handshake (its ClientHello names the host) runs inside reqwest's connector,
+//!   before this check; no HTTP request does;
 //! - ignores proxies, from the environment or the system (a proxy resolves the name itself and
 //!   would reach whatever it can);
 //! - follows no redirect itself: [`GuardedClient::get_following_redirects`] follows them by hand,
@@ -30,7 +37,7 @@ use std::time::{Duration, Instant};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, LOCATION};
 use reqwest::StatusCode;
 
-use crate::policy::{Denied, NetMode, NetPolicy, UrlDenied};
+use crate::policy::{Denied, NetMode, NetPolicy, UrlDenied, Vetted};
 use crate::resolve::{GuardedResolver, Lookup, ResolveError, SystemLookup};
 
 /// The `User-Agent` of every guarded request. Constant and versionless, so it says nothing about
@@ -111,7 +118,7 @@ fn build(
     options: ClientOptions,
 ) -> Result<GuardedClient, reqwest::Error> {
     // Built once here so a configuration error shows now rather than at the first fetch.
-    hop_client(None, &[], options)?;
+    hop_client(None, &[], options, None)?;
     Ok(GuardedClient { resolver, options })
 }
 
@@ -127,12 +134,124 @@ impl reqwest::dns::Resolve for NoNames {
     }
 }
 
+/// The check of each connection once made ([`NetPolicy::recheck_connected`]), as a reqwest
+/// connector layer: its service connects as reqwest's does (TCP, and TLS for `https`), then reads
+/// the connection's own addresses (hyper-util's `HttpInfo`: `getsockname`, `getpeername`) and
+/// hands the connection on only if the check admits it, before anything is written on it.
+#[derive(Clone)]
+struct RecheckLayer {
+    policy: NetPolicy,
+    vetted: Arc<[Vetted]>,
+}
+
+impl RecheckLayer {
+    /// The check for a connection whose own addresses are `local` and `peer` (on the blocking
+    /// pool: it asks the kernel).
+    async fn check(&self, local: SocketAddr, peer: SocketAddr) -> Result<(), Denied> {
+        let Some(vetted) = self
+            .vetted
+            .iter()
+            .find(|v| v.connect == unmapped(peer))
+            .cloned()
+        else {
+            return Err(Denied::PathChanged {
+                addr: peer,
+                why: "it reached an address that was not vetted".into(),
+            });
+        };
+        let policy = self.policy.clone();
+        let addr = vetted.addr;
+        tokio::task::spawn_blocking(move || policy.recheck_connected(&vetted, local, peer))
+            .await
+            .unwrap_or_else(|e| {
+                Err(Denied::PathChanged {
+                    addr,
+                    why: format!("the check did not finish: {e}"),
+                })
+            })
+    }
+}
+
+fn unmapped(a: SocketAddr) -> SocketAddr {
+    match a.ip() {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(a, |v4| SocketAddr::new(IpAddr::V4(v4), a.port())),
+        IpAddr::V4(_) => a,
+    }
+}
+
+impl<S> tower_layer::Layer<S> for RecheckLayer {
+    type Service = Recheck<S>;
+
+    fn layer(&self, inner: S) -> Recheck<S> {
+        Recheck {
+            inner,
+            check: self.clone(),
+        }
+    }
+}
+
+/// [`RecheckLayer`]'s service.
+#[derive(Clone)]
+struct Recheck<S> {
+    inner: S,
+    check: RecheckLayer,
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<S, Req> tower_service::Service<Req> for Recheck<S>
+where
+    S: tower_service::Service<Req>,
+    S::Response: hyper_util::client::legacy::connect::Connection + Send + 'static,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        let connecting = self.inner.call(req);
+        let check = self.check.clone();
+        Box::pin(async move {
+            let conn = connecting.await.map_err(Into::into)?;
+            let mut extras = http::Extensions::new();
+            use hyper_util::client::legacy::connect::Connection;
+            conn.connected().get_extras(&mut extras);
+            let denied = |d: Denied| -> BoxError { Box::new(ResolveError::Denied(d)) };
+            let Some(info) = extras.get::<hyper_util::client::legacy::connect::HttpInfo>() else {
+                // No addresses to check: not connected as vetted, as far as anyone can tell.
+                return Err(denied(Denied::PathChanged {
+                    addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+                    why: "the connection's own addresses could not be read".into(),
+                }));
+            };
+            let (local, peer) = (info.local_addr(), info.remote_addr());
+            check.check(local, peer).await.map_err(denied)?;
+            Ok(conn)
+        })
+    }
+}
+
 /// The client of one hop: `name` (when the hop's host is a name) pinned to `pinned`, every other
-/// name refused.
+/// name refused; each connection checked once made when `recheck` is given (every hop does, but
+/// the configuration check in [`build`]).
 fn hop_client(
     name: Option<&str>,
     pinned: &[SocketAddr],
     options: ClientOptions,
+    recheck: Option<RecheckLayer>,
 ) -> Result<reqwest::Client, reqwest::Error> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
@@ -155,6 +274,9 @@ fn hop_client(
     if let Some(name) = name {
         b = b.resolve_to_addrs(name, pinned);
     }
+    if let Some(layer) = recheck {
+        b = b.connector_layer(layer);
+    }
     b.build()
 }
 
@@ -166,8 +288,12 @@ impl GuardedClient {
     /// The addresses one hop to `url` connects to: its host resolved through the guarded
     /// resolver (an IP literal as it is), each address vetted for the URL's port right before
     /// the connection ([`NetPolicy::vet_connection`]; concurrently), the ones that pass in answer
-    /// order. Also the name to pin them to (`None` for an IP literal).
-    async fn pin(&self, url: &url::Url) -> Result<(Option<String>, Vec<SocketAddr>), FetchError> {
+    /// order. Also the name to pin them to (`None` for an IP literal), and the check each
+    /// connection gets once made ([`NetPolicy::recheck_connected`]).
+    async fn pin(
+        &self,
+        url: &url::Url,
+    ) -> Result<(Option<String>, Vec<SocketAddr>, RecheckLayer), FetchError> {
         let port = url
             .port_or_known_default()
             .ok_or(FetchError::Denied(Denied::Url(UrlDenied::BadPort)))?;
@@ -187,9 +313,10 @@ impl GuardedClient {
         for (i, ip) in ips.iter().enumerate() {
             let policy = self.policy().clone();
             let addr = SocketAddr::new(*ip, port);
-            checks.spawn_blocking(move || (i, policy.vet_connection(addr)));
+            let connect = SocketAddr::new(self.resolver.connect_ip(*ip), port);
+            checks.spawn_blocking(move || (i, policy.vet_path(addr, connect)));
         }
-        let mut verdicts: Vec<(usize, Result<(), Denied>)> = Vec::new();
+        let mut verdicts: Vec<(usize, Result<Vetted, Denied>)> = Vec::new();
         while let Some(r) = checks.join_next().await {
             match r {
                 Ok(v) => verdicts.push(v),
@@ -198,10 +325,14 @@ impl GuardedClient {
         }
         verdicts.sort_by_key(|(i, _)| *i);
         let mut pinned = Vec::new();
+        let mut vetted = Vec::new();
         let mut refused = Vec::new();
-        for (i, v) in verdicts {
+        for (_, v) in verdicts {
             match v {
-                Ok(()) => pinned.push(SocketAddr::new(self.resolver.connect_ip(ips[i]), port)),
+                Ok(v) => {
+                    pinned.push(v.connect);
+                    vetted.push(v);
+                }
                 Err(d) => refused.push(d),
             }
         }
@@ -221,7 +352,11 @@ impl GuardedClient {
                 crate::printable(url.host_str().unwrap_or(""), 128)
             );
         }
-        Ok((name, pinned))
+        let recheck = RecheckLayer {
+            policy: self.policy().clone(),
+            vetted: vetted.into(),
+        };
+        Ok((name, pinned, recheck))
     }
 
     /// [`NetPolicy::check_url`] on the blocking pool: an IP literal is judged by `admit`, which
@@ -255,14 +390,14 @@ impl GuardedClient {
             if remaining.is_zero() {
                 return Err(FetchError::TimedOut);
             }
-            let (name, pinned) = tokio::time::timeout(remaining, self.pin(&url))
+            let (name, pinned, recheck) = tokio::time::timeout(remaining, self.pin(&url))
                 .await
                 .map_err(|_| FetchError::TimedOut)??;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(FetchError::TimedOut);
             }
-            let response = hop_client(name.as_deref(), &pinned, self.options)
+            let response = hop_client(name.as_deref(), &pinned, self.options, Some(recheck))
                 .map_err(|e| FetchError::Http(e.without_url()))?
                 .get(url.clone())
                 .timeout(remaining)
@@ -341,14 +476,14 @@ impl GuardedClient {
     pub async fn post_json(&self, raw: &str, body: Vec<u8>, budget: Duration) -> Result<reqwest::Response, FetchError> {
         let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
         let url = self.check_url(raw).await?;
-        let (name, pinned) = tokio::time::timeout(budget, self.pin(&url))
+        let (name, pinned, recheck) = tokio::time::timeout(budget, self.pin(&url))
             .await
             .map_err(|_| FetchError::TimedOut)??;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(FetchError::TimedOut);
         }
-        hop_client(name.as_deref(), &pinned, self.options)
+        hop_client(name.as_deref(), &pinned, self.options, Some(recheck))
             .map_err(|e| FetchError::Http(e.without_url()))?
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -894,5 +1029,175 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, FetchError::Http(_)), "{e:?}");
         assert!(!e.to_string().contains("secret-path"), "{e}");
+    }
+
+    /// A route oracle whose answer for a connection (asked with its port) is the default route
+    /// via 192.168.1.1 for the first `admitted` such questions and no route after: a route that
+    /// changes between the check and the connection.
+    #[derive(Debug)]
+    struct Flip {
+        admitted: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::routes::RouteOracle for Flip {
+        fn route_to(
+            &self,
+            _: IpAddr,
+            dport: Option<u16>,
+        ) -> std::io::Result<crate::routes::KernelAnswer> {
+            use crate::routes::{KernelAnswer, Route};
+            let default = Route::via(
+                "0.0.0.0/0".parse().unwrap(),
+                "192.168.1.1".parse().unwrap(),
+                2,
+            );
+            if dport.is_none() {
+                return Ok(KernelAnswer::Entry(vec![default]));
+            }
+            let n = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(if n < self.admitted {
+                KernelAnswer::Entry(vec![default])
+            } else {
+                KernelAnswer::NoRoute
+            })
+        }
+    }
+
+    fn flipping_client(admitted: usize) -> GuardedClient {
+        use crate::facts::{FactsOptions, RawFacts};
+        use crate::routes::Route;
+        let facts = HostFacts::assemble(
+            RawFacts {
+                interface_prefixes: vec!["192.168.1.0/24".parse().unwrap()],
+                interface_addresses: vec!["192.168.1.33".parse().unwrap()],
+                routes: vec![Route::via(
+                    "0.0.0.0/0".parse().unwrap(),
+                    "192.168.1.1".parse().unwrap(),
+                    2,
+                )],
+                ..RawFacts::default()
+            },
+            &FactsOptions {
+                discover_public_addresses: false,
+                public_addresses: vec!["198.51.99.7".parse().unwrap()],
+                ..FactsOptions::default()
+            },
+        )
+        .with_route_oracle(Arc::new(Flip {
+            admitted,
+            asked: Default::default(),
+        }));
+        let policy = NetPolicy::with_facts(NetMode::Public, facts, Vec::new())
+            .with_near_probe(crate::nearhop::FixedProbe::far());
+        let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
+        guarded_client_for_test(
+            &policy,
+            Arc::new(public_names()),
+            to_loopback,
+            ClientOptions::default(),
+        )
+        .unwrap()
+    }
+
+    /// The Linux application of review round 2, bypass-3 (every platform): the route is judged
+    /// again once the connection is made, with the kernel asked afresh. A route that is the
+    /// default path when the address is checked and gone once the connection exists refuses the
+    /// connection before any request is written on it; one that stays admits it.
+    #[tokio::test]
+    async fn a_route_that_changes_between_the_check_and_the_connection_drops_it() {
+        let server = canned_server(&[OK_ELF, OK_ELF]);
+        // Admitted at the check (one question with the port), gone when connected.
+        let c = flipping_client(1);
+        let e = c
+            .get_following_redirects(&start(&server, "elfs.example.com"), 5, BUDGET)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                FetchError::Denied(Denied::OffDefaultRoute {
+                    kind: crate::RouteKind::NoRoute,
+                    ..
+                })
+            ),
+            "{e:?}"
+        );
+        // The connection was made (and dropped): no request was written on it.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            server.requests.lock().unwrap().iter().all(|r| r.is_empty()),
+            "{:?}",
+            server.requests.lock().unwrap()
+        );
+        // Admitted at the check and once connected: served.
+        let server = canned_server(&[OK_ELF]);
+        let c = flipping_client(2);
+        let r = c
+            .get_following_redirects(&start(&server, "elfs.example.com"), 5, BUDGET)
+            .await
+            .unwrap();
+        assert_eq!(r.text().await.unwrap(), "elf");
+    }
+
+    /// The same, for the source address: a connection whose own source is not the one the
+    /// kernel chose for it when it was checked (a VPN came up, the route moved it to another
+    /// interface) is refused, and so is one whose peer is not the vetted address; the vetted
+    /// connection, read from a real socket, is admitted. Mapped addresses read as IPv4.
+    #[test]
+    fn a_connection_that_left_by_another_path_is_refused() {
+        use crate::policy::connected_as_vetted;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = l.local_addr().unwrap();
+        let policy = NetPolicy::with_facts(NetMode::Public, HostFacts::empty(), Vec::new())
+            .with_near_probe(crate::nearhop::FixedProbe::far());
+        let vetted = policy.vet_path(peer, peer);
+        // Loopback is not public: the check itself refuses it in public mode.
+        assert!(vetted.is_err());
+        let v = Vetted {
+            addr: "93.184.216.34:443".parse().unwrap(),
+            connect: peer,
+            source: Some("127.0.0.1".parse().unwrap()),
+        };
+        let c = std::net::TcpStream::connect(peer).unwrap();
+        let (local, remote) = (c.local_addr().unwrap(), c.peer_addr().unwrap());
+        assert_eq!(connected_as_vetted(&v, local, remote), Ok(()));
+        let moved = Vetted {
+            source: Some("192.168.1.33".parse().unwrap()),
+            ..v.clone()
+        };
+        let why = connected_as_vetted(&moved, local, remote).unwrap_err();
+        assert!(why.contains("left from 127.0.0.1") && why.contains("192.168.1.33"), "{why}");
+        let d = policy.recheck_connected(&moved, local, remote).unwrap_err();
+        assert!(matches!(d, Denied::PathChanged { .. }), "{d:?}");
+        assert!(d.to_string().contains("dropped once made"), "{d}");
+        let elsewhere: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(connected_as_vetted(&v, local, elsewhere)
+            .unwrap_err()
+            .contains("reached 127.0.0.1:1"));
+        // An IPv4-mapped peer or source is its IPv4 address.
+        let mapped_peer: SocketAddr = format!("[::ffff:127.0.0.1]:{}", peer.port()).parse().unwrap();
+        let mapped_local: SocketAddr = format!("[::ffff:127.0.0.1]:{}", local.port()).parse().unwrap();
+        assert_eq!(connected_as_vetted(&v, mapped_local, mapped_peer), Ok(()));
+        // Developer mode checks nothing.
+        let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
+        assert_eq!(dev.recheck_connected(&moved, local, elsewhere), Ok(()));
+        let dv = dev.vet_path(peer, peer).unwrap();
+        assert_eq!(dv.source, None);
+        drop(l);
+    }
+
+    /// `vet_path` reads the source the kernel chooses for the connection, right after the
+    /// checks: for a loopback stand-in, loopback.
+    #[tokio::test]
+    async fn the_vetted_source_is_the_kernels() {
+        let c = public_client(public_names());
+        let url = c.policy().check_url("http://elfs.example.com:8080/").unwrap();
+        let (_, pinned, recheck) = c.pin(&url).await.unwrap();
+        assert_eq!(pinned, vec!["127.0.0.1:8080".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(recheck.vetted.len(), 1);
+        let v = &recheck.vetted[0];
+        assert_eq!(v.addr, "93.184.216.34:8080".parse::<SocketAddr>().unwrap());
+        assert_eq!(v.source, Some("127.0.0.1".parse().unwrap()));
     }
 }
