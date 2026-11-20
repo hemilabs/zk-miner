@@ -88,6 +88,11 @@ pub enum Denied {
         hops: u8,
         what: String,
     },
+    /// macOS: this host's facts could not be read again (`why`, naming what failed) and are
+    /// older than [`FACTS_TTL`] and a grace of 2 s: every requester connection is refused
+    /// until they can be read (review round 2, bypass-1).
+    #[cfg(target_os = "macos")]
+    FactsUnreadable { ip: IpAddr, why: String },
 }
 
 /// What is wrong with a URL, apart from where it points.
@@ -240,6 +245,14 @@ impl Denied {
                  `[]` if there are none), which the config does not state. Every connection is \
                  refused until it does"
             ),
+            #[cfg(target_os = "macos")]
+            Denied::FactsUnreadable { ip, why } => write!(
+                f,
+                "{ip} cannot be judged: this host's network facts (interfaces, routes, DNS \
+                 servers) could not be read again for more than {}s ({why}), so every \
+                 requester-caused connection is refused until they can be",
+                (FACTS_TTL + REFRESH_GRACE).as_secs()
+            ),
             Denied::NearHop { addr, hops, what } => write!(
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
@@ -265,6 +278,10 @@ impl Denied {
     /// Whether the refusal rests on the host's facts (which may have changed since they were
     /// read), rather than on the address alone or the operator's deny CIDRs.
     pub fn depends_on_facts(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(self, Denied::FactsUnreadable { .. }) {
+            return true;
+        }
         matches!(
             self,
             Denied::OwnAddress(_)
@@ -322,6 +339,13 @@ fn admit_inner(
 ) -> Result<(), Denied> {
     if mode == NetMode::DevPrivate {
         return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(why) = facts.unreadable() {
+        return Err(Denied::FactsUnreadable {
+            ip,
+            why: why.to_string(),
+        });
     }
     if !is_global(ip) {
         return Err(Denied::NotGlobal(ip));
@@ -440,6 +464,13 @@ pub const FACTS_TTL: Duration = Duration::from_secs(1);
 /// this: a host that just changed networks is judged on its new facts.
 pub const FORCED_REFRESH_MIN_AGE: Duration = Duration::from_millis(100);
 
+/// macOS: how long after [`FACTS_TTL`] facts whose refresh failed are still judged with (review
+/// round 2, bypass-1): a failure that clears within it (a resolver file being rewritten) refuses
+/// nothing; one that lasts longer refuses every requester connection
+/// ([`Denied::FactsUnreadable`]) until the facts can be read again.
+#[cfg(target_os = "macos")]
+pub const REFRESH_GRACE: Duration = Duration::from_secs(2);
+
 /// The host facts a policy judges with: gathered and re-read once older than [`FACTS_TTL`] (or
 /// on a facts-dependent refusal, [`FORCED_REFRESH_MIN_AGE`]), or fixed by the caller.
 #[derive(Debug)]
@@ -451,6 +482,31 @@ struct FactsCell {
     warned: std::sync::Mutex<Vec<EgressPath>>,
     /// The configuration gaps last warned about ([`HostFacts::config_gaps`]).
     warned_gaps: std::sync::Mutex<Vec<String>>,
+    /// macOS: held while the facts are re-read (one re-read at a time: review round 2, cross-3),
+    /// with the last re-read's failure, if it failed.
+    #[cfg(target_os = "macos")]
+    refreshing: std::sync::Mutex<Option<RefreshFailure>>,
+    /// macOS tests: a failure to stage in place of the next re-reads, and their count.
+    #[cfg(all(test, target_os = "macos"))]
+    seam: RefreshSeam,
+}
+
+/// macOS: the last re-read of the facts failed.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct RefreshFailure {
+    /// When it was tried.
+    at: std::time::Instant,
+    /// Why it failed.
+    why: String,
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[derive(Debug, Default)]
+struct RefreshSeam {
+    fail: std::sync::Mutex<Option<String>>,
+    delay: std::sync::Mutex<Duration>,
+    gathers: std::sync::atomic::AtomicUsize,
 }
 
 impl FactsCell {
@@ -458,7 +514,108 @@ impl FactsCell {
         self.get_fresher_than(FACTS_TTL)
     }
 
+    /// macOS: the facts, re-read first if they are older than `max_age` (and the cell refreshes),
+    /// one re-read at a time: a caller that finds one under way waits for it and takes its facts.
+    /// A re-read that fails (an `/etc/resolver` file that cannot be read, a configuration daemon
+    /// that does not answer: review round 2, bypass-1) leaves the last good facts in force,
+    /// without their cached kernel verdicts, for [`REFRESH_GRACE`] past [`FACTS_TTL`]; after
+    /// that, and until a re-read succeeds, the facts in force refuse every requester connection
+    /// ([`Denied::FactsUnreadable`], naming the failure). A failed re-read is tried again on a
+    /// later call, at most every [`FORCED_REFRESH_MIN_AGE`].
+    #[cfg(target_os = "macos")]
+    fn get_fresher_than(&self, max_age: Duration) -> Arc<HostFacts> {
+        let read = || {
+            self.current
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        let current = read();
+        if !self.refresh || current.gathered_at().elapsed() < max_age {
+            return current;
+        }
+        let mut failure = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-read by another caller while this one waited.
+        let current = read();
+        if current.gathered_at().elapsed() < max_age {
+            return current;
+        }
+        let retry = failure
+            .as_ref()
+            .is_none_or(|f| f.at.elapsed() >= FORCED_REFRESH_MIN_AGE);
+        if retry {
+            match self.gather() {
+                Ok(fresh) => {
+                    let fresh = Arc::new(fresh);
+                    if let Some(f) = failure.take() {
+                        tracing::info!(
+                            "network guard: this host's network facts are read again (after: \
+                             {}); connections are judged again",
+                            f.why
+                        );
+                    }
+                    self.warn_unknown(&fresh);
+                    *self.current.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+                    return fresh;
+                }
+                Err(e) => {
+                    let why = crate::printable(&e.to_string(), 300);
+                    if failure.as_ref().is_none_or(|f| f.why != why) {
+                        tracing::warn!(
+                            "network guard: re-reading this host's network facts failed: {why}. \
+                             Unless that clears within {}s, every requester-caused connection is \
+                             refused until it does",
+                            REFRESH_GRACE.as_secs()
+                        );
+                    }
+                    *failure = Some(RefreshFailure {
+                        at: std::time::Instant::now(),
+                        why,
+                    });
+                    // What the kernel answered for the old facts is asked again.
+                    let kept = Arc::new(current.without_verdicts());
+                    *self.current.write().unwrap_or_else(|e| e.into_inner()) = kept;
+                }
+            }
+        }
+        let current = read();
+        let Some(f) = failure.as_ref() else {
+            return current;
+        };
+        if current.unreadable().is_some()
+            || current.gathered_at().elapsed() < FACTS_TTL + REFRESH_GRACE
+        {
+            return current;
+        }
+        tracing::error!(
+            "network guard: this host's network facts could not be read again for more than {}s \
+             ({}): refusing every requester-caused connection until they can be",
+            (FACTS_TTL + REFRESH_GRACE).as_secs(),
+            f.why
+        );
+        let refusing = Arc::new(current.refusing(f.why.clone()));
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = refusing.clone();
+        refusing
+    }
+
+    /// macOS: one re-read of the facts (tests stage a failure, a delay, and count them).
+    #[cfg(target_os = "macos")]
+    fn gather(&self) -> io::Result<HostFacts> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            self.seam.gathers.fetch_add(1, Ordering::SeqCst);
+            let delay = *self.seam.delay.lock().unwrap();
+            std::thread::sleep(delay);
+            if let Some(why) = self.seam.fail.lock().unwrap().clone() {
+                return Err(io::Error::other(why));
+            }
+        }
+        HostFacts::gather_with(&self.options)
+    }
+
     /// The facts, re-read first if they are older than `max_age` (and the cell refreshes).
+    #[cfg(not(target_os = "macos"))]
     fn get_fresher_than(&self, max_age: Duration) -> Arc<HostFacts> {
         let current = self
             .current
@@ -661,6 +818,10 @@ impl NetPolicy {
                 options,
                 warned: std::sync::Mutex::new(Vec::new()),
                 warned_gaps: std::sync::Mutex::new(Vec::new()),
+                #[cfg(target_os = "macos")]
+                refreshing: std::sync::Mutex::new(None),
+                #[cfg(all(test, target_os = "macos"))]
+                seam: RefreshSeam::default(),
             }),
             deny: deny.into(),
             probe: Arc::new(TtlProbe),
@@ -1405,6 +1566,100 @@ mod tests {
             ..offline()
         };
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());
+    }
+
+    /// Review round 2, bypass-1 (macOS): a re-read of the facts that keeps failing (here a
+    /// staged `/etc/resolver` error) refuses every requester connection once the facts are older
+    /// than `FACTS_TTL` and `REFRESH_GRACE`, naming the failure; within that time the last good
+    /// facts are judged with (without their cached kernel verdicts); and once a re-read succeeds
+    /// again, connections are admitted again. Before this change the first facts stayed in force
+    /// for as long as the failure lasted (`r2-bypass/frozen-facts.log`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_failing_refresh_refuses_after_its_grace_and_recovers() {
+        use std::time::Instant;
+        let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
+        let public = ip("8.8.4.4");
+        if let Err(e) = p.admit(public) {
+            eprintln!("SKIPPED: {public} is not admitted on this host: {e}");
+            return;
+        }
+        let start = p.facts().gathered_at();
+        assert!(p.facts().cached_verdicts() > 0);
+        let why =
+            "the DNS resolver file /etc/resolver/corp.example: Permission denied (os error 13)";
+        *p.facts.seam.fail.lock().unwrap() = Some(why.into());
+        // Within the grace: judged with the last good facts.
+        std::thread::sleep(FACTS_TTL + Duration::from_millis(200));
+        let f = p.facts();
+        assert_eq!(f.gathered_at(), start);
+        assert!(f.unreadable().is_none());
+        // The kernel's verdicts for the old facts were dropped: asked again.
+        assert_eq!(f.cached_verdicts(), 0);
+        assert_eq!(p.admit(public), Ok(()));
+        // Past it: refused, naming the failure, and so is every other destination.
+        while start.elapsed() < FACTS_TTL + REFRESH_GRACE + Duration::from_millis(50) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let t = Instant::now();
+        let d = p.admit(public).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(
+            matches!(&d, Denied::FactsUnreadable { why: w, .. } if w.contains("corp.example")),
+            "{d:?}"
+        );
+        assert!(d.to_string().contains("corp.example"), "{d}");
+        assert!(d.depends_on_facts());
+        for other in ["1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                matches!(p.admit(ip(other)), Err(Denied::FactsUnreadable { .. })),
+                "{other}"
+            );
+        }
+        assert!(matches!(
+            p.admit_to("8.8.4.4:443".parse().unwrap()),
+            Err(Denied::FactsUnreadable { .. })
+        ));
+        assert!(matches!(
+            p.vet_connection("8.8.4.4:443".parse().unwrap()),
+            Err(Denied::FactsUnreadable { .. })
+        ));
+        // A caller judging with the facts in force (the witness broker's floor) refuses too.
+        assert!(matches!(
+            admit(NetMode::Public, public, &p.facts(), &[]),
+            Err(Denied::FactsUnreadable { .. })
+        ));
+        // The condition clears: the next call reads the facts again and admits.
+        *p.facts.seam.fail.lock().unwrap() = None;
+        std::thread::sleep(FORCED_REFRESH_MIN_AGE);
+        assert_eq!(p.admit(public), Ok(()));
+        assert!(p.facts().unreadable().is_none());
+        assert!(p.facts().gathered_at() > start);
+    }
+
+    /// Review round 2, cross-3 (macOS): stale facts are re-read once however many callers find
+    /// them stale at the same time; the others wait for that re-read and take its facts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_facts_are_re_read_once_for_every_caller() {
+        use std::sync::atomic::Ordering;
+        let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
+        *p.facts.seam.delay.lock().unwrap() = Duration::from_millis(300);
+        std::thread::sleep(FACTS_TTL + Duration::from_millis(50));
+        let before = p.facts.seam.gathers.load(Ordering::SeqCst);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (p, b) = (p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    p.facts().gathered_at()
+                })
+            })
+            .collect();
+        let got: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(p.facts.seam.gathers.load(Ordering::SeqCst) - before, 1);
+        assert!(got.iter().all(|g| *g == got[0]));
     }
 
     /// Review r2 R2-NG-1: local routes that hold every public address the host routes stop a

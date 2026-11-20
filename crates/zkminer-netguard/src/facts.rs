@@ -277,6 +277,10 @@ pub struct HostFacts {
     global_v4_interfaces: Vec<IpAddr>,
     /// Whether `[egress] internal_ranges` is stated (facts given by the caller: true).
     internal_ranges_stated: bool,
+    /// macOS: why these facts can no longer be judged with (a refresh failed and they outlived
+    /// their time): every requester connection is refused ([`crate::Denied::FactsUnreadable`]).
+    #[cfg(target_os = "macos")]
+    unreadable: Option<String>,
 }
 
 /// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict`]).
@@ -401,6 +405,25 @@ fn uplink_signature(routes: &RouteTable, internet: &[u32]) -> u64 {
     h.finish()
 }
 
+/// macOS: [`uplink_signature`] (`base`) and the network each service is on, as the configuration
+/// daemon identifies it (`NetworkSignature`: the router's address and hardware address for IPv4,
+/// the prefix and the router's hardware address for IPv6; [`macos_dns::network_signatures`]).
+/// Two networks whose routers have the same address on the same interface (two home networks
+/// behind 192.168.1.1) have the same routes, so `base` alone cannot tell them apart, and a public
+/// address confirmed on the first would stay confirmed on the second for up to
+/// [`crate::public::DISCOVERY_TTL`]; their routers' hardware addresses differ (review round 2,
+/// bypass-2). The kernel's neighbour table cannot stand in: an unprivileged process sees no ARP
+/// entries and every NDP entry's hardware address as `02:00:00:00:00:00`
+/// (`fix-r2/llinfo-unprivileged.log`).
+#[cfg(target_os = "macos")]
+fn macos_uplink_signature(base: u64, networks: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    base.hash(&mut h);
+    sorted(networks.to_vec()).hash(&mut h);
+    h.finish()
+}
+
 /// The enclosing /`len` of every global IPv6 address in `own` (`len` clamped to
 /// [`IPV6_SITE_PREFIX_LENS`]).
 pub fn site_prefixes(own: &[IpAddr], len: u8) -> Vec<Prefix> {
@@ -444,6 +467,8 @@ impl HostFacts {
             uplink_reasons: Vec::new(),
             global_v4_interfaces: Vec::new(),
             internal_ranges_stated: true,
+            #[cfg(target_os = "macos")]
+            unreadable: None,
         }
     }
 
@@ -524,6 +549,43 @@ impl HostFacts {
             uplink_reasons,
             global_v4_interfaces,
             internal_ranges_stated: opts.internal_ranges.is_some(),
+            #[cfg(target_os = "macos")]
+            unreadable: None,
+        }
+    }
+
+    /// How many kernel verdicts these facts hold (macOS tests).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn cached_verdicts(&self) -> usize {
+        self.verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// macOS: why these facts may not be judged with, if so (see [`Self::refusing`]).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn unreadable(&self) -> Option<&str> {
+        self.unreadable.as_deref()
+    }
+
+    /// macOS: these facts without the kernel's cached verdicts (a refresh failed: what the kernel
+    /// answered for them is asked again).
+    #[cfg(target_os = "macos")]
+    pub(crate) fn without_verdicts(&self) -> Self {
+        HostFacts {
+            verdicts: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// macOS: these facts, which may no longer be judged with: `why` they could not be read
+    /// again. [`crate::admit`] refuses every destination with them.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn refusing(&self, why: String) -> Self {
+        HostFacts {
+            unreadable: Some(why),
+            ..self.without_verdicts()
         }
     }
 
@@ -713,6 +775,15 @@ impl HostFacts {
             // Addresses confirmed under another uplink (a new default gateway, a VPN that came
             // up) are not this one's: discovery runs again, and meanwhile they are not known.
             let table = RouteTable::with_rules(routes.clone(), rules.clone());
+            #[cfg(target_os = "macos")]
+            let uplink_signature = {
+                // macOS: the routes' signature and the networks the configuration daemon says
+                // the services are on (`uplink_signature` in here is the function above).
+                let networks = macos_dns::network_signatures()?;
+                move |t: &RouteTable, i: &[u32]| {
+                    macos_uplink_signature(uplink_signature(t, i), &networks)
+                }
+            };
             crate::public::learned_on(uplink_signature(&table, &internet_interfaces))
         } else {
             crate::public::Learned::default()
@@ -850,22 +921,39 @@ fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
     macos_dns::read().map(sorted)
 }
 
-/// macOS: where the DNS servers are read from, and how (review round 1, parse-2 and bypass-1).
+/// macOS: where the DNS servers are read from, and how (review rounds 1 and 2).
 ///
 /// - **Files**: `/etc/resolv.conf` (configd writes it from the primary resolvers) and every
 ///   regular file in `/etc/resolver`. Read as bytes, at most [`macos_dns::MAX_FILE`] (a bigger
 ///   file fails the read), invalid UTF-8 replaced (a stray byte in a comment does not hide the
-///   file's servers); a file or directory that does not exist has none, any other error to read
-///   one fails the read, and what is not a regular file (a FIFO, a device, a directory) is
-///   skipped without being opened for reading.
+///   file's servers). Each file is opened non-blocking and `fstat`ed: what is not a regular file
+///   (a FIFO, a device, a directory) is skipped without being read. A file or directory that does
+///   not exist has none; a symbolic link that loops (`ELOOP`) is skipped with a warning (the
+///   configuration daemon, which reads these files for `scutil --dns`, cannot open it either, so
+///   it names no resolver); any other error (a file this user may not read, such as a root-only
+///   one the daemon reads as root: its servers would otherwise go unrefused) fails the read, its
+///   message naming the file.
 /// - **`nameserver` lines** (any case, leading blanks allowed): the word after it read by every
 ///   parser macOS uses for one: `getaddrinfo(AI_NUMERICHOST)` (libresolv, configd), which reads
 ///   `203.0.113.053` as decimal, `inet_aton` (`203.0.113.053` octal, `3405803829`, `0xcb007135`,
 ///   `10.1`), and the plain form with a zone dropped; every address any of them gives counts.
 /// - **The configuration daemon** (SCDynamicStore): the `ServerAddresses` of every
-///   `State:/Network/Service/<id>/DNS` key and of `State:/Network/Global/DNS`. A session that
-///   cannot be opened, a key list that cannot be read, or a value that is not what configd writes
-///   (a dictionary whose `ServerAddresses` is an array of numeric addresses) fails the read.
+///   `State:/Network/Service/<id>/DNS` key, of `State:/Network/Global/DNS`, and of every
+///   `Setup:/Network/Service/<id>/DNS` key (the DNS servers set by hand for a service, which the
+///   daemon gives a secondary service's scoped resolver without writing them to any `State:`
+///   key; review round 2; a service that is not active adds servers that are refused needlessly,
+///   never fewer). A session that cannot be opened, a key list that cannot be read, a value that
+///   is not what configd writes (a dictionary whose `ServerAddresses` is an array of numeric
+///   addresses), or a daemon that does not answer within [`macos_dns::CONFIGD_TIMEOUT`] fails the
+///   read. The daemon is asked on a thread of its own, at most one at a time: SCDynamicStore has
+///   no timeout of its own, and a stuck request must not hold the facts read (and every
+///   connection waiting on it) for ever.
+/// - **Not read**: the resolver configuration the daemon publishes for the system's resolver
+///   (`dns_configuration_copy`, what `scutil --dns` prints). Its layout is in configd's private
+///   `dnsinfo.h`, not in the SDK, and it is a tree of raw pointers whose layout is no ABI promise:
+///   misreading it is undefined behaviour, so no sound reader can be written against it. Its
+///   sources (the keys above and `/etc/resolver`) are read instead; the real-host test checks
+///   that every server `scutil --dns` lists is among them.
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_dns {
     use std::ffi::CString;
@@ -886,13 +974,29 @@ pub(crate) mod macos_dns {
 
     /// Every DNS server macOS knows of (see the module doc), unsorted.
     pub(crate) fn read() -> io::Result<Vec<IpAddr>> {
+        read_with(
+            super::RESOLV_CONF_PATHS.iter().map(Path::new),
+            Path::new("/etc/resolver"),
+            configd_all,
+        )
+    }
+
+    /// [`read`] from these files, this resolver directory, and this view of the configuration
+    /// daemon (`(State: servers, Setup: servers)`).
+    pub(crate) fn read_with<'a>(
+        files: impl IntoIterator<Item = &'a Path>,
+        resolver: &Path,
+        configd: impl FnOnce() -> io::Result<(Vec<IpAddr>, Vec<IpAddr>)>,
+    ) -> io::Result<Vec<IpAddr>> {
         let mut texts = Vec::new();
-        for p in super::RESOLV_CONF_PATHS {
-            texts.extend(read_file(Path::new(p))?);
+        for p in files {
+            texts.extend(read_file(p)?);
         }
-        texts.extend(resolver_dir(Path::new("/etc/resolver"))?);
+        texts.extend(resolver_dir(resolver)?);
         let mut v: Vec<IpAddr> = texts.iter().flat_map(|t| parse(t)).collect();
-        v.extend(configd()?);
+        let (state, setup) = configd()?;
+        v.extend(state);
+        v.extend(setup);
         Ok(v)
     }
 
@@ -907,7 +1011,16 @@ pub(crate) mod macos_dns {
         {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                warn_once(path, &e);
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("the DNS resolver file {}: {e}", path.display()),
+                ))
+            }
         };
         if !f.metadata()?.is_file() {
             return Ok(None);
@@ -917,7 +1030,10 @@ pub(crate) mod macos_dns {
         if b.len() as u64 > MAX_FILE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{} is larger than {MAX_FILE} bytes", path.display()),
+                format!(
+                    "the DNS resolver file {} is larger than {MAX_FILE} bytes",
+                    path.display()
+                ),
             ));
         }
         Ok(Some(String::from_utf8_lossy(&b).into_owned()))
@@ -928,13 +1044,33 @@ pub(crate) mod macos_dns {
         let entries = match std::fs::read_dir(dir) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", dir.display()))),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("the DNS resolver directory {}: {e}", dir.display()),
+                ))
+            }
         };
         let mut out = Vec::new();
         for e in entries {
             out.extend(read_file(&e?.path())?);
         }
         Ok(out)
+    }
+
+    /// Warns once per path about a resolver file that is skipped.
+    fn warn_once(path: &Path, e: &io::Error) {
+        static WARNED: std::sync::Mutex<Vec<std::path::PathBuf>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut w = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if !w.iter().any(|p| p == path) && w.len() < 64 {
+            w.push(path.to_path_buf());
+            tracing::warn!(
+                "network guard: skipping the DNS resolver file {}: {e} (the system cannot open \
+                 it either, so it names no resolver)",
+                path.display()
+            );
+        }
     }
 
     /// The servers of a resolver file's `nameserver` lines (see the module doc).
@@ -1025,29 +1161,123 @@ pub(crate) mod macos_dns {
     fn malformed(what: &str) -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("the system configuration's DNS settings: {what}"),
+            format!("the system configuration holds a value it would not write at {what}"),
         )
     }
 
-    /// The `ServerAddresses` of every DNS key of the configuration daemon (see the module doc).
-    pub(crate) fn configd() -> io::Result<Vec<IpAddr>> {
-        let store = SCDynamicStoreBuilder::new("zkminer-netguard")
+    /// The configuration daemon's DNS keys read for their servers (patterns of
+    /// `SCDynamicStoreCopyKeyList`): the active services' and the global resolvers.
+    pub(crate) const STATE_DNS_KEYS: &[&str] = &[
+        "State:/Network/Service/[^/]+/DNS",
+        "State:/Network/Global/DNS",
+    ];
+
+    /// The DNS servers set by hand for each service (review round 2).
+    pub(crate) const SETUP_DNS_KEYS: &[&str] = &["Setup:/Network/Service/[^/]+/DNS"];
+
+    /// How long the configuration daemon may take to answer (see the module doc).
+    pub(crate) const CONFIGD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// The keys whose `NetworkSignature` identifies the network a service is on.
+    pub(crate) const NETWORK_KEYS: &[&str] = &["State:/Network/Service/[^/]+/IPv[46]"];
+
+    /// The configuration daemon's identity of the network each active service is on: every
+    /// `NetworkSignature` of a [`NETWORK_KEYS`] key, as `key=signature` (a key without one, a VPN
+    /// service's, has none); a signature that is not a string fails the read (see
+    /// [`super::macos_uplink_signature`]).
+    pub(crate) fn network_signatures() -> io::Result<Vec<String>> {
+        ASKING.run(CONFIGD_TIMEOUT, || {
+            let store = session()?;
+            signatures_of(keys(&store, NETWORK_KEYS)?.into_iter().map(|k| {
+                let v = store.get(k.as_str());
+                (k, v)
+            }))
+        })
+    }
+
+    /// The `key=signature` of each value that has one, by key (`None`: the key is gone): an
+    /// error naming the key for a value configd would not write ([`network_signature`]).
+    pub(crate) fn signatures_of(
+        values: impl IntoIterator<Item = (String, Option<CFPropertyList>)>,
+    ) -> io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for (key, value) in values {
+            let Some(value) = value else {
+                continue;
+            };
+            if let Some(sig) = network_signature(&value).ok_or_else(|| malformed(&key))? {
+                out.push(format!("{key}={sig}"));
+            }
+        }
+        Ok(out)
+    }
+
+    /// A service's `NetworkSignature`: `Some(None)` without one, `None` for a value configd would
+    /// not write (not a dictionary, or a signature that is not a string).
+    pub(crate) fn network_signature(value: &CFPropertyList) -> Option<Option<String>> {
+        let dict = value.downcast::<CFDictionary>()?;
+        let key = CFString::from_static_string("NetworkSignature");
+        let Some(sig) = dict.find(key.as_CFTypeRef()) else {
+            return Some(None);
+        };
+        // SAFETY: a value of a property-list dictionary is a property list, retained here.
+        let sig = unsafe { CFPropertyList::wrap_under_get_rule(*sig) }.downcast::<CFString>()?;
+        Some(Some(sig.to_string()))
+    }
+
+    /// Calls to the configuration daemon: at most four outstanding (see [`Bounded`]).
+    static ASKING: Bounded = Bounded::new("the system configuration daemon", 4);
+
+    fn session() -> io::Result<system_configuration::dynamic_store::SCDynamicStore> {
+        SCDynamicStoreBuilder::new("zkminer-netguard")
             .build()
-            .ok_or_else(|| io::Error::other("could not reach the system configuration daemon"))?;
+            .ok_or_else(|| io::Error::other("could not reach the system configuration daemon"))
+    }
+
+    fn keys(
+        store: &system_configuration::dynamic_store::SCDynamicStore,
+        patterns: &[&str],
+    ) -> io::Result<Vec<String>> {
         let mut keys = Vec::new();
-        for pattern in [
-            "State:/Network/Service/[^/]+/DNS",
-            "State:/Network/Global/DNS",
-        ] {
+        for pattern in patterns {
             let list = store
-                .get_keys(pattern)
-                .ok_or_else(|| io::Error::other("could not list the system's DNS settings"))?;
+                .get_keys(*pattern)
+                .ok_or_else(|| io::Error::other("could not list the system's network settings"))?;
             keys.extend(list.iter().map(|k| k.to_string()));
         }
+        Ok(keys)
+    }
+
+    /// The servers of the daemon's [`STATE_DNS_KEYS`] (see the module doc).
+    #[cfg(test)]
+    pub(crate) fn configd() -> io::Result<Vec<IpAddr>> {
+        configd_all().map(|(state, _)| state)
+    }
+
+    /// The servers of the daemon's [`STATE_DNS_KEYS`] and of its [`SETUP_DNS_KEYS`], from one
+    /// session, asked on a thread of its own within [`CONFIGD_TIMEOUT`].
+    pub(crate) fn configd_all() -> io::Result<(Vec<IpAddr>, Vec<IpAddr>)> {
+        ASKING.run(CONFIGD_TIMEOUT, || {
+            let store = session()?;
+            let servers = |patterns: &[&str]| -> io::Result<Vec<IpAddr>> {
+                // A key gone since it was listed (a service went down) has no servers any more.
+                servers_of(keys(&store, patterns)?.into_iter().map(|k| {
+                    let v = store.get(k.as_str());
+                    (k, v)
+                }))
+            };
+            Ok((servers(STATE_DNS_KEYS)?, servers(SETUP_DNS_KEYS)?))
+        })
+    }
+
+    /// The servers of the daemon's DNS values, by key (`None`: the key is gone): an error naming
+    /// the key for a value configd would not write ([`server_addresses`]).
+    pub(crate) fn servers_of(
+        values: impl IntoIterator<Item = (String, Option<CFPropertyList>)>,
+    ) -> io::Result<Vec<IpAddr>> {
         let mut out = Vec::new();
-        for key in keys {
-            // Gone since it was listed (a service went down): it has no servers any more.
-            let Some(value) = store.get(key.as_str()) else {
+        for (key, value) in values {
+            let Some(value) = value else {
                 continue;
             };
             out.extend(server_addresses(&value).ok_or_else(|| malformed(&key))?);
@@ -1058,7 +1288,7 @@ pub(crate) mod macos_dns {
     /// The addresses of a DNS dictionary's `ServerAddresses` (none without one); `None` when the
     /// value is not a dictionary, `ServerAddresses` is not an array of strings, or a string names
     /// no address.
-    fn server_addresses(value: &CFPropertyList) -> Option<Vec<IpAddr>> {
+    pub(crate) fn server_addresses(value: &CFPropertyList) -> Option<Vec<IpAddr>> {
         let dict = value.downcast::<CFDictionary>()?;
         let key = CFString::from_static_string("ServerAddresses");
         let Some(list) = dict.find(key.as_CFTypeRef()) else {
@@ -1077,6 +1307,80 @@ pub(crate) mod macos_dns {
             out.extend(a);
         }
         Some(out)
+    }
+
+    /// A call that may block for ever (a request to a daemon), made on a thread of its own and
+    /// waited for at most a timeout. A call that timed out is abandoned (its thread finishes on
+    /// its own, if ever); while `max` abandoned calls have not returned, the next call fails at
+    /// once rather than leave another thread behind (review round 2, cross-3).
+    pub(crate) struct Bounded {
+        what: &'static str,
+        max: usize,
+        abandoned: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Bounded {
+        pub(crate) const fn new(what: &'static str, max: usize) -> Self {
+            Bounded {
+                what,
+                max,
+                abandoned: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// `f`'s result, or an error when it takes longer than `timeout` or `max` abandoned calls
+        /// have not returned yet.
+        pub(crate) fn run<T: Send + 'static>(
+            &'static self,
+            timeout: std::time::Duration,
+            f: impl FnOnce() -> io::Result<T> + Send + 'static,
+        ) -> io::Result<T> {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            use std::sync::Arc;
+            const RUNNING: u8 = 0;
+            const ABANDONED: u8 = 1;
+            const DONE: u8 = 2;
+            if self.abandoned.load(Ordering::Acquire) >= self.max {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{} has not answered earlier requests", self.what),
+                ));
+            }
+            let state = Arc::new(AtomicU8::new(RUNNING));
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let theirs = state.clone();
+            std::thread::Builder::new()
+                .name("netguard-configd".into())
+                .spawn(move || {
+                    let r = f();
+                    let _ = tx.send(r);
+                    if theirs
+                        .compare_exchange(RUNNING, DONE, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        // Abandoned by its caller: no longer outstanding.
+                        self.abandoned.fetch_sub(1, Ordering::AcqRel);
+                    }
+                })?;
+            match rx.recv_timeout(timeout) {
+                Ok(r) => r,
+                Err(_) => {
+                    if state
+                        .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.abandoned.fetch_add(1, Ordering::AcqRel);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("{} did not answer within {timeout:?}", self.what),
+                        ));
+                    }
+                    // It returned just now.
+                    rx.recv()
+                        .unwrap_or_else(|_| Err(io::Error::other("the call was lost")))
+                }
+            }
+        }
     }
 }
 
@@ -1229,7 +1533,7 @@ mod sys {
     /// # Safety
     /// `sa` is null or points to a sockaddr valid for its `sa_len` bytes.
     #[cfg(target_os = "macos")]
-    unsafe fn sockaddr_mask(sa: *const libc::sockaddr, v4: bool) -> Option<u8> {
+    pub(super) unsafe fn sockaddr_mask(sa: *const libc::sockaddr, v4: bool) -> Option<u8> {
         use std::mem::offset_of;
         if sa.is_null() {
             return None;
@@ -1735,7 +2039,25 @@ mod tests {
                 listed.contains(a),
                 "{a} (configd) not in scutil --dns: {listed:?}"
             );
+            assert!(all.contains(a), "{a} (configd) not in {all:?}");
         }
+        // Review round 2: the servers set by hand for any service, and every /etc/resolver
+        // file's, are the system's too.
+        let (state, setup) = super::macos_dns::configd_all().unwrap();
+        assert_eq!(state, configd);
+        for a in &setup {
+            assert!(all.contains(a), "{a} (Setup:) not in {all:?}");
+        }
+        let files: Vec<IpAddr> =
+            super::macos_dns::resolver_dir(std::path::Path::new("/etc/resolver"))
+                .unwrap()
+                .iter()
+                .flat_map(|t| super::macos_dns::parse(t))
+                .collect();
+        for a in &files {
+            assert!(all.contains(a), "{a} (/etc/resolver) not in {all:?}");
+        }
+        eprintln!("Setup: servers {setup:?}; /etc/resolver servers {files:?}");
         assert_eq!(
             listed.is_empty(),
             configd.is_empty(),
@@ -1745,6 +2067,396 @@ mod tests {
             "scutil --dns: {} server entries; configd keys: {configd:?}; all: {all:?}",
             listed.len()
         );
+    }
+
+    /// Review round 2 (cross-1, cross-2): every source counts: the files, the resolver
+    /// directory, the daemon's `State:` servers and its `Setup:` servers; a failure of any one
+    /// fails the read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dns_servers_come_from_every_source() {
+        use super::macos_dns::read_with;
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!("zkminer-dns-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("resolver")).unwrap();
+        std::fs::write(dir.join("resolv.conf"), "nameserver 192.0.2.1\n").unwrap();
+        std::fs::write(dir.join("resolver/corp.example"), "nameserver 192.0.2.2\n").unwrap();
+        let conf = dir.join("resolv.conf");
+        let files = [conf.as_path(), Path::new("/nonexistent/resolv.conf")];
+        let configd = || Ok((vec![ip("192.0.2.3")], vec![ip("192.0.2.4")]));
+        let mut got = read_with(files, &dir.join("resolver"), configd).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ip("192.0.2.1"),
+                ip("192.0.2.2"),
+                ip("192.0.2.3"),
+                ip("192.0.2.4")
+            ]
+        );
+        let down = || {
+            Err(io::Error::other(
+                "could not reach the system configuration daemon",
+            ))
+        };
+        assert!(read_with(files, &dir.join("resolver"), down).is_err());
+        // A symbolic link that loops is skipped (the system cannot open it either); the rest of
+        // the directory is still read.
+        std::os::unix::fs::symlink(dir.join("resolver/b"), dir.join("resolver/a")).unwrap();
+        std::os::unix::fs::symlink(dir.join("resolver/a"), dir.join("resolver/b")).unwrap();
+        let got = read_with(files, &dir.join("resolver"), configd).unwrap();
+        assert!(got.contains(&ip("192.0.2.2")), "{got:?}");
+        // A file this user may not read fails the read, naming it.
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.join("resolver/locked.example");
+        std::fs::write(&locked, "nameserver 192.0.2.5\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let e = read_with(files, &dir.join("resolver"), configd).unwrap_err();
+        assert!(e.to_string().contains("locked.example"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// cross-2: the daemon's values are read strictly: only a dictionary whose `ServerAddresses`
+    /// is an array of strings that each name an address gives servers (none without the key); a
+    /// value that is not one fails the read, naming its key; a key gone since it was listed has
+    /// none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn configd_values_are_read_strictly() {
+        use super::macos_dns::{server_addresses, servers_of};
+        use core_foundation::array::CFArray;
+        use core_foundation::base::{CFType, TCFType};
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::number::CFNumber;
+        use core_foundation::propertylist::{CFPropertyList, CFPropertyListSubClass};
+        use core_foundation::string::CFString;
+        let key = CFString::from_static_string("ServerAddresses");
+        let dict = |v: CFType| -> CFPropertyList {
+            CFDictionary::from_CFType_pairs(&[(key.as_CFType(), v)])
+                .to_untyped()
+                .to_CFPropertyList()
+        };
+        let strings = |v: &[&str]| -> CFType {
+            let items: Vec<CFType> = v.iter().map(|s| CFString::new(s).as_CFType()).collect();
+            CFArray::from_CFTypes(&items).as_CFType()
+        };
+        assert_eq!(
+            server_addresses(&dict(strings(&["192.0.2.53", "fe80::1%en0", "0xc0000235"]))),
+            Some(vec![ip("192.0.2.53"), ip("fe80::1"), ip("192.0.2.53")])
+        );
+        // No ServerAddresses: no servers.
+        let other = CFString::from_static_string("SearchDomains");
+        let no_key =
+            CFDictionary::from_CFType_pairs(&[(other.as_CFType(), strings(&["x.example"]))])
+                .to_untyped()
+                .to_CFPropertyList();
+        assert_eq!(server_addresses(&no_key), Some(Vec::new()));
+        // Not a dictionary; ServerAddresses a string; an array holding a number; a number; a
+        // string that names no address; an empty string.
+        let array = CFArray::from_CFTypes(&[CFString::new("192.0.2.53").as_CFType()])
+            .to_untyped()
+            .to_CFPropertyList();
+        let mixed = CFArray::from_CFTypes(&[
+            CFString::new("192.0.2.53").as_CFType(),
+            CFNumber::from(53i32).as_CFType(),
+        ])
+        .as_CFType();
+        for bad in [
+            array,
+            dict(CFString::new("192.0.2.53").as_CFType()),
+            dict(mixed),
+            dict(CFNumber::from(53i32).as_CFType()),
+            dict(strings(&["not-an-ip"])),
+            dict(strings(&["192.0.2.53", ""])),
+        ] {
+            assert_eq!(server_addresses(&bad), None);
+        }
+        let good = dict(strings(&["192.0.2.53"]));
+        assert_eq!(
+            servers_of([
+                ("State:/Network/Global/DNS".to_string(), Some(good.clone())),
+                ("State:/Network/Service/gone/DNS".to_string(), None),
+            ])
+            .unwrap(),
+            vec![ip("192.0.2.53")]
+        );
+        let e = servers_of([
+            ("State:/Network/Global/DNS".to_string(), Some(good)),
+            (
+                "Setup:/Network/Service/x/DNS".to_string(),
+                Some(dict(strings(&["not-an-ip"]))),
+            ),
+        ])
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("Setup:/Network/Service/x/DNS"),
+            "{e}"
+        );
+    }
+
+    /// cross-2: every DNS key this host's configuration daemon holds for a service or globally is
+    /// one the read lists (the multicast, private-relay and mDNSResponder keys hold no unicast
+    /// servers), and every value read is one configd wrote.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_hosts_dns_keys_are_all_read() {
+        use super::macos_dns::{SETUP_DNS_KEYS, STATE_DNS_KEYS};
+        use system_configuration::dynamic_store::SCDynamicStoreBuilder;
+        let store = SCDynamicStoreBuilder::new("zkminer-netguard-test")
+            .build()
+            .unwrap();
+        let keys = |patterns: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = patterns
+                .iter()
+                .flat_map(|p| {
+                    store
+                        .get_keys(*p)
+                        .unwrap()
+                        .iter()
+                        .map(|k| k.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let read = keys(&[STATE_DNS_KEYS, SETUP_DNS_KEYS].concat());
+        let every: Vec<String> = keys(&["(State|Setup):/Network/.*/DNS"])
+            .into_iter()
+            .filter(|k| !k.ends_with("/MulticastDNS") && !k.ends_with("/PrivateDNS"))
+            .collect();
+        eprintln!("this host's DNS keys: {every:?}");
+        assert_eq!(read, every);
+        assert!(every.contains(&"State:/Network/Global/DNS".to_string()) || every.is_empty());
+    }
+
+    /// bypass-2 (macOS): two networks whose routers have the same address on the same interface
+    /// have the same routes and the same `uplink_signature`; the configuration daemon's network
+    /// identities (the routers' hardware addresses) tell them apart, so a public address
+    /// confirmed on one is not confirmed on the other. The same network read twice, its services
+    /// listed in another order, is the same uplink.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn two_networks_behind_the_same_router_address_are_two_uplinks_on_macos() {
+        let gw = ip("192.168.1.1");
+        let home = RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), gw, 14),
+            Route::on_link(p("192.168.1.0/24"), 14),
+        ]);
+        let cafe = RouteTable::new(vec![
+            Route::via(p("0.0.0.0/0"), gw, 14),
+            Route::on_link(p("192.168.1.0/24"), 14),
+            Route::on_link(p("192.168.1.1/32"), 14),
+        ]);
+        let (a, b) = (
+            uplink_signature(&home, &[14]),
+            uplink_signature(&cafe, &[14]),
+        );
+        assert_eq!(a, b, "the routes alone cannot tell them apart");
+        let sig = |mac: &str| {
+            vec![
+                format!("State:/Network/Service/S/IPv4=IPv4.Router=192.168.1.1;IPv4.RouterHardwareAddress={mac}"),
+                format!("State:/Network/Service/S/IPv6=IPv6.Prefix=2001:db8:1::/64;IPv6.RouterHardwareAddress={mac}"),
+            ]
+        };
+        let at_home = macos_uplink_signature(a, &sig("a4:2b:b0:00:00:01"));
+        let at_cafe = macos_uplink_signature(b, &sig("3c:84:6a:00:00:02"));
+        assert_ne!(at_home, at_cafe);
+        let mut reordered = sig("a4:2b:b0:00:00:01");
+        reordered.reverse();
+        assert_eq!(macos_uplink_signature(a, &reordered), at_home);
+        assert_ne!(macos_uplink_signature(a, &[]), at_home);
+        // This host: the daemon identifies the network of every service with an IPv4 router.
+        let networks = macos_dns::network_signatures().unwrap();
+        eprintln!("{} network signatures", networks.len());
+        let (routes, _) = crate::routes::read_routing(&[]).unwrap();
+        if routes.iter().any(|r| {
+            r.prefix.len == 0 && r.prefix.addr.is_ipv4() && r.table == crate::routes::RT_TABLE_MAIN
+        }) {
+            assert!(
+                networks.iter().any(|n| n.contains("IPv4.Router=")),
+                "no IPv4 network signature"
+            );
+        }
+    }
+
+    /// bypass-2: a service's `NetworkSignature` is read strictly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn network_signatures_are_read_strictly() {
+        use super::macos_dns::{network_signature, signatures_of};
+        use core_foundation::base::TCFType;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::number::CFNumber;
+        use core_foundation::propertylist::CFPropertyListSubClass;
+        use core_foundation::string::CFString;
+        let key = CFString::from_static_string("NetworkSignature");
+        let with = |v: core_foundation::base::CFType| {
+            CFDictionary::from_CFType_pairs(&[(key.as_CFType(), v)])
+                .to_untyped()
+                .to_CFPropertyList()
+        };
+        assert_eq!(
+            network_signature(&with(CFString::new("IPv4.Router=192.0.2.1").as_CFType())),
+            Some(Some("IPv4.Router=192.0.2.1".to_string()))
+        );
+        assert_eq!(
+            network_signature(&with(CFNumber::from(1i32).as_CFType())),
+            None
+        );
+        let other = CFDictionary::from_CFType_pairs(&[(
+            CFString::new("Router").as_CFType(),
+            CFString::new("192.0.2.1").as_CFType(),
+        )])
+        .to_untyped()
+        .to_CFPropertyList();
+        assert_eq!(network_signature(&other), Some(None));
+        assert_eq!(
+            network_signature(&CFString::new("x").to_CFPropertyList()),
+            None
+        );
+        let k = |s: &str| s.to_string();
+        let good = with(CFString::new("IPv4.Router=192.0.2.1").as_CFType());
+        assert_eq!(
+            signatures_of([
+                (k("State:/Network/Service/a/IPv4"), Some(good.clone())),
+                (k("State:/Network/Service/b/IPv4"), Some(other)),
+                (k("State:/Network/Service/c/IPv6"), None),
+            ])
+            .unwrap(),
+            vec![k("State:/Network/Service/a/IPv4=IPv4.Router=192.0.2.1")]
+        );
+        let e = signatures_of([
+            (k("State:/Network/Service/a/IPv4"), Some(good)),
+            (
+                k("State:/Network/Service/d/IPv6"),
+                Some(with(CFNumber::from(1i32).as_CFType())),
+            ),
+        ])
+        .unwrap_err();
+        assert!(e.to_string().contains("Service/d/IPv6"), "{e}");
+    }
+
+    /// parse-4 / cross-2: a netmask is read within its `sa_len`: the kernel trims
+    /// 255.255.255.0 to `sa_len` 7, and what follows (here 0xff bytes, another sockaddr's) is
+    /// not the mask's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn netmasks_are_read_within_their_length() {
+        let mask = |b: &[u8], v4: bool| {
+            let mut buf = [0xffu8; 32];
+            buf[..b.len()].copy_from_slice(b);
+            // SAFETY: `buf` holds 32 bytes, more than any `sa_len` here.
+            unsafe { sys::sockaddr_mask(buf.as_ptr().cast(), v4) }
+        };
+        assert_eq!(mask(&[7, 0, 0, 0, 0xff, 0xff, 0xff], true), Some(24));
+        assert_eq!(mask(&[5, 0, 0, 0, 0xff], true), Some(8));
+        assert_eq!(mask(&[0], true), Some(0));
+        assert_eq!(mask(&[8, 0, 0, 0, 0xff, 0xff, 0xff, 0xff], true), Some(32));
+        let mut v6 = vec![16, 0, 0, 0, 0, 0, 0, 0];
+        v6.extend([0xff; 8]);
+        assert_eq!(mask(&v6, false), Some(64));
+        // SAFETY: null is allowed.
+        assert_eq!(unsafe { sys::sockaddr_mask(std::ptr::null(), true) }, None);
+    }
+
+    /// cross-2: without the configuration daemon (a sandbox that denies its Mach service) the
+    /// DNS servers cannot be read, so the facts read fails, and a public-mode policy cannot be
+    /// built: fail closed. Runs this test binary again under `sandbox-exec`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_facts_read_fails_without_the_configuration_daemon() {
+        if std::env::var_os("ZKMINER_TEST_NO_CONFIGD").is_some() {
+            let c = super::macos_dns::configd();
+            let g = HostFacts::gather_with(&offline());
+            let p = crate::NetPolicy::with_options(crate::NetMode::Public, Vec::new(), offline());
+            println!(
+                "RESULT configd {:?}; gather {:?}; policy {:?}",
+                c.as_ref().err(),
+                g.as_ref().err(),
+                p.as_ref().err()
+            );
+            assert!(c.is_err() && g.is_err() && p.is_err());
+            println!("RESULT all failed");
+            return;
+        }
+        let sandbox = std::path::Path::new("/usr/bin/sandbox-exec");
+        if !sandbox.exists() {
+            eprintln!("SKIPPED: no sandbox-exec");
+            return;
+        }
+        let out = std::process::Command::new(sandbox)
+            .args([
+                "-p",
+                "(version 1)(allow default)(deny mach-lookup (global-name \"com.apple.SystemConfiguration.configd\"))",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "facts::tests::the_facts_read_fails_without_the_configuration_daemon",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ZKMINER_TEST_NO_CONFIGD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        eprintln!("{text}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success() && text.contains("RESULT all failed"),
+            "{text}"
+        );
+    }
+
+    /// cross-3: a call to the configuration daemon is bounded: one that does not return within
+    /// its timeout fails, the next fails at once while it is still stuck (here one stuck call is
+    /// the most; the daemon's allows four), and once it returns calls are made again. Calls that
+    /// return in time may run at once, any number of them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stuck_configuration_daemon_fails_the_read_in_time() {
+        use super::macos_dns::Bounded;
+        use std::time::{Duration, Instant};
+        static B: Bounded = Bounded::new("the test daemon", 1);
+        assert_eq!(B.run(Duration::from_secs(1), || Ok(7)).unwrap(), 7);
+        let t = Instant::now();
+        let e = B
+            .run(Duration::from_millis(200), || {
+                std::thread::sleep(Duration::from_millis(800));
+                Ok(1)
+            })
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            t.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            t.elapsed()
+        );
+        let e = B.run(Duration::from_secs(1), || Ok(2)).unwrap_err();
+        assert!(e.to_string().contains("earlier requests"), "{e}");
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(B.run(Duration::from_secs(1), || Ok(3)).unwrap(), 3);
+        assert!(B
+            .run(Duration::from_secs(1), || Err::<(), _>(io::Error::other(
+                "x"
+            )))
+            .is_err());
+        assert_eq!(B.run(Duration::from_secs(1), || Ok(4)).unwrap(), 4);
+        let many: Vec<_> = (0..16)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    B.run(Duration::from_secs(2), move || {
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(i)
+                    })
+                })
+            })
+            .collect();
+        for (i, t) in many.into_iter().enumerate() {
+            assert_eq!(t.join().unwrap().unwrap(), i);
+        }
     }
 
     #[test]
