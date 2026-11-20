@@ -1,10 +1,33 @@
 name: Network guard (Linux)
 
+# Only when the guard, its callers, or what builds them changed (review round 6, cross-8).
 on:
   push:
     branches: [ "main" ]
+    paths:
+      - "crates/zkminer-netguard/**"
+      - "crates/zkminer-chain/**"
+      - "crates/zkminer-config/**"
+      - "crates/zkminer-witness/**"
+      - "crates/zkminer-witness-broker/**"
+      - "crates/zkminer-witness-sandbox/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/netguard-linux.yml"
   pull_request:
     branches: [ "main" ]
+    paths:
+      - "crates/zkminer-netguard/**"
+      - "crates/zkminer-chain/**"
+      - "crates/zkminer-config/**"
+      - "crates/zkminer-witness/**"
+      - "crates/zkminer-witness-broker/**"
+      - "crates/zkminer-witness-sandbox/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/netguard-linux.yml"
   workflow_dispatch:
 
 permissions:
@@ -77,5 +100,7 @@ jobs:
           restore-keys: netguard-linux-callers-
       - name: "zkminer-chain"
         run: cargo test --locked -p zkminer-chain
+      - name: "zkminer-chain: real downloads in public mode (ignored by default: they need the network)"
+        run: cargo test --locked -p zkminer-chain -- --ignored a_real_elf_downloads_in_public_mode real_stores_that_redirect_across_hosts_are_followed
       - name: "zkminer-witness-broker"
         run: cargo test --locked -p zkminer-witness-broker --lib

@@ -285,10 +285,16 @@ and no IPv4 (or IPv4 only through a CLAT, 464XLAT) joins a network, IPv6 destina
 for up to 2 s (`NAT64 prefix is still being learned`); on any host they are refused while the
 network names NAT64 prefixes the guard does not believe or cannot hold (more than two in one DNS
 answer, more than four live ones in one router's advertisements): the refusal names the source,
-and it clears as soon as that source names what fits (a withdrawn or expired prefix no longer
-counts). `its public ... address there is being learned again` follows a move to another network
-(on Linux also a default gateway that shows another link-layer address, until it shows the known
-one again): it clears by itself within seconds. `the connection to ... was dropped
+and it clears as soon as that source names what fits (a router's next advertisement replaces what
+it named before, and a PREF64 lifetime is believed for 30 minutes at most). Withdrawn, expired
+and other networks' prefixes stay refused for an hour, then are forgotten; if a network names so
+many that one withdrawn less than an hour ago must make room, IPv6 is refused there until that
+hour ends. Once a forger on the network stops, such a refusal ends within about 95 minutes (one
+forged advertisement: at the real router's next one). `its public ... address there is being
+learned again` follows a move to another network (on Linux also a default gateway that shows
+another link-layer address, until it shows the known one again or the new one holds; or a
+gateway whose neighbour entry is gone and does not come back when asked): it clears by itself
+within seconds. `the connection to ... was dropped
 once made` means the route changed between the check and the connection (a VPN coming up): the
 next attempt is judged on the new route.
 
