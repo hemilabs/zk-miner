@@ -963,6 +963,16 @@ impl NetPolicy {
         self.mode
     }
 
+    /// Tests: every re-read of the facts from now on takes `delay` (and how many ran).
+    #[cfg(test)]
+    pub(crate) fn stage_slow_refresh(&self, delay: Duration) -> usize {
+        *self.facts.seam.delay.lock().unwrap() = delay;
+        self.facts
+            .seam
+            .gathers
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The operator's extra deny CIDRs.
     pub fn deny(&self) -> &[Prefix] {
         &self.deny
@@ -971,6 +981,17 @@ impl NetPolicy {
     /// The host facts in force (re-read first if stale).
     pub fn facts(&self) -> Arc<HostFacts> {
         self.facts.get()
+    }
+
+    /// The host facts in force, as they are: never re-read (a snapshot for a caller that must
+    /// not block, an async runtime's worker: review round 4, parse-3). Whatever it decides with
+    /// them is admitted later on facts that are re-read.
+    pub(crate) fn facts_in_force(&self) -> Arc<HostFacts> {
+        self.facts
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The options the facts are gathered with.
