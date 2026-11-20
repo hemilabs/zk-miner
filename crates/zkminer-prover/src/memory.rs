@@ -1757,6 +1757,18 @@ pub fn claim_set_bytes(want: u64, same: usize, other: usize, other_peak: u64, sl
         .fold(want, |sum, p| sum.saturating_add(*p))
 }
 
+/// Whether a claim that will WAIT for a card fits (see `claim_set_bytes`): every card already has a
+/// job ahead of it, so it starts only once one of those is done, and does not need room beside
+/// the proofs running now. What it needs is that the set it will run in (`set`), with the OS slice
+/// (`reserve`), fits what is free now (`available`) plus what our own proofs, idle workers and
+/// measurements will have handed back by then (`returning`). That still counts memory held by
+/// anything else, which the set's test against the total cannot see. Requiring the job to fit on
+/// top of the running proofs instead refused a queued RISC Zero claim behind a running SP1 proof
+/// it would never run beside.
+pub fn queued_claim_fits(set: u64, reserve: u64, available: u64, returning: u64) -> bool {
+    set.saturating_add(reserve) <= available.saturating_add(returning)
+}
+
 /// The host memory one card's real proofs have reached, by the po2 they proved at (`BASELINE_PO2`
 /// for a proof given none), in bytes. Windows only: see `learned_host_peak`.
 pub type LearnedPeaks = std::collections::BTreeMap<u8, u64>;
@@ -3764,6 +3776,24 @@ mod windows_commit_tests {
             after.1 + GIB >= before.free_now + grew && after.1 <= before.free_now + grew + GIB,
             "{before:?} -> {after:?}"
         );
+    }
+
+    /// A claim that waits for a card is charged against what will be free when it starts, not
+    /// against room beside the proofs running now; memory held by anything else still counts.
+    #[test]
+    fn a_queued_claim_counts_what_running_proofs_hand_back() {
+        let reserve = 4 * GIB;
+        // Two cards busy: SP1 (42 GiB) and RISC Zero (5 GiB) running, 6 GiB free.
+        let (running, free) = (47 * GIB, 6 * GIB);
+        // A RISC Zero claim waits for a card; it will run beside one SP1 at most (47 GiB).
+        let set = claim_set_bytes(5 * GIB, 1, 1, 42 * GIB, 2);
+        assert_eq!(set, 47 * GIB);
+        // Live headroom refuses it: 6 GiB free less the OS slice is not 5 GiB.
+        assert!(!can_admit(5 * GIB, 0, running, free, 100 * GIB, reserve));
+        // When it starts, the running proofs' 47 GiB is back: 6 + 47 covers 47 + 4.
+        assert!(queued_claim_fits(set, reserve, free, running));
+        // Another program holding 60 GiB: nothing our proofs return makes room for the set.
+        assert!(!queued_claim_fits(set, reserve, 0, running - 10 * GIB));
     }
 
     /// The claim set: this proof and the largest of the outstanding, no more than the cards run.
