@@ -41,8 +41,9 @@ jobs:
 
   callers:
     # The guard's callers on x86_64 Linux: the program fetcher (zkminer-chain) and the witness
-    # broker's connector (zkminer-witness-broker), whose tests drive the guarded client and the
-    # connector's checks before and after connecting.
+    # broker's connector (zkminer-witness-broker's library tests), which drive the guarded client
+    # and the connector's checks before and after connecting. The broker's integration tests need
+    # anvil and run its sandboxed binary; they are not run here.
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -55,4 +56,4 @@ jobs:
       - name: "zkminer-chain"
         run: cargo test --locked -p zkminer-chain
       - name: "zkminer-witness-broker"
-        run: cargo test --locked -p zkminer-witness-broker
+        run: cargo test --locked -p zkminer-witness-broker --lib
