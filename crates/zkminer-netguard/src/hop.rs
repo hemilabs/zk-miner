@@ -109,7 +109,14 @@ pub(super) fn attempt_limit(
     connect_timeout: Duration,
     deadline: tokio::time::Instant,
 ) -> tokio::time::Instant {
-    (now + connect_timeout).min(deadline)
+    later(now, connect_timeout).min(deadline)
+}
+
+/// `now + d`, or far in the future when that does not fit an `Instant` (review round 6, the parse
+/// lens's suspicion: a huge timeout given through the public API panicked on the overflow).
+pub(super) fn later(now: tokio::time::Instant, d: Duration) -> tokio::time::Instant {
+    now.checked_add(d)
+        .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 24 * 3600))
 }
 
 /// A TCP connection to one of `pinned` (at most one per family: [`super::GuardedClient`]'s pin),
@@ -162,7 +169,7 @@ where
         {
             running.spawn(attempt(order[next]));
             next += 1;
-            start_next = tokio::time::Instant::now() + delay;
+            start_next = later(tokio::time::Instant::now(), delay);
         }
         if running.is_empty() {
             break;
@@ -260,7 +267,7 @@ pub(super) async fn send(
         };
         // Review round 5, parse-1: the handshake within the connect timeout (as reqwest's
         // connector bounded it before round 4), not only the request's whole time.
-        let by = (tokio::time::Instant::now() + options.connect_timeout).min(deadline);
+        let by = later(tokio::time::Instant::now(), options.connect_timeout).min(deadline);
         let tls = tokio::time::timeout_at(by, tokio_rustls::TlsConnector::from(tls.clone()).connect(name, tcp))
             .await
             .map_err(|_| failed("the TLS handshake", "timed out"))?
@@ -303,7 +310,7 @@ pub(super) async fn send(
         None => reqwest::Body::from(Vec::new()),
     };
     let req = req.body(body).map_err(|e| failed("the request", e))?;
-    let head_by = (tokio::time::Instant::now() + options.read_timeout).min(deadline);
+    let head_by = later(tokio::time::Instant::now(), options.read_timeout).min(deadline);
     let response = tokio::time::timeout_at(head_by, sender.send_request(req))
         .await
         .map_err(|_| FetchError::TimedOut)?
@@ -368,7 +375,7 @@ where
         }
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                let next = tokio::time::Instant::now() + this.read_timeout;
+                let next = later(tokio::time::Instant::now(), this.read_timeout);
                 this.idle.as_mut().reset(next);
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -547,5 +554,16 @@ mod tests {
         let soon = tokio::time::Instant::now() + Duration::from_millis(700);
         let mut b = Bounded::new(feed(300, 4), Duration::from_millis(500), soon);
         assert!(read_all(&mut b).await.unwrap_err().contains("time ran out"));
+    }
+
+    /// Review round 6 (the parse lens's suspicion): a timeout too large for an `Instant` is far
+    /// in the future, not a panic.
+    #[test]
+    fn r6_a_huge_timeout_does_not_overflow() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        assert_eq!(attempt_limit(now, Duration::MAX, deadline), deadline);
+        assert!(later(now, Duration::MAX) > now + Duration::from_secs(3600 * 24 * 365));
+        assert_eq!(later(now, Duration::from_secs(1)), now + Duration::from_secs(1));
     }
 }
