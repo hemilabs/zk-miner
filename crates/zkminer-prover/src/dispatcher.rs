@@ -9969,6 +9969,25 @@ impl WorkerPool {
         if set.saturating_add(reserve) > figures.total {
             return false;
         }
+        // Waits for a card (see `backend_fits_for_claim_at_po2`): what will be free when it starts,
+        // the commit our proofs and idle workers hand back included. Dispatch grows the page file
+        // for its RAM part then (`reserve_commit`).
+        if same.saturating_add(other) >= slots {
+            let pending = self
+                .commit_ledger
+                .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
+            let idle = self
+                .idle_commit_holdings_except(Some(backend))
+                .iter()
+                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
+            let returning = self.commit_ledger.reserved_bytes().saturating_add(idle);
+            return crate::memory::queued_claim_fits(
+                set,
+                reserve,
+                figures.available.saturating_sub(pending),
+                returning,
+            );
+        }
         // Dispatch's host rule (`reserve_commit`): the RAM still to come, this proof's included,
         // plus the pinned margin, must be free commit once the page file has grown.
         let host_need = self
@@ -10021,10 +10040,13 @@ impl WorkerPool {
     /// Could this host run the concurrent set that claiming one more `backend` job implies?
     ///
     /// For the CLAIM decision, and the question is deliberately NOT "does one more peak fit on top
-    /// of everything outstanding". Claimed jobs prove SEQUENTIALLY, bounded by `max_concurrent` — the
-    /// whole premise of the look-ahead queue is that a claim is a reservation of future time, not of
-    /// present memory. So the memory a set of claims can ever demand at once is
-    /// `min(outstanding + 1, max_concurrent)` peaks, and that is what has to fit.
+    /// of everything outstanding". Claimed jobs prove SEQUENTIALLY, one per card and no more than
+    /// `max_concurrent` at once — the whole premise of the look-ahead queue is that a claim is a
+    /// reservation of future time, not of present memory. So the memory a set of claims can ever
+    /// demand at once is this job and the largest of the outstanding, as many as can run at once
+    /// (`memory::claim_set_bytes`), and that is what has to fit. A claim that will wait for a card
+    /// is then tested against what will be free when it starts (`memory::queued_claim_fits`); one
+    /// that can start now, against live headroom.
     ///
     /// This replaced a per-tick accumulator that was wrong in both directions. Within a tick it
     /// charged every candidate a full concurrent peak, capping claims at `total / peak` — 4 for
@@ -10119,6 +10141,25 @@ impl WorkerPool {
             0
         };
         let reserved = self.reserved_host_memory();
+        // Every card already has a job ahead of this one: it waits for a card, and starts only once a
+        // proof running now is done. Charged against what will be free then.
+        if outstanding >= slots {
+            let idle = self
+                .idle_host_holdings_except(backend)
+                .iter()
+                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
+            let measures = self
+                .inflight_measures_snapshot()
+                .iter()
+                .fold(0u64, |sum, (key, _)| {
+                    sum.saturating_add(self.current_host_bytes_for_slot(key).unwrap_or(0))
+                });
+            let returning = reserved
+                .saturating_add(resident)
+                .saturating_add(idle)
+                .saturating_add(measures);
+            return crate::memory::queued_claim_fits(committed, reserve, available, returning);
+        }
         if crate::memory::can_admit(expected_peak, resident, reserved, available, total, reserve) {
             return true;
         }
