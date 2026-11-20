@@ -14,11 +14,11 @@ use crate::theme;
 pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
     // The job Enter picked, by id: the open list reorders by price every pass, so its index alone
     // would show a different job a moment later.
+    // Any row the Jobs page lists: claimed, held, open, or recently finished.
     let by_id = |id| {
         state
-            .open_jobs
-            .iter()
-            .chain(state.active_jobs.iter())
+            .jobs_page_rows()
+            .into_iter()
             .find(|j| j.info.job_id == id)
     };
     // A job picked by id that is no longer listed (fulfilled, released, claimed by another prover)

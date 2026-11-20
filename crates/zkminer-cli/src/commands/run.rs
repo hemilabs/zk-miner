@@ -2437,6 +2437,36 @@ fn open_rank(j: &TrackedJob) -> u128 {
 }
 
 
+/// Why a lock this miner holds is not being worked on, recorded where its lifecycle let it go (kept
+/// through a pause, past its deadline, a failed release, a hand-back), for the Jobs page's held rows
+/// (`MinerState::kept_locks`). Dropped when a lifecycle takes the job up again.
+static KEPT_REASON: std::sync::Mutex<Option<std::collections::HashMap<B256, String>>> =
+    std::sync::Mutex::new(None);
+
+fn note_kept_reason(job_id: B256, reason: impl Into<String>) {
+    let mut g = KEPT_REASON.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    bounded_insert(m, job_id, reason.into(), MEASURED_CYCLES_CAP);
+}
+
+fn forget_kept_reason(job_id: B256) {
+    if let Some(m) = KEPT_REASON
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        m.remove(&job_id);
+    }
+}
+
+fn kept_reason_of(job_id: B256) -> Option<String> {
+    KEPT_REASON
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&job_id).cloned())
+}
+
 /// Programs whose registry lists no ELF source (unregistered, or registered without URIs), with when
 /// that was seen. Every job of such a program is skipped by the candidate loop BEFORE the measure
 /// budget for `NO_ELF_SOURCE_TTL`, so a flood of decoys on one unregistered program costs one
@@ -6787,6 +6817,8 @@ async fn miner_brain(
     }
     let mut queue_model = zkminer_strategy::queue::QueueModel::new();
     let mut queue_last_tick = std::time::Instant::now();
+    // Each claimed job's last row, for the held locks' rows (`refresh_kept_locks`).
+    let mut kept_rows: HashMap<B256, zkminer_tui::state::TrackedJob> = HashMap::new();
     if !initial_queue_horizon.is_zero() {
         tracing::info!(
             "queue look-ahead: up to {}s of work queued per GPU (deadline-checked from the \
@@ -6891,6 +6923,7 @@ async fn miner_brain(
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
         prune_lock_blocks(&in_flight);
+        refresh_kept_locks(&state, &journal, &in_flight, &mut kept_rows).await;
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
             // loop awaits `recover_claimed_jobs` inline and can stall for minutes, and a
@@ -10609,6 +10642,8 @@ fn spawn_lifecycle_task(
         // A job reserved for a claim is one of the jobs the claim limit counts from now on, while its
         // pre-claim checks run (descriptor, binding; a minute on a slow RPC). Said so on its row, or
         // it reads as held by the very limit it is counted in. The claim's own stage rewrites it.
+        // Worked on again: no longer a held lock's reason.
+        forget_kept_reason(jid);
         if !already_locked {
             state.write().await.set_job_note(
                 jid,
@@ -10637,6 +10672,10 @@ fn spawn_lifecycle_task(
             // a later release to resume, and ask recovery to pick it up.
             if let Some(h) = e.downcast_ref::<HandBack>() {
                 tracing::warn!("KEEP: job {} {h}", short_id(jid));
+                note_kept_reason(
+                    jid,
+                    format!("kept ({}); the recovery pass takes it up again", h.0),
+                );
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != jid);
                 s.add_log(
@@ -12746,23 +12785,8 @@ async fn process_job_lifecycle(
     journal_update(journal, |j| j.remove(job_id));
     {
         let mut s = state.write().await;
-        let completed = s
-            .active_jobs
-            .iter()
-            .find(|j| j.info.job_id == job_id)
-            .cloned();
-        s.active_jobs.retain(|j| j.info.job_id != job_id);
-        if let Some(mut cj) = completed {
-            cj.status = MinerJobStatus::Fulfilled { payout: 0 };
-            s.completed_jobs.push(cj);
-            // Bound completed_jobs — keep most recent COMPLETED_JOBS_CAP entries.
-            // Prevents unbounded memory growth over long-running operation.
-            const COMPLETED_JOBS_CAP: usize = 500;
-            if s.completed_jobs.len() > COMPLETED_JOBS_CAP {
-                let excess = s.completed_jobs.len() - COMPLETED_JOBS_CAP;
-                s.completed_jobs.drain(0..excess);
-            }
-        }
+        // Into the Jobs page's history, with the time (bounded there).
+        s.record_finished(job_id, MinerJobStatus::Fulfilled { payout: 0 });
         s.add_log(
             LogLevel::Success,
             format!("Job {} fulfilled on-chain", short_id(job_id)),
@@ -12961,6 +12985,75 @@ async fn end_attempt_display(state: &zkminer_tui::state::SharedState, job_id: B2
         }
         j.gpu_bus_id = None;
     }
+}
+
+/// Rebuild the Jobs page's held locks (`MinerState::kept_locks`): the claim journal's locks with no
+/// task working on them (not in `in_flight`), each with why (`note_kept_reason`, else what its journal
+/// state implies). `rows` keeps each claimed job's last row, so a held one keeps its terms.
+async fn refresh_kept_locks(
+    state: &zkminer_tui::state::SharedState,
+    journal: &SharedJournal,
+    in_flight: &HashMap<B256, u128>,
+    rows: &mut HashMap<B256, zkminer_tui::state::TrackedJob>,
+) {
+    let held: Vec<(B256, u64, bool)> = {
+        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+        j.entries
+            .values()
+            .filter(|e| !in_flight.contains_key(&e.job_id))
+            .map(|e| {
+                (
+                    e.job_id,
+                    e.lock_deadline,
+                    matches!(e.state, crate::journal::JournalState::Claiming),
+                )
+            })
+            .collect()
+    };
+    let mut s = state.write().await;
+    for j in &s.active_jobs {
+        rows.insert(j.info.job_id, j.clone());
+    }
+    rows.retain(|id, _| {
+        held.iter().any(|(h, _, _)| h == id) || s.active_jobs.iter().any(|j| j.info.job_id == *id)
+    });
+    s.kept_reasons = held
+        .iter()
+        .map(|(id, _, claiming)| {
+            let why = kept_reason_of(*id).unwrap_or_else(|| {
+                if *claiming {
+                    "its claim was not confirmed; the recovery pass checks whether it holds the lock"
+                        .to_string()
+                } else {
+                    "held on-chain; the recovery pass re-drives or releases it".to_string()
+                }
+            });
+            (*id, why)
+        })
+        .collect();
+    s.kept_locks = held
+        .iter()
+        .map(|(id, deadline, _)| {
+            let mut row = rows
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| zkminer_tui::state::TrackedJob {
+                    info: zkminer_chain::jobs::JobInfo {
+                        job_id: *id,
+                        ..Default::default()
+                    },
+                    status: zkminer_tui::state::MinerJobStatus::Queued,
+                    current_price: 0,
+                    gpu_bus_id: None,
+                    prover_backend: String::new(),
+                    estimated_cycles: 0,
+                });
+            row.info.lock_deadline = row.info.lock_deadline.max(*deadline);
+            row.status = zkminer_tui::state::MinerJobStatus::Queued;
+            row.gpu_bus_id = None;
+            row
+        })
+        .collect();
 }
 
 /// How often the brain re-reads the router/Registry pause state before claiming.
@@ -14220,6 +14313,7 @@ async fn release_and_clean_with_nonce(
             "job {}: not releasing — keeping the lock for the next start",
             short_id(job_id)
         );
+        note_kept_reason(job_id, "kept for the next start (keep-locks stop)");
         if let Some(n) = pre_nonce {
             client.abort_nonce(n);
         }
@@ -14622,6 +14716,11 @@ async fn release_and_clean_with_nonce(
             }
             let mut s = state.write().await;
             s.active_jobs.retain(|j| j.info.job_id != job_id);
+            note_kept_reason(
+                job_id,
+                "past its deadline, so it cannot be released; this miner slashes it itself once \
+                 the slash opens (30 min after the deadline)",
+            );
             if first {
                 s.add_log(
                     LogLevel::Warn,
@@ -14676,11 +14775,15 @@ async fn release_and_clean_with_nonce(
                 "release_job({}) RPC failed: {e:#} — journal entry retained for recovery",
                 job_id,
             );
+            note_kept_reason(job_id, "its release failed; the recovery pass tries again");
             request_recovery();
             false
         }
     };
     let mut s = state.write().await;
+    if release_ok {
+        s.record_finished(job_id, MinerJobStatus::Released { penalty: 0 });
+    }
     s.active_jobs.retain(|j| j.info.job_id != job_id);
     if release_ok {
         s.add_log(LogLevel::Warn, format!("Released job {}", short_id(job_id)));

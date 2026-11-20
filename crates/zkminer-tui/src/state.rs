@@ -562,6 +562,9 @@ impl ShutdownView {
     }
 }
 
+/// How many finished jobs the Jobs page lists below the open market.
+pub const RECENT_ROWS: usize = 8;
+
 /// The complete miner state, shared between TUI and background tasks.
 #[derive(Debug)]
 pub struct MinerState {
@@ -590,6 +593,14 @@ pub struct MinerState {
         std::collections::HashMap<alloy_primitives::B256, crate::progress::AttemptProgress>,
     /// What each job is waiting on now, where its status would say something older (`JobNote`).
     pub job_notes: std::collections::HashMap<alloy_primitives::B256, JobNote>,
+    /// Locks this miner holds on-chain that nothing is proving or settling now (kept through a
+    /// pause, past their deadline, a release that failed, a claim not confirmed), rebuilt from the
+    /// claim journal every tick, with why (`kept_reasons`). Without them a lock holding collateral
+    /// was in no list at all.
+    pub kept_locks: Vec<TrackedJob>,
+    pub kept_reasons: std::collections::HashMap<alloy_primitives::B256, String>,
+    /// When each job in `completed_jobs` finished (unix seconds), for the Jobs page's history.
+    pub finished_at: std::collections::HashMap<alloy_primitives::B256, u64>,
     /// Each claimed job's proof system (zkVM and wrap), recorded at claim (`job_zkvm_text`).
     pub job_proof_systems:
         std::collections::HashMap<alloy_primitives::B256, zkminer_chain::auction::ProofSystem>,
@@ -1124,6 +1135,9 @@ impl Default for MinerState {
             open_jobs: Vec::new(),
             active_jobs: Vec::new(),
             job_notes: HashMap::new(),
+            kept_locks: Vec::new(),
+            kept_reasons: HashMap::new(),
+            finished_at: HashMap::new(),
             job_proof_systems: HashMap::new(),
             completed_jobs: Vec::new(),
             selected_job_index: 0,
@@ -1221,6 +1235,7 @@ impl MinerState {
             .open_jobs
             .iter()
             .chain(self.active_jobs.iter())
+            .chain(self.kept_locks.iter())
             .map(|j| j.info.job_id)
             .collect();
         self.job_notes
@@ -1414,15 +1429,68 @@ impl MinerState {
     /// The Jobs page's rows, in order: the jobs this miner has claimed, then the open market less
     /// any job also among them (a claim the market list has not caught up with yet). Its selection
     /// (`selected_job_index`) indexes this list.
+    /// The Jobs page's rows, in order: claimed jobs being worked on, locks held but not being
+    /// worked on (`kept_locks`), the open market, then the most recent finished jobs (`RECENT_ROWS`),
+    /// each job once.
     pub fn jobs_page_rows(&self) -> Vec<&TrackedJob> {
-        let claimed = self.active_jobs.iter();
-        let open = self.open_jobs.iter().filter(|o| {
-            !self
-                .active_jobs
-                .iter()
-                .any(|a| a.info.job_id == o.info.job_id)
-        });
-        claimed.chain(open).collect()
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::new();
+        for job in self
+            .active_jobs
+            .iter()
+            .chain(self.kept_locks.iter())
+            .chain(self.open_jobs.iter())
+            .chain(self.recent_finished(RECENT_ROWS))
+        {
+            if seen.insert(job.info.job_id) {
+                rows.push(job);
+            }
+        }
+        rows
+    }
+
+    /// Why a lock is held but not worked on, if it is one (`kept_locks`) and not being worked on.
+    pub fn kept_reason(&self, job_id: alloy_primitives::B256) -> Option<&str> {
+        if self.active_jobs.iter().any(|j| j.info.job_id == job_id) {
+            return None;
+        }
+        self.kept_reasons.get(&job_id).map(String::as_str)
+    }
+
+    /// The `n` most recently finished jobs (fulfilled or released), newest first.
+    pub fn recent_finished(&self, n: usize) -> impl Iterator<Item = &TrackedJob> {
+        self.completed_jobs.iter().rev().take(n)
+    }
+
+    /// `job_id` is done (fulfilled, or released): its row leaves the claimed list for the history,
+    /// with `status` and the time.
+    pub fn record_finished(&mut self, job_id: alloy_primitives::B256, status: MinerJobStatus) {
+        let Some(at) = self
+            .active_jobs
+            .iter()
+            .position(|j| j.info.job_id == job_id)
+        else {
+            return;
+        };
+        let mut row = self.active_jobs.remove(at);
+        row.status = status;
+        row.gpu_bus_id = None;
+        self.completed_jobs.retain(|j| j.info.job_id != job_id);
+        self.completed_jobs.push(row);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.finished_at.insert(job_id, now);
+        // Bounded, for a long run.
+        const COMPLETED_JOBS_CAP: usize = 500;
+        if self.completed_jobs.len() > COMPLETED_JOBS_CAP {
+            let excess = self.completed_jobs.len() - COMPLETED_JOBS_CAP;
+            self.completed_jobs.drain(0..excess);
+            let kept: std::collections::HashSet<alloy_primitives::B256> =
+                self.completed_jobs.iter().map(|j| j.info.job_id).collect();
+            self.finished_at.retain(|id, _| kept.contains(id));
+        }
+        self.job_notes.remove(&job_id);
     }
 
     /// Map a GPU-tuning device id (see `gpu_tuning::tuning_device_id`) to the
