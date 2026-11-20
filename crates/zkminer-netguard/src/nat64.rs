@@ -2539,6 +2539,52 @@ mod r4_tests {
         assert_eq!(h.named_by(&[other], t0)[0].1, vec![]);
     }
 
+    /// Review round 4 (cross-1), live (Linux): with `ZKMINER_TEST_ROGUE_RA=<ifindex>,<router>`
+    /// (a host on that interface's link sending router advertisements with 16 PREF64 options
+    /// each, every second, from link-local address `<router>`: `fix-r4/rogue-ra.sh`), the
+    /// configured NSP stays in force throughout. While the sender is no default gateway nothing
+    /// it names is learned; once it is the uplink's gateway, at most [`MAX_PER_ROUTER`] of its
+    /// prefixes are held and the uplink is unsettled (IPv6 refused).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn r4_rogue_router_advertisements_never_evict_the_configured_nsp() {
+        let Ok(v) = std::env::var("ZKMINER_TEST_ROGUE_RA") else {
+            return;
+        };
+        let (ifindex, router) = v.split_once(',').expect("<ifindex>,<router>");
+        let (ifindex, router): (u32, Ipv6Addr) = (ifindex.parse().unwrap(), router.parse().unwrap());
+        let rogue = |q: &Prefix| q.to_string().starts_with("2001:470:6400:");
+        let conf = p("2a01:4f8:ffff:64::/96");
+        set_configured(&[conf]).unwrap();
+        let inner = IpAddr::V6(synthesize(conf, Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!crate::is_global(inner));
+        // The sender is no gateway of the uplink in use.
+        let (a, b) = (0x00a1_1ce0_u64, 0x00b0_b000_u64);
+        on_uplink(a, &[]);
+        pref64::start();
+        let t = Instant::now();
+        while !pref64::seen().iter().any(rogue) && t.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("heard: {:?}", pref64::seen());
+        assert!(pref64::seen().iter().any(rogue), "no advertisement heard");
+        assert!(pref64::seen().iter().filter(|q| rogue(q)).count() <= MAX_PER_ROUTER + 1);
+        assert!(!learned().iter().any(rogue), "learned from a router that is no gateway");
+        assert!(prefixes().contains(&conf) && !crate::is_global(inner));
+        // The sender is the uplink's default gateway: its next advertisement is learned, capped.
+        on_uplink(b, &[(router, ifindex)]);
+        let t = Instant::now();
+        while unheld(b).is_none() && t.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("learned: {:?}; unheld: {:?}", learned(), unheld(b));
+        assert!(unheld(b).is_some_and(|w| w.contains("PREF64")), "{:?}", unheld(b));
+        assert!(learned().iter().filter(|q| rogue(q)).count() <= MAX_PER_ROUTER);
+        assert!(prefixes().contains(&conf) && !crate::is_global(inner));
+        assert_eq!(in_force().first(), Some(&conf));
+        set_configured(&[]).unwrap();
+    }
+
     /// cross-6 (`nat64.rs:814`, `:843`): the listener survives `ENOBUFS` and `EINTR` (the next
     /// datagram is still heard) and stops on any other error; a datagram not from the kernel
     /// is ignored.
