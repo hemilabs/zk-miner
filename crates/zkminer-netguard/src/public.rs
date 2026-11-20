@@ -666,7 +666,10 @@ fn discover() -> (FamilyFound, FamilyFound) {
             );
         }
     }
+    #[cfg(not(target_os = "macos"))]
     let dns_servers = crate::system_resolvers();
+    #[cfg(target_os = "macos")]
+    let dns_servers = dns_exclusion(crate::facts::read_system_resolvers(), &found, &mut vetoed);
     let result = |fam: usize, family: &str| -> FamilyFound {
         if !found[fam].is_empty() {
             Ok(Some(agree(family, &found[fam], &dns_servers, &vetoed[fam])))
@@ -677,6 +680,38 @@ fn discover() -> (FamilyFound, FamilyFound) {
         }
     };
     (result(0, "IPv4"), result(1, "IPv6"))
+}
+
+/// macOS (review round 3, cross-5): the DNS servers whose answers confirm nothing ([`agree`]),
+/// from `servers`. When they cannot be read (`servers` is an error), no DNS reflector answer
+/// confirms anything this round, since one could name a DNS server of this host (a site resolver
+/// that answers for the reflectors' names): every path an answer of `found` came over is vetoed in
+/// `vetoed`, as when the HTTPS reflector's TLS failed, so only the HTTPS reflector confirms.
+/// (Round 2 read an unreadable DNS configuration as no servers at all.)
+#[cfg(target_os = "macos")]
+fn dns_exclusion(
+    servers: io::Result<Vec<IpAddr>>,
+    found: &[Vec<Answer>; 2],
+    vetoed: &mut [Vec<Option<Prefix>>; 2],
+) -> Vec<IpAddr> {
+    match servers {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "network guard: this host's DNS servers could not be read ({e}), so no DNS \
+                 reflector answer confirms its public address this round (only the HTTPS \
+                 reflector's)"
+            );
+            for (fam, answers) in found.iter().enumerate() {
+                for a in answers {
+                    if !vetoed[fam].contains(&a.via) {
+                        vetoed[fam].push(a.via);
+                    }
+                }
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// Whether `p` is an HTTPS reflector query.
@@ -1279,6 +1314,44 @@ mod tests {
             &[Some(p)],
         );
         assert!(r.confirmed.is_empty() && r.via_nat64.is_empty());
+    }
+
+    /// macOS, review round 3, cross-5: a round in which this host's DNS servers cannot be read
+    /// confirms nothing from DNS reflectors (any could name a DNS server of this host), only from
+    /// the HTTPS reflector; when they can be read, an answer naming one of them is left out as
+    /// before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_answers_confirm_nothing_without_the_dns_servers() {
+        let a = |s: &str| s.parse::<IpAddr>().unwrap();
+        let p: Prefix = "64:ff9b::/96".parse().unwrap();
+        let through = |x: Answer| Answer { via: Some(p), ..x };
+        let v4 = vec![
+            dns(G, "81.2.69.160"),
+            dns(C, "81.2.69.160"),
+            through(dns(G, "81.2.69.161")),
+            through(dns(C, "81.2.69.161")),
+        ];
+        let found = [v4, vec![dns(G, "2001:db8::7"), dns(C, "2001:db8::7")]];
+        let mut vetoed: [Vec<Option<Prefix>>; 2] = [Vec::new(), Vec::new()];
+        let servers = dns_exclusion(Err(io::Error::other("staged")), &found, &mut vetoed);
+        assert!(servers.is_empty());
+        for (fam, family) in [(0, "IPv4"), (1, "IPv6")] {
+            let r = agree(family, &found[fam], &servers, &vetoed[fam]);
+            assert!(r.confirmed.is_empty(), "{family}: {r:?}");
+            assert!(r.via_nat64.is_empty());
+            assert!(!r.addresses.is_empty(), "still refused as this host's");
+        }
+        // The HTTPS reflector's answer still confirms.
+        let with_tls = [found[0].clone(), vec![tls("81.2.69.160")]].concat();
+        let r = agree("IPv4", &with_tls, &servers, &vetoed[0]);
+        assert_eq!(r.confirmed, vec![a("81.2.69.160")]);
+        // Read, the servers are left out of the agreement and nothing is vetoed.
+        let mut vetoed: [Vec<Option<Prefix>>; 2] = [Vec::new(), Vec::new()];
+        let servers = dns_exclusion(Ok(vec![a("81.2.69.160")]), &found, &mut vetoed);
+        assert_eq!(vetoed, [Vec::new(), Vec::new()]);
+        let r = agree("IPv4", &found[0], &servers, &vetoed[0]);
+        assert_eq!(r.confirmed, vec![a("81.2.69.161")]);
     }
 
     /// A confirmation counts for [`CONFIRMATION_LIFETIME`], and only on the uplink it was made
