@@ -2989,6 +2989,28 @@ mod sys {
             assert!(parse_neighbour(&[0u8; 8], &mut out).is_err());
         }
 
+        /// Review round 4, cross-3, live: the source the kernel chooses for a TCP connection
+        /// (`RTA_PREFSRC` of the connect's first lookup) is the one a connected socket gets (no
+        /// protocol-selective rule here), and the route query from a source is asked with it
+        /// (`RTA_SRC`): from an address that is not this host's the kernel has no route (or refuses),
+        /// from the chosen one it answers as without one. Skipped without an IPv4 route.
+        #[test]
+        fn the_tcp_source_is_the_kernels_and_routes_are_asked_from_it() {
+            let dst: IpAddr = "1.1.1.1".parse().unwrap();
+            if !matches!(query(dst, Some(443)), Ok(KernelAnswer::Entry(_))) {
+                crate::skipped("no IPv4 route here");
+                return;
+            }
+            let src = source(dst, Some(443)).unwrap().expect("the kernel names a source");
+            let udp = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            udp.connect((dst, 443)).unwrap();
+            assert_eq!(src, udp.local_addr().unwrap().ip());
+            assert_eq!(query_from(src, dst, Some(443)).unwrap(), query(dst, Some(443)).unwrap());
+            let stranger: IpAddr = "192.0.2.123".parse().unwrap();
+            let r = query_from(stranger, dst, Some(443));
+            assert!(!matches!(r, Ok(KernelAnswer::Entry(_))), "asked without RTA_SRC: {r:?}");
+        }
+
         /// The neighbour table is read unprivileged, and every default gateway this host has
         /// talked to has an entry; with a link-layer address unless its device has none.
         #[test]
