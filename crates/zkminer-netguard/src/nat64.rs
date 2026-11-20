@@ -14,11 +14,18 @@
 //! - **learned** ones (RFC 7050): an `AAAA` query for `ipv4only.arpa.` (a name with only `A`
 //!   records, `192.0.0.170` and `192.0.0.171`), asked of the DNS servers the host uses
 //!   ([`crate::system_resolvers`]); a DNS64 resolver synthesizes `AAAA` answers under its NSP, and
-//!   the prefix is where one of those two addresses sits. Asked when the host's facts are first
-//!   gathered (on the calling thread, at most [`DISCOVERY_TIMEOUT`], every server at once) and
-//!   again every [`DISCOVERY_TTL`] in the background. Failure is not fatal and is logged once.
-//!   A learned prefix stays learned for the life of the process (a stale one only refuses
-//!   more).
+//!   the prefix is where one of those two addresses sits. Asked per uplink
+//!   (`ensure_discovered_on`, review round 3, bypass-1; every platform since the Linux
+//!   application): when the host's facts are first gathered (on the calling thread, at most
+//!   [`DISCOVERY_TIMEOUT`], the servers in use first: `order_servers`), at once in the
+//!   background whenever the uplink signature changes, every [`RETRY_UNSETTLED`] while a host
+//!   with IPv6 and no IPv4 route has found nothing, and every [`DISCOVERY_TTL`]. Until the round
+//!   for a new uplink has finished, such a host refuses IPv6 destinations
+//!   ([`crate::Denied::Nat64Unsettled`]). Failure is not fatal and is logged once. A learned
+//!   prefix stays learned for the life of the process (a stale one only refuses more);
+//! - **announced** ones (RFC 8781 PREF64): macOS from the configuration daemon's NAT64 state,
+//!   Linux from the router advertisements the kernel processes (`pref64`), learned with each
+//!   round.
 //!
 //! Every address under one of them is read as the IPv4 address it carries, laid out as RFC 6052
 //! says for the prefix's length (bits 64–71, the "u" octet, skipped): [`crate::is_global`] refuses
@@ -427,7 +434,9 @@ fn run_discovery() {
 
 /// Learns the NSPs, process-wide, when they are due: the first call asks on this thread (at most
 /// [`DISCOVERY_TIMEOUT`]), a call during that first round waits for it, and later calls start a
-/// background round once the last is [`DISCOVERY_TTL`] old.
+/// background round once the last is [`DISCOVERY_TTL`] old. Not per uplink: the host's facts
+/// use `ensure_discovered_on` since the Linux application (on macOS since review round 3); this
+/// stays for callers that know no uplink.
 pub fn ensure_discovered() {
     let mut d = DISCOVERY.lock().unwrap_or_else(|e| e.into_inner());
     if d.attempted_at.is_none() && !d.running {
@@ -460,22 +469,19 @@ pub fn ensure_discovered() {
     }
 }
 
-/// macOS: how soon a round that failed, or found no prefix, is asked again while the host has
+/// how soon a round that failed, or found no prefix, is asked again while the host has
 /// IPv6 and no IPv4 route (where an unlearned prefix matters: review round 3, bypass-1).
-#[cfg(target_os = "macos")]
 pub const RETRY_UNSETTLED: Duration = Duration::from_secs(15);
 
-/// macOS: the uplink discovery runs for: the facts' uplink signature (which changes with the
+/// the uplink discovery runs for: the facts' uplink signature (which changes with the
 /// default routes, the internet interfaces and the networks the configuration daemon says the
 /// services are on) and whether the host routes IPv4 and IPv6 (`[IPv4, IPv6]`).
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Uplink {
     pub signature: u64,
     pub routed: [bool; 2],
 }
 
-#[cfg(target_os = "macos")]
 impl Uplink {
     /// IPv6 and no IPv4 route: connections to IPv4 go through NAT64, if anywhere.
     pub fn ipv6_only(&self) -> bool {
@@ -491,8 +497,7 @@ impl Uplink {
     }
 }
 
-/// macOS: discovery per uplink (see [`ensure_discovered_on`]).
-#[cfg(target_os = "macos")]
+/// discovery per uplink (see [`ensure_discovered_on`]).
 #[derive(Debug)]
 struct OnUplink {
     /// The uplink the latest caller is on.
@@ -507,11 +512,9 @@ struct OnUplink {
     found_nothing: bool,
 }
 
-/// macOS: signalled when the first round finishes.
-#[cfg(target_os = "macos")]
+/// signalled when the first round finishes.
 static ON_UPLINK_DONE: Condvar = Condvar::new();
 
-#[cfg(target_os = "macos")]
 static ON_UPLINK: Mutex<OnUplink> = Mutex::new(OnUplink {
     uplink: None,
     settled: None,
@@ -521,8 +524,7 @@ static ON_UPLINK: Mutex<OnUplink> = Mutex::new(OnUplink {
     found_nothing: false,
 });
 
-/// macOS: what [`ensure_discovered_on`] does next.
-#[cfg(target_os = "macos")]
+/// what [`ensure_discovered_on`] does next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Next {
     /// Ask on this thread (the first round).
@@ -535,7 +537,7 @@ pub(crate) enum Next {
     Nothing,
 }
 
-/// macOS: the decision [`ensure_discovered_on`] makes for a caller on `up` at `now`, from the
+/// the decision [`ensure_discovered_on`] makes for a caller on `up` at `now`, from the
 /// state `d` (updated: the uplink, and a round marked running when one starts). A round starts
 /// when none ran yet (on the caller's thread), when the uplink signature changed (review round
 /// 3, bypass-1: a new network's prefix is learned at once, not up to [`DISCOVERY_TTL`] later),
@@ -543,7 +545,6 @@ pub(crate) enum Next {
 /// [`RETRY_UNSETTLED`] after a round that failed or found nothing, or that finished on another
 /// uplink. One round runs at a time; a round that finishes after the uplink changed starts
 /// another.
-#[cfg(target_os = "macos")]
 fn next_on(d: &mut OnUplink, up: Uplink, now: Instant) -> Next {
     let changed = d.uplink.is_some_and(|u| u.signature != up.signature);
     d.uplink = Some(up);
@@ -573,13 +574,12 @@ fn next_on(d: &mut OnUplink, up: Uplink, now: Instant) -> Next {
     Next::Nothing
 }
 
-/// macOS: the DNS servers a round asks, in order (review round 3, bypass-2): the active ones
+/// the DNS servers a round asks, in order (review round 3, bypass-2): the active ones
 /// first (`active`, the configuration daemon's global resolvers, in its order), then the rest of
 /// `all`; when the host routes one family only, that family's servers alone (a server of an
 /// unrouted family cannot be reached), so on a host with IPv6 and no IPv4 route a DNS64 that
 /// answers only over IPv6 is never left behind IPv4 servers that cannot answer. At most
 /// [`MAX_SERVERS`], cut after this ordering.
-#[cfg(target_os = "macos")]
 pub(crate) fn order_servers<A: Copy + PartialEq>(
     active: &[A],
     all: &[A],
@@ -601,21 +601,20 @@ pub(crate) fn order_servers<A: Copy + PartialEq>(
     out
 }
 
-/// macOS: one round on uplink `up`: the configuration daemon's NAT64 prefixes, then the RFC 7050
+/// one round on uplink `up`: the configuration daemon's NAT64 prefixes, then the RFC 7050
 /// query to the servers [`order_servers`] picks. Its prefixes are learned; the state notes that
 /// it finished, on which uplink, and whether it found any.
-#[cfg(target_os = "macos")]
 fn round_on(up: Uplink) {
     let mut found_any = false;
-    match crate::facts::macos_dns::nat64_prefixes() {
+    match system_prefixes() {
         Ok(found) => {
             found_any |= !found.is_empty();
             add_learned(&found);
         }
-        Err(e) => tracing::debug!("network guard: NAT64 prefixes of the configuration daemon: {e}"),
+        Err(e) => tracing::debug!("network guard: NAT64 prefixes the system knows: {e}"),
     }
     let servers = crate::facts::read_system_resolvers().and_then(|all| {
-        let active = crate::facts::macos_dns::global_servers()?;
+        let active = active_servers()?;
         Ok(order_servers(&active, &all, up.routed, IpAddr::is_ipv6))
     });
     let result = servers
@@ -649,9 +648,281 @@ fn round_on(up: Uplink) {
     }
 }
 
-/// macOS: notes in `d` that a round on `up` finished (`found_any`: it found a prefix); when the
-/// uplink changed while it ran, a round on the new one is marked running (the caller starts it).
+/// The NAT64 prefixes the system itself knows, learned with each round: macOS, the configuration
+/// daemon's per-interface NAT64 state (its PLAT discovery, RFC 7050, and the PREF64 option a
+/// router announces, RFC 8781); Linux, the PREF64 options of the router advertisements the kernel
+/// processed since the guard started listening ([`pref64`]); elsewhere none.
 #[cfg(target_os = "macos")]
+fn system_prefixes() -> io::Result<Vec<Prefix>> {
+    crate::facts::macos_dns::nat64_prefixes()
+}
+
+/// See the macOS one.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn system_prefixes() -> io::Result<Vec<Prefix>> {
+    pref64::start();
+    Ok(pref64::seen())
+}
+
+/// See the macOS one.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn system_prefixes() -> io::Result<Vec<Prefix>> {
+    Ok(Vec::new())
+}
+
+/// The DNS servers in use, in the order the system asks them ([`order_servers`] asks them
+/// first): macOS, the configuration daemon's global resolvers; elsewhere the `nameserver` lines
+/// of [`crate::facts::RESOLV_CONF_PATHS`] in file order (`/etc/resolv.conf` first: glibc and
+/// musl ask its servers in that order; a stub such as systemd-resolved's 127.0.0.53 forwards to
+/// the upstream servers the later files name).
+#[cfg(target_os = "macos")]
+fn active_servers() -> io::Result<Vec<IpAddr>> {
+    crate::facts::macos_dns::global_servers()
+}
+
+/// See the macOS one.
+#[cfg(not(target_os = "macos"))]
+fn active_servers() -> io::Result<Vec<IpAddr>> {
+    Ok(crate::facts::RESOLV_CONF_PATHS
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|t| crate::facts::parse_nameservers(&t))
+        .collect())
+}
+
+/// Linux: the PREF64 option (RFC 8781) of router advertisements, as the kernel hands them to
+/// userspace. The kernel passes an RA's "user options" (RDNSS, DNSSL, captive portal, PREF64:
+/// `ndisc_is_useropt`, Linux 5.8 and later for PREF64) to the `RTNLGRP_ND_USEROPT` netlink
+/// group as `RTM_NEWNDUSEROPT` messages, and any process may join that group (rtnetlink is
+/// `NL_CFG_F_NONROOT_RECV`). There is no table to read: only advertisements that arrive while
+/// the listener runs are seen (routers repeat them every few minutes, RFC 4861's
+/// `MaxRtrAdvInterval` 600 s at most by default), so the first round on a new network may not
+/// have it yet and RFC 7050 discovery still runs. Only advertisements the kernel processes are
+/// seen: on a host where a userspace RA client handles them instead (systemd-networkd's own
+/// `IPv6AcceptRA`, NetworkManager), the kernel's `accept_ra` is 0 and nothing arrives;
+/// systemd-networkd keeps the PREF64 it saw to itself (`networkctl status`, its varlink and
+/// D-Bus interfaces), NetworkManager likewise, and neither writes it anywhere an unprivileged
+/// process could read without their APIs: not read (documented). A prefix seen is learned for the
+/// life of the process (a stale one only refuses more), whatever its lifetime.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod pref64 {
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::Mutex;
+
+    use crate::ip::Prefix;
+
+    /// `RTNLGRP_ND_USEROPT` (<linux/rtnetlink.h>).
+    const RTNLGRP_ND_USEROPT: u32 = 20;
+    const SOL_NETLINK: libc::c_int = 270;
+    const NETLINK_ADD_MEMBERSHIP: libc::c_int = 1;
+
+    /// Whether the listener was started, and every prefix it has seen.
+    static STATE: Mutex<(bool, Vec<Prefix>)> = Mutex::new((false, Vec::new()));
+
+    /// Starts the listener once per process, on a thread of its own; a listener that cannot
+    /// start (no netlink, a kernel without the group) is logged once and not tried again.
+    pub(crate) fn start() {
+        let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if s.0 {
+            return;
+        }
+        s.0 = true;
+        drop(s);
+        let sock = match subscribe() {
+            Ok(sock) => sock,
+            Err(e) => {
+                tracing::debug!(
+                    "network guard: cannot listen for router advertisements' NAT64 prefixes                      (RTNLGRP_ND_USEROPT): {e}"
+                );
+                return;
+            }
+        };
+        let spawned = std::thread::Builder::new()
+            .name("netguard-pref64".into())
+            .spawn(move || listen(sock));
+        if let Err(e) = spawned {
+            tracing::debug!("network guard: the PREF64 listener did not start: {e}");
+        }
+    }
+
+    /// Every PREF64 prefix seen so far.
+    pub(crate) fn seen() -> Vec<Prefix> {
+        STATE.lock().unwrap_or_else(|e| e.into_inner()).1.clone()
+    }
+
+    /// A route netlink socket in the `RTNLGRP_ND_USEROPT` group.
+    pub(crate) fn subscribe() -> io::Result<OwnedFd> {
+        // SAFETY: plain socket(2); the fd is owned by the OwnedFd from here on.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just created and is owned here alone.
+        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: a zeroed sockaddr_nl binds to a port the kernel picks, no groups yet.
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        // SAFETY: `addr` is valid for its size.
+        let rc = unsafe {
+            libc::bind(
+                sock.as_raw_fd(),
+                (&addr as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let group = RTNLGRP_ND_USEROPT;
+        // SAFETY: `group` is a valid u32 for the size given.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                SOL_NETLINK,
+                NETLINK_ADD_MEMBERSHIP,
+                (&group as *const u32).cast(),
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sock)
+    }
+
+    /// Reads `sock` for ever, learning every PREF64 prefix the kernel passes on.
+    fn listen(sock: OwnedFd) {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match receive(&sock, &mut buf) {
+                Ok(found) if !found.is_empty() => learn(&found),
+                Ok(_) => {}
+                // ENOBUFS: the group's messages overflowed the socket; the next ones still come.
+                Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    tracing::debug!("network guard: the PREF64 listener stopped: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The PREF64 prefixes in the next datagram the kernel sends `sock` (blocking).
+    pub(crate) fn receive(sock: &OwnedFd, buf: &mut [u8]) -> io::Result<Vec<Prefix>> {
+        // SAFETY: a zeroed sockaddr_nl is valid to be overwritten by recvfrom.
+        let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        // SAFETY: `buf` and `from` are valid for the lengths given.
+        let n = unsafe {
+            libc::recvfrom(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                0,
+                (&mut from as *mut libc::sockaddr_nl).cast(),
+                &mut from_len,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if from.nl_pid != 0 {
+            // Not from the kernel.
+            return Ok(Vec::new());
+        }
+        Ok(super::pref64_of_datagram(&buf[..n as usize]))
+    }
+
+    fn learn(found: &[Prefix]) {
+        let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        for p in found {
+            if !s.1.contains(p) && s.1.len() < super::MAX_PREFIXES {
+                s.1.push(*p);
+            }
+        }
+        drop(s);
+        super::add_learned(found);
+    }
+}
+
+/// `RTM_NEWNDUSEROPT` (<linux/rtnetlink.h>).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+const RTM_NEWNDUSEROPT: u16 = 68;
+/// The PREF64 option's type (RFC 8781 §4).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+const ND_OPT_PREF64: u8 = 38;
+
+/// The PREF64 prefixes (RFC 8781) in one datagram of `RTNLGRP_ND_USEROPT` messages: each
+/// `RTM_NEWNDUSEROPT` message (`struct nduseroptmsg`, 16 bytes: family, pad, `nduseropt_opts_len`,
+/// ifindex, ICMP type and code, pads; then the options) of an IPv6 router advertisement (ICMPv6
+/// type 134, code 0), each ND option within `nduseropt_opts_len` read by its length (8-byte
+/// units); a PREF64 option of length 2 gives the 96 bits after its scaled lifetime and PLC, cut
+/// to the length its PLC names (0: /96, 1: /64, 2: /56, 3: /48, 4: /40, 5: /32; other PLCs are
+/// invalid and skipped, as RFC 8781 §4 says). Anything malformed ends the reading of that message.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+pub(crate) fn pref64_of_datagram(mut b: &[u8]) -> Vec<Prefix> {
+    let u16_at = |b: &[u8], i: usize| b.get(i..i + 2).map(|x| u16::from_ne_bytes([x[0], x[1]]));
+    let u32_at =
+        |b: &[u8], i: usize| b.get(i..i + 4).map(|x| u32::from_ne_bytes([x[0], x[1], x[2], x[3]]));
+    let mut out = Vec::new();
+    while let (Some(len), Some(ty)) = (u32_at(b, 0), u16_at(b, 4)) {
+        let len = len as usize;
+        if len < 16 || len > b.len() {
+            break;
+        }
+        let payload = &b[16..len];
+        if ty == RTM_NEWNDUSEROPT && payload.len() >= 16 {
+            let family = payload[0];
+            let opts_len = usize::from(u16_at(payload, 2).unwrap_or(0));
+            let (icmp_type, icmp_code) = (payload[8], payload[9]);
+            if i32::from(family) == AF_INET6 && icmp_type == 134 && icmp_code == 0 {
+                let mut opts = payload.get(16..16 + opts_len).unwrap_or(&[]);
+                while opts.len() >= 2 {
+                    let olen = usize::from(opts[1]) * 8;
+                    if olen == 0 || olen > opts.len() {
+                        break;
+                    }
+                    if opts[0] == ND_OPT_PREF64 && olen == 16 {
+                        let plc = opts[3] & 0x7;
+                        let plen = match plc {
+                            0 => Some(96),
+                            1 => Some(64),
+                            2 => Some(56),
+                            3 => Some(48),
+                            4 => Some(40),
+                            5 => Some(32),
+                            _ => None,
+                        };
+                        if let Some(plen) = plen {
+                            let mut a = [0u8; 16];
+                            a[..12].copy_from_slice(&opts[4..16]);
+                            out.push(Prefix::new(IpAddr::V6(Ipv6Addr::from(a)), plen));
+                        }
+                    }
+                    opts = &opts[olen..];
+                }
+            }
+        }
+        b = &b[((len + 3) & !3).min(b.len())..];
+    }
+    out
+}
+
+/// `AF_INET6` as the kernel numbers it on Linux (10), for [`pref64_of_datagram`], which tests
+/// read on every platform.
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+const AF_INET6: i32 = 10;
+
+/// Notes in `d` that a round on `up` finished (`found_any`: it found a prefix); when the
+/// uplink changed while it ran, a round on the new one is marked running (the caller starts it).
 fn finished(d: &mut OnUplink, up: Uplink, found_any: bool) {
     d.running = false;
     d.first_done = true;
@@ -665,7 +936,6 @@ fn finished(d: &mut OnUplink, up: Uplink, found_any: bool) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn spawn_round(up: Uplink) {
     if std::thread::Builder::new()
         .name("netguard-nat64".into())
@@ -677,13 +947,12 @@ fn spawn_round(up: Uplink) {
     }
 }
 
-/// macOS: learns the NSPs for a host on uplink `up` when they are due ([`next_on`]): the first
+/// learns the NSPs for a host on uplink `up` when they are due ([`next_on`]): the first
 /// call asks on this thread (at most [`DISCOVERY_TIMEOUT`]), a call during that first round waits
 /// for it, later rounds run in the background. Whether discovery is settled for `up`: false while
 /// the first round on a new uplink signature has not finished. The facts then refuse IPv6
 /// destinations on a host with IPv6 and no IPv4 route ([`crate::Denied::Nat64Unsettled`]): until
 /// the new network's prefix is known, an address under it can carry a private IPv4 address.
-#[cfg(target_os = "macos")]
 pub(crate) fn ensure_discovered_on(up: Uplink) -> bool {
     let mut d = ON_UPLINK.lock().unwrap_or_else(|e| e.into_inner());
     match next_on(&mut d, up, Instant::now()) {
@@ -877,11 +1146,11 @@ mod tests {
         assert!(t.elapsed() < DISCOVERY_TIMEOUT + Duration::from_millis(500));
     }
 
-    /// macOS, review round 3, bypass-1: a round starts when the uplink signature changes (not up
-    /// to [`DISCOVERY_TTL`] later), and is asked again every [`RETRY_UNSETTLED`] while a host with
-    /// IPv6 and no IPv4 route has found nothing; a dual-stack host waits for the TTL; one round
-    /// runs at a time, and one that finishes after the uplink changed starts another.
-    #[cfg(target_os = "macos")]
+    /// Review round 3, bypass-1 (every platform since the Linux application): a round starts
+    /// when the uplink signature changes (not up to [`DISCOVERY_TTL`] later), and is asked again
+    /// every [`RETRY_UNSETTLED`] while a host with IPv6 and no IPv4 route has found nothing; a
+    /// dual-stack host waits for the TTL; one round runs at a time, and one that finishes after
+    /// the uplink changed starts another.
     #[test]
     fn a_new_uplink_is_asked_for_its_prefix_at_once() {
         let t0 = Instant::now();
@@ -943,29 +1212,27 @@ mod tests {
         );
     }
 
-    /// macOS, review round 3, bypass-1, live: a new uplink signature is unsettled when it is first
-    /// seen (its round runs in the background).
-    #[cfg(target_os = "macos")]
+    /// Review round 3, bypass-1, live (every platform since the Linux application): a new uplink
+    /// signature is unsettled when it is first seen (its round runs in the background).
     #[test]
     fn a_new_uplink_signature_is_unsettled_at_first() {
+        use std::hash::{BuildHasher, Hasher};
         ensure_discovered_on(Uplink {
             signature: 1,
             routed: [true, true],
         });
-        // SAFETY: arc4random takes no arguments and cannot fail.
-        let fresh = u64::from(unsafe { libc::arc4random() }) << 32 | 7;
+        let fresh = std::collections::hash_map::RandomState::new().build_hasher().finish() | 7;
         assert!(!ensure_discovered_on(Uplink {
             signature: fresh,
             routed: [true, true],
         }));
     }
 
-    /// macOS, review round 3, bypass-2 (the reviewer's
+    /// Review round 3, bypass-2 (every platform since the Linux application; the reviewer's
     /// `r3_nat64_discovery_asks_only_the_first_eight_sorted_servers`): eight IPv4 servers that
     /// never answer, sorted ahead of the network's DNS64 on IPv6, hid its prefix. On a host with
     /// IPv6 and no IPv4 route the IPv6 servers are asked (the IPv4 ones cannot be reached), and on
     /// any host the active servers come first, so the DNS64 is asked and its prefix found.
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_active_and_routed_servers_are_asked_first() {
         let dns64 = UdpSocket::bind("[::1]:0").unwrap();
@@ -1067,5 +1334,133 @@ mod tests {
         );
         let here = nat64_prefixes().unwrap();
         eprintln!("this host's NAT64 prefixes (configd): {here:?}");
+    }
+
+    /// The Linux application of review round 3, bypass-2: off macOS the active servers are the
+    /// `nameserver` lines in file order, `/etc/resolv.conf` first, so the server glibc asks
+    /// first is asked first (the facts' list is sorted).
+    #[test]
+    fn resolv_conf_servers_keep_their_order() {
+        let text = "nameserver 9.9.9.9\nnameserver 2001:db8::53\nnameserver 1.1.1.1\n";
+        let active = crate::facts::parse_nameservers(text);
+        let mut all = active.clone();
+        all.sort();
+        let ordered = order_servers(&active, &all, [true, true], IpAddr::is_ipv6);
+        assert_eq!(ordered, active);
+        assert_eq!(ordered[0], "9.9.9.9".parse::<IpAddr>().unwrap());
+        // IPv6 only: the IPv6 server, ahead of everything it cannot reach.
+        assert_eq!(
+            order_servers(&active, &all, [false, true], IpAddr::is_ipv6),
+            vec!["2001:db8::53".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// The Linux application (RFC 8781): `RTM_NEWNDUSEROPT` messages carrying a router
+    /// advertisement's PREF64 option give its prefix, at the length its PLC names; other options,
+    /// other ICMP types, invalid PLCs and malformed options give nothing.
+    #[test]
+    fn pref64_options_of_router_advertisements_are_read() {
+        // One RTM_NEWNDUSEROPT: nlmsghdr, nduseroptmsg, the options, an NDUSEROPT_SRCADDR.
+        let msg = |icmp_type: u8, opts: &[u8]| {
+            let mut payload = vec![0u8; 16];
+            payload[0] = AF_INET6 as u8;
+            payload[2..4].copy_from_slice(&(opts.len() as u16).to_ne_bytes());
+            payload[4..8].copy_from_slice(&2i32.to_ne_bytes());
+            payload[8] = icmp_type;
+            payload.extend_from_slice(opts);
+            // NDUSEROPT_SRCADDR: the router's address, after the options.
+            payload.extend_from_slice(&20u16.to_ne_bytes());
+            payload.extend_from_slice(&1u16.to_ne_bytes());
+            payload.extend_from_slice(&ip6("fe80::1").octets());
+            let mut m = Vec::new();
+            m.extend_from_slice(&((16 + payload.len()) as u32).to_ne_bytes());
+            m.extend_from_slice(&RTM_NEWNDUSEROPT.to_ne_bytes());
+            m.extend_from_slice(&[0u8; 10]);
+            m.extend_from_slice(&payload);
+            m
+        };
+        let pref64 = |prefix: &str, plc: u8, lifetime: u16| {
+            let a = ip6(prefix).octets();
+            let mut o = vec![ND_OPT_PREF64, 2];
+            o.extend_from_slice(&((lifetime << 3) | u16::from(plc)).to_be_bytes());
+            o.extend_from_slice(&a[..12]);
+            o
+        };
+        for (prefix, plc, len) in [
+            ("2a0b:7e40:64::", 0, 96),
+            ("2001:db8:122:344::", 1, 64),
+            ("2001:db8:122:300::", 2, 56),
+            ("2001:db8:122::", 3, 48),
+            ("2001:db8:100::", 4, 40),
+            ("2001:db8::", 5, 32),
+        ] {
+            assert_eq!(
+                pref64_of_datagram(&msg(134, &pref64(prefix, plc, 600))),
+                vec![p(&format!("{prefix}/{len}"))],
+                "{prefix} PLC {plc}"
+            );
+        }
+        // Lifetime 0 (the router withdraws it): still learned, which only refuses more.
+        assert_eq!(pref64_of_datagram(&msg(134, &pref64("64:ff9b::", 0, 0))), vec![WELL_KNOWN_PREFIX]);
+        // Behind an RDNSS option, and two messages in one datagram.
+        let rdnss = [25u8, 3, 0, 0, 0, 0, 0, 60, 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x53];
+        let mut both = msg(134, &[&rdnss[..], &pref64("2a0b:7e40:64::", 0, 600)].concat());
+        both.extend(msg(134, &pref64("2001:db8::", 5, 600)));
+        assert_eq!(pref64_of_datagram(&both), vec![p("2a0b:7e40:64::/96"), p("2001:db8::/32")]);
+        // PLC 6 and 7 are invalid; another ICMP type (a redirect's options); a PREF64 of the
+        // wrong length; an option whose length runs past the options; a cut message.
+        assert!(pref64_of_datagram(&msg(134, &pref64("2001:db8::", 6, 600))).is_empty());
+        assert!(pref64_of_datagram(&msg(134, &pref64("2001:db8::", 7, 600))).is_empty());
+        assert!(pref64_of_datagram(&msg(137, &pref64("2001:db8::", 5, 600))).is_empty());
+        let mut long = pref64("2001:db8::", 5, 600);
+        long[1] = 3;
+        long.extend_from_slice(&[0u8; 8]);
+        assert!(pref64_of_datagram(&msg(134, &long)).is_empty());
+        let mut past = pref64("2001:db8::", 5, 600);
+        past[1] = 9;
+        assert!(pref64_of_datagram(&msg(134, &past)).is_empty());
+        let whole = msg(134, &pref64("2001:db8::", 5, 600));
+        for cut in [0, 4, 16, 31, whole.len() - 1] {
+            assert!(pref64_of_datagram(&whole[..cut]).is_empty(), "{cut}");
+        }
+    }
+
+    /// Linux: the PREF64 listener joins `RTNLGRP_ND_USEROPT` without privileges. With
+    /// `ZKMINER_TEST_PREF64=<prefix>` (a router advertisement carrying that PREF64 staged on an
+    /// interface whose `accept_ra` lets the kernel process it, as `fix-linux/exp/pref64-ra.sh`
+    /// does), it also waits up to 30 s for that prefix to arrive and be learned.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_pref64_listener_joins_unprivileged() {
+        let sock = pref64::subscribe().expect("RTNLGRP_ND_USEROPT is open to every process");
+        let Ok(want) = std::env::var("ZKMINER_TEST_PREF64") else {
+            eprintln!("subscribed; no staged router advertisement (ZKMINER_TEST_PREF64) to wait for");
+            return;
+        };
+        let want: Prefix = want.parse().expect("ZKMINER_TEST_PREF64 is a prefix");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match pref64::receive(&sock, &mut buf) {
+                    Ok(found) if !found.is_empty() => {
+                        let _ = tx.send(found);
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        });
+        let found = rx.recv_timeout(Duration::from_secs(30)).expect("a PREF64 within 30 s");
+        eprintln!("PREF64 received: {found:?}");
+        assert!(found.contains(&want), "{found:?}");
+        // And the listener the rounds start learns it.
+        pref64::start();
+        let t = Instant::now();
+        while !pref64::seen().contains(&want) && t.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(pref64::seen().contains(&want), "{:?}", pref64::seen());
+        assert!(learned().contains(&want));
     }
 }

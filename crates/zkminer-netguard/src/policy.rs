@@ -92,10 +92,10 @@ pub enum Denied {
     /// [`FACTS_TTL`] and a grace of 2 s: every requester connection is refused until they can be
     /// read (review round 2, bypass-1; on every platform since the Linux application).
     FactsUnreadable { ip: IpAddr, why: String },
-    /// macOS: an IPv6 destination while this host, with IPv6 and no IPv4 route, has just joined a
+    /// An IPv6 destination while this host, with IPv6 and no IPv4 route, has just joined a
     /// network whose NAT64 prefix is still being learned ([`crate::nat64`]): an address under
-    /// that prefix can carry a private IPv4 address (review round 3, bypass-1).
-    #[cfg(target_os = "macos")]
+    /// that prefix can carry a private IPv4 address (review round 3, bypass-1; every platform
+    /// since the Linux application).
     Nat64Unsettled(IpAddr),
 }
 
@@ -256,7 +256,6 @@ impl Denied {
                  requester-caused connection is refused until they can be",
                 (FACTS_TTL + REFRESH_GRACE).as_secs()
             ),
-            #[cfg(target_os = "macos")]
             Denied::Nat64Unsettled(ip) => write!(
                 f,
                 "{ip} cannot be judged yet: this host, with IPv6 and no IPv4 route, is on a new \
@@ -289,13 +288,10 @@ impl Denied {
     /// Whether the refusal rests on the host's facts (which may have changed since they were
     /// read), rather than on the address alone or the operator's deny CIDRs.
     pub fn depends_on_facts(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        if matches!(self, Denied::Nat64Unsettled(_)) {
-            return true;
-        }
         matches!(
             self,
             Denied::FactsUnreadable { .. }
+                | Denied::Nat64Unsettled(_)
                 | Denied::OwnAddress(_)
                 | Denied::ConnectedPrefix { .. }
                 | Denied::SitePrefix { .. }
@@ -358,7 +354,6 @@ fn admit_inner(
             why: why.to_string(),
         });
     }
-    #[cfg(target_os = "macos")]
     if ip.is_ipv6() && facts.nat64_unsettled() {
         return Err(Denied::Nat64Unsettled(ip));
     }
@@ -1652,12 +1647,11 @@ mod tests {
         ));
     }
 
-    /// macOS, review round 3, bypass-1 (the reviewer's `r3_an_unlearned_nsp_carries_private_
-    /// ipv4_as_global`): on a host with IPv6 and no IPv4 route, `<NSP>::<private IPv4>` under a
+    /// Review round 3, bypass-1 (the reviewer's `r3_an_unlearned_nsp_carries_private_
+    /// ipv4_as_global`; every platform since the Linux application): on a host with IPv6 and no IPv4 route, `<NSP>::<private IPv4>` under a
     /// network-specific NAT64 prefix not learned yet is an ordinary global IPv6 address. While the
     /// new uplink's discovery round has not finished, every IPv6 destination is refused, and the
     /// refusal rests on the facts; once the prefix is learned, what it carries is judged.
-    #[cfg(target_os = "macos")]
     #[test]
     fn ipv6_is_refused_while_a_new_uplinks_nat64_prefix_is_learned() {
         use crate::facts::RawFacts;

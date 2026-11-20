@@ -252,10 +252,9 @@ pub struct RawFacts {
     /// How many PPPoE sessions the host has (`/proc/net/pppoe`): a `ppp` uplink is an ordinary
     /// PPPoE uplink only when every `ppp` interface can be one of them.
     pub pppoe_sessions: usize,
-    /// macOS: the host has IPv6 and no IPv4 route, and NAT64 prefix discovery for the uplink it
-    /// is on now has not finished ([`crate::nat64`]): every IPv6 destination is refused until it
-    /// has (review round 3, bypass-1).
-    #[cfg(target_os = "macos")]
+    /// The host has IPv6 and no IPv4 route, and NAT64 prefix discovery for the uplink it is on
+    /// now has not finished ([`crate::nat64`]): every IPv6 destination is refused until it has
+    /// (review round 3, bypass-1; every platform since the Linux application).
     pub nat64_unsettled: bool,
 }
 
@@ -285,8 +284,7 @@ pub struct HostFacts {
     /// Why these facts can no longer be judged with (a refresh failed and they outlived their
     /// time): every requester connection is refused ([`crate::Denied::FactsUnreadable`]).
     unreadable: Option<String>,
-    /// macOS: [`RawFacts::nat64_unsettled`].
-    #[cfg(target_os = "macos")]
+    /// [`RawFacts::nat64_unsettled`].
     nat64_unsettled: bool,
 }
 
@@ -457,18 +455,52 @@ fn default_path_known(
     Ok(())
 }
 
-/// macOS: NAT64 prefix discovery for the uplink of `table`, `internet` and `networks` (the
-/// configuration daemon's network signatures), started when it is due
+/// NAT64 prefix discovery for the uplink `signature` of `table`, started when it is due
 /// ([`crate::nat64::ensure_discovered_on`]); whether IPv6 destinations are refused meanwhile (a
 /// host with IPv6 and no IPv4 route whose uplink's round has not finished: review round 3,
-/// bypass-1).
-#[cfg(target_os = "macos")]
-fn nat64_unsettled_on(table: &RouteTable, internet: &[u32], networks: &[String]) -> bool {
+/// bypass-1; on every platform since the Linux application).
+fn nat64_unsettled_on(table: &RouteTable, signature: u64) -> bool {
     let up = crate::nat64::Uplink {
-        signature: macos_uplink_signature(uplink_signature(table, internet), networks),
+        signature,
         routed: [table.routes_family(false), table.routes_family(true)],
     };
     up.refuses_ipv6(crate::nat64::ensure_discovered_on(up))
+}
+
+/// The signature of the uplink this host is on now ([`uplink_signature`], and what tells two
+/// networks behind the same router address apart): macOS adds the configuration daemon's
+/// network signatures ([`macos_uplink_signature`]), Linux the default gateways' link-layer
+/// addresses ([`linux_uplink_signature`]); elsewhere the routes alone. Public-address discovery
+/// and NAT64 discovery both run per signature.
+#[cfg(target_os = "macos")]
+fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64> {
+    let networks = macos_dns::network_signatures()?;
+    Ok(macos_uplink_signature(
+        uplink_signature(table, internet),
+        &networks,
+    ))
+}
+
+/// See the macOS one.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64> {
+    let neighbours = crate::routes::read_neighbours().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("the neighbour table (RTM_GETNEIGH) could not be read: {e}"),
+        )
+    })?;
+    Ok(linux_uplink_signature(
+        uplink_signature(table, internet),
+        &gateway_identities(table, &neighbours),
+        next_read(),
+    ))
+}
+
+/// See the macOS one.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn host_uplink_signature(table: &RouteTable, internet: &[u32]) -> io::Result<u64> {
+    Ok(uplink_signature(table, internet))
 }
 
 /// macOS: [`uplink_signature`] (`base`) and the network each service is on, as the configuration
@@ -605,7 +637,6 @@ impl HostFacts {
             global_v4_interfaces: Vec::new(),
             internal_ranges_stated: true,
             unreadable: None,
-            #[cfg(target_os = "macos")]
             nat64_unsettled: false,
         }
     }
@@ -688,7 +719,6 @@ impl HostFacts {
             global_v4_interfaces,
             internal_ranges_stated: opts.internal_ranges.is_some(),
             unreadable: None,
-            #[cfg(target_os = "macos")]
             nat64_unsettled: raw.nat64_unsettled,
         }
     }
@@ -714,9 +744,8 @@ impl HostFacts {
         self.unreadable.as_deref()
     }
 
-    /// macOS: whether NAT64 prefix discovery for the uplink is unsettled on a host with IPv6 and
-    /// no IPv4 route ([`RawFacts::nat64_unsettled`]).
-    #[cfg(target_os = "macos")]
+    /// Whether NAT64 prefix discovery for the uplink is unsettled on a host with IPv6 and no IPv4
+    /// route ([`RawFacts::nat64_unsettled`]).
     pub(crate) fn nat64_unsettled(&self) -> bool {
         self.nat64_unsettled
     }
@@ -912,9 +941,6 @@ impl HostFacts {
     /// not know them cannot refuse what they name.
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
-        // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
-        #[cfg(not(target_os = "macos"))]
-        crate::nat64::ensure_discovered();
         let (routes, rules) = crate::routes::read_routing(&loopback)?;
         let links = crate::routes::read_links()?;
         let nexthops = if routes.iter().any(|r| r.nexthop != 0) {
@@ -923,47 +949,16 @@ impl HostFacts {
             Vec::new()
         };
         let internet_interfaces = crate::routes::internet_interfaces();
-        // macOS: the NAT64 prefixes, learned again whenever the uplink changes (review round 3,
-        // bypass-1); IPv6 destinations are refused on a host with IPv6 and no IPv4 route until
-        // the new uplink's round has finished.
-        #[cfg(target_os = "macos")]
-        let nat64_unsettled = nat64_unsettled_on(
-            &RouteTable::with_rules(routes.clone(), rules.clone()),
-            &internet_interfaces,
-            &macos_dns::network_signatures()?,
-        );
+        let table = RouteTable::with_rules(routes.clone(), rules.clone());
+        let signature = host_uplink_signature(&table, &internet_interfaces)?;
+        // The NAT64 prefixes, learned again whenever the uplink changes (review round 3,
+        // bypass-1; every platform since the Linux application); IPv6 destinations are refused
+        // on a host with IPv6 and no IPv4 route until the new uplink's round has finished.
+        let nat64_unsettled = nat64_unsettled_on(&table, signature);
         let public = if opts.discover_public_addresses {
             // Addresses confirmed under another uplink (a new default gateway, a VPN that came
             // up) are not this one's: discovery runs again, and meanwhile they are not known.
-            let table = RouteTable::with_rules(routes.clone(), rules.clone());
-            #[cfg(target_os = "macos")]
-            let uplink_signature = {
-                // macOS: the routes' signature and the networks the configuration daemon says
-                // the services are on (`uplink_signature` in here is the function above).
-                let networks = macos_dns::network_signatures()?;
-                move |t: &RouteTable, i: &[u32]| {
-                    macos_uplink_signature(uplink_signature(t, i), &networks)
-                }
-            };
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let uplink_signature = {
-                // Linux: the routes' signature and each default gateway's link-layer address
-                // (`uplink_signature` in here is the function above).
-                let neighbours = crate::routes::read_neighbours().map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("the neighbour table (RTM_GETNEIGH) could not be read: {e}"),
-                    )
-                })?;
-                move |t: &RouteTable, i: &[u32]| {
-                    linux_uplink_signature(
-                        uplink_signature(t, i),
-                        &gateway_identities(t, &neighbours),
-                        next_read(),
-                    )
-                }
-            };
-            crate::public::learned_on(uplink_signature(&table, &internet_interfaces))
+            crate::public::learned_on(signature)
         } else {
             crate::public::Learned::default()
         };
@@ -981,7 +976,6 @@ impl HostFacts {
                 internet_interfaces,
                 nexthops,
                 pppoe_sessions: crate::routes::pppoe_sessions(),
-                #[cfg(target_os = "macos")]
                 nat64_unsettled,
             },
             opts,
@@ -1081,9 +1075,9 @@ pub fn system_resolvers() -> Vec<IpAddr> {
     )
 }
 
-/// The DNS servers for the facts: [`system_resolvers`], which cannot fail here.
+/// The DNS servers for the facts and NAT64 discovery: [`system_resolvers`], which cannot fail here.
 #[cfg(not(target_os = "macos"))]
-fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
+pub(crate) fn read_system_resolvers() -> io::Result<Vec<IpAddr>> {
     Ok(system_resolvers())
 }
 
@@ -2900,15 +2894,14 @@ mod tests {
         assert_eq!(REFUSED.load(Ordering::Relaxed), 0);
     }
 
-    /// macOS, review round 3, bypass-1: the facts of a host with IPv6 and no IPv4 route that has
+    /// Review round 3, bypass-1 (every platform since the Linux application): the facts of a host with IPv6 and no IPv4 route that has
     /// just joined a network (an uplink signature not seen before) refuse IPv6 until that
     /// network's NAT64 round has finished; a dual-stack host's never do.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends() {
         use crate::routes::Route;
-        // SAFETY: arc4random takes no arguments and cannot fail.
-        let fresh = || format!("test={}", unsafe { libc::arc4random() });
+        use std::hash::{BuildHasher, Hasher};
+        let fresh = || std::collections::hash_map::RandomState::new().build_hasher().finish();
         let v6_only = RouteTable::new(vec![Route::via(p("::/0"), ip("fe80::1"), 4)]);
         let dual = RouteTable::new(vec![
             Route::via(p("::/0"), ip("fe80::1"), 4),
@@ -2916,9 +2909,9 @@ mod tests {
         ]);
         // The process's first round runs on the caller's thread; the next uplinks' in the
         // background.
-        nat64_unsettled_on(&dual, &[4], &[fresh()]);
-        assert!(nat64_unsettled_on(&v6_only, &[4], &[fresh()]));
-        assert!(!nat64_unsettled_on(&dual, &[4], &[fresh()]));
+        nat64_unsettled_on(&dual, fresh());
+        assert!(nat64_unsettled_on(&v6_only, fresh()));
+        assert!(!nat64_unsettled_on(&dual, fresh()));
     }
 
     #[test]
