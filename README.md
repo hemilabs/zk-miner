@@ -552,16 +552,24 @@ is skipped with a warning. `the system configuration daemon did not answer` mean
 not responding (restarting the Mac clears it). Every requester connection refused as near
 (`within 2 hops ... accepted a connection`) while a VPN app is on that adds no `utun` route
 points to a Network Extension proxy VPN (flow divert, app proxy): it is expected to accept every
-connection itself, so every probe connects, and the guard cannot see past it. A download refused with
-`the peer acknowledged the check connection's FIN neither within the hop limit nor at the default
-one` comes from a store whose servers never acknowledge a bare TCP FIN (AWS S3) on a path whose
-first two routers did not answer the hop-limited probe (they filter or rate-limit ICMP): the
-guard cannot tell how near such a server is, so it refuses (another attempt usually gets the
-probe answered).
+connection itself, so every probe connects, and the guard cannot see past it.
 `this kernel refused a route query sent as RTM_GET_SILENT` means the macOS version lacks a
-routing-socket call the guard needs (none known among those the miner supports). Right after a
-Mac with IPv6 and no IPv4 joins a network, IPv6 destinations are refused for up to 2 s (`NAT64
-prefix is still being learned`).
+routing-socket call the guard needs (none known among those the miner supports).
+
+*Troubleshooting (Linux and macOS):* the hardening the macOS reviews added applies on every
+platform ([docs/netguard-hardening.md](docs/netguard-hardening.md)). If every requester
+connection is refused with `this host's network facts ... could not be read again`, the message
+names what failed (on Linux a netlink read: the interfaces, routes, rules, neighbour table). A
+download refused with `the peer acknowledged the check's FIN neither within the hop limit nor at
+the default one (AWS S3 never does)` comes from a store whose servers never acknowledge a bare
+TCP FIN (AWS S3) on a path whose first two routers did not answer the hop-limited probe (they
+filter or rate-limit ICMP, as many cloud and corporate networks do): the guard cannot tell how
+near such a server is, so it refuses (another attempt usually gets the probe answered; on a
+host whose first hops never send ICMP, S3 is refused every time). Right after a host with IPv6
+and no IPv4 joins a network, IPv6 destinations are refused for up to 2 s (`NAT64 prefix is still
+being learned`); on Linux also for a moment after a link change while the router's neighbour
+entry is missing. `the connection to ... was dropped once made` means the route changed between
+the check and the connection (a VPN coming up): the next attempt is judged on the new route.
 
 **Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
 endpoints for builders, has no network of its own: its sandbox denies every socket call. The
