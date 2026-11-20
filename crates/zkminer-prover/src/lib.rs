@@ -7,6 +7,7 @@ pub mod dispatcher;
 pub mod engine;
 mod env;
 pub mod gpu_code;
+pub mod host_peaks;
 pub mod memory;
 pub mod metal_sizing;
 pub mod registry;

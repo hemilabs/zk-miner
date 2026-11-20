@@ -1964,6 +1964,24 @@ pub fn peak_for_po2(baseline_peak: u64, po2: u8) -> u64 {
     baseline_peak.saturating_mul(1u64.checked_shl(steps.min(16) as u32).unwrap_or(u64::MAX))
 }
 
+/// What the set of proofs a claim implies may need at once, in bytes: this one (`want`) and the
+/// largest `slots - 1` of those outstanding (`same` of its own backend at `want` each, `other` of
+/// other backends at `other_peak` each). `slots` is how many proofs can run at once: no more than
+/// there are cards, nor than the miner's concurrency limit. Charging every outstanding job this
+/// backend's peak, as the claim check did, refused an SP1 claim behind two RISC Zero jobs on a
+/// two-card machine as 3 x 42 GiB, and charged a RISC Zero claim behind an SP1 job only its own
+/// 5 GiB twice.
+pub fn claim_set_bytes(want: u64, same: usize, other: usize, other_peak: u64, slots: usize) -> u64 {
+    let mut peaks: Vec<u64> = std::iter::repeat_n(want, same)
+        .chain(std::iter::repeat_n(other_peak, other))
+        .collect();
+    peaks.sort_unstable_by(|a, b| b.cmp(a));
+    peaks
+        .iter()
+        .take(slots.max(1) - 1)
+        .fold(want, |sum, p| sum.saturating_add(*p))
+}
+
 /// The host memory one card's real proofs have reached, by the po2 they proved at (`BASELINE_PO2`
 /// for a proof given none), in bytes. Windows only: see `learned_host_peak`.
 pub type LearnedPeaks = std::collections::BTreeMap<u8, u64>;
@@ -2105,6 +2123,8 @@ pub struct MemoryReservation<'a> {
     tracked: Option<u64>,
     /// A reservation on another ledger held with this one (`pair`): Windows' commit beside RAM.
     paired: Option<Box<MemoryReservation<'a>>>,
+    /// Released without waking the waiters (`release_quietly`).
+    quiet: bool,
 }
 
 impl<'a> MemoryReservation<'a> {
@@ -2120,6 +2140,17 @@ impl<'a> MemoryReservation<'a> {
     pub fn pair(mut self, other: MemoryReservation<'a>) -> Self {
         self.paired = Some(Box::new(other));
         self
+    }
+
+    /// Give the memory back without waking the proofs waiting for memory (`MEMORY_RELEASED`): for a
+    /// reservation that never ran a proof, as when the commit beside its RAM was refused. Nothing
+    /// the waiters were short of was freed, and waking them on it burned their waits in
+    /// milliseconds, each one refused again by the same shortage.
+    pub fn release_quietly(mut self) {
+        self.quiet = true;
+        if let Some(paired) = self.paired.as_mut() {
+            paired.quiet = true;
+        }
     }
 }
 
@@ -2145,7 +2176,9 @@ impl Drop for MemoryReservation<'_> {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&id);
         }
-        MEMORY_RELEASED.notify_waiters();
+        if !self.quiet {
+            MEMORY_RELEASED.notify_waiters();
+        }
     }
 }
 
@@ -2200,6 +2233,7 @@ impl MemoryLedger {
                         bytes,
                         tracked: None,
                         paired: None,
+                        quiet: false,
                     })
                 }
                 Err(observed) => current = observed,
@@ -4023,6 +4057,23 @@ mod windows_commit_tests {
             after.1 + GIB >= before.free_now + grew && after.1 <= before.free_now + grew + GIB,
             "{before:?} -> {after:?}"
         );
+    }
+
+    /// The claim set: this proof and the largest of the outstanding, no more than the cards run.
+    #[test]
+    fn a_claim_is_charged_the_set_the_cards_can_run() {
+        let (sp1, risc0) = (42 * GIB, 5 * GIB);
+        // SP1 behind two RISC Zero jobs on two cards: SP1 and one RISC Zero, not 3 x SP1.
+        assert_eq!(claim_set_bytes(sp1, 0, 2, risc0, 2), sp1 + risc0);
+        // RISC Zero behind an SP1 job: the SP1 job's memory counts.
+        assert_eq!(claim_set_bytes(risc0, 0, 1, sp1, 2), risc0 + sp1);
+        // Nothing outstanding: this one.
+        assert_eq!(claim_set_bytes(sp1, 0, 0, 0, 2), sp1);
+        // More outstanding than cards: the largest that fit beside it.
+        assert_eq!(claim_set_bytes(risc0, 2, 2, sp1, 3), risc0 + 2 * sp1);
+        // One slot: this one alone.
+        assert_eq!(claim_set_bytes(sp1, 3, 3, sp1, 1), sp1);
+        assert_eq!(claim_set_bytes(sp1, 3, 3, sp1, 0), sp1);
     }
 
     /// Growth still to come: an admission's increment less what its worker has grown by since,
