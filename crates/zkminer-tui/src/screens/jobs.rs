@@ -159,6 +159,7 @@ pub(crate) fn row_kind(job: &TrackedJob, state: &MinerState) -> RowKind {
         MinerJobStatus::Fulfilled { .. }
             | MinerJobStatus::Released { .. }
             | MinerJobStatus::Slashed { .. }
+            | MinerJobStatus::EndedPastDeadline
     ) {
         RowKind::Finished
     } else {
@@ -186,8 +187,8 @@ pub(crate) fn held_status_text(job: &TrackedJob, state: &MinerState, now: u64) -
 pub(crate) fn finished_status_text(job: &TrackedJob, state: &MinerState, now: u64) -> String {
     let how = match job.status {
         MinerJobStatus::Released { .. } => "Released",
-        MinerJobStatus::Slashed { by_us: true } => "Slashed past its deadline (by this miner)",
-        MinerJobStatus::Slashed { by_us: false } => "Slashed past its deadline",
+        MinerJobStatus::Slashed { .. } => "Slashed past its deadline (by this miner)",
+        MinerJobStatus::EndedPastDeadline => "Ended past its deadline (slashed, or released late)",
         _ => "Fulfilled",
     };
     match state.finished_at.get(&job.info.job_id) {
@@ -291,6 +292,7 @@ pub(crate) fn job_status_text(job: &TrackedJob, state: &MinerState) -> String {
         MinerJobStatus::Fulfilled { .. } => "Fulfilled".to_string(),
         MinerJobStatus::Released { .. } => "Released".to_string(),
         MinerJobStatus::Slashed { .. } => "Slashed".to_string(),
+        MinerJobStatus::EndedPastDeadline => "Ended past its deadline".to_string(),
         MinerJobStatus::Skipped { reason } => format!("Skipped: {reason}"),
     }
 }

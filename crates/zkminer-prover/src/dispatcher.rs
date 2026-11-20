@@ -8603,6 +8603,19 @@ impl WorkerPool {
         abort_at: Option<Instant>,
         me: Option<(Option<u64>, Option<Instant>, Instant)>,
     ) -> bool {
+        self.better_card_soon_by(key, keys, abort_at, me, &slot_estimate)
+    }
+
+    /// `better_card_soon` for a job whose estimates `estimate` gives (another job's, waiting in
+    /// line, as `yields_to_waiter` weighs it).
+    fn better_card_soon_by(
+        &self,
+        key: &str,
+        keys: &[String],
+        abort_at: Option<Instant>,
+        me: Option<(Option<u64>, Option<Instant>, Instant)>,
+        estimate: &dyn Fn(&str) -> Option<Duration>,
+    ) -> bool {
         let now = Instant::now();
         let ahead: Vec<CardWaiter> = me
             .map(|(ticket, order, since)| {
@@ -8641,7 +8654,7 @@ impl WorkerPool {
                 WORKER_SWITCH_COST
             }
         };
-        let Some(here) = slot_estimate(key) else {
+        let Some(here) = estimate(key) else {
             return false;
         };
         let here = now + switch(key) + here;
@@ -8665,7 +8678,7 @@ impl WorkerPool {
                     }
                     *etas.get(&Self::card_of(k)).filter(|at| **at > now)?
                 };
-                let takes = slot_estimate(k)?;
+                let takes = estimate(k)?;
                 let finish = free_at + switch(k) + takes;
                 abort_at
                     .is_none_or(|a| finish + elsewhere_slack(takes) <= a)
@@ -8730,6 +8743,20 @@ impl WorkerPool {
             };
             // Only a card it can take and finish on by its cutoff.
             if self.finish_here(&theirs, key, now).is_none() {
+                return false;
+            }
+            // Nor one it would pass up itself for a faster card soon free (`better_card_soon`): a
+            // RISC Zero job left a free 4070 idle for an SP1 job waiting on the 5090.
+            let passes_up =
+                w.keys
+                    .iter()
+                    .find(|k| self.same_card(k, key))
+                    .is_some_and(|their_key| {
+                        self.better_card_soon_by(their_key, &w.keys, w.cutoff, None, &|k| {
+                            w.estimates.get(k).copied()
+                        })
+                    });
+            if passes_up {
                 return false;
             }
             match &my_view {
@@ -9058,6 +9085,23 @@ impl WorkerPool {
                 ram,
                 commit,
             }),
+        }
+    }
+
+    /// The job on this thread (`with_job_tag`) is still waiting (in the card line): its place in the
+    /// memory line does not expire (`MEMORY_WAITER_TTL`).
+    fn touch_memory_waiter(&self) {
+        if let Some(job) = JOB_TAG.with(|t| t.get()) {
+            let now = Instant::now();
+            for w in self
+                .memory_waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter_mut()
+                .filter(|w| w.job == job)
+            {
+                w.seen = now;
+            }
         }
     }
 
@@ -9558,6 +9602,8 @@ impl WorkerPool {
         // In line for a card: a freed one goes to the waiting job due first.
         let (in_line, ticket, since) = self.wait_for_card(&keys, latest_start, abort_at);
         loop {
+            // Its place in the memory line, if it has one, kept while it waits here for a card.
+            self.touch_memory_waiter();
             // Whether some eligible card is only BUSY (another proof holds it), not failed.
             let mut any_busy = false;
             for key in &keys {
@@ -11084,7 +11130,9 @@ impl WorkerPool {
     /// How many proofs of `backend` this host can run side by side: as many of its peaks as fit what
     /// can ever be held, in RAM and (Windows) commit, with the OS slice; at least one. Two SP1 proofs
     /// (2 x 74 GiB of commit) do not fit a 100 GiB host, so a second SP1 claim waits for the first
-    /// rather than being refused as if both had to run at once.
+    /// rather than being refused as if both had to run at once. Commit is fitted against what can
+    /// ever be committed, page-file growth included (`CommitFigures::total`): with a system-managed
+    /// page file that rarely binds, and RAM decides (two SP1 proofs side by side on a 96 GB host).
     pub fn backend_side_by_side(&self, backend: &str) -> usize {
         let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
         let fit = |total: u64, peak: u64| {
@@ -11206,15 +11254,16 @@ impl WorkerPool {
             let pending = self
                 .commit_ledger
                 .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
-            let idle_others = self
-                .idle_commit_holdings_except(Some(backend))
+            // Every idle worker: other backends' and its own on other cards are recycled for it
+            // (`reserve_commit`); the one it starts on is `resident` (counted once).
+            let idle = self
+                .idle_commit_holdings_except(None)
                 .iter()
                 .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
             let returning = self
                 .commit_ledger
                 .reserved_bytes()
-                .saturating_add(idle_others)
-                .saturating_add(resident);
+                .saturating_add(idle.max(resident));
             if !crate::memory::queued_claim_fits(
                 set,
                 reserve,
@@ -11401,10 +11450,13 @@ impl WorkerPool {
         // are in neither `reserved` nor `available`. What only idle workers and measurements hold
         // counts, as below.
         {
+            // Every idle worker, as dispatch recycles them (`make_host_room`), the one it starts on
+            // counted once with `resident`.
             let idle = self
-                .idle_host_holdings_except(backend)
+                .idle_prove_holdings()
                 .iter()
-                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
+                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held))
+                .saturating_sub(resident);
             let measures = self
                 .inflight_measures_snapshot()
                 .iter()
@@ -21216,6 +21268,39 @@ mod learned_host_peak_tests {
             );
             assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None, None));
         });
+    }
+
+    /// A waiter that would pass up a free card for a faster one soon free does not hold that card
+    /// from a job behind it: an SP1 job waiting on a 5090 due free in 30 s left the free 4070 idle
+    /// for a RISC Zero job that would have taken it.
+    #[test]
+    fn a_waiter_does_not_hold_a_card_it_would_pass_up() {
+        let pool = pool(&["sp1:cuda:0", "sp1:cuda:1", "risc0:cuda:1"]);
+        let sp1 = vec!["sp1:cuda:0".to_string(), "sp1:cuda:1".to_string()];
+        let now = Instant::now();
+        let far = Some(now + Duration::from_secs(3600));
+        // The 5090 busy, free in 30 s: the SP1 job finishes there by ~145 s against ~203 s on the
+        // 4070.
+        let lock = pool.gpu_lock_for("sp1:cuda:0").unwrap();
+        let _busy = lock.lock().unwrap();
+        pool.card_eta
+            .lock()
+            .unwrap()
+            .insert("cuda:0".to_string(), now + Duration::from_secs(30));
+        let takes = HashMap::from([
+            ("sp1:cuda:0".to_string(), Duration::from_secs(95)),
+            ("sp1:cuda:1".to_string(), Duration::from_secs(183)),
+        ]);
+        let in_line = with_slot_estimates(takes, || pool.wait_for_card(&sp1, Some(now), far).0);
+        // A RISC Zero job due later does not yield the free 4070 to it.
+        let later = Some(now + Duration::from_secs(1800));
+        assert!(!pool.yields_to_waiter("risc0:cuda:1", None, later, now, None));
+        drop(in_line);
+        // One that would take the 4070 (no faster card coming) is still yielded to.
+        let slow_only = HashMap::from([("sp1:cuda:1".to_string(), Duration::from_secs(183))]);
+        let _in_line =
+            with_slot_estimates(slow_only, || pool.wait_for_card(&sp1, Some(now), far).0);
+        assert!(pool.yields_to_waiter("risc0:cuda:1", None, later, now, None));
     }
 
     /// A waiter holds a card from later jobs only where it can finish by its cutoff: one that needs
