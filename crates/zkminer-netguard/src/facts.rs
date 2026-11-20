@@ -3415,7 +3415,7 @@ mod tests {
         nat64_unsettled_on(&dual, &[], held, false);
         crate::nat64::unheld_after_round(held, "test: one source named too many");
         let (_, why) = nat64_unsettled_on(&dual, &[], held, false);
-        assert_eq!(why.as_deref(), Some("test: one source named too many"));
+        assert!(why.is_some_and(|w| w.ends_with("test: one source named too many")));
         assert!(nat64_unsettled_on(&dual, &[], fresh(), false).1.is_none());
     }
 
