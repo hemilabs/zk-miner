@@ -557,13 +557,16 @@ mod client {
             )))
         }
 
-        /// On a host that routes IPv6 but not IPv4, with a NAT64 prefix in force: what a DNS64
-        /// resolver would answer for `a` when the name has no `AAAA` (RFC 6147).
-        fn synthesize(&self, aaaa: &[IpAddr], a: &[IpAddr]) -> Vec<IpAddr> {
+        /// On a host that routes IPv6 but not IPv4, with a NAT64 prefix in force for the uplink in
+        /// use ([`crate::nat64::in_force`]): what a DNS64 resolver would answer for `a` when the
+        /// name has no `AAAA` (RFC 6147).
+        pub(crate) fn synthesize(&self, aaaa: &[IpAddr], a: &[IpAddr]) -> Vec<IpAddr> {
             if !aaaa.is_empty() || a.is_empty() {
                 return Vec::new();
             }
-            let facts = self.policy.facts();
+            // The facts in force, never re-read here: this runs on a runtime worker (review
+            // round 4, parse-3); every address synthesized is admitted later on fresh facts.
+            let facts = self.policy.facts_in_force();
             if facts.routes().routes_family(false) || !facts.routes().routes_family(true) {
                 return Vec::new();
             }
@@ -810,6 +813,34 @@ mod tests {
             parse_response(&ok, "elfs.example.com", TYPE_A).unwrap(),
             Some(vec!["1.2.3.4".parse().unwrap()])
         );
+    }
+
+    /// Review round 4, parse-3: synthesizing addresses for an `A` answer reads the facts in
+    /// force and never re-reads them on the runtime worker it runs on (a re-read waits up to
+    /// `REFRESH_WAIT` for another, or runs the whole re-read, a configuration daemon's 2 s, a
+    /// NAT64 round, itself).
+    #[cfg(feature = "client")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn r4_synthesis_never_rereads_the_facts_on_a_worker() {
+        let opts = crate::FactsOptions {
+            discover_public_addresses: false,
+            public_addresses: vec!["198.51.99.7".parse().unwrap(), "2a02:db8:99::7".parse().unwrap()],
+            ..crate::FactsOptions::default()
+        };
+        let Ok(policy) = crate::NetPolicy::with_options(crate::NetMode::Public, Vec::new(), opts)
+        else {
+            crate::skipped("this host's facts cannot be read here".to_string());
+            return;
+        };
+        let before = policy.stage_slow_refresh(std::time::Duration::from_secs(3));
+        let lookup = DohLookup::new(&policy).unwrap();
+        // Stale: a facts() call would re-read them (3 s).
+        std::thread::sleep(crate::FACTS_TTL + std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
+        let _ = lookup.synthesize(&[], &["8.8.8.8".parse().unwrap()]);
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(300), "synthesis took {took:?}");
+        assert_eq!(policy.stage_slow_refresh(std::time::Duration::ZERO), before, "a re-read ran");
     }
 
     /// Review round 2, cross-3 (the Linux application): whether a server may be asked is judged
