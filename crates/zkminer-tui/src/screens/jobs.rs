@@ -61,13 +61,31 @@ pub fn render(f: &mut Frame, area: ratatui::layout::Rect, state: &MinerState) {
                 _ => Cell::from(status),
             };
 
+            // A held lock known only from the journal (after a restart) has no terms: "-", not 0.
+            let unknown = row == RowKind::Held && job.info.fulfillment_timeout == 0;
+            let amount = |a: u128| {
+                if unknown {
+                    "-".to_string()
+                } else {
+                    format_token_amount(a)
+                }
+            };
             Row::new(vec![
                 Cell::from(id_short).style(theme::identifier()),
-                Cell::from(program_short).style(theme::dim()),
-                Cell::from(format_token_amount(price)),
-                Cell::from(format_token_amount(job.info.max_price)),
-                Cell::from(format!("{}s", job.info.fulfillment_timeout)),
-                Cell::from(format_token_amount(job.info.bonus_amount)),
+                Cell::from(if unknown {
+                    "-".to_string()
+                } else {
+                    program_short
+                })
+                .style(theme::dim()),
+                Cell::from(amount(price)),
+                Cell::from(amount(job.info.max_price)),
+                Cell::from(if unknown {
+                    "-".to_string()
+                } else {
+                    format!("{}s", job.info.fulfillment_timeout)
+                }),
+                Cell::from(amount(job.info.bonus_amount)),
                 status_cell,
             ])
             .style(style)
@@ -145,7 +163,12 @@ pub(crate) fn row_kind(job: &TrackedJob, state: &MinerState) -> RowKind {
 
 /// A held lock's status: why nothing works on it, and its deadline.
 pub(crate) fn held_status_text(job: &TrackedJob, state: &MinerState, now: u64) -> String {
-    let why = state.kept_reason(job.info.job_id).unwrap_or("held");
+    // A task working on it now (a recovery release) says its stage; otherwise why it is held.
+    let note = state.job_note_text(job);
+    let why = note
+        .as_deref()
+        .or(state.kept_reason(job.info.job_id))
+        .unwrap_or("held");
     let deadline = match job.info.lock_deadline {
         0 => String::new(),
         d if d > now => format!(", deadline in {}", format_duration(d - now)),
@@ -325,9 +348,32 @@ mod tests {
         assert!(held_status_text(rows[1], &state, now)
             .starts_with("Held, not being proven: past its deadline"));
         assert!(finished_status_text(rows[3], &state, now).starts_with("Fulfilled "));
+        // A task working on a held lock (a recovery release) shows its stage there.
+        state.set_job_note(
+            B256::repeat_byte(2),
+            crate::state::JobNoteKind::Release,
+            "releasing the lock",
+        );
+        let rows = state.jobs_page_rows();
+        assert!(held_status_text(rows[1], &state, now)
+            .starts_with("Held, not being proven: releasing the lock"));
+        // Released from its held row, it goes to the history.
+        state.record_finished(
+            B256::repeat_byte(2),
+            MinerJobStatus::Released { penalty: 0 },
+        );
+        assert!(state.kept_locks.is_empty());
+        assert_eq!(
+            state.recent_finished(1).next().unwrap().info.job_id,
+            B256::repeat_byte(2)
+        );
         // A held lock taken up again is a claimed job, not a held one.
-        state.active_jobs.push(job(2, MinerJobStatus::Queued));
-        assert_eq!(state.kept_reason(B256::repeat_byte(2)), None);
+        state.kept_locks.push(job(4, MinerJobStatus::Queued));
+        state
+            .kept_reasons
+            .insert(B256::repeat_byte(4), "kept".into());
+        state.active_jobs.push(job(4, MinerJobStatus::Queued));
+        assert_eq!(state.kept_reason(B256::repeat_byte(4)), None);
     }
 
     /// While a job waits on something its status would not say (a claim or fulfil transaction the

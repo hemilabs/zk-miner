@@ -1465,14 +1465,18 @@ impl MinerState {
     /// `job_id` is done (fulfilled, or released): its row leaves the claimed list for the history,
     /// with `status` and the time.
     pub fn record_finished(&mut self, job_id: alloy_primitives::B256, status: MinerJobStatus) {
-        let Some(at) = self
+        // Its claimed row, or its held row (a lock recovery released, with no claimed row).
+        let mut row = if let Some(at) = self
             .active_jobs
             .iter()
             .position(|j| j.info.job_id == job_id)
-        else {
+        {
+            self.active_jobs.remove(at)
+        } else if let Some(at) = self.kept_locks.iter().position(|j| j.info.job_id == job_id) {
+            self.kept_locks.remove(at)
+        } else {
             return;
         };
-        let mut row = self.active_jobs.remove(at);
         row.status = status;
         row.gpu_bus_id = None;
         self.completed_jobs.retain(|j| j.info.job_id != job_id);
