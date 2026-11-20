@@ -11,19 +11,20 @@
 //!   ([`crate::nearhop`]), and connects only to the addresses that pass: each hop gets an HTTP
 //!   client pinned to exactly those addresses (reqwest resolves nothing itself, and an IP-literal
 //!   host is vetted the same way);
-//! - **checks each connection once made**, before any request byte is written on it
-//!   ([`NetPolicy::recheck_connected`], a connector layer: the connection's own peer and source
-//!   addresses must be the vetted ones, and the destination is admitted again with the kernel
-//!   asked afresh), and drops it otherwise: a route or VPN that changed between the check and the
-//!   connection is seen (the Linux application of review round 2, bypass-3, every platform). For
-//!   `https` the TLS handshake (its ClientHello names the host) runs inside reqwest's connector,
-//!   before this check; no HTTP request does;
+//! - **checks each connection once made**, before anything is written on it
+//!   ([`NetPolicy::recheck_connected`]: the connection's own peer and source addresses must be
+//!   the vetted ones, and the destination is admitted again with the kernel asked afresh), and
+//!   drops it otherwise: a route or VPN that changed between the check and the connection is seen
+//!   (the Linux application of review round 2, bypass-3, every platform). Each hop's TCP
+//!   connection is the guard's own (`hop`), made from the vetted source address and checked
+//!   before the TLS handshake, so not even a ClientHello reaches an unchecked path (review round
+//!   4, bypass-2: reqwest's connector did TCP and TLS before the check could run);
 //! - ignores proxies, from the environment or the system (a proxy resolves the name itself and
 //!   would reach whatever it can);
 //! - follows no redirect itself: [`GuardedClient::get_following_redirects`] follows them by hand,
 //!   each hop checked like the first, within a hop limit and one time budget for the whole chain;
-//! - uses rustls with compiled-in web roots, HTTP/1.1 only, and no connection reuse (a pooled
-//!   connection would outlive the decision that made it);
+//! - uses rustls with compiled-in web roots, HTTP/1.1 only (hyper's), one connection per hop
+//!   and no reuse (a pooled connection would outlive the decision that made it);
 //! - asks for and decodes no compression (`Accept-Encoding: identity`; a server that compresses
 //!   anyway hands back the compressed bytes, which the caller's size cap and hash check bound);
 //! - sends a constant `User-Agent: zkminer`, no version, and no `Referer`;
@@ -34,7 +35,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING, LOCATION};
+use reqwest::header::LOCATION;
 use reqwest::StatusCode;
 
 use crate::policy::{Denied, NetMode, NetPolicy, UrlDenied, Vetted};
@@ -62,11 +63,16 @@ impl Default for ClientOptions {
     }
 }
 
+#[path = "hop.rs"]
+mod hop;
+
 /// An HTTP client for requester-controlled URLs: see the module doc.
 #[derive(Clone)]
 pub struct GuardedClient {
     resolver: GuardedResolver,
     options: ClientOptions,
+    /// The TLS configuration of every hop (`hop::tls_config`), or why it could not be built.
+    tls: Result<Arc<rustls::ClientConfig>, String>,
 }
 
 impl fmt::Debug for GuardedClient {
@@ -117,27 +123,21 @@ fn build(
     resolver: GuardedResolver,
     options: ClientOptions,
 ) -> Result<GuardedClient, reqwest::Error> {
-    // Built once here so a configuration error shows now rather than at the first fetch.
-    hop_client(None, &[], options, None)?;
-    Ok(GuardedClient { resolver, options })
-}
-
-/// reqwest's resolver for a hop's client: the hop's name is pinned to its vetted addresses, so
-/// any name that reaches this is refused.
-struct NoNames;
-
-impl reqwest::dns::Resolve for NoNames {
-    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        Box::pin(async {
-            Err::<reqwest::dns::Addrs, _>("a guarded hop resolves no other name".into())
-        })
+    // Built once here; a configuration that cannot be built fails every hop, saying why.
+    let tls = hop::tls_config();
+    if let Err(e) = &tls {
+        tracing::error!("network guard: the guarded client's TLS configuration: {e}");
     }
+    Ok(GuardedClient {
+        resolver,
+        options,
+        tls,
+    })
 }
 
-/// The check of each connection once made ([`NetPolicy::recheck_connected`]), as a reqwest
-/// connector layer: its service connects as reqwest's does (TCP, and TLS for `https`), then reads
-/// the connection's own addresses (hyper-util's `HttpInfo`: `getsockname`, `getpeername`) and
-/// hands the connection on only if the check admits it, before anything is written on it.
+/// The check of each connection once made ([`NetPolicy::recheck_connected`]): the hop's own
+/// connector (`hop`) makes the TCP connection, reads its own addresses (`getsockname`,
+/// `getpeername`) and goes on (TLS, the request) only if this check admits it.
 #[derive(Clone)]
 struct RecheckLayer {
     policy: NetPolicy,
@@ -145,6 +145,14 @@ struct RecheckLayer {
 }
 
 impl RecheckLayer {
+    /// The source address the connection to `connect` was vetted with (the one to bind it to).
+    fn source_of(&self, connect: SocketAddr) -> Option<IpAddr> {
+        self.vetted
+            .iter()
+            .find(|v| v.connect == unmapped(connect))
+            .and_then(|v| v.source)
+    }
+
     /// The check for a connection whose own addresses are `local` and `peer` (on the blocking
     /// pool: it asks the kernel).
     async fn check(&self, local: SocketAddr, peer: SocketAddr) -> Result<(), Denied> {
@@ -186,105 +194,6 @@ fn unmapped(a: SocketAddr) -> SocketAddr {
             .map_or(a, |v4| SocketAddr::new(IpAddr::V4(v4), a.port())),
         IpAddr::V4(_) => a,
     }
-}
-
-impl<S> tower_layer::Layer<S> for RecheckLayer {
-    type Service = Recheck<S>;
-
-    fn layer(&self, inner: S) -> Recheck<S> {
-        Recheck {
-            inner,
-            check: self.clone(),
-        }
-    }
-}
-
-/// [`RecheckLayer`]'s service.
-#[derive(Clone)]
-struct Recheck<S> {
-    inner: S,
-    check: RecheckLayer,
-}
-
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-impl<S, Req> tower_service::Service<Req> for Recheck<S>
-where
-    S: tower_service::Service<Req>,
-    S::Response: hyper_util::client::legacy::connect::Connection + Send + 'static,
-    S::Error: Into<BoxError>,
-    S::Future: Send + 'static,
-{
-    type Response = S::Response;
-    type Error = BoxError;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>,
-    >;
-
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), BoxError>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, req: Req) -> Self::Future {
-        let connecting = self.inner.call(req);
-        let check = self.check.clone();
-        Box::pin(async move {
-            let conn = connecting.await.map_err(Into::into)?;
-            let mut extras = http::Extensions::new();
-            use hyper_util::client::legacy::connect::Connection;
-            conn.connected().get_extras(&mut extras);
-            let denied = |d: Denied| -> BoxError { Box::new(ResolveError::Denied(d)) };
-            let Some(info) = extras.get::<hyper_util::client::legacy::connect::HttpInfo>() else {
-                // No addresses to check: not connected as vetted, as far as anyone can tell.
-                return Err(denied(Denied::PathChanged {
-                    addr: SocketAddr::from(([0, 0, 0, 0], 0)),
-                    why: "the connection's own addresses could not be read".into(),
-                }));
-            };
-            let (local, peer) = (info.local_addr(), info.remote_addr());
-            check.check(local, peer).await.map_err(denied)?;
-            Ok(conn)
-        })
-    }
-}
-
-/// The client of one hop: `name` (when the hop's host is a name) pinned to `pinned`, every other
-/// name refused; each connection checked once made when `recheck` is given (every hop does, but
-/// the configuration check in [`build`]).
-fn hop_client(
-    name: Option<&str>,
-    pinned: &[SocketAddr],
-    options: ClientOptions,
-    recheck: Option<RecheckLayer>,
-) -> Result<reqwest::Client, reqwest::Error> {
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    let mut b = reqwest::Client::builder()
-        .dns_resolver(Arc::new(NoNames))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .use_rustls_tls()
-        .http1_only()
-        .no_gzip()
-        .no_brotli()
-        .no_deflate()
-        .no_zstd()
-        .default_headers(headers)
-        .user_agent(USER_AGENT)
-        .referer(false)
-        .pool_max_idle_per_host(0)
-        .connect_timeout(options.connect_timeout)
-        .read_timeout(options.read_timeout);
-    if let Some(name) = name {
-        b = b.resolve_to_addrs(name, pinned);
-    }
-    if let Some(layer) = recheck {
-        b = b.connector_layer(layer);
-    }
-    b.build()
 }
 
 impl GuardedClient {
@@ -394,20 +303,24 @@ impl GuardedClient {
             if remaining.is_zero() {
                 return Err(FetchError::TimedOut);
             }
-            let (name, pinned, recheck) = tokio::time::timeout(remaining, self.pin(&url))
+            let (_name, pinned, recheck) = tokio::time::timeout(remaining, self.pin(&url))
                 .await
                 .map_err(|_| FetchError::TimedOut)??;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(FetchError::TimedOut);
             }
-            let response = hop_client(name.as_deref(), &pinned, self.options, Some(recheck))
-                .map_err(|e| FetchError::Http(e.without_url()))?
-                .get(url.clone())
-                .timeout(remaining)
-                .send()
-                .await
-                .map_err(FetchError::from_reqwest)?;
+            let response = hop::send(
+                self.tls()?,
+                &self.options,
+                http::Method::GET,
+                &url,
+                &pinned,
+                &recheck,
+                None,
+                deadline,
+            )
+            .await?;
             if !matches!(
                 response.status(),
                 StatusCode::MOVED_PERMANENTLY
@@ -480,22 +393,31 @@ impl GuardedClient {
     pub async fn post_json(&self, raw: &str, body: Vec<u8>, budget: Duration) -> Result<reqwest::Response, FetchError> {
         let deadline = Instant::now() + budget.min(Duration::from_secs(7 * 24 * 3600));
         let url = self.check_url(raw).await?;
-        let (name, pinned, recheck) = tokio::time::timeout(budget, self.pin(&url))
+        let (_name, pinned, recheck) = tokio::time::timeout(budget, self.pin(&url))
             .await
             .map_err(|_| FetchError::TimedOut)??;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(FetchError::TimedOut);
         }
-        hop_client(name.as_deref(), &pinned, self.options, Some(recheck))
-            .map_err(|e| FetchError::Http(e.without_url()))?
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .timeout(remaining)
-            .send()
-            .await
-            .map_err(FetchError::from_reqwest)
+        hop::send(
+            self.tls()?,
+            &self.options,
+            http::Method::POST,
+            &url,
+            &pinned,
+            &recheck,
+            Some((body, "application/json")),
+            deadline,
+        )
+        .await
+    }
+
+    /// The hops' TLS configuration, or why there is none.
+    fn tls(&self) -> Result<&Arc<rustls::ClientConfig>, FetchError> {
+        self.tls
+            .as_ref()
+            .map_err(|e| FetchError::Connection(format!("the TLS configuration: {e}")))
     }
 }
 
@@ -519,8 +441,11 @@ pub enum FetchError {
     Denied(Denied),
     /// The name did not resolve (no such name, no resolver answered).
     Lookup(String),
-    /// The request failed (connection, TLS, protocol, timeout). Carries no URL.
+    /// The request failed (reading the body, a protocol error reqwest reports). Carries no URL.
     Http(reqwest::Error),
+    /// The connection, its TLS handshake or the HTTP/1.1 exchange failed (the guard's own
+    /// connector: `hop`): what failed. Carries no URL.
+    Connection(String),
     TooManyRedirects,
     BadRedirect(&'static str),
     /// The budget ran out between hops.
@@ -570,6 +495,7 @@ impl fmt::Display for FetchError {
                 }
                 Ok(())
             }
+            FetchError::Connection(why) => f.write_str(why),
             FetchError::TooManyRedirects => f.write_str("too many redirects"),
             FetchError::BadRedirect(why) => f.write_str(why),
             FetchError::TimedOut => f.write_str("timed out"),
@@ -1072,7 +998,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(e, FetchError::Http(_)), "{e:?}");
+        assert!(matches!(e, FetchError::Connection(_)), "{e:?}");
+        assert!(!e.is_denied());
         assert!(!e.to_string().contains("secret-path"), "{e}");
     }
 
@@ -1230,6 +1157,143 @@ mod tests {
         let dv = dev.vet_path(peer, peer).unwrap();
         assert_eq!(dv.source, None);
         drop(l);
+    }
+
+    /// Review round 4, bypass-2 (the reviewers' `r4_bypass_clienthello_precedes_the_recheck`,
+    /// inverted): for `https` the connection is checked before the TLS handshake, so a connection
+    /// the check refuses has nothing written on it, not even a ClientHello naming the host, and
+    /// the refusal is the guard's (a denial), not an HTTP error.
+    #[tokio::test]
+    async fn r4_nothing_is_written_on_a_connection_the_check_refuses() {
+        use std::io::Read;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let got = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+        let c = flipping_client(1);
+        let e = c
+            .get_following_redirects(&format!("https://elfs.example.com:{port}/x"), 0, BUDGET)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, FetchError::Denied(_)), "{e:?}");
+        let bytes = got.join().unwrap();
+        assert!(bytes.is_empty(), "{} bytes written: {:02x?}", bytes.len(), &bytes[..bytes.len().min(8)]);
+    }
+
+    /// cross-6 (`client.rs:154`): with two vetted addresses, the connection is checked against
+    /// the one its peer is (its own source), and a peer that is neither is refused.
+    #[tokio::test]
+    async fn r4_a_connection_is_checked_against_its_own_vetted_address() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = l.local_addr().unwrap();
+        let c = std::net::TcpStream::connect(peer).unwrap();
+        let local = c.local_addr().unwrap();
+        let policy = public_policy().with_near_probe(crate::nearhop::FixedProbe::far());
+        let other: SocketAddr = "127.0.0.2:443".parse().unwrap();
+        let layer = |sources: [&str; 2]| RecheckLayer {
+            policy: policy.clone(),
+            vetted: vec![
+                Vetted {
+                    addr: "93.184.216.35:443".parse().unwrap(),
+                    connect: other,
+                    source: Some(sources[0].parse().unwrap()),
+                },
+                Vetted {
+                    addr: "93.184.216.34:443".parse().unwrap(),
+                    connect: peer,
+                    source: Some(sources[1].parse().unwrap()),
+                },
+            ]
+            .into(),
+        };
+        // Checked against the second (its peer): its source is the connection's.
+        let ok = layer(["192.168.1.33", "127.0.0.1"]);
+        assert_eq!(ok.source_of(peer), Some("127.0.0.1".parse().unwrap()));
+        let r = ok.check(local, peer).await;
+        assert!(!matches!(r, Err(Denied::PathChanged { .. })), "{r:?}");
+        // Against the first's source it would have been refused.
+        let wrong = layer(["127.0.0.1", "192.168.1.33"]);
+        assert!(matches!(wrong.check(local, peer).await, Err(Denied::PathChanged { .. })));
+        // A peer that was not vetted.
+        let stranger: SocketAddr = "127.0.0.3:443".parse().unwrap();
+        let e = ok.check(local, stranger).await.unwrap_err();
+        assert!(matches!(&e, Denied::PathChanged { why, .. } if why.contains("not vetted")), "{e:?}");
+        assert_eq!(ok.source_of(stranger), None);
+    }
+
+    /// Review round 4, cross-3: the vetted source is the kernel's answer for a TCP connection
+    /// when the route oracle gives one (Linux's `RTA_PREFSRC`; a UDP socket's choice differs
+    /// under `ip rule ipproto udp`), and once connected the route is asked from the connection's
+    /// own source.
+    #[test]
+    fn r4_the_vetted_source_is_the_tcp_routes_and_the_recheck_asks_from_it() {
+        use crate::facts::{FactsOptions, RawFacts};
+        use crate::routes::{KernelAnswer, Route, RouteOracle};
+        #[derive(Debug, Default)]
+        struct Tcp {
+            from: Mutex<Vec<Option<IpAddr>>>,
+        }
+        impl RouteOracle for Tcp {
+            fn route_to(&self, _: IpAddr, _: Option<u16>) -> std::io::Result<KernelAnswer> {
+                self.from.lock().unwrap().push(None);
+                Ok(KernelAnswer::Entry(vec![Route::via(
+                    "0.0.0.0/0".parse().unwrap(),
+                    "192.168.1.1".parse().unwrap(),
+                    2,
+                )]))
+            }
+            fn source_for(&self, _: IpAddr, _: Option<u16>) -> std::io::Result<Option<IpAddr>> {
+                Ok(Some("192.168.1.33".parse().unwrap()))
+            }
+            fn route_from(
+                &self,
+                src: IpAddr,
+                dst: IpAddr,
+                dport: Option<u16>,
+            ) -> std::io::Result<KernelAnswer> {
+                let r = self.route_to(dst, dport);
+                *self.from.lock().unwrap().last_mut().unwrap() = Some(src);
+                r
+            }
+        }
+        let oracle = Arc::new(Tcp::default());
+        let facts = HostFacts::assemble(
+            RawFacts {
+                interface_prefixes: vec!["192.168.1.0/24".parse().unwrap()],
+                interface_addresses: vec!["192.168.1.33".parse().unwrap()],
+                routes: vec![Route::via(
+                    "0.0.0.0/0".parse().unwrap(),
+                    "192.168.1.1".parse().unwrap(),
+                    2,
+                )],
+                ..RawFacts::default()
+            },
+            &FactsOptions {
+                discover_public_addresses: false,
+                public_addresses: vec!["198.51.99.7".parse().unwrap()],
+                ..FactsOptions::default()
+            },
+        )
+        .with_route_oracle(oracle.clone());
+        let policy = NetPolicy::with_facts(NetMode::Public, facts, Vec::new())
+            .with_near_probe(crate::nearhop::FixedProbe::far());
+        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let v = policy.vet_path(addr, addr).unwrap();
+        assert_eq!(v.source, Some("192.168.1.33".parse().unwrap()), "the TCP route's source");
+        let local: SocketAddr = "192.168.1.33:50000".parse().unwrap();
+        oracle.from.lock().unwrap().clear();
+        assert_eq!(policy.recheck_connected(&v, local, addr), Ok(()));
+        assert_eq!(
+            *oracle.from.lock().unwrap(),
+            vec![Some("192.168.1.33".parse().unwrap())],
+            "asked from the connection's own source"
+        );
     }
 
     /// `vet_path` reads the source the kernel chooses for the connection, right after the

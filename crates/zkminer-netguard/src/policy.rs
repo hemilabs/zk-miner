@@ -432,7 +432,7 @@ pub fn admit(
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
-    admit_inner(mode, ip, None, facts, extra_deny)
+    admit_inner(mode, ip, None, None, facts, extra_deny)
 }
 
 /// [`admit`] for a connection to `addr`, its port included: the kernel is asked how it routes a
@@ -443,13 +443,26 @@ pub fn admit_to(
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
-    admit_inner(mode, addr.ip(), Some(addr.port()), facts, extra_deny)
+    admit_inner(mode, addr.ip(), Some(addr.port()), None, facts, extra_deny)
+}
+
+/// [`admit_to`] for a connection that leaves from `src` (the kernel is asked how it routes a
+/// connection from that source: review round 4).
+fn admit_from(
+    mode: NetMode,
+    addr: SocketAddr,
+    src: IpAddr,
+    facts: &HostFacts,
+    extra_deny: &[Prefix],
+) -> Result<(), Denied> {
+    admit_inner(mode, addr.ip(), Some(addr.port()), Some(src), facts, extra_deny)
 }
 
 fn admit_inner(
     mode: NetMode,
     ip: IpAddr,
     dport: Option<u16>,
+    src: Option<IpAddr>,
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
@@ -501,7 +514,7 @@ fn admit_inner(
     }
     // Review r2 R2-NG-3: the kernel applies the policy rules exactly; the tables above are the
     // prefix model, which a destination rule into a default-only table slipped past.
-    facts.kernel_verdict(ip, dport)?;
+    facts.kernel_verdict_from(ip, dport, src)?;
     facts
         .path_known(ip)
         .map_err(|path| {
@@ -1127,7 +1140,12 @@ impl NetPolicy {
                 source: None,
             });
         }
-        let source = source_for(connect).map_err(|e| Denied::RouteQueryFailed {
+        // The kernel's own choice for a TCP connection where it can say (Linux's TCP route
+        // query: review round 4, cross-3), else a connected UDP socket's.
+        let kernel = self
+            .facts()
+            .kernel_source(unmapped_ip(connect.ip()), Some(connect.port()));
+        let source = kernel.map_or_else(|| source_for(connect), Ok).map_err(|e| Denied::RouteQueryFailed {
             ip: addr.ip(),
             why: format!(
                 "a socket to it could not be connected (nothing sent): {}",
@@ -1164,8 +1182,12 @@ impl NetPolicy {
             addr: vetted.addr,
             why,
         })?;
-        let judge =
-            |f: &HostFacts| admit_to(self.mode, vetted.addr, &f.without_verdicts(), &self.deny);
+        // The kernel asked how it routes a connection from the connection's own source (a rule
+        // that selects by source sees it: review round 4).
+        let src = unmapped_ip(local.ip());
+        let judge = |f: &HostFacts| {
+            admit_from(self.mode, vetted.addr, src, &f.without_verdicts(), &self.deny)
+        };
         match judge(&self.facts()) {
             Err(d) if d.depends_on_facts() && self.facts.refresh => {
                 judge(&self.facts.get_fresher_than(FORCED_REFRESH_MIN_AGE))

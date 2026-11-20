@@ -294,7 +294,7 @@ pub struct HostFacts {
     nat64_unsettled: bool,
 }
 
-/// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict`]).
+/// Why the kernel's answer refused a destination ([`HostFacts::kernel_verdict_from`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum KernelRefusal {
     Route(RouteRefusal),
@@ -302,7 +302,7 @@ enum KernelRefusal {
 }
 
 /// The route oracle's verdicts, per destination and destination port.
-type Verdicts = HashMap<(IpAddr, Option<u16>), Result<(), KernelRefusal>>;
+type Verdicts = HashMap<(IpAddr, Option<u16>, Option<IpAddr>), Result<(), KernelRefusal>>;
 
 /// Most per-destination verdicts one facts snapshot keeps (it lives about a second).
 const MAX_VERDICTS: usize = 4096;
@@ -1021,12 +1021,32 @@ impl HostFacts {
         self.oracle.as_ref()
     }
 
-    /// The route oracle's verdict on a connection to `ip` (on destination port `dport` when
-    /// given; admitted when there is no oracle): asked once per destination and port for as long
-    /// as these facts are in force (a snapshot lives about a second, [`crate::FACTS_TTL`]). An
-    /// IPv4-mapped address is asked as its IPv4 address, which is how a dual-stack socket
-    /// connects to it.
+    /// [`Self::kernel_verdict_from`] with no source (the macOS tests).
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn kernel_verdict(&self, ip: IpAddr, dport: Option<u16>) -> Result<(), Denied> {
+        self.kernel_verdict_from(ip, dport, None)
+    }
+
+    /// The source address the kernel would choose for a TCP connection to `dst` (on `dport`),
+    /// when the route oracle can say ([`RouteOracle::source_for`]).
+    pub(crate) fn kernel_source(&self, dst: IpAddr, dport: Option<u16>) -> Option<IpAddr> {
+        self.oracle
+            .as_ref()
+            .and_then(|o| o.source_for(dst, dport).ok().flatten())
+    }
+
+    /// The route oracle's verdict on a connection to `ip` (on destination port `dport` when
+    /// given; from source `src` when given, a socket bound to it, asked with
+    /// [`RouteOracle::route_from`]; admitted when there is no oracle): asked once per destination,
+    /// port and source for as long as these facts are in force (a snapshot lives about a second,
+    /// [`crate::FACTS_TTL`]). An IPv4-mapped address is asked as its IPv4 address, which is how
+    /// a dual-stack socket connects to it.
+    pub(crate) fn kernel_verdict_from(
+        &self,
+        ip: IpAddr,
+        dport: Option<u16>,
+        src: Option<IpAddr>,
+    ) -> Result<(), Denied> {
         let Some(oracle) = &self.oracle else {
             return Ok(());
         };
@@ -1038,12 +1058,16 @@ impl HostFacts {
             .verdicts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(dst, dport))
+            .get(&(dst, dport, src))
             .cloned();
         let verdict = match cached {
             Some(v) => v,
             None => {
-                let v = match oracle.route_to(dst, dport) {
+                let answer = match src {
+                    Some(src) => oracle.route_from(src, dst, dport),
+                    None => oracle.route_to(dst, dport),
+                };
+                let v = match answer {
                     Ok(answer) => self
                         .routes
                         .judge_answer(&answer)
@@ -1055,7 +1079,7 @@ impl HostFacts {
                 if cache.len() >= MAX_VERDICTS {
                     cache.clear();
                 }
-                cache.insert((dst, dport), v.clone());
+                cache.insert((dst, dport, src), v.clone());
                 v
             }
         };

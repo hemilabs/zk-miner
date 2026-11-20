@@ -628,6 +628,26 @@ pub trait RouteOracle: Send + Sync + std::fmt::Debug {
     /// How the kernel would route a TCP connection from this process to `dst` (and, when given,
     /// destination port `dport`).
     fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer>;
+
+    /// The source address the kernel would choose for a TCP connection from this process to
+    /// `dst` (on `dport`), when it can say (review round 4, cross-3: Linux's `RTA_PREFSRC` of the
+    /// TCP route query; a UDP socket's choice can differ under a rule that selects by protocol).
+    /// `None`: ask a connected UDP socket instead.
+    fn source_for(&self, _dst: IpAddr, _dport: Option<u16>) -> std::io::Result<Option<IpAddr>> {
+        Ok(None)
+    }
+
+    /// How the kernel routes a TCP connection from this process to `dst` (on `dport`) that
+    /// leaves from `src` (a socket bound to it, as the guarded client's are): a rule that selects
+    /// by source is matched against it (review round 4). By default, [`Self::route_to`].
+    fn route_from(
+        &self,
+        _src: IpAddr,
+        dst: IpAddr,
+        dport: Option<u16>,
+    ) -> std::io::Result<KernelAnswer> {
+        self.route_to(dst, dport)
+    }
 }
 
 /// The kernel, asked over netlink per destination (Linux; on macOS over the routing socket, see
@@ -657,6 +677,21 @@ pub struct KernelRoutes;
 impl RouteOracle for KernelRoutes {
     fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer> {
         sys::query(dst, dport)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn source_for(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<Option<IpAddr>> {
+        sys::source(dst, dport)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn route_from(
+        &self,
+        src: IpAddr,
+        dst: IpAddr,
+        dport: Option<u16>,
+    ) -> std::io::Result<KernelAnswer> {
+        sys::query_from(src, dst, dport)
     }
 }
 
@@ -1530,6 +1565,22 @@ mod sys {
             });
         }
         Ok(KernelAnswer::Entry(entry))
+    }
+
+    /// The source address the kernel chooses for a TCP connection from this process to `dst`
+    /// (on `dport`): the `RTA_PREFSRC` of the connect's first lookup (review round 4, cross-3).
+    pub(super) fn source(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<IpAddr>> {
+        Ok(ask(dst, None, dport, false)?.and_then(|(_, m)| m.prefsrc))
+    }
+
+    /// How the kernel routes a TCP connection to `dst` (on `dport`) from a socket bound to
+    /// `src`: one lookup with that source, as such a socket's connect makes it (review round 4).
+    pub(super) fn query_from(
+        src: IpAddr,
+        dst: IpAddr,
+        dport: Option<u16>,
+    ) -> io::Result<KernelAnswer> {
+        Ok(ask(dst, Some(src), dport, true)?.map(|(e, _)| e).into())
     }
 
     /// The interface the kernel would send a connection to `dst` out of (`RTA_OIF` of a plain
