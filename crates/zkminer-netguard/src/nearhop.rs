@@ -1333,10 +1333,15 @@ mod tests {
         });
         let t = std::time::Instant::now();
         let v = decide(&TtlProbe, addr, 2);
-        assert_eq!(
-            v,
-            Verdict::Near("answered once connected (it had not answered the probe)"),
-            "after {:?}",
+        // Near either way: the check connection's answer, or (review round 5: the probes are
+        // paced, and other tests' probes can delay its attempts past the drain) the probe's own.
+        assert!(
+            matches!(
+                v,
+                Verdict::Near("answered once connected (it had not answered the probe)")
+                    | Verdict::Near("accepted a connection")
+            ),
+            "{v:?} after {:?}",
             t.elapsed()
         );
         drop(drain);
