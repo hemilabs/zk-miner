@@ -690,7 +690,7 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant
     // The peer closed or reset the connection before the FIN was sent: what follows could not
     // tell whether the FIN reached it (review round 2, probe-1).
     if ic.state != TcpState::Established {
-        return ConfirmOutcome::Failed(peer_closed_first(ic.state));
+        return ConfirmOutcome::Failed(peer_closed_first(ic.state, Conn::Check));
     }
     let mut decision = match Check::new(ic.rtt, ic.rto) {
         Ok(d) => d,
@@ -721,10 +721,7 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant
         Ok(i) if i.state == TcpState::Established => {}
         Ok(i) => {
             return near_already(&mut decision).unwrap_or_else(|| {
-                ConfirmOutcome::Failed(format!(
-                    "{} (control connection)",
-                    peer_closed_first(i.state)
-                ))
+                ConfirmOutcome::Failed(peer_closed_first(i.state, Conn::Control))
             })
         }
         Err(e) => return ConfirmOutcome::Failed(e.to_string()),
@@ -818,21 +815,18 @@ impl Check {
             Err(e) => return Some(ConfirmOutcome::Failed(e.to_string())),
         };
         // Any acknowledgement of the hop-limited FIN, whenever it comes: near.
-        if let Some(done) = fin_step(check) {
+        if let Some(done) = fin_step(check, Conn::Check) {
             return Some(done);
         }
         if self.control_acked.is_none() {
-            match control.map(fin_step) {
-                Err(e) => return Some(ConfirmOutcome::Failed(e.to_string())),
-                Ok(Some(ConfirmOutcome::Answered)) => self.control_acked = Some(now),
-                Ok(Some(other)) => {
-                    return Some(match other {
-                        ConfirmOutcome::Failed(why) => {
-                            ConfirmOutcome::Failed(format!("{why} (control connection)"))
-                        }
-                        o => o,
-                    })
+            match control.map(|c| fin_step(c, Conn::Control)) {
+                Err(e) => {
+                    return Some(ConfirmOutcome::Failed(format!(
+                        "the control connection's state could not be read: {e}"
+                    )))
                 }
+                Ok(Some(ConfirmOutcome::Answered)) => self.control_acked = Some(now),
+                Ok(Some(other)) => return Some(other),
                 Ok(None) => {}
             }
         }
@@ -850,10 +844,13 @@ impl Check {
                     TcpState::FinWait1 => ConfirmOutcome::Unanswered,
                     // The peer's FIN crossed the check's, which is still unacknowledged: it
                     // closed on its own.
-                    other => ConfirmOutcome::Failed(peer_closed_first(match other {
-                        TcpState::Closing => TcpState::LastAck,
-                        o => o,
-                    })),
+                    other => ConfirmOutcome::Failed(peer_closed_first(
+                        match other {
+                            TcpState::Closing => TcpState::LastAck,
+                            o => o,
+                        },
+                        Conn::Check,
+                    )),
                 })
             }
             None => (now >= self.control_sent + self.control_wait)
@@ -1016,12 +1013,23 @@ pub(crate) struct ConnInfo {
 /// on its own (`LAST_ACK`, `CLOSE_WAIT`, `CLOSED`: no acknowledgement of the FIN) is a failure,
 /// refused but not read as near, and never as far.
 #[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn fin_step(state: TcpState) -> Option<ConfirmOutcome> {
+fn fin_step(state: TcpState, which: Conn) -> Option<ConfirmOutcome> {
     match state {
         TcpState::FinWait2 | TcpState::TimeWait => Some(ConfirmOutcome::Answered),
         TcpState::FinWait1 | TcpState::Closing => None,
-        other => Some(ConfirmOutcome::Failed(peer_closed_first(other))),
+        other => Some(ConfirmOutcome::Failed(peer_closed_first(other, which))),
     }
+}
+
+/// Which of the check's two connections a state was read of (its failure names it: review round
+/// 5, probe-2).
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Conn {
+    /// The hop-limited one.
+    Check,
+    /// The one at the default hop limit.
+    Control,
 }
 
 /// Why a check whose control FIN, at the default hop limit, was never acknowledged fails
@@ -1034,16 +1042,18 @@ const UNACKED_FIN: &str = "the peer acknowledged the check's FIN neither within 
 /// Why the check fails when the peer closed (`CLOSE_WAIT`, then `LAST_ACK` once this side sends
 /// its FIN) or reset (`CLOSED`) the connection before its FIN was acknowledged.
 #[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn peer_closed_first(state: TcpState) -> String {
+fn peer_closed_first(state: TcpState, which: Conn) -> String {
+    let (conn, fin) = match which {
+        Conn::Check => ("check", "hop-limited FIN"),
+        Conn::Control => ("control", "FIN"),
+    };
     let how = match state {
         TcpState::CloseWait | TcpState::LastAck => "closed",
         TcpState::Closed => "reset",
-        other => return format!("the check connection is in TCP state {other:?}"),
+        other => return format!("the {conn} connection is in TCP state {other:?}"),
     };
-    format!(
-        "the peer {how} the check connection before its hop-limited FIN was acknowledged, so \
-         the check cannot tell how near it is"
-    )
+    // Within the 120 characters a refusal shows ([`ConfirmOutcome::verdict`]).
+    format!("the peer {how} the {conn} connection before its {fin} was acknowledged: the check cannot tell how near it is")
 }
 
 /// Linux: the bytes of a `struct tcp_info` (<linux/tcp.h>) the check connection reads, at the
@@ -1533,10 +1543,10 @@ mod tests {
     #[test]
     fn the_check_reads_only_an_acknowledged_fin_as_an_answer() {
         use TcpState::*;
-        assert_eq!(fin_step(FinWait2), Some(ConfirmOutcome::Answered));
-        assert_eq!(fin_step(TimeWait), Some(ConfirmOutcome::Answered));
-        assert_eq!(fin_step(FinWait1), None);
-        assert_eq!(fin_step(Closing), None);
+        assert_eq!(fin_step(FinWait2, Conn::Check), Some(ConfirmOutcome::Answered));
+        assert_eq!(fin_step(TimeWait, Conn::Check), Some(ConfirmOutcome::Answered));
+        assert_eq!(fin_step(FinWait1, Conn::Check), None);
+        assert_eq!(fin_step(Closing, Conn::Check), None);
         for (state, how) in [
             (LastAck, "closed"),
             (CloseWait, "closed"),
@@ -1544,14 +1554,28 @@ mod tests {
             (Established, "TCP state Established"),
             (Other(10), "TCP state Other(10)"),
         ] {
-            let o = fin_step(state);
+            let o = fin_step(state, Conn::Check);
             assert!(
                 matches!(&o, Some(ConfirmOutcome::Failed(w)) if w.contains(how)),
                 "{state:?}: {o:?}"
             );
             assert!(matches!(o.unwrap().verdict(), Verdict::Failed(_)));
         }
-        assert!(matches!(peer_closed_first(CloseWait), w if w.contains("closed")));
+        assert!(matches!(peer_closed_first(CloseWait, Conn::Check), w if w.contains("closed")));
+        // Review round 5, probe-2: a failure names the connection it was read of, within the
+        // 120 characters a refusal shows.
+        for which in [Conn::Check, Conn::Control] {
+            for state in [LastAck, Closed] {
+                let why = peer_closed_first(state, which);
+                let name = if which == Conn::Check { "check connection" } else { "control connection" };
+                assert!(why.contains(name), "{why}");
+                assert!(why.chars().count() <= 120, "{} chars: {why}", why.chars().count());
+                let Verdict::Failed(shown) = ConfirmOutcome::Failed(why.clone()).verdict() else {
+                    panic!()
+                };
+                assert!(shown.contains(name) && shown.ends_with("how near it is"), "{shown}");
+            }
+        }
         // Linux's <net/tcp_states.h> and macOS's <netinet/tcp_fsm.h>.
         for (linux, macos, state) in [
             (1, 4, Established),
@@ -1577,7 +1601,7 @@ mod tests {
         // as Linux numbers it, is a failure, not an answer.
         for linux in [7, 8, 9] {
             assert!(
-                matches!(fin_step(TcpState::from_linux(linux)), Some(ConfirmOutcome::Failed(_))),
+                matches!(fin_step(TcpState::from_linux(linux), Conn::Check), Some(ConfirmOutcome::Failed(_))),
                 "{linux}"
             );
         }
