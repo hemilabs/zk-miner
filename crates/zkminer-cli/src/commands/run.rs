@@ -12473,10 +12473,17 @@ async fn process_job_lifecycle(
                         // attempt means `MAX_PROVE_ATTEMPTS` no longer bounds anything by itself:
                         // an alternating health-fail / shortage sequence refunds each increment the
                         // health-fail spends, so without this cap the only bound was the deadline.
+                        // A proof that died in a host shortage while staying within what was
+                        // reserved for it (`ShortageFromOutside`) was not too big for the box: it
+                        // waits like a refusal, inside the same clock bound, and is not held
+                        // against the job.
+                        let outside = e
+                            .downcast_ref::<zkminer_prover_protocol::types::ShortageFromOutside>()
+                            .is_some();
                         let waited = memory_wait_since
                             .get_or_insert_with(std::time::Instant::now)
                             .elapsed();
-                        if !shortage.attempted && waited < HOST_MEMORY_WAIT_LIMIT {
+                        if (!shortage.attempted || outside) && waited < HOST_MEMORY_WAIT_LIMIT {
                             memory_waits += 1;
                             attempt = attempt.saturating_sub(1);
                             tracing::warn!(
@@ -12528,7 +12535,7 @@ async fn process_job_lifecycle(
                         // A proof OOM-killed mid-run is a failure after a clean measurement like any
                         // other (a guest can balloon host memory on purpose). Only an admission refusal
                         // — nothing ran — is exempt.
-                        if rode_measurement && shortage.attempted {
+                        if rode_measurement && shortage.attempted && !outside {
                             note_post_claim_divergence(program_id, backend, submitter, "proof OOM-killed mid-run");
                         }
                         return Err(anyhow::anyhow!(
@@ -16410,6 +16417,33 @@ mod tests {
         );
         // The old text predicate WOULD have been fooled, which is why this matters.
         assert!(zkminer_prover_protocol::types::is_gpu_oom(&f.message));
+    }
+
+    /// A shortage the proof did not cause (`ShortageFromOutside`) is read through its marker: the
+    /// retry loop still sees the shortage, waits instead of spending the attempt, and does not hold
+    /// it against the submitter. Without the marker, a proof that died mid-run still costs one.
+    #[test]
+    fn a_shortage_from_outside_waits_and_blames_no_one() {
+        use zkminer_prover_protocol::types::{HostMemoryShortage, ShortageFromOutside};
+        let shortage = || HostMemoryShortage {
+            attempted: true,
+            slot_key: "risc0:cuda:0".to_string(),
+            needed: 8 << 30,
+            reserved: 13 << 30,
+            available: 54 << 30,
+        };
+        let outside = anyhow::Error::new(shortage()).context(ShortageFromOutside);
+        assert!(outside
+            .downcast_ref::<HostMemoryShortage>()
+            .is_some_and(|s| s.attempted));
+        assert!(outside.downcast_ref::<ShortageFromOutside>().is_some());
+        let own = anyhow::Error::new(shortage());
+        assert!(own.downcast_ref::<ShortageFromOutside>().is_none());
+        // The loop: an outside shortage waits as a refusal does, and is not a divergence.
+        let src = include_str!("run.rs");
+        assert!(src
+            .contains("if (!shortage.attempted || outside) && waited < HOST_MEMORY_WAIT_LIMIT {"));
+        assert!(src.contains("if rode_measurement && shortage.attempted && !outside {"));
     }
 
     /// The same property for the host-memory class, where a forgery buys the opposite prize:
