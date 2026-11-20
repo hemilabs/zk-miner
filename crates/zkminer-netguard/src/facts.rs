@@ -632,6 +632,21 @@ impl HostFacts {
             .len()
     }
 
+    /// Why these facts refuse every requester connection, if they do: on macOS, their re-read
+    /// kept failing past its grace (`Denied::FactsUnreadable`, naming the failure; review round 3,
+    /// cross-6: for the operator's warnings). Always `None` on other platforms, which keep the last
+    /// good facts.
+    pub fn unreadable_reason(&self) -> Option<&str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.unreadable.as_deref()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
     /// macOS: why these facts may not be judged with, if so (see [`Self::refusing`]).
     #[cfg(target_os = "macos")]
     pub(crate) fn unreadable(&self) -> Option<&str> {

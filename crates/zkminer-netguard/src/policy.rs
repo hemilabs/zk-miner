@@ -1828,11 +1828,17 @@ mod tests {
             admit(NetMode::Public, public, &p.facts(), &[]),
             Err(Denied::FactsUnreadable { .. })
         ));
+        // And the operator's warnings can say why (review round 3, cross-6).
+        assert!(p
+            .facts()
+            .unreadable_reason()
+            .is_some_and(|w| w.contains("corp.example")));
         // The condition clears: the next call reads the facts again and admits.
         *p.facts.seam.fail.lock().unwrap() = None;
         std::thread::sleep(FORCED_REFRESH_MIN_AGE);
         assert_eq!(p.admit(public), Ok(()));
         assert!(p.facts().unreadable().is_none());
+        assert!(p.facts().unreadable_reason().is_none());
         assert!(p.facts().gathered_at() > start);
     }
 
