@@ -629,6 +629,28 @@ impl WorkerEntry {
     }
 }
 
+/// A watchdog's clock: its deadline is the last `touch` plus its timeout. A benchmark touches it as each
+/// step completes (the warm-up, each program, each scoring proof), so `benchmark_timeout` bounds a step
+/// rather than the whole run, which a slow card cannot finish in it (an Arc A770's risc0 suite and
+/// score take over 30 minutes, no step more than about 10), while a wedged step is still caught as
+/// soon.
+#[derive(Clone)]
+struct WatchdogClock(Arc<Mutex<Instant>>);
+
+impl WatchdogClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// RAII guard that kills a worker process after a deadline.
 /// Drop cancels the watchdog thread.
 struct ProvingWatchdog {
@@ -643,11 +665,30 @@ impl ProvingWatchdog {
     /// handler knows not to count it as a consecutive failure.
     fn new(
         pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_clock(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            WatchdogClock::new(),
+        )
+    }
+
+    /// [`new`](Self::new) with a deadline of `clock`'s last touch plus `timeout`, re-read every second.
+    fn with_clock(
+        pid_ref: Arc<AtomicU32>,
         // Only the identity-checked group kill reads it, and that is Unix-only.
         #[cfg_attr(not(unix), allow(unused_variables))] starttime_ref: Arc<AtomicU64>,
         timeout: Duration,
         slot_key: String,
         intentional_kill: Arc<AtomicBool>,
+        clock: WatchdogClock,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -661,8 +702,7 @@ impl ProvingWatchdog {
             std::thread::Builder::new()
                 .name(format!("prove-watchdog-{slot_key}"))
                 .spawn(move || {
-                    let deadline = Instant::now() + timeout;
-                    while Instant::now() < deadline {
+                    while Instant::now() < clock.last() + timeout {
                         std::thread::sleep(Duration::from_secs(1));
                         if cancel_clone.load(Ordering::Relaxed) {
                             return;
@@ -3754,6 +3794,9 @@ impl WorkerPool {
         key: &str,
         on_done: &dyn Fn(&BenchmarkEntry, u32, u32),
         on_warmed: &dyn Fn(),
+        // Called as each step completes (the warm-up, each program, each scoring proof): the
+        // benchmark's watchdog clock (see `WatchdogClock`).
+        progress: &dyn Fn(),
     ) -> BenchmarkRequests {
         use zkminer_prover_protocol::{
             benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BACKEND_SP1,
@@ -3762,7 +3805,9 @@ impl WorkerPool {
         let backend = handle.backend.clone();
         // The worker's one-off first-proof costs land here, not on the first program's row. A
         // warm-up that fails costs only that; the suite still runs.
-        match Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {}) {
+        let warmup = Self::benchmark_request(handle, vec![warmup_spec(&backend)], &|_, _, _| {});
+        progress();
+        match warmup {
             Err(e) => {
                 return BenchmarkRequests {
                     results: Err(e),
@@ -3776,6 +3821,7 @@ impl WorkerPool {
         let programs = benchmark_suite(&backend);
         let total = programs.len() as u32 + 1;
         let mut results = match Self::benchmark_request(handle, programs, &|row, index, _| {
+            progress();
             on_done(row, index, total)
         }) {
             Err(e) => {
@@ -3804,7 +3850,9 @@ impl WorkerPool {
         let mut lost: Option<anyhow::Error> = None;
         let scored = measure_zkop_mix(|iterations| {
             let rows = vec![zkop_mix_spec(iterations)];
-            match Self::benchmark_request(handle, rows, &|_, _, _| {}) {
+            let answer = Self::benchmark_request(handle, rows, &|_, _, _| {});
+            progress();
+            match answer {
                 Ok(Ok(mut rows)) => rows.pop().filter(|r| r.program_name == BENCH_ZKOP_MIX),
                 Ok(Err(message)) => {
                     tracing::error!("{key}: {BENCH_ZKOP_MIX}: {message}");
@@ -3954,18 +4002,21 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        // Start benchmark timeout watchdog if configured.
+        // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
+        let clock = WatchdogClock::new();
         let _watchdog = self.benchmark_timeout.map(|t| {
-            ProvingWatchdog::new(
+            ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
                 t,
                 key.to_string(),
                 entry.intentional_kill.clone(),
+                clock.clone(),
             )
         });
 
-        let requests = Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {});
+        let requests =
+            Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {}, &|| clock.touch());
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -4331,14 +4382,16 @@ impl WorkerPool {
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Worker not available for {key}"))?;
 
-        // Start benchmark timeout watchdog if configured.
+        // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
+        let clock = WatchdogClock::new();
         let _watchdog = self.benchmark_timeout.map(|t| {
-            ProvingWatchdog::new(
+            ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
                 t,
                 key.to_string(),
                 entry.intentional_kill.clone(),
+                clock.clone(),
             )
         });
 
@@ -4360,7 +4413,7 @@ impl WorkerPool {
         };
         let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
-        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed);
+        let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed, &|| clock.touch());
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -11183,6 +11236,33 @@ mod tests {
         drop(watchdog);
         // intentional_kill SHOULD be set (kill was attempted, PID unchanged)
         assert!(ik.load(Ordering::Acquire));
+    }
+
+    /// A watchdog on a clock fires its timeout after the clock's last touch, not after it started:
+    /// touched for 4 s with a 1.5 s timeout it holds, and fires once the touches stop.
+    #[test]
+    fn a_watchdog_on_a_clock_fires_its_timeout_after_the_last_touch() {
+        let ik = Arc::new(AtomicBool::new(false));
+        let clock = WatchdogClock::new();
+        let watchdog = ProvingWatchdog::with_clock(
+            Arc::new(AtomicU32::new(99999)),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(1500),
+            "test:generic".to_string(),
+            ik.clone(),
+            clock.clone(),
+        );
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(500));
+            clock.touch();
+        }
+        assert!(!ik.load(Ordering::Acquire), "fired while touched");
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(
+            ik.load(Ordering::Acquire),
+            "did not fire after the touches stopped"
+        );
+        drop(watchdog);
     }
 
     // ---- backoff-aware dispatch (job-loss on a dead slot inside its backoff window) ----

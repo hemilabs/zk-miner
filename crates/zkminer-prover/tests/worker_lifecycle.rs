@@ -127,6 +127,34 @@ fn benchmark_timeout_then_ensure_alive_respawns() {
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
+/// `benchmark_timeout` bounds each step of a benchmark, not the whole run: a worker whose warm-up and
+/// suite each take 2 s (4 s in all) outlives a 3 s timeout, as an Arc A770's risc0 benchmark (over
+/// 30 minutes, no step past about 10) outlives the default 1800 s.
+#[test]
+fn a_benchmark_longer_than_its_timeout_survives_when_each_step_fits() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(3)));
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BENCHMARK_SECS".to_string(), "2".to_string());
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), env)
+        .expect("failed to spawn mock worker");
+    let pid = pool.test_pid("mock:generic").unwrap();
+
+    let started = std::time::Instant::now();
+    assert!(pool.benchmark("mock").is_ok());
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "the benchmark should have taken both steps: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        pool.test_has_handle("mock:generic"),
+        Some(true),
+        "the worker was killed"
+    );
+    assert_eq!(pool.test_pid("mock:generic"), Some(pid));
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
 // ---- Prove timeout tests ----
 
 #[test]
