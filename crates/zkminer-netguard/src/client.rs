@@ -659,6 +659,57 @@ mod tests {
         assert!(head.starts_with("get /elf http/1.1\r\n"), "{head}");
     }
 
+    /// A server on loopback that, for one connection, records the exact bytes it is sent until
+    /// a request head (or 2 s pass, or 4 KiB arrive), then sends `reply` (if any) and holds the
+    /// connection for `hold`.
+    fn raw_server(reply: Option<&'static [u8]>, hold: Duration) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !got.windows(4).any(|w| w == b"\r\n\r\n") && got.len() < 4096 {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = tx.send(got);
+            if let Some(r) = reply {
+                let _ = s.write_all(r);
+            }
+            std::thread::sleep(hold);
+        });
+        (port, rx)
+    }
+
+    /// parse-1: a server that accepts and never answers the ClientHello: the handshake is
+    /// bounded by the connect timeout (pr/37's reqwest connector bounded TCP and TLS so), not
+    /// only by the request's whole time (the reviewer's
+    /// `r5_a_stalled_tls_handshake_is_bounded_by_the_connect_or_read_timeout`).
+    #[tokio::test]
+    async fn r5_a_stalled_tls_handshake_is_bounded_by_the_connect_timeout() {
+        let (port, _rx) = raw_server(None, Duration::from_secs(10));
+        let lookup = FakeLookup::with(&[("store.invalid", &["127.0.0.1"])]);
+        let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
+        let opts = ClientOptions {
+            connect_timeout: Duration::from_secs(1),
+            read_timeout: Duration::from_secs(1),
+        };
+        let c = guarded_client_with(&dev, Arc::new(lookup), opts).unwrap();
+        let t = Instant::now();
+        let e = c
+            .get_following_redirects(&format!("https://store.invalid:{port}/x"), 0, Duration::from_secs(8))
+            .await
+            .unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}: {e}", t.elapsed());
+        assert!(e.to_string().contains("TLS handshake"), "{e}");
+    }
+
     /// A probe that finds every destination far and notes the deadline each probe was given.
     #[derive(Debug, Default)]
     struct DeadlineProbe {
