@@ -767,3 +767,24 @@ round 3's:
     FIN's acknowledgement from `tcpi_snd_una` and needs no state polling.
 11. **Strict CI** (round 3, cross-2): already applied to the shared tests (it changes nothing
     without the variable); a Linux CI job (above).
+
+## Review round 4
+
+The findings and fixes, on every platform, are in
+[netguard-hardening.md](netguard-hardening.md#review-round-4). What changes on macOS:
+
+- **The check connection** (probe-1) is two connections: the check connection keeps its low hop
+  limit for good (its FIN first), and a control connection, made after it at the default hop
+  limit, replaces round 3's restored hop limit. Any acknowledgement of the check's FIN is near;
+  far only once the control's FIN was acknowledged and the check's stayed unacknowledged past
+  the window, one retransmission and the control's round trip again. Read from
+  `TCP_CONNECTION_INFO` through `ConnReader` as before. Its live tests pass here
+  (`the_check_connection_finds_a_public_host_far`: 1.1.1.1 far; `a_peer_that_never_acknowledges_a_fin_is_not_far`: S3 refused;
+  `the_check_connection_finds_a_local_listener_near`; `a_peer_that_closes_first_is_never_far`).
+- **Each hop's connection is the guard's own** (bypass-2): checked before its TLS handshake,
+  bound to the vetted source (the UDP socket's choice on macOS: its route oracle gives no TCP
+  source, and macOS has no protocol-selective routing rules).
+- **NAT64**: the configuration daemon's prefixes are one source (`Source::System`, at most 8),
+  kept per uplink; configured prefixes always in force; DNS64 answers validated (RFC 7050 §3).
+- **Probes**: a third attempt after a 1 s pause, at most two in flight, a name's addresses one
+  after another; a check that cannot decide is `NearCheckFailed`.
