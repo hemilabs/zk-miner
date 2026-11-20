@@ -3880,6 +3880,9 @@ pub struct WorkerPool {
     /// (`yields_to_waiter`) rather than whichever polled first.
     card_waiters: Mutex<Vec<CardWaiter>>,
     card_waiter_seq: AtomicU64,
+    /// When each busy card (`card_of`) should be free again: set as a proof with an estimate starts
+    /// there (`with_slot_estimates`), cleared when it ends. For `better_card_soon`.
+    card_eta: Mutex<HashMap<String, Instant>>,
     /// Commit in-flight proofs have laid claim to (Windows; `reserve_commit`), beside the RAM ones in
     /// `memory_ledger`.
     commit_ledger: crate::memory::MemoryLedger,
@@ -4117,6 +4120,31 @@ impl Drop for CardWaitGuard<'_> {
     }
 }
 
+/// Clears a card's expected free time (`WorkerPool::card_eta`) when its proof ends.
+struct CardEtaGuard<'a> {
+    pool: &'a WorkerPool,
+    card: Option<String>,
+}
+
+impl Drop for CardEtaGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(card) = self.card.take() {
+            self.pool
+                .card_eta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&card);
+        }
+    }
+}
+
+/// What starting a proof on a slot whose worker is not running costs before it proves: spawning it,
+/// and stopping the other backend's worker on the card for its memory (`better_card_soon`).
+const WORKER_SWITCH_COST: Duration = Duration::from_secs(20);
+
+/// How much sooner a busy card must finish a job than the free one for it to wait for it.
+const BETTER_CARD_MARGIN: Duration = Duration::from_secs(15);
+
 /// Windows: after recycling workers that held `held` bytes of commit (free commit was `before`),
 /// wait until most of it is free again, or `need` (what the proof starting will commit) is, 15 s at
 /// most and no later than `give_up_at`. The card's VRAM
@@ -4160,6 +4188,7 @@ impl WorkerPool {
             host_peaks_path: None,
             card_waiters: Mutex::new(Vec::new()),
             card_waiter_seq: AtomicU64::new(0),
+            card_eta: Mutex::new(HashMap::new()),
             commit_ledger: crate::memory::MemoryLedger::default(),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
@@ -8306,6 +8335,70 @@ impl WorkerPool {
         }
     }
 
+    /// The card a slot is on, as the GPU locks know it, else the slot key.
+    fn card_of(key: &str) -> String {
+        physical_gpu_id(key).unwrap_or_else(|| key.to_string())
+    }
+
+    /// A proof with an estimate (`with_slot_estimates`) is starting on `key`: record when its card
+    /// should be free again, until the guard drops.
+    fn note_card_eta(&self, key: &str) -> CardEtaGuard<'_> {
+        let card = slot_estimate(key).map(|takes| {
+            let card = Self::card_of(key);
+            self.card_eta
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(card.clone(), Instant::now() + takes);
+            card
+        });
+        CardEtaGuard { pool: self, card }
+    }
+
+    /// Whether the worker of `key` is running (no spawn, nor a sibling stopped, before it proves).
+    fn slot_running(&self, key: &str) -> bool {
+        self.workers.get(key).is_some_and(|e| {
+            e.slot
+                .try_lock()
+                .map(|mut s| s.handle.as_mut().is_some_and(|h| h.is_alive()))
+                .unwrap_or(true)
+        })
+    }
+
+    /// Whether a job about to take the free slot `key` would finish sooner on another of its `keys`
+    /// whose card is busy now but due free (`card_eta`, still ahead), by `BETTER_CARD_MARGIN`: then
+    /// it waits for that card. Each finish is when the card frees (now, for `key`), plus a switch
+    /// when its worker is not running, plus the job's estimate there. A RISC Zero job is ~4.5x
+    /// slower on a 4070 than on a 5090, and took the 4070 whenever it was free: a 1 B-cycle job ran
+    /// 15 minutes there instead of 3 on the 5090 a few seconds later. Without estimates, or with
+    /// the busy card overdue, nothing is known: take the free one.
+    fn better_card_soon(&self, key: &str, keys: &[String], abort_at: Option<Instant>) -> bool {
+        let now = Instant::now();
+        let switch = |k: &str| {
+            if self.slot_running(k) {
+                Duration::ZERO
+            } else {
+                WORKER_SWITCH_COST
+            }
+        };
+        let Some(here) = slot_estimate(key) else {
+            return false;
+        };
+        let here = now + switch(key) + here;
+        let etas = self
+            .card_eta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        keys.iter()
+            .filter(|k| Self::card_of(k) != Self::card_of(key))
+            .filter_map(|k| {
+                let free_at = *etas.get(&Self::card_of(k)).filter(|at| **at > now)?;
+                let finish = free_at + switch(k) + slot_estimate(k)?;
+                abort_at.is_none_or(|a| finish <= a).then_some(finish)
+            })
+            .any(|finish| finish + BETTER_CARD_MARGIN < here)
+    }
+
     /// Whether a job (`me`: its ticket when it is waiting, `None` arriving) must leave the free card
     /// `key` to a waiting job due before it: one that can take that card (by any of its workers, as a
     /// RISC Zero job can the card an SP1 job wants), with an earlier deadline,
@@ -8732,6 +8825,10 @@ impl WorkerPool {
             if self.yields_to_waiter(key, None, latest_start, arrived) {
                 continue;
             }
+            // Not when a busy card frees soon enough to finish it well before this one would.
+            if self.better_card_soon(key, &keys, abort_at) {
+                continue;
+            }
             if let Some(entry) = self.workers.get(key) {
                 // Prefer a worker whose PHYSICAL GPU is idle: skip one whose gpu_lock
                 // is held by another backend proving on the same card, so we don't
@@ -8812,6 +8909,10 @@ impl WorkerPool {
                     continue;
                 }
                 if self.yields_to_waiter(key, Some(ticket), latest_start, since) {
+                    any_busy = true;
+                    continue;
+                }
+                if self.better_card_soon(key, &keys, abort_at) {
                     any_busy = true;
                     continue;
                 }
@@ -12265,6 +12366,8 @@ impl WorkerPool {
         // from, including a genuinely single-GPU host.
         let gpu_lock = self.gpu_lock_for(key);
         let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, timeout)?;
+        // When this card should be free again, for jobs choosing a card by finish time.
+        let _card_eta = self.note_card_eta(key);
 
         // Host memory is reserved further down, after the slot mutex (see there), but
         // the VRAM budget just below may recycle a warm same-card sibling to make room. If the proofs
@@ -20208,6 +20311,40 @@ mod learned_host_peak_tests {
             assert!(finishes_in_time("sp1:cuda:9", abort));
         });
         assert!(finishes_in_time("sp1:cuda:1", abort));
+    }
+
+    /// A job leaves a free slow card for a busy fast one that frees soon enough to finish it well
+    /// before; not when the fast card's free time is unknown or overdue, nor when finishing there
+    /// would miss its cutoff.
+    #[test]
+    fn a_job_waits_for_a_faster_card_when_it_finishes_sooner() {
+        let pool = pool(&["risc0:cuda:0", "risc0:cuda:1"]);
+        let keys = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let estimates = HashMap::from([
+            ("risc0:cuda:0".to_string(), Duration::from_secs(60)),
+            ("risc0:cuda:1".to_string(), Duration::from_secs(300)),
+        ]);
+        with_slot_estimates(estimates, || {
+            // The fast card's free time is not known: take the slow free one.
+            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None));
+            // Due free in 60 s: done there by ~140 s against ~320 s here.
+            pool.card_eta.lock().unwrap().insert(
+                "cuda:0".to_string(),
+                Instant::now() + Duration::from_secs(60),
+            );
+            assert!(pool.better_card_soon("risc0:cuda:1", &keys, None));
+            // Not if finishing there would miss the cutoff.
+            let soon = Some(Instant::now() + Duration::from_secs(100));
+            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, soon));
+            // Not on the card it is choosing.
+            assert!(!pool.better_card_soon("risc0:cuda:0", &keys, None));
+            // Overdue: nothing is known.
+            pool.card_eta.lock().unwrap().insert(
+                "cuda:0".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
+            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None));
+        });
     }
 
     /// A freed card goes to the waiting job due first: a later deadline, or a later arrival with the
