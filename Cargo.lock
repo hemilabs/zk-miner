@@ -10676,8 +10676,11 @@ dependencies = [
 name = "zkminer-netguard"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "core-foundation",
  "http",
+ "http-body",
+ "hyper",
  "hyper-util",
  "libc",
  "proptest",
@@ -10686,8 +10689,7 @@ dependencies = [
  "socket2 0.6.2",
  "system-configuration",
  "tokio",
- "tower-layer",
- "tower-service",
+ "tokio-rustls",
  "tracing",
  "url",
  "webpki-roots 1.0.6",
