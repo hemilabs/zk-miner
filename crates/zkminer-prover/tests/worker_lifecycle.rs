@@ -681,6 +681,24 @@ fn a_hung_warmup_is_killed_at_its_deadline() {
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
 }
 
+/// The one-time setup is the host's, so a slot that fails it does not stop the backend: the next
+/// slot runs it.
+#[test]
+fn a_failed_warmup_moves_on_to_the_next_slot() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:a", "mock", mock_worker_path(), mock_env("", "warmup"))
+        .expect("failed to spawn mock worker");
+    pool.insert_test_worker("mock:b", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let summary = pool
+        .warm_up("mock", Duration::from_secs(10))
+        .expect("mock:b runs the setup after mock:a fails it");
+    assert_eq!(summary, "nothing to warm up");
+    assert!(pool.backend_warmed("mock"));
+    assert_eq!(pool.test_consecutive_failures("mock:a"), Some(1));
+    assert_eq!(pool.test_consecutive_failures("mock:b"), Some(0));
+}
+
 /// A worker that dies during its warm-up is an error, counted as a failure.
 #[test]
 fn a_warmup_crash_is_an_error() {

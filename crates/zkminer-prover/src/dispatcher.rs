@@ -295,6 +295,39 @@ fn recycle_after_proofs() -> u32 {
     })
 }
 
+/// Runs `attempt` on each of `keys` in turn and returns the first success, with its key (see
+/// `WorkerPool::warm_up`). A failure moves on to the next key, except a host-memory shortage, which
+/// is returned at once: it is the host's, and every other slot would meet it too. When every key
+/// fails, the last failure is returned, with the earlier ones in its context.
+fn first_slot_that_succeeds<T>(
+    keys: &[String],
+    mut attempt: impl FnMut(&str) -> Result<T>,
+) -> Result<(String, T)> {
+    let mut earlier: Vec<String> = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        let e = match attempt(key) {
+            Ok(value) => return Ok((key.clone(), value)),
+            Err(e) => e,
+        };
+        let host_short = e
+            .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .is_some();
+        let Some(next) = keys.get(i + 1).filter(|_| !host_short) else {
+            return Err(if earlier.is_empty() {
+                e
+            } else {
+                e.context(format!(
+                    "no slot could run the one-time setup ({}); the last one tried, {key}, failed",
+                    earlier.join("; ")
+                ))
+            });
+        };
+        tracing::warn!("{key} could not run the one-time setup, so {next} is tried: {e:#}");
+        earlier.push(format!("{key}: {e:#}"));
+    }
+    bail!("no slot to run the one-time setup on")
+}
+
 struct WorkerSlot {
     handle: Option<WorkerHandle>,
     path: PathBuf,
@@ -3435,18 +3468,43 @@ impl WorkerPool {
     /// for SP1, installing the Groth16 circuit artifacts and, where its server supports it,
     /// building the stripped circuit. Takes a host-memory reservation for it, and kills the worker
     /// if it runs past `timeout`. Returns what was done.
+    ///
+    /// The setup is the host's, not a card's, so any of the backend's slots can run it. They are
+    /// tried in turn until one succeeds, and a slot whose worker declined is tried last. Trying only
+    /// the first slot let one card that cannot run the backend stop the backend on every card: an
+    /// RTX 4090 whose SP1 worker had no CUDA server beside it kept two AMD cards with working HIP
+    /// servers from proving SP1 at all.
     pub fn warm_up(&self, backend: &str, timeout: Duration) -> Result<String> {
-        let mut keys = self.keys_for_prefix(backend);
-        keys.sort();
-        let key = keys
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no {backend} worker to warm up"))?;
-        let summary = self.warm_up_slot(key, timeout)?;
+        let keys = self.warm_up_order(backend);
+        if keys.is_empty() {
+            bail!("no {backend} worker to warm up");
+        }
+        let (key, summary) =
+            first_slot_that_succeeds(&keys, |key| self.warm_up_slot(key, timeout))?;
+        if keys.len() > 1 {
+            tracing::info!("{backend}'s one-time setup ran on {key}");
+        }
         self.warmed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(backend.to_string());
         Ok(summary)
+    }
+
+    /// `backend`'s slots in the order `warm_up` tries them: those whose worker has not declined
+    /// first, then the declined ones; each group in key order.
+    fn warm_up_order(&self, backend: &str) -> Vec<String> {
+        let mut keys = self.keys_for_prefix(backend);
+        keys.sort_by_cached_key(|k| (self.slot_declined(k), k.clone()));
+        keys
+    }
+
+    /// Whether `key`'s worker has declined. A slot that is busy (its lock is held) is not declined,
+    /// since a declined worker does no work, so `try_lock` is enough and never waits for a proof.
+    fn slot_declined(&self, key: &str) -> bool {
+        self.workers
+            .get(key)
+            .is_some_and(|e| e.slot.try_lock().is_ok_and(|s| s.declined.is_some()))
     }
 
     /// Warms `key` up first if it needs it, for a path that would otherwise do the setup inside its
@@ -9187,6 +9245,84 @@ mod tests {
         pool.warmed.lock().unwrap().insert("risc0".to_string());
         assert!(pool.backend_warmed("risc0"));
         assert!(!pool.has_slots("sp1"));
+    }
+
+    /// `warm_up` tries a slot whose worker declined only after every other slot of the backend.
+    #[test]
+    fn warm_up_tries_a_declined_slot_last() {
+        let pool = pool_with_keys(&["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1", "risc0:cuda:0"]);
+        assert_eq!(
+            pool.warm_up_order("sp1"),
+            ["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1"]
+        );
+        pool.workers["sp1:cuda:0"].slot.lock().unwrap().declined =
+            Some("no CUDA server".to_string());
+        assert_eq!(
+            pool.warm_up_order("sp1"),
+            ["sp1:rocm:0", "sp1:rocm:1", "sp1:cuda:0"]
+        );
+        // A busy slot reads as not declined, without waiting for it.
+        let busy = pool.workers["sp1:rocm:0"].slot.lock().unwrap();
+        assert_eq!(
+            pool.warm_up_order("sp1"),
+            ["sp1:rocm:0", "sp1:rocm:1", "sp1:cuda:0"]
+        );
+        drop(busy);
+    }
+
+    #[test]
+    fn the_one_time_setup_moves_past_a_slot_that_fails_it() {
+        let keys: Vec<String> = ["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1"]
+            .map(String::from)
+            .to_vec();
+        let mut tried = Vec::new();
+        let (key, value) = first_slot_that_succeeds(&keys, |k| {
+            tried.push(k.to_string());
+            if k == "sp1:cuda:0" {
+                bail!("{}", zkminer_prover_protocol::types::WORKER_DECLINED)
+            }
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!((key.as_str(), value), ("sp1:rocm:0", 7));
+        assert_eq!(tried, ["sp1:cuda:0", "sp1:rocm:0"]);
+    }
+
+    /// A host short of memory is the host's problem: no other slot is tried.
+    #[test]
+    fn a_host_memory_shortage_ends_the_one_time_setup_at_once() {
+        let keys: Vec<String> = ["sp1:cuda:0", "sp1:rocm:0"].map(String::from).to_vec();
+        let mut tried = 0;
+        let err = first_slot_that_succeeds::<()>(&keys, |k| {
+            tried += 1;
+            Err(anyhow::Error::new(
+                zkminer_prover_protocol::types::HostMemoryShortage {
+                    attempted: false,
+                    slot_key: k.to_string(),
+                    needed: 1,
+                    reserved: 0,
+                    available: 0,
+                },
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(tried, 1);
+        assert!(err
+            .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .is_some());
+    }
+
+    #[test]
+    fn when_every_slot_fails_the_one_time_setup_the_error_names_each() {
+        let keys: Vec<String> = ["sp1:cuda:0", "sp1:rocm:0", "sp1:rocm:1"]
+            .map(String::from)
+            .to_vec();
+        let err = first_slot_that_succeeds::<()>(&keys, |k| bail!("{k} broke")).unwrap_err();
+        let msg = format!("{err:#}");
+        for k in &keys {
+            assert!(msg.contains(&format!("{k} broke")), "{msg}");
+        }
+        assert!(first_slot_that_succeeds::<()>(&[], |_| Ok(())).is_err());
     }
 
     /// EVERY path that puts work on a card must take the per-card guard, and the guard must be taken
