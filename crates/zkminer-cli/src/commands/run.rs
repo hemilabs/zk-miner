@@ -7647,11 +7647,13 @@ async fn miner_brain(
         // fail-open means "keep piling on". Absent facts mean we cannot classify, so we keep the
         // last thing we could prove: PSI alone, which is the symptom and the stronger signal.
         let stall_pct = zkminer_prover::memory::memory_stall_percent();
-        // Windows: idle workers keep what they committed, and a proof that needs it recycles them
-        // (`make_host_room`). Braking on it would stop the dispatch that gives it back, for good.
+        // Windows: idle workers keep RAM and commit, and a proof that needs it recycles them
+        // (`make_host_room`, `reserve_commit`). Braking on it would stop the dispatch that gives it
+        // back, for good. Commit counts what the page file can still grow (`CommitFigures`).
+        let pool = zkminer_prover::engine::worker_pool();
         let mem_avail = zkminer_prover::memory::pressure_available_bytes(
-            zkminer_prover::engine::worker_pool()
-                .map_or(0, |pool| pool.idle_reclaimable_host_bytes()),
+            pool.map_or(0, |pool| pool.idle_reclaimable_host_bytes()),
+            pool.map_or(0, |pool| pool.idle_reclaimable_commit_bytes()),
         );
         let mem_total = zkminer_prover::memory::mem_total_bytes();
         let pressure = match (mem_avail, mem_total) {
@@ -8801,11 +8803,16 @@ async fn miner_brain(
                                     continue;
                                 }
                             }
-                            if !pool.backend_fits_for_claim(
+                            if !pool.backend_fits_for_claim_at_po2(
                                 want,
                                 backend,
                                 needing_card(&in_flight, &proved),
                                 max_concurrent,
+                                if backend == "risc0" {
+                                    risc0_sizes.iter().copied().max()
+                                } else {
+                                    None
+                                },
                             ) {
                                 // Rate-limited to once per backend per tick. On the market this
                                 // repo documents — 298 open jobs declaring zero cycles — a
