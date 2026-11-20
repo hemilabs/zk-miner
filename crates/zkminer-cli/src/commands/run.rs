@@ -14817,14 +14817,57 @@ async fn release_and_clean_with_nonce(
             });
         }
         if lock_deadline != 0 && now >= lock_deadline {
+            // It can be neither fulfilled nor released any more: once the slash opens, slash it
+            // ourselves (`slash_own_expired_lock`). The collateral is lost whoever slashes; done
+            // here, the keeper share comes back to this prover instead of a stranger, and the lock
+            // is cleared now. Judged on the LOWER chain-time estimate, and only on a lock the view
+            // shows as ours and Locked (checked above); an early send just reverts "Not expired
+            // yet" and is tried again on a later pass.
+            let slash_opens = view.slashOpensAt.to::<u64>();
+            if slash_opens != 0 && now >= slash_opens {
+                match client.slash_own_expired_lock(job_id).await {
+                    Ok(true) => {
+                        journal_update(journal, |j| j.remove(job_id));
+                        if let Some(n) = client.take_abandoned_nonce(job_id) {
+                            client.abort_nonce(n);
+                        }
+                        if let Some(n) = pre_nonce {
+                            client.abort_nonce(n);
+                        }
+                        let detail = format!(
+                            "Job {} could no longer be proved or released: slashed it ourselves. \
+                             Its collateral is lost either way; the keeper share (2%, at least 0.5 \
+                             HEMI) comes back to this prover.",
+                            short_id(job_id)
+                        );
+                        tracing::warn!("{detail}");
+                        let mut s = state.write().await;
+                        s.active_jobs.retain(|j| j.info.job_id != job_id);
+                        s.add_log(LogLevel::Warn, detail);
+                        return;
+                    }
+                    Ok(false) => tracing::info!(
+                        "{}: the chain refused our slash of the expired lock for now; trying \
+                         again later",
+                        short_id(job_id)
+                    ),
+                    Err(e) => tracing::warn!(
+                        "{}: could not slash the expired lock ourselves ({e:#}); trying again \
+                         later",
+                        short_id(job_id)
+                    ),
+                }
+            }
             let first = first_stranded_report(job_id);
             if first {
                 tracing::error!(
                     "PAGE: LOCK-LATE: {} is past its deadline ({} >= {}) — releaseJob would revert; \
-                     retaining breadcrumb (collateral stranded until a keeper slash)",
+                     retaining breadcrumb; this miner slashes it itself from {} (the keeper share \
+                     comes back to it)",
                     short_id(job_id),
                     now,
                     lock_deadline,
+                    slash_opens,
                 );
             } else {
                 tracing::debug!("{} still stranded past its deadline", short_id(job_id));
@@ -14843,7 +14886,8 @@ async fn release_and_clean_with_nonce(
                 s.add_log(
                     LogLevel::Warn,
                     format!(
-                        "Job {} past deadline — cannot release (stranded until slash)",
+                        "Job {} past deadline — cannot release; this miner slashes it itself once \
+                         the slash opens",
                         short_id(job_id)
                     ),
                 );
@@ -16310,6 +16354,44 @@ mod tests {
             forged.downcast_ref::<HostMemoryShortage>().is_none(),
             "a guest must not be able to buy itself unlimited retries"
         );
+    }
+
+    /// A lock of ours that can be neither fulfilled nor released any more is slashed by this miner
+    /// itself, and only then: inside the past-the-cutoff branch (the deadline plus the grace, after
+    /// the not-ours / not-locked drop), once the chain-time floor reaches `slashOpensAt`; a slash
+    /// that went through drops the breadcrumb, and the page says the miner will do it.
+    #[test]
+    fn an_expired_lock_of_ours_is_slashed_by_this_miner() {
+        let f = body(
+            include_str!("run.rs"),
+            "
+async fn release_and_clean_with_nonce(",
+        );
+        let not_ours = f
+            .find("let why = if not_ours {")
+            .expect("the not-ours drop");
+        let cutoff = f
+            .find("if lock_deadline != 0 && now >= lock_deadline {")
+            .expect("the past-the-cutoff branch");
+        let opens = f
+            .find("if slash_opens != 0 && now >= slash_opens {")
+            .expect("the slash-open check");
+        let slash = f
+            .find("client.slash_own_expired_lock(job_id).await")
+            .expect("the slash");
+        let page = f.find("PAGE: LOCK-LATE:").expect("the page");
+        let release = f
+            .find("client.release_job_with_nonce(job_id, pre_nonce, seen)")
+            .expect("the release");
+        assert!(not_ours < cutoff && cutoff < opens && opens < slash && slash < page);
+        assert!(page < release);
+        assert!(f[slash..page].contains(
+            "Ok(true) => {
+                        journal_update(journal, |j| j.remove(job_id));"
+        ));
+        assert!(f[page..release].contains("this miner slashes it itself"));
+        assert!(f.contains("let slash_opens = view.slashOpensAt.to::<u64>();"));
+        assert!(f.contains("let now = zkminer_chain::client::chain_now_floor();"));
     }
 
     /// A worker that died carries its last lines of output in its error (`death_note`), and those

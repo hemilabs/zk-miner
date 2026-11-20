@@ -70,12 +70,20 @@ mod tests {
         assert!(!set_tx_observer(|_, _, _| {}));
         let job = B256::repeat_byte(7);
         emit(job, TxKind::Claim, TxEvent::Sent { attempt: 1, of: 5 });
-        emit(job, TxKind::Fulfil, TxEvent::Unconfirmed { attempt: 2, of: 5 });
+        emit(
+            job,
+            TxKind::Fulfil,
+            TxEvent::Unconfirmed { attempt: 2, of: 5 },
+        );
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
                 (job, TxKind::Claim, TxEvent::Sent { attempt: 1, of: 5 }),
-                (job, TxKind::Fulfil, TxEvent::Unconfirmed { attempt: 2, of: 5 }),
+                (
+                    job,
+                    TxKind::Fulfil,
+                    TxEvent::Unconfirmed { attempt: 2, of: 5 }
+                ),
             ]
         );
     }
