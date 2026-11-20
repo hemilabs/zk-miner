@@ -281,12 +281,14 @@ TCP FIN (AWS S3) on a path whose first two routers did not answer the hop-limite
 filter or rate-limit ICMP, as many cloud and corporate networks do): the guard cannot tell how
 near such a server is, so it refuses (another attempt usually gets the probe answered; on a
 host whose first hops never send ICMP, S3 is refused every time). Right after a host with IPv6
-and no IPv4 joins a network, IPv6 destinations are refused for up to 2 s (`NAT64 prefix is still
-being learned`); on any host they are refused while the network names NAT64 prefixes the guard
-does not believe or cannot hold (more than two in one DNS answer, more than four in one router's
-advertisements: the log names the source). `its public ... address there is being learned again`
-follows a move to another network (on Linux also a default gateway whose link-layer address
-changed and held for 2 s): it clears by itself within seconds. `the connection to ... was dropped
+and no IPv4 (or IPv4 only through a CLAT, 464XLAT) joins a network, IPv6 destinations are refused
+for up to 2 s (`NAT64 prefix is still being learned`); on any host they are refused while the
+network names NAT64 prefixes the guard does not believe or cannot hold (more than two in one DNS
+answer, more than four live ones in one router's advertisements): the refusal names the source,
+and it clears as soon as that source names what fits (a withdrawn or expired prefix no longer
+counts). `its public ... address there is being learned again` follows a move to another network
+(on Linux also a default gateway that shows another link-layer address, until it shows the known
+one again): it clears by itself within seconds. `the connection to ... was dropped
 once made` means the route changed between the check and the connection (a VPN coming up): the
 next attempt is judged on the new route.
 

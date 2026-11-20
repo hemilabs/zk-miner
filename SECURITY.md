@@ -303,8 +303,9 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   refused, naming what failed, until a re-read succeeds. One re-read runs at a time, and other
   callers wait for it at most 500 ms (then the facts in force within their grace, or a refusal).
 - **NAT64 prefixes** are learned again whenever the network changes (and every 15 s while a host
-  with IPv6 and no IPv4 route has found none), also from the configuration daemon's NAT64 state;
-  until the new network's round has finished, such a host refuses every IPv6 destination.
+  with IPv6 and no IPv4 route, or with IPv4 only through a CLAT, has found none), also from the
+  configuration daemon's NAT64 state; until the new network's round has finished, such a host
+  refuses every IPv6 destination.
 - **Near hops:** the probe is the same hop-limited TCP connect (an unreachable `connect` reports
   before the connection is in progress, as Local Network privacy does, is refused, not far); a
   check connection reads its FIN's
@@ -338,7 +339,7 @@ is a check connection's answer, with a control connection; the probe asked up to
 and IPv4-mapped addresses unmapped (Windows too); a default-like kernel answer must be a default
 route the facts hold (on Linux, through the same nexthop object); NAT64 prefixes learned per
 network (Linux also from the default gateway's PREF64), configured ones always in force, IPv6
-refused on an IPv6-only host until the new network's round ends; and every connection checked
+refused on an IPv6-only host (or one behind a CLAT) until the new network's round ends; and every connection checked
 again once made, from the source the kernel chose for it, before anything (a TLS ClientHello
 included) is written on it (macOS too: new everywhere).
 
@@ -802,8 +803,7 @@ no second one):
   NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On Linux
   a router's PREF64 is read only from advertisements the kernel processes while the miner runs,
   and only from the IPv6 default gateway (none where systemd-networkd or NetworkManager handle
-  router advertisements themselves, which keep it to their own interfaces; none from a default
-  route through a nexthop object, whose gateway the guard does not see). A DNS64 that answers
+  router advertisements themselves, which keep it to their own interfaces). A DNS64 that answers
   `ipv4only.arpa` with one of its two addresses only reveals nothing. On an
   IPv6-only host, addresses under a prefix are refused until the translator's IPv4 address is
   learned through it (or stated in `public_addresses`). The
