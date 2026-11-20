@@ -129,10 +129,11 @@ impl ElfFetcher {
     }
 
     /// What the network guard refuses for want of configuration, as lines to show the operator:
-    /// each path whose public address is not known (every requester connection over it is
-    /// refused), and, when the host now needs `[egress] internal_ranges` the config does not
-    /// state, that every requester connection is refused; with what to set. Empty when there is
-    /// none (and in developer mode).
+    /// that every requester connection is refused because the host's network facts could not be
+    /// read again (macOS: `HostFacts::unreadable_reason`), each path whose public address is not
+    /// known (every requester connection over it is refused), and, when the host now needs
+    /// `[egress] internal_ranges` the config does not state, that every requester connection is
+    /// refused; with what to set. Empty when there is none (and in developer mode).
     pub fn guard_warnings(&self) -> Vec<String> {
         if self.mode() != NetMode::Public {
             return Vec::new();
@@ -149,6 +150,16 @@ impl ElfFetcher {
                 )
             })
             .collect();
+        if let Some(why) = facts.unreadable_reason() {
+            lines.insert(
+                0,
+                format!(
+                    "network guard: this host's network facts (interfaces, routes, DNS servers) \
+                     could not be read again ({why}), so every requester connection is refused \
+                     until they can be"
+                ),
+            );
+        }
         let gaps = facts.config_gaps();
         if !gaps.is_empty() {
             lines.push(format!(
