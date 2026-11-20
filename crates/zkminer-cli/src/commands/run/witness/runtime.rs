@@ -98,7 +98,8 @@ use zkminer_witness_store::{
 use super::super as run;
 use super::policy::{
     caller_admitted, caller_tally_key, card_room, claims_held_reason, deadline_fits, device_caller_tally_key,
-    device_tally_key, divergence_reusable, elf_image_id_outcome, estimate_prove_secs, fixed_allowance_secs,
+    device_tally_key, divergence_reusable, elf_image_id_outcome, eligible_cards, estimate_prove_secs,
+    fixed_allowance_secs, host_max_guest_cycles_over, CardPlan,
     fulfils_besides, funds_cover, gate_refusal_reason, held_lock_prove_sizes, host_max_guest_cycles,
     is_witness_input, lasts_until_terminal, not_claimable_reason, parse_session_cap, pin_lock_gone,
     pin_read_needs_time, proving_cutoff, rate_secs_left, reservation_wei, segment_need, session_cap_admits, short,
@@ -356,6 +357,52 @@ impl Candidate {
 
     fn cycles(&self) -> u64 {
         self.per_po2.iter().map(|p| p.1).max().unwrap_or(0)
+    }
+}
+
+/// How witness proofs on this host are planned: each card that may prove one, with the operator's
+/// `deadline_safety_margin` (see `prove_plan`).
+struct WitnessPlan {
+    /// Every enabled risc0 card that may prove a witness job.
+    cards: Vec<CardPlan>,
+    margin: f64,
+    /// The plan when no card is enabled (the floor rate at the host's sizes).
+    floor: ProvePlan,
+}
+
+impl WitnessPlan {
+    /// Over every card: the slowest rate and the largest fixed allowance.
+    fn all(&self) -> ProvePlan {
+        ProvePlan::over(self.cards.iter().map(|c| (c.cps, c.fixed_secs)), self.margin).unwrap_or(self.floor)
+    }
+
+    /// The plan a proof of `cycles` (its execute `execute_secs`) is sized at, and the cards it may run
+    /// on, fastest first: those whose own estimate fits the watchdog and `fits_window`
+    /// ([`eligible_cards`]), and the plan over them. No card fits: the plan over every card, which the
+    /// gates then refuse, as before, and no cards (any card may take it).
+    fn for_job(
+        &self,
+        cycles: u64,
+        execute_secs: u64,
+        proving_timeout_secs: u64,
+        fits_window: impl Fn(u64) -> bool,
+    ) -> (ProvePlan, Vec<CardPlan>) {
+        let eligible =
+            eligible_cards(&self.cards, self.margin, cycles, execute_secs, proving_timeout_secs, fits_window);
+        match ProvePlan::over(eligible.iter().map(|c| (c.cps, c.fixed_secs)), self.margin) {
+            Some(plan) => (plan, eligible),
+            None => (self.all(), Vec::new()),
+        }
+    }
+
+    /// The host's `maxGuestCycles` when the operator sets none: the most any card can prove inside the
+    /// watchdog, or the floor plan's without a card.
+    fn max_guest_cycles(&self, proving_timeout_secs: u64) -> u64 {
+        if self.cards.is_empty() {
+            host_max_guest_cycles(&self.floor, proving_timeout_secs)
+        } else {
+            host_max_guest_cycles_over(&self.cards, self.margin, proving_timeout_secs)
+        }
     }
 }
 
@@ -1346,41 +1393,50 @@ impl WitnessRuntime {
         run::risc0_job_sizes(&run::current_risc0_cards(&self.state, true).await)
     }
 
-    /// How a witness proof on this host is planned (§5.2 step 7): over every enabled risc0 card
-    /// that may prove it, the slowest rate (its benchmark row at its size, else the floor for its
-    /// kind: a card with no row is never left out) and the largest fixed allowance (its measured
-    /// Groth16 wrap, else the allowance for its kind; a CPU slot's wrap is minutes), with the
-    /// operator's `deadline_safety_margin`. `po2s` (the host's sizes) only seed the floor when no
-    /// card is enabled.
-    async fn prove_plan(&self, po2s: &[u8]) -> ProvePlan {
+    /// How witness proofs on this host are planned (§5.2 step 7): every enabled risc0 card that may
+    /// prove one, each with its rate (its benchmark row at its size, else the floor for its kind: a
+    /// card with no row is never left out) and its fixed allowance (its measured Groth16 wrap, else
+    /// the allowance for its kind; a CPU slot's wrap is minutes), with the operator's
+    /// `deadline_safety_margin`. A job is sized on the cards it fits ([`WitnessPlan::for_job`]).
+    /// `po2s` (the host's sizes) only seed the floor when no card is enabled.
+    async fn prove_plan(&self, po2s: &[u8]) -> WitnessPlan {
         let cards = run::current_risc0_cards(&self.state, true).await;
         let st = self.state.read().await;
         let margin = st.runtime_settings.deadline_safety_margin;
+        let margin = if margin.is_finite() && margin >= 1.0 { margin } else { 1.0 };
         let suite = st.benchmark_results.as_ref().filter(|s| !run::is_synthetic_suite(s));
-        let per_card = cards.iter().map(|c| {
-            let row = suite.and_then(|s| {
-                s.device_benchmarks
-                    .iter()
-                    .find(|d| d.device_id == c.device && d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0)
-            });
-            let cpu = c.device == "cpu";
-            let measured = row
-                .map(|r| zkminer_prover::benchmark::risc0_job_throughput(r, c.po2))
-                .filter(|t| t.is_finite() && *t > 0.0);
-            let cps = measured.unwrap_or_else(|| {
-                if cpu {
-                    RISC0_CPU_CONSERVATIVE_CPS
-                } else {
-                    run::risc0_conservative_cps(&[c.po2])
-                }
-            });
-            (cps, fixed_allowance_secs(row.and_then(|r| r.wrap_secs()), cpu))
-        });
-        ProvePlan::over(per_card.collect::<Vec<_>>(), margin).unwrap_or(ProvePlan {
-            cps: run::risc0_conservative_cps(po2s),
-            fixed_secs: fixed_allowance_secs(None, false),
-            margin: if margin.is_finite() && margin >= 1.0 { margin } else { 1.0 },
-        })
+        let cards = cards
+            .iter()
+            .map(|c| {
+                let row = suite.and_then(|s| {
+                    s.device_benchmarks
+                        .iter()
+                        .find(|d| d.device_id == c.device && d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0)
+                });
+                let cpu = c.device == "cpu";
+                let measured = row
+                    .map(|r| zkminer_prover::benchmark::risc0_job_throughput(r, c.po2))
+                    .filter(|t| t.is_finite() && *t > 0.0);
+                let cps = measured.unwrap_or_else(|| {
+                    if cpu {
+                        RISC0_CPU_CONSERVATIVE_CPS
+                    } else {
+                        run::risc0_conservative_cps(&[c.po2])
+                    }
+                });
+                let fixed_secs = fixed_allowance_secs(row.and_then(|r| r.wrap_secs()), cpu);
+                CardPlan { device: c.device.clone(), cps, fixed_secs }
+            })
+            .collect();
+        WitnessPlan {
+            cards,
+            margin,
+            floor: ProvePlan {
+                cps: run::risc0_conservative_cps(po2s),
+                fixed_secs: fixed_allowance_secs(None, false),
+                margin,
+            },
+        }
     }
 
     /// The build of every risc0 prove worker that may prove a witness bundle here (§15.1): each prove
@@ -1477,7 +1533,7 @@ impl WitnessRuntime {
         serving: &Serving,
         store: &Arc<Store>,
         po2s: Vec<u8>,
-        plan: &ProvePlan,
+        plan: &WitnessPlan,
         worker_builds: Vec<String>,
         execute_build: String,
     ) -> HostContext {
@@ -1491,7 +1547,7 @@ impl WitnessRuntime {
             execute_binary: serving.execute_binary.clone(),
             host_maxima: zkminer_witness_host::pipeline::host_maxima(
                 w,
-                w.max_guest_cycles.unwrap_or_else(|| host_max_guest_cycles(plan, self.proving_timeout.as_secs())),
+                w.max_guest_cycles.unwrap_or_else(|| plan.max_guest_cycles(self.proving_timeout.as_secs())),
             ),
             po2s,
             // Any of its cards may prove the job: over the cap at one is a skip.
@@ -1914,7 +1970,7 @@ impl WitnessRuntime {
         d: &JobDescriptor,
         rec: &JobRecord,
         c: &Candidate,
-        plan: &ProvePlan,
+        plan: &WitnessPlan,
         price: u128,
     ) -> Result<GateOk, (SkipReason, String)> {
         let jid = info.job_id;
@@ -1963,9 +2019,15 @@ impl WitnessRuntime {
                     format!("{cycles} sized cycles, over ZKMINER_RISC0_MAX_SESSION_CYCLES {}", cap.unwrap_or(0)),
                 ));
             }
-            // The proving time: every attempt inside the watchdog, and the margin before D.
-            let prove_secs = estimate_prove_secs(cycles, plan, c.execute_secs_per_po2);
+            // The proving time: every attempt inside the watchdog, and the margin before D, on the
+            // cards this job fits (the dispatcher sends it to no other when it is proven).
             let timeout = self.proving_timeout.as_secs();
+            let (plan, fits) = plan.for_job(cycles, c.execute_secs_per_po2, timeout, |need| {
+                let (fulfil, attempt) = (run::DEADLINE_FULFILL_MARGIN_SECS, run::MIN_ATTEMPT_BUDGET_SECS);
+                deadline_fits(rec.fulfillment_timeout, need, fulfil, attempt)
+            });
+            let plan = &plan;
+            let prove_secs = estimate_prove_secs(cycles, plan, c.execute_secs_per_po2);
             if !watchdog_admits(prove_secs, timeout) {
                 // This host's limit (a raised `proving_timeout_secs` or a faster card changes it).
                 return Err((
@@ -2019,12 +2081,13 @@ impl WitnessRuntime {
             }
             tracing::info!(
                 "witness job {}: claim gate passed — fulfil {} estimated DA bytes, {fulfil_gas} gas, ~{prove_secs} s to prove \
-                 ({} c/s, {} s fixed, margin {:.2}; watchdog {timeout} s)",
+                 ({} c/s, {} s fixed, margin {:.2}; watchdog {timeout} s; on {})",
                 short(jid),
                 est.estimated_bytes,
                 plan.cps.round(),
                 plan.fixed_secs,
-                plan.margin
+                plan.margin,
+                fits.iter().map(|c| c.device.as_str()).collect::<Vec<_>>().join(", ")
             );
             Ok(GateOk { reservation, window: rec.fulfillment_timeout, fulfil_gas, exposure })
         })
@@ -2743,6 +2806,19 @@ impl WitnessRuntime {
             // lock only if its realistic estimate (the CPU wrap included) fits this cap; the deadline
             // budget (`abort_at`) still bounds every attempt.
             let timeout = self.proving_timeout;
+            // The cards it fits in the time left, fastest first: the dispatcher sends it to no other
+            // (none fits: any card, as before).
+            let fits: Vec<String> = {
+                let halted = l.record.po2_results.iter().filter(|r| r.exit == GuestExit::Halted(0));
+                let cycles = halted.map(|r| r.cycles).max().unwrap_or(0);
+                let execute_secs = l.record.execute_ms_per_po2.unwrap_or(0).div_ceil(1000);
+                let budget = run::deadline_proof_budget(cutoff).map(|b| b.as_secs());
+                let po2s: Vec<u8> = executed.iter().filter_map(|p| u8::try_from(*p).ok()).collect();
+                let (_, fits) = self.prove_plan(&po2s).await.for_job(cycles, execute_secs, timeout.as_secs(), |need| {
+                    budget.is_none_or(|b| need <= b)
+                });
+                fits.into_iter().map(|c| c.device).collect()
+            };
             let (elf, sizes2, excl, dis, program_id) = (l.elf.clone(), sizes.clone(), excluded.clone(), disabled.clone(), l.record.image_id.0);
             let progress = self.progress_callback(jid);
             let (res, used) = tokio::task::spawn_blocking(move || {
@@ -2762,7 +2838,7 @@ impl WitnessRuntime {
                     abort_at,
                     Some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
                     Some(program_id),
-                    zkminer_prover::dispatcher::JobCards::default(),
+                    zkminer_prover::dispatcher::JobCards { eligible: &fits, order: &fits },
                     0,
                 );
                 (r, used)
@@ -2914,8 +2990,15 @@ impl WitnessRuntime {
         if !session_cap_admits(dv.cycles, parse_session_cap(std::env::var("ZKMINER_RISC0_MAX_SESSION_CYCLES").ok().as_deref())) {
             bail!("the diverged execution ({} cycles) is over ZKMINER_RISC0_MAX_SESSION_CYCLES", dv.cycles);
         }
-        let plan = self.prove_plan(&[po2]).await;
         let execute_secs = l.record.execute_ms_per_po2.unwrap_or(0).div_ceil(1000);
+        // On the cards it still fits, as it will be proven (see the prove call's `JobCards`).
+        let budget = run::deadline_proof_budget(self.proving_cutoff(l)).map(|b| b.as_secs());
+        let (plan, _) = self.prove_plan(&[po2]).await.for_job(
+            dv.cycles,
+            execute_secs,
+            self.proving_timeout.as_secs(),
+            |need| budget.is_none_or(|b| need <= b),
+        );
         let need = estimate_prove_secs(dv.cycles, &plan, execute_secs);
         if !watchdog_admits(need, self.proving_timeout.as_secs()) {
             bail!(
