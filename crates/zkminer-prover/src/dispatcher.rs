@@ -2877,6 +2877,42 @@ impl MeasureSetupError {
     }
 }
 
+thread_local! {
+    /// How long the job being dispatched on this thread would take on each slot (by slot key), for
+    /// `prove_min_vram`: set by `with_slot_estimates` around the call.
+    static SLOT_ESTIMATES: std::cell::RefCell<HashMap<String, Duration>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Run `f` (a `prove_min_vram` call) with `estimates`, how long the job would take on each slot by
+/// slot key: it is then started only on a slot where it can finish before its `abort_at`, and waits
+/// in the card line by its latest possible start. Without them every slot counts as fast enough.
+pub fn with_slot_estimates<R>(estimates: HashMap<String, Duration>, f: impl FnOnce() -> R) -> R {
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            SLOT_ESTIMATES.with(|e| e.borrow_mut().clear());
+        }
+    }
+    SLOT_ESTIMATES.with(|e| *e.borrow_mut() = estimates);
+    let _clear = Clear;
+    f()
+}
+
+/// This thread's estimate for `key` (`with_slot_estimates`).
+fn slot_estimate(key: &str) -> Option<Duration> {
+    SLOT_ESTIMATES.with(|e| e.borrow().get(key).copied())
+}
+
+/// Whether a proof estimated at `slot_estimate(key)` and starting now ends by `abort_at`; true when
+/// either is unknown.
+fn finishes_in_time(key: &str, abort_at: Option<Instant>) -> bool {
+    match (abort_at, slot_estimate(key)) {
+        (Some(abort), Some(takes)) => Instant::now() + takes <= abort,
+        _ => true,
+    }
+}
+
 /// A job waiting for a card (`WorkerPool::card_waiters`): the cards it can take, and when it is due.
 #[derive(Debug, Clone)]
 struct CardWaiter {
@@ -2915,16 +2951,18 @@ impl Drop for CardWaitGuard<'_> {
 }
 
 /// Windows: after recycling workers that held `held` bytes of commit (free commit was `before`),
-/// wait until most of it is free again, 15 s at most and no later than `give_up_at`. The card's VRAM
+/// wait until most of it is free again, or `need` (what the proof starting will commit) is, 15 s at
+/// most and no later than `give_up_at`. The card's VRAM
 /// comes back within a second, but the commit those workers held can lag it, and a worker started
 /// into it died of it: every out-of-commit death on a 5090 came 6-14 s after an SP1 sibling was
 /// recycled, with commit near the limit.
-fn wait_for_commit_back(before: u64, held: u64, give_up_at: Option<Instant>) {
+fn wait_for_commit_back(before: u64, held: u64, need: u64, give_up_at: Option<Instant>) {
     const COMMIT_BACK_WAIT: Duration = Duration::from_secs(15);
-    if held == 0 {
+    if held == 0 || before >= need {
         return;
     }
-    let want = before.saturating_add(held / 8 * 7);
+    // Most of what they held, or what this proof needs, whichever comes first.
+    let want = before.saturating_add(held / 8 * 7).min(need);
     let cap = Instant::now() + COMMIT_BACK_WAIT;
     let until = give_up_at.map_or(cap, |g| g.min(cap));
     let started = Instant::now();
@@ -4331,6 +4369,17 @@ impl WorkerPool {
         backends.sort();
         backends.dedup();
         backends
+    }
+
+    /// The slot keys of `backend`'s workers, for a caller that sizes a job per slot
+    /// (`with_slot_estimates`).
+    pub fn slot_keys_for(&self, backend: &str) -> Vec<String> {
+        self.keys_for_prefix(backend)
+    }
+
+    /// The benchmark's device id for a slot key (`"gpu0"`), to read its rate.
+    pub fn slot_benchmark_device(key: &str) -> String {
+        Self::benchmark_device_id(key)
     }
 
     /// Find all slot keys matching a prefix.
@@ -6859,30 +6908,6 @@ impl WorkerPool {
         }
     }
 
-    /// Like [`prove`], but with three extra controls used by the miner's retry loop:
-    ///
-    /// - `min_vram_bytes`: only dispatch to workers with at least this much VRAM
-    ///   (keeps large, OOM-prone proofs off smaller cards, e.g. a 300-segment proof
-    ///   onto a 32 GB GPU, not 24 GB). If no worker meets the floor (or none report
-    ///   VRAM), falls back to the full worker set so a job is never stranded.
-    /// - `exclude`: prefer workers whose slot key is NOT in this list — used to
-    ///   steer a retry away from a GPU that just wedged/timed out. Never strands:
-    ///   if excluding leaves no candidate, the full set is used.
-    /// - `used_slot`: set to the slot key actually dispatched to (BEFORE the proof
-    ///   runs, so it's populated even when the proof errors/times out), letting the
-    ///   caller exclude a wedged worker on the next attempt.
-    /// - `abort_at`: an absolute monotonic instant past which this proof must not
-    ///   run (the miner sets it to the job's lock deadline minus a release margin).
-    ///   Unlike `timeout` (a relative wedge budget that starts when the proof
-    ///   actually begins), this is re-checked AFTER any GPU-queue / respawn wait, so
-    ///   queue latency can't erase the caller's release margin. If the instant has
-    ///   already passed by the time a worker is ready, the proof isn't started and an
-    ///   error is returned so the caller can release the job in time.
-    /// - `disabled`: slots the OPERATOR switched off, as a HARD filter. Unlike `exclude` this is
-    ///   never restored when it empties the candidate set: a disabled device stays disabled even if
-    ///   that means the dispatch fails, because the reason for disabling it may be that using it
-    ///   breaks the host. See the note on the parameter.
-    #[allow(clippy::too_many_arguments)]
     /// Whether a job (`me`: its ticket when it is waiting, `None` arriving) must leave the free card
     /// `key` to a waiting job due before it: one that can take that card (by any of its workers, as a
     /// RISC Zero job can the card an SP1 job wants), with an earlier deadline,
@@ -6930,10 +6955,14 @@ impl WorkerPool {
     }
 
     /// Whether two slot keys are on one physical card (one is RISC Zero's, the other SP1's, say):
-    /// the same key, or the same PCI bus id.
+    /// the same key, the same GPU (`physical_gpu_id`, as the GPU locks), or the same PCI bus id.
     fn same_card(&self, a: &str, b: &str) -> bool {
         if a == b {
             return true;
+        }
+        // As the GPU locks key a card (`physical_gpu_id`), else by its PCI bus id.
+        if let (Some(x), Some(y)) = (physical_gpu_id(a), physical_gpu_id(b)) {
+            return x == y;
         }
         let bus = |k: &str| self.workers.get(k).and_then(|e| e.pci_bus_id.clone());
         matches!((bus(a), bus(b)), (Some(x), Some(y)) if x == y)
@@ -6959,6 +6988,30 @@ impl WorkerPool {
         (CardWaitGuard { pool: self, ticket }, ticket, since)
     }
 
+    /// Like [`prove`], but with three extra controls used by the miner's retry loop:
+    ///
+    /// - `min_vram_bytes`: only dispatch to workers with at least this much VRAM
+    ///   (keeps large, OOM-prone proofs off smaller cards, e.g. a 300-segment proof
+    ///   onto a 32 GB GPU, not 24 GB). If no worker meets the floor (or none report
+    ///   VRAM), falls back to the full worker set so a job is never stranded.
+    /// - `exclude`: prefer workers whose slot key is NOT in this list — used to
+    ///   steer a retry away from a GPU that just wedged/timed out. Never strands:
+    ///   if excluding leaves no candidate, the full set is used.
+    /// - `used_slot`: set to the slot key actually dispatched to (BEFORE the proof
+    ///   runs, so it's populated even when the proof errors/times out), letting the
+    ///   caller exclude a wedged worker on the next attempt.
+    /// - `abort_at`: an absolute monotonic instant past which this proof must not
+    ///   run (the miner sets it to the job's lock deadline minus a release margin).
+    ///   Unlike `timeout` (a relative wedge budget that starts when the proof
+    ///   actually begins), this is re-checked AFTER any GPU-queue / respawn wait, so
+    ///   queue latency can't erase the caller's release margin. If the instant has
+    ///   already passed by the time a worker is ready, the proof isn't started and an
+    ///   error is returned so the caller can release the job in time.
+    /// - `disabled`: slots the OPERATOR switched off, as a HARD filter. Unlike `exclude` this is
+    ///   never restored when it empties the candidate set: a disabled device stays disabled even if
+    ///   that means the dispatch fails, because the reason for disabling it may be that using it
+    ///   breaks the host. See the note on the parameter.
+    #[allow(clippy::too_many_arguments)]
     pub fn prove_min_vram(
         &self,
         backend: &str,
@@ -7092,7 +7145,17 @@ impl WorkerPool {
                 .get(&keys[0])
                 .and_then(|e| e.slot.try_lock().ok())
                 .is_some_and(|slot| Self::slot_eligible(&slot) && Self::in_respawn_backoff(&slot));
-        if keys.len() == 1 && !backoff_blocked {
+        // Straight to the one slot only when its card is free and no waiting job due first wants it
+        // (`yields_to_waiter`); otherwise into the line below. Taking the shortcut onto a busy card
+        // polled its GPU lock outside the line, five times as often, ahead of earlier deadlines.
+        let shortcut = keys.len() == 1
+            && !backoff_blocked
+            && self
+                .gpu_lock_for(&keys[0])
+                .is_none_or(|l| !matches!(l.try_lock(), Err(std::sync::TryLockError::WouldBlock)))
+            && finishes_in_time(&keys[0], abort_at)
+            && !self.yields_to_waiter(&keys[0], None, abort_at, Instant::now());
+        if shortcut {
             *used_slot = Some(keys[0].clone());
             return self.prove_on_slot(
                 &keys[0],
@@ -7146,9 +7209,22 @@ impl WorkerPool {
         let keys = Self::prefer_device_first(keys, preferred_device);
 
         let arrived = Instant::now();
+        // Its place in the card line: the latest it can start and still finish, on its best card
+        // (`with_slot_estimates`), else its cutoff.
+        let latest_start = abort_at.map(|abort| {
+            keys.iter()
+                .filter_map(|k| slot_estimate(k))
+                .min()
+                .and_then(|best| abort.checked_sub(best))
+                .unwrap_or(abort)
+        });
         for key in &keys {
+            // Not on a card too slow to finish it before its cutoff.
+            if !finishes_in_time(key, abort_at) {
+                continue;
+            }
             // A job already waiting for this card, and due first, takes it (`yields_to_waiter`).
-            if self.yields_to_waiter(key, None, abort_at, arrived) {
+            if self.yields_to_waiter(key, None, latest_start, arrived) {
                 continue;
             }
             if let Some(entry) = self.workers.get(key) {
@@ -7218,7 +7294,7 @@ impl WorkerPool {
         const QUEUE_WAIT_CAP: Duration = Duration::from_secs(3600);
         let queue_deadline = Instant::now() + timeout.unwrap_or(QUEUE_WAIT_CAP);
         // In line for a card: a freed one goes to the waiting job due first.
-        let (in_line, ticket, since) = self.wait_for_card(&keys, abort_at);
+        let (in_line, ticket, since) = self.wait_for_card(&keys, latest_start);
         loop {
             // Whether some eligible card is only BUSY (another proof holds it), not failed.
             let mut any_busy = false;
@@ -7226,7 +7302,11 @@ impl WorkerPool {
                 let Some(entry) = self.workers.get(key) else {
                     continue;
                 };
-                if self.yields_to_waiter(key, Some(ticket), abort_at, since) {
+                // A card too slow to finish it in time is no use to it, busy or not.
+                if !finishes_in_time(key, abort_at) {
+                    continue;
+                }
+                if self.yields_to_waiter(key, Some(ticket), latest_start, since) {
                     any_busy = true;
                     continue;
                 }
@@ -7262,6 +7342,18 @@ impl WorkerPool {
                         );
                     }
                 }
+            }
+            // No card here can finish it before its cutoff any more (each one's estimate,
+            // `with_slot_estimates`): release now, while that still succeeds, rather than start a
+            // proof the cutoff kills.
+            if abort_at.is_some() && keys.iter().all(|k| !finishes_in_time(k, abort_at)) {
+                return Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::ProofDeadlineReached {
+                        detail: "no card here can finish it before its deadline cutoff now \
+                                 (releasing to recover collateral)"
+                            .to_string(),
+                    },
+                ));
             }
             // Bail while a release can still succeed, rather than after the deadline passes.
             if let Some(abort) = abort_at {
@@ -7478,9 +7570,6 @@ impl WorkerPool {
             .unwrap_or_else(|| self.published_host_peak_at_po2(backend, po2))
     }
 
-    /// What a proof at `po2` on the slot `key` is charged in COMMIT (Windows): what that card's real
-    /// proofs at this po2 or above committed (`memory::learned_host_peak`), else the unmeasured
-    /// default (`memory::unmeasured_commit_for`) at `po2`, within what the host can ever commit.
     /// Whether a proof on `key` at `po2` stayed, at its peak (`low_water`), within what was reserved
     /// for it: `ram_charge` of RAM, and the slot's commit figure. A host shortage it died in then
     /// came from outside the job (`ShortageFromOutside`). Unknown peaks are not within.
@@ -7499,6 +7588,9 @@ impl WorkerPool {
         ram && commit
     }
 
+    /// What a proof at `po2` on the slot `key` is charged in COMMIT (Windows): what that card's real
+    /// proofs at this po2 or above committed (`memory::learned_host_peak`), else the unmeasured
+    /// default (`memory::unmeasured_commit_for`) at `po2`, within what the host can ever commit.
     fn slot_commit_peak(&self, key: &str, po2: Option<u8>) -> u64 {
         let total = crate::memory::commit_figures().map_or(u64::MAX, |c| c.total);
         self.slot_commit_peak_in(key, po2, total)
@@ -7584,6 +7676,51 @@ impl WorkerPool {
                     commit.saturating_add(self.current_commit_bytes_for_slot(k).unwrap_or(0)),
                 )
             })
+    }
+
+    /// Whether a proof of `backend` refused `needed` bytes of host RAM would fit once the proofs of
+    /// ours running now are done: what is free now (net of their growth still to come), plus what
+    /// their workers hold now, plus what idle workers of other backends could be recycled for, covers
+    /// it with the OS slice; and on Windows the same for its commit figure. Then it is waiting its
+    /// turn behind our own work, which its deadline bounds; otherwise something else holds the memory.
+    pub fn fits_when_ours_finish(&self, backend: &str, needed: u64) -> bool {
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        let idle: std::collections::HashSet<String> = self
+            .idle_prove_holdings()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let busy: Vec<&String> = self.workers.keys().filter(|k| !idle.contains(*k)).collect();
+        let held_ram = busy.iter().fold(0u64, |sum, k| {
+            sum.saturating_add(self.current_host_bytes_for_slot(k).unwrap_or(0))
+        });
+        let idle_ram = self
+            .idle_host_holdings_except(backend)
+            .iter()
+            .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
+        let ram_ok = self.admission_available().is_none_or(|available| {
+            needed.saturating_add(reserve)
+                <= available.saturating_add(held_ram).saturating_add(idle_ram)
+        });
+        let commit_ok = crate::memory::commit_figures().is_none_or(|c| {
+            let want = self.backend_commit_peak_in(backend, None, c.total);
+            let pending = self
+                .commit_ledger
+                .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
+            let held = busy.iter().fold(0u64, |sum, k| {
+                sum.saturating_add(self.current_commit_bytes_for_slot(k).unwrap_or(0))
+            });
+            let idle = self
+                .idle_commit_holdings_except(Some(backend))
+                .iter()
+                .fold(0u64, |sum, (_, h)| sum.saturating_add(*h));
+            want.saturating_add(reserve)
+                <= c.available
+                    .saturating_sub(pending)
+                    .saturating_add(held)
+                    .saturating_add(idle)
+        });
+        ram_ok && commit_ok
     }
 
     /// What the IDLE workers have COMMITTED (Windows): for the pressure check, as
@@ -8763,10 +8900,11 @@ impl WorkerPool {
     /// How many proofs can run at once, for a claim's set (`memory::claim_set_bytes`): one per card
     /// with a worker, no more than `max_concurrent`; `max_concurrent` when no card is known.
     fn claim_slots(&self, max_concurrent: usize) -> usize {
-        let mut cards: Vec<&str> = self
+        // Cards as the GPU locks know them (`physical_gpu_id`), else by PCI bus id.
+        let mut cards: Vec<String> = self
             .workers
-            .values()
-            .filter_map(|e| e.pci_bus_id.as_deref())
+            .iter()
+            .filter_map(|(k, e)| physical_gpu_id(k).or_else(|| e.pci_bus_id.clone()))
             .collect();
         cards.sort_unstable();
         cards.dedup();
@@ -10051,18 +10189,27 @@ impl WorkerPool {
                 }
                 // Windows: what the siblings to recycle hold in COMMIT (their VRAM included), and free
                 // commit now, to wait for that to come back too (below).
-                let commit_before = crate::memory::commit_figures().map(|c| c.free_now);
-                let commit_held: u64 = recyclable
+                let commit_before = crate::memory::commit_figures();
+                let commit_held: Vec<(String, u64)> = recyclable
                     .iter()
-                    .filter_map(|k| self.current_commit_bytes_for_slot(k))
-                    .sum();
+                    .filter_map(|k| Some((k.clone(), self.current_commit_bytes_for_slot(k)?)))
+                    .collect();
                 let gone = if recyclable.is_empty() {
                     Vec::new()
                 } else {
                     self.evict_idle_siblings(key, &recyclable, "VRAM")
                 };
                 if let (Some(before), false) = (commit_before, gone.is_empty()) {
-                    wait_for_commit_back(before, commit_held, give_up_at);
+                    // Only what the workers actually stopped held, and no more than this proof will
+                    // commit (with the pinned margin) needs to be back.
+                    let held = commit_held
+                        .iter()
+                        .filter(|(k, _)| gone.contains(k))
+                        .fold(0u64, |sum, (_, h)| sum.saturating_add(*h));
+                    let need = self
+                        .slot_commit_peak(key, risc0_po2)
+                        .saturating_add(crate::memory::pinned_commit_margin(before.limit));
+                    wait_for_commit_back(before.free_now, held, need, give_up_at);
                 }
                 let freed = movable
                     .iter()
@@ -16259,6 +16406,24 @@ mod learned_host_peak_tests {
         );
         pool.raise_learned_after_shortage("risc0:cuda:1", Some(19));
         assert!(pool.slot_commit_peak("risc0:cuda:1", Some(19)) >= after);
+    }
+
+    /// A job is started only on a slot where its estimate ends by its cutoff; with no estimate, or
+    /// no cutoff, any slot will do; the estimates last only for the call they were given to.
+    #[test]
+    fn a_job_is_not_started_where_it_cannot_finish() {
+        let abort = Some(Instant::now() + Duration::from_secs(300));
+        let estimates = HashMap::from([
+            ("sp1:cuda:0".to_string(), Duration::from_secs(130)),
+            ("sp1:cuda:1".to_string(), Duration::from_secs(340)),
+        ]);
+        with_slot_estimates(estimates, || {
+            assert!(finishes_in_time("sp1:cuda:0", abort));
+            assert!(!finishes_in_time("sp1:cuda:1", abort));
+            assert!(finishes_in_time("sp1:cuda:1", None));
+            assert!(finishes_in_time("sp1:cuda:9", abort));
+        });
+        assert!(finishes_in_time("sp1:cuda:1", abort));
     }
 
     /// A freed card goes to the waiting job due first: a later deadline, or a later arrival with the
