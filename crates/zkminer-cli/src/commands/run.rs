@@ -4576,6 +4576,46 @@ impl FiniteOr for f64 {
 /// Groth16 wrap that costs the same for any job, ~25-50 s on its own, and with hemilabs `sp1` from
 /// v6.8.1 it can also wait for the host-wide final-wrap slot while another card's wrap holds it. A
 /// small job sat at the 90 s floor, which those alone could use up.
+/// Whether a card proving at `rate` cycles/s can finish a measured job of `cycles` in time, by the two
+/// gates the claim admits it through: inside the per-attempt watchdog (`watchdog_secs`, the job's
+/// proof at the safety margin plus `allowance_secs`, as the watchdog gate counts it) and inside the
+/// job's prove window (`window_secs`, which already has those allowances taken off), by the
+/// evaluator's own test (`can_finish_at_throughput`). The claim gate admits a job on the cards this
+/// holds for, sizes it on the slowest of them, and the dispatcher sends it to no other
+/// (`JobCards`), so a slow card neither takes a job it cannot finish nor holds back a faster one.
+fn card_finishes_in_time(
+    cycles: u64,
+    rate: f64,
+    margin: f64,
+    allowance_secs: f64,
+    watchdog_secs: f64,
+    window_secs: u64,
+) -> bool {
+    if !(rate.is_finite() && rate > 0.0) {
+        return false;
+    }
+    let inside_watchdog = (cycles as f64 / rate) * margin + allowance_secs < watchdog_secs;
+    let inside_window =
+        zkminer_strategy::timing::can_finish_at_throughput(rate, cycles, window_secs, margin).0;
+    inside_watchdog && inside_window
+}
+
+/// The order a job's cards are tried in at dispatch (`JobCards::order`): the card it was planned for,
+/// then the rest of the cards it was admitted on (`eligible`, fastest first), leaving out the cards
+/// that refused it admission (`refused`), which the dispatcher then tries after these.
+fn job_card_order(
+    planned: Option<&String>,
+    eligible: &[String],
+    refused: &[String],
+) -> Vec<String> {
+    planned
+        .into_iter()
+        .chain(eligible.iter().filter(|d| Some(*d) != planned))
+        .filter(|d| !refused.contains(*d))
+        .cloned()
+        .collect()
+}
+
 fn fixed_proving_allowance_secs(backend: &str) -> u64 {
     if backend == zkminer_prover_protocol::BACKEND_SP1 {
         120
@@ -7049,11 +7089,47 @@ async fn miner_brain(
             // target. Only when there is no genuine row at all do we fall back to the mixed-list value
             // (behavior there is unchanged; the empty-rows case is handled by the sizing rework).
             let backend_name = backend_opt.unwrap_or("");
-            let genuine_throughputs: Vec<f64> = device_backend_throughputs
+            let genuine_rows: Vec<(String, f64)> = device_backend_throughputs
                 .iter()
                 .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
-                .map(|(_, _, t)| *t)
+                .map(|(d, _, t)| (d.clone(), *t))
                 .collect();
+            let genuine_throughputs: Vec<f64> = genuine_rows.iter().map(|(_, t)| *t).collect();
+            // A measured job is admitted only on the cards that can finish it in time (see
+            // `card_finishes_in_time`), and sized on the slowest of THOSE. Sizing on the slowest card of
+            // all let one slow card (an Arc A770 proves risc0 about 15x slower than an RX 7900 XTX)
+            // refuse every job too big for it, on every card; and fallback dispatch sent jobs to it
+            // while faster cards were free. When no card can, nothing changes: the gates below refuse
+            // the job on the slowest card's figure, as before.
+            let eligible_rows: Vec<(String, f64)> = match measured_for_job {
+                Some(cycles) => genuine_rows
+                    .iter()
+                    .filter(|(_, rate)| {
+                        card_finishes_in_time(
+                            cycles,
+                            *rate,
+                            deadline_safety_margin,
+                            (backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0)
+                                + execute_allowance) as f64,
+                            proving_timeout.as_secs_f64(),
+                            prove_window,
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            let sizing_rows = if eligible_rows.is_empty() {
+                &genuine_rows
+            } else {
+                &eligible_rows
+            };
+            // The cards the dispatcher may send it to, fastest first (`JobCards`); none named: any.
+            snapshot.eligible_devices = {
+                let mut by_speed = eligible_rows.clone();
+                by_speed.sort_by(|a, b| b.1.total_cmp(&a.1));
+                by_speed.into_iter().map(|(d, _)| d).collect()
+            };
             let slowest_eligible = if genuine_throughputs.is_empty() {
                 throughputs_for_backend(&device_backend_throughputs, backend_name)
                     .iter()
@@ -7063,13 +7139,15 @@ async fn miner_brain(
                     .fold(f64::INFINITY, f64::min)
                     .pipe_finite_or(0.0)
             } else {
-                genuine_throughputs.iter().copied().fold(f64::INFINITY, f64::min)
+                sizing_rows
+                    .iter()
+                    .map(|(_, t)| *t)
+                    .fold(f64::INFINITY, f64::min)
             };
-            snapshot.preferred_device = device_backend_throughputs
+            snapshot.preferred_device = sizing_rows
                 .iter()
-                .filter(|(_, b, t)| b.as_str() == backend_name && t.is_finite() && *t > 0.0)
-                .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(id, _, _)| id.clone());
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| id.clone());
             // The conservative floor, charged for a risc0 card at a size below the one rows describe.
             let conservative_cps = if backend_name == zkminer_prover_protocol::BACKEND_RISC0 {
                 risc0_conservative_cps(&risc0_sizes)
@@ -8033,6 +8111,10 @@ struct JobStatusSnapshot {
     /// passed to the dispatcher as a PREFERENCE (tried first, graceful fallback). `None` on paths
     /// without a plan (recovery, non-measurable backends). See `prove_min_vram`'s `preferred_device`.
     preferred_device: Option<String>,
+    /// Benchmark device ids of the cards the claim gate admitted this job on, fastest first: the
+    /// dispatcher sends it to no other (see `JobCards`). Empty: no such plan (recovery, an unmeasured
+    /// or non-measurable job), so any card.
+    eligible_devices: Vec<String>,
     /// keccak256 of the risc0 ELF whose image-id was verified when this (program, input) was measured,
     /// resolved from the measurement cache entry alongside `measured_cycles` (so it co-evicts with it).
     /// Threaded into `fetch_or_download_elf` on the claim-obtainability and prove fetches as the
@@ -8088,6 +8170,7 @@ impl JobStatusSnapshot {
             measured_cycles: None,
             measured_peak: None,
             preferred_device: None,
+            eligible_devices: Vec::new(),
             verified_elf_hash: None,
             measured_journal: None,
             measured_execute_secs: None,
@@ -9657,11 +9740,12 @@ async fn process_job_lifecycle(
         // (`segment_disk::inline_short`, read here, not from the worker): this host's failure.
         let mut disk_short = false;
         let mut attempt = 0u32;
-        // Set once the claim-time preferred card hits an ADMISSION (un-attempted host-RAM) refusal:
-        // unlike a GPU shortage it does not exclude the card, so without dropping the preference the
-        // dispatcher would re-pin the un-admittable cold preferred card every retry while the warm
-        // sibling idles → abandon → penalized release. Dropping it reverts to warm-first fallback.
-        let mut drop_preference = false;
+        // The cards that refused this job ADMISSION (an un-attempted host-RAM refusal), in the order
+        // they refused. Unlike a GPU shortage that does not exclude the card, so if it stayed in the
+        // order the dispatcher would re-pin the un-admittable card every retry while another idles →
+        // abandon → penalized release. It is taken out of the order instead: the job's other cards
+        // are tried first, fastest first, and the refused one after them (still eligible).
+        let mut refused_admission: Vec<String> = Vec::new();
         // Whether the log has said this job proves at a size it was not measured at, or that it is
         // waiting for a risc0 card.
         let mut warned_unmeasured = false;
@@ -9829,12 +9913,15 @@ async fn process_job_lifecycle(
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
-            // The card this job was planned for (benchmark id, e.g. "gpu1"), preferred at dispatch.
-            let preferred_for_prove = if drop_preference {
-                None
-            } else {
-                snapshot.preferred_device.clone()
-            };
+            // The cards this job was admitted on (a hard filter) and the order to try them in: the card
+            // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
+            // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
+            let eligible_for_prove = snapshot.eligible_devices.clone();
+            let order_for_prove = job_card_order(
+                snapshot.preferred_device.as_ref(),
+                &eligible_for_prove,
+                &refused_admission,
+            );
             // This job's pre-claim measured execute PEAK (SP1 only; 0 otherwise), for the dispatcher's
             // RH2 prove reservation — charges the `server + execute` spike so a concurrent other-backend
             // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
@@ -9911,7 +9998,10 @@ async fn process_job_lifecycle(
                         .is_some()
                         .then_some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
                     program_id_bytes,
-                    preferred_for_prove.as_deref(),
+                    zkminer_prover::dispatcher::JobCards {
+                        eligible: &eligible_for_prove,
+                        order: &order_for_prove,
+                    },
                     execute_peak_for_prove,
                 );
                 (r, used)
@@ -10082,12 +10172,17 @@ async fn process_job_lifecycle(
                     {
                         // An admission refusal (nothing ran) means the slot just tried — most likely
                         // the cold claim-time preferred card — could not be admitted now. Unlike a GPU
-                        // shortage this does NOT exclude the slot, so drop the device preference for the
-                        // rest of this job and let the dispatcher's warm-first ordering pick the warm
-                        // sibling instead of re-pinning the un-admittable card every retry. Only on an
-                        // un-attempted (admission) refusal; an OOM mid-proof is a different event.
+                        // shortage this does NOT exclude the slot, so take its card out of this job's
+                        // order: the other cards it may run on are tried first, fastest first, rather
+                        // than re-pinning the un-admittable card every retry. Only on an un-attempted
+                        // (admission) refusal; an OOM mid-proof is a different event.
                         if !shortage.attempted {
-                            drop_preference = true;
+                            let card = zkminer_prover::dispatcher::WorkerPool::benchmark_device_id(
+                                &shortage.slot_key,
+                            );
+                            if !refused_admission.contains(&card) {
+                                refused_admission.push(card);
+                            }
                         }
                         // Only an ADMISSION refusal is free. That costs a `/proc/meminfo` read, so
                         // nothing was attempted and waiting is the honest response. A worker
@@ -13319,6 +13414,49 @@ async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    #[test]
+    fn a_job_tries_its_planned_card_then_the_fastest_and_a_refusing_card_last() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let eligible = ids(&["gpu0", "gpu-rocm1", "gpu-rocm0", "gpu-intel0"]);
+        let planned = "gpu-rocm1".to_string();
+        assert_eq!(
+            job_card_order(Some(&planned), &eligible, &[]),
+            ids(&["gpu-rocm1", "gpu0", "gpu-rocm0", "gpu-intel0"])
+        );
+        // The 7900 XTX refused admission (host RAM): the 4090, then the 9070 XT, before the A770.
+        assert_eq!(
+            job_card_order(Some(&planned), &eligible, &ids(&["gpu-rocm1"])),
+            ids(&["gpu0", "gpu-rocm0", "gpu-intel0"])
+        );
+        // No plan: only the preference, which a refusal removes.
+        let any = "gpu0".to_string();
+        assert_eq!(job_card_order(Some(&any), &[], &[]), ids(&["gpu0"]));
+        assert!(job_card_order(Some(&any), &[], &ids(&["gpu0"])).is_empty());
+        assert!(job_card_order(None, &[], &[]).is_empty());
+    }
+
+    /// The cards a measured job is admitted on: those that finish it inside the watchdog and the
+    /// window, at the claim gate's margin. Measured on this host: an RX 7900 XTX proves risc0 at ~2.2M
+    /// c/s, an Arc A770 at ~116K.
+    #[test]
+    fn a_card_is_eligible_only_if_it_finishes_the_job_in_time() {
+        // A 1.5 margin, 2 s of allowances, a 600 s watchdog and a window of `window` s.
+        let fits =
+            |cycles, rate, window| card_finishes_in_time(cycles, rate, 1.5, 2.0, 600.0, window);
+        let (xtx, a770) = (2.2e6, 116e3);
+        // A 41M-cycle job: both cards (the A770's ~535 s, at the margin, fits the 600 s watchdog).
+        assert!(fits(41_418_752, xtx, 3000));
+        assert!(fits(41_418_752, a770, 3000));
+        // A 100M-cycle job: the XTX only; the A770 would need ~1300 s.
+        assert!(fits(100_000_000, xtx, 3000));
+        assert!(!fits(100_000_000, a770, 3000));
+        // The window binds too: 41M cycles on the A770 do not fit a 400 s window.
+        assert!(!fits(41_418_752, a770, 400));
+        // No rate, no card.
+        assert!(!fits(1, 0.0, 3000));
+        assert!(!fits(1, f64::NAN, 3000));
+    }
 
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.
     ///
