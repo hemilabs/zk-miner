@@ -42,7 +42,66 @@ fn loopback_link_local_the_lan_and_the_router_are_refused() {
         ip("10.0.0.1"),
     ];
     // The default routes' gateways: the home router.
-    checked.extend(f.routes().uplinks().iter().map(|(gw, _)| *gw));
+    let gateways: Vec<IpAddr> = f.routes().uplinks().iter().map(|(gw, _)| *gw).collect();
+    assert!(!gateways.is_empty(), "no uplink: {:?}", f.routes().routes());
+    checked.extend(&gateways);
+    // On a private LAN the address checks refuse all of these before any macOS code runs, so the
+    // macOS route reading and kernel query are checked on their own here (review round 1,
+    // cross-2): the IPv4 router is on-link to the kernel, and a LAN neighbour to the table.
+    let mut kernel_checked = 0;
+    for gw in gateways.iter().filter(|g| g.is_ipv4()) {
+        assert!(
+            matches!(
+                f.kernel_verdict(*gw, Some(80)),
+                Err(Denied::OffDefaultRoute {
+                    kind: RouteKind::OnLink,
+                    ..
+                })
+            ),
+            "{gw}: {:?}",
+            f.kernel_verdict(*gw, Some(80))
+        );
+        kernel_checked += 1;
+    }
+    let lan: Vec<IpAddr> = f
+        .connected()
+        .iter()
+        .filter(|c| c.addr.is_ipv4() && !c.addr.is_loopback() && c.len <= 29)
+        .filter(|c| gateways.iter().any(|g| c.contains(*g)))
+        .map(|c| match c.addr {
+            IpAddr::V4(a) => IpAddr::V4((u32::from(a) | 6).into()),
+            v6 => v6,
+        })
+        .filter(|n| !f.own_addresses().contains(n) && !gateways.contains(n))
+        .collect();
+    for n in &lan {
+        assert_eq!(
+            f.routes().off_default_path(*n).map(|r| r.kind),
+            Some(RouteKind::OnLink),
+            "{n}"
+        );
+        assert!(
+            matches!(
+                f.kernel_verdict(*n, Some(80)),
+                Err(Denied::OffDefaultRoute {
+                    kind: RouteKind::OnLink,
+                    ..
+                })
+            ),
+            "{n}: {:?}",
+            f.kernel_verdict(*n, Some(80))
+        );
+        checked.push(*n);
+        kernel_checked += 1;
+    }
+    if gateways.iter().any(|g| g.is_ipv4()) {
+        assert!(
+            !lan.is_empty(),
+            "no LAN prefix holds the router: {:?}",
+            f.connected()
+        );
+    }
+    eprintln!("{kernel_checked} router and LAN verdicts checked on the macOS route code");
     for a in checked {
         let d = p.admit(a).unwrap_err();
         if is_global(a) {
@@ -72,6 +131,11 @@ fn neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused() {
     let p = policy();
     let f = p.facts();
     let mut neighbours = 0;
+    let global_prefixes = f
+        .connected()
+        .iter()
+        .filter(|c| is_global(c.addr) && c.len + 3 <= if c.addr.is_ipv4() { 32 } else { 128 })
+        .count();
     for c in f.connected() {
         let width = if c.addr.is_ipv4() { 32 } else { 128 };
         if !is_global(c.addr) || c.len + 3 > width {
@@ -153,6 +217,15 @@ fn neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused() {
         );
     }
     eprintln!("{neighbours} global neighbours refused");
+    // Review round 1, cross-2: the neighbour checks must have run where they can.
+    if global_prefixes > 0 {
+        assert!(
+            neighbours > 0,
+            "{global_prefixes} global connected prefixes, no neighbour"
+        );
+    } else {
+        eprintln!("SKIPPED the global neighbours: no global connected prefix here");
+    }
 }
 
 /// An ordinary public address is admitted, by the address checks and by the kernel (its route is
@@ -229,6 +302,48 @@ fn this_macs_uplinks_are_its_unscoped_defaults() {
     for r in t.routes().iter().filter(|r| r.is_default_like()) {
         assert_eq!(r.table, crate::routes::RT_TABLE_MAIN, "{r:?}");
     }
+    // On the raw dump, before the table drops anything (review round 1, cross-2): the scoped
+    // defaults are there, in their interface's scoped table, and neither a route of the table nor
+    // an uplink.
+    let (raw, _) = crate::routes::read_routing(&[]).unwrap();
+    let scoped: Vec<&Route> = raw
+        .iter()
+        .filter(|r| r.prefix.len == 0 && r.table != crate::routes::RT_TABLE_MAIN)
+        .collect();
+    for r in &scoped {
+        assert!(r.table >= crate::routes::sys::SCOPED_TABLE, "{r:?}");
+        assert_eq!(
+            r.table,
+            crate::routes::sys::SCOPED_TABLE + r.ifindex,
+            "{r:?}"
+        );
+        assert!(
+            !t.routes()
+                .iter()
+                .any(|x| x.prefix == r.prefix && x.ifindex == r.ifindex && x.table == r.table),
+            "{r:?}"
+        );
+        if let Hop::Via(gw) = r.hop {
+            assert!(!t.uplinks().contains(&(gw, r.ifindex)), "{r:?}");
+        }
+        assert!(!t.default_interfaces().contains(&r.ifindex), "{r:?}");
+    }
+    let links = crate::routes::read_links().unwrap();
+    let utun_scoped = scoped
+        .iter()
+        .filter(|r| {
+            links
+                .iter()
+                .any(|l| l.index == r.ifindex && l.name.starts_with("utun"))
+        })
+        .count();
+    if utun_scoped == 0 {
+        eprintln!("SKIPPED the scoped utun defaults: this Mac has none");
+    }
+    eprintln!(
+        "{} scoped defaults in the dump ({utun_scoped} on utun), none a default route",
+        scoped.len()
+    );
     let links = crate::routes::read_links().unwrap();
     for (_, i) in t.uplinks() {
         let l = links.iter().find(|l| l.index == *i).unwrap();
