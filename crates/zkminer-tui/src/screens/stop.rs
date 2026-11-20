@@ -38,17 +38,33 @@ pub struct HeldJobs {
     pub too_close_to_keep: usize,
     /// The earliest cutoff among the locks a keep-locks stop would keep.
     pub earliest_kept: Option<u64>,
+    /// Locks held but not being worked on (`MinerState::kept_locks`): kept through a pause, past
+    /// their deadline, a release that failed.
+    pub held_idle: usize,
 }
 
 impl HeldJobs {
     pub fn total(&self) -> usize {
-        self.proving + self.submitting
+        self.proving + self.submitting + self.held_idle
     }
 }
 
 /// The held jobs as of `now` (unix seconds).
 pub fn held_jobs(state: &MinerState, now: u64) -> HeldJobs {
-    let mut held = HeldJobs::default();
+    let mut held = HeldJobs {
+        // Collateral the status bar counts too: a quit with only these used to skip the question.
+        held_idle: state
+            .kept_locks
+            .iter()
+            .filter(|k| {
+                !state
+                    .active_jobs
+                    .iter()
+                    .any(|j| j.info.job_id == k.info.job_id)
+            })
+            .count(),
+        ..HeldJobs::default()
+    };
     for job in &state.active_jobs {
         match job.status {
             MinerJobStatus::Queued | MinerJobStatus::Proving { .. } => {
@@ -282,10 +298,14 @@ pub fn render_prompt(f: &mut Frame, area: Rect, state: &MinerState) {
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
-                        " {} job(s) hold collateral: {} queued or proving, {} submitting a proof.",
+                        " {} job(s) hold collateral: {} queued or proving, {} submitting a proof{}.",
                         held.total(),
                         held.proving,
-                        held.submitting
+                        held.submitting,
+                        match held.held_idle {
+                            0 => String::new(),
+                            n => format!(", {n} held but not being proven"),
+                        }
                     ),
                     Style::default().fg(theme::text()),
                 )),

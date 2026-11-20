@@ -2566,6 +2566,64 @@ fn open_rank(j: &TrackedJob) -> u128 {
 }
 
 
+/// A job's tag for the dispatcher's memory line (`with_job_tag`): the first 8 bytes of its id.
+fn job_tag(job_id: B256) -> u64 {
+    u64::from_be_bytes(job_id.0[..8].try_into().unwrap_or_default())
+}
+
+/// How a lock of ours that is gone ended, for the history (`MinerState::record_finished`), judged
+/// from its record before that is dropped and from the job's view (`status`, `prover`) when read:
+/// fulfilled by us; else gone after its deadline (a keeper slashed it); else released. `None` for a
+/// claim never confirmed ours (it may never have landed).
+fn lock_end(
+    journal: &SharedJournal,
+    job_id: B256,
+    view: Option<(u8, alloy::primitives::Address)>,
+    us: alloy::primitives::Address,
+) -> Option<zkminer_tui::state::MinerJobStatus> {
+    use zkminer_tui::state::MinerJobStatus;
+    let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    let e = j.entries.get(&job_id)?;
+    let held = e.state != crate::journal::JournalState::Claiming;
+    let past = e.lock_deadline != 0 && zkminer_chain::client::chain_now_floor() >= e.lock_deadline;
+    if view.is_some_and(|(status, prover)| {
+        status == zkminer_chain::jobs::JOB_STATUS_FULFILLED && prover == us
+    }) {
+        Some(MinerJobStatus::Fulfilled { payout: 0 })
+    } else if held && past {
+        Some(MinerJobStatus::Slashed { by_us: false })
+    } else if held {
+        Some(MinerJobStatus::Released { penalty: 0 })
+    } else {
+        None
+    }
+}
+
+/// Put locks a recovery pass found gone (`RecoveryPass::ended`) in the history, and say so in the
+/// activity log: a slash loses the collateral, and nothing else would tell the operator.
+async fn record_lock_ends(
+    state: &zkminer_tui::state::SharedState,
+    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus)>,
+) {
+    use zkminer_tui::state::MinerJobStatus;
+    if ended.is_empty() {
+        return;
+    }
+    let mut s = state.write().await;
+    for (job_id, end) in ended {
+        let (level, what) = match end {
+            MinerJobStatus::Slashed { .. } => (
+                LogLevel::Warn,
+                "was slashed after its deadline: its collateral is lost",
+            ),
+            MinerJobStatus::Fulfilled { .. } => (LogLevel::Info, "was fulfilled"),
+            _ => (LogLevel::Info, "is no longer locked to this miner"),
+        };
+        s.record_finished(job_id, end);
+        s.add_log(level, format!("Job {} {what}", short_id(job_id)));
+    }
+}
+
 /// Windows: keep the machine from sleeping while this miner holds collateral (`holding`: a claim in
 /// flight or a lock on record). Asleep it proves nothing, and its locks run past their deadlines to a
 /// slash. The request belongs to the thread that makes it (`SetThreadExecutionState`), so a thread
@@ -4346,6 +4404,14 @@ pub async fn run(
     let brain_state = state.clone();
     // Read at the start (see `loaded_journal`).
     let journal: SharedJournal = Arc::new(Mutex::new(loaded_journal));
+    // Locks on record from the last run: awake through startup and recovery, before the first tick.
+    keep_awake(
+        !journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .is_empty(),
+    );
     let brain_journal = journal.clone();
     // The startup value; the brain re-reads the Settings screen's every pass.
     let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs().max(60));
@@ -5937,9 +6003,27 @@ static OBSERVED_THROUGHPUT: std::sync::Mutex<Option<HashMap<(String, String), f6
 /// Weight of the newest proof in `OBSERVED_THROUGHPUT`'s moving average.
 const OBSERVED_THROUGHPUT_WEIGHT: f64 = 0.3;
 
-/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`).
+/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`): its STARK rate, net
+/// of the card's fixed part (`card_fixed_secs`, at most half the proof). A whole-proof rate depends
+/// on the job's size: one learned on a 50 M-cycle SP1 proof (most of it the wrap) priced a 2 B one
+/// at twice what it took, and sent it to the slower card.
 fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration) {
-    let Some((key, rate)) = observed_rate(slot, cycles, duration) else {
+    let backend = slot.split(':').next().unwrap_or(slot);
+    let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(slot);
+    let fixed = zkminer_prover::benchmark::load_cached_benchmark()
+        .and_then(|suite| {
+            let row = suite
+                .device_benchmarks
+                .iter()
+                .find(|d| d.device_id == device && d.prover_backend == backend)
+                .cloned();
+            card_fixed_secs(backend, row.as_ref())
+        })
+        .unwrap_or(0.0);
+    let stark = duration
+        .saturating_sub(Duration::from_secs_f64(fixed))
+        .max(duration / 2);
+    let Some((key, rate)) = observed_rate(slot, cycles, stark) else {
         return;
     };
     let mut seen = OBSERVED_THROUGHPUT
@@ -6393,12 +6477,29 @@ const SP1_PROOF_SETUP_SECS: f64 = 15.0;
 /// can still finish before its cutoff, so it leans long.
 const SLOT_ESTIMATE_PAD: f64 = 1.1;
 
-/// How long a job of `cycles` takes on a card, from what is known of the card: the whole-proof rate
-/// observed on it this run (which reflects the size it proves at and an SP1 shard cap), at least the
-/// fixed part of a proof; else the benchmark's STARK rate plus its wrap time (plus the SP1 server's
-/// setup), plus `execute` seconds for running the guest first; else the benchmark's mean rate plus the
-/// planner's fixed allowance, as before. Padded by `SLOT_ESTIMATE_PAD`. A flat 120 s for every SP1
-/// proof was right for neither card: the 5090 wraps in a few seconds, the 4070 in 17.
+/// The part of a proof on a card that does not scale with cycles: its benchmarked wrap, plus the SP1
+/// server's setup for the program. `None` without a measured wrap.
+fn card_fixed_secs(
+    backend: &str,
+    row: Option<&zkminer_prover::benchmark::DeviceBenchmark>,
+) -> Option<f64> {
+    let setup = if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        SP1_PROOF_SETUP_SECS
+    } else {
+        0.0
+    };
+    row.and_then(|r| r.wrap_secs()).map(|w| w + setup)
+}
+
+/// How long a job of `cycles` takes on a card, from what is known of the card: its STARK rate (the
+/// one observed on it this run, net of the fixed part, which reflects the size it proves at and an
+/// SP1 shard cap; else the benchmark's) plus the fixed part (`card_fixed_secs`), plus `execute`
+/// seconds for running the guest first; else the benchmark's mean rate plus the planner's fixed
+/// allowance, as before.
+/// Padded by `SLOT_ESTIMATE_PAD`. The benchmark's STARK rate is weighted by cycles, which its
+/// precompile-heavy program dominates for SP1 (17 Mc/s on a 5090 against 9-11 for the rest), so the
+/// slower of it and the mean of the programs' rates is taken. A flat 120 s for every SP1 proof was
+/// right for neither card.
 fn card_estimate_secs(
     backend: &str,
     cycles: u64,
@@ -6407,17 +6508,19 @@ fn card_estimate_secs(
     row: Option<&zkminer_prover::benchmark::DeviceBenchmark>,
 ) -> Option<f64> {
     let positive = |r: &f64| r.is_finite() && *r > 0.0;
-    let setup = if backend == zkminer_prover_protocol::BACKEND_SP1 {
-        SP1_PROOF_SETUP_SECS
-    } else {
-        0.0
-    };
-    let fixed = row.and_then(|r| r.wrap_secs()).map(|w| w + setup);
+    let fixed = card_fixed_secs(backend, row);
     let secs = if let Some(rate) = observed.filter(positive) {
-        (cycles as f64 / rate).max(fixed.unwrap_or(0.0))
+        // The guest's execute too: a job's own (its measurement says how slow) is not the average
+        // the observed rate holds.
+        cycles as f64 / rate + fixed.unwrap_or(0.0) + execute as f64
     } else {
         let row = row?;
-        match (row.stark_rate().filter(positive), fixed) {
+        let stark = row
+            .stark_rate()
+            .filter(positive)
+            .map(|r| r.min(row.throughput).max(f64::MIN_POSITIVE))
+            .filter(|_| positive(&row.throughput));
+        match (stark, fixed) {
             (Some(rate), Some(fixed)) => cycles as f64 / rate + fixed + execute as f64,
             _ => {
                 let rate = Some(row.throughput).filter(positive)?;
@@ -7023,6 +7126,7 @@ async fn miner_brain(
             undecided: Vec::new(),
             actions: Vec::new(),
             scan: None,
+            ended: Vec::new(),
         }
     } else {
         recover_claimed_jobs(
@@ -7040,6 +7144,7 @@ async fn miner_brain(
     };
     let mut recovery_deferred = startup_pass.deferred;
     let mut recovery_scan = startup_pass.scan;
+    record_lock_ends(&state, startup_pass.ended).await;
     spawn_recovery_actions(
         startup_pass.actions,
         (startup_pass.scan_ok, startup_pass.undecided),
@@ -7662,6 +7767,7 @@ async fn miner_brain(
                     .await;
                     recovery_deferred = pass.deferred;
                     recovery_scan = pass.scan;
+                    record_lock_ends(&state, pass.ended).await;
                     // Reap tasks that finished DURING the pass first, so a lock whose task just
                     // ended can be picked up again.
                     let mut rearm = false;
@@ -9307,9 +9413,10 @@ async fn miner_brain(
             // job, or behind as many of its own backend as run side by side, starts only once those
             // are done: what is left of its window is what it has, not the whole of it. Checked as
             // if it started now, a queued job could reach its cutoff waiting and be released.
-            let prove_window = if planner_active {
-                prove_window
-            } else {
+            // With the planner, which places jobs on cards as if each card ran its own, only the turn a
+            // backend waits for memory (fewer of it side by side than there are cards: one SP1 proof
+            // at a time on a ~100 GB Windows host) is added.
+            let prove_window = {
                 let backend = backend_opt.unwrap_or("");
                 let outstanding: Vec<(u64, &str)> = inflight_work
                     .iter()
@@ -9325,29 +9432,42 @@ async fn miner_brain(
                 cards.dedup();
                 let side_by_side = zkminer_prover::engine::worker_pool()
                     .map_or(usize::MAX, |p| p.backend_side_by_side(backend));
-                let wait = expected_queue_wait_secs(
-                    &outstanding,
-                    backend,
-                    cards.len().clamp(1, max_concurrent.max(1)),
-                    side_by_side,
-                    |b| {
-                        // Each card's rate as observed this run where it has proved, else planned.
-                        let mut rates: Vec<f64> = device_backend_throughputs
-                            .iter()
-                            .filter(|(_, rb, _)| rb == b)
-                            .map(|(d, rb, t)| {
-                                observed
-                                    .get(&(d.clone(), rb.clone()))
-                                    .copied()
-                                    .unwrap_or(*t)
-                            })
-                            .filter(|t| t.is_finite() && *t > 0.0)
-                            .collect();
-                        rates.sort_by(|x, y| y.total_cmp(x));
-                        rates
-                    },
-                    |b| fixed_proving_allowance_secs(b) as f64,
-                );
+                let card_count = if planner_active {
+                    if side_by_side >= cards.len() {
+                        0
+                    } else {
+                        usize::MAX
+                    }
+                } else {
+                    cards.len().clamp(1, max_concurrent.max(1))
+                };
+                let wait = if card_count == 0 {
+                    0
+                } else {
+                    expected_queue_wait_secs(
+                        &outstanding,
+                        backend,
+                        card_count,
+                        side_by_side,
+                        |b| {
+                            // Each card's rate as observed this run where it has proved, else planned.
+                            let mut rates: Vec<f64> = device_backend_throughputs
+                                .iter()
+                                .filter(|(_, rb, _)| rb == b)
+                                .map(|(d, rb, t)| {
+                                    observed
+                                        .get(&(d.clone(), rb.clone()))
+                                        .copied()
+                                        .unwrap_or(*t)
+                                })
+                                .filter(|t| t.is_finite() && *t > 0.0)
+                                .collect();
+                            rates.sort_by(|x, y| y.total_cmp(x));
+                            rates
+                        },
+                        |b| fixed_proving_allowance_secs(b) as f64,
+                    )
+                };
                 prove_window.saturating_sub(wait)
             };
 
@@ -10189,8 +10309,20 @@ async fn miner_brain(
                 .map(|j| j.info.job_id)
                 .chain(in_flight.keys().copied())
                 .collect();
-            s.job_measurements.retain(|jid, _| live.contains(jid));
             s.proving.retain(|jid, _| live.contains(jid));
+            // A measurement also outlasts the claim on held locks and the history the Jobs page
+            // lists (`recent_finished`): their Job Detail said it was never recorded.
+            let shown: std::collections::HashSet<B256> = s
+                .kept_locks
+                .iter()
+                .map(|j| j.info.job_id)
+                .chain(
+                    s.recent_finished(zkminer_tui::state::RECENT_ROWS)
+                        .map(|j| j.info.job_id),
+                )
+                .collect();
+            s.job_measurements
+                .retain(|jid, _| live.contains(jid) || shown.contains(jid));
         }
         // Why each job looked at this pass was not claimed, for the dashboard and the headless log.
         {
@@ -12245,6 +12377,20 @@ async fn process_job_lifecycle(
         // Cleared once a pass is not a memory wait (an attempt ran): a later shortage is a new one.
         let mut memory_wait_since: Option<std::time::Instant> = None;
         let mut memory_waited_last = false;
+        // Its place in the dispatcher's memory line goes when its proving does, however it ends
+        // (`WorkerPool::forget_memory_waiter`), not after the line's timeout.
+        struct ForgetMemoryPlace(u64);
+        impl Drop for ForgetMemoryPlace {
+            fn drop(&mut self) {
+                if let Some(pool) = zkminer_prover::engine::worker_pool() {
+                    pool.forget_memory_waiter(self.0);
+                }
+            }
+        }
+        let _memory_place = ForgetMemoryPlace(job_tag(job_id));
+        // A note saying what the job waits for is up (no card, GPU or host memory): cleared when a
+        // pass gets past that wait, else it outlived it while the job only queued for a card.
+        let mut wait_note_up = false;
         // Free VRAM waits, counted separately from `memory_waits`: the two shortages have different
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
@@ -12426,6 +12572,7 @@ async fn process_job_lifecycle(
                         "waiting: no enabled risc0 card has a job size (switch one on, or give one \
                          a po2 under Settings, Advanced); released before its deadline otherwise",
                     );
+                    wait_note_up = true;
                     if !warned_no_card {
                         warned_no_card = true;
                         let detail = format!(
@@ -12468,6 +12615,14 @@ async fn process_job_lifecycle(
             } else {
                 None
             };
+            // Past every wait before the dispatch: what it waited for is no longer what it waits for
+            // (the dispatcher's own memory and card waits set theirs again).
+            if std::mem::take(&mut wait_note_up) {
+                state
+                    .write()
+                    .await
+                    .clear_job_note(job_id, zkminer_tui::state::JobNoteKind::Wait);
+            }
             // Cloned for the progress callback below, which runs on the blocking thread, and the
             // runtime it hands the state update to.
             let state_for_prove_progress = state.clone();
@@ -12596,8 +12751,7 @@ async fn process_job_lifecycle(
                 };
                 let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
                 // As this job, so a wait for memory keeps its place across attempts.
-                let tag = u64::from_be_bytes(job_id.0[..8].try_into().unwrap_or_default());
-                let r = zkminer_prover::dispatcher::with_job_tag(tag, || {
+                let r = zkminer_prover::dispatcher::with_job_tag(job_tag(job_id), || {
                     zkminer_prover::dispatcher::with_slot_estimates(estimates_for_prove, || {
                         pool.prove_min_vram(
                             &backend_str,
@@ -12748,6 +12902,7 @@ async fn process_job_lifecycle(
                                     "waiting for GPU memory, checking again every {GPU_MEMORY_BACKOFF_SECS}s"
                                 ),
                             );
+                            wait_note_up = true;
                             tokio::time::sleep(Duration::from_secs(GPU_MEMORY_BACKOFF_SECS)).await;
                             continue;
                         }
@@ -12890,6 +13045,7 @@ async fn process_job_lifecycle(
                                      free up"
                                 },
                             );
+                            wait_note_up = true;
                             // Until memory is given back, or the backoff at most: a release is a
                             // wake-up, not a promise, and one before this wait began is missed.
                             let began = std::time::Instant::now();
@@ -13443,10 +13599,19 @@ async fn process_job_lifecycle(
                 // `fulfill_job` only returns Stale once a `jobs()` read pinned at or after the lock
                 // block agrees (a lagging preflight node's JobNotLocked is retried, not trusted).
                 tracing::warn!("LOCK-LOST: {} — {reason}", short_id(job_id));
+                let view = client
+                    .get_job_status_view(job_id)
+                    .await
+                    .ok()
+                    .map(|v| (v.status, v.prover));
+                let ended = lock_end(journal, job_id, view, client.address);
                 journal_update(journal, |j| j.remove(job_id));
                 // No release will ever run for this job, and release is the stash's only consumer.
                 client.settle_abandoned_nonce(job_id).await;
                 let mut s = state.write().await;
+                if let Some(ended) = ended {
+                    s.record_finished(job_id, ended);
+                }
                 s.active_jobs.retain(|j| j.info.job_id != job_id);
                 s.add_log(
                     LogLevel::Warn,
@@ -15438,25 +15603,12 @@ async fn release_and_clean_with_nonce(
             // How the lock ended, for the history (`MinerState::record_finished`): only one this
             // miner is known to have held (its claim confirmed). Fulfilled by us, else gone after its
             // deadline (a keeper slashed it), else released.
-            let ended = {
-                let j = journal.lock().unwrap_or_else(|p| p.into_inner());
-                j.entries.get(&job_id).and_then(|e| {
-                    let held = e.state != crate::journal::JournalState::Claiming;
-                    let past = e.lock_deadline != 0
-                        && zkminer_chain::client::chain_now_floor() >= e.lock_deadline;
-                    if view.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED
-                        && view.prover == client.address
-                    {
-                        Some(MinerJobStatus::Fulfilled { payout: 0 })
-                    } else if held && past {
-                        Some(MinerJobStatus::Slashed { by_us: false })
-                    } else if held {
-                        Some(MinerJobStatus::Released { penalty: 0 })
-                    } else {
-                        None
-                    }
-                })
-            };
+            let ended = lock_end(
+                journal,
+                job_id,
+                Some((view.status, view.prover)),
+                client.address,
+            );
             let why = match &ended {
                 Some(MinerJobStatus::Slashed { .. }) => {
                     "slashed after its deadline: its collateral is lost"
@@ -15679,7 +15831,15 @@ async fn release_and_clean_with_nonce(
         );
     }
     s.active_jobs.retain(|j| j.info.job_id != job_id);
-    if release_ok {
+    if release_ok && fulfilled {
+        s.add_log(
+            LogLevel::Info,
+            format!(
+                "Job {} fulfilled: its fulfil landed before the release",
+                short_id(job_id)
+            ),
+        );
+    } else if release_ok {
         s.add_log(LogLevel::Warn, format!("Released job {}", short_id(job_id)));
     } else {
         s.add_log(
@@ -15760,6 +15920,8 @@ struct RecoveryPass {
     actions: Vec<(B256, RecoveryAction)>,
     /// The incremental locked-job scan state to hand to the next pass.
     scan: Option<RecoveryScan>,
+    /// Locks of ours this pass found gone, and how each ended (`lock_end`), for the history.
+    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus)>,
 }
 
 /// Incremental discovery of locks we hold. Only the startup pass scans the whole lookback window;
@@ -15892,6 +16054,8 @@ async fn recover_claimed_jobs(
     }
     // Ids found settled / not ours this pass: dropped from `known` at the end.
     let mut settled: Vec<B256> = Vec::new();
+    // And how each lock of ours among them ended (`lock_end`).
+    let mut ended: Vec<(B256, zkminer_tui::state::MinerJobStatus)> = Vec::new();
     // A live lifecycle task owns these: it is the only writer of their breadcrumbs.
     job_ids.retain(|jid| !skip.contains(jid));
     // Every id this pass is about: whatever it neither settles nor acts on is left undecided.
@@ -16012,8 +16176,11 @@ async fn recover_claimed_jobs(
             false
         }
         // Present but settled / held by another prover → drop the stale breadcrumb.
-        Some(_) => {
+        Some(v) => {
             settled.push(*jid);
+            if let Some(end) = lock_end(journal, *jid, Some((v.status, v.prover)), client.address) {
+                ended.push((*jid, end));
+            }
             journal_update(journal, |j| j.remove(*jid));
             take_pause_kept(*jid);
             // Dropping the breadcrumb means no `release_job` will ever run for this job again,
@@ -16124,6 +16291,14 @@ async fn recover_claimed_jobs(
             }
             tracing::info!("recover: {} no longer ours (prover={})", jid, view.prover);
             settled.push(jid);
+            if let Some(end) = lock_end(
+                journal,
+                jid,
+                Some((view.status, view.prover)),
+                client.address,
+            ) {
+                ended.push((jid, end));
+            }
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
             client.settle_abandoned_nonce(jid).await;
@@ -16138,6 +16313,14 @@ async fn recover_claimed_jobs(
                 view.status,
             );
             settled.push(jid);
+            if let Some(end) = lock_end(
+                journal,
+                jid,
+                Some((view.status, view.prover)),
+                client.address,
+            ) {
+                ended.push((jid, end));
+            }
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
             client.settle_abandoned_nonce(jid).await;
@@ -16357,6 +16540,7 @@ async fn recover_claimed_jobs(
         undecided: considered.into_iter().filter(|j| !decided.contains(j)).collect(),
         actions,
         scan: next_scan,
+        ended,
     }
 }
 
@@ -17294,7 +17478,7 @@ async fn release_and_clean_with_nonce(",
             "Ok(true) => {
                         journal_update(journal, |j| j.remove(job_id));"
         ));
-        assert!(f[page..release].contains("this miner slashes it itself"));
+        assert!(f[page..release].contains("cannot release; this miner slashes it itself once"));
         assert!(f.contains("let slash_opens = view.slashOpensAt.to::<u64>();"));
         assert!(f.contains("let now = zkminer_chain::client::chain_now_floor();"));
     }

@@ -3377,7 +3377,7 @@ pub(crate) fn load_cached_benchmark_from(
         return None;
     }
 
-    if !same_hardware(&saved.hardware_fingerprint, &current_fp) {
+    if !same_hardware(&saved.hardware_fingerprint, current_fp) {
         tracing::info!(
             "Hardware changed (saved: {}, current: {current_fp}), re-benchmarking needed",
             saved.hardware_fingerprint,

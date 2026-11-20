@@ -4205,10 +4205,49 @@ struct JobView<'a> {
     cutoff: Option<Instant>,
 }
 
+/// A card picked as free was taken in the moment since (another job arriving, a measurement), or no
+/// longer fits the job's cutoff once its lock was held: `prove_min_vram` goes back to choosing, in
+/// line, rather than wait for that card outside the line. Never leaves `prove_min_vram`.
+#[derive(Debug)]
+struct CardTaken;
+
+impl std::fmt::Display for CardTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the card was taken before the proof could start")
+    }
+}
+
+impl std::error::Error for CardTaken {}
+
 /// Removes a waiter from `card_waiters` when its wait ends, however it ends.
 struct CardWaitGuard<'a> {
     pool: &'a WorkerPool,
     ticket: u64,
+    /// Its entry, to put back after `leave` (`rejoin`) with its place unchanged.
+    waiter: CardWaiter,
+}
+
+impl CardWaitGuard<'_> {
+    /// Out of line while its proof starts: a proof must not hold other cards' places.
+    fn leave(&self) {
+        self.pool
+            .card_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| w.ticket != self.ticket);
+    }
+
+    /// Back in line, in the place it had (`CardTaken`).
+    fn rejoin(&self) {
+        let mut line = self
+            .pool
+            .card_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !line.iter().any(|w| w.ticket == self.ticket) {
+            line.push(self.waiter.clone());
+        }
+    }
 }
 
 impl Drop for CardWaitGuard<'_> {
@@ -4245,6 +4284,14 @@ const WORKER_SWITCH_COST: Duration = Duration::from_secs(20);
 
 /// How much sooner a busy card must finish a job than the free one for it to wait for it.
 const BETTER_CARD_MARGIN: Duration = Duration::from_secs(15);
+
+/// The room a job must have left before its cutoff on a card it would go to instead of one it can
+/// take now (`better_card_soon`, `hands_off`): a busy card's free time is an estimate, and so is the
+/// switch. A tenth of the proof, `BETTER_CARD_MARGIN` at least. Accepted at exactly the cutoff, a
+/// 25 s overrun of the other card's proof released a job that had a free card.
+fn elsewhere_slack(takes: Duration) -> Duration {
+    (takes / 10).max(BETTER_CARD_MARGIN)
+}
 
 /// What a proof's progress reports have shown so far, for `eta_from_progress`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -6183,6 +6230,7 @@ impl WorkerPool {
             key,
             None,
             self.benchmark_timeout_for(key),
+            true,
         )?;
 
         // Size the segment to what is actually free, rather than refusing the card.
@@ -6530,7 +6578,8 @@ impl WorkerPool {
         // An Intel card's warm-up is a proof (see `ensure_warmed`), so it takes the card's guard like
         // any other work on it.
         let gpu_lock = is_intel_slot(key).then(|| self.gpu_lock_for(key)).flatten();
-        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, Some(timeout))?;
+        let _gpu_guard =
+            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, Some(timeout), true)?;
         if if_cold && self.slot_warmed(key) {
             return Ok("already warmed up".to_string());
         }
@@ -6854,6 +6903,7 @@ impl WorkerPool {
             key,
             None,
             self.benchmark_timeout_for(key),
+            true,
         )?;
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
@@ -7167,6 +7217,7 @@ impl WorkerPool {
                         &key,
                         None,
                         self.benchmark_timeout_for(&key),
+                        true,
                     ) {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -7309,6 +7360,7 @@ impl WorkerPool {
             key,
             None,
             self.benchmark_timeout_for(key),
+            true,
         )?;
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
@@ -7668,6 +7720,7 @@ impl WorkerPool {
                         &key,
                         None,
                         self.benchmark_timeout_for(&key),
+                        true,
                     ) {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -8539,8 +8592,48 @@ impl WorkerPool {
     /// slower on a 4070 than on a 5090, and took the 4070 whenever it was free: a 1 B-cycle job ran
     /// 15 minutes there instead of 3 on the 5090 a few seconds later. Without estimates, or with
     /// the busy card overdue, nothing is known: take the free one.
-    fn better_card_soon(&self, key: &str, keys: &[String], abort_at: Option<Instant>) -> bool {
+    ///
+    /// With `me` (its ticket in line, if waiting; its place: latest start, arrival), a busy card that
+    /// a job ahead of it in line can take and finish on does not count: that job takes it as it
+    /// frees, and this one would come back to the free card late.
+    fn better_card_soon(
+        &self,
+        key: &str,
+        keys: &[String],
+        abort_at: Option<Instant>,
+        me: Option<(Option<u64>, Option<Instant>, Instant)>,
+    ) -> bool {
         let now = Instant::now();
+        let ahead: Vec<CardWaiter> = me
+            .map(|(ticket, order, since)| {
+                let mine = CardWaiter {
+                    ticket: ticket.unwrap_or(u64::MAX),
+                    abort_at: order,
+                    since,
+                    keys: Vec::new(),
+                    cutoff: None,
+                    estimates: HashMap::new(),
+                }
+                .order();
+                self.card_waiters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|w| Some(w.ticket) != ticket && w.order() < mine)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let claimed_ahead = |k: &str| {
+            ahead.iter().any(|w| {
+                let view = JobView {
+                    keys: &w.keys,
+                    estimates: &w.estimates,
+                    cutoff: w.cutoff,
+                };
+                self.finish_here(&view, k, now).is_some()
+            })
+        };
         let switch = |k: &str| {
             if self.slot_running(k) {
                 Duration::ZERO
@@ -8567,10 +8660,16 @@ impl WorkerPool {
                 let free_at = if free_now {
                     now
                 } else {
+                    if claimed_ahead(k) {
+                        return None;
+                    }
                     *etas.get(&Self::card_of(k)).filter(|at| **at > now)?
                 };
-                let finish = free_at + switch(k) + slot_estimate(k)?;
-                abort_at.is_none_or(|a| finish <= a).then_some(finish)
+                let takes = slot_estimate(k)?;
+                let finish = free_at + switch(k) + takes;
+                abort_at
+                    .is_none_or(|a| finish + elsewhere_slack(takes) <= a)
+                    .then_some(finish)
             })
             .any(|finish| finish + BETTER_CARD_MARGIN < here)
     }
@@ -8682,7 +8781,9 @@ impl WorkerPool {
                     WORKER_SWITCH_COST
                 };
                 let finish = free_at + switch + takes;
-                job.cutoff.is_none_or(|c| finish <= c).then_some(finish)
+                job.cutoff
+                    .is_none_or(|c| finish + elsewhere_slack(takes) <= c)
+                    .then_some(finish)
             })
             .min()
     }
@@ -8716,6 +8817,13 @@ impl WorkerPool {
         let Some(holder_elsewhere) = self.finish_elsewhere(holder, key, now) else {
             return false;
         };
+        // And, should its other card fall through, it can still have this one after `other`.
+        if holder
+            .cutoff
+            .is_some_and(|c| now + other_here + holder_here + elsewhere_slack(holder_here) > c)
+        {
+            return false;
+        }
         let loss = holder_elsewhere.saturating_duration_since(now + holder_here);
         let other_elsewhere = self
             .finish_elsewhere(other, key, now)
@@ -8766,18 +8874,27 @@ impl WorkerPool {
             .iter()
             .filter_map(|k| Some((k.clone(), slot_estimate(k)?)))
             .collect();
+        let waiter = CardWaiter {
+            ticket,
+            abort_at,
+            since,
+            keys: keys.to_vec(),
+            cutoff,
+            estimates,
+        };
         self.card_waiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(CardWaiter {
+            .push(waiter.clone());
+        (
+            CardWaitGuard {
+                pool: self,
                 ticket,
-                abort_at,
-                since,
-                keys: keys.to_vec(),
-                cutoff,
-                estimates,
-            });
-        (CardWaitGuard { pool: self, ticket }, ticket, since)
+                waiter,
+            },
+            ticket,
+            since,
+        )
     }
 
     /// Whether the memory a proof on `key` would take now (`want` RAM at `po2`) must be left to a job
@@ -8803,15 +8920,17 @@ impl WorkerPool {
             if line.iter().all(|w| Some(w.job) == me) {
                 return None;
             }
-            let order = abort_at.map(|a| {
-                slot_estimate(key)
-                    .and_then(|takes| a.checked_sub(takes))
-                    .unwrap_or(a)
+            // Its place as the line has it, when it is in it: computed again here for this card, two
+            // jobs could each see the other ahead.
+            let stored = line.iter().find(|w| Some(w.job) == me);
+            let order = stored.map(|w| w.order).unwrap_or_else(|| {
+                abort_at.map(|a| {
+                    slot_estimate(key)
+                        .and_then(|takes| a.checked_sub(takes))
+                        .unwrap_or(a)
+                })
             });
-            let since = line
-                .iter()
-                .find(|w| Some(w.job) == me)
-                .map_or(now, |w| w.since);
+            let since = stored.map_or(now, |w| w.since);
             let mine = MemoryWaiter {
                 job: me.unwrap_or(u64::MAX),
                 order,
@@ -8953,8 +9072,20 @@ impl WorkerPool {
         }
     }
 
+    /// The job tagged `tag` (`with_job_tag`) is done waiting for memory for good: its proving ended,
+    /// however it ended. Its place in the memory line is given up at once, not after
+    /// `MEMORY_WAITER_TTL`.
+    pub fn forget_memory_waiter(&self, tag: u64) {
+        self.memory_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|w| w.job != tag);
+    }
+
     /// `prove_on_slot` for `prove_min_vram`, keeping the job's place in the memory line: refused host
-    /// memory (nothing ran), it takes or keeps one (`note_memory_waiter`); otherwise it leaves.
+    /// memory (nothing ran), it takes or keeps one (`note_memory_waiter`). It leaves the line when
+    /// admitted (`prove_on_slot`), or when its proving ends (`forget_memory_waiter`); a retry that
+    /// fails for another reason keeps its place.
     #[allow(clippy::too_many_arguments)]
     fn prove_in_memory_line(
         &self,
@@ -8963,7 +9094,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<SlotProgress>,
+        on_progress: &mut Option<SlotProgress>,
         abort_at: Option<Instant>,
         job_po2: Option<SlotPo2<'_>>,
         program_id: Option<[u8; 32]>,
@@ -8988,8 +9119,6 @@ impl WorkerPool {
         if refused {
             let po2 = job_po2.and_then(|size_of| size_of(key)).or(po2);
             self.note_memory_waiter(key, po2, abort_at, execute_peak_bytes);
-        } else {
-            self.leave_memory_line();
         }
         result
     }
@@ -9025,7 +9154,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<SlotProgress>,
+        mut on_progress: Option<SlotProgress>,
         min_vram_bytes: Option<u64>,
         exclude: &[String],
         // Slots the OPERATOR switched off. A HARD filter, unlike `exclude`.
@@ -9254,6 +9383,15 @@ impl WorkerPool {
         // path: its honest "permanently failed" error is more useful than a long wait.
         // Uses `try_lock` so a slot that is merely BUSY proving is never mistaken for
         // one in backoff -- a held lock means alive, which is not a backoff state.
+        // Its place in the card line: the latest it can start and still finish, on its best card
+        // (`with_slot_estimates`), else its cutoff.
+        let latest_start = abort_at.map(|abort| {
+            keys.iter()
+                .filter_map(|k| slot_estimate(k))
+                .min()
+                .and_then(|best| abort.checked_sub(best))
+                .unwrap_or(abort)
+        });
         let backoff_blocked = keys.len() == 1
             && self
                 .workers
@@ -9272,24 +9410,28 @@ impl WorkerPool {
             && !self.yields_to_waiter(
                 &keys[0],
                 None,
-                abort_at,
+                latest_start,
                 Instant::now(),
                 Some((&keys, abort_at)),
             );
         if shortcut {
             *used_slot = Some(keys[0].clone());
-            return self.prove_in_memory_line(
+            match self.prove_in_memory_line(
                 &keys[0],
                 elf,
                 input,
                 po2,
                 timeout,
-                on_progress,
+                &mut on_progress,
                 abort_at,
                 job_po2,
                 program_id,
                 execute_peak_bytes,
-            );
+            ) {
+                // Taken in the moment since: into the line below.
+                Err(e) if e.is::<CardTaken>() => *used_slot = None,
+                result => return result,
+            }
         }
 
         // ROTATE for fairness, then order WARM SLOTS FIRST.
@@ -9330,15 +9472,6 @@ impl WorkerPool {
         let keys = Self::order_by_cards(keys, cards.order);
 
         let arrived = Instant::now();
-        // Its place in the card line: the latest it can start and still finish, on its best card
-        // (`with_slot_estimates`), else its cutoff.
-        let latest_start = abort_at.map(|abort| {
-            keys.iter()
-                .filter_map(|k| slot_estimate(k))
-                .min()
-                .and_then(|best| abort.checked_sub(best))
-                .unwrap_or(abort)
-        });
         for key in &keys {
             // Not on a card too slow to finish it before its cutoff.
             if !finishes_in_time(key, abort_at) {
@@ -9349,7 +9482,7 @@ impl WorkerPool {
                 continue;
             }
             // Not when a busy card frees soon enough to finish it well before this one would.
-            if self.better_card_soon(key, &keys, abort_at) {
+            if self.better_card_soon(key, &keys, abort_at, Some((None, latest_start, arrived))) {
                 continue;
             }
             if let Some(entry) = self.workers.get(key) {
@@ -9374,18 +9507,22 @@ impl WorkerPool {
                     if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
                         *used_slot = Some(key.clone());
-                        return self.prove_in_memory_line(
+                        match self.prove_in_memory_line(
                             key,
                             elf,
                             input,
                             po2,
                             timeout,
-                            on_progress,
+                            &mut on_progress,
                             abort_at,
                             job_po2,
                             program_id,
                             execute_peak_bytes,
-                        );
+                        ) {
+                            // Taken in the moment since: the next card, or the line.
+                            Err(e) if e.is::<CardTaken>() => *used_slot = None,
+                            result => return result,
+                        }
                     }
                 }
             }
@@ -9441,7 +9578,12 @@ impl WorkerPool {
                     any_busy = true;
                     continue;
                 }
-                if self.better_card_soon(key, &keys, abort_at) {
+                if self.better_card_soon(
+                    key,
+                    &keys,
+                    abort_at,
+                    Some((Some(ticket), latest_start, since)),
+                ) {
                     any_busy = true;
                     continue;
                 }
@@ -9461,20 +9603,29 @@ impl WorkerPool {
                     if is_alive || Self::slot_dispatchable(&slot) {
                         drop(slot);
                         // Out of line before proving: the proof must not hold other cards' places.
-                        drop(in_line);
+                        in_line.leave();
                         *used_slot = Some(key.clone());
-                        return self.prove_in_memory_line(
+                        match self.prove_in_memory_line(
                             key,
                             elf,
                             input,
                             po2,
                             timeout,
-                            on_progress,
+                            &mut on_progress,
                             abort_at,
                             job_po2,
                             program_id,
                             execute_peak_bytes,
-                        );
+                        ) {
+                            // Taken in the moment since: back in its place in line.
+                            Err(e) if e.is::<CardTaken>() => {
+                                *used_slot = None;
+                                in_line.rejoin();
+                                any_busy = true;
+                                continue;
+                            }
+                            result => return result,
+                        }
                     }
                 }
             }
@@ -10640,8 +10791,9 @@ impl WorkerPool {
     }
 
     /// Idle workers of `key`'s own backend on OTHER cards, with what `held` says each holds: what a
-    /// proof on `key` recycles last for memory (`make_host_room`, `reserve_commit`), after every other
-    /// backend's idle worker. An idle SP1 worker on the 4070 keeps ~34 GiB committed, and an SP1 proof
+    /// proof on `key` may also recycle for memory (`make_host_room`, `reserve_commit`) when every
+    /// other backend's idle worker is not enough; the plan then takes the fewest workers, biggest
+    /// first, from both. An idle SP1 worker on the 4070 keeps ~34 GiB committed, and an SP1 proof
     /// on the 5090 short of commit could not have it, as it was never offered. Not one a job waiting
     /// in the card line can take: that one is about to be used.
     fn idle_same_backend_elsewhere(
@@ -11021,8 +11173,10 @@ impl WorkerPool {
             let pending = self
                 .commit_ledger
                 .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
+            // Every idle worker: another backend's and, on other cards, its own are recycled for it
+            // (`reserve_commit`), and its own on its card is what it starts on.
             let idle = self
-                .idle_commit_holdings_except(Some(backend))
+                .idle_commit_holdings_except(None)
                 .iter()
                 .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
             let returning = self.commit_ledger.reserved_bytes().saturating_add(idle);
@@ -11033,12 +11187,55 @@ impl WorkerPool {
                 returning,
             );
         }
-        // Dispatch's host rule (`reserve_commit`): the RAM still to come, this proof's included,
-        // plus the pinned margin, must be free commit once the page file has grown.
+        // The warm worker it lands on (a first claim of its backend): what it already holds.
+        let resident = if credit_resident {
+            self.workers
+                .keys()
+                .filter(|key| key.split(':').next() == Some(backend))
+                .filter_map(|key| self.current_commit_bytes_for_slot(key))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        // The whole set against what is live: jobs claimed but not started yet (fetching, measuring,
+        // in a line) are in neither `reserved` nor `available`, and checking this proof alone let an
+        // SP1 claim in beside a RISC Zero job still on its way, one of which then waited a whole
+        // proof for memory, a wait no deadline sum counted.
+        {
+            let pending = self
+                .commit_ledger
+                .pending_growth(|slot| self.current_commit_bytes_for_slot(slot));
+            let idle_others = self
+                .idle_commit_holdings_except(Some(backend))
+                .iter()
+                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held));
+            let returning = self
+                .commit_ledger
+                .reserved_bytes()
+                .saturating_add(idle_others)
+                .saturating_add(resident);
+            if !crate::memory::queued_claim_fits(
+                set,
+                reserve,
+                figures.available.saturating_sub(pending),
+                returning,
+            ) {
+                return false;
+            }
+        }
+        // Dispatch's host rule (`reserve_commit`): the RAM still to come, this proof's included
+        // (net of what its warm worker already holds, as dispatch tracks it), plus the pinned
+        // margin, must be free commit once the page file has grown.
+        let ram_resident = if credit_resident {
+            self.resident_host_bytes_for_backend(backend)
+        } else {
+            0
+        };
         let host_need = self
             .memory_ledger
             .pending_growth(|slot| self.current_host_bytes_for_slot(slot))
-            .saturating_add(ram_want)
+            .saturating_add(ram_want.saturating_sub(ram_resident))
             .saturating_add(crate::memory::pinned_commit_margin(figures.limit));
         // The cheap test first: this runs per candidate job, and the holdings below are a process
         // snapshot per worker.
@@ -11059,16 +11256,6 @@ impl WorkerPool {
         if figures.available.saturating_add(idle_sum) < host_need {
             return false;
         }
-        let resident = if credit_resident {
-            self.workers
-                .keys()
-                .filter(|key| key.split(':').next() == Some(backend))
-                .filter_map(|key| self.current_commit_bytes_for_slot(key))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
         crate::memory::plan_host_room(
             want,
             resident,
@@ -11191,6 +11378,29 @@ impl WorkerPool {
         // side: it waits, and starts only once a proof running now is done. Charged against what
         // will be free then.
         if queued {
+            // Every idle worker but the one credited as `resident`: other backends' and its own
+            // elsewhere are recycled for it (`make_host_room`).
+            let idle = self
+                .idle_prove_holdings()
+                .iter()
+                .fold(0u64, |sum, (_, held)| sum.saturating_add(*held))
+                .saturating_sub(resident);
+            let measures = self
+                .inflight_measures_snapshot()
+                .iter()
+                .fold(0u64, |sum, (key, _)| {
+                    sum.saturating_add(self.current_host_bytes_for_slot(key).unwrap_or(0))
+                });
+            let returning = reserved
+                .saturating_add(resident)
+                .saturating_add(idle)
+                .saturating_add(measures);
+            return crate::memory::queued_claim_fits(committed, reserve, available, returning);
+        }
+        // The whole set against what is live, as for the commit half: jobs claimed and not started
+        // are in neither `reserved` nor `available`. What only idle workers and measurements hold
+        // counts, as below.
+        {
             let idle = self
                 .idle_host_holdings_except(backend)
                 .iter()
@@ -11205,7 +11415,9 @@ impl WorkerPool {
                 .saturating_add(resident)
                 .saturating_add(idle)
                 .saturating_add(measures);
-            return crate::memory::queued_claim_fits(committed, reserve, available, returning);
+            if !crate::memory::queued_claim_fits(committed, reserve, available, returning) {
+                return false;
+            }
         }
         if crate::memory::can_admit(expected_peak, resident, reserved, available, total, reserve) {
             return true;
@@ -12139,10 +12351,20 @@ impl WorkerPool {
         key: &str,
         abort_at: Option<Instant>,
         timeout: Option<Duration>,
+        // False for a card picked as free (`prove_min_vram`): held by another proof now, it is
+        // `CardTaken`, not a wait outside the card line.
+        wait: bool,
     ) -> Result<Option<std::sync::MutexGuard<'a, ()>>> {
         let Some(l) = gpu_lock else {
             return Ok(None);
         };
+        if !wait {
+            return match l.try_lock() {
+                Ok(g) => Ok(Some(g)),
+                Err(std::sync::TryLockError::Poisoned(e)) => Ok(Some(e.into_inner())),
+                Err(std::sync::TryLockError::WouldBlock) => Err(anyhow::Error::new(CardTaken)),
+            };
+        }
         // The instant past which waiting is pointless, if there is one.
         let give_up_at = match (abort_at, timeout) {
             (Some(abort), _) => Some(abort.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(abort)),
@@ -12902,7 +13124,8 @@ impl WorkerPool {
         input: ProveInput<'_>,
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<SlotProgress>,
+        // Taken only once the card is held (`CardTaken` leaves it for the next try).
+        on_progress: &mut Option<SlotProgress>,
         abort_at: Option<Instant>,
         // A job's segment size on each slot; see `prove_min_vram`.
         job_po2: Option<SlotPo2<'_>>,
@@ -12952,8 +13175,16 @@ impl WorkerPool {
         // the `keys.len() == 1` shortcut straight into this function, skipping the round-robin loop's
         // queue-deadline check entirely. Bounding the wait here removes the hazard wherever it comes
         // from, including a genuinely single-GPU host.
+        // (That wait is now `prove_min_vram`'s card line, which re-checks the deadline as it goes.)
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, timeout)?;
+        // `prove_min_vram` picked this card as free: taken since, it goes back to the line
+        // (`CardTaken`) rather than wait here, outside it, ahead of jobs due first.
+        let _gpu_guard = Self::acquire_gpu_guard(gpu_lock.as_ref(), key, abort_at, timeout, false)?;
+        // Nor started where it can no longer finish (`with_slot_estimates`).
+        if !finishes_in_time(key, abort_at) {
+            return Err(anyhow::Error::new(CardTaken));
+        }
+        let on_progress = on_progress.take();
         // When this card should be free again, for jobs choosing a card by finish time.
         let _card_eta = self.note_card_eta(key);
 
@@ -13413,6 +13644,11 @@ impl WorkerPool {
             let card = Self::card_of(key);
             let backend = key.split(':').next().unwrap_or(key).to_string();
             Some(Box::new(move |e: zkminer_prover_protocol::ProveEvent| {
+                // The worker starting the proof over (RISC Zero retries a proof that fails to
+                // verify): its progress starts over too.
+                if matches!(e, zkminer_prover_protocol::ProveEvent::Started) {
+                    *track.lock().unwrap_or_else(|p| p.into_inner()) = EtaTrack::default();
+                }
                 if let zkminer_prover_protocol::ProveEvent::Stage(report) = e {
                     let learned = tails
                         .lock()
@@ -16712,7 +16948,7 @@ mod tests {
                 ProveInput::Inline(&[]),
                 Some(20),
                 Some(Duration::from_secs(1)),
-                None,
+                &mut None,
                 None,
                 Some(&none),
                 None,
@@ -20958,27 +21194,27 @@ mod learned_host_peak_tests {
         ]);
         with_slot_estimates(estimates, || {
             // Both free: the fast one, not whichever comes first.
-            assert!(pool.better_card_soon("risc0:cuda:1", &keys, None));
-            assert!(!pool.better_card_soon("risc0:cuda:0", &keys, None));
+            assert!(pool.better_card_soon("risc0:cuda:1", &keys, None, None));
+            assert!(!pool.better_card_soon("risc0:cuda:0", &keys, None, None));
             // The fast card busy, its free time not known: take the slow free one.
             let lock = pool.gpu_lock_for("risc0:cuda:0").unwrap();
             let _busy = lock.lock().unwrap();
-            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None));
+            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None, None));
             // Due free in 60 s: done there by ~140 s against ~320 s here.
             pool.card_eta.lock().unwrap().insert(
                 "cuda:0".to_string(),
                 Instant::now() + Duration::from_secs(60),
             );
-            assert!(pool.better_card_soon("risc0:cuda:1", &keys, None));
+            assert!(pool.better_card_soon("risc0:cuda:1", &keys, None, None));
             // Not if finishing there would miss the cutoff.
             let soon = Some(Instant::now() + Duration::from_secs(100));
-            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, soon));
+            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, soon, None));
             // Overdue: nothing is known.
             pool.card_eta.lock().unwrap().insert(
                 "cuda:0".to_string(),
                 Instant::now() - Duration::from_secs(1),
             );
-            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None));
+            assert!(!pool.better_card_soon("risc0:cuda:1", &keys, None, None));
         });
     }
 
