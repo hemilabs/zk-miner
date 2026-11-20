@@ -283,29 +283,85 @@ fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()
     }
 }
 
-/// The probe, on every platform: asked at most twice within `timeout` ([`probe_twice`]), to
-/// the destination as a connection reaches it ([`unmapped`]).
+/// The probe, on every platform: asked up to three times ([`probe_attempts`]), to the
+/// destination as a connection reaches it ([`unmapped`]), at most [`PROBES_AT_ONCE`] probes in
+/// the process at a time ([`ProbeGate`]).
 fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let addr = unmapped(addr);
-    probe_twice(timeout, |t| probe_attempt(addr, hops, t))
+    probe_attempts(timeout, PROBE_PAUSE, std::thread::sleep, |t| {
+        let _turn = ProbeGate::enter();
+        probe_attempt(addr, hops, t)
+    })
 }
 
-/// The probe asked at most twice within `timeout`: two thirds of it, then, after a timeout, the
-/// rest (review round 3, probe-1; on every platform since the Linux application). A router that
-/// rate-limits its ICMP drops some "time exceeded" answers (7.5% of the reviewer's probes on a
-/// home path went unanswered: `r3-probe/sweep-h2.log`), and a probe without an answer leaves the
-/// decision to the check connection, whose control connection refuses a peer that never
-/// acknowledges a bare FIN (every AWS S3 front end), and which does not exist on Windows (a
-/// probe without an answer is refused there). An answer comes within a round trip to the router,
-/// milliseconds.
-fn probe_twice(
+/// How long the probe pauses before its third attempt ([`probe_attempts`]): a router's ICMP rate
+/// limit refills (Linux: one "time exceeded" a second per destination after a burst of six,
+/// `icmp_ratelimit`).
+pub const PROBE_PAUSE: Duration = Duration::from_secs(1);
+
+/// The probe asked up to three times: two thirds of `timeout`, then, after a timeout, the rest;
+/// then, after a further timeout, once more for two thirds of `timeout` after `pause` (review
+/// round 3, probe-1; review round 4, probe-2). A router that rate-limits its ICMP drops some
+/// "time exceeded" answers (7.5% of the reviewer's probes on a home path went unanswered:
+/// `r3-probe/sweep-h2.log`; many more when 8 probes went at once: `r4-probe/exp`), and a probe
+/// without an answer leaves the decision to the check connection, whose control connection
+/// refuses a peer that never acknowledges a bare FIN (every AWS S3 front end), and which does
+/// not exist on Windows (a probe without an answer is refused there). An answer comes within a
+/// round trip to the router, milliseconds.
+fn probe_attempts(
     timeout: Duration,
+    pause: Duration,
+    sleep: impl FnOnce(Duration),
     mut attempt: impl FnMut(Duration) -> io::Result<()>,
 ) -> io::Result<()> {
     let first = timeout * 2 / 3;
-    match attempt(first) {
-        Err(e) if e.kind() == io::ErrorKind::TimedOut => attempt(timeout - first),
-        r => r,
+    let timed_out = |r: &io::Result<()>| matches!(r, Err(e) if e.kind() == io::ErrorKind::TimedOut);
+    let r = attempt(first);
+    if !timed_out(&r) {
+        return r;
+    }
+    let r = attempt(timeout - first);
+    if !timed_out(&r) {
+        return r;
+    }
+    sleep(pause);
+    attempt(first)
+}
+
+/// Most hop-limited probes in flight in the process at once (review round 4, probe-2): they go
+/// through the same first hops, whose ICMP rate limit drops answers past a small burst.
+pub const PROBES_AT_ONCE: usize = 2;
+
+/// A turn to probe: at most [`PROBES_AT_ONCE`] are held at a time; [`ProbeGate::enter`] waits for
+/// one.
+struct ProbeGate;
+
+static PROBES_IN_FLIGHT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static PROBE_TURN: std::sync::Condvar = std::sync::Condvar::new();
+
+impl ProbeGate {
+    fn enter() -> Self {
+        let mut n = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= PROBES_AT_ONCE {
+            n = PROBE_TURN.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        ProbeGate
+    }
+
+    /// Probes in flight now (tests).
+    #[cfg(test)]
+    fn in_flight() -> usize {
+        *PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Drop for ProbeGate {
+    fn drop(&mut self) {
+        let mut n = PROBES_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        drop(n);
+        PROBE_TURN.notify_one();
     }
 }
 
@@ -1451,33 +1507,45 @@ mod tests {
         assert_eq!(o.verdict(), Verdict::Undecided);
     }
 
-    /// Review round 3, probe-1 (every platform since the Linux application): a probe that timed
-    /// out is asked once more within the same time (two thirds, then the rest); any other outcome
-    /// of the first attempt stands.
+    /// Review round 3, probe-1, and round 4, probe-2 (every platform): a probe that timed out
+    /// is asked once more within the same time (two thirds, then the rest), and, timed out
+    /// again, a third time after a pause (a router's ICMP rate limit refills); any other outcome
+    /// of an attempt stands.
     #[cfg(unix)]
     #[test]
-    fn a_probe_that_timed_out_is_asked_again_once() {
+    fn a_probe_that_timed_out_is_asked_again() {
         let timeout = Duration::from_millis(1500);
-        let mut asked = Vec::new();
-        let r = probe_twice(timeout, |t| {
-            asked.push(t);
-            Err(io::ErrorKind::TimedOut.into())
-        });
+        let pause = Duration::from_secs(1);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let r = probe_attempts(
+            timeout,
+            pause,
+            |p| asked.borrow_mut().push(format!("pause {}", p.as_millis())),
+            |t| {
+                asked.borrow_mut().push(format!("probe {}", t.as_millis()));
+                Err(io::ErrorKind::TimedOut.into())
+            },
+        );
         assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(
-            asked,
-            [Duration::from_millis(1000), Duration::from_millis(500)]
+            *asked.borrow(),
+            ["probe 1000", "probe 500", "pause 1000", "probe 1000"]
         );
-        let mut n = 0;
-        let r = probe_twice(timeout, |_| {
-            n += 1;
-            if n == 1 {
-                Err(io::ErrorKind::TimedOut.into())
-            } else {
-                Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))
-            }
-        });
-        assert_eq!(ProbeOutcome::of(r), ProbeOutcome::Unreachable);
+        for answered_at in 1..=3 {
+            let mut n = 0;
+            let mut paused = false;
+            let r = probe_attempts(timeout, pause, |_| paused = true, |_| {
+                n += 1;
+                if n < answered_at {
+                    Err(io::ErrorKind::TimedOut.into())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))
+                }
+            });
+            assert_eq!(ProbeOutcome::of(r), ProbeOutcome::Unreachable);
+            assert_eq!(n, answered_at);
+            assert_eq!(paused, answered_at == 3);
+        }
         for first in [
             Ok(()),
             Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH)),
@@ -1485,12 +1553,34 @@ mod tests {
         ] {
             let mut first = Some(first);
             let mut n = 0;
-            let _ = probe_twice(timeout, |_| {
+            let _ = probe_attempts(timeout, pause, |_| {}, |_| {
                 n += 1;
                 first.take().unwrap()
             });
             assert_eq!(n, 1);
         }
+    }
+
+    /// Review round 4, probe-2: at most [`PROBES_AT_ONCE`] probes are in flight in the process;
+    /// eight callers at once take turns.
+    #[test]
+    fn probes_take_turns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let _turn = ProbeGate::enter();
+                    MOST.fetch_max(ProbeGate::in_flight(), Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(30));
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let most = MOST.load(Ordering::SeqCst);
+        assert!((1..=PROBES_AT_ONCE).contains(&most), "{most}");
     }
 
     /// Review round 4, probe-1: the two-connection check, every interleaving. An
