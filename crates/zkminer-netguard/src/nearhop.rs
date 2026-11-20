@@ -1680,6 +1680,10 @@ mod tests {
         assert_eq!(c.step(ms(120), ok(FinWait1), ok(FinWait2)), None);
         assert_eq!(c.far_after(ms(120)), ms(510));
         assert_eq!(c.step(ms(510), ok(FinWait1), ok(FinWait2)), Some(ConfirmOutcome::Unanswered));
+        // The control's round trip counts from its own FIN: sent at 400, acknowledged at 420.
+        let mut c = fresh();
+        c.control_sent_at(ms(400));
+        assert_eq!(c.far_after(ms(420)), ms(670));
         let mut c = fresh();
         c.control_sent_at(ms(100));
         assert_eq!(c.step(ms(609), ok(FinWait1), ok(FinWait1)), None, "control_wait from its FIN");
