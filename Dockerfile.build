@@ -98,6 +98,34 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && cp target/release/zkminer /zkminer
 
 # ===========================================================================
+# Stage: build-witness — what a miner serving witness jobs runs beside zkminer
+# ===========================================================================
+# The witness runtime (`[witness] enabled`) looks for these in zkminer's own directory: the sandbox
+# probe its self-test runs, the builder and broker sandboxes, and the risc0 CPU worker that executes
+# a requester's guest. Each is built on its own, so no feature of one leaks into another (or into
+# zkminer, built in build-cli). The risc0 worker builds its guests with rzup's toolchain.
+FROM rust-base AS build-witness
+ENV PATH="${PATH}:/root/.risc0/bin"
+# rzup: see cuda-base (GITHUB_TOKEN).
+RUN --mount=type=secret,id=github_token,env=GITHUB_TOKEN \
+    { [ -n "$GITHUB_TOKEN" ] || unset GITHUB_TOKEN; } && \
+    curl -fsSL https://risczero.com/install | bash && rzup install -f
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=target-witness,target=/build/target \
+    cargo build --release -p zkminer-witness-sandbox --bin zkminer-witness-sandbox-probe \
+    && cargo build --release -p zkminer-witness-builder --bin zkminer-witness-builder \
+    && cargo build --release -p zkminer-witness-broker --bin zkminer-witness-broker \
+    && NVCC=off HIPCC=off cargo build --release -p zkminer-prove-risc0 --features cpu \
+        --bin zkminer-prove-risc0-cpu \
+    && mkdir -p /witness \
+    && cp target/release/zkminer-witness-sandbox-probe target/release/zkminer-witness-builder \
+        target/release/zkminer-witness-broker target/release/zkminer-prove-risc0-cpu /witness/
+
+# ===========================================================================
 # Stage: e2e — end-to-end tests that drive the built zkminer binary
 #
 #   make e2e
@@ -758,6 +786,9 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # ===========================================================================
 FROM scratch AS dist-cli
 COPY --from=build-cli /zkminer /zkminer
+
+FROM scratch AS dist-witness
+COPY --from=build-witness /witness/ /
 
 FROM scratch AS dist-cli-windows
 COPY --from=build-cli-windows /zkminer.exe /zkminer.exe

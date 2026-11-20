@@ -45,6 +45,19 @@ installs the same files.
 cargo build --release -p zkminer-cli        # the CLI; no GPU toolchain needed
 ```
 
+A miner that serves witness jobs (`[witness] enabled`) also runs four binaries from the CLI's own
+directory (`target/release` here): the sandbox probe its self-test runs, the builder and broker
+sandboxes, and the risc0 CPU worker that executes requesters' guests. Each is built on its own, so
+no feature of one reaches another:
+
+```bash
+cargo build --release -p zkminer-witness-sandbox --bin zkminer-witness-sandbox-probe
+cargo build --release -p zkminer-witness-builder --bin zkminer-witness-builder
+cargo build --release -p zkminer-witness-broker --bin zkminer-witness-broker
+env NVCC=off HIPCC=off cargo build --release -p zkminer-prove-risc0 --features cpu \
+    --bin zkminer-prove-risc0-cpu
+```
+
 GPU prover workers are separate binaries, built with the toolchain for their vendor:
 
 ```bash
@@ -110,8 +123,12 @@ no error.**
 └── zkminer-prove-openvm
 ```
 
-**From a release**, put the single files there and unpack the AMD or Intel tarball into the same
-directory (`tar --zstd -xf zkminer-provers-amd-linux-x86_64.tar.zst -C ~/.zkminer/provers`). Each
+**From a release**, put the single-file provers there and unpack the AMD or Intel tarball into the
+same directory (`tar --zstd -xf zkminer-provers-amd-linux-x86_64.tar.zst -C ~/.zkminer/provers`).
+`zkminer` goes elsewhere (`~/.zkminer/zkminer`, or a directory on your `PATH`), with the four witness
+binaries beside it: `zkminer-witness-sandbox-probe`, `zkminer-witness-builder`,
+`zkminer-witness-broker` and `zkminer-prove-risc0-cpu`. A miner serving witness jobs looks for them
+in its own directory, and without them serves none, saying which is missing. Each
 prover carries the GPU runtime it loads, so a host needs only its GPU's driver: NVIDIA's driver for
 RTX cards, and for AMD (Radeon RX 7000 and 9000) and Intel (Arc A and B) cards just the kernel
 driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or

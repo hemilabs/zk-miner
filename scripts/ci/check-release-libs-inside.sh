@@ -22,6 +22,9 @@ check() { # <file> [library path]
 }
 
 check "$p/../zkminer"
+for f in zkminer-witness-sandbox-probe zkminer-witness-builder zkminer-witness-broker zkminer-prove-risc0-cpu; do
+  check "$p/../$f"
+done
 check "$p/zkminer-prove-openvm"
 check "$p/zkminer-prove-risc0-cuda"
 check "$p/zkminer-prove-sp1"
@@ -36,6 +39,6 @@ while IFS= read -r -d '' lib; do
   check "$lib" "$(dirname "$lib")"
   n=$((n + 1))
 done < <(find "$p/zkminer-rocm/lib" "$p/sp1-gpu-server-hip-lib" "$p/zkminer-intel/lib" -type f -name '*.so*' -print0)
-echo "checked 9 binaries and $n libraries"
+echo "checked 13 binaries and $n libraries"
 [ $fail -eq 0 ] && echo "ok: everything loads with only the GPU driver to come from the host"
 exit $fail
