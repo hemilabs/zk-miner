@@ -52,6 +52,7 @@ use std::mem::{offset_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::{Hop, KernelAnswer, Link, Nexthop, Route, RouteType, Rule, RT_TABLE_MAIN};
@@ -374,9 +375,17 @@ pub(super) fn dump() -> io::Result<(Vec<Route>, Vec<Rule>)> {
     ))
 }
 
-/// Sequence numbers of this process's queries: every routing socket gets a copy of every routing
-/// message, so another thread's answer can arrive on this socket too.
-static SEQ: AtomicI32 = AtomicI32::new(1);
+/// The next sequence number of this process's queries: every routing socket gets a copy of every
+/// routing message, so another thread's answer can arrive on this socket too. The first is random
+/// (`arc4random`), so no number is known ahead of the query it marks.
+fn next_seq() -> i32 {
+    static SEQ: OnceLock<AtomicI32> = OnceLock::new();
+    SEQ.get_or_init(|| {
+        // SAFETY: arc4random takes no arguments and cannot fail.
+        AtomicI32::new(unsafe { libc::arc4random() } as i32)
+    })
+    .fetch_add(1, Ordering::Relaxed)
+}
 
 /// A `PF_ROUTE` socket, close-on-exec, with a receive timeout.
 fn route_socket() -> io::Result<OwnedFd> {
@@ -472,7 +481,9 @@ pub(super) fn request(dst: IpAddr, pid: i32, seq: i32) -> Vec<u8> {
 /// The answer to request (`pid`, `seq`) for `dst` in one datagram: `Some(Some(route))`,
 /// `Some(None)` for no route (`ESRCH`, or a route that reaches nothing), `None` when the datagram is
 /// another message (another process's or thread's, or a routing change). An answer whose route
-/// does not hold `dst` is an error, as is a truncated or malformed answer.
+/// does not hold `dst` is an error, as is a truncated or malformed answer, and one whose
+/// interface (`RTA_IFP`, the `sockaddr_dl` the request asked for) is not the header's
+/// `rtm_index` (xnu takes both from the route's `rt_ifp`, so they always agree).
 pub(super) fn parse_answer(
     b: &[u8],
     pid: i32,
@@ -500,7 +511,14 @@ pub(super) fn parse_answer(
             e => Err(io::Error::from_raw_os_error(e)),
         };
     }
-    let Some(route) = parse_route(&h, &b[HDR_LEN..h.len], false)? else {
+    let body = &b[HDR_LEN..h.len];
+    if let Some(ifp) = sockaddrs(body, h.addrs)?[libc::RTAX_IFP as usize] {
+        let index = u16_at(ifp, offset_of!(libc::sockaddr_dl, sdl_index));
+        if ifp.get(1).map(|f| i32::from(*f)) != Some(libc::AF_LINK) || index != Some(h.index) {
+            return Err(malformed());
+        }
+    }
+    let Some(route) = parse_route(&h, body, false)? else {
         return Ok(Some(None));
     };
     if !route.holds(dst) {
@@ -518,7 +536,7 @@ pub(super) fn parse_answer(
 /// One `RTM_GET` for `dst` (see the module doc): the route, or `None` without one.
 fn ask(dst: IpAddr) -> io::Result<Option<Route>> {
     let sock = route_socket()?;
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let seq = next_seq();
     // SAFETY: getpid cannot fail.
     let pid = unsafe { libc::getpid() };
     let req = request(dst, pid, seq);
@@ -1186,6 +1204,30 @@ mod tests {
             let r = ask(ip(d)).unwrap();
             eprintln!("RTM_GET {d}: {r:?}");
         }
+    }
+
+    /// The reply's interface (`RTA_IFP`) must be the header's (hardening): every captured reply's
+    /// is; one that names another interface, or is no link-layer sockaddr, is an error. And
+    /// sequence numbers are consecutive from a random start.
+    #[test]
+    fn the_answers_interface_is_the_headers() {
+        for (d, b) in replies() {
+            let h = header(&b).unwrap();
+            assert_ne!(h.addrs & libc::RTA_IFP, 0, "{d}");
+            let sas = sockaddrs(&b[HDR_LEN..h.len], h.addrs).unwrap();
+            let ifp = sas[libc::RTAX_IFP as usize].unwrap();
+            let off = ifp.as_ptr() as usize - b.as_ptr() as usize;
+            let at = off + offset_of!(libc::sockaddr_dl, sdl_index);
+            assert_eq!(u16_at(&b, at), Some(h.index), "{d}");
+            let mut m = b.clone();
+            m[at..at + 2].copy_from_slice(&(h.index + 1).to_ne_bytes());
+            assert!(parse_answer(&m, h.pid, h.seq, d).is_err(), "{d}");
+            let mut m = b.clone();
+            m[off + 1] = libc::AF_INET as u8;
+            assert!(parse_answer(&m, h.pid, h.seq, d).is_err(), "{d}");
+        }
+        let a = next_seq();
+        assert_eq!(next_seq(), a.wrapping_add(1));
     }
 
     /// Truncated or malformed input of every kind is an error, never a route: a reply cut short
