@@ -2946,6 +2946,9 @@ pub struct WorkerPool {
     /// Slot key -> the segment size its card proves risc0 jobs at (`set_risc0_card_sizes`), for the
     /// figures that name no job: a card proving at po2 21 takes twice what the default 20 is charged.
     risc0_card_po2: Mutex<HashMap<String, u8>>,
+    /// The card model behind each learned-figures key (`learn_key`), read when the record is loaded
+    /// (`use_host_peaks`) and saved with it.
+    card_models: Mutex<HashMap<String, String>>,
     /// Where the learned figures are kept across runs (`use_host_peaks`), when they are.
     host_peaks_path: Option<PathBuf>,
     /// Jobs waiting in `prove_min_vram` for a card, so a freed card goes to the one due first
@@ -3452,6 +3455,7 @@ impl WorkerPool {
             learned_peaks: Mutex::new(HashMap::new()),
             learned_commit: Mutex::new(HashMap::new()),
             risc0_card_po2: Mutex::new(HashMap::new()),
+            card_models: Mutex::new(HashMap::new()),
             host_peaks_path: None,
             card_waiters: Mutex::new(Vec::new()),
             card_waiter_seq: AtomicU64::new(0),
@@ -3496,7 +3500,39 @@ impl WorkerPool {
     /// Keep the learned host-memory figures in `path` (`host_peaks`): loaded now, so a restart
     /// charges each card what its proofs took, and written whenever one changes.
     pub fn use_host_peaks(&mut self, path: PathBuf) {
-        let cards = crate::host_peaks::load(&path);
+        // Each card's model now, by key: read before any proof holds a slot.
+        let models: HashMap<String, String> = self
+            .workers
+            .iter()
+            .filter_map(|(key, entry)| {
+                let name = entry
+                    .slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .gpu_name
+                    .clone()?;
+                Some((self.learn_key(key), name))
+            })
+            .collect();
+        let mut cards = crate::host_peaks::load(&path);
+        // Figures learned on another card than the one in the slot now (or on one not named) are
+        // not this card's: an RTX 5080 put where an RTX 5090 was would be charged the 5090's 42 GiB
+        // per SP1 proof. It starts from the defaults and learns its own.
+        cards.retain(|card, figures| {
+            let Some(now) = models.get(card) else {
+                return true;
+            };
+            if figures.model.as_deref() == Some(now.as_str()) {
+                return true;
+            }
+            tracing::info!(
+                "{card}: the host-memory figures on record were learned on {}, not the {now} there \
+                 now: starting from the defaults",
+                figures.model.as_deref().unwrap_or("an unrecorded card")
+            );
+            false
+        });
+        *self.card_models.lock().unwrap_or_else(|e| e.into_inner()) = models;
         {
             let mut ram = self.learned_peaks.lock().unwrap_or_else(|e| e.into_inner());
             let mut commit = self
@@ -3547,9 +3583,12 @@ impl WorkerPool {
         {
             cards.entry(card.clone()).or_default().commit = commit.clone();
         }
+        let models = self.card_models.lock().unwrap_or_else(|e| e.into_inner());
         for (card, figures) in cards.iter_mut() {
             figures.card = card.clone();
+            figures.model = models.get(card).cloned();
         }
+        drop(models);
         if let Err(e) = crate::host_peaks::save(path, &cards) {
             tracing::warn!(
                 "could not keep the learned host-memory figures in {}: {e}",
@@ -18081,6 +18120,68 @@ mod learned_host_peak_tests {
             pool.workers.insert(key.to_string(), entry(backend, 0, 0));
         }
         pool
+    }
+
+    /// Learned figures belong to the card model they were learned on: a different card in the same
+    /// slot (an RTX 5080 where an RTX 5090 was), or a record that names none, starts from the
+    /// defaults; the same model keeps its figures, and the next save names it.
+    #[test]
+    fn a_new_card_in_a_slot_does_not_inherit_the_old_cards_figures() {
+        let dir = std::env::temp_dir().join(format!("zkminer-card-model-{}", std::process::id()));
+        let path = dir.join(crate::host_peaks::FILE_NAME);
+        let card = |name: &str, model: Option<&str>| crate::host_peaks::Card {
+            card: name.to_string(),
+            model: model.map(str::to_string),
+            ram: std::collections::BTreeMap::from([(20, 40 * GIB)]),
+            commit: std::collections::BTreeMap::new(),
+        };
+        let cards = HashMap::from([
+            (
+                "sp1@0000:01:00.0".to_string(),
+                card("sp1@0000:01:00.0", Some("NVIDIA GeForce RTX 5090")),
+            ),
+            (
+                "sp1@0000:03:00.0".to_string(),
+                card("sp1@0000:03:00.0", Some("AMD Radeon RX 9070 XT")),
+            ),
+            (
+                "risc0@0000:03:00.0".to_string(),
+                card("risc0@0000:03:00.0", None),
+            ),
+        ]);
+        crate::host_peaks::save(&path, &cards).unwrap();
+        let mut pool = pool(&["sp1:cuda:0", "sp1:rocm:1", "risc0:rocm:1"]);
+        for (key, bus, name) in [
+            ("sp1:cuda:0", "0000:01:00.0", "NVIDIA GeForce RTX 5080"),
+            ("sp1:rocm:1", "0000:03:00.0", "AMD Radeon RX 9070 XT"),
+            ("risc0:rocm:1", "0000:03:00.0", "AMD Radeon RX 9070 XT"),
+        ] {
+            let entry = pool.workers.get_mut(key).unwrap();
+            entry.pci_bus_id = Some(bus.to_string());
+            entry.slot.get_mut().unwrap().gpu_name = Some(name.to_string());
+        }
+        pool.use_host_peaks(path.clone());
+        let learned = pool.learned_peaks.lock().unwrap().clone();
+        assert!(
+            !learned.contains_key("sp1@0000:01:00.0"),
+            "the 5090's figures"
+        );
+        assert!(
+            !learned.contains_key("risc0@0000:03:00.0"),
+            "a record naming no card"
+        );
+        assert!(
+            learned.contains_key("sp1@0000:03:00.0"),
+            "the same card keeps its own"
+        );
+        pool.save_host_peaks();
+        let back = crate::host_peaks::load(&path);
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back["sp1@0000:03:00.0"].model.as_deref(),
+            Some("AMD Radeon RX 9070 XT")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Figures that name no job charge each risc0 card the size it proves at: a card set to po2 21

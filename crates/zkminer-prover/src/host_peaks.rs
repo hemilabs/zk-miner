@@ -3,7 +3,9 @@
 //! proofs take rather than going back to the defaults measured on another machine.
 //!
 //! A card is known by its zkVM and PCI bus id (`"risc0@0000:01:00.0"`); one whose bus id is unknown
-//! by its slot key, which is kept for the run only.
+//! by its slot key, which is kept for the run only. Each record names the card model it was learned
+//! on, so a card swapped into the same slot starts from the defaults rather than its predecessor's
+//! figures.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,10 @@ pub fn default_path() -> PathBuf {
 pub struct Card {
     /// `"<zkVM>@<PCI bus id>"`.
     pub card: String,
+    /// The card model the figures were learned on (`NVIDIA GeForce RTX 5090`); `None` in a record
+    /// written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub ram: BTreeMap<u8, u64>,
     #[serde(default)]
@@ -99,6 +105,7 @@ mod tests {
             "sp1@0000:01:00.0".to_string(),
             Card {
                 card: "sp1@0000:01:00.0".into(),
+                model: Some("NVIDIA GeForce RTX 5090".into()),
                 ram: BTreeMap::from([(20, 37 << 30)]),
                 commit: BTreeMap::from([(20, 63 << 30)]),
             },
