@@ -731,10 +731,20 @@ unsafe fn sockaddr_bytes<'a>(sa: *const libc::sockaddr) -> Option<&'a [u8]> {
     Some(std::slice::from_raw_parts(sa.cast::<u8>(), len))
 }
 
+/// The names of Apple's own Ethernet-type and Wi-Fi interfaces (`IFT_ETHER`, `IFT_IEEE80211`):
+/// `en` (Ethernet, Wi-Fi, Thunderbolt and USB adapters), `ap` (the Wi-Fi access point of Internet
+/// Sharing), `awdl` and `llw` (Apple Wireless Direct Link, low-latency WLAN), `nan` (Wi-Fi Aware),
+/// `anpi` (the internal Apple network interfaces of Apple-silicon Macs). Any other name of those
+/// types (ZeroTier's `feth`, a virtual machine's `vmenet`, a third-party driver's) is a virtual
+/// Ethernet the guard cannot tell from a tunnel, so it does not count as physical.
+const PHYSICAL_NAMES: &[&str] = &["en", "ap", "awdl", "llw", "nan", "anpi"];
+
 /// A macOS interface type and name read as a Linux link kind (see the module doc): `None` for a
-/// physical interface (Ethernet, Wi-Fi, loopback), a kind in [`super::PHYSICAL_KINDS`] for a
-/// bridge, VLAN or link aggregate, `tun` for a `utun`, `tap` for a `tap`, and otherwise a kind no
-/// list has (`ipsec`, `gif`, `stf`, `iftype-N`), which the guard does not count as physical.
+/// physical interface (an Ethernet-type or Wi-Fi interface of a name in [`PHYSICAL_NAMES`], and
+/// loopback), a kind in [`super::PHYSICAL_KINDS`] for a bridge, VLAN or link aggregate, `tun` for
+/// a `utun`, `tap` for a `tap`, and otherwise a kind no list has (`ether-feth` for an
+/// Ethernet-type interface of another name, `ipsec`, `gif`, `stf`, `iftype-N`), which the guard
+/// does not count as physical.
 pub(crate) fn link_kind(ift: u8, name: &str) -> Option<String> {
     let named = |p: &str| {
         name.strip_prefix(p)
@@ -751,8 +761,11 @@ pub(crate) fn link_kind(ift: u8, name: &str) -> Option<String> {
                 "bond"
             } else if named("tap") {
                 "tap"
-            } else {
+            } else if PHYSICAL_NAMES.iter().any(|p| named(p)) {
                 return None;
+            } else {
+                let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
+                return Some(format!("ether-{}", crate::printable(base, 32)));
             }
         }
         IFT_BRIDGE => "bridge",
@@ -1426,6 +1439,59 @@ mod tests {
         assert!(!link(IFT_OTHER, "utun0").is_physical());
         assert!(!link(IFT_OTHER, "ipsec0").is_physical());
         assert!(link(IFT_PPP, "ppp0").is_ppp());
+        // parse-3: only Apple's own Ethernet-type and Wi-Fi names are physical; ZeroTier's
+        // `feth`, a VM's `vmenet`, an unknown driver's interface are not (fail closed).
+        for name in ["en0", "en12", "ap1", "awdl0", "llw0", "nan0", "anpi3"] {
+            for ift in [IFT_ETHER, IFT_IEEE80211] {
+                assert_eq!(link_kind(ift, name), None, "{name}");
+            }
+        }
+        for (name, kind) in [
+            ("feth0", "ether-feth"),
+            ("feth1234", "ether-feth"),
+            ("vmenet0", "ether-vmenet"),
+            ("zt0", "ether-zt"),
+            ("en", "ether-en"),
+            ("enx0", "ether-enx"),
+            ("eth0", "ether-eth"),
+        ] {
+            assert_eq!(link_kind(IFT_ETHER, name).as_deref(), Some(kind), "{name}");
+            assert!(!link(IFT_ETHER, name).is_physical(), "{name}");
+            assert!(!link(IFT_IEEE80211, name).is_physical(), "{name}");
+        }
+    }
+
+    /// This host's real interfaces classify as their kinds: Apple's Ethernet, Wi-Fi and internal
+    /// interfaces and loopback are physical, `bridgeN` a bridge, `utunN` a tunnel, `gif`/`stf`
+    /// not physical; anything else found is printed with its kind.
+    #[test]
+    fn this_hosts_interfaces_read_as_their_kinds() {
+        let links = links().unwrap();
+        let base = |n: &str| n.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+        for l in &links {
+            let want: Option<Option<&str>> = match base(&l.name).as_str() {
+                "en" | "ap" | "awdl" | "llw" | "nan" | "anpi" | "lo" => Some(None),
+                "bridge" => Some(Some("bridge")),
+                "utun" => Some(Some("tun")),
+                "gif" => Some(Some("gif")),
+                "stf" => Some(Some("stf")),
+                _ => None,
+            };
+            if let Some(want) = want {
+                assert_eq!(l.kind.as_deref(), want, "{l:?}");
+            }
+            let physical = l.is_physical();
+            assert_eq!(
+                physical,
+                matches!(l.kind.as_deref(), None | Some("bridge")),
+                "{l:?}"
+            );
+            eprintln!(
+                "{} (index {}): kind {:?}, physical {physical}",
+                l.name, l.index, l.kind
+            );
+        }
+        assert!(links.iter().any(|l| l.name == "lo0"));
     }
 
     /// This host's real table and kernel, read-only: the dump reads, the kernel answers every
