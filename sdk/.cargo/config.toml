@@ -1,0 +1,15 @@
+# The builder ABI v1 WASM profile (zkminer docs/witness-construction-jobs.md §9.1), pinned explicitly
+# so a new rustc's default CPU cannot add a feature the runner rejects:
+# - `target-cpu=mvp` enables nothing; the profile's features are then added one by one: bulk memory,
+#   multi-value, mutable globals, saturating float-to-int, reference types (funcref only; it brings the
+#   overlong call_indirect encoding), sign extension;
+# - SIMD (`simd128`, `relaxed-simd`), tail calls and extended-const are named off as well. Atomics,
+#   exception handling, GC, wide arithmetic, multi-memory and fp16 are off through `mvp` (rustc warns
+#   when they are named, as unstable or LLVM-only features).
+# The precompiled std for wasm32-unknown-unknown uses only features inside this set; the runner's
+# tests put the built example through the runner's pre-pass to prove the module uses no others.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-cpu=mvp",
+    "-C", "target-feature=+bulk-memory,+multivalue,+mutable-globals,+nontrapping-fptoint,+reference-types,+sign-ext,-simd128,-relaxed-simd,-tail-call,-extended-const",
+]

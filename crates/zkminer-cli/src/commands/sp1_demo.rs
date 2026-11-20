@@ -10,6 +10,9 @@
 //!   4. Register the program on ProgramRegistry with the HTTP URI
 //!   5. Approve HemiProve for the deposit, submit a job via submitJobDefault
 //!   6. Print the jobId — the miner will pick it up from the monitor
+//!
+//! The ELF is served from 127.0.0.1, which a miner's network guard refuses unless its config has
+//! `[dev] private_network = true` (refused on mainnet): run the demo only against a test network.
 
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
@@ -56,6 +59,9 @@ pub async fn run(config_path: Option<&Path>, n: u32) -> Result<()> {
     let elf_url = format!("http://127.0.0.1:{port}/fibonacci-sp1-guest.bin");
     tokio::spawn(serve_elf_forever(port));
     println!("Serving ELF at {elf_url}");
+    println!(
+        "  (a miner fetches it from 127.0.0.1 only with `[dev] private_network = true` in its config)"
+    );
     // Brief warm-up so the listener is ready before registration.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 

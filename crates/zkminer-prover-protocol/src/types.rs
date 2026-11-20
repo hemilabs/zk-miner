@@ -34,7 +34,29 @@ use serde::{Deserialize, Serialize};
 /// A v12 worker would seed guests by its host's key, unlike a v13 one proving the same job. And
 /// `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
 /// segment sizes (both in the same unreleased version).
-pub const PROTOCOL_VERSION: u32 = 13;
+/// 14: witness-construction jobs (plan §15.3). `Prove` gained `witness` ([`WitnessProve`]): the input
+/// is `prefix ‖ W`, read by the worker from a file and checked against the bundle's length and
+/// `sha256(prefix ‖ W)` (a mismatch is the new [`ErrorKind::InputMismatch`]), executed once with its
+/// segments under `segment_dir`, and proven only if its journal hashes to the bundle's; otherwise the
+/// worker answers with the new `WorkerResponse::JournalDiverged`. A v13 worker cannot decode the
+/// field, so the handshake refuses it. The one-shot sandboxed execute
+/// ([`WitnessExecuteRequest`] / [`WitnessExecuteResponse`]) is not part of the IPC stream, but ships
+/// in the same version; so does its response's `sdk_version` / `worker_version` (in the same
+/// unreleased version: no handshake covers the one-shot execute, and a response from a binary built
+/// without them fails to decode rather than pass for one).
+/// 15: no new field, new meanings, all of the SP1 worker's: it refuses at measurement a guest that
+/// halts with a non-zero exit code or commits its public values under a digest other than SHA-256,
+/// binds a proof's `programId` in the canonical byte order only, and reports cycles (measured,
+/// proven and benchmarked) as SP1's gas, which weights precompiles by what they cost to prove, not
+/// as its instruction count (`zkop-mix`'s scoring rows excepted). A v14 SP1 worker would measure such
+/// guests clean and size a host's jobs in other units, and `~/.zkminer/provers` is searched before
+/// the workers shipped beside the miner, so the handshake refuses it.
+/// 16: [`WitnessExecutePo2`] gained `sys_rand_draws`, the guest's `sys_rand` calls past its runtime's
+/// own, which the miner's witness gate and `zkminer simulate --adversarial` refuse: no proof binds
+/// the seed, so a prover picks what the guest draws. The one-shot execute is not part of the IPC
+/// stream, but ships with the workers: a v15 binary's response lacks the field and fails to decode
+/// rather than pass for one that drew nothing.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -181,6 +203,13 @@ pub enum WorkerCommand {
         /// the pre-existing behaviour (benchmark/calibration paths, mock worker).
         #[serde(default)]
         program_id: Option<[u8; 32]>,
+        /// A witness-construction job's input, by path (protocol v14): `None` for every other
+        /// proof. When set, `input_data` must be empty: the worker reads `prefix ‖ W` itself, refuses
+        /// it on a length or hash mismatch ([`ErrorKind::InputMismatch`]), and proves only if the
+        /// execution's journal hashes to `expect_journal_sha256` (else `JournalDiverged`). risc0
+        /// only; the other workers refuse it. Appended last, as bincode is positional.
+        #[serde(default)]
+        witness: Option<WitnessProve>,
     },
     /// EXECUTE the guest without proving, to measure its true cycle count.
     ///
@@ -364,9 +393,9 @@ pub enum WorkerResponse {
     ProgramIdResult {
         request_id: u64,
         /// risc0: the image id (`Digest::as_bytes`, the order the deployed adapter verifies against).
-        /// SP1: the verifying-key hash as `vk.bytes32()` writes it. The on-chain order of an SP1
-        /// programId is deployment-defined, so a caller compares it in either order, as the SP1
-        /// worker's prove-path gate does.
+        /// SP1: the verifying-key hash as `vk.bytes32()` writes it, the big-endian order the
+        /// on-chain verifier reads `programId` in. A caller compares it in that order only, as the
+        /// SP1 worker's prove-path gate does.
         program_id: [u8; 32],
         /// How long the derivation took.
         duration_secs: f64,
@@ -383,6 +412,262 @@ pub enum WorkerResponse {
         /// What `done_bytes` is heading for, where it is known.
         total_bytes: Option<u64>,
     },
+    /// Answer to a witness `Prove` ([`WitnessProve`]) whose execution did not reproduce the bundle:
+    /// it did not halt with exit code 0, or its journal does not hash to `expect_journal_sha256`.
+    /// Nothing was proven. Typed so the host never classifies a divergence from text: it re-runs the
+    /// binding and the claim-gate limits on this journal and either re-dispatches a new bundle
+    /// version, hands the job back, or releases it (plan §15.3). Appended last (v14), so every
+    /// earlier variant keeps its bincode index.
+    JournalDiverged {
+        request_id: u64,
+        /// The journal this execution committed: empty when it is longer than
+        /// [`EXECUTE_JOURNAL_MAX_BYTES`] (no fulfil could carry it) or the guest committed none.
+        journal: Vec<u8>,
+        /// Its length in bytes, whether or not `journal` carries it.
+        journal_len: u32,
+        /// `sha256(journal)` over the full journal (of no bytes when there was none).
+        journal_sha256: [u8; 32],
+        /// How the guest ended: one of the `GUEST_EXIT_*` constants.
+        exit_kind: u8,
+        /// The guest's exit code for [`GUEST_EXIT_HALTED`] and [`GUEST_EXIT_PAUSED`], else 0.
+        exit_code: u32,
+        /// Sized cycles, in the unit of `ExecuteResult.cycles` (every segment padded to its power
+        /// of two, plus each keccak request).
+        cycles: u64,
+    },
+}
+
+/// The input of a witness-construction job's proof (`WorkerCommand::Prove::witness`, protocol v14).
+///
+/// The prove workers are trusted processes of the miner's own uid, so the input travels as a path:
+/// host RAM is not charged for a copy in the frame, and the worker hashes what it actually reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessProve {
+    /// `W` in the retention store (`w.bin` of the bundle). The worker opens it once and reads it
+    /// through that one descriptor.
+    pub input_path: String,
+    /// The guest input's prefix, prepended to `W`: `abi.encode(jobId, prover)` (64 bytes) for a
+    /// job with the journal-prefix marker, else empty. Any other length is refused.
+    pub prefix: Vec<u8>,
+    /// `sha256(prefix ‖ W)`, from the bundle.
+    pub input_sha256: [u8; 32],
+    /// `|W|`, from the bundle.
+    pub w_len: u64,
+    /// `sha256` of the journal the bundle recorded at this po2: the proof runs only if the execution
+    /// commits exactly it.
+    pub expect_journal_sha256: [u8; 32],
+    /// The directory the execution's segments are written to: an absolute path on an
+    /// operator-configured, non-tmpfs filesystem, one per prove slot. Created if missing; everything
+    /// in it is deleted before the execution and after the proof.
+    pub segment_dir: String,
+}
+
+/// `JournalDiverged.exit_kind` / [`WitnessExecutePo2`]`.exit_kind`: how a risc0 guest ended
+/// (`risc0_zkvm::ExitCode`). Only `Halted(0)` is provable for a job.
+pub const GUEST_EXIT_HALTED: u8 = 0;
+/// `ExitCode::Paused(code)`.
+pub const GUEST_EXIT_PAUSED: u8 = 1;
+/// `ExitCode::SystemSplit`.
+pub const GUEST_EXIT_SYSTEM_SPLIT: u8 = 2;
+/// `ExitCode::SessionLimit`.
+pub const GUEST_EXIT_SESSION_LIMIT: u8 = 3;
+/// An `ExitCode` this protocol version does not know (risc0's enum is `#[non_exhaustive]`).
+pub const GUEST_EXIT_UNKNOWN: u8 = 255;
+
+/// The argument that runs the risc0 CPU worker as a one-shot sandboxed witness execute (plan §10.1):
+/// it restricts itself before anything else, reads one [`WitnessExecuteRequest`] frame from fd 0 and
+/// `W` from fd 3, writes one [`WitnessExecuteResponse`] frame to fd 1, logs to fd 2, and exits with
+/// 0 or a [`WitnessExecuteFailure`] code.
+pub const WITNESS_EXECUTE_ARG: &str = "--witness-execute";
+
+/// The fd a witness execute reads `W` from: a read-only regular file or a write-sealed memfd.
+pub const WITNESS_EXECUTE_W_FD: i32 = 3;
+
+/// After [`WITNESS_EXECUTE_ARG`]: answer one [`WitnessExecuteBuild`] frame on fd 1 and exit 0, under
+/// the same self-restriction, reading no request, no `W` and running no guest. The miner asks before
+/// any requester's guest runs in that binary: a witness bundle records this as the build its
+/// journals came from, never what a process that ran a guest says of itself.
+pub const WITNESS_EXECUTE_BUILD_ARG: &str = "--build";
+
+/// The execute worker's build, as [`WitnessExecuteResponse`] and the binary's `HelloAck` name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecuteBuild {
+    pub sdk_version: String,
+    pub worker_version: String,
+}
+
+/// What a sandboxed witness execute runs: the guest on `prefix ‖ W` at each po2, with the given seed.
+///
+/// One length-prefixed bincode frame on fd 0 (see [`crate::codec`]). `W` itself is not in the frame:
+/// it is read from fd [`WITNESS_EXECUTE_W_FD`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecuteRequest {
+    /// The guest ELF.
+    pub elf: Vec<u8>,
+    /// Prepended to `W`: 0 or 64 bytes (see [`WitnessProve::prefix`]).
+    pub prefix: Vec<u8>,
+    /// `|W|`: fd 3's size must be exactly this.
+    pub w_len: u64,
+    /// `sha256(prefix ‖ W)`: the worker refuses any other input ([`WitnessExecuteFailure::InputMismatch`]).
+    pub input_sha256: [u8; 32],
+    /// The guest's `sys_rand` seed: the public rule's, as the miner derives it
+    /// (`crate::sys_rand::risc0_seed`), or another that a host-dependence check runs the guest
+    /// under. The worker derives no seed in this mode.
+    pub sys_rand_seed: [u8; 32],
+    /// The segment sizes to execute at, in order, each within
+    /// [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`], without repeats.
+    pub po2s: Vec<u8>,
+    /// The keccak po2 (`RISC0_KECCAK_PO2`, 14..=18), which a guest can observe. The worker sets the
+    /// variable from this field before it starts any thread; the launcher passes no environment.
+    pub keccak_po2: u8,
+    /// A cap in sized cycles (segments padded to their power of two plus keccak requests) per po2;
+    /// `None` = no cap beyond the launcher's timeout and the cgroup's limits.
+    pub max_cycles: Option<u64>,
+}
+
+/// One po2 of a [`WitnessExecuteResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecutePo2 {
+    pub po2: u8,
+    /// Sized cycles, in the unit of `ExecuteResult.cycles`.
+    pub cycles: u64,
+    /// The journal: empty when it is longer than [`EXECUTE_JOURNAL_MAX_BYTES`] or there is none.
+    pub journal: Vec<u8>,
+    pub journal_len: u32,
+    /// `sha256` of the full journal (of no bytes when there is none).
+    pub journal_sha256: [u8; 32],
+    /// One of the `GUEST_EXIT_*` constants.
+    pub exit_kind: u8,
+    /// The code of `Halted` / `Paused`, else 0.
+    pub exit_code: u32,
+    /// What the execution's segments serialize to (`bincode`, as risc0 writes them to a
+    /// `segment_path`): the disk a proof at this po2 needs.
+    pub segment_bytes: u64,
+    /// The worker's peak resident set (`getrusage` `ru_maxrss`) after this po2 ran: a high-water mark
+    /// of the whole process, so it never decreases across the po2s of one response.
+    pub peak_host_bytes: u64,
+    /// The guest's `sys_rand` calls at this po2 past the one its runtime makes before `main` (four
+    /// words of memory-image entropy): `Some(0)` for a guest that drew nothing of its own, `None`
+    /// when no call was seen at all (a guest without risc0's runtime, or a fork whose handler stopped
+    /// logging the call the worker counts). The proof binds no seed, so whatever a guest draws a
+    /// prover may choose; the miner skips a job whose guest draws (`GuestUsesSysRand`). A count of
+    /// calls, not a proof of independence: a guest can read its runtime's own draw from memory.
+    pub sys_rand_draws: Option<u64>,
+}
+
+/// The answer to a [`WitnessExecuteRequest`]: one frame on fd 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExecuteResponse {
+    /// The ELF's image id (`Digest::as_bytes`), as the seed and the bundle must name it.
+    pub image_id: [u8; 32],
+    /// One per requested po2, in the request's order. Execution stops after the first po2 whose
+    /// guest did not halt with code 0 (no later po2 can make the job claimable), so that result is
+    /// then the last one and there are fewer results than po2s.
+    pub results: Vec<WitnessExecutePo2>,
+    /// The executor's build, as the binary's `Hello` names it to a pool (`WorkerResponse::Hello`):
+    /// a witness bundle records the build of every executor its journals came from (plan §15.1).
+    pub sdk_version: String,
+    pub worker_version: String,
+}
+
+/// How a sandboxed witness execute failed, as its exit code: never parsed from text (its stderr can
+/// carry guest-controlled bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessExecuteFailure {
+    /// The request frame or one of its fields is malformed, or fd 3 is not a read-only file.
+    BadRequest,
+    /// `W`'s length or `sha256(prefix ‖ W)` differs from the request.
+    InputMismatch,
+    /// risc0 refused the ELF.
+    InvalidElf,
+    /// The execution failed: a guest panic or trap, an execution the pinned risc0 refuses because no
+    /// proof of it could verify, or a keccak request that does not match its input.
+    GuestFault,
+    /// The guest halted with code 0, but no proof of the run can verify: no output, or an
+    /// assumption other than its keccak root.
+    Unprovable,
+    /// [`Self::Unprovable`] for a known cause: an assumption under risc0-circuit-recursion 4.0's
+    /// control root, which a guest built with risc0-zkvm older than 3.1 names for two or more keccak
+    /// batches and the 3.1 prover cannot resolve. Its requester rebuilds the guest with 3.1.0.
+    OldRisc0Guest,
+    /// `max_cycles` was exceeded.
+    CycleLimit,
+    /// The sandbox could not be applied; nothing was read.
+    Sandbox,
+    /// The executor panicked (a malformed or hostile ELF, as on the measure path).
+    Panicked,
+    /// Anything else: writing the response, an allocation the cgroup refused.
+    Internal,
+    /// This binary has no witness execute mode.
+    Unsupported,
+}
+
+impl WitnessExecuteFailure {
+    const ALL: [WitnessExecuteFailure; 11] = [
+        Self::BadRequest,
+        Self::InputMismatch,
+        Self::InvalidElf,
+        Self::GuestFault,
+        Self::Unprovable,
+        Self::OldRisc0Guest,
+        Self::CycleLimit,
+        Self::Sandbox,
+        Self::Panicked,
+        Self::Internal,
+        Self::Unsupported,
+    ];
+
+    /// The process exit code: 80..=90, clear of 1 (a generic failure), 2 (usage), 101 (an uncaught
+    /// Rust panic), 126/127 (exec failures) and [`WORKER_EXIT_SERVER_LOST`].
+    pub const fn code(self) -> i32 {
+        match self {
+            Self::BadRequest => 80,
+            Self::InputMismatch => 81,
+            Self::InvalidElf => 82,
+            Self::GuestFault => 83,
+            Self::Unprovable => 84,
+            Self::CycleLimit => 85,
+            Self::Sandbox => 86,
+            Self::Panicked => 87,
+            Self::Internal => 88,
+            Self::Unsupported => 89,
+            Self::OldRisc0Guest => 90,
+        }
+    }
+
+    /// What the failure means, in the host's words: a requester reads it in simulate's report and an
+    /// operator in the miner's log, never the worker's stderr (which a guest can write to).
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::BadRequest => "the request or W's descriptor is malformed",
+            Self::InputMismatch => "W's length or sha256(prefix ‖ W) is not the request's",
+            Self::InvalidElf => "risc0 refused the ELF",
+            Self::GuestFault => {
+                "the execution failed: a guest panic or trap, an execution no proof of which could \
+                 verify, or a keccak request that does not match its input"
+            }
+            Self::Unprovable => {
+                "the guest halted with code 0, but no proof of the run can verify: it has no output, \
+                 or assumes a claim no proof here resolves"
+            }
+            Self::OldRisc0Guest => {
+                "the guest was built with risc0-zkvm older than 3.1: it assumes a claim under \
+                 risc0-circuit-recursion 4.0's control root (what a 3.0 guest's keccak batcher names \
+                 for two or more batches), which this risc0-zkvm 3.1 prover cannot resolve, so no \
+                 proof of it can verify. Rebuild the guest with risc0-zkvm 3.1.0 (its image id changes)"
+            }
+            Self::CycleLimit => "the execution went over its cycle cap",
+            Self::Sandbox => "the execute worker could not apply its sandbox",
+            Self::Panicked => "the executor panicked (a malformed or hostile ELF)",
+            Self::Internal => "the execute worker failed internally",
+            Self::Unsupported => "this worker binary has no witness execute mode",
+        }
+    }
+
+    /// The failure an exit code stands for, if it is one.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.code() == code)
+    }
 }
 
 /// What a worker's one-time setup is doing (`WorkerResponse::SetupProgress`), for display.
@@ -440,6 +725,11 @@ pub enum ErrorKind {
     ProtocolError,
     /// Catch-all for internal errors.
     Internal,
+    /// A witness `Prove`'s input, read in full, does not have the bundle's length or
+    /// `sha256(prefix ‖ W)`: the retained `W` is corrupt (plan §15.2), not the job or the worker. An
+    /// input the worker could not open or read is `Internal` instead (the store may be unavailable).
+    /// Appended last (v14).
+    InputMismatch,
 }
 /// The exit code of a worker whose proving server is gone, or whose connection to it is unusable.
 ///
@@ -449,6 +739,37 @@ pub enum ErrorKind {
 /// the dispatcher reads this code as it reads a worker's own SIGKILL (see
 /// `WorkerHandle::died_of_host_oom`). 75 is `EX_TEMPFAIL`: another worker may well succeed.
 pub const WORKER_EXIT_SERVER_LOST: i32 = 75;
+
+/// The exit code of a worker that found, after its handshake, that it cannot run its backend on this
+/// host: an SP1 worker whose executor could not run its own small guest once confined (it cannot
+/// share memory with its runner process there, say). It answers nothing and exits; the dispatcher
+/// then declines the slot as it does a worker that declines its handshake (`WORKER_DECLINED`) and
+/// reports [`WorkerDeclined`]. An exit code, not a message, because no guest's text can produce it:
+/// the worker checks before it runs any requester's guest. 78 is `EX_CONFIG`.
+pub const WORKER_EXIT_DECLINED: i32 = 78;
+
+/// A worker exited [`WORKER_EXIT_DECLINED`] in the middle of a request: its backend cannot run on
+/// this host, its slot is declined (until a fresh worker is tried after a backoff), and nothing about
+/// the job or program it was given is known. Only the dispatcher constructs it, from the worker's exit
+/// code, or for a declined slot it will not respawn before then.
+#[derive(Debug, Clone)]
+pub struct WorkerDeclined {
+    /// The declined slot, e.g. `sp1:cuda:0` or `sp1:measure:1`.
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for WorkerDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{WORKER_DECLINED}: worker {} found it cannot run its backend here (an environment \
+             fault, not the job's; see the worker's log) and is declined",
+            self.slot_key
+        )
+    }
+}
+
+impl std::error::Error for WorkerDeclined {}
 
 /// Bytes of HOST memory a worker is allowed to use, as the dispatcher sees it.
 ///
@@ -548,6 +869,23 @@ pub const SP1_NO_AUTOTUNE_ENV: &str = "ZKMINER_SP1_NO_AUTOTUNE";
 /// runs one such server-less worker as the dedicated cycle-measurement slot, so a measure wall-clock
 /// watchdog SIGKILL (which group-kills the worker) can never tear down a proving worker's warm server.
 pub const SP1_MEASURE_ONLY_ENV: &str = "ZKMINER_SP1_MEASURE_ONLY";
+
+/// For a risc0 worker: the retention store's directory, which its witness proofs read their input
+/// from (`WitnessProve::input_path` is below it). A worker confines itself before its first guest
+/// (Landlock), and reads nothing of the home directory afterwards that it was not told of before.
+pub const WITNESS_READ_DIR_ENV: &str = "ZKMINER_WITNESS_READ_DIR";
+
+/// For a risc0 worker: the root of the witness proofs' segment directories
+/// (`WitnessProve::segment_dir` is below it), which its confinement lets it write.
+pub const WITNESS_SEGMENT_DIR_ENV: &str = "ZKMINER_WITNESS_SEGMENT_DIR";
+
+/// Where SP1's servers take turns for their final wraps (`SP1_GROTH16_QUEUE_DIR`, lock files, one
+/// per slot) unless the operator says otherwise: `<home>/.zkminer/locks`. On disk, owned by the
+/// miner, the same for every worker it starts and for a worker started on its own, so every server
+/// on the host shares one queue; never `/dev/shm`, which a confined SP1 process cannot reach.
+pub fn sp1_groth16_queue_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".zkminer").join("locks")
+}
 
 /// Set to `0` to stop the SP1 worker installing the `sp1-gpu-server` shipped beside it over
 /// `~/.sp1/bin/sp1-gpu-server`. Shared because the dispatcher has to know which of the two servers
@@ -916,11 +1254,11 @@ impl std::fmt::Display for MeasureWallClockTimeout {
 impl std::error::Error for MeasureWallClockTimeout {}
 
 /// A committed (claimed) proof reclaimed this in-flight pre-claim MEASUREMENT's resources by killing
-/// its throwaway measure worker (dispatcher `preempt_measures_for_host` / `preempt_measures_for_shm`).
+/// its throwaway measure worker (dispatcher `preempt_measures_for_host`).
 ///
 /// Typed, and TRANSIENT, for the same reason as `MeasureSlotsBusy`: nothing about the (program, input)
 /// failed — the measurement was healthy and simply YIELDED to a bonded job on the marginal box where a
-/// ~12 GiB measure and an ~18 GiB prove cannot co-fit (host-RAM and, on x86_64, `/dev/shm`). A
+/// ~12 GiB measure and an ~18 GiB prove cannot co-fit in host RAM. A
 /// measurement is speculative work with no collateral; a claimed proof is bonded and on a deadline, so
 /// giving the proof priority is the correct resolution of that contention (finding RH-round3 residual
 /// A — the "give the committed prove priority over the speculative measure" proper fix). The caller
@@ -1155,6 +1493,12 @@ impl WorkerProofError {
     /// for this program can ever be proved: the caller should stop claiming the program, not retry.
     pub fn is_program_mismatch(&self) -> bool {
         matches!(self.kind, ErrorKind::ProgramMismatch)
+    }
+
+    /// Did a witness proof's input fail the bundle's length or hash? Then the retained `W` is
+    /// corrupt: no card can prove it, and the bundle needs §15.2's handling.
+    pub fn is_input_mismatch(&self) -> bool {
+        matches!(self.kind, ErrorKind::InputMismatch)
     }
 }
 
@@ -1647,6 +1991,7 @@ mod tests {
             input_data: vec![4, 5, 6],
             po2: Some(20),
             program_id: Some([7u8; 32]),
+            witness: None,
         };
         let bytes = bincode::serialize(&cmd).unwrap();
         let decoded: WorkerCommand = bincode::deserialize(&bytes).unwrap();
@@ -1657,15 +2002,44 @@ mod tests {
                 input_data,
                 po2,
                 program_id,
+                witness,
             } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(elf, vec![1, 2, 3]);
                 assert_eq!(input_data, vec![4, 5, 6]);
                 assert_eq!(po2, Some(20));
                 assert_eq!(program_id, Some([7u8; 32]));
+                assert_eq!(witness, None);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn a_witness_execute_failure_round_trips_through_its_exit_code() {
+        let codes: Vec<i32> = WitnessExecuteFailure::ALL
+            .iter()
+            .map(|f| f.code())
+            .collect();
+        for f in WitnessExecuteFailure::ALL {
+            assert_eq!(WitnessExecuteFailure::from_code(f.code()), Some(f));
+            assert!((80..=90).contains(&f.code()), "{f:?}");
+            assert!(!f.describe().is_empty());
+        }
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "codes are distinct");
+        for other in [0, 1, 2, 75, 101, 126, 127, 137] {
+            assert_eq!(WitnessExecuteFailure::from_code(other), None, "{other}");
+        }
+        // The one a requester can fix themselves says how.
+        let old = WitnessExecuteFailure::OldRisc0Guest.describe();
+        assert!(
+            old.contains("older than 3.1")
+                && old.contains("Rebuild the guest with risc0-zkvm 3.1.0"),
+            "{old}"
+        );
     }
 
     #[test]

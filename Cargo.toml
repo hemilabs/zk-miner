@@ -1,8 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/zkminer-witness",
+    "crates/zkminer-witness-builder",
+    "crates/zkminer-witness-broker",
+    "crates/zkminer-witness-sandbox",
+    "crates/zkminer-witness-store",
+    "crates/zkminer-witness-host",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
+    "crates/zkminer-netguard",
     "crates/zkminer-prover",
     "crates/zkminer-prover-protocol",
     "crates/zkminer-strategy",
@@ -12,23 +19,43 @@ members = [
     "crates/zkminer-prove-risc0",
     "crates/zkminer-prove-sp1",
     "crates/zkminer-e2e",
+    "reference/eth-prelude",
+    "reference/proxy-slots/statement",
+    # Not a default member: it builds a risc0 guest and links the risc0 executor.
+    "reference/proxy-slots/methods",
 ]
 default-members = [
+    "crates/zkminer-witness",
+    "crates/zkminer-witness-builder",
+    "crates/zkminer-witness-broker",
+    "crates/zkminer-witness-sandbox",
+    "crates/zkminer-witness-store",
+    "crates/zkminer-witness-host",
     "crates/zkminer-contracts",
     "crates/zkminer-chain",
+    "crates/zkminer-netguard",
     "crates/zkminer-prover",
     "crates/zkminer-prover-protocol",
     "crates/zkminer-strategy",
     "crates/zkminer-tui",
     "crates/zkminer-config",
     "crates/zkminer-cli",
+    "reference/eth-prelude",
+    "reference/proxy-slots/statement",
 ]
 exclude = [
     "crates/zkminer-prover/guests",
+    # risc0 guests, each its own workspace and lockfile (built by reference/proxy-slots/methods).
+    "reference/proxy-slots/guest",
+    "reference/proxy-slots/lint-control",
+    "reference/proxy-slots/hostdep",
     # Its own workspace and lockfile: OpenVM 1.5.0-rc.1 pins p3-field =0.4.1 and SP1 6.8.1's slop
     # crates =0.4.3-succinct, and one workspace can hold only one 0.4.x. Build it with
     # `--manifest-path crates/zkminer-prove-openvm/Cargo.toml`.
     "crates/zkminer-prove-openvm",
+    # The witness-builder SDK and its examples: their own workspace and lockfile, built for
+    # wasm32-unknown-unknown (see sdk/README.md).
+    "sdk",
 ]
 
 [workspace.package]
@@ -80,11 +107,20 @@ rand = "0.8"
 # Internal crates
 zkminer-contracts = { path = "crates/zkminer-contracts" }
 zkminer-chain = { path = "crates/zkminer-chain" }
+# Members that need the guarded HTTP client ask for `features = ["client"]`.
+zkminer-netguard = { path = "crates/zkminer-netguard", default-features = false }
 zkminer-prover = { path = "crates/zkminer-prover" }
 zkminer-prover-protocol = { path = "crates/zkminer-prover-protocol" }
 zkminer-strategy = { path = "crates/zkminer-strategy" }
 zkminer-tui = { path = "crates/zkminer-tui" }
 zkminer-config = { path = "crates/zkminer-config" }
+zkminer-witness = { path = "crates/zkminer-witness" }
+zkminer-witness-store = { path = "crates/zkminer-witness-store" }
+zkminer-witness-sandbox = { path = "crates/zkminer-witness-sandbox" }
+# The reference guest library and plan §12's statement (no_std; also built by risc0 guests and wasm32
+# builders in workspaces of their own, which name them by path).
+hemiprove-eth-prelude = { path = "reference/eth-prelude" }
+hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 
 # Patch risc0 crates to use hemilabs fork (AMD + NVIDIA GPU support)
 #
@@ -217,24 +253,24 @@ sppark = { git = "https://github.com/hemilabs/risc0-sppark", rev = "5f68eb3eb9e4
 # which installs it. A commit rather than a branch, so that a moved branch can never pair an SDK with
 # a different server. Keep `crates/zkminer-cli/Cargo.toml`, which names the commit directly, in step
 # with this.
-sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
-sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "a4df7c8f70292a7f30100ae253c6ba42fd2859a1" }
+sp1-sdk = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-build = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-cuda = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-prover = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-prover-types = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-core-executor = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-core-machine = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-curves = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-derive = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-hypercube = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-jit = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-primitives = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-recursion-circuit = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-recursion-compiler = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-recursion-executor = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-recursion-gnark-ffi = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-recursion-machine = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
+sp1-verifier = { git = "https://github.com/hemilabs/sp1", rev = "d20bbb645838b35ac967c2cd4df05fa88eb42f41" }
 
 [profile.release]
 opt-level = 3

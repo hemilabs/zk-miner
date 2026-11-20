@@ -31,6 +31,32 @@ fn mock_env(hang_on: &str, crash_on: &str) -> HashMap<String, String> {
     env
 }
 
+// ---- Handshake ----
+
+/// A worker built for another protocol version (an old one left in `~/.zkminer/provers`, which is
+/// searched first) is a DECLINE, not a transient spawn failure: otherwise its slot stays "healthy",
+/// is respawned on every dispatch, and the miner claims jobs only a stale worker would take.
+#[test]
+fn a_worker_of_another_protocol_version_declines() {
+    let mut env = mock_env("", "");
+    env.insert(
+        "MOCK_PROTOCOL_VERSION".to_string(),
+        (zkminer_prover_protocol::PROTOCOL_VERSION - 1).to_string(),
+    );
+    let err = match zkminer_prover::worker::WorkerHandle::spawn("mock", &mock_worker_path(), &env) {
+        Ok(_) => panic!("a worker of another protocol version was accepted"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains(zkminer_prover_protocol::types::WORKER_DECLINED),
+        "not a decline: {err}"
+    );
+    assert!(err.contains("Protocol version mismatch"), "{err}");
+    // This build's version is accepted.
+    zkminer_prover::worker::WorkerHandle::spawn("mock", &mock_worker_path(), &mock_env("", ""))
+        .expect("a worker of this protocol version");
+}
+
 // ---- Benchmark timeout tests ----
 
 #[test]
@@ -657,6 +683,47 @@ fn warmup_reports_what_was_done() {
         .is_err());
 }
 
+/// A worker that has run a guest has no network, so a warm-up (which may download) never runs on
+/// one: the slot gets a fresh worker for it, without counting a failure. A worker that has only
+/// shaken hands keeps its process.
+#[test]
+fn a_warmup_after_a_guest_runs_on_a_fresh_worker() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let first = pool.test_pid("mock:generic").unwrap();
+    assert_ne!(first, 0);
+    pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        pool.test_pid("mock:generic"),
+        Some(first),
+        "nothing ran before it: same worker"
+    );
+
+    // A measurement on the prove slot (a backend with no measure pool) runs the job's guest there.
+    let m = pool
+        .execute_cycles("mock", &[], &[], Some(Duration::from_secs(10)), None, None)
+        .unwrap();
+    assert_eq!(m.cycles, 1000);
+    assert_eq!(pool.test_pid("mock:generic"), Some(first));
+    let summary = pool.warm_up("mock", Duration::from_secs(10)).unwrap();
+    assert_eq!(summary, "nothing to warm up");
+    let fresh = pool.test_pid("mock:generic").unwrap();
+    assert!(fresh != 0 && fresh != first, "{first} -> {fresh}");
+    assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+    // And the fresh one, warmed, serves the next job.
+    pool.prove(
+        "mock:generic",
+        &[],
+        &[],
+        None,
+        Some(Duration::from_secs(10)),
+        None,
+    )
+    .unwrap();
+    assert_eq!(pool.test_pid("mock:generic"), Some(fresh));
+}
+
 /// A warm-up that hangs (a download that stalls) is killed at its deadline, like a benchmark: the
 /// slot is cleared for a respawn and the kill is not counted as a crash.
 #[test]
@@ -855,4 +922,62 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
         "a finished measurement must not stay registered as preemptible"
     );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+// ---- Declines expire ----
+
+/// A worker that exits `WORKER_EXIT_DECLINED` on its first guest (its executor canary failed) has its
+/// slot declined, out of use for ten minutes. Once that wait is over the slot is tried with a fresh
+/// worker, which passes its handshake and is offered again; a worker that still cannot run a guest
+/// declines again, for twice as long; and one that can proves.
+#[test]
+fn a_declined_slot_is_retried_with_a_fresh_worker() {
+    use zkminer_prover_protocol::types::{WorkerDeclined, WORKER_EXIT_DECLINED};
+    let min = |m: u64| Duration::from_secs(m * 60);
+    let declining = || {
+        let mut env = mock_env("", "prove");
+        env.insert(
+            "MOCK_CRASH_CODE".to_string(),
+            WORKER_EXIT_DECLINED.to_string(),
+        );
+        env
+    };
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), declining())
+        .expect("failed to spawn mock worker");
+    let prove = |pool: &WorkerPool| {
+        pool.prove(
+            "mock",
+            b"elf",
+            b"input",
+            None,
+            Some(Duration::from_secs(30)),
+            None,
+        )
+    };
+
+    let err = prove(&pool).expect_err("a declining worker proves nothing");
+    assert!(err.downcast_ref::<WorkerDeclined>().is_some(), "{err:#}");
+    let (_, wait) = pool.test_decline("mock:generic").expect("declined");
+    assert_eq!(wait, min(10));
+    assert!(!pool.is_backend_healthy("mock"));
+    assert_eq!(pool.retry_due_declines(), 0, "not before its wait is over");
+    assert!(prove(&pool).is_err(), "a declined slot takes no proof");
+
+    pool.test_expire_decline("mock:generic");
+    assert_eq!(pool.retry_due_declines(), 1);
+    assert!(pool.test_decline("mock:generic").is_none(), "offered again");
+    assert_eq!(pool.test_has_handle("mock:generic"), Some(true));
+    assert!(pool.is_backend_healthy("mock"));
+
+    let err = prove(&pool).expect_err("its worker still cannot run a guest");
+    assert!(err.downcast_ref::<WorkerDeclined>().is_some(), "{err:#}");
+    let (_, wait) = pool.test_decline("mock:generic").expect("declined again");
+    assert_eq!(wait, min(20));
+
+    pool.test_set_spawn_env("mock:generic", mock_env("", ""));
+    pool.test_expire_decline("mock:generic");
+    assert_eq!(pool.retry_due_declines(), 1);
+    prove(&pool).expect("a worker that can run a guest proves");
+    assert!(pool.test_decline("mock:generic").is_none());
 }

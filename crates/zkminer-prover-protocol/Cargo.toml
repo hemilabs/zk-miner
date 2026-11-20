@@ -7,3 +7,5 @@ edition.workspace = true
 serde = { workspace = true }
 bincode = "1"
 thiserror = { workspace = true }
+# `sys_rand::risc0_seed` / `rule_id`: the one implementation of the public seed rule.
+sha2 = "0.10"

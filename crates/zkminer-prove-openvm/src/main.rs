@@ -52,6 +52,56 @@ fn main() {
     }
 }
 
+/// Workers that run requester guests are confined: before the first command that carries a
+/// requester's ELF (`Execute`, `Prove`, `ProgramId`), the worker confines itself, its threads and
+/// everything it starts, for the rest of its life (`zkminer_witness_sandbox::confine`: no socket of
+/// any kind, Landlock to the system's files and its own directory, no reaching other processes), as
+/// the risc0 and SP1 workers do. This worker parses no ELF yet (it declines all three), so this only
+/// keeps it so when it does. It has nothing to download.
+///
+/// An error means the command must not run: the caller answers it with that.
+#[cfg(target_os = "linux")]
+fn confine() -> Result<(), String> {
+    use zkminer_witness_sandbox::confine::{self, Confinement, Rights, Sockets};
+    if confine::report().is_some() {
+        // Confined already: the sockets and the filesystems within reach, again.
+        return confine::recheck().map_err(|e| e.to_string());
+    }
+    let mut c = Confinement::with_system(Sockets::None);
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(std::path::PathBuf::from))
+    {
+        c.allow(dir, Rights::READ);
+    }
+    for dir in confine::library_path_dirs() {
+        c.allow(dir, Rights::READ);
+    }
+    let report = confine::confine_all_threads(&c).map_err(|e| e.to_string())?;
+    tracing::info!("worker confined: {report}");
+    Ok(())
+}
+
+/// No Landlock or seccomp off Linux: nothing to confine with.
+#[cfg(not(target_os = "linux"))]
+fn confine() -> Result<(), String> {
+    Ok(())
+}
+
+/// [`confine`] before a command with a requester's ELF, or the answer refusing it.
+fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
+    confine().map_err(|e| {
+        tracing::error!("cannot confine this worker, so it runs no guest: {e}");
+        WorkerResponse::Error {
+            request_id,
+            kind: ErrorKind::Internal,
+            message: format!(
+                "this worker could not confine itself, so it runs no requester's guest: {e}"
+            ),
+        }
+    })
+}
+
 fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
     let mut stdout = BufWriter::new(ipc_stdout);
@@ -111,7 +161,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 input_data: _,
                 po2: _,         // OpenVM does not use segment sizing
                 program_id: _,  // for risc0 this is the image id; OpenVM has no such binding
+                witness: _,     // witness jobs are risc0-only; every Prove is refused below
             } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 tracing::info!("Proving request {request_id} ({} bytes ELF)", elf.len());
                 // OpenVM SDK compiles guests at runtime, so proving is handled differently.
                 // For now, return an error indicating this is not yet fully implemented.
@@ -140,6 +195,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Execute { request_id, .. } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // Cycle measurement is implemented for risc0 only: it is the backend whose
                 // executor reports the same `total_cycles` the prover does, so the number is
                 // directly comparable to what proving will report. Decline explicitly rather
@@ -155,6 +214,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::ProgramId { request_id, .. } => {
+                if let Err(refused) = guest_may_run(request_id) {
+                    write_message(&mut stdout, &refused)?;
+                    continue;
+                }
                 // Not implemented for openvm, which measures nothing either (see Execute): decline
                 // rather than answer an id the chain would not bind a proof to. `Internal`, not
                 // `InvalidInput`: a missing capability, not this worker's verdict on the bytes (the
