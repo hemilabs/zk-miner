@@ -1386,6 +1386,15 @@ impl ChainClient {
                             "claimJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {} — bumping fee, keeping nonce",
                             crate::programs::sanitize_log(&msg)
                         );
+                        crate::tx_events::emit(
+                            job_id,
+                            crate::tx_events::TxKind::Claim,
+                            crate::tx_events::TxEvent::SendFailed {
+                                attempt,
+                                of: MAX_ATTEMPTS,
+                                rate_limited: false,
+                            },
+                        );
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -1401,6 +1410,15 @@ impl ChainClient {
                         tracing::warn!(
                             "claimJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {} — re-syncing nonce",
                             crate::programs::sanitize_log(&msg)
+                        );
+                        crate::tx_events::emit(
+                            job_id,
+                            crate::tx_events::TxKind::Claim,
+                            crate::tx_events::TxEvent::SendFailed {
+                                attempt,
+                                of: MAX_ATTEMPTS,
+                                rate_limited: false,
+                            },
                         );
                         // "nonce too low" at a nonce WE broadcast a claim at means that claim MINED.
                         // Read the job where it is included before re-sending at a fresh nonce: if it
@@ -1477,6 +1495,14 @@ impl ChainClient {
             let tx_hash = *pending.tx_hash();
             tracing::info!(
                 "claimJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
+            );
+            crate::tx_events::emit(
+                job_id,
+                crate::tx_events::TxKind::Claim,
+                crate::tx_events::TxEvent::Sent {
+                    attempt,
+                    of: MAX_ATTEMPTS,
+                },
             );
 
             match crate::tx::await_receipt(&*self.provider, tx_hash, CLAIM_RECEIPT_WAIT).await {
@@ -1570,6 +1596,14 @@ impl ChainClient {
                     tracing::warn!(
                         "claimJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling state before re-broadcast"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Claim,
+                        crate::tx_events::TxEvent::Unconfirmed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                        },
                     );
                     let deadline = std::time::Instant::now() + CLAIM_STATE_POLL;
                     while std::time::Instant::now() < deadline {
@@ -2150,7 +2184,18 @@ impl ChainClient {
                     if is_funds_refusal(&raw) {
                         self.note_funds_short();
                     }
-                    tracing::warn!("fulfillJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}");
+                    tracing::warn!(
+                        "fulfillJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Fulfil,
+                        crate::tx_events::TxEvent::SendFailed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                            rate_limited: is_rate_limit_error(&msg),
+                        },
+                    );
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                     }
@@ -2160,6 +2205,14 @@ impl ChainClient {
             let tx_hash = *pending.tx_hash();
             tracing::info!(
                 "fulfillJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}, gas {gas}): {tx_hash:?}, waiting for receipt..."
+            );
+            crate::tx_events::emit(
+                job_id,
+                crate::tx_events::TxKind::Fulfil,
+                crate::tx_events::TxEvent::Sent {
+                    attempt,
+                    of: MAX_ATTEMPTS,
+                },
             );
 
             // Short per-attempt wait (FULFIL_RECEIPT_WAIT, ~3 blocks), not the generic 120 s: an
@@ -2238,6 +2291,14 @@ impl ChainClient {
                     tracing::warn!(
                         "fulfillJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Fulfil,
+                        crate::tx_events::TxEvent::Unconfirmed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                        },
                     );
                     let mut poll_end = std::time::Instant::now() + FULFIL_STATE_POLL;
                     if let Some(b) = budget {
@@ -2650,6 +2711,15 @@ impl ChainClient {
                         tracing::warn!(
                             "releaseJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
                         );
+                        crate::tx_events::emit(
+                            job_id,
+                            crate::tx_events::TxKind::Release,
+                            crate::tx_events::TxEvent::SendFailed {
+                                attempt,
+                                of: MAX_ATTEMPTS,
+                                rate_limited: is_rate_limit_error(&msg),
+                            },
+                        );
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                         }
@@ -2660,6 +2730,14 @@ impl ChainClient {
             let tx_hash = *pending.tx_hash();
             tracing::info!(
                 "releaseJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
+            );
+            crate::tx_events::emit(
+                job_id,
+                crate::tx_events::TxKind::Release,
+                crate::tx_events::TxEvent::Sent {
+                    attempt,
+                    of: MAX_ATTEMPTS,
+                },
             );
 
             // Poll for the receipt (no heartbeat watcher). None folds the old
@@ -2714,6 +2792,14 @@ impl ChainClient {
                     tracing::warn!(
                         "releaseJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Release,
+                        crate::tx_events::TxEvent::Unconfirmed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                        },
                     );
                     let deadline = std::time::Instant::now() + RELEASE_STATE_POLL;
                     while std::time::Instant::now() < deadline {

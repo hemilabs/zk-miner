@@ -14,3 +14,4 @@ pub mod rpc_meter;
 pub mod send_guard;
 pub mod staking;
 pub mod tx;
+pub mod tx_events;

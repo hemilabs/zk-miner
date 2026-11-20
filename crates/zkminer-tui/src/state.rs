@@ -335,6 +335,32 @@ pub enum MinerJobStatus {
     Skipped { reason: String },
 }
 
+/// What a job this miner is claiming or holding is waiting on right now, when its status alone
+/// would say something older: a claim or fulfil transaction the testnet has not confirmed yet (and
+/// its retries), a wait for host or GPU memory, a retry after a failed attempt. Shown in place of
+/// "queued, waiting for a GPU" or "submitting" while set, with how long it has been so.
+#[derive(Debug, Clone)]
+pub struct JobNote {
+    pub kind: JobNoteKind,
+    pub text: String,
+    /// When this kind of wait began (a new text of the same kind keeps it).
+    pub since: std::time::Instant,
+}
+
+/// Which stage a `JobNote` belongs to. A transaction's events update only a note of its own stage,
+/// so one that arrives after the stage has moved on changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobNoteKind {
+    /// The claim transaction.
+    Claim,
+    /// Between proving attempts: memory, a retry.
+    Wait,
+    /// The fulfil transaction.
+    Submit,
+    /// The release transaction.
+    Release,
+}
+
 /// A job's measured cycle count: what the miner executed the guest at and sized the job on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobMeasurement {
@@ -562,6 +588,8 @@ pub struct MinerState {
     /// report (see `crate::progress`). A retry replaces it, so its progress and time start over.
     pub proving:
         std::collections::HashMap<alloy_primitives::B256, crate::progress::AttemptProgress>,
+    /// What each job is waiting on now, where its status would say something older (`JobNote`).
+    pub job_notes: std::collections::HashMap<alloy_primitives::B256, JobNote>,
     /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
     pub claim_outlook: ClaimOutlook,
 
@@ -1071,6 +1099,7 @@ impl Default for MinerState {
             prover_stats: None,
             open_jobs: Vec::new(),
             active_jobs: Vec::new(),
+            job_notes: HashMap::new(),
             completed_jobs: Vec::new(),
             selected_job_index: 0,
             selected_job_id: None,
@@ -1150,6 +1179,101 @@ impl TuiContext {
 impl MinerState {
     /// How long a proving job has been proving, in seconds: live from when it started, or what its
     /// status last carried when the start was not seen.
+    /// Note what `job_id` is waiting on (`JobNote`). The same kind keeps its start time.
+    pub fn set_job_note(
+        &mut self,
+        job_id: alloy_primitives::B256,
+        kind: JobNoteKind,
+        text: impl Into<String>,
+    ) {
+        let since = match self.job_notes.get(&job_id) {
+            Some(note) if note.kind == kind => note.since,
+            _ => std::time::Instant::now(),
+        };
+        // Drop the notes of jobs no longer listed (fulfilled, released, handed back): a job leaves
+        // the lists from many places, and none of them needs to know about notes.
+        let listed: std::collections::HashSet<alloy_primitives::B256> = self
+            .open_jobs
+            .iter()
+            .chain(self.active_jobs.iter())
+            .map(|j| j.info.job_id)
+            .collect();
+        self.job_notes
+            .retain(|id, _| *id == job_id || listed.contains(id));
+        self.job_notes.insert(
+            job_id,
+            JobNote {
+                kind,
+                text: text.into(),
+                since,
+            },
+        );
+    }
+
+    /// Drop `job_id`'s note if it is of `kind`: that stage is over.
+    pub fn clear_job_note(&mut self, job_id: alloy_primitives::B256, kind: JobNoteKind) {
+        if self.job_notes.get(&job_id).is_some_and(|n| n.kind == kind) {
+            self.job_notes.remove(&job_id);
+        }
+    }
+
+    /// A transaction event from the chain client (`zkminer_chain::tx_events`): rewrite the job's
+    /// note, if it is waiting on that transaction's stage. Events of a stage that has ended (no
+    /// note, or another kind) are ignored.
+    pub fn on_tx_event(
+        &mut self,
+        job_id: alloy_primitives::B256,
+        kind: zkminer_chain::tx_events::TxKind,
+        event: zkminer_chain::tx_events::TxEvent,
+    ) {
+        use zkminer_chain::tx_events::{TxEvent, TxKind};
+        let (note_kind, what) = match kind {
+            TxKind::Claim => (JobNoteKind::Claim, "claiming"),
+            TxKind::Fulfil => (JobNoteKind::Submit, "submitting the proof"),
+            TxKind::Release => (JobNoteKind::Release, "releasing"),
+        };
+        if self.job_notes.get(&job_id).map(|n| n.kind) != Some(note_kind) {
+            return;
+        }
+        let text = match event {
+            TxEvent::Sent { attempt, of } => {
+                format!("{what}: waiting for the chain to confirm (try {attempt} of {of})")
+            }
+            TxEvent::Unconfirmed { attempt, of } => format!(
+                "{what}: not confirmed yet, checking the chain before sending again (try {attempt} \
+                 of {of})"
+            ),
+            TxEvent::SendFailed {
+                attempt,
+                of,
+                rate_limited: true,
+            } => format!(
+                "{what}: the RPC is rate-limiting, sending again shortly (try {attempt} of {of})"
+            ),
+            TxEvent::SendFailed { attempt, of, .. } => {
+                format!("{what}: the send failed, sending again (try {attempt} of {of})")
+            }
+        };
+        self.set_job_note(job_id, note_kind, text);
+    }
+
+    /// What `job` is waiting on, with for how long, when there is a note for it and its status is
+    /// one the note can speak for (not proving or finished).
+    pub fn job_note_text(&self, job: &TrackedJob) -> Option<String> {
+        if !matches!(
+            job.status,
+            MinerJobStatus::Open | MinerJobStatus::Queued | MinerJobStatus::Submitting
+        ) {
+            return None;
+        }
+        let note = self.job_notes.get(&job.info.job_id)?;
+        Some(format!(
+            "{}, {}",
+            note.text,
+            crate::screens::dashboard::format_duration(note.since.elapsed().as_secs())
+        ))
+    }
+
     pub fn proving_secs(&self, job: &TrackedJob) -> u64 {
         match self.proving.get(&job.info.job_id) {
             Some(attempt) => attempt.started.elapsed().as_secs(),

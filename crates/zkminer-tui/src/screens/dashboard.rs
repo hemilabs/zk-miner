@@ -495,6 +495,13 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
             id
         };
         match &job.status {
+            // What it is waiting on now (a transaction, memory, a retry), where the status would say
+            // something older (`JobNote`).
+            _ if state.job_note_text(job).is_some() => (
+                id_short,
+                state.job_note_text(job).unwrap_or_default(),
+                theme::warning(),
+            ),
             // Said in place of the bar: the proof is running many times slower than it shows.
             MinerJobStatus::Proving { .. } if spill.is_some() => (
                 id_short,
@@ -874,6 +881,10 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
             let cycles_str = format_compact(job.estimated_cycles as f64);
 
             let status_str = match &job.status {
+                // What it is waiting on now, where the status would say something older.
+                _ if state.job_note_text(job).is_some() => {
+                    state.job_note_text(job).unwrap_or_default()
+                }
                 MinerJobStatus::Proving { .. } => {
                     let secs = format_duration(state.proving_secs(job));
                     let stage = state.proving_stage_label(job).unwrap_or_default();
