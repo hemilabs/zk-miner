@@ -689,9 +689,11 @@ escape its executor:
   (`PAGE: SECRETS-UNLABELLED`), and no Low worker starts until it is fixed.
 - **The miner.** Its process and threads grant the user only seeing, waiting for and ending them,
   and carry a Medium no-write, no-read, no-execute-up label: a Low worker can neither read nor
-  end the miner. A job whose proof the miner died in the middle of in three runs in a row is
-  released (`PAGE: JOB-CRASH-LOOP`), so a guest that ends the miner each time cannot hold every
-  lock past its deadline.
+  end the miner. A job whose proof the miner died in the middle of in three runs in a row (counted
+  from when a worker accepts the proof) is released (`PAGE: JOB-CRASH-LOOP`) and marked in the
+  journal so it is not claimed again, so a guest that ends the miner each time cannot hold every
+  lock past its deadline. A proof is not started while its start cannot be recorded (a full disk:
+  `PAGE: DISK-LOW`, `PAGE: JOURNAL-UNWRITABLE`), which would keep that count from ever rising.
 - **Other workers.** A Low worker cannot open another's process or first thread (the same
   label), nor the threads it starts later (each worker narrows its own, as the miner does).
 - **Files.** A Low worker writes only its temporary, cache and segment directories, which the

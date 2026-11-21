@@ -156,7 +156,31 @@ pub struct JobJournal {
     /// nothing is lost (an operator, or a newer build, can still read them).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unparsed: BTreeMap<String, serde_json::Value>,
+    /// Jobs released because the miner kept ending in the middle of their proofs (JOB-CRASH-LOOP),
+    /// by job id: not claimed again, nor their submitter's jobs of the same program for a while
+    /// ([`Self::crash_loop_hold`]). Outlives the job's entry, which its release removes. An older
+    /// build ignores it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crash_looped: BTreeMap<B256, CrashLoopMark>,
 }
+
+/// A job released as a crash loop ([`JobJournal::crash_looped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashLoopMark {
+    pub program_id: B256,
+    pub submitter: Address,
+    /// Unix seconds.
+    pub at: i64,
+}
+
+/// How long a crash-looped job id is not claimed again (a job's window is at most 7 days).
+pub const CRASH_LOOP_JOB_HOLD_SECS: i64 = 7 * 24 * 3600;
+
+/// How long a crash-looped job's submitter is not claimed from for the same program.
+pub const CRASH_LOOP_PAIR_HOLD_SECS: i64 = 24 * 3600;
+
+/// How many crash-loop marks are kept at most: the oldest go first.
+const CRASH_LOOP_MARKS_MAX: usize = 1000;
 
 impl Default for JobJournal {
     fn default() -> Self {
@@ -164,6 +188,7 @@ impl Default for JobJournal {
             format_version: JOURNAL_FORMAT_VERSION,
             entries: HashMap::new(),
             unparsed: BTreeMap::new(),
+            crash_looped: BTreeMap::new(),
         }
     }
 }
@@ -252,6 +277,17 @@ fn parse_journal(content: &str) -> std::result::Result<(JobJournal, Vec<String>)
     if let Some(serde_json::Value::Object(u)) = obj.get("unparsed") {
         for (k, e) in u {
             j.unparsed.entry(k.clone()).or_insert_with(|| e.clone());
+        }
+    }
+    // A mark that does not parse is dropped: it only holds claims back.
+    if let Some(serde_json::Value::Object(marks)) = obj.get("crash_looped") {
+        for (k, m) in marks {
+            if let (Ok(id), Ok(m)) = (
+                k.parse::<B256>(),
+                serde_json::from_value::<CrashLoopMark>(m.clone()),
+            ) {
+                j.crash_looped.insert(id, m);
+            }
         }
     }
     let unparsed = j.unparsed.keys().cloned().collect();
@@ -575,6 +611,89 @@ impl JobJournal {
         self.entries.get(&job_id).map_or(0, |e| e.prove_starts)
     }
 
+    /// A proof of `job_id` completed: the runs that ended in the middle of its earlier proofs no
+    /// longer count, so the limit counts runs in a row ([`JournalEntry::prove_starts`]).
+    pub fn note_prove_completed(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = 0;
+        }
+    }
+
+    /// `job_id`, of `program_id` from `submitter`, is released as a crash loop at `now` (unix
+    /// seconds): marked so it is not claimed again ([`Self::crash_loop_hold`]). Marks past their hold
+    /// are dropped, and the oldest beyond [`CRASH_LOOP_MARKS_MAX`].
+    pub fn mark_crash_looped(
+        &mut self,
+        job_id: B256,
+        program_id: B256,
+        submitter: Address,
+        now: i64,
+    ) {
+        self.crash_looped.insert(
+            job_id,
+            CrashLoopMark {
+                program_id,
+                submitter,
+                at: now,
+            },
+        );
+        self.crash_looped
+            .retain(|_, m| now.saturating_sub(m.at) < CRASH_LOOP_JOB_HOLD_SECS);
+        while self.crash_looped.len() > CRASH_LOOP_MARKS_MAX {
+            let Some(oldest) = self
+                .crash_looped
+                .iter()
+                .min_by_key(|(_, m)| m.at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.crash_looped.remove(&oldest);
+        }
+    }
+
+    /// Why `job_id` (of `program_id`, from `submitter`) is not claimed at `now`, if a crash-loop mark
+    /// holds it: the job itself was released as one in the last [`CRASH_LOOP_JOB_HOLD_SECS`], or a job
+    /// of the same program from the same submitter in the last [`CRASH_LOOP_PAIR_HOLD_SECS`]. With
+    /// the seconds the hold has left.
+    pub fn crash_loop_hold(
+        &self,
+        job_id: B256,
+        submitter: Address,
+        program_id: B256,
+        now: i64,
+    ) -> Option<(String, i64)> {
+        if let Some(m) = self.crash_looped.get(&job_id) {
+            let left =
+                m.at.saturating_add(CRASH_LOOP_JOB_HOLD_SECS)
+                    .saturating_sub(now);
+            if left > 0 {
+                return Some((
+                    "it was released as a crash loop: the miner kept ending in the middle of its \
+                     proof"
+                        .to_string(),
+                    left,
+                ));
+            }
+        }
+        self.crash_looped
+            .values()
+            .filter(|m| m.submitter == submitter && m.program_id == program_id)
+            .map(|m| {
+                m.at.saturating_add(CRASH_LOOP_PAIR_HOLD_SECS)
+                    .saturating_sub(now)
+            })
+            .filter(|left| *left > 0)
+            .max()
+            .map(|left| {
+                (
+                    "another job of its program from its submitter was released as a crash loop"
+                        .to_string(),
+                    left,
+                )
+            })
+    }
+
     pub fn mark_fulfilling(&mut self, job_id: B256) {
         if let Some(e) = self.entries.get_mut(&job_id) {
             e.state = JournalState::Fulfilling;
@@ -887,6 +1006,57 @@ mod tests {
         assert_eq!(j.prove_starts(jid), 0, "never below 0");
         assert_eq!(j.prove_starts(B256::ZERO), 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A completed proof resets the count (it counts runs in a row); a crash-loop mark survives a
+    /// save and a load and the job's own removal, holds the job for its window and its submitter's
+    /// jobs of the same program for a day, and is dropped after.
+    #[test]
+    fn crash_loop_marks_survive_a_restart_and_expire() {
+        let path = tmp_path("crash-looped");
+        let mut j = JobJournal::default();
+        let (jid, other) = (B256::repeat_byte(0x51), B256::repeat_byte(0x52));
+        let (program, submitter) = (B256::repeat_byte(0x61), Address::repeat_byte(0x71));
+        j.mark_claimed(jid, None, 100);
+        j.note_prove_start(jid);
+        j.note_prove_start(jid);
+        j.note_prove_completed(jid);
+        assert_eq!(j.prove_starts(jid), 0);
+
+        let now = 1_800_000_000;
+        assert_eq!(j.crash_loop_hold(jid, submitter, program, now), None);
+        j.mark_crash_looped(jid, program, submitter, now);
+        j.remove(jid);
+        j.save_to(&path).unwrap();
+        let j = JobJournal::load_checked_from(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(j
+            .crash_loop_hold(jid, submitter, program, now + 60)
+            .is_some());
+        // Its submitter's other job of the same program: a day.
+        let (_, left) = j
+            .crash_loop_hold(other, submitter, program, now + 60)
+            .unwrap();
+        assert_eq!(left, CRASH_LOOP_PAIR_HOLD_SECS - 60);
+        assert_eq!(
+            j.crash_loop_hold(other, submitter, program, now + CRASH_LOOP_PAIR_HOLD_SECS),
+            None
+        );
+        // Another program, or another submitter: not held.
+        assert_eq!(j.crash_loop_hold(other, submitter, B256::ZERO, now), None);
+        assert_eq!(j.crash_loop_hold(other, Address::ZERO, program, now), None);
+        // The job itself: its window, then free.
+        assert!(j
+            .crash_loop_hold(jid, submitter, program, now + CRASH_LOOP_PAIR_HOLD_SECS)
+            .is_some());
+        assert_eq!(
+            j.crash_loop_hold(jid, submitter, program, now + CRASH_LOOP_JOB_HOLD_SECS),
+            None
+        );
+        // Expired marks are dropped at the next mark.
+        let mut j = j;
+        j.mark_crash_looped(other, program, submitter, now + CRASH_LOOP_JOB_HOLD_SECS);
+        assert_eq!(j.crash_looped.len(), 1);
     }
 
     #[test]

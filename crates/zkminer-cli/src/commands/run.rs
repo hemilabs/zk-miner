@@ -528,6 +528,11 @@ fn move_ladder_phase(from: &[u8], to: u8) -> Result<(), u8> {
 /// Raise the ladder to `stage` (1 DRAIN, 2 ABANDON), never lower it: a signal and a stop request
 /// handled at the same moment must not undo each other.
 pub(crate) fn raise_stage(sig_tx: &tokio::sync::watch::Sender<u8>, stage: u8) {
+    // A stop is decided: the proofs still running are not a crash, whatever ends the process from
+    // here (a service manager's timeout, Windows' end of a closing console).
+    if stage >= 1 {
+        end_counted_prove_starts();
+    }
     sig_tx.send_if_modified(|v| {
         if *v < stage {
             *v = stage;
@@ -9592,6 +9597,15 @@ async fn miner_brain(
                     continue;
                 }
             }
+            // No claim (a batch claim included) while this host cannot record a proof's start, nor
+            // of a job or its submitter's program released as a crash loop (`start_record_hold`).
+            if start_record_hold(&journal, jid, job.info.caller, job.info.program_id).is_some() {
+                declines.note(
+                    jid,
+                    "held: proof starts cannot be recorded, or a crash loop",
+                );
+                continue;
+            }
             // FULL/FIELDS-bound with bound-job claiming off: settled by its one descriptor fetch.
             if !claim_predicate_now && job_is_bound(jid) {
                 declines.note(jid, "bound job (claim_predicate_jobs is off)");
@@ -12333,6 +12347,19 @@ async fn process_job_lifecycle(
         requeue_open_job(state, requeue_job.clone()).await;
         return Ok(());
     }
+    // No claim while this host could not record a proof's start (a full disk, an unwritable
+    // journal), nor of a job, or its submitter's job of the same program, released as a crash loop.
+    if !is_recovery {
+        if let Some((why, wait)) = start_record_hold(journal, job_id, submitter, program_id) {
+            tracing::debug!(
+                "Not claiming {} now: {why} — nothing locked",
+                short_id(job_id)
+            );
+            note_job_retry_after(job_id, wait, "held: a claim gate is closed");
+            requeue_open_job(state, requeue_job.clone()).await;
+            return Ok(());
+        }
+    }
 
     // 0. Pre-claim binding gate (HemiProve v2, handoff §8). Every open-market job is FULL- or
     //    FIELDS-bound (`expectedJournalHash != 0`): a NONE job (both binding words 0) must name an
@@ -13136,11 +13163,15 @@ async fn process_job_lifecycle(
     let crash_loop = crash_loop_refusal(&journal.lock().unwrap_or_else(|p| p.into_inner()), job_id);
     if let Some(why) = crash_loop {
         tracing::error!("PAGE: JOB-CRASH-LOOP — {why}");
+        mark_crash_looped(journal, job_id, program_id, submitter);
         return Err(anyhow::anyhow!("{why}"));
     }
-    journal_update(journal, |j| j.mark_proving(job_id));
-    // Counted until the proof below ends, however it ends.
-    let prove_start = ProveStart::counted(journal, job_id);
+    // Not started where its start could not be recorded: the crash-loop limit above would never
+    // be reached.
+    record_proving(journal, job_id, lock_deadline)?;
+    // Counted once a worker accepts the proof (its `Started`), until the proof ends, however it
+    // ends.
+    let prove_start = ProveStart::new(journal, job_id);
 
     let pool = zkminer_prover::engine::worker_pool()
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
@@ -13556,6 +13587,7 @@ async fn process_job_lifecycle(
             )
             .await;
             let started_flag = proof_started.clone();
+            let counted_start = prove_start.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
@@ -13640,6 +13672,7 @@ async fn process_job_lifecycle(
                                          slot_key: &str| {
                     if matches!(event, zkminer_prover_protocol::ProveEvent::Started) {
                         started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        counted_start.count();
                         if let Some(p) = risc0_placements().get_mut(&job_id) {
                             p.proving_on = Some(slot_key.to_string());
                         }
@@ -14198,6 +14231,7 @@ async fn process_job_lifecycle(
             }
         }
     };
+    prove_start.completed();
     drop(prove_start);
 
     card.release();
@@ -17419,13 +17453,38 @@ async fn release_and_clean_with_nonce(
 /// go through this helper so that disk-full / permission errors are visible
 /// rather than silently swallowed.
 fn save_journal_or_warn(journal: &JobJournal) {
-    // Never from a watch-only run: the file is the running miner's record of its locks.
-    if watch_only() {
-        return;
-    }
-    if let Err(e) = journal.save() {
+    if let Err(e) = save_journal_checked(journal) {
         tracing::warn!("journal.save() failed: {e:#} — recovery on next restart may be stale");
     }
+}
+
+/// Set while the journal's last save failed: no job is claimed until one succeeds
+/// ([`start_record_hold`]).
+static JOURNAL_SAVE_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Save the journal, recording whether it failed ([`JOURNAL_SAVE_FAILED`]).
+fn save_journal_checked(journal: &JobJournal) -> Result<()> {
+    // Never from a watch-only run: the file is the running miner's record of its locks.
+    if watch_only() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    let saved = match TEST_JOURNAL_SAVES.get() {
+        Some(true) => Ok(()),
+        Some(false) => Err(anyhow::anyhow!("No space left on device (test)")),
+        None => journal.save(),
+    };
+    #[cfg(not(test))]
+    let saved = journal.save();
+    JOURNAL_SAVE_FAILED.store(saved.is_err(), std::sync::atomic::Ordering::SeqCst);
+    saved
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: whether this thread's journal saves succeed, without touching the disk.
+    static TEST_JOURNAL_SAVES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The proving journal, shared across concurrent per-job tasks (one job per GPU).
@@ -17440,8 +17499,151 @@ fn journal_update(journal: &SharedJournal, f: impl FnOnce(&mut JobJournal)) {
     save_journal_or_warn(&j);
 }
 
-/// How many runs in a row may end in the middle of one job's proof before the job is released
-/// rather than proven again (`crash_loop_refusal`).
+/// [`journal_update`], with the save's error.
+fn journal_update_checked(journal: &SharedJournal, f: impl FnOnce(&mut JobJournal)) -> Result<()> {
+    let mut j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    f(&mut j);
+    save_journal_checked(&j)
+}
+
+/// Free space kept on the volumes the miner records and stages on (`~/.zkminer`; on Windows also
+/// the Low workers' directory): below it no job is claimed and no proof started, as the record of a
+/// proof's start may not fit ([`start_record_hold`]). Segment space is reserved on top of it
+/// (`segment_disk`).
+const STORAGE_FLOOR_BYTES: u64 = 2 << 30;
+
+/// The directories whose volumes must keep [`STORAGE_FLOOR_BYTES`] free.
+fn storage_floor_dirs() -> Vec<PathBuf> {
+    let home = dirs::home_dir().map(|h| h.join(".zkminer"));
+    #[cfg(windows)]
+    let local = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let local = None;
+    home.into_iter().chain(local).collect()
+}
+
+/// The first of `dirs` whose volume has less than [`STORAGE_FLOOR_BYTES`] free, by `free_bytes`
+/// (a volume whose free space cannot be read is not held on), as the reason.
+fn storage_short(
+    dirs: &[PathBuf],
+    free_bytes: impl Fn(&Path) -> std::io::Result<u64>,
+) -> Option<String> {
+    dirs.iter().find_map(|dir| match free_bytes(dir) {
+        Ok(free) if free < STORAGE_FLOOR_BYTES => Some(format!(
+            "{} has {} MiB free, under the {} MiB kept free",
+            dir.display(),
+            free >> 20,
+            STORAGE_FLOOR_BYTES >> 20
+        )),
+        _ => None,
+    })
+}
+
+/// Page `code` (`JOURNAL-UNWRITABLE`, `DISK-LOW`) for `why`, at most every 10 minutes: no job is
+/// claimed and no proof started while it lasts.
+fn page_storage(code: &str, why: &str) {
+    static PAGED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut paged = PAGED.lock().unwrap_or_else(|p| p.into_inner());
+    if paged.is_none_or(|at| at.elapsed() >= Duration::from_secs(600)) {
+        *paged = Some(std::time::Instant::now());
+        tracing::error!(
+            "PAGE: {code} — {why}: no job is claimed and no proof started until it is fixed (a \
+             proof whose start cannot be recorded could crash the miner over and over without the \
+             crash-loop limit ever seeing it). Free disk space on that volume"
+        );
+    }
+}
+
+/// Why this host's disk cannot take a proof now: a volume it records on is under
+/// [`STORAGE_FLOOR_BYTES`] (paged, `DISK-LOW`).
+fn disk_low() -> Option<String> {
+    let why = storage_short(&storage_floor_dirs(), segment_disk::free_bytes)?;
+    page_storage("DISK-LOW", &why);
+    Some(why)
+}
+
+/// Why `job_id` (of `program_id`, from `submitter`) is not claimed now, if it is not, and how long
+/// to wait: the journal's last save failed (tried again here at most every 30 s, so a disk with
+/// room again clears it), [`disk_low`], or a crash-loop mark (`JobJournal::crash_loop_hold`).
+fn start_record_hold(
+    journal: &SharedJournal,
+    job_id: B256,
+    submitter: alloy::primitives::Address,
+    program_id: B256,
+) -> Option<(String, Duration)> {
+    let held = Duration::from_secs(300);
+    if JOURNAL_SAVE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        static RETRIED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let retry = {
+            let mut retried = RETRIED.lock().unwrap_or_else(|p| p.into_inner());
+            let due = retried.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+            if due {
+                *retried = Some(std::time::Instant::now());
+            }
+            due || cfg!(test)
+        };
+        if retry {
+            let _ = save_journal_checked(&journal.lock().unwrap_or_else(|p| p.into_inner()));
+        }
+        if JOURNAL_SAVE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+            let why = "the job journal cannot be saved".to_string();
+            page_storage("JOURNAL-UNWRITABLE", &why);
+            return Some((why, held));
+        }
+    }
+    if let Some(why) = disk_low() {
+        return Some((why, held));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let (why, left) = journal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .crash_loop_hold(job_id, submitter, program_id, now)?;
+    // Looked at again within the hour: the brain's other gates may want it sooner.
+    Some((why, Duration::from_secs(left.clamp(60, 3600) as u64)))
+}
+
+/// Record that `job_id` is being proven, before its proof starts: `Err` (and no proof) where that
+/// cannot be done, so a proof never starts unrecorded. Handed back to recovery, which tries again,
+/// while its lock can still survive a restart; a plain error (the job released) once it is within
+/// the keep horizon, rather than left to a slash.
+fn record_proving(journal: &SharedJournal, job_id: B256, lock_deadline: u64) -> Result<()> {
+    let refused = match disk_low() {
+        Some(why) => Some(why),
+        None => journal_update_checked(journal, |j| j.mark_proving(job_id))
+            .err()
+            .map(|e| {
+                let why = format!("the job journal cannot be saved: {e:#}");
+                page_storage("JOURNAL-UNWRITABLE", &why);
+                why
+            }),
+    };
+    let Some(why) = refused else {
+        return Ok(());
+    };
+    let why = format!("the proof's start could not be recorded: {why}");
+    if lock_deadline <= keep_horizon() {
+        return Err(anyhow::anyhow!("{why}"));
+    }
+    Err(HandBack(why).into())
+}
+
+/// Mark `job_id` (of `program_id`, from `submitter`) released as a crash loop, so neither it nor its
+/// submitter's jobs of the same program are claimed again for a while (`JobJournal::crash_looped`).
+fn mark_crash_looped(
+    journal: &SharedJournal,
+    job_id: B256,
+    program_id: B256,
+    submitter: alloy::primitives::Address,
+) {
+    let now = chrono::Utc::now().timestamp();
+    journal_update(journal, |j| {
+        j.mark_crash_looped(job_id, program_id, submitter, now)
+    });
+}
+
+/// How many runs in a row may end in the middle of one job's proof (one a worker had accepted)
+/// before the job is released rather than proven again (`crash_loop_refusal`).
 const MAX_UNFINISHED_PROVE_STARTS: u8 = 3;
 
 /// Why `job_id` is released rather than proven again, if it is: its proof started
@@ -17467,21 +17669,69 @@ fn crash_loop_refusal(journal: &JobJournal, job_id: B256) -> Option<String> {
 /// (token, job, journal).
 static COUNTED_PROVE_STARTS: Mutex<Vec<(u64, B256, SharedJournal)>> = Mutex::new(Vec::new());
 
-/// A proof start counted in the journal (`note_prove_start`), taken back when the proof ends in
-/// this run, however it ends (dropped), or when the miner exits on purpose with it still running
-/// ([`end_counted_prove_starts`]): only a run that ended some other way leaves it counted.
-struct ProveStart(u64);
+/// Set once a stop is decided ([`end_counted_prove_starts`]): no proof start counts after it.
+static PROVE_STARTS_ENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A proof of one job, from the moment it is about to be handed to the dispatcher. Its start is
+/// counted in the journal (`note_prove_start`) only when a worker accepts the proof ([`Self::count`],
+/// at its `Started`): a job that was only queued for a card, host RAM or VRAM when the miner died
+/// was not being proven, and is not charged. Taken back when the proof ends in this run, however
+/// it ends (dropped), reset when it completes ([`Self::completed`]), or taken back when a stop is
+/// decided with it still running ([`end_counted_prove_starts`]): only a run that ended some other
+/// way leaves it counted.
+struct ProveStart {
+    token: u64,
+    job_id: B256,
+    journal: SharedJournal,
+}
 
 impl ProveStart {
-    fn counted(journal: &SharedJournal, job_id: B256) -> Self {
+    fn new(journal: &SharedJournal, job_id: B256) -> Arc<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        journal_update(journal, |j| j.note_prove_start(job_id));
+        Arc::new(Self {
+            token: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            job_id,
+            journal: journal.clone(),
+        })
+    }
+
+    /// A worker accepted the proof: count its start, once (a retry's `Started` does not count it
+    /// again), unless a stop was decided.
+    fn count(&self) {
+        if !PROVE_STARTS_ENDED.load(std::sync::atomic::Ordering::SeqCst) {
+            self.count_now();
+        }
+    }
+
+    fn count_now(&self) {
+        // Held across the save, so a stop's `end_counted_prove_starts` cannot take it back first.
+        let mut counted = COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if counted.iter().any(|(token, ..)| *token == self.token) {
+            return;
+        }
+        counted.push((self.token, self.job_id, self.journal.clone()));
+        let job_id = self.job_id;
+        if let Err(e) = journal_update_checked(&self.journal, |j| j.note_prove_start(job_id)) {
+            tracing::error!(
+                "PAGE: JOURNAL-UNWRITABLE — {e:#}; the start of {}'s proof is not recorded, so a \
+                 crash during it would not count towards its crash-loop limit",
+                short_id(job_id)
+            );
+        }
+    }
+
+    /// The proof completed: the runs that ended in the middle of this job's earlier proofs no
+    /// longer count either.
+    fn completed(&self) {
         COUNTED_PROVE_STARTS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push((token, job_id, journal.clone()));
-        Self(token)
+            .retain(|(token, ..)| *token != self.token);
+        let job_id = self.job_id;
+        journal_update(&self.journal, |j| j.note_prove_completed(job_id));
     }
 }
 
@@ -17490,7 +17740,7 @@ impl Drop for ProveStart {
         let mut counted = COUNTED_PROVE_STARTS
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let Some(at) = counted.iter().position(|(token, ..)| *token == self.0) else {
+        let Some(at) = counted.iter().position(|(token, ..)| *token == self.token) else {
             return;
         };
         let (_, job_id, journal) = counted.swap_remove(at);
@@ -17499,9 +17749,10 @@ impl Drop for ProveStart {
     }
 }
 
-/// The miner is exiting on purpose (a stop, keep-locks included): the proofs still running are not
-/// a crash, so their starts no longer count.
+/// A stop is decided, or the miner is exiting on purpose (keep-locks included): the proofs still
+/// running are not a crash, so their starts no longer count, nor do any that start from now on.
 fn end_counted_prove_starts() {
+    PROVE_STARTS_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
     let counted = std::mem::take(
         &mut *COUNTED_PROVE_STARTS
             .lock()
@@ -18446,6 +18697,135 @@ mod tests {
         // No rate, no card.
         assert!(!fits(1, 0.0, 3000));
         assert!(!fits(1, f64::NAN, 3000));
+    }
+
+    /// A volume under the floor holds claims and proofs, naming it; one whose free space cannot be
+    /// read does not.
+    #[test]
+    fn a_volume_under_the_floor_holds_proofs() {
+        let (home, local) = (PathBuf::from("/home/z/.zkminer"), PathBuf::from("/local"));
+        let dirs = [home.clone(), local.clone()];
+        assert_eq!(storage_short(&dirs, |_| Ok(STORAGE_FLOOR_BYTES)), None);
+        let why = storage_short(&dirs, |d| {
+            Ok(if d == local {
+                STORAGE_FLOOR_BYTES - 1
+            } else {
+                u64::MAX
+            })
+        })
+        .expect("held");
+        assert!(why.contains(&local.display().to_string()), "{why}");
+        assert_eq!(
+            storage_short(&dirs, |_| Err(std::io::Error::other("unreadable"))),
+            None
+        );
+    }
+
+    /// Held by the tests that save the journal: whether the last save failed is process-wide.
+    static JOURNAL_SAVE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn journal_with(job: B256) -> SharedJournal {
+        let mut j = JobJournal::default();
+        j.mark_claimed(job, None, u64::MAX);
+        Arc::new(Mutex::new(j))
+    }
+
+    fn starts(journal: &SharedJournal, job: B256) -> u8 {
+        journal.lock().unwrap().prove_starts(job)
+    }
+
+    /// A proof's start counts once its worker accepted it, once however many attempts start, and
+    /// is taken back when the proof ends in its run; a completed proof also clears the runs that
+    /// ended in the middle of earlier ones. A job only queued when the miner died is not charged.
+    #[test]
+    fn a_proof_start_counts_only_once_a_worker_accepts_it() {
+        let _serial = JOURNAL_SAVE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        TEST_JOURNAL_SAVES.set(Some(true));
+        let job = B256::repeat_byte(0x4a);
+        let journal = journal_with(job);
+        // Queued for a card, then ended (the miner stopping it, or a refusal): never counted.
+        drop(ProveStart::new(&journal, job));
+        assert_eq!(starts(&journal, job), 0);
+        // Started on a worker, then a retry started on another: one start.
+        let start = ProveStart::new(&journal, job);
+        start.count_now();
+        start.count_now();
+        assert_eq!(starts(&journal, job), 1);
+        // Ended in its run (failed): taken back.
+        drop(start);
+        assert_eq!(starts(&journal, job), 0);
+        // Two runs that ended mid-proof, then a proof that completes: back to 0.
+        journal.lock().unwrap().note_prove_start(job);
+        journal.lock().unwrap().note_prove_start(job);
+        let start = ProveStart::new(&journal, job);
+        start.count_now();
+        assert_eq!(starts(&journal, job), 3);
+        start.completed();
+        drop(start);
+        assert_eq!(starts(&journal, job), 0);
+        TEST_JOURNAL_SAVES.set(None);
+    }
+
+    /// A proof whose start cannot be recorded is not started: handed back while the lock can still
+    /// survive a restart, released (a plain error) once it cannot; and claims stop until a save
+    /// succeeds again.
+    #[test]
+    fn a_proof_is_not_started_when_its_start_cannot_be_recorded() {
+        let _serial = JOURNAL_SAVE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let job = B256::repeat_byte(0x4b);
+        let journal = journal_with(job);
+        TEST_JOURNAL_SAVES.set(Some(false));
+        let far = keep_horizon() + 3600;
+        let e = record_proving(&journal, job, far).expect_err("started unrecorded");
+        assert!(e.downcast_ref::<HandBack>().is_some(), "{e:#}");
+        let e = record_proving(&journal, job, keep_horizon()).expect_err("started unrecorded");
+        assert!(e.downcast_ref::<HandBack>().is_none(), "{e:#}");
+        let other = B256::repeat_byte(0x4c);
+        let (why, _) = start_record_hold(
+            &journal,
+            other,
+            alloy::primitives::Address::ZERO,
+            B256::ZERO,
+        )
+        .expect("claimed with an unwritable journal");
+        assert!(why.contains("cannot be saved"), "{why}");
+        // The disk has room again: the next claim's retry clears it.
+        TEST_JOURNAL_SAVES.set(Some(true));
+        assert_eq!(
+            start_record_hold(
+                &journal,
+                other,
+                alloy::primitives::Address::ZERO,
+                B256::ZERO
+            ),
+            None
+        );
+        record_proving(&journal, job, far).unwrap();
+        TEST_JOURNAL_SAVES.set(None);
+    }
+
+    /// A job released as a crash loop is marked: neither it nor its submitter's jobs of the same
+    /// program are claimed again for a while.
+    #[test]
+    fn a_crash_looped_job_is_not_claimed_again() {
+        let _serial = JOURNAL_SAVE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        TEST_JOURNAL_SAVES.set(Some(true));
+        let (job, again) = (B256::repeat_byte(0x4d), B256::repeat_byte(0x4e));
+        let (program, submitter) = (
+            B256::repeat_byte(0x5d),
+            alloy::primitives::Address::repeat_byte(0x6d),
+        );
+        let journal = journal_with(job);
+        assert_eq!(start_record_hold(&journal, job, submitter, program), None);
+        mark_crash_looped(&journal, job, program, submitter);
+        let (_, wait) = start_record_hold(&journal, job, submitter, program).expect("held");
+        assert_eq!(wait, Duration::from_secs(3600));
+        assert!(start_record_hold(&journal, again, submitter, program).is_some());
+        assert_eq!(
+            start_record_hold(&journal, again, alloy::primitives::Address::ZERO, program),
+            None
+        );
+        TEST_JOURNAL_SAVES.set(None);
     }
 
     /// A job whose proof the miner died in the middle of in three runs in a row is released, not
