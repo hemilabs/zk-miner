@@ -745,9 +745,11 @@ fn leave_gate(m: &std::sync::Mutex<GateState>, cv: &std::sync::Condvar) {
 impl ProbeGate {
     /// A turn, waited for until `deadline` (review round 5: the wait had no bound, so a caller
     /// that gave up left a thread waiting for a turn, then probing for nobody); `None` when none
-    /// came in time ([`enter_gate`]).
+    /// came in time ([`enter_gate`]). The turn is made only once given: before the S3 review
+    /// `then_some(ProbeGate)` made one either way, and dropping the unused one gave back a turn
+    /// never taken, so every caller that got none let one more probe in flight.
     fn enter_until(deadline: Instant) -> Option<Self> {
-        enter_gate(&PROBES_IN_FLIGHT, &PROBE_TURN, deadline).then_some(ProbeGate)
+        enter_gate(&PROBES_IN_FLIGHT, &PROBE_TURN, deadline).then(|| ProbeGate)
     }
 
     /// Probes in flight now (tests).
@@ -760,7 +762,7 @@ impl ProbeGate {
 impl ProbeGateV6 {
     /// See [`ProbeGate::enter_until`].
     fn enter_until(deadline: Instant) -> Option<Self> {
-        enter_gate(&PROBES_IN_FLIGHT_V6, &PROBE_TURN_V6, deadline).then_some(ProbeGateV6)
+        enter_gate(&PROBES_IN_FLIGHT_V6, &PROBE_TURN_V6, deadline).then(|| ProbeGateV6)
     }
 }
 
@@ -2047,6 +2049,24 @@ mod tests {
         assert!(matches!(&v, Verdict::Failed(w) if w.contains("no turn")), "{v:?}");
         drop(held);
         assert!(ProbeGate::enter_until(Instant::now() + Duration::from_secs(5)).is_some());
+    }
+
+    /// The S3 review (found on the Linux VM): a caller that gets no turn gives none back. Before,
+    /// each one did (`then_some(ProbeGate)` dropped a gate it never entered), so after two failed
+    /// waits four rounds could be in flight.
+    #[test]
+    fn a_caller_without_a_turn_gives_none_back() {
+        let far = Instant::now() + Duration::from_secs(30);
+        let held: Vec<ProbeGateV6> = (0..PROBES_AT_ONCE)
+            .map(|_| ProbeGateV6::enter_until(far).expect("a turn"))
+            .collect();
+        let in_flight = || PROBES_IN_FLIGHT_V6.lock().unwrap_or_else(|e| e.into_inner()).0;
+        for _ in 0..3 {
+            assert!(ProbeGateV6::enter_until(Instant::now() + Duration::from_millis(50)).is_none());
+            assert!(in_flight() >= PROBES_AT_ONCE, "a turn given back that was never taken");
+        }
+        assert!(ProbeGateV6::enter_until(Instant::now() + Duration::from_millis(50)).is_none());
+        drop(held);
     }
 
     /// Review round 5 (the probe lens's suspicion): rounds start at most [`PROBE_BURST`] at once
