@@ -972,6 +972,29 @@ fn settle(end: Option<ProbeOutcome>, icmp: &[(u8, u8, IpAddr)]) -> ProbeOutcome 
     }
 }
 
+/// Whether what the probes of a round saw so far (`None`: not yet ended) already decides it, so
+/// the round ends at once and the connection can follow its probe closely: an answer within the
+/// limit (near), or a far verdict whose every probe at or below its hop limit has ended (no later
+/// answer can contradict it: only an answer at or below that hop limit could).
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+fn decided(dst: IpAddr, hops: u8, seen: &[(u8, Option<ProbeOutcome>)]) -> bool {
+    let ended: Vec<Obs> = seen
+        .iter()
+        .filter_map(|(ttl, o)| {
+            o.clone().map(|outcome| Obs {
+                ttl: *ttl,
+                outcome,
+                local: None,
+            })
+        })
+        .collect();
+    match rule(dst, hops, &ended) {
+        Verdict::Near(_) => true,
+        Verdict::Far(e) => seen.iter().all(|(t, o)| *t > e.ttl || o.is_some()),
+        _ => false,
+    }
+}
+
 /// How a probe's socket ended, from its pending error (`SO_ERROR`) when it has one.
 #[cfg(unix)]
 fn ended(e: &io::Error) -> ProbeOutcome {
@@ -1377,7 +1400,11 @@ fn observe(
     let end = Instant::now() + wait;
     loop {
         let left = end.saturating_duration_since(Instant::now());
-        if left.is_zero() || probes.iter().all(|p| p.end.is_some()) {
+        let seen: Vec<(u8, Option<ProbeOutcome>)> = probes
+            .iter()
+            .map(|p| (p.ttl, p.end.as_ref().map(|_| settle(p.end.clone(), &p.icmp))))
+            .collect();
+        if left.is_zero() || probes.iter().all(|p| p.end.is_some()) || decided(addr.ip(), hops, &seen) {
             break;
         }
         let mut pf: Vec<libc::pollfd> = probes
@@ -1646,6 +1673,22 @@ mod tests {
         // And so through the rule: the queued Time Exceeded of a probe that connected is near.
         let obs = [o(2, settle(Some(ProbeOutcome::Connected), &tex)), te(3)];
         assert!(matches!(rule(D4, 2, &obs), Verdict::Near(_)));
+    }
+
+    /// A round ends as soon as it is decided: an answer within the limit, or a Time Exceeded
+    /// whose lower probes have all ended; never while a probe at or below its hop limit could
+    /// still be answered.
+    #[test]
+    fn a_round_ends_once_decided() {
+        use ProbeOutcome::*;
+        let tex = || Some(Icmp { kind: 11, code: 0, from: R4 });
+        assert!(decided(D4, 2, &[(2, tex()), (3, None), (4, None)]), "TE at N");
+        assert!(!decided(D4, 2, &[(2, None), (3, tex()), (4, None)]), "N may still answer");
+        assert!(decided(D4, 2, &[(2, Some(TimedOut)), (3, tex()), (4, None)]));
+        assert!(decided(D4, 2, &[(2, Some(Refused)), (3, None), (4, None)]), "near");
+        assert!(!decided(D4, 2, &[(2, None), (3, Some(Connected)), (4, None)]), "an answer beyond N");
+        assert!(!decided(D4, 2, &[(2, Some(Icmp { kind: 3, code: 1, from: R4 })), (3, None), (4, None)]));
+        assert!(!decided(D4, 2, &[(2, None), (3, None), (4, None)]));
     }
 
     /// The decision's rounds, staged: the first that decides ends it; a second round follows one
