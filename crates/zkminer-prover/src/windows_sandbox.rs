@@ -415,6 +415,30 @@ pub fn lock_down_this_process() -> io::Result<()> {
     lock_running_threads(thread)
 }
 
+/// Libraries loaded by name from now on (by this process's code or the libraries it uses: the GPU
+/// vendors' telemetry, NVML) are looked for only beside the program and in System32, never in the
+/// current directory or on `PATH`, where anyone who can write there could put a library of that
+/// name in the miner. For the miner's `main`, first thing. A failure is reported, not fatal: the
+/// vendors' libraries are loaded from System32 by full search flags anyway.
+pub fn restrict_library_search() {
+    const LOAD_LIBRARY_SEARCH_APPLICATION_DIR: u32 = 0x0000_0200;
+    const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDefaultDllDirectories(flags: u32) -> i32;
+    }
+    // SAFETY: a plain kernel32 call with documented flags.
+    if unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)
+    } == 0
+    {
+        eprintln!(
+            "warning: the library search could not be limited to System32 ({})",
+            io::Error::last_os_error()
+        );
+    }
+}
+
 /// Locks every thread of this process running now. A thread that ended in the meantime is skipped.
 fn lock_running_threads(descriptor: *mut c_void) -> io::Result<()> {
     const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;

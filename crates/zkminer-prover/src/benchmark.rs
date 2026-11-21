@@ -1507,7 +1507,13 @@ fn read_windows_power_by_card(proving_bus_ids: &[String], out: &mut BTreeMap<Str
     use std::sync::{Mutex, OnceLock};
     // One for the process: the counters' previous readings live in it.
     static TELEMETRY: OnceLock<Mutex<WindowsTelemetry>> = OnceLock::new();
-    let telemetry = TELEMETRY.get_or_init(|| Mutex::new(WindowsTelemetry::new(true, true)));
+    let telemetry = TELEMETRY.get_or_init(|| {
+        let (intel, amd) = telemetry_vendors(
+            crate::windows_gpu_memory::adapter_vendors().as_deref(),
+            proving_bus_ids,
+        );
+        Mutex::new(WindowsTelemetry::new(intel, amd))
+    });
     let Ok(mut telemetry) = telemetry.lock() else {
         return;
     };
@@ -1521,6 +1527,30 @@ fn read_windows_power_by_card(proving_bus_ids: &[String], out: &mut BTreeMap<Str
             fold_peak(out, [(bus.clone(), reading.power_watts)]);
         }
     }
+}
+
+/// Which vendors' libraries the power readings need, `(intel, amd)`: those of the proving cards, by
+/// the PCI vendor ids in `adapters` (`(pci address, vendor)`). A library is loaded only for a vendor
+/// whose card proves here: a vendor library loaded on a machine without its GPU does nothing but
+/// leave its own threads and event registrations behind (Intel's crashed the miner that way). A
+/// proving card whose vendor is unknown (the adapters could not be listed) asks for both, as before.
+#[cfg(any(windows, test))]
+fn telemetry_vendors(
+    adapters: Option<&[(String, u32)]>,
+    proving_bus_ids: &[String],
+) -> (bool, bool) {
+    const INTEL: u32 = 0x8086;
+    const AMD: u32 = 0x1002;
+    let (mut intel, mut amd) = (false, false);
+    for bus in proving_bus_ids {
+        match adapters.and_then(|a| a.iter().find(|(pci, _)| pci == bus)) {
+            Some((_, INTEL)) => intel = true,
+            Some((_, AMD)) => amd = true,
+            Some(_) => {}
+            None => return (true, true),
+        }
+    }
+    (intel, amd)
 }
 
 /// AMD per-card draw via hwmon.
@@ -3738,6 +3768,39 @@ mod zkop_score_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vendor's library is asked for only when one of its cards proves here; a proving card of
+    /// unknown vendor asks for both.
+    #[test]
+    fn only_the_proving_cards_vendors_libraries_are_loaded() {
+        let adapters = [
+            ("0000:03:00.0".to_string(), 0x10de),
+            ("0000:07:00.0".to_string(), 0x1002),
+            ("0000:0a:00.0".to_string(), 0x8086),
+        ];
+        let ids = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            telemetry_vendors(Some(&adapters), &ids(&["0000:03:00.0"])),
+            (false, false)
+        );
+        assert_eq!(
+            telemetry_vendors(Some(&adapters), &ids(&["0000:03:00.0", "0000:07:00.0"])),
+            (false, true)
+        );
+        assert_eq!(
+            telemetry_vendors(Some(&adapters), &ids(&["0000:0a:00.0"])),
+            (true, false)
+        );
+        assert_eq!(telemetry_vendors(Some(&adapters), &[]), (false, false));
+        assert_eq!(
+            telemetry_vendors(Some(&adapters), &ids(&["0000:21:00.0"])),
+            (true, true)
+        );
+        assert_eq!(
+            telemetry_vendors(None, &ids(&["0000:03:00.0"])),
+            (true, true)
+        );
+    }
 
     #[test]
     fn fingerprint_tolerates_reboot_ram_drift() {
