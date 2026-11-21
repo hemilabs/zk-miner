@@ -172,41 +172,66 @@ Every connection a requester can cause goes through one guard
   container's interfaces and routes, so use host networking (`--network host`), or list the
   host's networks and addresses in `[egress] deny_cidrs`.
 - **Nothing within two hops.** Right before every connection (each hop of the ELF fetch, and
-  each connection the witness connector makes), a **probe** asks whether the destination is
-  near: a fresh TCP socket whose packets may cross at most `[egress] near_hop_limit` hops
-  (`IP_TTL` / `IPV6_UNICAST_HOPS`, default 2: the first-hop router and what sits directly
-  behind it) connects to the exact address and port, for at most 1.5 s, and is closed without
-  sending data. If something answers — the connection is accepted, refused or reset — the
-  destination is this host's own network (the home router's own global address on its WAN
-  side, which many routers serve their admin page, DNS and UPnP on; a NAT router or NAT64
-  translator hairpinning its own public address; a neighbour in the same cloud VPC; the far
-  side of a tunnel) and is refused. If the probe runs out of hops (Linux reports the router's
-  "time exceeded" as host unreachable; so does macOS while `net.inet.tcp.icmp_may_rst` is 1, its
-  default), the destination is farther and the real connection is
-  made, on a new socket with the usual hop limit. **No answer in time decides nothing** (a path
-  that filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
-  limit, a device waking up): a **check connection** is made with the usual hop limit, and once
-  it is established its hop limit is lowered to the probe's for good and it is half-closed,
-  without a byte written. Its FIN reaches the peer only if the peer is within the limit, and a
-  peer that gets it acknowledges it: acknowledged, whenever, refused. Then a second, **control**
-  connection is made at the usual hop limit and half-closed the same way: far only once the
-  control's FIN is acknowledged and the check's is not, for a few round trips, one
-  retransmission and the control's own round trip again (a peer that acknowledges a bare FIN at
-  no hop limit, as AWS S3's front ends, is refused, the message saying so); then the real
-  connection is made. A peer that closes or resets either connection first is a failed check,
-  refused (never read as near or far). A refusal that is not a near answer says `could not tell
-  how near ... is`. The probe is asked up to three times (1 s, 0.5 s, and after a 1 s pause
-  1 s: a router rate-limiting its ICMP answers a later one), and once more after 2 s when the
-  check connection could not tell (AWS S3); at most two probes at a time per address family,
-  started at most six in a burst and three a second, first come first served; a name's
-  addresses one after another per family (the two families at once, a family given up after
-  two checks that could not tell) until one of each family passes; and an IPv4-mapped
-  destination is probed as its IPv4 address. A far verdict is remembered for 10 s for that exact
-  address, port and hop limit on unchanged facts (routes, rules, addresses, uplink), never for a
-  prefix and never a near or failed one. Linux reads the FIN's fate from `TCP_INFO`, macOS from
-  `TCP_CONNECTION_INFO`; Windows has no check connection (a probe without an answer refuses
-  there). A check connection that does not connect refuses. Any other probe error (a local
-  firewall's) refuses. Unprivileged; developer mode sends no probe.
+  each connection the witness connector makes), **probes** ask whether the destination is near,
+  and it is admitted as far **only on positive evidence (a router past the limit said a probe ran
+  out of hops), never on silence**. Three fresh TCP sockets connect at once to the exact address
+  and port with hop limits (`IP_TTL` / `IPV6_UNICAST_HOPS`) `N`, `N+1` and `N+2`, `N` being
+  `[egress] near_hop_limit` (default 2: the first-hop router and what sits directly behind it),
+  each from the source address (and interface) the real connection will use; a round waits at
+  most 1.5 s and ends as soon as it is decided, and a second round follows 1 s later only when
+  the first decided nothing (8 s at most for the whole decision). No data is ever written; a
+  probe that connected is closed with a reset.
+  - **Near** (refused): the destination answered (accepted, refused or reset) a probe limited to
+    `N` hops or fewer. It is this host's own network: the home router's own global address on
+    its WAN side, which many routers serve their admin page, DNS and UPnP on; a NAT router or
+    NAT64 translator hairpinning its own public address; a neighbour in the same cloud VPC; the
+    far side of a tunnel.
+  - **Far** (admitted) only when a probe limited to `t >= N` hops got an ICMP "time exceeded",
+    code 0 (IPv4 type 11, ICMPv6 type 3), that the kernel matched to that probe (its addresses,
+    ports and initial sequence number), from a unicast, specified sender that is not the
+    destination, and the destination answered no probe limited to `t` hops or fewer. Linux and
+    Android read it from the socket's error queue (`IP_RECVERR` / `IPV6_RECVERR`,
+    `MSG_ERRQUEUE`: the ICMP type, code and offender); macOS as described under "macOS" below.
+  - **Everything else refuses** (`could not tell how near ... is`): no answer (a path that
+    filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
+    limit, a device waking up; refused, never far), any destination unreachable, a "time
+    exceeded" with code 1 or sent by the destination itself, an answer only beyond the limit,
+    an unreachable whose ICMP message could not be read, inconsistent results, any local error
+    (a local firewall's). An answer always outweighs an ICMP error queued for the same probe.
+
+  **The connection that follows** is pinned to the probe that found the far evidence: it is
+  made from the same source address and the same local port (a port another socket holds then
+  fails the attempt; it is never made from another port), on the same interface (macOS
+  `IP_BOUND_IF` / `IPV6_BOUND_IF`, Linux `IP_UNICAST_IF` / `IPV6_UNICAST_IF`), and on Linux
+  with the IPv6 flow label fixed (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), so
+  a per-connection load balancer hashes it as it hashed the probe; the check once connected
+  also checks the port. A far verdict is not remembered for other connections: it belongs to
+  that probe's address and port pair, and another connection (another port) may take another
+  path, so every connection is decided afresh. At most two rounds at a time per address
+  family, started at most six in a burst and three a second (one token per round of three
+  probes: each router expires at most one of them, so its ICMP load is that of a single probe),
+  first come first served; a name's addresses one after another per family (the two families
+  at once, a family given up after two decisions that could not tell) until one of each family
+  passes; and an IPv4-mapped destination is probed as its IPv4 address. Unprivileged;
+  developer mode sends no probe.
+
+  **What "within two hops" means, and what the far verdict assumes.** A hop is a router that
+  decrements the hop count: "within `N` hops" is `N - 1` such routers before the destination,
+  and a "time exceeded" proves only that the probe's own path crossed that many. The far verdict
+  holds under four assumptions: (1) no party that sees the probe's SYN forges ICMP (root on a
+  near host, an on-path or on-link attacker: **a hostile LAN gets no protection from this
+  check**, as from any distance test); (2) routers send "time exceeded" only for packets they
+  forward (RFC 1812 5.3.1), not for their own addresses reached through policy routing or a VRF
+  leak; (3) the real connection follows the probe's path (the pin above; a stateless per-packet
+  balancer, a transient loop or a route change in between can still break it); (4) the
+  kernel's matching of the ICMP error to the probe (on macOS through a private `TCP_INFO`
+  layout). A box that hides hops (a second NAT router behind the ISP's, a VM's NAT, a VPN, a
+  userspace NAT64) moves the limit: at `near_hop_limit` 2 it then does not reach the ISP's first
+  box. Paths whose first hops send no "time exceeded" refuse every destination. Windows has no
+  way to read the ICMP errors yet (`TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are
+  a possible path, unverified), so every decision there refuses; it already refuses every
+  requester connection in public mode. See "The near-hop probe's own limits" below and
+  [docs/netguard-hardening.md](docs/netguard-hardening.md), "Near-hop rule: positive evidence".
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
   (`home.arpa`), `corp`, `intranet`, `private`, `localdomain`, `svc`, `consul`, `test`,
@@ -311,17 +336,19 @@ The same decisions, from what macOS shows an unprivileged process (evidence, com
   with IPv6 and no IPv4 route, or with IPv4 only through a CLAT, has found none), also from the
   configuration daemon's NAT64 state; until the new network's round has finished, such a host
   refuses every IPv6 destination.
-- **Near hops:** the probe is the same hop-limited TCP connect (an unreachable `connect` reports
-  before the connection is in progress, as Local Network privacy does, is refused, not far); a
-  check connection reads its FIN's
-  fate from `TCP_CONNECTION_INFO`: only an acknowledgement of the FIN (`FIN_WAIT_2`,
-  `TIME_WAIT`) is an answer; a peer that closes or resets the connection first is refused as a
-  failed check, never read as far. macOS does not report an ICMP "time exceeded" for the FIN, so
-  a far peer is known only when the wait ends, and only if it acknowledges the control
-  connection's FIN at the default hop limit: a peer that acknowledges a FIN at no hop limit (AWS
-  S3's front ends) is a failed check, refused. A probe without an answer is asked again, up to
-  three times. An IPv4-mapped destination is
-  probed as its IPv4 address.
+- **Near hops:** the probes are the same hop-limited TCP connects and the same rule. macOS gives
+  an unprivileged process no per-socket ICMP error, so an unprivileged `SOCK_DGRAM`
+  `IPPROTO_ICMP` (`IPPROTO_ICMPV6`) socket is opened before the probes, and a copy of an ICMP
+  error counts for a probe only when it quotes the probe's destination address and port, source
+  address and port and initial sequence number, and the probe's own socket failed with
+  `EHOSTUNREACH` / `ENETUNREACH` (late copies are drained for 30 ms). The sequence number comes
+  from the **private** `getsockopt(IPPROTO_TCP, TCP_INFO)` (0x200: `tcpi_snd_nxt` - 1, read only
+  in `SYN_SENT`, its length checked; a zero or repeated number refuses): an undocumented layout
+  Apple may change, and a Mac where the ICMP socket cannot be opened or `TCP_INFO` cannot be read
+  refuses every requester connection (said once at startup). An error `connect` itself reports
+  before the connection is in progress (Local Network privacy, a Network Extension policy) is a
+  local failure, refused, never evidence. The connection is bound to the probe's interface with
+  `IP_BOUND_IF` / `IPV6_BOUND_IF`. An IPv4-mapped destination is probed as its IPv4 address.
 - **Public addresses:** a public address is confirmed for one network, which macOS identifies by
   its routes and by the configuration daemon's network signature (the router's address and
   hardware address); moving to another network behind a router of the same address learns it
@@ -339,9 +366,9 @@ Windows where it has the code path (details, what was run on Linux and what was 
 type-checked: [docs/netguard-hardening.md](docs/netguard-hardening.md)): facts that cannot be
 read again refuse after their grace; one re-read at a time, callers waiting at most 500 ms, and
 the checks off the async runtime's workers; the uplink signature tells two networks behind the
-same router address apart (Linux: the gateways' link-layer addresses); only an acknowledged FIN
-is a check connection's answer, with a control connection; the probe asked up to three times
-and IPv4-mapped addresses unmapped (Windows too); a default-like kernel answer must be a default
+same router address apart (Linux: the gateways' link-layer addresses); IPv4-mapped addresses
+unmapped before the near-hop probes (Windows too; the near-hop rule itself is the S3 review's
+positive-evidence rule above); a default-like kernel answer must be a default
 route the facts hold (on Linux, through the same nexthop object); NAT64 prefixes learned per
 network (Linux also from the default gateway's PREF64), configured ones always in force, IPv6
 refused on an IPv6-only host (or one behind a CLAT) until the new network's round ends; and every connection checked
@@ -399,7 +426,7 @@ job there could then reach this host's private network.
 | The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes; every 15 seconds while a family is unknown) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53; `https://1.1.1.1/cdn-cgi/trace` and its IPv6 twin (the miner); on an IPv6-only host, the same IPv4 reflectors through the NAT64 prefix | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | DNS-over-HTTPS resolution of requester names (public mode) | fixed in the build (Cloudflare, Google, Quad9 by IP literal), or the operator's `[egress] doh_resolvers`; the **name** from the requester | the resolver's address must pass the floor (being one of the host's DNS servers is allowed); certificate verified for the IP literal |
-| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | a SYN with no data, closed without data; when it gets no answer, a check connection to the same address and port (a handshake, then a FIN and a reset limited to `near_hop_limit` hops; never data) |
+| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | three SYNs with no data, limited to `near_hop_limit`, one more and two more hops (a second round a second later when the first told nothing); one that connects is reset, never data |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect`, and every `setsockopt` but the socket timeouts |
 | The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
@@ -646,8 +673,11 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   mode only from the miner's own `[dev] private_network`;
 - right before each connection the floor applies to (public mode, or a DNS-named endpoint),
   checks the exact address and port again: the kernel's route with the port, and the near-hop
-  probe; an address that answers within `near_hop_limit` hops (an operator node in the same VPC
-  by its public address) is refused and never connected to;
+  probes; an address that answers within `near_hop_limit` hops (an operator node in the same VPC
+  by its public address) is refused and never connected to, and so is one no router past the
+  limit sent a "time exceeded" for (no evidence: refused, so an endpoint on a path whose routers
+  send no ICMP is lost); the connection is made from the far probe's address, port and
+  interface;
 - connects with the configured connect timeout, and paces attempts (64 at once, 16 a second: a
   hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
   `max_concurrency` in flight);
@@ -756,7 +786,7 @@ no second one):
   host's interfaces, routes, sites and public addresses, refuses the IPv6 /32 and the IPv4 /16
   around them, makes a host with a public IPv4 interface address or an uplink that is not
   plainly physical list its `internal_ranges` (at startup and whenever that appears later), and
-  refuses whatever answers within `near_hop_limit` hops. What remains is your organisation's own
+  refuses whatever is not shown to be past `near_hop_limit` hops. What remains is your organisation's own
   space beyond all of that: a VPC neighbour or campus subnet more than two hops away and outside
   the sites and the ranges you listed, an IPv6 organisation wider than `ipv6_site_prefix_len`
   on a host without a public IPv4 address, a policy-based IPsec tunnel that installs no routing
@@ -765,16 +795,48 @@ no second one):
   internal_ranges` or `deny_cidrs` (and raise `near_hop_limit` where your network is deeper).
   On a cloud host, also block the metadata service inside the instance (IMDSv2 required, hop
   limit 1, or the endpoint off) as defense in depth.
-- **The near-hop probe's own limits.** The probe is a SYN with no data, and the check
-  connection a handshake, a FIN and a reset with no data, but a near host does receive them
-  before the connection is refused. A near host that drops the probe's SYNs **and** the check
-  connection's FIN (but answers the real connection) reads as far: a firewall that filters by
-  hop count could do that. A transparent proxy within the limit answers for every destination,
-  so every connection through it is refused. A router that does not decrement the hop count is
-  invisible to the probe. A far destination whose path drops ICMP costs the probe's 1.5 seconds
-  plus a check connection (a round trip and a few hundred milliseconds) per address, and leaves
-  that destination a half-open connection. The probe and the connection are connects a moment
-  apart; a route that changes in between is not followed.
+- **The near-hop probe's own limits.** The guard admits a destination as far only on positive
+  evidence (a router past the limit said the probe ran out of hops), never on silence; it is
+  not a proof that the destination is far, only that the probe's own path crossed
+  `near_hop_limit` decrementing routers, under the four assumptions under "Nothing within two
+  hops" above. What that leaves:
+  - **A forger that sees the probe's SYN** (root on a near host, an on-path or on-link
+    attacker) can send the "time exceeded" itself and have a near destination admitted: a
+    hostile LAN gets no protection from this check, as from any distance test. (macOS and Linux
+    abort a connecting socket on the first ICMP error they accept, so a forged one that arrives
+    before the destination's answer is enough; no drop is needed.) Unprivileged processes on
+    Linux and macOS cannot send one (tested), nor can an off-path party without the probe's
+    sequence number.
+  - **Definitional cases read far**, as they did before the S3 review: a router reached on its
+    own addresses through policy routing or a VRF leak (it sends "time exceeded" for its own
+    address), a userspace NAT64 (tayga) that uses several hop-limit units in one box, a VM's
+    NAT or a second NAT router that hides a hop (at the default limit the ISP's first box is
+    then far), a carrier-grade NAT hairpinning to the operator's own port mapping (PCP), a
+    transient routing loop, a stateless per-packet balancer that sends the connection another
+    way than the probe.
+  - **Silent paths refuse.** A path whose routers at hops `N` to `N+2` send no "time exceeded"
+    (many cloud providers' networks, EC2 included, and corporate edges that filter ICMP)
+    refuses every destination, every time; a router rate-limiting its ICMP refuses some. Cloud
+    servers are out of scope for now. Windows refuses every decision (no ICMP plumbing yet).
+  - **Port reuse and strict NATs (open, the owner's decision pending).** The connection must
+    reuse the far probe's local port so that it takes the probe's path. On a measured IPv4 home
+    path (a home NAT router, then the ISP's carrier-grade NAT) the real connection's SYN then got
+    no answer whenever it followed the probe's by more than about 20 ms, for at least 125 s,
+    while a new port connected at once; IPv6 (no NAT) was not affected, and Linux conntrack
+    alone (the lab) reuses the port fine. The likely cause is a stateful NAT or firewall (the
+    carrier's NAT, or pf-style strict TCP tracking) that keeps the probe's session with its
+    sequence number and drops a second SYN on it. On such paths every IPv4 connection after a
+    far verdict fails, refused (`connecting to ... from the near-hop probe's port ...: timed
+    out`; never retried from another port). The alternative is to pin only the source address,
+    interface and flow label, which works there but leaves a per-connection balancer free to
+    send the connection another way than the probe.
+  - **What the probes cost.** A near host does receive the probes' SYNs (and answers them: a
+    handshake or a reset, never data) before the connection is refused. A transparent proxy
+    within the limit answers for every destination, so every connection through it is refused.
+    A router that does not decrement the hop count is invisible to the probes. A destination
+    whose evidence comes late costs up to 1.5 s a round (two rounds and a 1 s pause at most),
+    and every connection is decided afresh (three decisions a second per family after a burst
+    of six).
 - **What the routing checks cannot see.** The kernel is asked as a connection's route
   lookups are made: with the destination port and (IPv4) the source address the kernel picks,
   firewall mark 0, and no source port (one is chosen after these lookups; a rule that selects by
