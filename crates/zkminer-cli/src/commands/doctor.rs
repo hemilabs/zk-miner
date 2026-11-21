@@ -229,6 +229,12 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
             report.say(level, "key", finding);
         }
     }
+    // Linux: the key's files that other users can read or change (review r6 LS1). Before the key
+    // is loaded: the unit's environment file is there whether or not this shell has the variable.
+    #[cfg(target_os = "linux")]
+    for finding in linux_key_file_findings(&config.wallet).await {
+        report.say(Level::Fail, "key", finding);
+    }
     let signer = match zkminer_config::wallet::load_signer(&config.wallet) {
         Ok(s) => s,
         Err(e) => {
@@ -729,6 +735,55 @@ fn replaceable_checks(report: &mut Report, config: &ZkMinerConfig, config_file: 
         .collect();
     for (level, detail) in replaceable_findings(&checked, service, &services) {
         report.say(level, "who can replace the miner", detail);
+    }
+}
+
+/// Linux: [`super::run::file_access::key_file_findings`], with the installed unit's environment
+/// files (`systemctl show`, off the runtime).
+#[cfg(target_os = "linux")]
+async fn linux_key_file_findings(wallet: &zkminer_config::config::WalletConfig) -> Vec<String> {
+    let wallet = wallet.clone();
+    tokio::task::spawn_blocking(move || {
+        use super::run::file_access as access;
+        access::key_file_findings(&wallet, access::installed_service().as_deref())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Linux: who can replace what the miner runs (review r6 LS3, `run::file_access`): the Windows
+/// check's counterpart. Each finding fails where the miner runs as the installed unit, as a Windows
+/// service's do; run by hand, it warns.
+#[cfg(target_os = "linux")]
+fn linux_replaceable_checks(report: &mut Report, config: &ZkMinerConfig, config_file: &Path) {
+    use super::run::file_access as access;
+    let service = access::installed_service();
+    let targets = access::replace_targets(config, config_file, service.as_deref());
+    let problems = access::replace_problems(&targets);
+    let level = if service.is_some() || std::env::var_os("INVOCATION_ID").is_some() {
+        Level::Fail
+    } else {
+        Level::Warn
+    };
+    if problems.is_empty() {
+        report.say(
+            Level::Pass,
+            "who can replace the miner",
+            "only root and this user can write the miner, its workers, its configuration and \
+             ~/.sp1/bin, and the directories above them",
+        );
+    }
+    for (path, why) in problems {
+        report.say(
+            level,
+            "who can replace the miner",
+            format!(
+                "{} {why}: another user could replace it and run code as the miner's account, its \
+                 key included. Make it root's or this user's, writable by its owner only (`chmod \
+                 go-w`)",
+                path.display()
+            ),
+        );
     }
 }
 
@@ -1286,7 +1341,7 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
         }
     }
     let host_config = config.clone().unwrap_or_default();
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let config_file = config_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| ZkMinerConfig::default_dir().join("config.toml"));
@@ -1296,6 +1351,8 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
         host_checks(&mut host_report, &host_config);
         #[cfg(windows)]
         replaceable_checks(&mut host_report, &host_config, &config_file);
+        #[cfg(target_os = "linux")]
+        linux_replaceable_checks(&mut host_report, &host_config, &config_file);
         host_report
     })
     .await?;

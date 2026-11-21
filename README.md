@@ -418,7 +418,13 @@ Worth knowing:
   `OOMPolicy=continue`, without which systemd stops the whole unit (a drain, then a restart)
   when the kernel kills one worker for memory; a unit installed from an older copy has neither:
   copy the new one over it, `systemctl daemon-reload`, and restart the miner when its locks
-  allow (`zkminer doctor` says whether the installed unit has both). To
+  allow (`zkminer doctor` says whether the installed unit has both). A key in the unit's
+  `/etc/zkminer/env` must be readable by root only: create the file with `sudo install -m 600
+  -o root -g root /dev/null /etc/zkminer/env` before the key goes in (an editor or `tee`
+  alone makes it readable by every user), or pass the key as a systemd credential (the unit
+  shows how). The miner pages `KEY-FILE-READABLE`, and `zkminer doctor` fails, when other
+  users can read or change the key's file; doctor also checks that only root and the miner's
+  user can replace the miner, its workers, its configuration and `~/.sp1/bin`. To
   upgrade, `install -m755` the new miner and every worker over the old ones (all of them: a
   worker from another build is refused), then `zkminer stop --keep-locks`. For Docker, run
   with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and keep `~/.zkminer`
