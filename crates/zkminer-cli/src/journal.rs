@@ -309,6 +309,16 @@ impl JobJournal {
             .unwrap_or_default()
     }
 
+    /// As [`Self::peek`], but saying why a journal that is there could not be read (`zkminer
+    /// status`): an empty journal must not be reported for one that did not parse.
+    pub fn peek_checked() -> std::result::Result<Self, String> {
+        match std::fs::read_to_string(Self::default_path()) {
+            Ok(content) => parse_journal(&content).map(|(j, _)| j),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// [`Self::load_checked_from`] without the logging, for tests.
     pub fn load_reporting(path: &Path) -> std::result::Result<(Self, LoadReport), JournalLoadError> {
         let content = match std::fs::read_to_string(path) {
