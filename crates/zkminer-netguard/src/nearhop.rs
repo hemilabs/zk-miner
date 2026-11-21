@@ -734,6 +734,17 @@ fn enter_gate(m: &std::sync::Mutex<GateState>, cv: &std::sync::Condvar, deadline
     }
 }
 
+/// [`enter_gate`], the turn made by `make` only once given (both families' gates: a turn made
+/// and dropped unused would give back one never taken).
+fn enter_gate_as<G>(
+    m: &std::sync::Mutex<GateState>,
+    cv: &std::sync::Condvar,
+    deadline: Instant,
+    make: impl FnOnce() -> G,
+) -> Option<G> {
+    enter_gate(m, cv, deadline).then(make)
+}
+
 /// Gives a turn of the gate `m` back.
 fn leave_gate(m: &std::sync::Mutex<GateState>, cv: &std::sync::Condvar) {
     let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -749,7 +760,7 @@ impl ProbeGate {
     /// `then_some(ProbeGate)` made one either way, and dropping the unused one gave back a turn
     /// never taken, so every caller that got none let one more probe in flight.
     fn enter_until(deadline: Instant) -> Option<Self> {
-        enter_gate(&PROBES_IN_FLIGHT, &PROBE_TURN, deadline).then(|| ProbeGate)
+        enter_gate_as(&PROBES_IN_FLIGHT, &PROBE_TURN, deadline, || ProbeGate)
     }
 
     /// Probes in flight now (tests).
@@ -762,7 +773,7 @@ impl ProbeGate {
 impl ProbeGateV6 {
     /// See [`ProbeGate::enter_until`].
     fn enter_until(deadline: Instant) -> Option<Self> {
-        enter_gate(&PROBES_IN_FLIGHT_V6, &PROBE_TURN_V6, deadline).then(|| ProbeGateV6)
+        enter_gate_as(&PROBES_IN_FLIGHT_V6, &PROBE_TURN_V6, deadline, || ProbeGateV6)
     }
 }
 
@@ -1313,6 +1324,15 @@ fn icmp_quote(b: &[u8], dst: SocketAddr) -> Option<Quote> {
     })
 }
 
+/// macOS: whether an ICMP error quoting `q` is about the probe that left from `local` with initial
+/// sequence number `isn` (known only in `SYN_SENT`): its source port, its sequence number, and its
+/// source address (unless the probe's is unspecified). Pure.
+#[cfg(any(test, target_os = "macos"))]
+fn quotes(q: &Quote, local: SocketAddr, isn: Option<u32>) -> bool {
+    let src_ok = local.ip().is_unspecified() || local.ip() == q.src;
+    local.port() == q.sport && isn == Some(q.seq) && src_ok
+}
+
 /// macOS: a `SOCK_DGRAM` `IPPROTO_ICMP` / `IPPROTO_ICMPV6` socket (unprivileged), non-blocking;
 /// it gets a copy of every ICMP error this host receives.
 #[cfg(target_os = "macos")]
@@ -1368,8 +1388,7 @@ fn read_icmp(fd: i32, dst: SocketAddr, probes: &mut [Probe]) {
             continue;
         };
         for p in probes.iter_mut() {
-            let src_ok = p.local.ip().is_unspecified() || p.local.ip() == q.src;
-            if p.local.port() == q.sport && p.isn == Some(q.seq) && src_ok {
+            if quotes(&q, p.local, p.isn) {
                 p.icmp.push((q.kind, q.code, sender));
             }
         }
@@ -1868,6 +1887,14 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("could not be sent"), "{e}");
         assert_eq!(interface_of("192.0.2.200".parse().unwrap()).unwrap(), None);
+        // The interface is bound: a probe of a public address held to loopback's interface does
+        // not leave by the default route (macOS: no route on lo0; Linux: IP_UNICAST_IF).
+        let public: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let pin = Pin { source: None, interface };
+        let r = TtlProbe.round(0, public, 64, 0, &pin, Duration::from_millis(300), Instant::now() + DECIDE_BUDGET);
+        eprintln!("held to loopback's interface: {r:?}");
+        #[cfg(target_os = "macos")]
+        assert!(matches!(&r, Ok(o) if matches!(&o[0].outcome, ProbeOutcome::Failed(_))), "{r:?}");
     }
 
     /// The real probe, on the real path: a probe of hop limit 1 to a public address runs out of
@@ -2005,6 +2032,15 @@ mod tests {
         );
         v6[14] = 17;
         assert_eq!(icmp_quote(&v6, d6), None, "not TCP");
+        // Matched to the probe only by its source port, ISN and source address.
+        let q = icmp_quote(&b, dst).unwrap();
+        let local: SocketAddr = "192.0.2.9:40000".parse().unwrap();
+        assert!(quotes(&q, local, Some(77)));
+        assert!(!quotes(&q, local, Some(78)), "another ISN");
+        assert!(!quotes(&q, local, None), "no ISN known");
+        assert!(!quotes(&q, "192.0.2.9:40001".parse().unwrap(), Some(77)), "another port");
+        assert!(!quotes(&q, "192.0.2.10:40000".parse().unwrap(), Some(77)), "another source");
+        assert!(quotes(&q, "0.0.0.0:40000".parse().unwrap(), Some(77)), "unbound source");
     }
 
     /// macOS: a real probe in `SYN_SENT` has its initial sequence number read.
