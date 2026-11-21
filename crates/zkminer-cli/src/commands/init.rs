@@ -10,6 +10,26 @@ use zkminer_chain::staking::TESTNET_CHAIN_ID;
 const MAINNET_CHAIN_ID: u64 = 43111;
 const MAINNET_RPC: &str = "https://rpc.hemi.network";
 
+/// Whether `init` makes (or keeps) a key file and points the config at it: asked for with
+/// `--generate-key` or `--key-source file`, and by default on Windows, where a key kept in the
+/// environment ends up where Low-integrity workers can read it (a `setx` copy in the registry,
+/// PowerShell's command history). `--key-source env` keeps the variable.
+pub fn key_file_wanted(generate_key: bool, key_source: Option<&str>) -> Result<bool> {
+    key_file_wanted_on(cfg!(windows), generate_key, key_source)
+}
+
+fn key_file_wanted_on(windows: bool, generate_key: bool, key_source: Option<&str>) -> Result<bool> {
+    match key_source {
+        Some("env") if generate_key => {
+            anyhow::bail!("--generate-key makes a key file: it cannot go with --key-source env")
+        }
+        Some("env") => Ok(false),
+        Some("file") => Ok(true),
+        Some(other) => anyhow::bail!("unknown key source '{other}': use 'file' or 'env'"),
+        None => Ok(generate_key || windows),
+    }
+}
+
 pub fn run(
     config_path: Option<&Path>,
     force: bool,
@@ -111,8 +131,9 @@ pub fn run(
             #[cfg(windows)]
             {
                 println!("     Not with setx or in a service's environment (NSSM's");
-                println!("     AppEnvironmentExtra): other users or processes read it there.");
-                println!("     A service needs the key file.");
+                println!("     AppEnvironmentExtra): other users or processes read it there,");
+                println!("     and with a setx copy no prover worker starts. A service needs");
+                println!("     the key file (the default without --key-source env).");
             }
         }
     }
@@ -135,4 +156,22 @@ pub fn run(
     println!("                        then zkminer withdraw 7 days on");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Windows makes a key file unless the variable is asked for; elsewhere the variable stays the
+    /// default. A key file cannot be generated for an `env` key.
+    #[test]
+    fn windows_defaults_to_a_key_file() {
+        assert!(key_file_wanted_on(true, false, None).unwrap());
+        assert!(!key_file_wanted_on(true, false, Some("env")).unwrap());
+        assert!(!key_file_wanted_on(false, false, None).unwrap());
+        assert!(key_file_wanted_on(false, true, None).unwrap());
+        assert!(key_file_wanted_on(false, false, Some("file")).unwrap());
+        assert!(key_file_wanted_on(true, true, Some("env")).is_err());
+        assert!(key_file_wanted_on(false, false, Some("vault")).is_err());
+    }
 }

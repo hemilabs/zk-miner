@@ -3673,6 +3673,7 @@ pub(crate) fn protect_secrets(config: &ZkMinerConfig) {
         (config.wallet.key_source == "file")
             .then(|| config.wallet.key_file_path.as_deref().map(Path::new))
             .flatten(),
+        (config.wallet.key_source == "env").then_some(config.wallet.key_env_var.as_str()),
         &JobJournal::default_path(),
     );
 }
