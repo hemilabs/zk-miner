@@ -236,9 +236,10 @@ fn os_err(what: &str) -> SandboxError {
 /// ([`make_runners_executable`]), and nothing else; every other one fails with `EPERM`, as all do
 /// when `runner_dir` is `None`.
 ///
-/// Call it from a single-threaded process (it forks). Fails before starting anything if the
-/// confinement cannot be built or a filesystem in reach is not local ([`crate::localfs`]); a child
-/// that cannot be confined exits with [`EXIT_NOT_CONFINED`] without running `program`.
+/// Call it from a single-threaded process (it forks). It drops every capability first
+/// ([`crate::drop_all_capabilities`]). Fails before starting anything if the confinement cannot be
+/// built or a filesystem in reach is not local ([`crate::localfs`]); a child that cannot be
+/// confined exits with [`EXIT_NOT_CONFINED`] without running `program`.
 pub fn run_supervised(
     program: &Path,
     args: &[OsString],
@@ -266,6 +267,9 @@ pub fn run_supervised(
     // again once confined.
     let granted = confinement.granted_paths();
     crate::localfs::check_local_filesystems(&granted)?;
+    // No capability, in the supervisor or the server it starts (a no-op unless run as root, and
+    // already done where the worker dropped them in `main`).
+    crate::caps::drop_all_capabilities()?;
     // Everything that allocates happens before the fork.
     let ruleset = confinement.landlock_ruleset(false)?;
     let filters = netdeny::filters(Sockets::Supervised, confinement.filter_allowances())?;
@@ -469,6 +473,9 @@ fn confine_child(
     }
     if let Err(what) = netdeny::namespaces_refused() {
         return fail(&what);
+    }
+    if !crate::caps::capabilities_cleared() {
+        return fail("it still holds a capability");
     }
     if let Err(e) = crate::localfs::check_local_filesystems(granted) {
         return fail(&e.to_string());

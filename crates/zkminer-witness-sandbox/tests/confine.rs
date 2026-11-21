@@ -8,7 +8,9 @@
 //! config), signals (by every syscall that sends one) and `/proc` access to the miner (the probe's
 //! parent stands in for it), and the kernel surface the filters take away: namespaces (`unshare`,
 //! `setns`, `clone` with a `CLONE_NEW*` flag; `clone3` is unimplemented), mounts and the new mount
-//! API, `userfaultfd`, `perf_event_open` and file handles; threads and `posix_spawn` still work.
+//! API, `userfaultfd`, `perf_event_open` and file handles, and the host-control calls (modules,
+//! `kexec`, `reboot`, the clock, swap, accounting, quotas, the kernel log, port I/O; `personality`
+//! only queried); threads and `posix_spawn` still work.
 //! Metadata writes (mode, owner, extended attributes, times; by path and through an fd) are
 //! refused, but for the supervised server's runner, which its supervisor makes executable; links,
 //! renames, removals, directories, symlinks and truncation outside the writable path are refused
@@ -129,6 +131,37 @@ const KERNEL_SURFACE: &[&str] = &[
     "clone3_enosys",
     "thread_after_confinement",
 ];
+
+/// The host-control calls both probes make (`host_control_checks`), each refused, and
+/// `personality`, which may be queried and not changed.
+fn host_control_checks() -> Vec<&'static str> {
+    let mut v = vec![
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "kexec_file_load",
+        "reboot",
+        "clock_settime",
+        "clock_adjtime",
+        "settimeofday",
+        "adjtimex",
+        "swapon",
+        "swapoff",
+        "acct",
+        "quotactl",
+        "quotactl_fd",
+        "syslog",
+        "sethostname",
+        "setdomainname",
+        "personality_query",
+        "personality_change",
+    ];
+    if cfg!(target_arch = "x86_64") {
+        v.extend(["iopl", "ioperm"]);
+    }
+    v
+}
 
 /// Metadata writes (`metadata_checks`), each refused, on a file both probes may write; and the
 /// namespace changes outside the writable path that Landlock refuses (`namespace_checks`).
@@ -278,6 +311,7 @@ fn a_confined_worker_reaches_no_socket_no_home_and_not_the_miner() {
     assert!(log.contains("GOT SIGUSR1"), "{log}");
     assert_eq!(code, Some(0), "{log}");
     for name in [
+        "capabilities_dropped",
         "confine",
         "pivot_session_bus",
         "pivot_docker",
@@ -316,7 +350,7 @@ fn a_confined_worker_reaches_no_socket_no_home_and_not_the_miner() {
     ] {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
     }
-    for name in KERNEL_SURFACE {
+    for name in KERNEL_SURFACE.iter().copied().chain(host_control_checks()) {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
     }
     for name in signal_checks("parent") {
@@ -506,7 +540,7 @@ fn a_supervised_server_listens_until_its_first_connection_and_never_after() {
     ] {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
     }
-    for name in KERNEL_SURFACE {
+    for name in KERNEL_SURFACE.iter().copied().chain(host_control_checks()) {
         assert!(checked(&log, name), "{name} not checked:\n{log}");
     }
     for name in signal_checks("supervisor") {

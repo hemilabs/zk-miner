@@ -109,6 +109,14 @@ mod test_leak {
 }
 
 fn main() {
+    // First, while the process has one thread: no capability on any thread it will ever have, nor
+    // on anything it starts (a no-op unless the miner runs as root). The confinement checks this
+    // before the first guest and refuses otherwise.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
+        eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
+    }
+
     // `--groth16-docker-helper`: the Docker Groth16 wrap's helper process (groth16_wrap.rs), which
     // never runs a guest. It does not return.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(groth16_wrap::HELPER_ARG))

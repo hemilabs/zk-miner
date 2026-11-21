@@ -339,8 +339,17 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // First, while the process has one thread: no capability on any thread it will ever have, nor
+    // on anything it starts (a no-op unless the miner runs as root). The confinement checks this
+    // before the first guest and refuses otherwise.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
+        eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
+    }
+
     // Started by the SDK as `~/.sp1/bin/zkminer-confined-<server>`: the shim that runs the real
-    // `sp1-gpu-server` confined (confinement.rs). Before anything else; it does not return.
+    // `sp1-gpu-server` confined (confinement.rs). Before anything else but the above; it does not
+    // return.
     #[cfg(target_os = "linux")]
     confinement::run_if_shim();
 

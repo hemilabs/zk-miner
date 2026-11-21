@@ -263,7 +263,7 @@ pub(crate) fn current_state(landlock_abi: i32) -> RestrictReport {
         no_new_privs: nnp == 1,
         dumpable_cleared: dumpable == 0,
         core_dumps_disabled: core_ok && core.rlim_cur == 0 && core.rlim_max == 0,
-        capabilities_cleared: capabilities_cleared(),
+        capabilities_cleared: crate::caps::capabilities_cleared(),
     }
 }
 
@@ -284,49 +284,10 @@ fn set_process_attributes() -> Result<(), SandboxError> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    drop_capabilities()
-}
-
-/// `struct __user_cap_header_struct` / `__user_cap_data_struct` (version 3: two data words).
-#[repr(C)]
-struct CapHeader {
-    version: u32,
-    pid: libc::c_int,
-}
-#[repr(C)]
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-struct CapData {
-    effective: u32,
-    permitted: u32,
-    inheritable: u32,
-}
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-
-/// Clears the effective, permitted and inheritable capability sets (and the ambient set, which
-/// cannot outlive the permitted one). A process of an unprivileged uid holds none already; a
-/// miner started as root would otherwise hand its sandboxes `CAP_NET_ADMIN` — with which a
-/// per-packet `SO_MARK` on `sendmsg`, invisible to a seccomp filter, selects a mark-routed path —
-/// `CAP_NET_RAW` and the rest. With `NO_NEW_PRIVS` and no `exec`, none can come back.
-fn drop_capabilities() -> Result<(), SandboxError> {
-    let mut header = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
-    let none = [CapData::default(); 2];
-    // SAFETY: a version-3 header and two data words, as capset(2) requires; lowering capabilities
-    // needs no privilege.
-    if unsafe { libc::syscall(libc::SYS_capset, &mut header as *mut CapHeader, none.as_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: an integer prctl.
-    unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
-    Ok(())
-}
-
-/// Whether the calling thread holds no capability (effective, permitted, inheritable).
-pub(crate) fn capabilities_cleared() -> bool {
-    let mut header = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
-    let mut data = [CapData { effective: !0, permitted: !0, inheritable: !0 }; 2];
-    // SAFETY: as in `drop_capabilities`; capget writes two data words.
-    let r = unsafe { libc::syscall(libc::SYS_capget, &mut header as *mut CapHeader, data.as_mut_ptr()) };
-    r == 0 && data == [CapData::default(); 2]
+    // No capabilities: a miner started as root would otherwise hand its sandboxes `CAP_NET_ADMIN`
+    // (with which a per-packet `SO_MARK` on `sendmsg`, invisible to a seccomp filter, selects a
+    // mark-routed path), `CAP_NET_RAW` and the rest.
+    crate::caps::clear_capability_sets()
 }
 
 // ---------------------------------------------------------------------------------------------

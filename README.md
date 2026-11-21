@@ -166,7 +166,10 @@ RTX cards, and for AMD (Radeon RX 7000 and 9000) and Intel (Arc A and B) cards j
 driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
 oneAPI install, and a ROCm the distribution has is not used. A miner run outside a desktop session
 (a systemd unit, SSH) needs its user in the `render` group for AMD and Intel cards
-(`sudo usermod -aG render $USER`). The release workflow checks all of this on real GPUs before it
+(`sudo usermod -aG render $USER`). Run it as such a user, not as root: its workers drop every
+capability, but as uid 0 they could still read root's files after an executor escape, so a run as
+root on a bare host logs `PAGE: RUNNING-AS-ROOT` and `zkminer doctor` warns of it (only the
+dashboard's GPU tuning needs root). The release workflow checks all of this on real GPUs before it
 publishes (`.github/workflows/release.yml`).
 
 **SP1** needs three more things, all handled for you:
@@ -738,7 +741,10 @@ Worth knowing:
   worker from another build is refused), then `zkminer stop --keep-locks`. For Docker, run
   with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and keep `~/.zkminer`
   on a volume (`-v zkminer-home:/root/.zkminer`): the kept locks are found through the job
-  journal there, and a new container without it never finds them. Restart in place with
+  journal there, and a new container without it never finds them. The miner runs as root in
+  that container, and its workers drop every capability; `--cap-drop=ALL --security-opt
+  no-new-privileges`, or `--user` with a uid that owns the volume (mounted at that user's
+  `~/.zkminer`), narrows the container further. Restart in place with
   `docker exec <container> zkminer stop --keep-locks` (not `--wait`, which ends with the
   container); for a new image, start the new container on the same volume promptly. On
   Windows, the workers have consoles of their own, so Ctrl+C reaches only the miner.
