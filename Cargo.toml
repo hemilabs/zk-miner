@@ -192,17 +192,20 @@ hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 # build work, #27's memory fixes for small Intel cards, and #28's AMD RDNA3/RDNA4 speedups, which
 # rewrite most of the ROCm proving path (validated upstream on ROCm 7.2; prove on an AMD card before
 # trusting a new ROCm toolchain with it).
-# The pin is hemilabs/risc0 branch `zkminer/metal-3.1` @ 37b434755: `release-3.1` @ 5beab26b5 (upstream
+# The pin is 81ee699e3, the macOS/Metal fork branch rebased onto hemilabs/risc0 `release-3.1` @ eb847a1af
+# (W12-REBASE; it must be pushed to hemilabs/risc0 before this rev resolves): `release-3.1` (upstream
 # v3.1.0, with the GHSA-g6qg-9j8p-7j87 Groth16 fix whose receipts the risc0-ethereum v3.1.0 verifier
 # accepts: SELECTOR 0xe71e6620, control root e6feef13..., with the fork's work above, #39's zkr decode
-# cache, #40's Intel Poseidon-254 S-box, and #41's ROCm eval_check regenerated for the 3.1 circuit, before
-# which every rv32im proof on an AMD card failed verification) merged with the macOS/Metal port: the
+# cache, #40's Intel Poseidon-254 S-box, #41's ROCm eval_check regenerated for the 3.1 circuit, before
+# which every rv32im proof on an AMD card failed verification, and #42's ROCm recursion fast asserts on
+# Windows) merged with the macOS/Metal port: the
 # Metal backend, the 3.1 security fixes (B9-SEC), the 4 GiB Groth16 wrap (B9-G1, B9-4G), the W10-R0
 # merge of release-3.1 itself, and W10-GATE, which turns every fork change off by default unless the
 # build is a Metal build (macOS + the `metal` feature), so CUDA/ROCm/Intel/CPU builds behave like
 # release-3.1. RELEASE-DEPS.md records the pin, what it changes on the other platforms and how it was
 # validated; docs/metal-port-notes/W10-INT.md records how it replaced the 5beab26b5 pin and
-# docs/metal-port-notes/W10-PIN.md the move to 37b434755.
+# docs/metal-port-notes/W10-PIN.md the move to 37b434755, and docs/metal-port-notes/W12-REBASE.md the
+# move to 81ee699e3 (37b434755 rebased onto release-3.1 eb847a1af; same tree plus #42).
 # 3.1 receipts are not accepted by a 3.0 verifier, and 3.0 receipts are not accepted by a 3.1 verifier.
 # Build at -j 4 or more: from #21, three -sys build scripts can deadlock on cargo's jobserver at -j 1..3.
 # A rev and not a branch for the reason given on `sppark` below: a branch pin follows a moved head on
@@ -212,23 +215,23 @@ hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 # `make -f Makefile.mac RISC0_SRC=local ...` (or `cargo --config .cargo/risc0-local.toml ...`) patches
 # these crates to ../deps/risc0-3.1 instead. RELEASE-DEPS.md explains both modes and the lockfile.
 [patch.crates-io]
-risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
-risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "37b434755ce77dd1354d957a7b61912aa4359423" }
+risc0-zkvm = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-build = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-zkp = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-sys = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-core = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-binfmt = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-build-kernel = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-groth16 = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-groth16-sys = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-circuit-rv32im = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-circuit-rv32im-sys = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-circuit-recursion = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-circuit-recursion-sys = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-circuit-keccak = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-circuit-keccak-sys = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-zkos-v1compat = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
+risc0-zkvm-platform = { git = "https://github.com/hemilabs/risc0", rev = "81ee699e3df4a08e9950f3374571ddeb250e6009" }
 # Pinned by immutable REV, not a branch: a branch head can silently move the build
 # off a validated commit (which is why the risc0/sp1 patches below carry a
 # do-not-cargo-update warning). 5f68eb3 = hemilabs/risc0-sppark `zkminer/windows-amd`
@@ -319,7 +322,7 @@ codegen-units = 1
 # risc0 3.1's recursion programs (`risc0-circuit-recursion-zkrs`, `-control-zkrs`) ship as a tarball
 # stored in git-lfs, which a cargo git checkout of the fork does not fetch (its build script then stops
 # with "zkrs.tar.xz is a git-lfs pointer"). The crates.io releases hold the same tarballs (SHA-256
-# 53388c58... and 202fd7e7..., the fork's LFS object ids at f6f6f8f9 and at the pinned 37b434755; same
+# 53388c58... and 202fd7e7..., the fork's LFS object ids at f6f6f8f9 and at 37b434755 and the pinned 81ee699e3; same
 # build.rs and src/, B9-DEP note), so they are taken from there. Keep this a table of its own after
 # [patch.crates-io]: a header placed among that table's lines would take the lines below it out of it.
 [patch."https://github.com/hemilabs/risc0"]
