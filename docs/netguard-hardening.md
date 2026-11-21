@@ -748,7 +748,7 @@ box far at `N` 2), a CGNAT hairpin to the operator's own PCP mapping, a transien
 (measured), a stateless per-packet balancer. A per-connection balancer with unequal paths
 (mwan3 style) reads far about half the time per family (lab: 11 of 20, 10 of 20) and, since the
 connection takes a new port (the owner's decision), reaches the near host over the short path on
-some connections: 4 of 13 in the lab (round 3's prototype: 12 of 15); with the probe's port
+some connections: 4 of 13 and 8 of 17 in two lab runs (round 3's prototype: 12 of 15); with the probe's port
 reused it was 0 of 18 (0 of 19). A documented residual, as before the S3 review.
 
 **Availability.** Home paths whose hop 2 sends Time Exceeded (this Mac's and its Linux VM's): no
