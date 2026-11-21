@@ -114,6 +114,37 @@ fn fmt_eth(wei: u128) -> String {
     format!("{:.5} ETH", wei as f64 / 1e18)
 }
 
+/// Windows: the key in a file (`key_source = "file"`, or `<home>/.env` beside an `env` key source,
+/// which is only checked for, never read). Windows has no owner-only file a process of the same
+/// user cannot read, so any process run as this user can read it; with Low-integrity workers
+/// (`low_il`) at least the prover workers cannot.
+#[cfg(any(windows, test))]
+fn key_on_disk_warning(
+    wallet: &zkminer_config::config::WalletConfig,
+    home: &Path,
+    low_il: bool,
+) -> Option<String> {
+    let what = match wallet.key_source.as_str() {
+        "file" => format!(
+            "the key file {}",
+            wallet.key_file_path.as_deref().unwrap_or("(unset)")
+        ),
+        "env" if home.join(".env").exists() => {
+            format!("{}, if it holds the key,", home.join(".env").display())
+        }
+        _ => return None,
+    };
+    Some(if low_il {
+        format!(
+            "{what} can be read by any process run as this user; the prover workers cannot (they              run at Low integrity)"
+        )
+    } else {
+        format!(
+            "{what} can be read by any process run as this user, a prover worker included (and the              guest programs it runs, should one break out). Set ZKMINER_WINDOWS_LOW_IL_WORKERS=1 to              keep the workers from it"
+        )
+    })
+}
+
 async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
     report.section("Chain and funds");
     let signer = match zkminer_config::wallet::load_signer(&config.wallet) {
@@ -128,6 +159,14 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
         "key",
         format!("{} ({})", signer.address(), config.wallet.key_source),
     );
+    #[cfg(windows)]
+    if let Some(warning) = key_on_disk_warning(
+        &config.wallet,
+        &ZkMinerConfig::default_dir(),
+        zkminer_prover::windows_sandbox::low_il_workers(),
+    ) {
+        report.say(Level::Warn, "key", warning);
+    }
     let host = rpc_host(&config.chain.rpc_url);
     let client = match tokio::time::timeout(
         Duration::from_secs(60),
@@ -685,6 +724,30 @@ mod tests {
             "rpc.example.com:8545"
         );
         assert_eq!(rpc_host("http://127.0.0.1:8546"), "127.0.0.1:8546");
+    }
+
+    /// Windows' warning on a key in a file: a key file always, `.env` only if there is one, and
+    /// a plain `env` source never.
+    #[test]
+    fn doctor_warns_of_a_key_any_process_of_the_user_can_read() {
+        let home = TempDir::new("key-on-disk");
+        let mut wallet = zkminer_config::config::WalletConfig {
+            key_source: "file".into(),
+            key_file_path: Some(r"C:\keys\miner.key".into()),
+            ..Default::default()
+        };
+        let w = key_on_disk_warning(&wallet, &home.0, false).unwrap();
+        assert!(
+            w.contains("miner.key") && w.contains("ZKMINER_WINDOWS_LOW_IL_WORKERS=1"),
+            "{w}"
+        );
+        let w = key_on_disk_warning(&wallet, &home.0, true).unwrap();
+        assert!(w.contains("workers cannot"), "{w}");
+        wallet.key_source = "env".into();
+        assert_eq!(key_on_disk_warning(&wallet, &home.0, false), None);
+        std::fs::write(home.0.join(".env"), "").unwrap();
+        let w = key_on_disk_warning(&wallet, &home.0, false).unwrap();
+        assert!(w.contains(".env, if it holds the key,"), "{w}");
     }
 
     #[test]
