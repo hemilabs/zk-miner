@@ -3583,6 +3583,10 @@ pub async fn run(
     // Windows: a service account `main` was told to let through, or an elevated token, paged.
     #[cfg(windows)]
     zkminer_prover::windows_sandbox::page_account_risk();
+    // Windows: the privileges `main` removed from this process (and so from its workers), or a
+    // page if it could not and was told to start anyway.
+    #[cfg(windows)]
+    zkminer_prover::windows_account::log_startup_strip();
     // Windows, an `env` key: a copy of its variable kept in the registry outlives its removal from
     // this process, readable there by every user of this PC (the machine's or a service's
     // environment) or by every process of this one (`setx`). Not a refusal: the key is out

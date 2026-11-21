@@ -1379,6 +1379,16 @@ fn spawn(
         }
         let process = OwnedHandle::from_raw_handle(info.process);
         let thread = OwnedHandle::from_raw_handle(info.thread);
+        // No privileges but the kept ones (`windows_account`), before it runs a single instruction:
+        // one still there (SeImpersonate, from a service logon) and it is not started at all.
+        if let Err(e) = crate::windows_account::strip_worker(process.as_raw_handle()) {
+            let allowed = privileged_account_allowed();
+            crate::windows_account::worker_privileges_failed(program, &e, allowed);
+            if !allowed {
+                TerminateProcess(process.as_raw_handle(), 1);
+                return Err(e);
+            }
+        }
         // A Low worker: its token lowered to Low and its process and first thread narrowed to what
         // this user keeps (their Medium label stays), before it runs a single instruction. If
         // either fails it is not started at all, never at Medium.
