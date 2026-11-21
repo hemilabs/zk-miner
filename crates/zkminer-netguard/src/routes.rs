@@ -65,8 +65,16 @@
 //! of any family the host routes, [`RouteTable::local_refuses_everything`] says so, and a
 //! public-mode policy refuses to start with that explanation rather than refuse every fetch.
 //!
-//! Only Linux (and Android) routing tables are read; elsewhere the table is empty and only the
-//! interfaces' own prefixes are known (put further ranges in `[egress] deny_cidrs`).
+//! **Windows** (IP Helper, unprivileged): `GetIpForwardTable2` reads every route of both
+//! families, `GetBestRoute2` is the kernel asked per destination, and `GetIfTable2` gives each
+//! interface's kind ([`windows_link_kind`]). Windows has one routing table and no policy-routing
+//! rules, so every route is read as `main`'s, under a stock host's rules. A route whose next hop
+//! is unspecified (`0.0.0.0` / `::`) is on-link; the host's own addresses and their broadcast
+//! addresses are on-link host routes there, refused like any connected prefix.
+//!
+//! Elsewhere (macOS, the BSDs) no routing table is read and the kernel cannot be asked, so a
+//! public-mode policy over gathered facts refuses every destination
+//! ([`crate::public_mode_unsupported`]).
 
 use std::net::IpAddr;
 
@@ -219,6 +227,8 @@ pub enum RuleMatch {
 }
 
 impl RuleMatch {
+    // Only the netlink rule reader combines selectors.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     fn and(self, other: RuleMatch) -> RuleMatch {
         use RuleMatch::*;
         match (self, other) {
@@ -623,8 +633,10 @@ pub trait RouteOracle: Send + Sync + std::fmt::Debug {
     fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer>;
 }
 
-/// The kernel, asked over netlink per destination (Linux; elsewhere every query fails, and a
-/// policy over gathered facts refuses everything: routes are only read on Linux anyway).
+/// The kernel, asked per destination: over netlink on Linux (below), with `GetBestRoute2` on
+/// Windows (one lookup, as a `connect` makes it: Windows has no policy rules, and the port does
+/// not change its route). Elsewhere every query fails, and a policy over gathered facts refuses
+/// everything ([`crate::public_mode_unsupported`]).
 ///
 /// Non-dump `RTM_GETROUTE`s, unprivileged, each with the destination, the destination port when
 /// known (`RTA_DPORT`), this process's uid and TCP, and `RTM_F_LOOKUP_TABLE` (without it an IPv4
@@ -782,6 +794,9 @@ pub const TUNNEL_KINDS: &[&str] = &[
     "amt",
     "l2tpeth",
     "gtp",
+    // Windows ([`windows_link_kind`]).
+    "tunnel",
+    "vpn",
 ];
 
 /// The interface kinds that carry traffic onto the network they are attached to, as a physical
@@ -811,6 +826,86 @@ impl Link {
     /// Whether it is a `ppp` interface.
     pub fn is_ppp(&self) -> bool {
         self.kind.as_deref() == Some("ppp")
+    }
+}
+
+/// The `IF_TYPE_*` values [`windows_link_kind`] reads (ipifcons.h).
+mod if_type {
+    pub const ETHERNET_CSMACD: u32 = 6;
+    pub const PPP: u32 = 23;
+    pub const SOFTWARE_LOOPBACK: u32 = 24;
+    pub const PROP_VIRTUAL: u32 = 53;
+    pub const IEEE80211: u32 = 71;
+    pub const TUNNEL: u32 = 131;
+    pub const WWANPP: u32 = 243;
+    pub const WWANPP2: u32 = 244;
+}
+
+/// Words in a Windows interface's alias or description that name a VPN or overlay adapter
+/// (matched lowercased): such an interface is a tunnel whatever its `IfType` says (TAP-Windows is
+/// an Ethernet adapter, Wintun a virtual one).
+pub const WINDOWS_VPN_MARKERS: &[&str] = &[
+    "vpn",
+    "wireguard",
+    "wintun",
+    "tap-windows",
+    "openvpn",
+    "tailscale",
+    "zerotier",
+    "nordlynx",
+    "anyconnect",
+    "globalprotect",
+    "pangp",
+    "fortinet",
+    "forticlient",
+    "juniper",
+    "pulse secure",
+    "cloudflare warp",
+];
+
+/// The [`Link::kind`] of a Windows interface, from its `IfType`, its `HardwareInterface` flag
+/// (`MIB_IF_ROW2`) and its names (alias and description): `None` (physical) only for a hardware
+/// Ethernet, Wi-Fi or mobile-broadband adapter whose names carry no [`WINDOWS_VPN_MARKERS`] word.
+/// Anything else names what it is: `vpn` (a marker word), `ppp` (a RAS connection: a VPN, or a
+/// PPPoE dial-up, which Windows does not tell apart from one), `tunnel` (`IF_TYPE_TUNNEL`:
+/// Teredo, 6to4, IP-HTTPS, ISATAP), `loopback`, `virtual` (a virtual adapter: Hyper-V, WSL, a
+/// VPN the list does not know), or `if-type-N`. None of those is physical ([`PHYSICAL_KINDS`]), so
+/// as an uplink each needs `[egress] internal_ranges`: an adapter this cannot place counts as a
+/// tunnel, never as a NIC.
+pub fn windows_link_kind(if_type: u32, hardware: bool, names: &[&str]) -> Option<String> {
+    if if_type == if_type::SOFTWARE_LOOPBACK {
+        return Some("loopback".into());
+    }
+    let vpn = names.iter().any(|n| {
+        let n = n.to_ascii_lowercase();
+        WINDOWS_VPN_MARKERS.iter().any(|m| n.contains(m))
+    });
+    if vpn {
+        return Some("vpn".into());
+    }
+    match if_type {
+        if_type::PPP => Some("ppp".into()),
+        if_type::TUNNEL => Some("tunnel".into()),
+        if_type::ETHERNET_CSMACD | if_type::IEEE80211 | if_type::WWANPP | if_type::WWANPP2
+            if hardware =>
+        {
+            None
+        }
+        if_type::ETHERNET_CSMACD | if_type::IEEE80211 | if_type::PROP_VIRTUAL => {
+            Some("virtual".into())
+        }
+        t => Some(format!("if-type-{t}")),
+    }
+}
+
+/// Whether every address of `p` is multicast (`224.0.0.0/4`, `ff00::/8`): a route to it reaches
+/// no unicast destination. Windows lists one on every interface; read as a route, `224.0.0.0/4`
+/// would count as a split default ([`DEFAULT_LIKE_MAX_LEN`]) out of loopback and every adapter.
+#[cfg(any(windows, test))]
+fn is_multicast_prefix(p: Prefix) -> bool {
+    match p.addr {
+        IpAddr::V4(a) => p.len >= 4 && a.is_multicast(),
+        IpAddr::V6(a) => p.len >= 8 && a.is_multicast(),
     }
 }
 
@@ -862,7 +957,8 @@ pub(crate) fn read_nexthops() -> std::io::Result<Vec<Nexthop>> {
     sys::nexthops()
 }
 
-/// How many PPPoE sessions this host has (`/proc/net/pppoe`, 0 when it does not exist).
+/// How many PPPoE sessions this host has (`/proc/net/pppoe`, 0 when it does not exist: on
+/// Windows every `ppp` uplink then counts as a VPN, [`windows_link_kind`]).
 pub(crate) fn pppoe_sessions() -> usize {
     std::fs::read_to_string("/proc/net/pppoe")
         .map(|t| count_pppoe_sessions(&t))
@@ -877,7 +973,7 @@ pub fn count_pppoe_sessions(text: &str) -> usize {
         .count()
 }
 
-/// Every network interface, with its kind (Linux; elsewhere none).
+/// Every network interface, with its kind (Linux and Windows; elsewhere none).
 pub(crate) fn read_links() -> std::io::Result<Vec<Link>> {
     sys::links()
 }
@@ -2920,7 +3016,271 @@ mod sys {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(windows)]
+mod sys {
+    //! IP Helper: `GetIpForwardTable2`, `GetBestRoute2`, `GetIfTable2`. Unprivileged.
+
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_HOST_UNREACHABLE, ERROR_NETWORK_UNREACHABLE, ERROR_NOT_FOUND, ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetBestRoute2, GetIfTable2, GetIpForwardTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
+        MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_INET};
+
+    use super::{Hop, KernelAnswer, Link, Nexthop, Route, Rule};
+    use crate::ip::Prefix;
+
+    /// A table IP Helper allocated, freed exactly once.
+    struct MibTable<T>(*mut T);
+
+    impl<T> Drop for MibTable<T> {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer came from a successful Get*Table2 call.
+                unsafe { FreeMibTable(self.0.cast()) };
+            }
+        }
+    }
+
+    fn malformed(what: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, format!("IP Helper: {what}"))
+    }
+
+    /// The address of a `SOCKADDR_INET` (`None` for a family that is neither IPv4 nor IPv6).
+    fn sockaddr_ip(sa: &SOCKADDR_INET) -> Option<IpAddr> {
+        // SAFETY: every member of the union starts with the family, which says which one is in
+        // force; all of them are plain data.
+        unsafe {
+            match sa.si_family {
+                AF_INET => Some(IpAddr::V4(Ipv4Addr::from(
+                    sa.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+                ))),
+                AF_INET6 => Some(IpAddr::V6(Ipv6Addr::from(sa.Ipv6.sin6_addr.u.Byte))),
+                _ => None,
+            }
+        }
+    }
+
+    fn sockaddr_inet(ip: IpAddr) -> SOCKADDR_INET {
+        // SAFETY: an all-zero SOCKADDR_INET is valid (family AF_UNSPEC); it is filled in below.
+        let mut sa: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+        match ip {
+            IpAddr::V4(a) => {
+                sa.Ipv4.sin_family = AF_INET;
+                sa.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(a.octets());
+            }
+            IpAddr::V6(a) => {
+                sa.Ipv6.sin6_family = AF_INET6;
+                sa.Ipv6.sin6_addr.u.Byte = a.octets();
+            }
+        }
+        sa
+    }
+
+    /// One routing-table row as a [`Route`] of `main`: on-link when its next hop is unspecified,
+    /// else through it; a next hop of no known family is [`Hop::Unknown`] (refused wherever it
+    /// matters). A destination that is not IPv4 or IPv6, or a prefix longer than its family's
+    /// width, fails the read.
+    fn route_of(row: &MIB_IPFORWARD_ROW2) -> io::Result<Route> {
+        let addr = sockaddr_ip(&row.DestinationPrefix.Prefix)
+            .ok_or_else(|| malformed("a route's destination is neither IPv4 nor IPv6"))?;
+        let len = row.DestinationPrefix.PrefixLength;
+        if len > if addr.is_ipv4() { 32 } else { 128 } {
+            return Err(malformed("a route's prefix length is too long"));
+        }
+        let prefix = Prefix::new(addr, len);
+        let ifindex = row.InterfaceIndex;
+        Ok(match sockaddr_ip(&row.NextHop) {
+            Some(gw) if gw.is_unspecified() => Route::on_link(prefix, ifindex),
+            Some(gw) => Route::via(prefix, gw, ifindex),
+            None => Route {
+                hop: Hop::Unknown,
+                ..Route::on_link(prefix, ifindex)
+            },
+        })
+    }
+
+    /// The rows of a `MIB_*_TABLE2`.
+    ///
+    /// # Safety
+    /// `first` points to the table's first row, and the table holds `n` rows, alive for `'a`.
+    unsafe fn rows<'a, R>(first: *const R, n: u32) -> &'a [R] {
+        if n == 0 {
+            return &[];
+        }
+        std::slice::from_raw_parts(first, n as usize)
+    }
+
+    /// Every unicast route of both families (the active store; multicast routes, which Windows
+    /// installs on every interface as `224.0.0.0/4` and `ff00::/8`, left out, as on Linux), and no
+    /// rules.
+    pub(super) fn dump() -> io::Result<(Vec<Route>, Vec<Rule>)> {
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        // SAFETY: `table` receives a table IP Helper allocates; `MibTable` frees it.
+        let rc = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let table = MibTable(table);
+        if table.0.is_null() {
+            return Err(malformed("GetIpForwardTable2 returned no table"));
+        }
+        // SAFETY: a table GetIpForwardTable2 returned holds `NumEntries` rows, alive until
+        // `table` drops.
+        let rows = unsafe {
+            rows(
+                std::ptr::addr_of!((*table.0).Table).cast::<MIB_IPFORWARD_ROW2>(),
+                (*table.0).NumEntries,
+            )
+        };
+        let mut routes = rows.iter().map(route_of).collect::<io::Result<Vec<_>>>()?;
+        routes.retain(|r| !super::is_multicast_prefix(r.prefix));
+        Ok((routes, Vec::new()))
+    }
+
+    /// The route Windows would send a connection to `dst` by (`GetBestRoute2`, which also picks
+    /// the source address); `None` when it has none.
+    fn best_route(dst: IpAddr) -> io::Result<Option<Route>> {
+        let d = sockaddr_inet(dst);
+        // SAFETY: plain data, overwritten by the call.
+        let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let mut src: SOCKADDR_INET = unsafe { std::mem::zeroed() };
+        // SAFETY: no interface and no source given (null, 0, null); `d`, `row` and `src` are
+        // valid for the call.
+        let rc = unsafe {
+            GetBestRoute2(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &d,
+                0,
+                &mut row,
+                &mut src,
+            )
+        };
+        match rc {
+            ERROR_SUCCESS => route_of(&row).map(Some),
+            ERROR_NETWORK_UNREACHABLE | ERROR_HOST_UNREACHABLE | ERROR_NOT_FOUND => Ok(None),
+            e => Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+
+    /// The route a TCP connection to `dst` would take: Windows routes by destination alone, so
+    /// the port does not change it.
+    pub(super) fn query(dst: IpAddr, _: Option<u16>) -> io::Result<KernelAnswer> {
+        Ok(best_route(dst)?.map(|r| vec![r]).into())
+    }
+
+    pub(super) fn output_interface(dst: IpAddr) -> io::Result<Option<u32>> {
+        Ok(best_route(dst)?.map(|r| r.ifindex).filter(|i| *i != 0))
+    }
+
+    /// A NUL-terminated UTF-16 field as a string.
+    fn wide(w: &[u16]) -> String {
+        let end = w.iter().position(|c| *c == 0).unwrap_or(w.len());
+        String::from_utf16_lossy(&w[..end])
+    }
+
+    /// Every interface (`GetIfTable2`), with its kind ([`super::windows_link_kind`]).
+    pub(super) fn links() -> io::Result<Vec<Link>> {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        // SAFETY: `table` receives a table IP Helper allocates; `MibTable` frees it.
+        let rc = unsafe { GetIfTable2(&mut table) };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let table = MibTable(table);
+        if table.0.is_null() {
+            return Err(malformed("GetIfTable2 returned no table"));
+        }
+        // SAFETY: as in `dump`.
+        let rows = unsafe {
+            rows(
+                std::ptr::addr_of!((*table.0).Table).cast::<MIB_IF_ROW2>(),
+                (*table.0).NumEntries,
+            )
+        };
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let alias = wide(&r.Alias);
+                let description = wide(&r.Description);
+                // `InterfaceAndOperStatusFlags`: bit 0 is `HardwareInterface`.
+                let hardware = r.InterfaceAndOperStatusFlags._bitfield & 1 != 0;
+                let kind = super::windows_link_kind(r.Type, hardware, &[&alias, &description]);
+                let name = if description.is_empty() || description == alias {
+                    alias
+                } else {
+                    format!("{alias} ({description})")
+                };
+                Link {
+                    index: r.InterfaceIndex,
+                    name,
+                    kind,
+                }
+            })
+            .collect())
+    }
+
+    pub(super) fn nexthops() -> io::Result<Vec<Nexthop>> {
+        Ok(Vec::new())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sockaddrs_round_trip() {
+            for a in ["192.0.2.7", "2001:db8::5", "0.0.0.0", "::"] {
+                let ip: IpAddr = a.parse().unwrap();
+                assert_eq!(sockaddr_ip(&sockaddr_inet(ip)), Some(ip));
+            }
+        }
+
+        /// This host's table reads, and the kernel's answer for a public address is a route of
+        /// the table that takes the default path; loopback is routed otherwise; the interfaces
+        /// read, loopback among them.
+        #[test]
+        fn this_hosts_routes_read_and_the_kernel_answers() {
+            let (routes, rules) = dump().expect("GetIpForwardTable2");
+            assert!(rules.is_empty());
+            for r in &routes {
+                assert_eq!(Prefix::new(r.prefix.addr, r.prefix.len), r.prefix, "{r:?}");
+            }
+            let t = super::super::RouteTable::new(routes.clone());
+            match query("1.1.1.1".parse().unwrap(), Some(443)).expect("GetBestRoute2") {
+                KernelAnswer::NoRoute => {
+                    assert!(
+                        !t.routes_family(false),
+                        "no IPv4 route, yet a default route"
+                    )
+                }
+                KernelAnswer::Entry(e) => {
+                    assert_eq!(e.len(), 1);
+                    assert!(routes.contains(&e[0]), "{e:?} is not in the table");
+                    assert_eq!(t.judge(&e), Ok(()), "{e:?}");
+                }
+                KernelAnswer::Split { .. } => panic!("no split answers on Windows"),
+            }
+            let lo = query("127.0.0.1".parse().unwrap(), None).expect("GetBestRoute2");
+            assert!(t.judge_answer(&lo).is_err(), "{lo:?}");
+            let links = links().expect("GetIfTable2");
+            assert!(
+                links.iter().any(|l| l.kind.as_deref() == Some("loopback")),
+                "{links:#?}"
+            );
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 mod sys {
     pub(super) fn dump() -> std::io::Result<(Vec<super::Route>, Vec<super::Rule>)> {
         Ok((Vec::new(), Vec::new()))
@@ -2930,7 +3290,10 @@ mod sys {
         _: std::net::IpAddr,
         _: Option<u16>,
     ) -> std::io::Result<super::KernelAnswer> {
-        Err(std::io::ErrorKind::Unsupported.into())
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "asking the kernel how a destination is routed is supported on Linux and Windows only",
+        ))
     }
 
     pub(super) fn output_interface(_: std::net::IpAddr) -> std::io::Result<Option<u32>> {
@@ -2956,6 +3319,143 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// Only a hardware Ethernet, Wi-Fi or mobile-broadband adapter with no VPN word in its names
+    /// is physical; every other Windows adapter, one of an unknown type included, is not.
+    #[test]
+    fn windows_link_kinds() {
+        let kind = |t: u32, hw: bool, names: &[&str]| windows_link_kind(t, hw, names);
+        assert_eq!(
+            kind(6, true, &["Ethernet 2", "Intel(R) Ethernet I226-V"]),
+            None
+        );
+        assert_eq!(kind(71, true, &["Wi-Fi", "Intel(R) Wi-Fi 6E AX211"]), None);
+        assert_eq!(
+            kind(243, true, &["Cellular", "Qualcomm Snapdragon X55"]),
+            None
+        );
+        // The same types without the hardware flag: Hyper-V's and WSL's vEthernet, Wi-Fi Direct.
+        assert_eq!(
+            kind(
+                6,
+                false,
+                &["vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter"]
+            )
+            .as_deref(),
+            Some("virtual")
+        );
+        assert_eq!(
+            kind(71, false, &["Local Area Connection* 1"]).as_deref(),
+            Some("virtual")
+        );
+        // VPN adapters, whatever their type and flag says.
+        for (t, hw, names) in [
+            (53, false, ["wg0", "WireGuard Tunnel"]),
+            (53, false, ["OpenVPN Data Channel Offload", "ovpn-dco"]),
+            (6, true, ["Ethernet 3", "TAP-Windows Adapter V9"]),
+            (6, false, ["Tailscale", "Tailscale Tunnel"]),
+            (
+                6,
+                true,
+                ["Ethernet 4", "Cisco AnyConnect Secure Mobility Client"],
+            ),
+            (6, true, ["PANGP Virtual Ethernet Adapter", "x"]),
+        ] {
+            assert_eq!(kind(t, hw, &names).as_deref(), Some("vpn"), "{names:?}");
+        }
+        assert_eq!(kind(23, false, &["Work VPN"]).as_deref(), Some("vpn"));
+        assert_eq!(kind(23, false, &["Broadband"]).as_deref(), Some("ppp"));
+        assert_eq!(
+            kind(131, false, &["Teredo Tunneling Pseudo-Interface"]).as_deref(),
+            Some("tunnel")
+        );
+        assert_eq!(
+            kind(24, false, &["Loopback Pseudo-Interface 1"]).as_deref(),
+            Some("loopback")
+        );
+        assert_eq!(kind(53, false, &["Something"]).as_deref(), Some("virtual"));
+        assert_eq!(kind(1, true, &["Odd"]).as_deref(), Some("if-type-1"));
+        for (t, hw, names) in [
+            (6, false, ["vEthernet (Default Switch)"]),
+            (53, false, ["wg0"]),
+            (131, false, ["6to4 Adapter"]),
+            (1, true, ["Odd"]),
+        ] {
+            let l = Link {
+                index: 9,
+                name: names[0].into(),
+                kind: kind(t, hw, &names),
+            };
+            assert!(!l.is_physical(), "{l:?}");
+        }
+    }
+
+    /// A Windows host's table as `GetIpForwardTable2` reads it: host routes for its own address
+    /// and the subnet's broadcast, the LAN on-link, multicast and limited broadcast on-link on
+    /// every interface, loopback, and the default via the router. A WireGuard full tunnel adds
+    /// `0.0.0.0/1` + `128.0.0.0/1` on-link on its adapter, and pushes a company range. The
+    /// multicast routes are not read (on Windows they would be split defaults out of loopback).
+    #[test]
+    fn a_windows_table_is_judged_like_a_linux_one() {
+        let mut routes = vec![
+            Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 5),
+            Route::on_link(p("192.168.1.0/24"), 5),
+            Route::on_link(p("192.168.1.33/32"), 5),
+            Route::on_link(p("192.168.1.255/32"), 5),
+            Route::on_link(p("224.0.0.0/4"), 5),
+            Route::on_link(p("255.255.255.255/32"), 5),
+            Route::on_link(p("127.0.0.0/8"), 1),
+            Route::on_link(p("224.0.0.0/4"), 1),
+            Route::on_link(p("ff00::/8"), 1),
+            Route::via(p("::/0"), ip("fe80::1"), 5),
+            Route::on_link(p("2a02:1:2:3::/64"), 5),
+            Route::on_link(p("fe80::/64"), 5),
+        ];
+        assert!(!is_multicast_prefix(p("0.0.0.0/0")));
+        assert!(!is_multicast_prefix(p("192.0.0.0/2")));
+        assert!(is_multicast_prefix(p("239.255.255.250/32")));
+        assert!(!is_multicast_prefix(p("::/0")));
+        routes.retain(|r| !is_multicast_prefix(r.prefix));
+        assert_eq!(routes.len(), 9);
+        let t = RouteTable::new(routes.clone());
+        assert_eq!(t.default_interfaces(), vec![5]);
+        assert_eq!(t.off_default_path(ip("93.184.216.34")), None);
+        assert_eq!(t.off_default_path(ip("2606:4700::1")), None);
+        assert_eq!(
+            t.off_default_path(ip("192.168.1.20")).map(|r| r.kind),
+            Some(RouteKind::OnLink)
+        );
+        assert!(t.on_link_prefixes().contains(&p("192.168.1.0/24")));
+        // GetBestRoute2's answers.
+        assert_eq!(
+            t.judge(&[Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 5)]),
+            Ok(())
+        );
+        assert_eq!(
+            t.judge(&[Route::on_link(p("192.168.1.0/24"), 5)])
+                .map_err(|r| r.kind),
+            Err(RouteKind::OnLink)
+        );
+        assert!(t.judge_answer(&KernelAnswer::NoRoute).is_err());
+        let mut vpn = routes;
+        vpn.extend([
+            Route::on_link(p("0.0.0.0/1"), 9),
+            Route::on_link(p("128.0.0.0/1"), 9),
+            Route::on_link(p("10.64.0.2/32"), 9),
+            Route::on_link(p("198.51.100.0/24"), 9),
+            Route::via(p("203.0.113.9/32"), ip("192.168.1.1"), 5),
+        ]);
+        let t = RouteTable::new(vpn);
+        // The company range is refused; the tunnel's split default and the endpoint's host route
+        // through the router take the default path.
+        assert_eq!(
+            t.off_default_path(ip("198.51.100.7")).map(|r| r.kind),
+            Some(RouteKind::OnLink)
+        );
+        assert_eq!(t.off_default_path(ip("93.184.216.34")), None);
+        assert_eq!(t.off_default_path(ip("203.0.113.9")), None);
+        assert_eq!(t.default_interfaces(), vec![5, 9]);
     }
 
     /// A home host: DHCP default via the router, the LAN on-link, Docker's bridge, DHCP option 121

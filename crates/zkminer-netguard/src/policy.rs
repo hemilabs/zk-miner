@@ -485,6 +485,24 @@ impl FactsCell {
     }
 }
 
+/// Why public mode admits nothing on this platform, where it cannot work: the kernel's route for
+/// each destination ([`crate::KernelRoutes`]), the routing table and the near-hop check
+/// connection are read on Linux, Android and Windows only. Elsewhere (macOS, the BSDs) the guard
+/// fails closed: every requester-caused connection is refused, so ELF, IPFS and Arweave
+/// downloads and `artifact publish` cannot work. `None` where public mode works.
+pub fn public_mode_unsupported() -> Option<&'static str> {
+    if cfg!(any(target_os = "linux", target_os = "android", windows)) {
+        None
+    } else {
+        Some(
+            "public mode cannot work on this platform: the network guard reads routes and probes \
+             destinations on Linux and Windows only, so it refuses every requester-caused \
+             connection here (ELF, IPFS and Arweave downloads, artifact publish). Run the miner \
+             on Linux or Windows",
+        )
+    }
+}
+
 /// Refuses, at startup in public mode, what the guard cannot run safely or usefully with, saying
 /// what to change:
 ///
@@ -631,6 +649,9 @@ impl NetPolicy {
             NetMode::DevPrivate => (HostFacts::empty(), false),
         };
         if mode == NetMode::Public {
+            if let Some(why) = public_mode_unsupported() {
+                tracing::warn!("network guard: {why}");
+            }
             usable(&facts, &options)?;
         }
         let policy = Self::build(mode, facts, refresh, deny, options);

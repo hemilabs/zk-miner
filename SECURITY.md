@@ -110,7 +110,12 @@ Every connection a requester can cause goes through one guard
     source the kernel picks, then with that source; a `from` rule that sends the connection to
     another table than the first lookup used is refused. (IPv6 looks the route up once, matching
     source rules inside that lookup, and is asked once.) Answers are reused for the life of one
-    facts snapshot (about a second). Linux only;
+    facts snapshot (about a second). On Windows the routing table is read with
+    `GetIpForwardTable2` (one table, no policy rules) and `GetBestRoute2` is asked once per
+    destination (Windows does not route by port), judged the same way; interface kinds come from
+    `GetIfTable2`, and only a hardware Ethernet, Wi-Fi or mobile-broadband adapter with no VPN
+    name counts as physical. Elsewhere (macOS) the kernel cannot be asked: public mode refuses
+    every requester connection, and says so at start and in `zkminer status`;
   - **the site around each of the host's global IPv6 addresses**: its enclosing `/32`
     (`[egress] ipv6_site_prefix_len`, 16 to 64), what an organisation (a campus, a company)
     usually holds, whose other networks hold its other machines. This also refuses the rest of
@@ -648,7 +653,10 @@ no second one):
   not the default path, and every destination rule's prefix. If you route the miner's own
   traffic by source port, mark or cgroup, list what those paths reach in `[egress] deny_cidrs`.
   A destination rule into a table that routes it out the same uplink is refused all the same
-  (refusing too much). Routes and rules are read on Linux only.
+  (refusing too much). Routes and rules are read on Linux; on Windows the one routing table is
+  read, and a WFP callout or a VPN client's per-application redirect is not followed. Windows
+  does not tell a PPPoE dial-up from a VPN, so a PPPoE uplink there needs `[egress]
+  internal_ranges` (`[]` if there are none).
 - **Public-address discovery depends on outside services.** If the reflectors cannot confirm
   a family's address (a firewall blocking outbound DNS and HTTPS to them, an outage), no
   requester connection goes out over that family until they can or `[egress]

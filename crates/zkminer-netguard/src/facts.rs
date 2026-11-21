@@ -26,7 +26,7 @@
 //!   re-judged with every snapshot ([`HostFacts::config_gaps`]);
 //! - **DNS servers:** the `nameserver`s of `/etc/resolv.conf` and of systemd-resolved's
 //!   `/run/systemd/resolve/resolv.conf` (the upstream servers behind its `127.0.0.53` stub), which
-//!   may answer only their own customers;
+//!   may answer only their own customers; on Windows, every adapter's (`GetAdaptersAddresses`);
 //! - **the routing table and the policy-routing rules**, for the best-route rule: a destination
 //!   whose best route is not the default path is refused, and so is one a `local`, `broadcast` or
 //!   `anycast` route delivers to this host (an AnyIP range) or a destination rule sends to another
@@ -694,8 +694,9 @@ impl HostFacts {
     /// non-contiguous netmask counts its leading ones, which only widens the prefix), the routing
     /// tables and rules, the DNS servers, (if `opts` says so) the public addresses, and the NAT64
     /// prefixes the DNS servers reveal ([`crate::nat64`]), then [`Self::assemble`]s them, with the
-    /// kernel as the route oracle. Fails if the interfaces or the routing table cannot be read: a
-    /// public-mode policy that does not know them cannot refuse what they name.
+    /// kernel as the route oracle. Fails if the interfaces, the routing table, or (Windows) the
+    /// interface list or the DNS servers cannot be read: a public-mode policy that does not know
+    /// them cannot refuse what they name.
     pub fn gather_with(opts: &FactsOptions) -> io::Result<Self> {
         let (interface_prefixes, interface_addresses, loopback) = sys::interfaces()?;
         // The NAT64 prefixes the host's DNS64 reveals (process-wide; the first call asks).
@@ -722,7 +723,7 @@ impl HostFacts {
                 interface_addresses,
                 routes,
                 rules,
-                resolvers: system_resolvers(),
+                resolvers: gathered_resolvers()?,
                 public_addresses: public.addresses,
                 public_confirmed: public.confirmed,
                 public_via_nat64: public.via_nat64,
@@ -816,15 +817,37 @@ pub fn parse_nameservers(text: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// The DNS servers of every file in [`RESOLV_CONF_PATHS`] that exists, sorted.
+/// The DNS servers this host uses, sorted: those of every file in [`RESOLV_CONF_PATHS`] that
+/// exists; on Windows, those of every adapter (`GetAdaptersAddresses`; none if it fails, which
+/// [`HostFacts::gather_with`] does not accept).
 pub fn system_resolvers() -> Vec<IpAddr> {
-    sorted(
-        RESOLV_CONF_PATHS
-            .iter()
-            .filter_map(|p| std::fs::read_to_string(p).ok())
-            .flat_map(|t| parse_nameservers(&t))
-            .collect(),
-    )
+    #[cfg(windows)]
+    {
+        sys::dns_servers().map(sorted).unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        sorted(
+            RESOLV_CONF_PATHS
+                .iter()
+                .filter_map(|p| std::fs::read_to_string(p).ok())
+                .flat_map(|t| parse_nameservers(&t))
+                .collect(),
+        )
+    }
+}
+
+/// [`system_resolvers`] for gathered facts: on Windows a failed read fails the gather (a policy
+/// that does not know the host's DNS servers cannot refuse them).
+fn gathered_resolvers() -> io::Result<Vec<IpAddr>> {
+    #[cfg(windows)]
+    {
+        sys::dns_servers().map(sorted)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(system_resolvers())
+    }
 }
 
 #[cfg(unix)]
@@ -947,16 +970,78 @@ mod sys {
     use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IF_TYPE_SOFTWARE_LOOPBACK,
+        IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKET_ADDRESS};
 
     use crate::ip::Prefix;
 
-    /// Every unicast address of every adapter, with its on-link prefix length (no loopback
-    /// indexes: routes are not read on Windows).
+    /// Every unicast address of every adapter, with its on-link prefix length, and the indexes
+    /// (IPv4 and IPv6) of the loopback adapters.
     pub(super) fn interfaces() -> io::Result<(Vec<Prefix>, Vec<IpAddr>, Vec<u32>)> {
-        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+        let buf =
+            adapters(GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER)?;
+        let mut connected = Vec::new();
+        let mut own = Vec::new();
+        let mut loopback = Vec::new();
+        let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !adapter.is_null() {
+            // SAFETY: a node of the list GetAdaptersAddresses wrote into `buf`, alive while `buf`
+            // is.
+            let a = unsafe { &*adapter };
+            if a.IfType == IF_TYPE_SOFTWARE_LOOPBACK {
+                // SAFETY: the union's `Anonymous` view (length and IPv4 index) is how every
+                // adapter entry is written.
+                let v4 = unsafe { a.Anonymous1.Anonymous.IfIndex };
+                loopback.extend([v4, a.Ipv6IfIndex].into_iter().filter(|i| *i != 0));
+            }
+            let mut unicast = a.FirstUnicastAddress;
+            while !unicast.is_null() {
+                // SAFETY: as above.
+                let u = unsafe { &*unicast };
+                // SAFETY: the address of a live unicast node.
+                if let Some(ip) = unsafe { socket_address_ip(&u.Address) } {
+                    own.push(ip);
+                    connected.push(Prefix::new(ip, u.OnLinkPrefixLength));
+                }
+                unicast = u.Next;
+            }
+            adapter = a.Next;
+        }
+        loopback.sort();
+        loopback.dedup();
+        Ok((connected, own, loopback))
+    }
+
+    /// The DNS servers of every adapter, connected or not (an IPv6 zone id is dropped).
+    pub(super) fn dns_servers() -> io::Result<Vec<IpAddr>> {
+        let buf =
+            adapters(GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST)?;
+        let mut servers = Vec::new();
+        let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !adapter.is_null() {
+            // SAFETY: a node of the list GetAdaptersAddresses wrote into `buf`, alive while `buf`
+            // is.
+            let a = unsafe { &*adapter };
+            let mut dns = a.FirstDnsServerAddress;
+            while !dns.is_null() {
+                // SAFETY: as above.
+                let d = unsafe { &*dns };
+                // SAFETY: the address of a live DNS server node.
+                if let Some(ip) = unsafe { socket_address_ip(&d.Address) } {
+                    servers.push(ip);
+                }
+                dns = d.Next;
+            }
+            adapter = a.Next;
+        }
+        Ok(servers)
+    }
+
+    /// The adapter list `GetAdaptersAddresses` writes with `flags`, in an 8-byte aligned buffer
+    /// that holds it.
+    fn adapters(flags: u32) -> io::Result<Vec<u64>> {
         // The documented way: start at 15 KB and grow to what the call asks for, a few times
         // (adapters can appear between calls).
         let mut size: u32 = 15 * 1024;
@@ -988,27 +1073,7 @@ mod sys {
                 "GetAdaptersAddresses kept asking for a larger buffer",
             ));
         }
-        let mut connected = Vec::new();
-        let mut own = Vec::new();
-        let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
-        while !adapter.is_null() {
-            // SAFETY: a node of the list GetAdaptersAddresses wrote into `buf`, alive while `buf`
-            // is.
-            let a = unsafe { &*adapter };
-            let mut unicast = a.FirstUnicastAddress;
-            while !unicast.is_null() {
-                // SAFETY: as above.
-                let u = unsafe { &*unicast };
-                // SAFETY: the address of a live unicast node.
-                if let Some(ip) = unsafe { socket_address_ip(&u.Address) } {
-                    own.push(ip);
-                    connected.push(Prefix::new(ip, u.OnLinkPrefixLength));
-                }
-                unicast = u.Next;
-            }
-            adapter = a.Next;
-        }
-        Ok((connected, own, Vec::new()))
+        Ok(buf)
     }
 
     /// The IP of a SOCKET_ADDRESS, read from its bytes (family at 0; IPv4 at 4..8; IPv6 at 8..24).
@@ -1233,6 +1298,87 @@ mod tests {
             &opts,
         );
         assert_eq!(f.site_prefixes(), &[p("2606:4700:4700::/48")]);
+    }
+
+    /// Review r3 G2: facts shaped as Windows reads them keep every fail-closed rule. The default
+    /// route makes IPv4 a routed family, so its public address must be known; a default route
+    /// out of a hardware NIC needs nothing more, one out of a WireGuard (Wintun) adapter or an
+    /// adapter the guard cannot place needs `[egress] internal_ranges`; the DNS servers are
+    /// refused.
+    #[test]
+    fn windows_shaped_facts_keep_the_fail_closed_rules() {
+        use crate::routes::{windows_link_kind, Link};
+        use crate::{admit, NetMode};
+        let link = |index: u32, t: u32, hw: bool, name: &str| Link {
+            index,
+            name: name.into(),
+            kind: windows_link_kind(t, hw, &[name]),
+        };
+        let links = vec![
+            link(1, 24, false, "Loopback Pseudo-Interface 1"),
+            link(5, 6, true, "Ethernet 2"),
+            link(9, 53, false, "WireGuard Tunnel"),
+            link(11, 6, false, "vEthernet (External Switch)"),
+        ];
+        let raw = RawFacts {
+            interface_prefixes: vec![p("192.168.1.0/24"), p("127.0.0.0/8")],
+            interface_addresses: vec![ip("192.168.1.33"), ip("127.0.0.1")],
+            routes: vec![
+                Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 5),
+                Route::on_link(p("192.168.1.0/24"), 5),
+            ],
+            resolvers: vec![ip("9.9.9.9")],
+            links: links.clone(),
+            internet_interfaces: vec![5],
+            ..RawFacts::default()
+        };
+        let f = HostFacts::assemble(raw.clone(), &offline());
+        assert_eq!(f.unknown_paths(), vec![EgressPath::Ipv4]);
+        assert!(
+            f.needs_internal_ranges().is_empty(),
+            "{:?}",
+            f.needs_internal_ranges()
+        );
+        assert_eq!(
+            admit(NetMode::Public, ip("9.9.9.9"), &f, &[]),
+            Err(Denied::DnsServer(ip("9.9.9.9")))
+        );
+        assert!(matches!(
+            admit(NetMode::Public, ip("93.184.216.34"), &f, &[]),
+            Err(Denied::PublicAddressUnknown { .. })
+        ));
+        let known = FactsOptions {
+            public_addresses: vec![ip("81.2.69.160")],
+            internal_ranges: Some(Vec::new()),
+            ..offline()
+        };
+        assert_eq!(
+            admit(
+                NetMode::Public,
+                ip("93.184.216.34"),
+                &HostFacts::assemble(raw.clone(), &known),
+                &[]
+            ),
+            Ok(())
+        );
+        for (uplink, routes) in [
+            (
+                9,
+                vec![
+                    Route::on_link(p("0.0.0.0/1"), 9),
+                    Route::on_link(p("128.0.0.0/1"), 9),
+                ],
+            ),
+            (11, vec![Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 11)]),
+            (42, vec![Route::via(p("0.0.0.0/0"), ip("192.168.1.1"), 42)]),
+        ] {
+            let mut r = raw.clone();
+            r.routes.extend(routes);
+            r.internet_interfaces = vec![uplink];
+            let f = HostFacts::assemble(r, &offline());
+            assert!(!f.needs_internal_ranges().is_empty(), "uplink {uplink}");
+            assert!(!f.config_gaps().is_empty(), "uplink {uplink}");
+        }
     }
 
     #[test]

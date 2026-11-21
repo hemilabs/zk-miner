@@ -31,6 +31,14 @@
 //!
 //! The probe is closed without sending data (a reset if it connected). Unprivileged.
 //!
+//! **Windows** keeps retrying a SYN an ICMP error answered, so the probe sets
+//! `TCP_FAIL_CONNECT_ON_ICMP_ERROR` and reads which ICMP message ended the connect
+//! ([`ProbeOutcome::of_icmp`]: "time exceeded" is far). Where the message does not reach TCP
+//! (as seen on Windows 11, likely withheld by the firewall) a far destination's probe times out,
+//! and the check connection, which reads the FIN's fate from `SIO_TCP_INFO`, decides: every
+//! connection then waits out [`PROBE_TIMEOUT`] first. Elsewhere than Linux and Windows the check
+//! connection fails, so a probe without an answer refuses.
+//!
 //! **What it cannot help:** a probe that connects, and a check connection, still reach a near
 //! host (a SYN, a handshake, a FIN, a reset; never data) before the refusal; a near host that
 //! drops the probe and also drops the check connection's FIN reads as far; a transparent proxy
@@ -183,7 +191,14 @@ pub struct TtlProbe;
 
 impl NearProbe for TtlProbe {
     fn probe(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ProbeOutcome {
-        ProbeOutcome::of(probe_once(addr, hops, timeout))
+        #[cfg(windows)]
+        {
+            probe_windows(addr, hops, timeout)
+        }
+        #[cfg(not(windows))]
+        {
+            ProbeOutcome::of(probe_once(addr, hops, timeout))
+        }
     }
 
     fn confirm(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
@@ -266,6 +281,23 @@ fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()
     }
 }
 
+impl ProbeOutcome {
+    /// What an ICMP error that ended a probe's connect says (Windows reports it apart from the
+    /// error code, as `TCP_ICMP_ERROR_INFO`): "time exceeded" is the probe running out of hops
+    /// (far); "port" or "protocol unreachable" comes from the destination itself (refused, as
+    /// Linux reads it: `ECONNREFUSED`); any other "destination unreachable" is unreachable, as
+    /// Linux's `EHOSTUNREACH` reads it. `None` for any other message.
+    pub fn of_icmp(v6: bool, icmp_type: u8, code: u8) -> Option<Self> {
+        match (v6, icmp_type, code) {
+            (false, 11, _) | (true, 3, _) => Some(ProbeOutcome::Unreachable),
+            (false, 3, 2 | 3) | (true, 1, 4) => Some(ProbeOutcome::Refused),
+            (false, 3, _) | (true, 1, _) => Some(ProbeOutcome::Unreachable),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(windows))]
 fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let sock = new_socket(addr)?;
     set_hops(&sock, addr, hops)?;
@@ -274,6 +306,35 @@ fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
     let _ = sock.set_linger(Some(Duration::ZERO));
     drop(sock);
     r
+}
+
+/// The probe on Windows, whose TCP keeps retrying a SYN an ICMP "time exceeded" answered unless
+/// told otherwise: with `TCP_FAIL_CONNECT_ON_ICMP_ERROR` the connect ends on the ICMP error, and
+/// `TCP_ICMP_ERROR_INFO` says which it was ([`ProbeOutcome::of_icmp`]). Where the ICMP error never
+/// reaches TCP (the option unknown before Windows 10 1903, or the firewall withholding the
+/// message, as seen on Windows 11) the probe times out instead, and the check connection
+/// decides.
+#[cfg(windows)]
+fn probe_windows(addr: SocketAddr, hops: u8, timeout: Duration) -> ProbeOutcome {
+    let sock = match new_socket(addr) {
+        Ok(s) => s,
+        Err(e) => return ProbeOutcome::of(Err(e)),
+    };
+    if let Err(e) = set_hops(&sock, addr, hops) {
+        return ProbeOutcome::of(Err(e));
+    }
+    win::fail_connect_on_icmp(&sock);
+    let r = sock.connect_timeout(&addr.into(), timeout);
+    let icmp = if r.is_err() {
+        win::icmp_error(&sock)
+    } else {
+        None
+    };
+    // Closed with a reset, never a byte of data.
+    let _ = sock.set_linger(Some(Duration::ZERO));
+    drop(sock);
+    icmp.and_then(|(v6, t, c)| ProbeOutcome::of_icmp(v6, t, c))
+        .unwrap_or_else(|| ProbeOutcome::of(r))
 }
 
 /// The check connection (see the module doc). Linux: the FIN's fate is read from `TCP_INFO`.
@@ -350,9 +411,190 @@ fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// Where a check connection's FIN stands, by its TCP state (Windows `TCPSTATE`).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinState {
+    /// Sent and not acknowledged yet (`FIN_WAIT_1`, `LAST_ACK`).
+    Pending,
+    /// Acknowledged, or the peer reset (`FIN_WAIT_2`, `CLOSING`, `TIME_WAIT`, `CLOSED`): as Linux
+    /// reads every state past `FIN_WAIT_1`.
+    Answered,
+    /// Not sent (`ESTABLISHED`, `CLOSE_WAIT`, or a state a connected socket never has): no
+    /// evidence either way.
+    NotSent,
+}
+
+#[cfg(any(windows, test))]
+fn windows_fin_state(state: i32) -> FinState {
+    match state {
+        5 | 10 => FinState::Pending,
+        0 | 6 | 7 | 8 => FinState::Answered,
+        _ => FinState::NotSent,
+    }
+}
+
+/// The check connection (see the module doc). Windows: the FIN's fate is read from
+/// `SIO_TCP_INFO` (Windows 10 1703 and later), as Linux reads it from `TCP_INFO`. A FIN still
+/// unsent when the wait ends is no evidence: refused.
+#[cfg(windows)]
+fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
+    let sock = match new_socket(addr) {
+        Ok(s) => s,
+        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
+    };
+    if let Err(e) = sock.connect_timeout(&addr.into(), timeout) {
+        return ConfirmOutcome::ConnectFailed(e.to_string());
+    }
+    // From here on every packet of this socket — the FIN, its retransmissions, the closing
+    // reset — may cross at most `hops` hops.
+    let _ = sock.set_linger(Some(Duration::ZERO));
+    if let Err(e) = set_hops(&sock, addr, hops) {
+        return ConfirmOutcome::Failed(e.to_string());
+    }
+    let rtt = match win::tcp_info(&sock) {
+        Ok(i) => Duration::from_micros(u64::from(i.RttUs)),
+        Err(e) => return ConfirmOutcome::Failed(format!("SIO_TCP_INFO: {e}")),
+    };
+    if let Err(e) = sock.shutdown(std::net::Shutdown::Write) {
+        return ConfirmOutcome::Failed(e.to_string());
+    }
+    let wait = (rtt * 4 + Duration::from_millis(250))
+        .clamp(Duration::from_millis(300), Duration::from_millis(1500));
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let state = match win::tcp_info(&sock) {
+            Ok(i) => windows_fin_state(i.State),
+            // The peer reset the connection: as Linux reads `CLOSE`.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                FinState::Answered
+            }
+            Err(e) => return ConfirmOutcome::Failed(format!("SIO_TCP_INFO: {e}")),
+        };
+        if state == FinState::Answered {
+            return ConfirmOutcome::Answered;
+        }
+        if std::time::Instant::now() >= deadline {
+            return match state {
+                FinState::Pending => ConfirmOutcome::Unanswered,
+                _ => ConfirmOutcome::Failed("the check connection's FIN was not sent".into()),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    //! Winsock calls the probe and the check connection make.
+
+    use std::io;
+    use std::os::windows::io::AsRawSocket;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        getsockopt, setsockopt, TCP_INFO_v0, WSAGetLastError, ICMP_ERROR_INFO, IPPROTO_TCP,
+        SIO_TCP_INFO, SOCKET, TCP_FAIL_CONNECT_ON_ICMP_ERROR, TCP_ICMP_ERROR_INFO,
+    };
+
+    // `WSAIoctl` as declared in winsock2.h (windows-sys gates it behind a feature this crate does
+    // not enable, for its `OVERLAPPED` argument, which is always null here).
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(
+            s: SOCKET,
+            code: u32,
+            inbuf: *const core::ffi::c_void,
+            inlen: u32,
+            outbuf: *mut core::ffi::c_void,
+            outlen: u32,
+            returned: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+            completion: *const core::ffi::c_void,
+        ) -> i32;
+    }
+
+    fn last_error() -> io::Error {
+        // SAFETY: no arguments; reads the calling thread's last Winsock error.
+        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    /// Ends the socket's connect on an ICMP error (best effort: older Windows does not know the
+    /// option, and the probe then times out instead).
+    pub(super) fn fail_connect_on_icmp(sock: &socket2::Socket) {
+        let on: u32 = 1;
+        // SAFETY: a valid socket, and a DWORD option value of the size given.
+        unsafe {
+            setsockopt(
+                sock.as_raw_socket() as SOCKET,
+                IPPROTO_TCP,
+                TCP_FAIL_CONNECT_ON_ICMP_ERROR,
+                (&on as *const u32).cast(),
+                std::mem::size_of::<u32>() as i32,
+            )
+        };
+    }
+
+    /// The ICMP error that ended the socket's connect, if one did: (IPv6, type, code).
+    pub(super) fn icmp_error(sock: &socket2::Socket) -> Option<(bool, u8, u8)> {
+        // SAFETY: plain data, overwritten by the call.
+        let mut info: ICMP_ERROR_INFO = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<ICMP_ERROR_INFO>() as i32;
+        // SAFETY: a valid socket, and `info` and `len` valid for the size given.
+        let rc = unsafe {
+            getsockopt(
+                sock.as_raw_socket() as SOCKET,
+                IPPROTO_TCP,
+                TCP_ICMP_ERROR_INFO,
+                (&mut info as *mut ICMP_ERROR_INFO).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 || len < std::mem::size_of::<ICMP_ERROR_INFO>() as i32 {
+            return None;
+        }
+        match info.protocol {
+            1 => Some((false, info.r#type, info.code)),
+            58 => Some((true, info.r#type, info.code)),
+            _ => None,
+        }
+    }
+
+    /// `SIO_TCP_INFO`, version 0.
+    pub(super) fn tcp_info(sock: &socket2::Socket) -> io::Result<TCP_INFO_v0> {
+        let version: u32 = 0;
+        // SAFETY: plain data, overwritten by the call.
+        let mut info: TCP_INFO_v0 = unsafe { std::mem::zeroed() };
+        let mut returned: u32 = 0;
+        // SAFETY: a valid socket; the in and out buffers are valid for the sizes given; no
+        // overlapped I/O.
+        let rc = unsafe {
+            WSAIoctl(
+                sock.as_raw_socket() as SOCKET,
+                SIO_TCP_INFO,
+                (&version as *const u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+                (&mut info as *mut TCP_INFO_v0).cast(),
+                std::mem::size_of::<TCP_INFO_v0>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        Ok(info)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
 fn confirm_once(_: SocketAddr, _: u8, _: Duration) -> ConfirmOutcome {
-    ConfirmOutcome::Failed("the check connection is supported on Linux only".into())
+    ConfirmOutcome::Failed("the check connection is supported on Linux and Windows only".into())
 }
 
 #[cfg(test)]
@@ -386,6 +628,77 @@ mod tests {
         for e in [libc::EPERM, libc::EACCES, libc::EADDRNOTAVAIL, libc::EINVAL] {
             assert!(matches!(os(e).verdict(), Verdict::Failed(_)), "{e}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_outcomes_are_classified() {
+        // WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAENETUNREACH, WSAETIMEDOUT.
+        let os = |e: i32| ProbeOutcome::of(Err(io::Error::from_raw_os_error(e)));
+        assert_eq!(os(10061), ProbeOutcome::Refused);
+        assert_eq!(os(10054), ProbeOutcome::Reset);
+        assert_eq!(os(10065).verdict(), Verdict::Far);
+        assert_eq!(os(10051).verdict(), Verdict::Far);
+        assert_eq!(os(10060).verdict(), Verdict::Undecided);
+        // WSAEACCES, WSAEADDRNOTAVAIL, WSAEINVAL.
+        for e in [10013, 10049, 10022] {
+            assert!(matches!(os(e).verdict(), Verdict::Failed(_)), "{e}");
+        }
+    }
+
+    /// The ICMP message that ended a Windows probe's connect: time exceeded is far, port and
+    /// protocol unreachable come from the destination (near), other unreachables are far as on
+    /// Linux; anything else says nothing (the error code decides).
+    #[test]
+    fn icmp_errors_are_classified() {
+        let of = ProbeOutcome::of_icmp;
+        assert_eq!(of(false, 11, 0), Some(ProbeOutcome::Unreachable));
+        assert_eq!(of(true, 3, 0), Some(ProbeOutcome::Unreachable));
+        assert_eq!(of(false, 3, 3), Some(ProbeOutcome::Refused));
+        assert_eq!(of(false, 3, 2), Some(ProbeOutcome::Refused));
+        assert_eq!(of(true, 1, 4), Some(ProbeOutcome::Refused));
+        assert_eq!(of(false, 3, 1), Some(ProbeOutcome::Unreachable));
+        assert_eq!(of(false, 3, 13), Some(ProbeOutcome::Unreachable));
+        assert_eq!(of(true, 1, 0), Some(ProbeOutcome::Unreachable));
+        // Not errors that end a connect: an echo reply, a redirect, IPv6 "packet too big".
+        assert_eq!(of(false, 0, 0), None);
+        assert_eq!(of(false, 5, 1), None);
+        assert_eq!(of(true, 2, 0), None);
+        // A type is read in its own family: IPv4 type 11 is not IPv6 time exceeded.
+        assert_eq!(of(true, 11, 0), None);
+    }
+
+    /// A Windows check connection's TCP state: only a FIN sent and unacknowledged reads as far
+    /// (at the deadline); acknowledged or reset is near; a FIN never sent is neither.
+    #[test]
+    fn windows_fin_states() {
+        assert_eq!(windows_fin_state(5), FinState::Pending); // FIN_WAIT_1
+        assert_eq!(windows_fin_state(10), FinState::Pending); // LAST_ACK
+        for s in [0, 6, 7, 8] {
+            assert_eq!(windows_fin_state(s), FinState::Answered, "{s}");
+        }
+        for s in [1, 2, 3, 4, 9, 11, -1] {
+            assert_eq!(windows_fin_state(s), FinState::NotSent, "{s}");
+        }
+    }
+
+    /// The check connection against a listener on loopback (zero hops): its FIN is acknowledged,
+    /// near.
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn the_check_connection_finds_a_local_listener_near() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let accept = std::thread::spawn(move || {
+            let s = l.accept();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(s);
+        });
+        assert_eq!(
+            TtlProbe.confirm(addr, 2, Duration::from_secs(5)),
+            ConfirmOutcome::Answered
+        );
+        accept.join().unwrap();
     }
 
     /// A probe without an answer is decided by the check connection: answered is near, unanswered
@@ -427,10 +740,18 @@ mod tests {
             ProbeOutcome::Connected
         );
         drop(l);
-        assert_eq!(
-            TtlProbe.probe(addr, 2, PROBE_TIMEOUT),
-            ProbeOutcome::Refused
-        );
+        let closed = TtlProbe.probe(addr, 2, PROBE_TIMEOUT);
+        // Windows retries a connect a reset answered for about two seconds, so the probe may
+        // time out; the check connection then fails to connect, which refuses too.
+        #[cfg(windows)]
+        if closed == ProbeOutcome::TimedOut {
+            assert!(
+                matches!(decide(&TtlProbe, addr, 2), Verdict::Failed(_)),
+                "a closed local port"
+            );
+            return;
+        }
+        assert_eq!(closed, ProbeOutcome::Refused);
     }
 
     /// A near listener that drops SYNs while its accept queue is full (backlog 0, one connection

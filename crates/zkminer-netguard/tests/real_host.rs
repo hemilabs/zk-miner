@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use zkminer_netguard::nearhop::{decide, NearProbe, ProbeOutcome, Verdict, PROBE_TIMEOUT};
 use zkminer_netguard::{
-    guarded_client, DohLookup, GuardedResolver, Lookup, NetMode, NetPolicy, TtlProbe,
+    guarded_client, Denied, DohLookup, GuardedResolver, Lookup, NetMode, NetPolicy, TtlProbe,
 };
 
 #[tokio::test]
@@ -31,6 +31,20 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
         "gathered facts ask the kernel per destination"
     );
     let doh = DohLookup::new(&policy).unwrap();
+    // Review r3 G1: the guard itself must let the resolvers be asked (on Windows it refused every
+    // one, and this test skipped). Only a network that does not reach them skips.
+    let asked: Vec<_> = doh
+        .servers()
+        .iter()
+        .map(|s| (s.addr, policy.admit(s.addr.ip())))
+        .collect();
+    assert!(
+        asked.iter().any(|(_, r)| matches!(
+            r,
+            Ok(()) | Err(Denied::DnsServer(_)) | Err(Denied::PublicAddressUnknown { .. })
+        )),
+        "the network guard refuses every DNS-over-HTTPS resolver on this host: {asked:?}"
+    );
     if let Err(e) = doh.lookup(names[0]).await {
         eprintln!("SKIPPED: no DNS-over-HTTPS here ({e})");
         return;
@@ -84,6 +98,49 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
         };
         assert!(client.policy().check_url(&url).is_err(), "{url}");
     }
+}
+
+/// Review r3 G1/G2: on Linux and Windows the facts public mode rests on are read: the routing
+/// table (a default route makes a family routed, so its public address must be known), the DNS
+/// servers, the interfaces with their kinds, and the kernel's route for a public address, which
+/// takes the default path. Elsewhere public mode says it cannot work.
+#[test]
+fn this_hosts_facts_are_read() {
+    if let Some(why) = zkminer_netguard::public_mode_unsupported() {
+        eprintln!("SKIPPED: {why}");
+        return;
+    }
+    let policy = NetPolicy::new(NetMode::Public, Vec::new()).expect("read this host");
+    let facts = policy.facts();
+    let routes = facts.routes();
+    eprintln!(
+        "routes: {}, default interfaces {:?}, uplinks {:?}, DNS servers: {}, unknown paths {:?}, \
+         needs internal_ranges: {:?}",
+        routes.routes().len(),
+        routes.default_interfaces(),
+        routes.uplinks(),
+        facts.resolvers().len(),
+        facts.unknown_paths(),
+        facts.needs_internal_ranges()
+    );
+    assert!(routes.routes_family(false), "no IPv4 default route read");
+    assert!(
+        !routes.on_link_prefixes().is_empty(),
+        "no on-link route read"
+    );
+    for p in routes.on_link_prefixes() {
+        assert!(facts.connected().contains(&p), "{p}");
+    }
+    #[cfg(windows)]
+    assert!(!facts.resolvers().is_empty(), "no DNS server read");
+    for r in facts.resolvers() {
+        assert!(policy.admit(*r).is_err(), "DNS server {r} admitted");
+    }
+    let oracle = facts.route_oracle().expect("gathered facts ask the kernel");
+    let answer = oracle
+        .route_to("1.1.1.1".parse().unwrap(), Some(443))
+        .expect("the kernel answers");
+    assert_eq!(routes.judge_answer(&answer), Ok(()), "{answer:?}");
 }
 
 /// The near-hop probe for real, against public anycast resolvers: a probe limited to 2 hops dies
