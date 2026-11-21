@@ -396,6 +396,51 @@ fn account_finding(
     }
 }
 
+/// Windows: what to say of the Low-integrity workers (`windows_sandbox`): whether they are on
+/// (`on`), the flag's value if it is set to something other than `1` (`misset`), and the Low
+/// directories found to be a file or a link (`tampered`).
+#[cfg(any(windows, test))]
+fn low_il_findings(on: bool, misset: Option<&str>, tampered: &[String]) -> Vec<(Level, String)> {
+    let mut findings = Vec::new();
+    if let Some(value) = misset {
+        findings.push((
+            Level::Warn,
+            format!(
+                "ZKMINER_WINDOWS_LOW_IL_WORKERS is {value:?}, not 1: the workers run at Medium \
+                 integrity"
+            ),
+        ));
+    } else if on {
+        findings.push((
+            Level::Pass,
+            "on: the workers run at Low integrity. A worker that cannot start there is not \
+             started at Medium instead: its slot proves nothing (PAGE: LOW-IL-WORKER-FAILED) \
+             until one starts at Low, tried again with back-off"
+                .to_string(),
+        ));
+    } else {
+        findings.push((
+            Level::Info,
+            "off: the workers run at Medium integrity, able to read this user's files. \
+             ZKMINER_WINDOWS_LOW_IL_WORKERS=1 runs them at Low"
+                .to_string(),
+        ));
+    }
+    if on {
+        for dir in tampered {
+            findings.push((
+                Level::Warn,
+                format!(
+                    "{dir}, not a directory: only a Low-integrity process (a worker) or this \
+                     account puts one there. The miner replaces it with a directory before its \
+                     next Low worker"
+                ),
+            ));
+        }
+    }
+    findings
+}
+
 fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     report.section("This host");
     let home = super::run::zkminer_home();
@@ -442,6 +487,17 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             ),
         };
         report.say(level, "account", detail);
+        let on = sandbox::low_il_workers();
+        let tampered = if on {
+            sandbox::low_dirs_tampered()
+        } else {
+            Vec::new()
+        };
+        for (level, detail) in
+            low_il_findings(on, sandbox::low_il_workers_misset().as_deref(), &tampered)
+        {
+            report.say(level, "Low-integrity workers", detail);
+        }
     }
     if super::run::stop_request_path().exists() {
         report.say(
@@ -1137,6 +1193,31 @@ mod tests {
         assert_eq!(level, Level::Warn);
         assert!(text.contains("elevated"), "{text}");
         assert_eq!(account_finding(None, false).0, Level::Pass);
+    }
+
+    /// Windows' Low-integrity workers as doctor reports them: on (failing closed), off, a flag
+    /// set to something other than 1 (which is off), and a Low directory that was tampered with.
+    #[test]
+    fn doctor_reports_the_low_integrity_workers_as_they_are() {
+        let on = low_il_findings(true, None, &[]);
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].0, Level::Pass);
+        assert!(
+            on[0].1.contains("not started at Medium") && on[0].1.contains("LOW-IL-WORKER-FAILED"),
+            "{}",
+            on[0].1
+        );
+        let off = low_il_findings(false, None, &["ignored".into()]);
+        assert_eq!(off.len(), 1, "{off:?}");
+        assert_eq!(off[0].0, Level::Info);
+        assert!(off[0].1.contains("Medium"), "{}", off[0].1);
+        let misset = low_il_findings(false, Some("true"), &[]);
+        assert_eq!(misset[0].0, Level::Warn);
+        assert!(misset[0].1.contains("\"true\""), "{}", misset[0].1);
+        let tampered = low_il_findings(true, None, &[r"C:\x\worker\neo is a file".into()]);
+        assert_eq!(tampered.len(), 2);
+        assert_eq!(tampered[1].0, Level::Warn);
+        assert!(tampered[1].1.contains("neo is a file"), "{}", tampered[1].1);
     }
 
     #[test]

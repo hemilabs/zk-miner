@@ -1112,12 +1112,14 @@ impl WorkerHandle {
         // Perform Hello handshake
         #[cfg(windows)]
         if handle.child.is_low_integrity() {
-            // A worker that cannot even answer at Low integrity (a library that will not load
-            // there) is started again at Medium, paged: see `windows_sandbox`.
+            // A worker that does not answer at Low integrity (a library that will not load there,
+            // or another Low worker that ended it) is NOT started again at Medium: that fallback
+            // would be any Low process's to trigger. It fails like any spawn, paged, and the
+            // dispatcher starts the next one at Low after its back-off. See `windows_sandbox`.
             if let Err(e) = handle.handshake() {
                 drop(handle);
-                crate::windows_sandbox::low_il_failed(backend, &format!("{e:#}"));
-                return Self::spawn_on_this_thread(backend, path, env_overrides);
+                crate::windows_sandbox::low_il_worker_failed(backend, &format!("{e:#}"));
+                return Err(e);
             }
             return Ok(handle);
         }
@@ -2876,4 +2878,43 @@ pub(crate) fn isolate_from_console(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(all(test, windows))]
+mod low_integrity_tests {
+    use super::*;
+    use crate::windows_sandbox::{TEST_LOW_ROOT, TEST_SPAWNS};
+
+    /// With Low workers, one that fails its handshake (here a program that exits without one) is
+    /// not started again at Medium: the spawn fails, and the next one is at Low again. And one
+    /// whose directories cannot be prepared is not started at all.
+    #[test]
+    fn a_low_worker_that_fails_is_not_started_at_medium() {
+        let root = std::env::temp_dir().join(format!("zkminer-low-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        TEST_LOW_ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
+        let no_handshake = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("where.exe");
+        let env = HashMap::new();
+        let first = WorkerHandle::spawn_on_this_thread("mock", &no_handshake, &env);
+        let second = WorkerHandle::spawn_on_this_thread("mock", &no_handshake, &env);
+        let spawned = TEST_SPAWNS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        // Where a Low directory's parent should be, a file: nothing is started.
+        let _ = std::fs::remove_dir_all(root.join("home").join(".zkminer"));
+        std::fs::write(root.join("home").join(".zkminer"), b"not a directory").unwrap();
+        let unprepared = WorkerHandle::spawn_on_this_thread("mock", &no_handshake, &env);
+        let spawned_after = TEST_SPAWNS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        TEST_LOW_ROOT.with(|r| *r.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&root);
+        for failed in [first, second] {
+            // Started, and failed in its handshake (not before it).
+            let failed = format!("{:#}", failed.err().expect("a worker without a handshake"));
+            assert!(failed.contains("Handshake"), "{failed}");
+        }
+        assert_eq!(spawned, [true, true], "a worker was started at Medium");
+        let unprepared = format!("{:#}", unprepared.err().expect("started without its dirs"));
+        assert!(unprepared.contains("could not be prepared"), "{unprepared}");
+        assert!(spawned_after.is_empty(), "{spawned_after:?}");
+    }
 }

@@ -15,9 +15,12 @@
 //!   miner (or any process of the user's at Medium) at all, nor write a file or registry key at
 //!   Medium. Its temporary, cache and segment directories are made writable at Low before it starts,
 //!   and the key file, `~/.zkminer/.env` and the lock journal get a label Low processes cannot read
-//!   through ([`protect_secrets`], [`write_secret_file`]). Off by default until each GPU runtime is
-//!   known to work at Low; a worker that cannot even start its handshake at Low is restarted at
-//!   Medium, with a `PAGE:` ([`low_il_failed`]).
+//!   through ([`protect_secrets`], [`write_secret_file`]). No other Low worker can open it but to see
+//!   it ([`low_worker_descriptors`]). Off by default until each GPU runtime is known to work at Low.
+//!   The flag fails closed: a worker that cannot start at Low (its handshake fails, or its
+//!   directories cannot be prepared) is not started at Medium instead but paged and tried again at
+//!   Low after a back-off ([`low_il_worker_failed`]), as a Low process could otherwise force the
+//!   fallback.
 //!
 //! Without the flag a worker can still read every file of the user's, the key file and `.env`
 //! included (`zkminer doctor` says so).
@@ -36,7 +39,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Set to `1` to run every worker at Low integrity (see the module docs).
@@ -46,6 +49,7 @@ type Handle = *mut c_void;
 
 // Process and thread rights (winnt.h).
 const PROCESS_TERMINATE: u32 = 0x0001;
+const PROCESS_VM_READ: u32 = 0x0010;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
 const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
@@ -208,14 +212,6 @@ extern "system" {
     ) -> u32;
     fn SetKernelObjectSecurity(handle: Handle, information: u32, descriptor: *mut c_void) -> i32;
     fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
-    fn DuplicateTokenEx(
-        token: Handle,
-        access: u32,
-        attributes: *const SecurityAttributes,
-        impersonation_level: i32,
-        token_type: i32,
-        new_token: *mut Handle,
-    ) -> i32;
     fn SetTokenInformation(token: Handle, class: i32, info: *const c_void, length: u32) -> i32;
     fn GetTokenInformation(
         token: Handle,
@@ -223,19 +219,6 @@ extern "system" {
         info: *mut c_void,
         length: u32,
         returned: *mut u32,
-    ) -> i32;
-    fn CreateProcessAsUserW(
-        token: Handle,
-        application: *const u16,
-        command_line: *mut u16,
-        process_attributes: *const SecurityAttributes,
-        thread_attributes: *const SecurityAttributes,
-        inherit_handles: i32,
-        flags: u32,
-        environment: *const c_void,
-        current_directory: *const u16,
-        startup_info: *const StartupInfoExW,
-        information: *mut ProcessInformation,
     ) -> i32;
 }
 
@@ -502,38 +485,129 @@ pub fn low_il_workers() -> bool {
     *ON.get_or_init(|| std::env::var(LOW_IL_WORKERS_ENV).is_ok_and(|v| v.trim() == "1"))
 }
 
-/// Backends whose workers fell back to Medium, and whether all did (no Low directories).
-static LOW_IL_REFUSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-static LOW_IL_OFF: AtomicBool = AtomicBool::new(false);
-
-/// Whether `backend`'s next worker starts at Low integrity.
-fn low_il_for(backend: &str) -> bool {
-    low_il_workers()
-        && !LOW_IL_OFF.load(Ordering::Relaxed)
-        && !LOW_IL_REFUSED
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(backend)
+/// The flag's value when it is set to something other than `1` (which leaves the workers at
+/// Medium), for `zkminer doctor`.
+pub fn low_il_workers_misset() -> Option<String> {
+    std::env::var(LOW_IL_WORKERS_ENV)
+        .ok()
+        .filter(|v| v.trim() != "1" && !v.trim().is_empty())
 }
 
-/// A Low worker of `backend` failed to start (`why`): its workers run at Medium from now on, and the
-/// operator is paged, as the sandbox the flag asked for is gone for them.
-pub(crate) fn low_il_failed(backend: &str, why: &str) {
-    LOW_IL_REFUSED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(backend.to_string());
+/// A Low worker of `backend` did not start (`why`). The flag fails closed: it is not started at
+/// Medium instead, which a Low process could otherwise bring about at will (by ending a sibling
+/// before its handshake, or by planting a file where a Low directory goes). The slot stays without
+/// a worker and the dispatcher starts one again, at Low, after its back-off.
+pub(crate) fn low_il_worker_failed(backend: &str, why: &str) {
     tracing::error!(
-        "PAGE: LOW-IL-WORKER-UNSUPPORTED ({backend}) — a worker at Low integrity failed to start \
-         ({why}); {backend} workers run at Medium integrity from now on, able to read this user's \
-         files and open this user's processes other than the miner"
+        "PAGE: LOW-IL-WORKER-FAILED ({backend}) — a worker at Low integrity did not start ({why}). \
+         It is not started at Medium integrity instead ({LOW_IL_WORKERS_ENV}=1 fails closed): \
+         this {backend} slot proves nothing until a Low worker starts, which is tried again with \
+         back-off. If {backend} works here only at Medium, unset {LOW_IL_WORKERS_ENV}"
     );
 }
 
-/// Make `dir` (created if missing) and everything in it writable by Low processes.
+/// Make `dir` (created if missing) and everything made in it writable by Low processes. `dir` must
+/// be a directory, not a link to one ([`set_dir_label`]).
 fn label_low_writable(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    set_label(dir, LOW_WRITABLE_DIR)
+    set_dir_label(dir, LOW_WRITABLE_DIR)
+}
+
+/// Whether `metadata` (of the path itself, not followed) is a link: a symbolic link or a junction.
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Make `path`, whose parent exists, a plain directory: a file, a symbolic link or a junction
+/// there (a Low process can put one where a directory of the Low tree should be) is removed, never
+/// followed, and a directory made in its place.
+fn make_plain_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && !is_reparse_point(&m) => return Ok(()),
+        // A link to a directory is removed as a directory (the link, not its target).
+        Ok(m) if m.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 => std::fs::remove_dir(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir(path)
+}
+
+/// Label the directory `path` with `sddl`'s label, through a handle to `path` itself: a link there
+/// is refused, not followed, so a label meant for the Low tree never lands on what it points at.
+fn set_dir_label(path: &Path, sddl: &str) -> io::Result<()> {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn SetSecurityInfo(
+            handle: Handle,
+            object_type: i32,
+            information: u32,
+            owner: *mut c_void,
+            group: *mut c_void,
+            dacl: *mut c_void,
+            sacl: *mut c_void,
+        ) -> u32;
+    }
+    let descriptor = Descriptor::from_sddl(sddl)?;
+    let sacl = descriptor.sacl()?;
+    let name = wide(path.as_os_str());
+    // SAFETY: a NUL-terminated path; the handle is owned by `File` at once.
+    let dir = unsafe {
+        let handle = CreateFileW(
+            name.as_ptr(),
+            READ_CONTROL | WRITE_OWNER | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if handle as isize == -1 || handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        std::fs::File::from_raw_handle(handle)
+    };
+    let metadata = dir.metadata()?;
+    if is_reparse_point(&metadata) {
+        return Err(io::Error::other(format!(
+            "{} is a link, not a directory",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "{} is a file, not a directory",
+            path.display()
+        )));
+    }
+    // SAFETY: an open handle with WRITE_OWNER and a SACL inside a live descriptor. Setting a label
+    // at or below this process's own level needs no privilege, only WRITE_OWNER.
+    let status = unsafe {
+        SetSecurityInfo(
+            dir.as_raw_handle(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            sacl,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
 }
 
 fn set_label(path: &Path, sddl: &str) -> io::Result<()> {
@@ -639,42 +713,87 @@ fn write_labelled_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.write_all(contents)
 }
 
-/// The directories a Low worker writes, made and labelled once: (variable, directory) for those it
-/// is pointed at, then `~/.zkminer/risc0-segments` and `~/.zkminer/locks`, which it finds itself.
-fn low_dirs() -> Result<&'static [(&'static str, PathBuf)], String> {
-    static DIRS: OnceLock<Result<Vec<(&'static str, PathBuf)>, String>> = OnceLock::new();
-    DIRS.get_or_init(|| {
-        let local = dirs::data_local_dir().ok_or("no local application data directory")?;
-        let base = local.join("zkminer").join("worker");
-        let home = dirs::home_dir().ok_or("no home directory")?;
-        let mut dirs = Vec::new();
-        for (vars, name) in [
-            (&["TMP", "TEMP", "TMPDIR"][..], "tmp"),
-            (&["CUDA_CACHE_PATH"], "cuda-cache"),
-            (&["NEO_CACHE_DIR"], "neo"),
-            (&["SYCL_CACHE_DIR"], "sycl"),
-            (&["RISC0_G16_CACHE_DIR"], "risc0-groth16"),
-            (&["AMD_COMGR_CACHE_DIR"], "comgr"),
-        ] {
-            for var in vars {
-                dirs.push((*var, base.join(name)));
-            }
+/// The directories a Low worker is pointed at by its environment: (variable, directory name below
+/// `%LOCALAPPDATA%\zkminer\worker`).
+const LOW_DIRS: &[(&[&str], &str)] = &[
+    (&["TMP", "TEMP", "TMPDIR"], "tmp"),
+    (&["CUDA_CACHE_PATH"], "cuda-cache"),
+    (&["NEO_CACHE_DIR"], "neo"),
+    (&["SYCL_CACHE_DIR"], "sycl"),
+    (&["RISC0_G16_CACHE_DIR"], "risc0-groth16"),
+    (&["AMD_COMGR_CACHE_DIR"], "comgr"),
+];
+
+/// The Low-writable directories outside `<local>\zkminer\worker`: `<home>\.zkminer\risc0-segments`
+/// and the SP1 Groth16 queue (`~/.zkminer/locks`), which the dispatcher names to the worker.
+fn low_dirs_in_home(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".zkminer").join("risc0-segments"),
+        zkminer_prover_protocol::types::sp1_groth16_queue_dir(home),
+    ]
+}
+
+/// The directories a Low worker writes, made and labelled: (variable, directory) for those it is
+/// pointed at, below `<local>\zkminer\worker`, then [`low_dirs_in_home`]. A Low process can write
+/// in each of them, so each is made a plain directory again first ([`make_plain_dir`]: a file or
+/// a link planted there is removed), and every label is set through the directory itself, never
+/// through a link ([`set_dir_label`]).
+fn prepare_low_dirs(local: &Path, home: &Path) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    fn at(dir: &Path) -> impl FnOnce(io::Error) -> String + '_ {
+        move |e| format!("{}: {e}", dir.display())
+    }
+    let base = local.join("zkminer").join("worker");
+    let mut dirs = Vec::new();
+    let mut plain = vec![base.clone()];
+    for (vars, name) in LOW_DIRS {
+        let dir = base.join(name);
+        dirs.extend(vars.iter().map(|var| (*var, dir.clone())));
+        plain.push(dir);
+    }
+    plain.extend(low_dirs_in_home(home));
+    for dir in &plain {
+        // The parents are this user's at Medium: no Low process changes them.
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(at(parent))?;
         }
-        for (_, dir) in &dirs {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
-        label_low_writable(&base).map_err(|e| format!("{}: {e}", base.display()))?;
-        for dir in [
-            home.join(".zkminer").join("risc0-segments"),
-            zkminer_prover_protocol::types::sp1_groth16_queue_dir(&home),
-        ] {
-            label_low_writable(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        }
-        Ok(dirs)
-    })
-    .as_ref()
-    .map(Vec::as_slice)
-    .map_err(String::clone)
+        make_plain_dir(dir).map_err(at(dir))?;
+        set_dir_label(dir, LOW_WRITABLE_DIR).map_err(at(dir))?;
+    }
+    Ok(dirs)
+}
+
+/// [`prepare_low_dirs`] in this user's profile, done once it has succeeded (a failure is tried
+/// again at the next Low worker).
+fn low_dirs() -> Result<Vec<(&'static str, PathBuf)>, String> {
+    static DIRS: Mutex<Option<Vec<(&'static str, PathBuf)>>> = Mutex::new(None);
+    let mut done = DIRS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(dirs) = &*done {
+        return Ok(dirs.clone());
+    }
+    let local = dirs::data_local_dir().ok_or("no local application data directory")?;
+    let home = dirs::home_dir().ok_or("no home directory")?;
+    let dirs = prepare_low_dirs(&local, &home)?;
+    *done = Some(dirs.clone());
+    Ok(dirs)
+}
+
+/// For `zkminer doctor`, read only: the Low directories ([`prepare_low_dirs`]) that are a file or a
+/// link, not a directory. Only a Low process (or the operator) puts one there; the miner replaces
+/// it with a directory before its next Low worker.
+pub fn low_dirs_tampered() -> Vec<String> {
+    let (Some(local), Some(home)) = (dirs::data_local_dir(), dirs::home_dir()) else {
+        return Vec::new();
+    };
+    let base = local.join("zkminer").join("worker");
+    std::iter::once(base.clone())
+        .chain(LOW_DIRS.iter().map(|(_, name)| base.join(name)))
+        .chain(low_dirs_in_home(&home))
+        .filter_map(|dir| match std::fs::symlink_metadata(&dir) {
+            Ok(m) if is_reparse_point(&m) => Some(format!("{} is a link", dir.display())),
+            Ok(m) if !m.is_dir() => Some(format!("{} is a file", dir.display())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Directories a worker is pointed at by its environment that it writes (the witness proofs'
@@ -780,32 +899,108 @@ impl WorkerChild {
 /// to the miner, in a console of its own with no window (`CREATE_NO_WINDOW`: the miner's console
 /// events, Ctrl+C above all, must not reach it), in the miner's job and a job of its own, at Low
 /// integrity when that is on (see the module docs). Nothing else of the miner's is inherited.
+///
+/// With Low workers on, a worker whose directories cannot be prepared is not started at all (the
+/// flag fails closed, [`low_il_worker_failed`]), and before the first SP1 worker the server it
+/// runs is installed from here ([`install_sp1_server`]).
 pub(crate) fn spawn_worker(
     backend: &str,
     program: &Path,
     mut env: Vec<(OsString, OsString)>,
 ) -> io::Result<WorkerChild> {
-    let low = low_il_for(backend)
-        && match low_dirs().and_then(|dirs| label_env_dirs(&env).map(|()| dirs)) {
-            Ok(dirs) => {
-                // Last, so they win over the miner's own: a Low process cannot write those.
-                env.extend(
-                    dirs.iter()
-                        .map(|(var, dir)| (OsString::from(var), dir.into())),
-                );
-                true
-            }
-            Err(e) => {
-                LOW_IL_OFF.store(true, Ordering::Relaxed);
-                tracing::error!(
-                    "PAGE: LOW-IL-WORKER-UNSUPPORTED (all) — the directories a Low-integrity \
-                     worker writes could not be prepared ({e}); every worker runs at Medium \
-                     integrity"
-                );
-                false
-            }
-        };
-    spawn(program, &[], &env, low)
+    #[cfg(test)]
+    let test_root = TEST_LOW_ROOT.with(|root| root.borrow().clone());
+    #[cfg(not(test))]
+    let test_root: Option<PathBuf> = None;
+    let low = low_il_workers() || test_root.is_some();
+    if low {
+        let dirs = match &test_root {
+            Some(root) => prepare_low_dirs(&root.join("local"), &root.join("home")),
+            None => low_dirs(),
+        }
+        .and_then(|dirs| label_env_dirs(&env).map(|()| dirs))
+        .map_err(|e| {
+            let why =
+                format!("the directories a Low-integrity worker writes could not be prepared: {e}");
+            low_il_worker_failed(backend, &why);
+            io::Error::other(why)
+        })?;
+        // Last, so they win over the miner's own: a Low process cannot write those.
+        env.extend(
+            dirs.iter()
+                .map(|(var, dir)| (OsString::from(var), dir.into())),
+        );
+        if backend == "sp1" {
+            install_sp1_server(program, &env);
+        }
+    }
+    #[cfg(test)]
+    TEST_SPAWNS.with(|spawns| spawns.borrow_mut().push(low));
+    spawn(program, &[], &env, low).inspect_err(|e| {
+        if low {
+            low_il_worker_failed(backend, &format!("it could not be started at Low: {e}"));
+        }
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the workers [`spawn_worker`] starts on this thread run at Low integrity whatever the
+    /// flag, with their directories below this root instead of the user's profile.
+    pub(crate) static TEST_LOW_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    /// And whether each one it started on this thread was at Low.
+    pub(crate) static TEST_SPAWNS: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// SP1 at Low integrity: the worker installs the `sp1-gpu-server` shipped beside it into
+/// `~/.sp1/bin`, which a Low process cannot write (and must not: a Medium worker runs what is
+/// there). So the miner, at Medium, has the worker binary do just that (`--install-bundled-server`:
+/// no GPU, network or guest) once per worker binary and server build, before the first Low worker
+/// of it. A failure is logged and tried again before the next one; the Low worker then declines
+/// SP1 for want of its server, as one does at Medium.
+fn install_sp1_server(program: &Path, env: &[(OsString, OsString)]) {
+    static DONE: Mutex<BTreeSet<(PathBuf, OsString)>> = Mutex::new(BTreeSet::new());
+    let server = env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("SP1_GPU_SERVER_NAME"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let key = (program.to_path_buf(), server);
+    let mut done = DONE.lock().unwrap_or_else(|p| p.into_inner());
+    if done.contains(&key) {
+        return;
+    }
+    let ran = std::process::Command::new(program)
+        .arg(zkminer_prover_protocol::types::INSTALL_BUNDLED_SERVER_ARG)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    match ran {
+        Ok(out) if out.status.success() => {
+            done.insert(key);
+        }
+        Ok(out) => tracing::warn!(
+            "{} could not install the SP1 server it ships ({}): its Low-integrity workers \
+             decline SP1 until it is installed",
+            program.display(),
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .trim()
+        ),
+        Err(e) => tracing::warn!(
+            "{} could not be run to install the SP1 server it ships ({e}): its Low-integrity \
+             workers decline SP1 until it is installed",
+            program.display()
+        ),
+    }
 }
 
 /// Quote `arg` for a command line as the C runtime parses it back.
@@ -891,50 +1086,75 @@ fn environment_block(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
     Ok(block)
 }
 
-/// A copy of this process's token at Low integrity, to start a process with.
-fn low_integrity_token() -> io::Result<OwnedHandle> {
-    const TOKEN_DUPLICATE: u32 = 0x0002;
-    const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
+/// What this user keeps on a Low worker's process: what the miner opens one by pid for (see it, its
+/// times and memory figures, wait for it, end it).
+const LOW_WORKER_USER_RIGHTS: u32 = PROCESS_USER_RIGHTS | PROCESS_VM_READ;
+/// A Low worker's process and first thread are labelled Medium, no read and no write up: a Low
+/// process (another Low worker) gets none of the rights above but seeing and waiting for it.
+const LOW_WORKER_LABEL: &str = "S:(ML;;NWNR;;;ME)";
+
+/// The descriptors of a Low worker's process and first thread. A Low worker's token keeps this
+/// user's SID, and its default DACL grants that SID everything, so without these any other Low
+/// worker could read another's memory (another requester's guest and inputs), run code in it or
+/// end it before its handshake. With them, this user gets only [`LOW_WORKER_USER_RIGHTS`] (on the
+/// thread, [`THREAD_USER_RIGHTS`]), and the Medium label keeps even those from Low processes but
+/// for seeing and waiting. Threads the worker starts later have its token's default DACL.
+///
+/// No object can be created with a label above its creator's token's, and the handles a process's
+/// creator gets are checked against the descriptor it gives, which cannot tell the miner from a
+/// Low worker of the same user but by the label. So [`spawn`] creates the worker at Medium,
+/// suspended, with `at_creation` (all rights for this user, and the label: a Low process can never
+/// open it), lowers its token to Low, then narrows it to `before_resume` before it runs. In pairs:
+/// (process, thread).
+struct LowWorkerDescriptors {
+    at_creation: (Descriptor, Descriptor),
+    before_resume: (Descriptor, Descriptor),
+}
+
+fn low_worker_descriptors() -> io::Result<LowWorkerDescriptors> {
+    let user = zkminer_config::wallet::current_user_sid()?;
+    let pair = |process_rights: u32, thread_rights: u32| -> io::Result<_> {
+        Ok((
+            Descriptor::from_sddl(&format!(
+                "{}{LOW_WORKER_LABEL}",
+                locked_dacl(&user, process_rights, PROCESS_ALL_ACCESS)
+            ))?,
+            Descriptor::from_sddl(&format!(
+                "{}{LOW_WORKER_LABEL}",
+                locked_dacl(&user, thread_rights, THREAD_ALL_ACCESS)
+            ))?,
+        ))
+    };
+    Ok(LowWorkerDescriptors {
+        at_creation: pair(PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS)?,
+        before_resume: pair(LOW_WORKER_USER_RIGHTS, THREAD_USER_RIGHTS)?,
+    })
+}
+
+/// Lower the token of `process` (a worker created suspended, not yet run) to Low integrity. A
+/// token's level may always be lowered, by whoever may adjust it: here the miner, whose token that
+/// one is a copy of.
+fn lower_to_low_integrity(process: Handle) -> io::Result<()> {
     const TOKEN_QUERY: u32 = 0x0008;
     const TOKEN_ADJUST_DEFAULT: u32 = 0x0080;
-    const SECURITY_IMPERSONATION: i32 = 2;
-    const TOKEN_PRIMARY: i32 = 1;
     const TOKEN_INTEGRITY_LEVEL: i32 = 25;
     const SE_GROUP_INTEGRITY: u32 = 0x20;
     // S-1-16-4096: revision 1, one sub-authority, the mandatory label authority (16), Low (0x1000).
     let mut low_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x10, 0x00, 0x00];
-    // SAFETY: plain advapi32 calls; every handle is owned as soon as it exists, and `label` and the
-    // SID it points to outlive the call that reads them.
+    // SAFETY: plain advapi32 calls on a valid process handle; the token is owned as soon as it
+    // exists, and `label` and the SID it points to outlive the call that reads them.
     unsafe {
         let mut token = std::ptr::null_mut();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
-            &mut token,
-        ) == 0
-        {
+        if OpenProcessToken(process, TOKEN_QUERY | TOKEN_ADJUST_DEFAULT, &mut token) == 0 {
             return Err(io::Error::last_os_error());
         }
         let token = OwnedHandle::from_raw_handle(token);
-        let mut low = std::ptr::null_mut();
-        if DuplicateTokenEx(
-            token.as_raw_handle(),
-            0,
-            std::ptr::null(),
-            SECURITY_IMPERSONATION,
-            TOKEN_PRIMARY,
-            &mut low,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let low = OwnedHandle::from_raw_handle(low);
         let label = TokenMandatoryLabel {
             sid: low_sid.as_mut_ptr().cast(),
             attributes: SE_GROUP_INTEGRITY,
         };
         if SetTokenInformation(
-            low.as_raw_handle(),
+            token.as_raw_handle(),
             TOKEN_INTEGRITY_LEVEL,
             (&label as *const TokenMandatoryLabel).cast(),
             (std::mem::size_of::<TokenMandatoryLabel>() + low_sid.len()) as u32,
@@ -942,7 +1162,7 @@ fn low_integrity_token() -> io::Result<OwnedHandle> {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(low)
+        Ok(())
     }
 }
 
@@ -1061,10 +1281,24 @@ fn spawn(
     let application = wide(program.as_os_str());
     let mut line = command_line(program, args)?;
     let block = environment_block(env)?;
-    let token = if low {
-        Some(low_integrity_token()?)
+    // A Low worker's process and first thread get a descriptor of their own (its token's default
+    // grants this user, and so every other Low worker, everything): see `LowWorkerDescriptors`.
+    let descriptors = if low {
+        Some(low_worker_descriptors()?)
     } else {
         None
+    };
+    let attributes = descriptors.as_ref().map(|d| {
+        let (process, thread) = &d.at_creation;
+        [process, thread].map(|descriptor| SecurityAttributes {
+            length: std::mem::size_of::<SecurityAttributes>() as u32,
+            descriptor: descriptor.0,
+            inherit_handle: 0,
+        })
+    });
+    let (process_attributes, thread_attributes) = match &attributes {
+        Some([process, thread]) => (process as *const SecurityAttributes, thread as *const _),
+        None => (std::ptr::null(), std::ptr::null()),
     };
     let (stdin_child, stdin_ours) = pipe(true)?;
     let (stdout_child, stdout_ours) = pipe(false)?;
@@ -1123,33 +1357,19 @@ fn spawn(
         for handle in [&stdin_child, &stdout_child, &stderr_child] {
             set_inheritable(handle, true)?;
         }
-        let ok = match &token {
-            Some(token) => CreateProcessAsUserW(
-                token.as_raw_handle(),
-                application.as_ptr(),
-                line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                flags,
-                block.as_ptr().cast(),
-                std::ptr::null(),
-                &startup,
-                &mut info,
-            ),
-            None => CreateProcessW(
-                application.as_ptr(),
-                line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                flags,
-                block.as_ptr().cast(),
-                std::ptr::null(),
-                &startup,
-                &mut info,
-            ),
-        };
+        // At this process's integrity: a Low worker is lowered below, before it runs.
+        let ok = CreateProcessW(
+            application.as_ptr(),
+            line.as_mut_ptr(),
+            process_attributes,
+            thread_attributes,
+            1,
+            flags,
+            block.as_ptr().cast(),
+            std::ptr::null(),
+            &startup,
+            &mut info,
+        );
         let created = io::Error::last_os_error();
         for handle in [&stdin_child, &stdout_child, &stderr_child] {
             let _ = set_inheritable(handle, false);
@@ -1159,6 +1379,25 @@ fn spawn(
         }
         let process = OwnedHandle::from_raw_handle(info.process);
         let thread = OwnedHandle::from_raw_handle(info.thread);
+        // A Low worker: its token lowered to Low and its process and first thread narrowed to what
+        // this user keeps (their Medium label stays), before it runs a single instruction. If
+        // either fails it is not started at all, never at Medium.
+        if let Some(d) = &descriptors {
+            let (process_descriptor, thread_descriptor) = &d.before_resume;
+            let lowered = lower_to_low_integrity(process.as_raw_handle()).and_then(|()| {
+                for (handle, descriptor) in [
+                    (process.as_raw_handle(), process_descriptor),
+                    (thread.as_raw_handle(), thread_descriptor),
+                ] {
+                    set_dacl(handle, descriptor.0)?;
+                }
+                Ok(())
+            });
+            if let Err(e) = lowered {
+                TerminateProcess(process.as_raw_handle(), 1);
+                return Err(e);
+            }
+        }
         // Into the jobs while it is suspended: once running, the SP1 worker puts itself in a job of
         // its own, and could then no longer be put in this one.
         crate::windows_job::end_with_this_process(process.as_raw_handle(), info.process_id);
@@ -1207,7 +1446,6 @@ mod tests {
         fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
         fn GetCurrentThreadId() -> u32;
     }
-    const PROCESS_VM_READ: u32 = 0x0010;
     const PROCESS_VM_WRITE: u32 = 0x0020;
     const PROCESS_CREATE_THREAD: u32 = 0x0002;
     const THREAD_GET_CONTEXT: u32 = 0x0008;
@@ -1530,6 +1768,213 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success());
+    }
+
+    /// The test binary at Low integrity as a worker would start, running only the ignored helper
+    /// `test` with `vars` added.
+    fn low_helper_child(test: &str, vars: &[(&str, String)]) -> WorkerChild {
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        env.extend(vars.iter().map(|(k, v)| (k.into(), v.into())));
+        let args = [
+            "--ignored",
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .map(OsStr::new);
+        spawn(&std::env::current_exe().unwrap(), &args, &env, true).unwrap()
+    }
+
+    fn read_all(child: &mut WorkerChild) -> String {
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        out
+    }
+
+    /// A Low worker that waits for its stdin to close.
+    #[test]
+    #[ignore = "run by low_workers_cannot_open_each_other"]
+    fn low_waiting_helper() {
+        if std::env::var(HELPER).as_deref() != Ok("wait") {
+            return;
+        }
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+    }
+
+    /// A Low worker that says which rights on the process `ZKMINER_TEST_TARGET` it got.
+    #[test]
+    #[ignore = "run by low_workers_cannot_open_each_other"]
+    fn low_probing_helper() {
+        if std::env::var(HELPER).as_deref() != Ok("probe") {
+            return;
+        }
+        const PROCESS_VM_OPERATION: u32 = 0x0008;
+        const PROCESS_DUP_HANDLE: u32 = 0x0040;
+        const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+        let target: u32 = std::env::var("ZKMINER_TEST_TARGET")
+            .unwrap()
+            .parse()
+            .unwrap();
+        println!("LEVEL {:#x}", integrity_level());
+        for (what, access) in [
+            ("VM_READ", PROCESS_VM_READ),
+            ("VM_WRITE", PROCESS_VM_WRITE | PROCESS_VM_OPERATION),
+            ("CREATE_THREAD", PROCESS_CREATE_THREAD),
+            ("DUP_HANDLE", PROCESS_DUP_HANDLE),
+            ("SUSPEND_RESUME", PROCESS_SUSPEND_RESUME),
+            ("TERMINATE", PROCESS_TERMINATE),
+            ("WRITE_DAC", WRITE_DAC),
+            ("QUERY", PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE),
+        ] {
+            println!("OPEN {what} {:?}", open_process(target, access));
+        }
+    }
+
+    /// One Low worker cannot read, write, start a thread in, suspend or re-DACL another; it can
+    /// see it, wait for it and end it (a process's generic execute right, which no label keeps
+    /// from a Low process: since a Low worker that fails is not started at Medium instead, that
+    /// costs only the worker). The miner (here, at Medium) still opens it as it does by pid, for
+    /// its times and memory figures and to end it, and no more.
+    #[test]
+    fn low_workers_cannot_open_each_other() {
+        let mut target = low_helper_child(
+            "windows_sandbox::tests::low_waiting_helper",
+            &[(HELPER, "wait".into())],
+        );
+        let mut probe = low_helper_child(
+            "windows_sandbox::tests::low_probing_helper",
+            &[
+                (HELPER, "probe".into()),
+                ("ZKMINER_TEST_TARGET", target.id().to_string()),
+            ],
+        );
+        let out = read_all(&mut probe);
+        let probed = probe.wait().unwrap();
+        let by_miner = [
+            open_process(
+                target.id(),
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            ),
+            open_process(target.id(), PROCESS_TERMINATE),
+            open_process(target.id(), PROCESS_VM_WRITE),
+        ];
+        let still_alive = target.try_wait().unwrap().is_none();
+        drop(target.stdin.take());
+        let _ = target.wait();
+        assert!(probed.success(), "{probed:?}\n{out}");
+        assert!(
+            out.contains("LEVEL 0x1000"),
+            "the probe is not at Low:\n{out}"
+        );
+        for what in [
+            "VM_READ",
+            "VM_WRITE",
+            "CREATE_THREAD",
+            "DUP_HANDLE",
+            "SUSPEND_RESUME",
+            "WRITE_DAC",
+        ] {
+            assert!(
+                out.contains(&format!("OPEN {what} Err({ERROR_ACCESS_DENIED})")),
+                "{what} was not refused:\n{out}"
+            );
+        }
+        assert!(out.contains("OPEN QUERY Ok(())"), "{out}");
+        assert!(out.contains("OPEN TERMINATE Ok(())"), "{out}");
+        // VM_WRITE, refused to the miner too.
+        assert_eq!(by_miner, [Ok(()), Ok(()), Err(ERROR_ACCESS_DENIED)]);
+        assert!(still_alive, "the probe ended the other worker");
+    }
+
+    /// `cmd /c mklink /J link target`: a junction, which a Low process may make (to a directory it
+    /// can write) where a Low directory should be.
+    fn junction(link: &Path, target: &Path) {
+        let ok = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "mklink /J {}", link.display());
+    }
+
+    /// A file and a junction planted where Low directories go are replaced by directories, the
+    /// junction's target left as it was (not emptied, not made Low-writable); a junction where a
+    /// directory is to be labelled for the environment is refused, not followed.
+    #[test]
+    fn low_dirs_are_repaired_and_links_never_followed() {
+        let root = std::env::temp_dir().join(format!("zkminer-low-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (local, home) = (root.join("local"), root.join("home"));
+        let worker = local.join("zkminer").join("worker");
+        std::fs::create_dir_all(&worker).unwrap();
+        let medium = root.join("medium");
+        std::fs::create_dir_all(&medium).unwrap();
+        std::fs::write(medium.join("kept"), b"x").unwrap();
+        std::fs::write(worker.join("neo"), b"planted").unwrap();
+        junction(&worker.join("sycl"), &medium);
+        std::fs::create_dir_all(home.join(".zkminer")).unwrap();
+        junction(&home.join(".zkminer").join("locks"), &medium);
+
+        let dirs = prepare_low_dirs(&local, &home).unwrap();
+        for name in ["neo", "sycl"] {
+            let m = std::fs::symlink_metadata(worker.join(name)).unwrap();
+            assert!(
+                m.is_dir() && !is_reparse_point(&m),
+                "{name} is not a plain directory"
+            );
+        }
+        let locks = std::fs::symlink_metadata(home.join(".zkminer").join("locks")).unwrap();
+        assert!(locks.is_dir() && !is_reparse_point(&locks));
+        assert!(dirs.contains(&("SYCL_CACHE_DIR", worker.join("sycl"))));
+        assert!(
+            medium.join("kept").exists(),
+            "the junction's target was emptied"
+        );
+
+        // A link where an environment's directory goes: refused.
+        let env_link = root.join("segments");
+        junction(&env_link, &medium);
+        let refused = label_low_writable(&env_link).unwrap_err().to_string();
+        assert!(refused.contains("a link"), "{refused}");
+
+        // At Low: the repaired directory is writable, the junction's old target is not.
+        let mut child = low_helper_child(
+            "windows_sandbox::tests::low_helper",
+            &[
+                (HELPER, "low".into()),
+                ("ZKMINER_TEST_PARENT", std::process::id().to_string()),
+                (
+                    "ZKMINER_TEST_SECRET",
+                    root.join("none").display().to_string(),
+                ),
+                (
+                    "ZKMINER_TEST_JOURNAL",
+                    root.join("none").display().to_string(),
+                ),
+                (
+                    "ZKMINER_TEST_LOW_DIR",
+                    worker.join("sycl").display().to_string(),
+                ),
+                ("ZKMINER_TEST_MEDIUM_DIR", medium.display().to_string()),
+            ],
+        );
+        let out = read_all(&mut child);
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(status.success(), "{status:?}\n{out}");
+        assert!(out.contains("WRITE_LOW Ok(())"), "{out}");
+        assert!(out.contains("WRITE_MEDIUM Err(Some(5))"), "{out}");
     }
 
     /// LocalSystem, LocalService and NetworkService are refused whatever their elevation, unless

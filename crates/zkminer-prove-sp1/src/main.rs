@@ -388,6 +388,25 @@ fn main() {
         return;
     }
 
+    // `--install-bundled-server`: install the server shipped beside this worker and exit. For the
+    // Windows miner, before this worker's first start at Low integrity, which cannot write
+    // `~/.sp1/bin` (`windows_sandbox::install_sp1_server`). No IPC, GPU, network or guest.
+    if args
+        .iter()
+        .any(|a| a == zkminer_prover_protocol::types::INSTALL_BUNDLED_SERVER_ARG)
+    {
+        tracing_subscriber::fmt()
+            .with_writer(io::stderr)
+            .with_env_filter("info")
+            .init();
+        bundled_server::install_bundled_server();
+        if let Some(failure) = bundled_server::install_failure() {
+            eprintln!("{failure}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // CRITICAL: Save the real stdout FD for IPC before anything can pollute it.
     // The SP1 SDK's gnark CGO library (Go code) may print to stdout (FD 1),
     // which would corrupt the bincode IPC stream. We dup stdout for IPC,
