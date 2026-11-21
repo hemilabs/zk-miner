@@ -362,6 +362,40 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
     }
 }
 
+/// Windows: what to say of the account this runs as (`windows_sandbox::account_risk`), as `run`
+/// would treat it: a service account fails (`run` refuses it, unless `allowed`), an elevated token
+/// warns.
+#[cfg(windows)]
+fn account_finding(
+    risk: Option<zkminer_prover::windows_sandbox::AccountRisk>,
+    allowed: bool,
+) -> (Level, String) {
+    use zkminer_prover::windows_sandbox::{AccountRisk, ALLOW_PRIVILEGED_ACCOUNT_ENV};
+    match risk {
+        Some(AccountRisk::ServiceAccount(account)) => (
+            Level::Fail,
+            format!(
+                "{account}: `zkminer run` {} as it: every prover worker would run as {account} \
+                 too, and the miner could keep none of them from its key. Run the miner as a \
+                 dedicated standard user (README: Windows service)",
+                if allowed {
+                    format!("runs ({ALLOW_PRIVILEGED_ACCOUNT_ENV}=1), paged,")
+                } else {
+                    "refuses to run".to_string()
+                }
+            ),
+        ),
+        Some(AccountRisk::Elevated) => (
+            Level::Warn,
+            "elevated (administrator rights): the prover workers would be too, so a requester's \
+             guest that broke out of one would be an administrator of this PC. Run the miner \
+             from a console that is not elevated, or as a dedicated standard user"
+                .to_string(),
+        ),
+        None => (Level::Pass, "a standard account, not elevated".to_string()),
+    }
+}
+
 fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     report.section("This host");
     let home = super::run::zkminer_home();
@@ -396,6 +430,18 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
         report.say(level, "user", detail);
         let (level, detail) = worker_memory_verdict();
         report.say(level, "worker memory", detail);
+    }
+    #[cfg(windows)]
+    {
+        use zkminer_prover::windows_sandbox as sandbox;
+        let (level, detail) = match sandbox::account_risk() {
+            Ok(risk) => account_finding(risk, sandbox::privileged_account_allowed()),
+            Err(e) => (
+                Level::Warn,
+                format!("could not be read from this process's token ({e})"),
+            ),
+        };
+        report.say(level, "account", detail);
     }
     if super::run::stop_request_path().exists() {
         report.say(
@@ -1066,6 +1112,31 @@ mod tests {
             "{}",
             found[1].1
         );
+    }
+
+    /// Windows: a service account fails (refused, or run paged with the override), an elevated
+    /// token warns, a standard one passes.
+    #[cfg(windows)]
+    #[test]
+    fn doctor_reports_a_privileged_account() {
+        use zkminer_prover::windows_sandbox::{AccountRisk, ALLOW_PRIVILEGED_ACCOUNT_ENV};
+        let (level, text) =
+            account_finding(Some(AccountRisk::ServiceAccount("LocalSystem")), false);
+        assert_eq!(level, Level::Fail);
+        assert!(
+            text.contains("LocalSystem")
+                && text.contains("refuses")
+                && text.contains("standard user"),
+            "{text}"
+        );
+        let (level, text) =
+            account_finding(Some(AccountRisk::ServiceAccount("NetworkService")), true);
+        assert_eq!(level, Level::Fail);
+        assert!(text.contains(ALLOW_PRIVILEGED_ACCOUNT_ENV), "{text}");
+        let (level, text) = account_finding(Some(AccountRisk::Elevated), false);
+        assert_eq!(level, Level::Warn);
+        assert!(text.contains("elevated"), "{text}");
+        assert_eq!(account_finding(None, false).0, Level::Pass);
     }
 
     #[test]

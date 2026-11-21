@@ -446,21 +446,44 @@ Worth knowing:
   rarely waits that long, and whatever it cuts off keeps its locks. So stop the miner first
   and let it finish, or `zkminer stop --abandon`, or, for maintenance you'll be back from
   soon, `zkminer stop --keep-locks --wait && sudo systemctl stop zkminer` (within the 10 s
-  before systemd restarts it). On Windows, a miner run as a service keeps its `.zkminer` in
-  the service account's profile (for LocalSystem,
-  `C:\Windows\System32\config\systemprofile\.zkminer`), so run `zkminer stop` as that
-  account (`psexec -s` for LocalSystem). Give a service its key in a key file
-  (`key_source = "file"`), never in its environment: NSSM keeps `AppEnvironmentExtra` in
-  `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters` and `setx /M` keeps a variable
-  in the machine's environment, and every user of the PC can read both. Create the key as the
-  service account: `zkminer init --generate-key` run as that account writes it to its
-  `.zkminer` with an ACL for that account and SYSTEM only. For a key file made another way,
-  `icacls <file> /inheritance:r /grant:r <account>:R` leaves only that account on it.
-  `zkminer doctor` and the miner's start-up say when the key's variable is kept in the
-  machine's, a service's or the user's environment. A service wrapper's stop (NSSM sends Ctrl+C, then
-  kills the process after its timeout) starts a drain it then cuts off: run `zkminer stop
-  --wait` (as the service account) before stopping the service, or give NSSM a timeout long
-  enough for a drain (`nssm set <service> AppStopMethodConsole 3900000`).
+  before systemd restarts it). For a Windows service, see the next point.
+- **A Windows service runs as a dedicated standard user, with its key in a file.** The miner's
+  workers run requesters' guest programs as the account the miner runs as, so give the miner an
+  account of its own with no other rights. `zkminer run` refuses LocalSystem, LocalService and
+  NetworkService (NSSM's default is LocalSystem): a guest that broke out of a worker would have
+  that account's rights, and under LocalSystem the miner could not keep any worker from its key.
+  `ZKMINER_DANGEROUSLY_ALLOW_PRIVILEGED_ACCOUNT=1` runs it anyway, paged at every start. An
+  elevated (administrator) console is paged too, not refused. From an administrator console:
+
+  ```
+  net user zkminer * /add
+  nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
+  nssm set zkminer ObjectName .\zkminer <password>
+  nssm set zkminer AppStopMethodConsole 3900000
+  ```
+
+  Install the miner and its workers in a directory only administrators can write
+  (`C:\Program Files\zkminer`), not in a new folder under `C:\`, which every local user can
+  write to. NSSM grants the account "Log on as a service". Its home is `C:\Users\zkminer`, so the
+  miner keeps its `.zkminer` there; run `zkminer` commands for it as that account (`runas
+  /user:zkminer cmd`, then `zkminer init`, `zkminer doctor`, `zkminer stop`). Give it its key in
+  a key file (`key_source = "file"`), never in its environment: NSSM keeps `AppEnvironmentExtra`
+  in `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters` and `setx /M` keeps a
+  variable in the machine's environment, and every user of the PC can read both. `zkminer init
+  --generate-key --network <network>` run as the account writes the key to its `.zkminer` with
+  an ACL for that account and SYSTEM only; for a key file made another way, `icacls <file>
+  /inheritance:r /grant:r zkminer:R` leaves only the account on it. `zkminer doctor` says when
+  the miner's account is refused or elevated, and when the key's variable is kept in the
+  machine's, a service's or the user's environment; the miner's start-up pages both.
+
+  Moving from LocalSystem: stop the old service with `zkminer stop --wait` run as LocalSystem
+  (`psexec -s`; its home was `C:\Windows\System32\config\systemprofile\.zkminer`) so it finishes
+  or releases its locks, then change the account. A miner started in the new account's home does
+  not see the old journal, so locks kept there are never driven. Consider a key that was in
+  `AppEnvironmentExtra` exposed. A service wrapper's stop (NSSM sends Ctrl+C, then kills the
+  process after its timeout) starts a drain it then cuts off: run `zkminer stop --wait` (as the
+  service account) before stopping the service, or keep NSSM's timeout long enough for a drain
+  (`AppStopMethodConsole` above).
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in
