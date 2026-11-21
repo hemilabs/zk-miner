@@ -625,10 +625,12 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
         (" SLASHED ", theme::red())
     } else if state.paused {
         (" PAUSED ", theme::yellow())
-    } else if state.connected {
-        ("  UP  ", theme::green())
     } else {
-        (" DOWN ", theme::red())
+        match state.chain_link() {
+            crate::state::ChainLink::Up => ("  UP  ", theme::green()),
+            crate::state::ChainLink::Stale(_) => (" STALE ", theme::yellow()),
+            crate::state::ChainLink::Down => (" DOWN ", theme::red()),
+        }
     };
 
     let mut lines: Vec<Line> = vec![

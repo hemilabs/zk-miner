@@ -963,16 +963,22 @@ fn draw(f: &mut Frame, state: &MinerState) {
     // --- Status bar ---
     let mut left_spans: Vec<Span> = Vec::new();
 
-    // Connection badge
-    if state.connected {
-        left_spans.push(Span::styled(" CONNECTED ", theme::badge_ok()));
-    } else {
-        let badge = if state.tick_count.is_multiple_of(2) {
-            theme::badge_error()
-        } else {
-            theme::error()
-        };
-        left_spans.push(Span::styled(" DISCONNECTED ", badge));
+    // Connection badge, from the age of the last successful chain read
+    match state.chain_link() {
+        crate::state::ChainLink::Up => {
+            left_spans.push(Span::styled(" CONNECTED ", theme::badge_ok()));
+        }
+        crate::state::ChainLink::Stale(age) => {
+            left_spans.push(Span::styled(format!(" STALE {age}s "), theme::badge_warn()));
+        }
+        crate::state::ChainLink::Down => {
+            let badge = if state.tick_count.is_multiple_of(2) {
+                theme::badge_error()
+            } else {
+                theme::error()
+            };
+            left_spans.push(Span::styled(" DISCONNECTED ", badge));
+        }
     }
 
     // Developer mode: never on a public market, so it is never out of sight.
