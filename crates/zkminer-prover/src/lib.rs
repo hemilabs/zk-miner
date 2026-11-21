@@ -12,6 +12,8 @@ pub mod memory;
 pub mod registry;
 pub mod sp1_shard_caps;
 #[cfg(windows)]
+pub mod windows_account;
+#[cfg(windows)]
 mod windows_gpu_memory;
 #[cfg(windows)]
 mod windows_job;

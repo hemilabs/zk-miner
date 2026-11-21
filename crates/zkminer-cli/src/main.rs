@@ -583,6 +583,22 @@ fn main() -> Result<()> {
             }
             Err(e) => eprintln!("warning: could not tell which account the miner runs as ({e})"),
         }
+        // Every privilege but traverse checking and two GPU runtimes may use, removed for good
+        // before any thread or child starts: a service logon's SeImpersonatePrivilege (the SERVICE
+        // group's) would let a requester's guest that broke out of a worker reach SYSTEM. Each
+        // worker's token is a copy of this one, and is checked again before it runs.
+        if let Err(e) = zkminer_prover::windows_account::strip_this_process() {
+            if !sandbox::privileged_account_allowed() {
+                anyhow::bail!(
+                    "refusing to run: this process's privileges could not be removed ({e}), and \
+                     its prover workers would hold them too (with SeImpersonatePrivilege, a \
+                     requester's guest that broke out of one could reach SYSTEM). Run the miner \
+                     as a dedicated standard user (README: Windows service). To run anyway, \
+                     accepting that, set {}=1",
+                    sandbox::ALLOW_PRIVILEGED_ACCOUNT_ENV
+                );
+            }
+        }
     }
     // `--password-fd N` is taken now, while every open descriptor above 2 is one the caller passed:
     // once the runtime, the network guard or a connection has opened its own, a number the caller

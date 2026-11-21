@@ -396,6 +396,47 @@ fn account_finding(
     }
 }
 
+/// Windows: what to say of the privileges this account's token holds (`held`), and of a dry run of
+/// the strip `run` does at start-up (`strip`: the names it removes, or why it failed).
+#[cfg(windows)]
+fn privilege_finding(held: &[String], strip: Result<Vec<String>, String>) -> (Level, String) {
+    use zkminer_prover::windows_account::{dangerous, KEPT_PRIVILEGES};
+    use zkminer_prover::windows_sandbox::ALLOW_PRIVILEGED_ACCOUNT_ENV;
+    let dangerous = dangerous(held);
+    match strip {
+        Err(e) => (
+            Level::Fail,
+            format!(
+                "they could not be removed from a copy of this token ({e}): `zkminer run` refuses \
+                 to start (unless {ALLOW_PRIVILEGED_ACCOUNT_ENV}=1), as its workers would keep \
+                 them{}",
+                if dangerous.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} among them", dangerous.join(", "))
+                }
+            ),
+        ),
+        Ok(_) if !dangerous.is_empty() => (
+            Level::Warn,
+            format!(
+                "held by this account: {}. `zkminer run` removes them from itself and its workers \
+                 at start-up; for a service, `sc privs <service> {}` removes them from the service \
+                 wrapper too (README: Windows service)",
+                dangerous.join(", "),
+                KEPT_PRIVILEGES.join("/")
+            ),
+        ),
+        Ok(_) => (
+            Level::Pass,
+            format!(
+                "none that would make a worker an administrator; `zkminer run` keeps only {}",
+                KEPT_PRIVILEGES.join(", ")
+            ),
+        ),
+    }
+}
+
 /// Windows: what to say of the Low-integrity workers (`windows_sandbox`): whether they are on
 /// (`on`), the flag's value if it is set to something other than `1` (`misset`), and the Low
 /// directories found to be a file or a link (`tampered`).
@@ -487,6 +528,17 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             ),
         };
         report.say(level, "account", detail);
+        let (level, detail) = match zkminer_prover::windows_account::this_process_privileges() {
+            Ok(held) => privilege_finding(
+                &held,
+                zkminer_prover::windows_account::strip_check().map_err(|e| e.to_string()),
+            ),
+            Err(e) => (
+                Level::Warn,
+                format!("could not be read from this process's token ({e})"),
+            ),
+        };
+        report.say(level, "privileges", detail);
         let on = sandbox::low_il_workers();
         let tampered = if on {
             sandbox::low_dirs_tampered()
@@ -1193,6 +1245,31 @@ mod tests {
         assert_eq!(level, Level::Warn);
         assert!(text.contains("elevated"), "{text}");
         assert_eq!(account_finding(None, false).0, Level::Pass);
+    }
+
+    /// Windows: SeImpersonate (a service logon's) warns, naming `sc privs`; a strip that fails
+    /// fails; a token with none of the dangerous privileges passes.
+    #[cfg(windows)]
+    #[test]
+    fn doctor_reports_dangerous_privileges() {
+        let held: Vec<String> = ["SeChangeNotifyPrivilege", "SeImpersonatePrivilege"]
+            .map(String::from)
+            .to_vec();
+        let (level, text) = privilege_finding(&held, Ok(vec!["SeImpersonatePrivilege".into()]));
+        assert_eq!(level, Level::Warn);
+        assert!(
+            text.contains("SeImpersonatePrivilege") && text.contains("sc privs"),
+            "{text}"
+        );
+        let (level, text) = privilege_finding(&held, Err("denied".into()));
+        assert_eq!(level, Level::Fail);
+        assert!(
+            text.contains("refuses") && text.contains("SeImpersonate"),
+            "{text}"
+        );
+        let (level, text) = privilege_finding(&held[..1], Ok(Vec::new()));
+        assert_eq!(level, Level::Pass);
+        assert!(text.contains("SeChangeNotifyPrivilege"), "{text}");
     }
 
     /// Windows' Low-integrity workers as doctor reports them: on (failing closed), off, a flag

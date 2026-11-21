@@ -461,7 +461,14 @@ Worth knowing:
   nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
   nssm set zkminer ObjectName .\zkminer <password>
   nssm set zkminer AppStopMethodConsole 3900000
+  sc privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
   ```
+
+  A service logon gives the account `SeImpersonatePrivilege` through the SERVICE group, and with
+  it a guest that broke out of a worker could make itself SYSTEM. `sc privs` leaves the service
+  (NSSM included) only the three privileges named. Whatever the service is given, `zkminer run`
+  removes every other privilege from itself at start-up and from each worker before it runs; a
+  worker that still holds a dangerous one is not started (`PAGE: WORKER-PRIVILEGES`).
 
   Install the miner and its workers in a directory only administrators can write
   (`C:\Program Files\zkminer`), not in a new folder under `C:\`, which every local user can
@@ -474,7 +481,8 @@ Worth knowing:
   --generate-key --network <network>` run as the account writes the key to its `.zkminer` with
   an ACL for that account and SYSTEM only; for a key file made another way, `icacls <file>
   /inheritance:r /grant:r zkminer:R` leaves only the account on it. `zkminer doctor` says when
-  the miner's account is refused or elevated, and when the key's variable is kept in the
+  the miner's account is refused or elevated, which dangerous privileges it holds, and when the
+  key's variable is kept in the
   machine's, a service's or the user's environment; the miner's start-up pages both.
 
   `ZKMINER_WINDOWS_LOW_IL_WORKERS=1` (off by default, as not every GPU runtime is known to work
