@@ -115,4 +115,4 @@ their round and are covered (the live forge test; the NAT64 caps).
    (measured on this project's IPv4 home path: every such connection timed out). It is pinned to
    the probes' source address, interface and IPv6 flow label; a per-connection multi-WAN
    balancer routing connections over unequal paths can send it another way than its probe (lab:
-   4 of 13 reached the near host), a documented residual as before the S3 review.
+   4 of 13 and 8 of 17 reached the near host), a documented residual as before the S3 review.

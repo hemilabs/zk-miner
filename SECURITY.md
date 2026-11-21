@@ -826,8 +826,8 @@ no second one):
     probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
     probe's port timed out, a new port connected at once). A per-connection multi-WAN balancer
     (mwan3 style) that routes connections over unequal paths can therefore send the connection another way than its probe:
-    in the lab, with paths of 2 and 4 hops to the same near host, 4 of 13 connections after a far
-    verdict reached it over the 2-hop path (with the probe's port reused, 0 of 18). The same
+    in the lab, with paths of 2 and 4 hops to the same near host, 4 of 13 and 8 of 17 connections
+    after a far verdict (two runs) reached it over the 2-hop path (with the probe's port reused, 0 of 18). The same
     residual as before the S3 review.
   - **What the probes cost.** A near host does receive the probes' SYNs (and answers them: a
     handshake or a reset, never data) before the connection is refused. A transparent proxy
