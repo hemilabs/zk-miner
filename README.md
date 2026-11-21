@@ -550,8 +550,12 @@ Worth knowing:
   start at Low is never started at Medium instead; its slot proves nothing, with `PAGE:
   LOW-IL-WORKER-FAILED` naming the worker binary and its last words (`PAGE: LOW-IL-WARMUP-FAILED`
   for one whose warm-up fails), and the miner tries it again at Low with back-off. A job whose
-  proof the miner has died in the middle of three runs in a row (a crash, or a guest that broke
-  out and ended it) is released, with `PAGE: JOB-CRASH-LOOP`, rather than proven again. If a zkVM
+  proof (once a worker accepted it) the miner has died in the middle of three runs in a row (a
+  crash, or a guest that broke out and ended it) is released, with `PAGE: JOB-CRASH-LOOP`, rather
+  than proven again, and is not claimed again for a week (nor its submitter's jobs of the same
+  program for a day). No job is claimed and no proof started while the journal cannot be saved or
+  `~/.zkminer`'s disk has less than 2 GiB free (`PAGE: JOURNAL-UNWRITABLE`, `PAGE: DISK-LOW`):
+  a proof whose start is not recorded would never reach that limit. If a zkVM
   works on your card only at Medium, `ZKMINER_WINDOWS_LOW_IL_WORKERS=0` runs every worker at
   Medium, where a guest that breaks out can read the key: it is paged at every start (`PAGE:
   MEDIUM-WORKERS`) and `zkminer doctor` warns.
