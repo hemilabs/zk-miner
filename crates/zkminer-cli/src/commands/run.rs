@@ -39,7 +39,8 @@ mod segment_disk;
 /// The slash latch: after a slash, no new claims until `zkminer resume-claims` (review r6 M6-1).
 pub(crate) mod slash_latch;
 
-/// Pages when the chain is lost while locks are held (review r6 D2).
+/// Pages when the chain is lost while locks are held (review r6 D2), and on Windows recycles the
+/// workers when that lasts (G-1).
 mod chain_watch;
 
 /// A miner run as root: a `PAGE:` on a bare host (review r4 LD2).
@@ -4649,7 +4650,7 @@ pub async fn run(
     });
     // Chain-loss pages and the outage worker recycle; nothing to watch in a watch-only run.
     let watch_handle = (!watch_only())
-        .then(|| chain_watch::spawn(state.clone(), journal.clone()));
+        .then(|| chain_watch::spawn(state.clone(), journal.clone(), client.rpc_meter()));
 
     // Escalating shutdown. Each signal advances one stage:
     //   1st -> DRAIN   : stop claiming, let in-flight proofs FINISH and fulfil.

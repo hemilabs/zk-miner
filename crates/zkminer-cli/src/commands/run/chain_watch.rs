@@ -15,8 +15,20 @@
 //!   which needs no RPC.
 //!
 //! Nothing is paged while no lock is held: an idle miner that lost the chain loses nothing.
+//!
+//! On Windows the watch also recycles the workers (review r6 G-1). A Low-integrity worker keeps the
+//! network, so one whose guest broke out of its executor can cut the miner off its RPC without
+//! ending it (the host's ephemeral ports held open, or the uplink flooded): nothing crashes, so the
+//! crash-loop guard never counts it, and every lock runs to a slash. When no chain read has
+//! succeeded for [`RECYCLE_AFTER`] while locks are held and workers run, and the endpoint is not
+//! answering with rate limits (an answer is a working link), every worker is stopped
+//! (`PAGE: WORKERS-RECYCLED`); each starts again when next dispatched. An honest outage must not
+//! churn the cards: at most once per outage, and at least [`RECYCLE_GAP_FIRST`] between two,
+//! doubling up to [`RECYCLE_GAP_MAX`] while recycles do not bring the chain back. On Linux a
+//! confined worker has no socket at all, so it is not done there.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::B256;
@@ -30,6 +42,24 @@ pub(crate) const UNREACHABLE_REPEAT: Duration = Duration::from_secs(5 * 60);
 
 /// How often the watch looks.
 const TICK: Duration = Duration::from_secs(5);
+
+/// Whether an outage recycles the workers: where they can reach the network (see the module docs).
+const RECYCLE_ON_OUTAGE: bool = cfg!(windows);
+
+/// No chain read for this long, with locks held and workers running, recycles the workers. Long
+/// enough that an honest blip never kills a proof, short of the shortest lock's deadline plus grace
+/// (about 35 min) by more than the release margin, so a recycle that frees the link still leaves
+/// time to release.
+pub(crate) const RECYCLE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// The least time between two recycles, after one that brought the chain back.
+pub(crate) const RECYCLE_GAP_FIRST: Duration = Duration::from_secs(30 * 60);
+
+/// The most the gap between two recycles grows to while recycles do not bring the chain back.
+pub(crate) const RECYCLE_GAP_MAX: Duration = Duration::from_secs(4 * 3600);
+
+/// A chain back within this of a recycle counts as the recycle having helped.
+const RECYCLE_HELPED_WITHIN: Duration = Duration::from_secs(2 * 60);
 
 /// A lock on record: its job and its recorded cutoff (unix seconds, 0 unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +95,12 @@ pub(crate) struct Watch {
     /// Locks paged at risk in this outage: the time that was left when first paged, and whether the
     /// second page went out.
     at_risk: HashMap<B256, (u64, bool)>,
+    /// Whether this outage already recycled the workers.
+    recycled_this_outage: bool,
+    /// When the workers were last recycled.
+    last_recycle: Option<Instant>,
+    /// The least time before the next recycle.
+    recycle_gap: Duration,
 }
 
 impl Watch {
@@ -74,7 +110,37 @@ impl Watch {
             outage: None,
             paged: None,
             at_risk: HashMap::new(),
+            recycled_this_outage: false,
+            last_recycle: None,
+            recycle_gap: RECYCLE_GAP_FIRST,
         }
+    }
+
+    /// Whether to recycle the workers now (and, if so, recorded as done). `holding`: a lock is on
+    /// record. `workers_running`: a prove worker is up. `rate_limited`: the endpoint answered with a
+    /// rate limit lately, so the link works and the outage is its quota.
+    pub(crate) fn recycle_due(
+        &mut self,
+        now: Instant,
+        age: Option<Duration>,
+        holding: bool,
+        workers_running: bool,
+        rate_limited: bool,
+    ) -> bool {
+        let age = age.unwrap_or_else(|| now.saturating_duration_since(self.started));
+        let due = age >= RECYCLE_AFTER
+            && holding
+            && workers_running
+            && !rate_limited
+            && !self.recycled_this_outage
+            && self
+                .last_recycle
+                .is_none_or(|t| now.saturating_duration_since(t) >= self.recycle_gap);
+        if due {
+            self.recycled_this_outage = true;
+            self.last_recycle = Some(now);
+        }
+        due
     }
 
     /// One look. `age`: since the last successful refresh (`None`: none yet). `held`: the journal's
@@ -95,6 +161,18 @@ impl Watch {
                     out.push(Action::Restored {
                         secs: now.saturating_duration_since(since).as_secs() + age.as_secs(),
                     });
+                }
+                // A recycle the chain came back right after keeps the shortest gap: a worker held
+                // the link. One that changed nothing was an honest outage: wait longer next time.
+                if std::mem::take(&mut self.recycled_this_outage) {
+                    let helped = self.last_recycle.is_some_and(|t| {
+                        now.saturating_duration_since(t) <= RECYCLE_HELPED_WITHIN + age
+                    });
+                    self.recycle_gap = if helped {
+                        RECYCLE_GAP_FIRST
+                    } else {
+                        (self.recycle_gap * 2).min(RECYCLE_GAP_MAX)
+                    };
                 }
             }
             self.paged = None;
@@ -182,11 +260,34 @@ pub(crate) fn describe(a: &Action, margin: u64) -> String {
     }
 }
 
+/// The page for a recycle after `secs` without a chain read, with `locks` held.
+pub(crate) fn describe_recycle(secs: u64, locks: usize) -> String {
+    format!(
+        "PAGE: WORKERS-RECYCLED — no chain read for {secs}s with {locks} lock(s) held and workers \
+         running: stopping every worker (each starts again when next needed) in case one of them is \
+         holding this host's network. Proofs in flight are retried. Once per outage; if the chain \
+         stays unreachable, the link or the RPC is down"
+    )
+}
+
+/// Stop every worker, off the runtime (`WorkerPool::shutdown_all` waits for busy slots to free).
+/// Each slot is respawned by the next dispatch to it, prove and measure alike.
+fn recycle_workers() {
+    let Some(pool) = zkminer_prover::engine::worker_pool() else {
+        return;
+    };
+    tokio::task::spawn_blocking(move || {
+        pool.shutdown_all();
+        tracing::warn!("workers recycled after the chain outage; they start again on demand");
+    });
+}
+
 /// Run the watch until aborted: every few seconds, the age of the last refresh and the journal's
-/// locks, and the pages they call for.
+/// locks, and the pages (and, on Windows, the worker recycle) they call for.
 pub(crate) fn spawn(
     state: zkminer_tui::state::SharedState,
     journal: super::SharedJournal,
+    meter: Arc<zkminer_chain::rpc_meter::RpcMeter>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let margin = super::DEADLINE_RELEASE_MARGIN_SECS;
@@ -210,7 +311,25 @@ pub(crate) fn spawn(
                     .collect()
             };
             let chain_now = zkminer_chain::client::chain_now();
-            for a in watch.step(Instant::now(), age, &held, chain_now, margin) {
+            let now = Instant::now();
+            let workers_running = zkminer_prover::engine::worker_pool()
+                .is_some_and(|p| !p.connected_backends().is_empty());
+            // Not while stopping: the shutdown reaps the workers itself.
+            if RECYCLE_ON_OUTAGE
+                && !super::SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
+                && watch.recycle_due(
+                    now,
+                    age,
+                    !held.is_empty(),
+                    workers_running,
+                    meter.rate_limited_within(super::RPC_BACKOFF_WINDOW),
+                )
+            {
+                let secs = age.map_or(0, |a| a.as_secs());
+                tracing::error!("{}", describe_recycle(secs, held.len()));
+                recycle_workers();
+            }
+            for a in watch.step(now, age, &held, chain_now, margin) {
                 let text = describe(&a, margin);
                 match a {
                     Action::Restored { .. } => tracing::warn!("{text}"),
@@ -341,6 +460,62 @@ mod tests {
         assert!(w
             .step(t0, Some(secs(10)), &[lock(1, 10_100)], 10_000, MARGIN)
             .is_empty());
+    }
+
+    #[test]
+    fn workers_are_recycled_once_per_long_outage_with_locks_held_and_workers_running() {
+        let t0 = Instant::now();
+        let mut w = Watch::new(t0);
+        // Not before RECYCLE_AFTER, without locks, without workers, or while the endpoint answers
+        // with rate limits.
+        assert!(!w.recycle_due(t0, Some(secs(599)), true, true, false));
+        assert!(!w.recycle_due(t0, Some(secs(700)), false, true, false));
+        assert!(!w.recycle_due(t0, Some(secs(700)), true, false, false));
+        assert!(!w.recycle_due(t0, Some(secs(700)), true, true, true));
+        assert!(w.recycle_due(t0, Some(secs(700)), true, true, false));
+        // Once per outage, however long it lasts.
+        for i in 1..100 {
+            assert!(!w.recycle_due(
+                t0 + secs(i * 60),
+                Some(secs(700 + i * 60)),
+                true,
+                true,
+                false
+            ));
+        }
+    }
+
+    #[test]
+    fn an_honest_outage_backs_the_recycle_off_and_a_helpful_one_does_not() {
+        let t0 = Instant::now();
+        let held = [lock(1, 0)];
+        let mut w = Watch::new(t0);
+        // Outage 1: recycled at 10 min, the chain back only 20 min later (the recycle did nothing).
+        w.step(t0, Some(secs(600)), &held, 0, MARGIN);
+        assert!(w.recycle_due(t0, Some(secs(600)), true, true, false));
+        w.step(t0 + secs(1_200), Some(secs(5)), &held, 0, MARGIN);
+        assert_eq!(w.recycle_gap, RECYCLE_GAP_FIRST * 2);
+        // Outage 2 starts at once: no recycle until the doubled gap since the last has passed.
+        let t1 = t0 + secs(1_200);
+        w.step(t1 + secs(600), Some(secs(600)), &held, 0, MARGIN);
+        assert!(!w.recycle_due(t1 + secs(600), Some(secs(600)), true, true, false));
+        let t2 = t0 + RECYCLE_GAP_FIRST * 2;
+        assert!(w.recycle_due(t2, Some(secs(3_000)), true, true, false));
+        // ... and this time the chain is back a minute later: the shortest gap again.
+        w.step(t2 + secs(60), Some(secs(5)), &held, 0, MARGIN);
+        assert_eq!(w.recycle_gap, RECYCLE_GAP_FIRST);
+        // The gap never grows past its ceiling.
+        for _ in 0..10 {
+            w.recycle_gap = (w.recycle_gap * 2).min(RECYCLE_GAP_MAX);
+        }
+        assert_eq!(w.recycle_gap, RECYCLE_GAP_MAX);
+    }
+
+    #[test]
+    fn the_recycle_is_paged_and_only_where_workers_have_the_network() {
+        let p = describe_recycle(700, 2);
+        assert!(p.starts_with("PAGE: WORKERS-RECYCLED — no chain read for 700s with 2 lock(s)"));
+        assert_eq!(RECYCLE_ON_OUTAGE, cfg!(windows));
     }
 
     #[test]
