@@ -436,6 +436,11 @@ impl ArtifactReader {
         }
         let n = m.chunks.len() as u32;
         if *charged != Some((m.length, n)) {
+            // The miner takes one charge per fetch (a second is a protocol violation): a manifest
+            // whose cost changed between two reads of one fetch ends it.
+            if charged.is_some() {
+                return Read::Fail(ArtifactFailure::Endpoint);
+            }
             if !charge(m.length, n).await {
                 return Read::Fail(ArtifactFailure::Budget);
             }

@@ -13,7 +13,8 @@
 //! name an endpoint index; the connector resolves, admits (netguard's floor with the miner's facts)
 //! and connects, and hands back the connected socket. A broker that breaks the protocol is cut off:
 //! the socket is closed, the miner pages (`WITNESS-BROKER-CUT-OFF`) and kills the broker's cgroup,
-//! and witness serving stops. So is a broker that closes its connector socket and is still running
+//! and witness serving stops. So is a broker that breaks the control protocol ([`BrokerClient`]
+//! raises it) or closes its connector socket and is still running
 //! [`BROKER_EXIT_GRACE`] later (an honest one closes it only by exiting). When the session ends,
 //! for any reason, the builder runners registered with the broker
 //! ([`zkminer_witness_broker::client::RunnerCgroups`]) are killed too: a socket the broker passed
@@ -127,6 +128,7 @@ impl BrokerProcess {
         check_chain_rpc_host(&broker_cfg, miner)
             .with_context(|| format!("the broker config {}", config.display()))?;
         let connector = Connector::for_miner(&broker_cfg, &miner_deny, facts_options.clone()).context("the broker's connector")?;
+        let artifact_fetch = broker_cfg.timeouts.artifact_fetch();
         drop(broker_cfg);
         let cgroup = Cgroup::create(
             cgroup_root,
@@ -175,25 +177,34 @@ impl BrokerProcess {
                 })
                 .ok();
         }
-        let client = Arc::new(BrokerClient::new(miner_end).context("broker client")?);
+        let client = Arc::new(BrokerClient::new(miner_end).context("broker client")?.with_artifact_fetch_timeout(artifact_fetch));
         connector.warm_up();
         let cgroup_dir = cgroup.path().to_path_buf();
         let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let session = tokio::spawn({
             let (connector, cut, runners) = (connector.clone(), cut.clone(), client.runners().clone());
+            let violated = client.violated();
             async move {
-                let end = connector.serve(connector_end).await;
-                let why = match &end {
-                    SessionEnd::CutOff(why) => Some(why.to_string()),
+                let serve = connector.serve(connector_end);
+                tokio::pin!(serve);
+                // A broker that broke the control protocol (review r3 W1) is cut off as one that
+                // broke the connector's.
+                let (end, violation) = tokio::select! {
+                    end = &mut serve => (Some(end), None),
+                    why = violated => (None, Some(why)),
+                };
+                let why = match (&end, violation) {
+                    (_, Some(v)) => Some(format!("it broke the control protocol: {v}")),
+                    (Some(SessionEnd::CutOff(why)), None) => Some(why.to_string()),
                     // An honest broker closes its connector socket only by exiting.
-                    SessionEnd::Closed if still_running(&cgroup_dir, BROKER_EXIT_GRACE).await => {
+                    (Some(SessionEnd::Closed), None) if still_running(&cgroup_dir, BROKER_EXIT_GRACE).await => {
                         Some(format!("it closed its connector socket and was still running {BROKER_EXIT_GRACE:?} later"))
                     }
-                    SessionEnd::Closed => None,
+                    (Some(SessionEnd::Closed), None) | (None, None) => None,
                 };
                 if let Some(why) = &why {
                     cut.store(true, Ordering::SeqCst);
-                    // The broker broke the connector's protocol: treat it as compromised.
+                    // The broker broke a protocol: treat it as compromised.
                     let killed = std::fs::write(cgroup_dir.join("cgroup.kill"), "1");
                     tracing::error!("PAGE: WITNESS-BROKER-CUT-OFF: the broker was killed ({why}; cgroup.kill: {killed:?})");
                 }
@@ -204,14 +215,19 @@ impl BrokerProcess {
                 if runners_killed > 0 {
                     tracing::warn!(runners_killed, cut_off = why.is_some(), "the builder runners of the broker's session were killed with it");
                 }
-                end
+                match end {
+                    Some(end) => end,
+                    // The broker was killed: its connector session ends with it.
+                    None => tokio::time::timeout(BROKER_EXIT_GRACE, serve).await.unwrap_or(SessionEnd::Closed),
+                }
             }
         });
         let refresher = Some(tokio::spawn(refresh_facts(client.clone(), facts_options, miner_deny)));
         Ok(Self { child, cgroup: Some(cgroup), client, connector, session: Some(session), cut, refresher })
     }
 
-    /// Whether the connector cut the broker off (it was then killed).
+    /// Whether the broker was cut off (and killed): by the connector, or for breaking the control
+    /// protocol.
     pub fn cut_off(&self) -> bool {
         self.cut.load(Ordering::SeqCst)
     }
@@ -287,7 +303,7 @@ async fn refresh_facts(client: Arc<BrokerClient>, opts: zkminer_netguard::FactsO
                 tracing::debug!(count, "the witness broker's host facts refreshed");
                 sent = now;
             }
-            Err(ClientError::Closed) => return,
+            Err(ClientError::Closed | ClientError::Violation) => return,
             Err(e) => tracing::warn!("network guard: refreshing the witness broker's host facts failed: {e}"),
         }
     }
