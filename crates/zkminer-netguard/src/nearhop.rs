@@ -1,576 +1,576 @@
-//! The near-hop refusal: before every connection made under the floor in public mode, a probe
-//! asks whether the destination answers within a few hops of this host, and a destination that
-//! does is refused.
+//! The near-hop refusal: before every connection made under the floor in public mode, the guard
+//! asks whether the destination is within `[egress] near_hop_limit` hops of this host, and admits
+//! it as far **only on positive evidence, never on silence** (the S3 review, 2026-11:
+//! docs/netguard-hardening.md, "Near-hop rule: positive evidence").
 //!
 //! Some destinations pass every address and route check and are still the operator's own
 //! network: the home router's own global address (its WAN side, reached through the default
 //! route like the internet, and on many routers zoned by input interface, so the LAN reaches its
 //! admin page, DNS and UPnP on it), a NAT64 translator or NAT router that hairpins its own public
 //! address, a cloud VPC neighbour or a campus host reached through the default gateway, the far
-//! side of a tunnel. They have in common that they are near. So each connection is preceded by a
-//! probe ([`TtlProbe`]): a fresh TCP socket whose packets may cross at most `[egress]
-//! near_hop_limit` hops (`IP_TTL` / `IPV6_UNICAST_HOPS`, default 2: the first-hop router and what
-//! sits directly behind it), connecting to the exact destination address and port, for at most
-//! [`PROBE_TIMEOUT`]:
+//! side of a tunnel. They have in common that they are near.
 //!
-//! - **connected**, or **refused** / **reset** (`ECONNREFUSED`, `ECONNRESET`): something within
-//!   that many hops answered for the destination: refused ([`crate::Denied::NearHop`]);
-//! - **host or network unreachable** (`EHOSTUNREACH`, `ENETUNREACH`: on Linux, how an ICMP "time
-//!   exceeded" from the router where the probe ran out of hops ends a connect; on macOS too, as
-//!   long as `net.inet.tcp.icmp_may_rst` is 1, its default, which drops a connection still in
-//!   `SYN_SENT` on such an ICMP error): the destination is farther: the real connection is made,
-//!   on a new socket with the default hop limit;
-//! - **no answer in time**: no evidence either way (a path that filters ICMP, or a near host that
-//!   drops SYNs for a while: a full accept queue, a SYN rate limit, a neighbour being resolved, a
-//!   device waking up). So the destination is **checked once connected**
-//!   ([`NearProbe::confirm`]): a check connection and a control connection are made with the
-//!   default hop limit (no data is ever written on either); the check connection's hop limit is
-//!   then lowered to the probe's for good and both are half-closed: the check's FIN can reach the
-//!   peer only if the peer is within the limit, the control's always does, and a peer that gets a
-//!   FIN acknowledges it. The check's FIN acknowledged, whenever: near, refused. Far only once the
-//!   control's FIN was acknowledged and the check's was not for a few round trips, one
-//!   retransmission and the control's time again (review round 4, probe-1); then the real
-//!   connection is made. A control never acknowledged, a peer that closes or resets first, a check
-//!   connection that fails to connect: refused (the real one would fail the same way). Linux reads
-//!   the FINs' fate from `TCP_INFO`, macOS from `TCP_CONNECTION_INFO`; elsewhere there is no check
-//!   connection, and a probe without an answer refuses;
-//! - **any other error** (a local firewall's `EPERM`/`EACCES`, `EADDRNOTAVAIL`, …): refused.
+//! **The probes** ([`TtlProbe`]). Fresh TCP sockets connect to the exact destination address and
+//! port with hop limits (`IP_TTL` / `IPV6_UNICAST_HOPS`) `N`, `N + 1` and `N + 2` at once, `N` the
+//! limit (default 2: the first-hop router and what sits directly behind it), each from the source
+//! address (and interface) the real connection will use; a second round follows about a second
+//! later when the first decided nothing ([`ROUNDS`], [`ROUND_PAUSE`]). No data is ever written; a
+//! probe that connected is closed with a reset. Unprivileged. What each probe saw
+//! ([`ProbeOutcome`]):
 //!
-//! The probe is closed without sending data (a reset if it connected). Unprivileged.
+//! - **an answer from the destination** (connected, `ECONNREFUSED`, `ECONNRESET`);
+//! - **an ICMP error the kernel matched to that probe** (its 4-tuple and initial sequence number),
+//!   with its type, code and sender: Linux and Android set `IP_RECVERR` / `IPV6_RECVERR` and read
+//!   the error queue (`MSG_ERRQUEUE`: `sock_extended_err`, `SO_EE_ORIGIN_ICMP(6)`, `ee_type`,
+//!   `ee_code`, `SO_EE_OFFENDER`); macOS opens a `SOCK_DGRAM` `IPPROTO_ICMP(V6)` socket before the
+//!   probes and takes a copy only when its quoted destination address and port, source address
+//!   and port and sequence number (the probe's ISN, from the private `TCP_INFO` 0x200) are the
+//!   probe's and the probe socket itself failed with `EHOSTUNREACH` / `ENETUNREACH`;
+//! - an unreachable without a matched ICMP message, no answer at all, or a local failure.
+//!
+//! **The rule** ([`rule`]):
+//!
+//! - **near** (refused, [`crate::Denied::NearHop`]) when the destination answered any probe whose
+//!   hop limit was `N` or less;
+//! - **far** only when some probe with hop limit `t >= N` got an ICMP Time Exceeded, code 0
+//!   (IPv4 11/0, ICMPv6 3/0), matched to it by the kernel, from a unicast, specified sender that
+//!   is not the destination, and the destination answered no probe whose hop limit was `t` or
+//!   less (an answer only at a hop limit above `N` with no Time Exceeded below it is refused);
+//! - **everything else is refused** ([`crate::Denied::NearCheckFailed`]): silence, any
+//!   Destination Unreachable, Time Exceeded code 1, a Time Exceeded sent by the destination
+//!   itself, an unreachable without its ICMP message, inconsistent results, local errors, a
+//!   platform without the ICMP plumbing (Windows today, which refuses every requester connection
+//!   in public mode anyway).
+//!
+//! An answer always dominates an ICMP error queued for the same probe (Linux can queue an error
+//! and still complete the connection: `sk_err_soft` while the socket is owned by the user).
+//!
+//! **The connection that follows** is pinned to the probe that produced the far evidence
+//! ([`FarEvidence::local`], carried by [`crate::Vetted`]): the same source address and local port
+//! (`EADDRINUSE` refuses), the same interface where the platform can bind one (macOS
+//! `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux `IP_UNICAST_IF` / `IPV6_UNICAST_IF`), and on Linux a
+//! fixed IPv6 flow label (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), so a
+//! per-connection balancer hashes it as it hashed the probe. A far verdict is not remembered for
+//! other connections: it belongs to that 4-tuple.
+//!
+//! **What "within `N` hops" means, and what it assumes.** A hop is a router that decrements the hop
+//! count; a Time Exceeded at hop limit `t` proves only that the probe's own path crossed `t`
+//! decrementing routers before the destination. The far verdict holds under four assumptions:
+//! (1) no party that sees the probe's SYN forges ICMP (root on a near host, an on-path or on-link
+//! attacker: a hostile LAN gets no protection from this check, as from any distance test);
+//! (2) routers send Time Exceeded only for packets they forward (RFC 1812 5.3.1), not for their
+//! own addresses reached through policy routing or a VRF leak; (3) the real connection follows
+//! the probe's path (the pin above; a stateless per-packet balancer, a transient loop or a route
+//! change in between can still break it); (4) the kernel's matching of the ICMP error to the probe
+//! (on macOS through a private `TCP_INFO` layout). A box that hides hops (double NAT behind the
+//! ISP's router, a VM's NAT, a VPN, a userspace NAT64) moves the limit: `near_hop_limit` 2 then
+//! does not reach the ISP's first box. Paths whose first hops send no Time Exceeded are refused,
+//! every destination on them.
 //!
 //! **macOS.** A process that Local Network privacy has not been granted to gets `EHOSTUNREACH` at
 //! once for a connection into a directly attached network, before any packet is sent (as does a
-//! connection a Network Extension policy denies). The probe reads an unreachable that `connect`
-//! itself reports, before the connection was in progress, as a failure (refused), not as far: no
-//! packet was answered, so it says nothing of the distance. (An ICMP "time exceeded" can only
-//! arrive after `connect` has returned `EINPROGRESS`; on this Mac every real one did, 2 ms or more
-//! later, and every Local Network denial came from `connect` itself, in under 0.4 ms: see
-//! docs/netguard-macos.md.) Such destinations are on-link, refused by the address and route
-//! checks before any probe anyway, and the real connection would fail the same way.
+//! connection a Network Extension policy denies). An error `connect` itself reports, before the
+//! connection was in progress, is a local failure, never evidence (see docs/netguard-macos.md).
+//! A macOS host whose ICMP socket cannot be opened, or whose `TCP_INFO` cannot be read, refuses
+//! every requester connection (said once at startup: [`warn_if_unsupported`]).
 //!
-//! **What it cannot help:** a probe that connects, and a check connection, still reach a near
-//! host (a SYN, a handshake, a FIN, a reset; never data) before the refusal; a near host that
-//! drops the probe and also drops the check connection's FIN reads as far; a transparent proxy
-//! within the limit answers for every destination, so every connection through it is refused; a
-//! router that decrements no hop count is invisible to it.
+//! **What it cannot help:** a probe that connects still reaches a near host (a SYN, a handshake,
+//! a reset; never data) before the refusal; a transparent proxy within the limit answers for every
+//! destination, so every connection through it is refused; a router that decrements no hop count
+//! is invisible to it.
 
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-/// How long a probe waits for an answer before it counts as no answer.
+/// How long one round of probes waits for its answers.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// How long the check connection ([`NearProbe::confirm`]) may take to connect.
-pub const CONFIRM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many rounds of probes a decision sends at most (the second only when the first decided
+/// nothing).
+pub const ROUNDS: u32 = 2;
 
-/// How a probe ended.
+/// The pause before the second round (a router's ICMP rate limit refills: Linux, one "time
+/// exceeded" a second per destination after a burst of six).
+pub const ROUND_PAUSE: Duration = Duration::from_secs(1);
+
+/// The probes of a round go out at hop limits `N ..= N + EXTRA_HOPS` (a first router past the
+/// limit that sends no Time Exceeded leaves the next one to).
+pub const EXTRA_HOPS: u8 = 2;
+
+/// The longest the near-hop decision takes when nothing bounds it ([`decide`]): two rounds, the
+/// pause between them, and turns waited for.
+pub const DECIDE_BUDGET: Duration = Duration::from_secs(8);
+
+/// What one probe saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeOutcome {
-    /// The connection was established within the hop limit.
+    /// The destination accepted the connection.
     Connected,
-    /// `ECONNREFUSED`: something within the hop limit answered with a reset (or a port
-    /// unreachable).
+    /// `ECONNREFUSED`: a reset (or an ICMP port unreachable, which is counted as an answer: it
+    /// can only make the verdict nearer).
     Refused,
     /// `ECONNRESET`.
     Reset,
-    /// `EHOSTUNREACH` / `ENETUNREACH`: the probe ran out of hops (an ICMP "time exceeded"), or
-    /// nothing routes there.
+    /// An ICMP error the kernel matched to this probe and that ended it: its type and code (ICMP
+    /// or ICMPv6, by the destination's family) and the address that sent it.
+    Icmp { kind: u8, code: u8, from: IpAddr },
+    /// `EHOSTUNREACH` / `ENETUNREACH` with no matched ICMP message to say why.
     Unreachable,
-    /// No answer within the probe's time.
+    /// No answer within the round's time.
     TimedOut,
-    /// Any other error: what it was.
-    Failed(String),
-}
-
-/// How the check connection ([`NearProbe::confirm`]) ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfirmOutcome {
-    /// The peer acknowledged (or reset on) the hop-limited FIN: it is within the limit.
-    Answered,
-    /// Nothing answered the hop-limited FIN: the peer is farther.
-    Unanswered,
-    /// The check connection did not connect: why.
-    ConnectFailed(String),
-    /// Anything else went wrong: what.
-    Failed(String),
-}
-
-/// What a probe's outcome means for the connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    /// Farther than the hop limit: connect.
-    Far,
-    /// Answered within the hop limit (how): refuse.
-    Near(&'static str),
-    /// No answer to the probe: check once connected ([`NearProbe::confirm`]).
-    Undecided,
-    /// The probe failed (why): refuse.
+    /// A local failure, or anything else (what it was).
     Failed(String),
 }
 
 impl ProbeOutcome {
-    /// The outcome of a probe's connect.
-    pub fn of(r: io::Result<()>) -> Self {
-        match r {
-            Ok(()) => ProbeOutcome::Connected,
-            Err(e) => match e.raw_os_error() {
-                #[cfg(unix)]
-                Some(libc::ECONNREFUSED) => ProbeOutcome::Refused,
-                #[cfg(unix)]
-                Some(libc::ECONNRESET) => ProbeOutcome::Reset,
-                #[cfg(unix)]
-                Some(libc::EHOSTUNREACH) | Some(libc::ENETUNREACH) => ProbeOutcome::Unreachable,
-                #[cfg(unix)]
-                Some(libc::ETIMEDOUT) => ProbeOutcome::TimedOut,
-                _ => match e.kind() {
-                    io::ErrorKind::TimedOut => ProbeOutcome::TimedOut,
-                    io::ErrorKind::ConnectionRefused => ProbeOutcome::Refused,
-                    io::ErrorKind::ConnectionReset => ProbeOutcome::Reset,
-                    io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => {
-                        ProbeOutcome::Unreachable
-                    }
-                    _ => ProbeOutcome::Failed(e.to_string()),
-                },
-            },
-        }
+    /// Whether the destination answered (connected, refused, reset).
+    pub fn answered(&self) -> bool {
+        matches!(
+            self,
+            ProbeOutcome::Connected | ProbeOutcome::Refused | ProbeOutcome::Reset
+        )
     }
 
-    /// What it means on its own (see the module doc): a timeout decides nothing.
-    pub fn verdict(&self) -> Verdict {
+    /// How an answer is named in a refusal.
+    fn how(&self) -> &'static str {
         match self {
-            ProbeOutcome::Connected => Verdict::Near("accepted a connection"),
-            ProbeOutcome::Refused => Verdict::Near("refused a connection"),
-            ProbeOutcome::Reset => Verdict::Near("reset a connection"),
-            ProbeOutcome::Unreachable => Verdict::Far,
-            ProbeOutcome::TimedOut => Verdict::Undecided,
-            ProbeOutcome::Failed(why) => Verdict::Failed(crate::printable(why, 120)),
+            ProbeOutcome::Connected => "accepted a connection",
+            ProbeOutcome::Refused => "refused a connection",
+            _ => "reset a connection",
         }
     }
 }
 
-impl ConfirmOutcome {
-    /// What it means for a destination the probe could not decide.
-    pub fn verdict(&self) -> Verdict {
-        match self {
-            ConfirmOutcome::Answered => {
-                Verdict::Near("answered once connected (it had not answered the probe)")
+/// One probe: its hop limit, what it saw, and the address it left from (`None` only where a test
+/// stages it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Obs {
+    pub ttl: u8,
+    pub outcome: ProbeOutcome,
+    pub local: Option<SocketAddr>,
+}
+
+/// The evidence a far verdict rests on: the hop limit of the probe whose Time Exceeded it was,
+/// the router that sent it, and the address and port that probe left from (which the real
+/// connection binds: `None` only from a test's staged probe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FarEvidence {
+    pub ttl: u8,
+    pub from: IpAddr,
+    pub local: Option<SocketAddr>,
+}
+
+/// What the probes mean for the connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The destination answered within the hop limit (how): refuse.
+    Near(&'static str),
+    /// A router past the hop limit said the probe ran out of hops: connect, pinned to the
+    /// evidence's probe.
+    Far(FarEvidence),
+    /// No positive evidence either way (what the probes saw): refuse.
+    NoEvidence(String),
+    /// The probes failed or contradicted each other (why): refuse.
+    Failed(String),
+}
+
+/// Where the probes (and then the real connection) leave from: the source address the kernel
+/// chose for the destination, and the interface that holds it. `None`: the kernel's choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pin {
+    pub source: Option<IpAddr>,
+    pub interface: Option<u32>,
+}
+
+/// ICMP Time Exceeded, code 0 ("hop limit exceeded in transit") for a destination of `dst`'s
+/// family: IPv4 type 11, ICMPv6 type 3.
+pub fn time_exceeded(dst: IpAddr) -> (u8, u8) {
+    if dst.is_ipv6() {
+        (3, 0)
+    } else {
+        (11, 0)
+    }
+}
+
+/// Whether `from` can be the router a Time Exceeded for a probe of `dst` came from: the same
+/// family, not `dst` itself, a specified unicast address (not multicast, broadcast, loopback, or
+/// an IPv4-mapped IPv6 address).
+fn router_sent(from: IpAddr, dst: IpAddr) -> bool {
+    if from == dst || from.is_unspecified() || from.is_multicast() || from.is_loopback() {
+        return false;
+    }
+    match (from, dst) {
+        (IpAddr::V4(f), IpAddr::V4(_)) => !f.is_broadcast(),
+        (IpAddr::V6(f), IpAddr::V6(_)) => f.to_ipv4_mapped().is_none(),
+        _ => false,
+    }
+}
+
+/// The decision on what the probes of every round saw (see the module doc). Pure.
+pub fn rule(dst: IpAddr, hops: u8, obs: &[Obs]) -> Verdict {
+    if let Some(o) = obs
+        .iter()
+        .filter(|o| o.ttl <= hops && o.outcome.answered())
+        .min_by_key(|o| o.ttl)
+    {
+        return Verdict::Near(o.outcome.how());
+    }
+    let (te, te_code) = time_exceeded(dst);
+    let evidence = obs
+        .iter()
+        .filter(|o| o.ttl >= hops)
+        .filter_map(|o| match o.outcome {
+            ProbeOutcome::Icmp { kind, code, from }
+                if kind == te && code == te_code && router_sent(from, dst) =>
+            {
+                Some(FarEvidence {
+                    ttl: o.ttl,
+                    from,
+                    local: o.local,
+                })
             }
-            ConfirmOutcome::Unanswered => Verdict::Far,
-            ConfirmOutcome::ConnectFailed(why) => Verdict::Failed(format!(
-                "the probe had no answer and a check connection did not connect: {}",
-                crate::printable(why, 120)
-            )),
-            ConfirmOutcome::Failed(why) => Verdict::Failed(crate::printable(why, 120)),
+            _ => None,
+        })
+        .min_by_key(|e| e.ttl);
+    let answered_at_or_below = |t: u8| obs.iter().any(|o| o.ttl <= t && o.outcome.answered());
+    match evidence {
+        Some(e) if !answered_at_or_below(e.ttl) => Verdict::Far(e),
+        Some(e) => Verdict::Failed(format!(
+            "inconsistent: it answered a probe of at most {} hops, which a router at {} said \
+             ran out",
+            e.ttl, e.from
+        )),
+        None => {
+            if let Some(why) = obs.iter().find_map(|o| match &o.outcome {
+                ProbeOutcome::Failed(why) => Some(why),
+                _ => None,
+            }) {
+                return Verdict::Failed(format!("a probe failed: {}", crate::printable(why, 100)));
+            }
+            Verdict::NoEvidence(format!(
+                "no router past {hops} hops said a probe ran out of hops (a time exceeded), and \
+                 silence is not taken as far ({})",
+                summary(obs)
+            ))
         }
     }
 }
 
-/// Sends the probe ([`TtlProbe`] for real; a fake in tests, where a loopback server stands in for
-/// a public address).
+/// What the probes saw, counted.
+fn summary(obs: &[Obs]) -> String {
+    let n = |f: &dyn Fn(&ProbeOutcome) -> bool| obs.iter().filter(|o| f(&o.outcome)).count();
+    format!(
+        "{} probes: no answer {}, answered beyond the limit {}, other ICMP {}, unreachable {}",
+        obs.len(),
+        n(&|s| *s == ProbeOutcome::TimedOut),
+        n(&|s| s.answered()),
+        n(&|s| matches!(s, ProbeOutcome::Icmp { .. })),
+        n(&|s| *s == ProbeOutcome::Unreachable),
+    )
+}
+
+/// Sends the probes ([`TtlProbe`] for real; a fake in tests, where a loopback server stands in for
+/// a public address, or a router's answer is staged).
 pub trait NearProbe: Send + Sync + fmt::Debug {
-    /// Connects to `addr` with packets that may cross at most `hops` hops, for at most `timeout`.
-    /// Blocking.
-    fn probe(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ProbeOutcome;
-
-    /// For a destination the probe had no answer from: connects to `addr` with the default hop
-    /// limit (within `timeout`), then lowers the hop limit to `hops` and half-closes, and sees
-    /// whether the FIN is answered (see the module doc). Writes no data. Blocking.
-    fn confirm(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome;
-
-    /// [`Self::probe`], given up on at `deadline` (a turn waited for, attempts, pauses: review
-    /// round 5, probe-1). A probe that knows no deadline (a test's fake) ignores it.
-    fn probe_until(
+    /// Round `round` (0, 1, …) of probes to `addr` (an IPv4 address for an IPv4-mapped one) at
+    /// hop limits `hops ..= hops + extra`, from `pin`, each waited for at most `wait` and never
+    /// past `deadline`: what each saw, or why the round could not be sent. Blocking.
+    #[allow(clippy::too_many_arguments)]
+    fn round(
         &self,
+        round: u32,
         addr: SocketAddr,
         hops: u8,
-        timeout: Duration,
+        extra: u8,
+        pin: &Pin,
+        wait: Duration,
         deadline: Instant,
-    ) -> ProbeOutcome {
-        let _ = deadline;
-        self.probe(addr, hops, timeout)
-    }
+    ) -> Result<Vec<Obs>, String>;
 
-    /// Review round 6, probe-4: one more probe attempt, after `pause`, for a destination whose
-    /// probe had no answer and whose check connection could not decide (every AWS S3 front end
-    /// resets or never acknowledges it: a router's ICMP loss can outlast the probe's three
-    /// attempts). A probe that knows no such attempt (a test's fake) has no answer.
-    fn probe_last_until(
-        &self,
-        addr: SocketAddr,
-        hops: u8,
-        pause: Duration,
-        deadline: Instant,
-    ) -> ProbeOutcome {
-        let _ = (addr, hops, pause, deadline);
-        ProbeOutcome::TimedOut
-    }
-
-    /// [`Self::confirm`], given up on at `deadline` (a failure, never far).
-    fn confirm_until(
-        &self,
-        addr: SocketAddr,
-        hops: u8,
-        timeout: Duration,
-        deadline: Instant,
-    ) -> ConfirmOutcome {
-        let _ = deadline;
-        self.confirm(addr, hops, timeout)
+    /// The pause before a further round ([`ROUND_PAUSE`]; a test's fake need not wait).
+    fn pause(&self) -> Duration {
+        ROUND_PAUSE
     }
 }
 
-/// The longest the near-hop decision takes when nothing bounds it ([`decide`]): the probe's
-/// attempts and pause, two connects of the check connection and its wait, and turns waited for.
-pub const DECIDE_BUDGET: Duration = Duration::from_secs(40);
-
-/// The near-hop decision for a connection to `addr` (see the module doc): the probe, and when it
-/// had no answer, the check connection. Blocking (up to [`PROBE_TIMEOUT`], plus
-/// [`CONFIRM_CONNECT_TIMEOUT`] and a few round trips when the probe had no answer).
+/// The near-hop decision for a connection to `addr` (see the module doc), from the kernel's
+/// source. Blocking (up to [`DECIDE_BUDGET`]).
 pub fn decide(probe: &dyn NearProbe, addr: SocketAddr, hops: u8) -> Verdict {
-    decide_until(probe, addr, hops, Instant::now() + DECIDE_BUDGET)
+    decide_until(probe, addr, hops, &Pin::default(), Instant::now() + DECIDE_BUDGET)
 }
 
-/// [`decide`], given up on at `deadline` (review round 5, probe-1): a caller that stops waiting
-/// (the broker's connector, a guarded request whose budget ran out) passes its own, so the work
-/// it abandons stops too and gives back its turn ([`ProbeGate`]) instead of running on for
-/// seconds. Out of time is a failure (refused), never far.
-pub fn decide_until(probe: &dyn NearProbe, addr: SocketAddr, hops: u8, deadline: Instant) -> Verdict {
+/// [`decide`] from `pin`, given up on at `deadline` (review round 5, probe-1): a caller that stops
+/// waiting (the broker's connector, a guarded request whose budget ran out) passes its own, so
+/// the work it abandons stops too and gives back its turn ([`ProbeGate`]). Out of time is a
+/// failure (refused), never far. Up to [`ROUNDS`] rounds, [`ROUND_PAUSE`] apart; the first that
+/// decides near or far ends it.
+pub fn decide_until(
+    probe: &dyn NearProbe,
+    addr: SocketAddr,
+    hops: u8,
+    pin: &Pin,
+    deadline: Instant,
+) -> Verdict {
+    let addr = unmapped(addr);
     let left = || deadline.saturating_duration_since(Instant::now());
-    if left().is_zero() {
-        return Verdict::Failed(OUT_OF_TIME.into());
-    }
-    match probe.probe_until(addr, hops, PROBE_TIMEOUT, deadline).verdict() {
-        Verdict::Undecided => {
-            if left().is_zero() {
+    let mut all: Vec<Obs> = Vec::new();
+    for round in 0..ROUNDS {
+        if round > 0 {
+            std::thread::sleep(probe.pause().min(left()));
+        }
+        let wait = PROBE_TIMEOUT.min(left());
+        if wait.is_zero() {
+            if round == 0 {
                 return Verdict::Failed(OUT_OF_TIME.into());
             }
-            let timeout = CONFIRM_CONNECT_TIMEOUT.min(left());
-            match probe.confirm_until(addr, hops, timeout, deadline).verdict() {
-                // Never undecided twice.
-                Verdict::Undecided => Verdict::Failed("no answer either way".into()),
-                Verdict::Failed(why) => {
-                    // Review round 6, probe-4: the probe once more, when the time allows it.
-                    if left() < PROBE_LAST_PAUSE + PROBE_TIMEOUT {
-                        return Verdict::Failed(why);
-                    }
-                    match probe
-                        .probe_last_until(addr, hops, PROBE_LAST_PAUSE, deadline)
-                        .verdict()
-                    {
-                        Verdict::Undecided => Verdict::Failed(why),
-                        v => v,
-                    }
-                }
-                v => v,
-            }
+            break;
         }
-        v => v,
+        match probe.round(round, addr, hops, EXTRA_HOPS, pin, wait, deadline) {
+            Ok(obs) => all.extend(obs),
+            Err(why) if round == 0 => return Verdict::Failed(crate::printable(&why, 160)),
+            // A later round that could not be sent decides nothing more.
+            Err(_) => break,
+        }
+        if let v @ (Verdict::Near(_) | Verdict::Far(_)) = rule(addr.ip(), hops, &all) {
+            return v;
+        }
     }
+    rule(addr.ip(), hops, &all)
 }
-
-/// How long the probe's last attempt waits ([`NearProbe::probe_last_until`]).
-pub const PROBE_LAST_PAUSE: Duration = Duration::from_secs(2);
 
 /// Why a decision out of time failed.
 const OUT_OF_TIME: &str = "the time for the check ran out before it could tell how near it is";
 
-/// The real probe: a fresh TCP socket with its hop limit set, connected without sending data.
+/// The real probe: fresh TCP sockets with their hop limits set, connected without sending data,
+/// their ICMP errors read (see the module doc). Each round takes one turn of the probe gate
+/// ([`ProbeGate`]: one token for its three SYNs, since each router on the path expires at most
+/// one of them).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TtlProbe;
 
 impl NearProbe for TtlProbe {
-    fn probe(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ProbeOutcome {
-        self.probe_until(addr, hops, timeout, Instant::now() + DECIDE_BUDGET)
-    }
-
-    fn confirm(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
-        self.confirm_until(addr, hops, timeout, Instant::now() + DECIDE_BUDGET)
-    }
-
-    fn probe_until(
+    #[allow(clippy::too_many_arguments)]
+    fn round(
         &self,
+        _round: u32,
         addr: SocketAddr,
         hops: u8,
-        timeout: Duration,
+        extra: u8,
+        pin: &Pin,
+        wait: Duration,
         deadline: Instant,
-    ) -> ProbeOutcome {
-        ProbeOutcome::of(probe_once(addr, hops, timeout, deadline))
-    }
-
-    fn confirm_until(
-        &self,
-        addr: SocketAddr,
-        hops: u8,
-        timeout: Duration,
-        deadline: Instant,
-    ) -> ConfirmOutcome {
-        confirm_once(addr, hops, timeout, deadline)
-    }
-
-    fn probe_last_until(
-        &self,
-        addr: SocketAddr,
-        hops: u8,
-        pause: Duration,
-        deadline: Instant,
-    ) -> ProbeOutcome {
-        std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
-        ProbeOutcome::of(probe_turn(unmapped(addr), hops, PROBE_TIMEOUT * 2 / 3, deadline))
+    ) -> Result<Vec<Obs>, String> {
+        let addr = unmapped(addr);
+        if deadline <= Instant::now() {
+            return Err(OUT_OF_TIME.into());
+        }
+        let Some(_turn) = Turn::enter_for(addr, deadline) else {
+            return Err(NO_TURN.into());
+        };
+        #[cfg(test)]
+        ROUNDS_SENT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+        if wait.is_zero() {
+            return Err(OUT_OF_TIME.into());
+        }
+        observe(addr, hops, extra, pin, wait)
     }
 }
 
-/// How long a far verdict is remembered ([`remembered_far`]).
-pub const FAR_TTL: Duration = Duration::from_secs(10);
-/// Most far verdicts remembered.
-const MAX_FAR: usize = 256;
+/// How many rounds the real probe sent (tests).
+#[cfg(test)]
+static ROUNDS_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// A far verdict's key: the destination (address and port: a router can send one port elsewhere,
-/// a transparent proxy), the hop limit, the facts the path was judged on (their routes, rules,
-/// addresses and uplink signature: [`crate::HostFacts`]), and the probe.
-pub(crate) type FarKey = (SocketAddr, u8, u64, usize);
+/// Why a round that got no turn before its deadline failed ([`ProbeGate::enter_until`]).
+const NO_TURN: &str = "no turn to probe before the check's time ran out (too many probes at once)";
 
-/// The far verdicts of the last [`FAR_TTL`] (review round 6, probe-3: the pacer let 2 probes at
-/// once and 3 a second through, process-wide, so 64 connections at once to four hosts left 28
-/// refused after 17 s). Only far is remembered (near and failed never are), for one exact
-/// destination and port, never a prefix: a /24 or /48 can hold both a far host and a near one
-/// (an ISP's access router and its data centre), so a far verdict for one would admit the other.
-/// Any change of the facts (a route, a rule, an address, the uplink) is another key.
-static FAR: std::sync::Mutex<Vec<(FarKey, Instant)>> = std::sync::Mutex::new(Vec::new());
-
-/// Whether `key` was found far within [`FAR_TTL`] of `now`.
-pub(crate) fn remembered_far(key: FarKey, now: Instant) -> bool {
-    let mut far = FAR.lock().unwrap_or_else(|e| e.into_inner());
-    far.retain(|(_, at)| now.saturating_duration_since(*at) < FAR_TTL);
-    far.iter().any(|(k, _)| *k == key)
+/// Says once, at startup in public mode, when this host cannot read the ICMP errors the rule needs
+/// (every requester connection is then refused as no evidence).
+pub fn warn_if_unsupported() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Err(why) = supported() {
+            tracing::warn!(
+                "network guard: the near-hop check cannot read ICMP errors on this host ({why}): \
+                 every requester connection will be refused"
+            );
+        }
+    });
 }
 
-/// The keys a decision is running for ([`decide_remembered`]).
-static DECIDING: std::sync::Mutex<Vec<FarKey>> = std::sync::Mutex::new(Vec::new());
-static DECIDED: std::sync::Condvar = std::sync::Condvar::new();
-
-/// `decide` (the near-hop decision for `key`'s destination), unless a far verdict for `key` is
-/// remembered ([`remembered_far`]); a far one is remembered. One decision runs per key at a
-/// time: a caller that finds one running waits for it (until `deadline`), then takes its far
-/// verdict, or decides itself (review round 6, probe-3: 64 connections at once to four hosts
-/// each sent their own probes). `None` (facts given by the caller): `decide`, nothing remembered.
-pub(crate) fn decide_remembered(
-    key: Option<FarKey>,
-    deadline: Instant,
-    decide: impl FnOnce() -> Verdict,
-) -> Verdict {
-    let Some(key) = key else { return decide() };
-    let mut g = DECIDING.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        let now = Instant::now();
-        if remembered_far(key, now) {
-            return Verdict::Far;
+/// Whether this host can read what the rule needs (an ICMP socket on macOS, `TCP_INFO`; the
+/// error queue on Linux), or why not.
+pub fn supported() -> Result<(), String> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        for v6 in [false, true] {
+            let addr: SocketAddr = if v6 {
+                "[2001:db8::1]:9".parse().unwrap()
+            } else {
+                "192.0.2.1:9".parse().unwrap()
+            };
+            let sock = new_socket(addr).map_err(|e| e.to_string())?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            set_recverr(&sock, addr).map_err(|e| format!("IP_RECVERR: {e}"))?;
+            #[cfg(target_os = "macos")]
+            {
+                // An IPv6 ICMP socket where IPv6 is off is no loss: no IPv6 probe is sent then.
+                if let Err(e) = icmp_socket(v6) {
+                    if !v6 {
+                        return Err(format!("an ICMP socket: {e}"));
+                    }
+                }
+                if !v6 {
+                    use std::os::fd::AsRawFd;
+                    let mut b = [0u8; TCP_INFO_BUF];
+                    tcp_info(sock.as_raw_fd(), &mut b).map_err(|e| format!("TCP_INFO: {e}"))?;
+                }
+            }
+            drop(sock);
         }
-        if !g.contains(&key) {
-            g.push(key);
-            break;
-        }
-        let left = deadline.saturating_duration_since(now);
-        if left.is_zero() {
-            return Verdict::Failed(OUT_OF_TIME.into());
-        }
-        g = DECIDED
-            .wait_timeout(g, left.min(TOKEN_INTERVAL))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        Ok(())
     }
-    drop(g);
-    /// Gives the key back however `decide` ends (a panic included).
-    struct Done(FarKey);
-    impl Drop for Done {
-        fn drop(&mut self) {
-            DECIDING
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .retain(|k| *k != self.0);
-            DECIDED.notify_all();
-        }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        Err(UNSUPPORTED.into())
     }
-    let done = Done(key);
-    let v = decide();
-    if v == Verdict::Far {
-        remember_far(key, Instant::now());
-    }
-    drop(done);
-    v
 }
 
-/// Remembers that `key` was found far at `now`.
-pub(crate) fn remember_far(key: FarKey, now: Instant) {
-    let mut far = FAR.lock().unwrap_or_else(|e| e.into_inner());
-    far.retain(|(k, at)| *k != key && now.saturating_duration_since(*at) < FAR_TTL);
-    if far.len() >= MAX_FAR {
-        far.remove(0);
-    }
-    far.push((key, now));
-}
-
-/// A probe that answers the same every time, and records what it was asked: for tests, where a
-/// server on loopback stands in for a public address (the real probe would find it near), or
-/// where a near destination is staged. Test builds only (the `test-util` feature).
+/// A probe that answers the same every time, run through the real [`rule`], and records what it
+/// was asked: for tests, where a server on loopback stands in for a public address (the real
+/// probe would find it near), or where a near destination or a router's answer is staged. Test
+/// builds only (the `test-util` feature).
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Debug)]
 pub struct FixedProbe {
-    pub outcome: ProbeOutcome,
-    /// What the check connection finds, when the probe times out.
-    pub confirmed: ConfirmOutcome,
+    /// Per round (the last repeats): what each hop limit's probe saw; `None` for the staged Time
+    /// Exceeded from [`FixedProbe::ROUTER_V4`] or [`FixedProbe::ROUTER_V6`].
+    pub rounds: Vec<Vec<(u8, Option<ProbeOutcome>)>>,
+    /// The address the evidence's probe left from, when staged.
+    pub local: Option<SocketAddr>,
+    /// The decisions asked for: destination and hop limit (once per decision).
     pub asked: std::sync::Mutex<Vec<(SocketAddr, u8)>>,
-    /// The check connections asked for.
-    pub confirms: std::sync::Mutex<Vec<(SocketAddr, u8)>>,
+    /// The pins the decisions were given.
+    pub pins: std::sync::Mutex<Vec<Pin>>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl FixedProbe {
-    /// A probe that always finds the destination far (it runs out of hops).
+    /// The router a staged Time Exceeded comes from (TEST-NET-2 / the IPv6 documentation prefix).
+    pub const ROUTER_V4: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+    pub const ROUTER_V6: IpAddr = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x99));
+
+    /// A probe that always finds the destination far: a router past the limit sends a Time
+    /// Exceeded for every probe.
     pub fn far() -> std::sync::Arc<Self> {
-        Self::answering(ProbeOutcome::Unreachable)
+        Self::staged(vec![(0, None)], None)
     }
 
-    /// A probe that always ends with `outcome` (and, if that is a timeout, whose check
-    /// connection finds nothing).
+    /// [`Self::far`], its evidence's probe having left from `local`.
+    pub fn far_from(local: SocketAddr) -> std::sync::Arc<Self> {
+        Self::staged(vec![(0, None)], Some(local))
+    }
+
+    /// A probe each of whose probes ends with `outcome`, at every hop limit and in every round.
     pub fn answering(outcome: ProbeOutcome) -> std::sync::Arc<Self> {
-        Self::with(outcome, ConfirmOutcome::Unanswered)
+        Self::staged(vec![(0, Some(outcome))], None)
     }
 
-    /// A probe that ends with `outcome`, and whose check connection ends with `confirmed`.
-    pub fn with(outcome: ProbeOutcome, confirmed: ConfirmOutcome) -> std::sync::Arc<Self> {
+    /// One round staged, repeated: per hop limit offset from the limit (0 = `N`), what that probe
+    /// saw (`None`: a router's Time Exceeded); a hop limit not listed is silent.
+    pub fn staged(
+        round: Vec<(u8, Option<ProbeOutcome>)>,
+        local: Option<SocketAddr>,
+    ) -> std::sync::Arc<Self> {
+        Self::rounds(vec![round], local)
+    }
+
+    /// Several rounds staged (the last repeats).
+    pub fn rounds(
+        rounds: Vec<Vec<(u8, Option<ProbeOutcome>)>>,
+        local: Option<SocketAddr>,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(FixedProbe {
-            outcome,
-            confirmed,
+            rounds,
+            local,
             asked: std::sync::Mutex::new(Vec::new()),
-            confirms: std::sync::Mutex::new(Vec::new()),
+            pins: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl NearProbe for FixedProbe {
-    fn probe(&self, addr: SocketAddr, hops: u8, _: Duration) -> ProbeOutcome {
-        self.asked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((addr, hops));
-        self.outcome.clone()
+    #[allow(clippy::too_many_arguments)]
+    fn round(
+        &self,
+        round: u32,
+        addr: SocketAddr,
+        hops: u8,
+        extra: u8,
+        pin: &Pin,
+        _: Duration,
+        _: Instant,
+    ) -> Result<Vec<Obs>, String> {
+        if round == 0 {
+            self.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((addr, hops));
+            self.pins.lock().unwrap_or_else(|e| e.into_inner()).push(*pin);
+        }
+        let staged = self
+            .rounds
+            .get(round as usize)
+            .or(self.rounds.last())
+            .cloned()
+            .unwrap_or_default();
+        let router = if addr.is_ipv6() {
+            Self::ROUTER_V6
+        } else {
+            Self::ROUTER_V4
+        };
+        let (kind, code) = time_exceeded(addr.ip());
+        Ok((0..=extra)
+            .map(|k| {
+                let outcome = match staged.iter().find(|(o, _)| *o == k) {
+                    Some((_, Some(o))) => o.clone(),
+                    Some((_, None)) => ProbeOutcome::Icmp {
+                        kind,
+                        code,
+                        from: router,
+                    },
+                    None => ProbeOutcome::TimedOut,
+                };
+                Obs {
+                    ttl: hops.saturating_add(k),
+                    outcome,
+                    local: self.local,
+                }
+            })
+            .collect())
     }
 
-    fn confirm(&self, addr: SocketAddr, hops: u8, _: Duration) -> ConfirmOutcome {
-        self.confirms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((addr, hops));
-        self.confirmed.clone()
+    fn pause(&self) -> Duration {
+        Duration::ZERO
     }
 }
 
-fn new_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-}
-
-fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()> {
-    if addr.is_ipv4() {
-        sock.set_ttl_v4(u32::from(hops))
-    } else {
-        sock.set_unicast_hops_v6(u32::from(hops))
-    }
-}
-
-/// The probe, on every platform: asked up to three times ([`probe_attempts`]), to the
-/// destination as a connection reaches it ([`unmapped`]), at most [`PROBES_AT_ONCE`] probes in
-/// the process at a time ([`ProbeGate`]).
-fn probe_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant) -> io::Result<()> {
-    let addr = unmapped(addr);
-    let left = || deadline.saturating_duration_since(Instant::now());
-    probe_attempts(
-        timeout,
-        PROBE_PAUSE,
-        left,
-        |pause| std::thread::sleep(pause.min(left())),
-        |t| probe_turn(addr, hops, t, deadline),
-    )
-}
-
-/// One attempt of the probe, within `t` and the caller's `deadline` (review round 5, probe-1: a
-/// turn waited for included; review round 6, parse-4 = probe-2, cross-7 N14: out of time, it
-/// neither waits for a turn nor takes a token, and an attempt never runs past the deadline).
-fn probe_turn(addr: SocketAddr, hops: u8, t: Duration, deadline: Instant) -> io::Result<()> {
-    if deadline <= Instant::now() {
-        return Err(io::ErrorKind::TimedOut.into());
-    }
-    let Some(_turn) = Turn::enter_for(addr, deadline) else {
-        return Err(io::Error::other(NO_TURN));
-    };
-    let t = t.min(deadline.saturating_duration_since(Instant::now()));
-    if t.is_zero() {
-        return Err(io::ErrorKind::TimedOut.into());
-    }
-    probe_attempt(addr, hops, t)
-}
-
-/// Why a probe that got no turn before its deadline failed ([`ProbeGate::enter_until`]).
-const NO_TURN: &str = "no turn to probe before the check's time ran out (too many probes at once)";
-
-/// How long the probe pauses before its third attempt ([`probe_attempts`]): a router's ICMP rate
-/// limit refills (Linux: one "time exceeded" a second per destination after a burst of six,
-/// `icmp_ratelimit`).
-pub const PROBE_PAUSE: Duration = Duration::from_secs(1);
-
-/// The probe asked up to three times: two thirds of `timeout`, then, after a timeout, the rest;
-/// then, after a further timeout, once more for two thirds of `timeout` after `pause` (review
-/// round 3, probe-1; review round 4, probe-2). A router that rate-limits its ICMP drops some
-/// "time exceeded" answers (7.5% of the reviewer's probes on a home path went unanswered:
-/// `r3-probe/sweep-h2.log`; many more when 8 probes went at once: `r4-probe/exp`), and a probe
-/// without an answer leaves the decision to the check connection, whose control connection
-/// refuses a peer that never acknowledges a bare FIN (every AWS S3 front end), and which does
-/// not exist on Windows (a probe without an answer is refused there). An answer comes within a
-/// round trip to the router, milliseconds.
-///
-/// Review round 6 (parse-4 = probe-2): once the caller's time is out (`left`), no further attempt
-/// is made.
-fn probe_attempts(
-    timeout: Duration,
-    pause: Duration,
-    left: impl Fn() -> Duration,
-    sleep: impl FnOnce(Duration),
-    mut attempt: impl FnMut(Duration) -> io::Result<()>,
-) -> io::Result<()> {
-    let first = timeout * 2 / 3;
-    let timed_out = |r: &io::Result<()>| matches!(r, Err(e) if e.kind() == io::ErrorKind::TimedOut);
-    let r = attempt(first);
-    if !timed_out(&r) || left().is_zero() {
-        return r;
-    }
-    let r = attempt(timeout - first);
-    if !timed_out(&r) || left().is_zero() {
-        return r;
-    }
-    sleep(pause);
-    if left().is_zero() {
-        return r;
-    }
-    attempt(first)
-}
-
-/// Most hop-limited probes in flight in the process at once (review round 4, probe-2): they go
-/// through the same first hops, whose ICMP rate limit drops answers past a small burst.
+/// Most rounds of hop-limited probes in flight in the process at once (review round 4,
+/// probe-2): they go through the same first hops, whose ICMP rate limit drops answers past a
+/// small burst. A round is the three probes of one decision ([`EXTRA_HOPS`]); each router on the
+/// path expires at most one of them (the probe at its own hop limit), so a round loads each
+/// router's ICMP budget as one probe did before the S3 review.
 pub const PROBES_AT_ONCE: usize = 2;
 
-/// Most hop-limited probe SYNs sent in a burst, and how many a second after it (review round 5,
-/// the probe lens's suspicion): [`PROBES_AT_ONCE`] bounds how many are in flight, not how many a
-/// second, and a requester naming many far hosts could drain the first hops' ICMP rate limit
-/// (Linux routers: about one "time exceeded" a second per destination after a burst of six), so
-/// that ordinary probes went unanswered and fell to the check connection (which refuses every
-/// AWS S3 front end). A turn waits for a token as it waits for a slot.
+/// Most rounds started in a burst, and how many a second after it (review round 5, the probe
+/// lens's suspicion): [`PROBES_AT_ONCE`] bounds how many are in flight, not how many a second,
+/// and a requester naming many far hosts could drain the first hops' ICMP rate limit (Linux
+/// routers: about one "time exceeded" a second per destination after a burst of six), so that
+/// ordinary probes went unanswered (refused: no evidence). A round waits for a token as it waits
+/// for a slot, and takes one token for its three probes.
 pub const PROBE_BURST: u32 = 6;
 /// See [`PROBE_BURST`].
 pub const PROBES_PER_SECOND: u32 = 3;
@@ -653,6 +653,12 @@ static PROBE_TURN_V6: std::sync::Condvar = std::sync::Condvar::new();
 #[cfg(test)]
 static PACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// The turns this thread took (tests: a round takes one).
+    static TURNS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A turn of either family.
 #[allow(dead_code)] // held for its Drop
 enum Turn {
@@ -663,11 +669,16 @@ enum Turn {
 impl Turn {
     /// A turn for a probe of `addr`, waited for until `deadline`.
     fn enter_for(addr: SocketAddr, deadline: Instant) -> Option<Self> {
-        if addr.is_ipv4() {
+        let turn = if addr.is_ipv4() {
             ProbeGate::enter_until(deadline).map(Turn::V4)
         } else {
             ProbeGateV6::enter_until(deadline).map(Turn::V6)
+        };
+        #[cfg(test)]
+        if turn.is_some() {
+            TURNS_TAKEN.with(|t| t.set(t.get() + 1));
         }
+        turn
     }
 }
 
@@ -765,35 +776,159 @@ impl Drop for ProbeGateV6 {
     }
 }
 
-/// One probe (not macOS): `socket2::Socket::connect_timeout` with the hop limit set.
-#[cfg(not(target_os = "macos"))]
-fn probe_attempt(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
-    let sock = new_socket(addr)?;
-    set_hops(&sock, addr, hops)?;
-    let r = sock.connect_timeout(&addr.into(), timeout);
-    // Closed with a reset, never a byte of data.
-    let _ = sock.set_linger(Some(Duration::ZERO));
-    drop(sock);
-    r
+/// A fresh TCP socket of `addr`'s family.
+pub(crate) fn new_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
 }
 
-/// macOS: one probe, `socket2::Socket::connect_timeout`'s steps run here so that an unreachable
-/// `connect` reports at once, before the connection is in progress, is a failure (see the module
-/// doc).
-#[cfg(target_os = "macos")]
-fn probe_attempt(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()> {
-    let sock = new_socket(addr)?;
-    set_hops(&sock, addr, hops)?;
-    sock.set_nonblocking(true)?;
-    let r = match sock.connect(&addr.into()) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => poll_connected(&sock, timeout),
-        Err(e) => Err(unreachable_at_once(e)),
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()> {
+    if addr.is_ipv4() {
+        sock.set_ttl_v4(u32::from(hops))
+    } else {
+        sock.set_unicast_hops_v6(u32::from(hops))
+    }
+}
+
+/// `setsockopt` of an `int` option.
+#[cfg(unix)]
+fn set_int(sock: &socket2::Socket, level: libc::c_int, opt: libc::c_int, v: libc::c_int) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid fd and a c_int option value of the size given.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            opt,
+            (&v as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
     };
-    // Closed with a reset, never a byte of data.
-    let _ = sock.set_linger(Some(Duration::ZERO));
-    drop(sock);
-    r
+    if rc != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Linux: ICMP errors for the socket queued with their details (`IP_RECVERR` / `IPV6_RECVERR`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_recverr(sock: &socket2::Socket, addr: SocketAddr) -> io::Result<()> {
+    if addr.is_ipv4() {
+        set_int(sock, libc::IPPROTO_IP, libc::IP_RECVERR, 1)
+    } else {
+        set_int(sock, libc::IPPROTO_IPV6, libc::IPV6_RECVERR, 1)
+    }
+}
+
+/// Pins a socket for `addr` as the probes and the real connection are pinned (see the module
+/// doc): on Linux a fixed IPv6 flow label (`IPV6_AUTOFLOWLABEL` off: a balancer that hashes the
+/// flow label sees the probe's and the connection's alike, and Linux does not rehash it on a
+/// retransmission); `pin`'s interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`, Linux
+/// `IP_UNICAST_IF` / `IPV6_UNICAST_IF`); bound to `pin`'s source and `port` (0: any).
+pub(crate) fn pin_socket(
+    sock: &socket2::Socket,
+    addr: SocketAddr,
+    pin: &Pin,
+    port: u16,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if addr.is_ipv6() {
+        set_int(sock, libc::IPPROTO_IPV6, libc::IPV6_AUTOFLOWLABEL, 0)?;
+    }
+    if let Some(i) = pin.interface {
+        bind_interface(sock, addr, i)?;
+    }
+    if let Some(src) = pin.source {
+        sock.bind(&SocketAddr::new(src, port).into())?;
+    }
+    Ok(())
+}
+
+/// Binds the socket's traffic to interface `index`.
+#[cfg(target_os = "macos")]
+fn bind_interface(sock: &socket2::Socket, addr: SocketAddr, index: u32) -> io::Result<()> {
+    let i = index as libc::c_int;
+    if addr.is_ipv4() {
+        set_int(sock, libc::IPPROTO_IP, libc::IP_BOUND_IF, i)
+    } else {
+        set_int(sock, libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF, i)
+    }
+}
+
+/// Binds the socket's traffic to interface `index` (`IP_UNICAST_IF` takes it in network byte
+/// order, `IPV6_UNICAST_IF` in host order).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn bind_interface(sock: &socket2::Socket, addr: SocketAddr, index: u32) -> io::Result<()> {
+    if addr.is_ipv4() {
+        set_int(sock, libc::IPPROTO_IP, libc::IP_UNICAST_IF, index.to_be() as libc::c_int)
+    } else {
+        set_int(sock, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF, index as libc::c_int)
+    }
+}
+
+/// No interface pin here (no far verdict is ever given on such a platform).
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn bind_interface(_: &socket2::Socket, _: SocketAddr, _: u32) -> io::Result<()> {
+    Ok(())
+}
+
+/// The interface that holds local address `ip` (`getifaddrs`), if any.
+#[cfg(unix)]
+pub(crate) fn interface_of(ip: IpAddr) -> io::Result<Option<u32>> {
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a list it allocates, freed below.
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut found = None;
+    let mut p = ifap;
+    while !p.is_null() {
+        // SAFETY: a node of the list getifaddrs returned.
+        let ifa = unsafe { &*p };
+        // SAFETY: ifa_addr is null or a sockaddr of its family.
+        if !ifa.ifa_addr.is_null() && unsafe { sockaddr_ip(ifa.ifa_addr) } == Some(ip) {
+            // SAFETY: ifa_name is the interface's NUL-terminated name.
+            let i = unsafe { libc::if_nametoindex(ifa.ifa_name) };
+            found = (i != 0).then_some(i);
+            break;
+        }
+        p = ifa.ifa_next;
+    }
+    // SAFETY: the list getifaddrs returned, freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+    Ok(found)
+}
+
+/// No interface lookup here.
+#[cfg(not(unix))]
+pub(crate) fn interface_of(_: IpAddr) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
+/// The address of a `sockaddr_in` / `sockaddr_in6`.
+///
+/// # Safety
+/// `sa` points to a sockaddr whose family says how long it is.
+#[cfg(unix)]
+unsafe fn sockaddr_ip(sa: *const libc::sockaddr) -> Option<IpAddr> {
+    match i32::from((*sa).sa_family) {
+        libc::AF_INET => {
+            let a = &*(sa as *const libc::sockaddr_in);
+            Some(IpAddr::from(u32::from_be(a.sin_addr.s_addr).to_be_bytes()))
+        }
+        libc::AF_INET6 => {
+            let a = &*(sa as *const libc::sockaddr_in6);
+            Some(IpAddr::from(a.sin6_addr.s6_addr))
+        }
+        _ => None,
+    }
 }
 
 /// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as its IPv4 address, which is what a
@@ -801,8 +936,7 @@ fn probe_attempt(addr: SocketAddr, hops: u8, timeout: Duration) -> io::Result<()
 /// `IPV6_UNICAST_HOPS` need not limit them (on macOS they left with the default TTL, so the probe
 /// of a far host connected and read it as near: `r2-probe/mapped.log`); an IPv4 socket with
 /// `IP_TTL` set limits them. Review round 2, probe-2, on every platform since the Linux
-/// application ([`crate::NetPolicy::vet_connection`] already unmaps before it asks; the probe and
-/// the check connection no longer rely on it).
+/// application ([`crate::NetPolicy::vet_connection`] already unmaps before it asks).
 fn unmapped(addr: SocketAddr) -> SocketAddr {
     match addr {
         SocketAddr::V6(a) => match a.ip().to_ipv4_mapped() {
@@ -813,1252 +947,1059 @@ fn unmapped(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// macOS: an error `connect` reported before the connection was in progress. An unreachable
-/// (Local Network privacy, a Network Extension policy, no route) becomes a failure the probe does
-/// not read as "farther"; any other error is left as it is.
-#[cfg(target_os = "macos")]
-fn unreachable_at_once(e: io::Error) -> io::Error {
+/// What a probe saw, from how its own socket ended (`None`: not yet, at the round's end) and the
+/// ICMP errors matched to it: an answer dominates any ICMP error (Linux can queue one and still
+/// complete the connection: `sk_err_soft` while the socket is owned by the user; the S3 review's
+/// skeptic); an unreachable is the ICMP error that caused it when one kind was matched (several
+/// different ones: a failure), a plain unreachable when none was; an ICMP error the socket did not
+/// end on is no evidence (no answer).
+#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+fn settle(end: Option<ProbeOutcome>, icmp: &[(u8, u8, IpAddr)]) -> ProbeOutcome {
+    match end {
+        None => ProbeOutcome::TimedOut,
+        Some(ProbeOutcome::Unreachable) => match icmp.first() {
+            Some(&first) if icmp.iter().all(|e| *e == first) => ProbeOutcome::Icmp {
+                kind: first.0,
+                code: first.1,
+                from: first.2,
+            },
+            Some(_) => ProbeOutcome::Failed("different ICMP errors for one probe".into()),
+            None => ProbeOutcome::Unreachable,
+        },
+        Some(o) => o,
+    }
+}
+
+/// How a probe's socket ended, from its pending error (`SO_ERROR`) when it has one.
+#[cfg(unix)]
+fn ended(e: &io::Error) -> ProbeOutcome {
     match e.raw_os_error() {
-        Some(libc::EHOSTUNREACH) | Some(libc::ENETUNREACH) => io::Error::other(format!(
-            "{e}, before any packet was answered (Local Network privacy, a Network Extension \
-             policy, or no route)"
-        )),
-        _ => e,
+        Some(libc::ECONNREFUSED) => ProbeOutcome::Refused,
+        Some(libc::ECONNRESET) => ProbeOutcome::Reset,
+        Some(libc::EHOSTUNREACH) | Some(libc::ENETUNREACH) => ProbeOutcome::Unreachable,
+        Some(libc::ETIMEDOUT) => ProbeOutcome::TimedOut,
+        _ => ProbeOutcome::Failed(e.to_string()),
     }
 }
 
-/// macOS: waits for a non-blocking connect in progress, as `socket2::Socket::connect_timeout`
-/// does: connected, its error, or `TimedOut`.
-#[cfg(target_os = "macos")]
-fn poll_connected(sock: &socket2::Socket, timeout: Duration) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let start = std::time::Instant::now();
-    let mut p = libc::pollfd {
-        fd: sock.as_raw_fd(),
-        events: libc::POLLIN | libc::POLLOUT,
-        revents: 0,
-    };
-    loop {
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        let ms = (timeout - elapsed).as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
-        // SAFETY: `p` is one valid pollfd.
-        match unsafe { libc::poll(&mut p, 1, ms) } {
-            0 => return Err(io::ErrorKind::TimedOut.into()),
-            n if n > 0 => return connect_result(p.revents, sock.take_error()),
-            _ => {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
-                }
-            }
-        }
+/// An error `connect` reported at once, before the connection was in progress: a reset (on
+/// loopback) is an answer; anything else (Local Network privacy, a Network Extension policy, no
+/// route) is a local failure, never evidence: no packet was answered.
+#[cfg(unix)]
+fn at_once(e: io::Error) -> ProbeOutcome {
+    match e.raw_os_error() {
+        Some(libc::ECONNREFUSED) => ProbeOutcome::Refused,
+        Some(libc::ECONNRESET) => ProbeOutcome::Reset,
+        _ => ProbeOutcome::Failed(format!("{e}, before any packet was answered")),
     }
 }
 
-/// macOS: how a connect in progress ended, from `poll`'s `revents` and the socket's pending error
-/// (`SO_ERROR`): that error; a hang-up or error event with no error set is a failure of its own
-/// (never an unreachable, which would read as far: review round 3, cross-1); otherwise connected.
-#[cfg(target_os = "macos")]
-fn connect_result(revents: libc::c_short, error: io::Result<Option<io::Error>>) -> io::Result<()> {
-    if revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-        return match error {
-            Ok(Some(e)) | Err(e) => Err(e),
-            Ok(None) => Err(io::Error::other("no error set after POLLHUP")),
-        };
-    }
-    match error? {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// The check connection (see the module doc), on Linux, Android and macOS alike since the Linux
-/// application, redesigned in review round 4 (probe-1): two connections to the destination, both
-/// made with the default hop limit. The **check** connection's hop limit is then lowered to
-/// `hops` for the rest of its life (its FIN, every retransmission of it, its closing reset), and
-/// it is half-closed; then the **control** connection is made, at the default hop limit, and
-/// half-closed too. Both FINs' fates are read from the connections' TCP state ([`ConnReader`]:
-/// Linux's `TCP_INFO`, macOS's `TCP_CONNECTION_INFO`) and decided by [`Check::step`]:
-///
-/// - the check's FIN acknowledged, at any time: near ([`ConfirmOutcome::Answered`]);
-/// - far ([`ConfirmOutcome::Unanswered`]) only once the control's FIN was acknowledged (the peer
-///   acknowledges a FIN that reaches it) and the check's has stayed unacknowledged for
-///   [`Check::far_after`]: at least the window a near peer answers in (four round trips and
-///   250 ms, at least 300 ms), one retransmission of the check's FIN (its RTO, two round trips and
-///   250 ms), and the control's acknowledgement plus its round trip again (at least 250 ms) after
-///   it (the check's FIN left first on the same path, so a near peer's answer to it would come
-///   before the control's);
-/// - the control's FIN unacknowledged within its RTO, two round trips and 250 ms (at least
-///   500 ms), a peer that closes or resets either connection first, a wait past
-///   [`MAX_CHECK_WAIT`]: a failure, never far.
-///
-/// Before review round 4 one connection did both: its hop limit was restored after a deadline
-/// capped at 1.5 s (the "positive control"), and a late acknowledgement of the hop-limited FIN
-/// (a near peer behind a congested queue, a delayed or lost ACK) then read as the control's
-/// answer: far. Now the check connection's hop limit is never restored, and nothing it answers
-/// can read as far.
-///
-/// Only an acknowledgement counts as an answer (review round 2, probe-1): a peer that closed or
-/// reset the connection first is a failed check, never near by mistake and never far. ICMP
-/// errors for the FIN are not read (Linux keeps them as soft errors `SO_ERROR` does not report
-/// unless `IP_RECVERR` is set; macOS never reports them).
+/// One probe of a round.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn confirm_once(addr: SocketAddr, hops: u8, timeout: Duration, deadline: Instant) -> ConfirmOutcome {
-    use std::os::fd::AsRawFd;
-    let addr = unmapped(addr);
-    let connect = || -> Result<socket2::Socket, ConfirmOutcome> {
-        let sock = new_socket(addr).map_err(|e| ConfirmOutcome::Failed(e.to_string()))?;
-        // Review round 5, probe-1: within the caller's time too.
-        let timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
-        if timeout.is_zero() {
-            return Err(ConfirmOutcome::Failed(OUT_OF_TIME.into()));
-        }
-        sock.connect_timeout(&addr.into(), timeout)
-            .map_err(|e| ConfirmOutcome::ConnectFailed(e.to_string()))?;
+struct Probe {
+    sock: socket2::Socket,
+    ttl: u8,
+    local: SocketAddr,
+    /// How its socket ended.
+    end: Option<ProbeOutcome>,
+    /// The ICMP errors matched to it: type, code, sender.
+    icmp: Vec<(u8, u8, IpAddr)>,
+    /// macOS: its initial sequence number, while in `SYN_SENT` when read.
+    #[cfg(target_os = "macos")]
+    isn: Option<u32>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl Probe {
+    /// A probe to `addr` with hop limit `ttl`, from `pin`, its connect started.
+    fn open(addr: SocketAddr, ttl: u8, pin: &Pin) -> io::Result<Self> {
+        let sock = new_socket(addr)?;
+        set_hops(&sock, addr, ttl)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        set_recverr(&sock, addr)?;
+        pin_socket(&sock, addr, pin, 0)?;
+        sock.set_nonblocking(true)?;
+        let end = match sock.connect(&addr.into()) {
+            Ok(()) => Some(ProbeOutcome::Connected),
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => None,
+            Err(e) => Some(at_once(e)),
+        };
         // Closed with a reset, never a byte of data.
         let _ = sock.set_linger(Some(Duration::ZERO));
-        Ok(sock)
-    };
-    let check = match connect() {
-        Ok(s) => s,
-        Err(o) => return o,
-    };
-    // From here on every packet of the check connection — the FIN, its retransmissions, the
-    // closing reset — may cross at most `hops` hops.
-    if let Err(e) = set_hops(&check, addr, hops) {
-        return ConfirmOutcome::Failed(e.to_string());
-    }
-    let rc = ConnReader::new(check.as_raw_fd());
-    let ic = match rc.info() {
-        Ok(i) => i,
-        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
-    };
-    // The peer closed or reset the connection before the FIN was sent: what follows could not
-    // tell whether the FIN reached it (review round 2, probe-1).
-    if ic.state != TcpState::Established {
-        return ConfirmOutcome::Failed(peer_closed_first(ic.state, Conn::Check));
-    }
-    // The hop-limited FIN first; then the control connection is made and its FIN sent. An
-    // acknowledgement of the check's FIN that comes meanwhile is near at once.
-    if let Err(e) = check.shutdown(std::net::Shutdown::Write) {
-        return ConfirmOutcome::Failed(e.to_string());
-    }
-    let start = std::time::Instant::now();
-    // Review round 6, probe-1: macOS reports the retransmission timeout only while its timer is
-    // armed (0 on an idle connection, so the margin for a retransmitted FIN's acknowledgement
-    // collapsed to ~50 ms): read again now that the FIN is out, and an RTO still unknown is
-    // UNKNOWN_RTO.
-    let rto = check_rto(ic.rto, rc.info().ok().map(|i| i.rto));
-    #[cfg(test)]
-    LAST_RTO.store(rto.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
-    let mut decision = match Check::new(ic.rtt, rto) {
-        Ok(d) => d,
-        Err(o) => return o,
-    };
-    let check_state = || rc.info().map(|i| i.state);
-    let near_already = |d: &mut Check| {
-        let state = check_state();
-        matches!(state, Ok(TcpState::FinWait2 | TcpState::TimeWait))
-            .then(|| d.step(start.elapsed(), state, Ok(TcpState::FinWait1)))
-            .flatten()
-    };
-    if let Some(done) = near_already(&mut decision) {
-        return done;
-    }
-    let control = match connect() {
-        Ok(s) => s,
-        Err(o) => return near_already(&mut decision).unwrap_or(o),
-    };
-    let rk = ConnReader::new(control.as_raw_fd());
-    match rk.info() {
-        Ok(i) if i.state == TcpState::Established => {}
-        Ok(i) => {
-            return near_already(&mut decision).unwrap_or_else(|| {
-                ConfirmOutcome::Failed(peer_closed_first(i.state, Conn::Control))
-            })
-        }
-        Err(e) => return ConfirmOutcome::Failed(e.to_string()),
-    }
-    if let Err(e) = control.shutdown(std::net::Shutdown::Write) {
-        return ConfirmOutcome::Failed(e.to_string());
-    }
-    decision.control_sent_at(start.elapsed());
-    loop {
-        let (c, k) = (check_state(), rk.info().map(|i| i.state));
-        if let Some(done) = decision.step(start.elapsed(), c, k) {
-            return done;
-        }
-        if Instant::now() >= deadline {
-            return ConfirmOutcome::Failed(OUT_OF_TIME.into());
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// The retransmission timeout taken when the kernel reports none (review round 6, probe-1): RFC
-/// 6298's initial RTO, more than any path the check can judge needs (Linux's minimum is 200 ms).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-pub const UNKNOWN_RTO: Duration = Duration::from_secs(1);
-
-/// The check connection's retransmission timeout: the larger of what the kernel reported before
-/// and after the FIN was sent, [`UNKNOWN_RTO`] when both are zero (unknown, never "none").
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn check_rto(before: Duration, after: Option<Duration>) -> Duration {
-    let rto = before.max(after.unwrap_or_default());
-    if rto.is_zero() {
-        UNKNOWN_RTO
-    } else {
-        rto
-    }
-}
-
-/// The RTO the last check connection used, in milliseconds (tests).
-#[cfg(all(test, any(target_os = "linux", target_os = "android", target_os = "macos")))]
-static LAST_RTO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The longest the check connection may wait for the decision ([`Check`]); a path whose round
-/// trip asks for longer is refused (`round trip too long`), never decided with a shorter wait.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-pub const MAX_CHECK_WAIT: Duration = Duration::from_secs(10);
-
-/// The two-connection check's decision ([`confirm_once`]), from the states read of the check
-/// connection (its FIN limited to the probe's hops) and the control connection (its FIN at the
-/// default hop limit), polled with the time since both FINs were sent. Pure: tests drive every
-/// interleaving.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Check {
-    /// How long the check's FIN must stay unacknowledged at least before far: the window a
-    /// near peer answers in, and one retransmission of the FIN.
-    min_wait: Duration,
-    /// How long the control's FIN may take to be acknowledged.
-    control_wait: Duration,
-    /// When the control's FIN was sent (after the check's: the control connection is made once
-    /// the check's FIN is out).
-    control_sent: Duration,
-    /// When the control's FIN was acknowledged.
-    control_acked: Option<Duration>,
-}
-
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-impl Check {
-    /// The margin past the control's acknowledgement (a delayed ACK, jitter).
-    const MARGIN: Duration = Duration::from_millis(250);
-
-    /// The check for a connection whose round trip is `rtt` and retransmission timeout `rto`;
-    /// a failure when the waits they ask for pass [`MAX_CHECK_WAIT`].
-    pub(crate) fn new(rtt: Duration, rto: Duration) -> Result<Self, ConfirmOutcome> {
-        let window = (rtt * 4 + Self::MARGIN).max(Duration::from_millis(300));
-        let retransmission = rto + rtt * 2 + Self::MARGIN;
-        let min_wait = window.max(retransmission);
-        let control_wait = retransmission.max(Duration::from_millis(500));
-        if min_wait.max(control_wait) > MAX_CHECK_WAIT {
-            return Err(too_slow(rtt, rto));
-        }
-        Ok(Check {
-            min_wait,
-            control_wait,
-            control_sent: Duration::ZERO,
-            control_acked: None,
+        let local = sock
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| io::Error::other("the probe's own address is not an IP address"))?;
+        #[cfg(target_os = "macos")]
+        let isn = match end {
+            None => {
+                use std::os::fd::AsRawFd;
+                let mut b = [0u8; TCP_INFO_BUF];
+                let n = tcp_info(sock.as_raw_fd(), &mut b)?;
+                isn_from(&b[..n])?
+            }
+            Some(_) => None,
+        };
+        Ok(Probe {
+            sock,
+            ttl,
+            local,
+            end,
+            icmp: Vec::new(),
+            #[cfg(target_os = "macos")]
+            isn,
         })
     }
 
-    /// Notes that the control's FIN was sent `at` (after the check's).
-    pub(crate) fn control_sent_at(&mut self, at: Duration) {
-        self.control_sent = at;
-    }
-
-    /// How long after the check's FIN it may be read as unanswered, once the control's was
-    /// acknowledged at `acked`: [`Self::min_wait`], and the control's round trip again plus the
-    /// margin after that.
-    pub(crate) fn far_after(&self, acked: Duration) -> Duration {
-        let round_trip = acked.saturating_sub(self.control_sent);
-        self.min_wait.max(acked + round_trip.max(Self::MARGIN))
-    }
-
-    /// One reading, `now` after the check's FIN: the check connection's state and the control's
-    /// (or why they could not be read). `Some` when decided.
-    pub(crate) fn step(
-        &mut self,
-        now: Duration,
-        check: io::Result<TcpState>,
-        control: io::Result<TcpState>,
-    ) -> Option<ConfirmOutcome> {
-        let check = match check {
-            Ok(s) => s,
-            Err(e) => return Some(ConfirmOutcome::Failed(e.to_string())),
+    /// The socket reported `revents`: how it ended, its queued ICMP errors read (Linux). Its
+    /// pending error is read first: reading the error queue clears it (`sock_dequeue_err_skb`).
+    fn ready(&mut self, revents: libc::c_short) {
+        let error = self.sock.take_error();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let queued = self.read_errqueue();
+        #[cfg(target_os = "macos")]
+        let queued = 0;
+        self.end = match error {
+            Err(e) => Some(ProbeOutcome::Failed(e.to_string())),
+            Ok(Some(e)) => Some(ended(&e)),
+            Ok(None) if self.sock.peer_addr().is_ok() => Some(ProbeOutcome::Connected),
+            // An ICMP error queued while the connection goes on (Linux's soft error): how it
+            // ends decides.
+            Ok(None) if queued > 0 => None,
+            Ok(None) => Some(ProbeOutcome::Failed(format!(
+                "the socket reported {revents:#x} with neither an error nor a connection"
+            ))),
         };
-        // Any acknowledgement of the hop-limited FIN, whenever it comes: near.
-        if let Some(done) = fin_step(check, Conn::Check) {
-            return Some(done);
-        }
-        if self.control_acked.is_none() {
-            match control.map(|c| fin_step(c, Conn::Control)) {
-                Err(e) => {
-                    return Some(ConfirmOutcome::Failed(format!(
-                        "the control connection's state could not be read: {e}"
-                    )))
-                }
-                Ok(Some(ConfirmOutcome::Answered)) => self.control_acked = Some(now),
-                Ok(Some(other)) => return Some(other),
-                Ok(None) => {}
+    }
+
+    /// Linux: every ICMP error queued for the probe (`MSG_ERRQUEUE`), kept when it is an ICMP
+    /// message of the probe's family; how many entries were read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_errqueue(&mut self) -> usize {
+        use std::os::fd::AsRawFd;
+        let v6 = self.local.is_ipv6();
+        let mut n = 0;
+        while n < 16 {
+            let mut data = [0u8; 256];
+            let mut cbuf = [0u64; 64];
+            let mut iov = libc::iovec {
+                iov_base: data.as_mut_ptr().cast(),
+                iov_len: data.len(),
+            };
+            // SAFETY: a zeroed msghdr, then filled with valid buffers.
+            let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
+            m.msg_iov = &mut iov;
+            m.msg_iovlen = 1;
+            m.msg_control = cbuf.as_mut_ptr().cast();
+            m.msg_controllen = std::mem::size_of_val(&cbuf) as _;
+            // SAFETY: as above; MSG_DONTWAIT: an empty queue is EAGAIN.
+            let r = unsafe {
+                libc::recvmsg(
+                    self.sock.as_raw_fd(),
+                    &mut m,
+                    libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+                )
+            };
+            if r < 0 {
+                break;
+            }
+            n += 1;
+            // SAFETY: the control buffer the kernel wrote, walked with the libc CMSG macros.
+            if let Some(e) = unsafe { errqueue_entry(&m, v6) } {
+                self.icmp.push(e);
             }
         }
-        match self.control_acked {
-            Some(acked) => {
-                let far_after = self.far_after(acked);
-                if far_after > MAX_CHECK_WAIT {
-                    return Some(ConfirmOutcome::Failed(format!(
-                        "the peer took {} ms to acknowledge the control's FIN, too long for the \
-                         check to tell how near it is",
-                        acked.saturating_sub(self.control_sent).as_millis()
-                    )));
-                }
-                (now >= far_after).then(|| match check {
-                    TcpState::FinWait1 => ConfirmOutcome::Unanswered,
-                    // The peer's FIN crossed the check's, which is still unacknowledged: it
-                    // closed on its own.
-                    other => ConfirmOutcome::Failed(peer_closed_first(
-                        match other {
-                            TcpState::Closing => TcpState::LastAck,
-                            o => o,
-                        },
-                        Conn::Check,
-                    )),
-                })
+        n
+    }
+}
+
+/// Linux: the ICMP error of one error-queue message: type, code and sender (`SO_EE_OFFENDER`),
+/// when its origin is ICMP (IPv4) or ICMPv6 (`v6`) and its control message holds the whole
+/// `sock_extended_err` and offender.
+///
+/// # Safety
+/// `m` is a msghdr `recvmsg` filled.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errqueue_entry(m: &libc::msghdr, v6: bool) -> Option<(u8, u8, IpAddr)> {
+    let (level, kind, origin, addr_len) = if v6 {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_RECVERR,
+            libc::SO_EE_ORIGIN_ICMP6,
+            std::mem::size_of::<libc::sockaddr_in6>(),
+        )
+    } else {
+        (
+            libc::IPPROTO_IP,
+            libc::IP_RECVERR,
+            libc::SO_EE_ORIGIN_ICMP,
+            std::mem::size_of::<libc::sockaddr_in>(),
+        )
+    };
+    let need = libc::CMSG_LEN((std::mem::size_of::<libc::sock_extended_err>() + addr_len) as u32) as usize;
+    let mut c = libc::CMSG_FIRSTHDR(m);
+    while !c.is_null() {
+        let h = &*c;
+        if h.cmsg_level == level && h.cmsg_type == kind && h.cmsg_len as usize >= need {
+            let e = &*(libc::CMSG_DATA(c) as *const libc::sock_extended_err);
+            if e.ee_origin != origin {
+                return None;
             }
-            None => (now >= self.control_sent + self.control_wait)
-                .then(|| ConfirmOutcome::Failed(UNACKED_FIN.into())),
+            let off = (e as *const libc::sock_extended_err).add(1) as *const libc::sockaddr;
+            let from = sockaddr_ip(off)?;
+            return Some((e.ee_type, e.ee_code, from));
         }
+        c = libc::CMSG_NXTHDR(m, c);
     }
+    None
 }
 
-/// Why a path is too slow for the check ([`Check::new`]).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn too_slow(rtt: Duration, rto: Duration) -> ConfirmOutcome {
-    ConfirmOutcome::Failed(format!(
-        "its round trip ({} ms, retransmission timeout {} ms) is too long for the check to tell \
-         how near it is",
-        rtt.as_millis(),
-        rto.as_millis()
-    ))
-}
+/// macOS: the private `TCP_INFO` option (xnu `tcp_private.h`), whose `struct tcp_info` holds
+/// `tcpi_state` at 0 and `tcpi_snd_nxt` at 52.
+#[cfg(target_os = "macos")]
+const TCP_INFO_PRIVATE: libc::c_int = 0x200;
+/// The bytes of it read: up to `tcpi_snd_nxt`'s end (this Mac's kernel writes 424).
+#[cfg(any(test, target_os = "macos"))]
+const TCP_INFO_NEEDED: usize = 56;
+/// The buffer it is read into.
+#[cfg(target_os = "macos")]
+const TCP_INFO_BUF: usize = 1024;
+/// xnu's `TCPS_SYN_SENT`.
+#[cfg(any(test, target_os = "macos"))]
+const TCPS_SYN_SENT: u8 = 2;
 
-/// Reads a connection's [`ConnInfo`] ([`conn_info`]), and remembers a reset (review round 4,
-/// parse-2): on Linux a reset is `TCP_CLOSE` with an error pending, and reading the error
-/// (`SO_ERROR`) clears it, so a later read of the same `TCP_CLOSE` would look like a completed
-/// close (acknowledged). Once a read says [`TcpState::Closed`], every later one does.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-struct ConnReader {
-    fd: i32,
-    closed: std::cell::Cell<Option<ConnInfo>>,
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-impl ConnReader {
-    fn new(fd: i32) -> Self {
-        ConnReader {
-            fd,
-            closed: std::cell::Cell::new(None),
-        }
-    }
-
-    fn info(&self) -> io::Result<ConnInfo> {
-        sticky_closed(&self.closed, || conn_info(self.fd))
-    }
-}
-
-/// [`ConnReader::info`]'s rule: once `read` says [`TcpState::Closed`], `closed` keeps it.
-#[cfg(any(all(test, unix), target_os = "linux", target_os = "android", target_os = "macos"))]
-fn sticky_closed(
-    closed: &std::cell::Cell<Option<ConnInfo>>,
-    read: impl FnOnce() -> io::Result<ConnInfo>,
-) -> io::Result<ConnInfo> {
-    if let Some(i) = closed.get() {
-        return Ok(i);
-    }
-    let i = read()?;
-    if i.state == TcpState::Closed {
-        closed.set(Some(i));
-    }
-    Ok(i)
-}
-
-/// A TCP connection's state as the check connection reads it, whatever the platform's numbering
-/// (Linux's <net/tcp_states.h>, [`TcpState::from_linux`]; macOS's <netinet/tcp_fsm.h>,
-/// [`TcpState::from_macos`]).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TcpState {
-    /// Closed: the peer reset the connection (Linux `TCP_CLOSE` with an error pending; macOS
-    /// `TCPS_CLOSED`, which also follows an acknowledged `LAST_ACK` there).
-    Closed,
-    Established,
-    /// The peer closed its side first.
-    CloseWait,
-    /// This side's FIN sent, not yet acknowledged.
-    FinWait1,
-    /// Both FINs sent, this side's not yet acknowledged.
-    Closing,
-    /// The peer closed first, then this side sent its FIN.
-    LastAck,
-    /// This side's FIN acknowledged.
-    FinWait2,
-    /// Both closed, this side's FIN acknowledged (Linux: `TCP_CLOSE` with no error pending).
-    TimeWait,
-    /// Any other state (the platform's number).
-    Other(u8),
-}
-
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-impl TcpState {
-    /// Linux's `tcpi_state` (<net/tcp_states.h>: `TCP_ESTABLISHED` 1 … `TCP_CLOSING` 11), with
-    /// the socket's pending error (`SO_ERROR`, read only for `TCP_CLOSE`).
-    ///
-    /// Linux never shows `TIME_WAIT` on the socket itself: a connection that reaches it (this
-    /// side's FIN acknowledged and the peer's FIN received, from `FIN_WAIT2` or `CLOSING`) is
-    /// handed to a timewait mini-socket and the socket the process holds is `TCP_CLOSE`
-    /// (`tcp_time_wait` → `tcp_done`); so is one whose `LAST_ACK` was acknowledged. Both mean
-    /// this side's FIN was acknowledged. A reset is `TCP_CLOSE` too, but with `sk_err` set
-    /// (`tcp_reset`: `ECONNRESET`, `EPIPE` from `CLOSE_WAIT`), as is a connection the kernel gave
-    /// up on (`ETIMEDOUT`) or another process aborted (`ECONNABORTED`). So `TCP_CLOSE` with no
-    /// pending error reads as [`TcpState::TimeWait`] (the FIN acknowledged, the connection
-    /// closed), and with one as [`TcpState::Closed`] (reset). Measured: the check connection to
-    /// 1.1.1.1 whose restored FIN 1.1.1.1 acknowledged and answered with its own went straight
-    /// from `FIN_WAIT1` to `TCP_CLOSE` with `SO_ERROR` 0 (`fix-linux/exp/finctl-1.1.1.1-vm.log`).
-    #[cfg(any(all(test, unix), target_os = "linux", target_os = "android"))]
-    pub(crate) fn from_linux_close(s: u8, so_error: i32) -> Self {
-        match (s, so_error) {
-            (7, 0) => TcpState::TimeWait,
-            (7, _) => TcpState::Closed,
-            (s, _) => TcpState::from_linux(s),
-        }
-    }
-
-    /// Linux's `tcpi_state` (<net/tcp_states.h>: `TCP_ESTABLISHED` 1 … `TCP_CLOSING` 11), as
-    /// numbered (`TCP_CLOSE` 7 is [`TcpState::Closed`]; see [`TcpState::from_linux_close`]).
-    #[cfg(any(test, target_os = "linux", target_os = "android"))]
-    pub(crate) fn from_linux(s: u8) -> Self {
-        match s {
-            1 => TcpState::Established,
-            4 => TcpState::FinWait1,
-            5 => TcpState::FinWait2,
-            6 => TcpState::TimeWait,
-            7 => TcpState::Closed,
-            8 => TcpState::CloseWait,
-            9 => TcpState::LastAck,
-            11 => TcpState::Closing,
-            o => TcpState::Other(o),
-        }
-    }
-
-    /// macOS's `tcpi_state` (<netinet/tcp_fsm.h>: `TCPS_CLOSED` 0 … `TCPS_TIME_WAIT` 10).
-    #[cfg(any(test, target_os = "macos"))]
-    pub(crate) fn from_macos(s: u8) -> Self {
-        match s {
-            0 => TcpState::Closed,
-            4 => TcpState::Established,
-            5 => TcpState::CloseWait,
-            6 => TcpState::FinWait1,
-            7 => TcpState::Closing,
-            8 => TcpState::LastAck,
-            9 => TcpState::FinWait2,
-            10 => TcpState::TimeWait,
-            o => TcpState::Other(o),
-        }
-    }
-}
-
-/// What the check connection reads of a connection: its state, the round trip (smoothed, or the
-/// last before there is one) and the retransmission timeout.
-#[cfg(any(all(test, unix), target_os = "linux", target_os = "android", target_os = "macos"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConnInfo {
-    pub state: TcpState,
-    pub rtt: Duration,
-    pub rto: Duration,
-}
-
-/// What the check connection's state, polled after its FIN was sent, decides (review round 2,
-/// probe-1; Linux too since the Linux application): `FIN_WAIT_2` or `TIME_WAIT` (only reached
-/// once the FIN was acknowledged; `TIME_WAIT` also from `CLOSING`) is an answer, near;
-/// `FIN_WAIT_1` (the FIN not yet acknowledged) and `CLOSING` (the peer's FIN crossed this side's,
-/// which is still not acknowledged) decide nothing yet; a peer that closed or reset the connection
-/// on its own (`LAST_ACK`, `CLOSE_WAIT`, `CLOSED`: no acknowledgement of the FIN) is a failure,
-/// refused but not read as near, and never as far.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn fin_step(state: TcpState, which: Conn) -> Option<ConfirmOutcome> {
-    match state {
-        TcpState::FinWait2 | TcpState::TimeWait => Some(ConfirmOutcome::Answered),
-        TcpState::FinWait1 | TcpState::Closing => None,
-        other => Some(ConfirmOutcome::Failed(peer_closed_first(other, which))),
-    }
-}
-
-/// Which of the check's two connections a state was read of (its failure names it: review round
-/// 5, probe-2).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Conn {
-    /// The hop-limited one.
-    Check,
-    /// The one at the default hop limit.
-    Control,
-}
-
-/// Why a check whose control FIN, at the default hop limit, was never acknowledged fails
-/// ([`Check::step`]): the cause within the 120 characters a refusal shows of it
-/// ([`ConfirmOutcome::verdict`]).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-const UNACKED_FIN: &str = "the peer acknowledged the check's FIN neither within the hop limit \
-                           nor at the default one (AWS S3 never does)";
-
-/// Why the check fails when the peer closed (`CLOSE_WAIT`, then `LAST_ACK` once this side sends
-/// its FIN) or reset (`CLOSED`) the connection before its FIN was acknowledged.
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
-fn peer_closed_first(state: TcpState, which: Conn) -> String {
-    let (conn, fin) = match which {
-        Conn::Check => ("check", "hop-limited FIN"),
-        Conn::Control => ("control", "FIN"),
+/// macOS: `getsockopt(IPPROTO_TCP, TCP_INFO 0x200)` on `fd` into `b`: how many bytes the kernel
+/// wrote, an error when that does not reach `tcpi_snd_nxt`'s end.
+#[cfg(target_os = "macos")]
+fn tcp_info(fd: i32, b: &mut [u8; TCP_INFO_BUF]) -> io::Result<usize> {
+    let mut len = b.len() as libc::socklen_t;
+    // SAFETY: `b` and `len` are valid for the size given; the kernel writes at most `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(fd, libc::IPPROTO_TCP, TCP_INFO_PRIVATE, b.as_mut_ptr().cast(), &mut len)
     };
-    let how = match state {
-        TcpState::CloseWait | TcpState::LastAck => "closed",
-        TcpState::Closed => "reset",
-        other => return format!("the {conn} connection is in TCP state {other:?}"),
-    };
-    // Within the 120 characters a refusal shows ([`ConfirmOutcome::verdict`]).
-    format!("the peer {how} the {conn} connection before its {fin} was acknowledged: the check cannot tell how near it is")
-}
-
-/// Linux: the bytes of a `struct tcp_info` (<linux/tcp.h>) the check connection reads, at the
-/// kernel's ABI offsets: `tcpi_state` (0, u8), `tcpi_rto` (8, µs), `tcpi_rtt` (68, µs, the
-/// smoothed round trip). Every kernel since 2.6 writes at least these 104 bytes; the check needs
-/// the 72 up to `tcpi_rtt`'s end, and reads nothing past what the kernel says it wrote. (Parsed
-/// from bytes, not the libc crate's struct: Android's libc defines none, and the crate's layouts
-/// differ between C libraries past these fields.)
-#[cfg(any(all(test, unix), target_os = "linux", target_os = "android"))]
-const TCP_INFO_NEEDED: usize = 72;
-
-/// [`ConnInfo`] from the `len` bytes of a `tcp_info` the kernel wrote into `b` (`so_error`: the
-/// socket's pending error, read when the state is `TCP_CLOSE`: [`TcpState::from_linux_close`]);
-/// an error when that does not reach `tcpi_rtt`'s end.
-#[cfg(any(all(test, unix), target_os = "linux", target_os = "android"))]
-fn linux_conn_info(b: &[u8], len: usize, so_error: impl FnOnce() -> i32) -> io::Result<ConnInfo> {
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = len as usize;
     if len < TCP_INFO_NEEDED || len > b.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("TCP_INFO wrote {len} bytes, not the {TCP_INFO_NEEDED} needed"),
         ));
     }
-    let u32_at = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
-    let state = match b[0] {
-        7 => TcpState::from_linux_close(7, so_error()),
-        s => TcpState::from_linux(s),
-    };
-    Ok(ConnInfo {
-        state,
-        rto: Duration::from_micros(u64::from(u32_at(8))),
-        rtt: Duration::from_micros(u64::from(u32_at(68))),
-    })
+    Ok(len)
 }
 
-/// Linux: the pending error `getsockopt(SO_ERROR)` returned `rc` and `e` for: a socket whose
-/// error cannot be read (`rc != 0`) is not known to have closed cleanly, so it reads as an error
-/// (-1), which makes its `TCP_CLOSE` a reset (review round 4, cross-6).
-#[cfg(any(all(test, unix), target_os = "linux", target_os = "android"))]
-fn so_error_read(rc: i32, e: i32) -> i32 {
-    if rc != 0 {
-        -1
-    } else {
-        e
-    }
-}
-
-/// Linux: `getsockopt(TCP_INFO)` on `fd`, read as [`linux_conn_info`] says.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn conn_info(fd: i32) -> io::Result<ConnInfo> {
-    let mut b = [0u8; 256];
-    let mut len = b.len() as libc::socklen_t;
-    // SAFETY: `b` and `len` are valid for the size given; the kernel writes at most `len` bytes.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INFO,
-            b.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Read (and so cleared) only for TCP_CLOSE, which every caller takes as final: polled again,
-    // a reset's TCP_CLOSE would read as acknowledged (its error already read).
-    let so_error = || {
-        let mut e: libc::c_int = 0;
-        let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `e` and `l` are valid for the size given.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                (&mut e as *mut libc::c_int).cast(),
-                &mut l,
-            )
-        };
-        so_error_read(rc, e)
-    };
-    linux_conn_info(&b, len as usize, so_error)
-}
-
-/// macOS: `getsockopt(TCP_CONNECTION_INFO)` on `fd` ([`connection_info`]) as a [`ConnInfo`].
-#[cfg(target_os = "macos")]
-fn conn_info(fd: i32) -> io::Result<ConnInfo> {
-    let i = connection_info(fd)?;
-    Ok(ConnInfo {
-        state: TcpState::from_macos(i.state),
-        // Milliseconds; the smoothed round trip, or the last one before there is one.
-        rtt: Duration::from_millis(u64::from(i.srtt_ms.max(i.rttcur_ms))),
-        rto: Duration::from_millis(u64::from(i.rto_ms)),
-    })
-}
-
-/// The fields of a `struct tcp_connection_info` (<netinet/tcp.h>) the check connection reads.
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ConnectionInfo {
-    /// `tcpi_state`: a <netinet/tcp_fsm.h> state.
-    state: u8,
-    /// `tcpi_rttcur`, `tcpi_srtt`: the last and the smoothed round trip, in milliseconds.
-    rttcur_ms: u32,
-    srtt_ms: u32,
-    /// `tcpi_rto`: the retransmission timeout, in milliseconds.
-    rto_ms: u32,
-}
-
-/// The bytes of a `tcp_connection_info` that must have been written for [`ConnectionInfo`] to be
-/// read: up to the end of `tcpi_srtt` (48). The libc crate's struct is 176 bytes and the SDK's
-/// 112 (the kernel writes 112: review round 1, probe-1), so only the fields within what the kernel
-/// says it wrote are read, never the libc struct's tail; the offsets are the SDK's (`tcpi_state`
-/// 0, `tcpi_rttcur` 40, `tcpi_srtt` 44), checked in the tests.
-#[cfg(target_os = "macos")]
-const CONNECTION_INFO_NEEDED: usize =
-    std::mem::offset_of!(libc::tcp_connection_info, tcpi_srtt) + 4;
-
-/// [`ConnectionInfo`] from a `tcp_connection_info` of which the kernel wrote `len` bytes; an
-/// error when that does not reach `tcpi_srtt`'s end.
-#[cfg(target_os = "macos")]
-fn connection_info_fields(i: &libc::tcp_connection_info, len: usize) -> io::Result<ConnectionInfo> {
-    if len < CONNECTION_INFO_NEEDED || len > std::mem::size_of::<libc::tcp_connection_info>() {
+/// macOS: a probe's initial sequence number from the `TCP_INFO` bytes the kernel wrote
+/// (`tcpi_snd_nxt - 1` while in `SYN_SENT`, when only the SYN has been sent); `None` when the
+/// connection is no longer in `SYN_SENT` (it already ended: an ICMP error then cannot be matched
+/// to it, and is no evidence); an error when the bytes are too few or the number is zero.
+#[cfg(any(test, target_os = "macos"))]
+fn isn_from(b: &[u8]) -> io::Result<Option<u32>> {
+    if b.len() < TCP_INFO_NEEDED {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "TCP_CONNECTION_INFO wrote {len} bytes, not the {CONNECTION_INFO_NEEDED} needed"
-            ),
+            format!("TCP_INFO wrote {} bytes, not the {TCP_INFO_NEEDED} needed", b.len()),
         ));
     }
-    Ok(ConnectionInfo {
-        state: i.tcpi_state,
-        rttcur_ms: i.tcpi_rttcur,
-        srtt_ms: i.tcpi_srtt,
-        rto_ms: i.tcpi_rto,
+    if b[0] != TCPS_SYN_SENT {
+        return Ok(None);
+    }
+    let snd_nxt = u32::from_ne_bytes([b[52], b[53], b[54], b[55]]);
+    let isn = snd_nxt.wrapping_sub(1);
+    if snd_nxt == 0 || isn == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TCP_INFO gave the probe no initial sequence number",
+        ));
+    }
+    Ok(Some(isn))
+}
+
+/// macOS: the round's probes' initial sequence numbers must differ (two equal ones could not tell
+/// whose ICMP error is whose).
+#[cfg(any(test, target_os = "macos"))]
+fn distinct_isns(isns: &[Option<u32>]) -> Result<(), String> {
+    let known: Vec<u32> = isns.iter().flatten().copied().collect();
+    for (i, a) in known.iter().enumerate() {
+        if known[i + 1..].contains(a) {
+            return Err("two probes read the same initial sequence number".into());
+        }
+    }
+    Ok(())
+}
+
+/// What an ICMP error quotes of the TCP segment it is about ([`icmp_quote`]).
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Quote {
+    kind: u8,
+    code: u8,
+    src: IpAddr,
+    sport: u16,
+    seq: u32,
+}
+
+/// macOS: an ICMP datagram as the `SOCK_DGRAM` ICMP socket hands it over (IPv4 with its IP header,
+/// ICMPv6 without), when it quotes a TCP segment to `dst` (its address and port): its type, code,
+/// and the quoted segment's source address, source port and sequence number. Pure.
+#[cfg(any(test, target_os = "macos"))]
+fn icmp_quote(b: &[u8], dst: SocketAddr) -> Option<Quote> {
+    let icmp = if dst.is_ipv6() {
+        b
+    } else {
+        if b.first()? >> 4 != 4 {
+            return None;
+        }
+        b.get(usize::from(b[0] & 15) * 4..)?
+    };
+    let (kind, code) = (*icmp.first()?, *icmp.get(1)?);
+    let inner = icmp.get(8..)?;
+    let (src, qdst, l4): (IpAddr, IpAddr, &[u8]) = if dst.is_ipv6() {
+        if inner.len() < 48 || inner[0] >> 4 != 6 || inner[6] != 6 {
+            return None;
+        }
+        let a = |o: usize| {
+            let mut x = [0u8; 16];
+            x.copy_from_slice(&inner[o..o + 16]);
+            IpAddr::from(x)
+        };
+        (a(8), a(24), &inner[40..])
+    } else {
+        let ihl = usize::from(*inner.first()? & 15) * 4;
+        if inner[0] >> 4 != 4 || ihl < 20 || inner.len() < ihl + 8 || inner[9] != 6 {
+            return None;
+        }
+        (
+            IpAddr::from([inner[12], inner[13], inner[14], inner[15]]),
+            IpAddr::from([inner[16], inner[17], inner[18], inner[19]]),
+            &inner[ihl..],
+        )
+    };
+    let sport = u16::from_be_bytes([l4[0], l4[1]]);
+    let dport = u16::from_be_bytes([l4[2], l4[3]]);
+    let seq = u32::from_be_bytes([l4[4], l4[5], l4[6], l4[7]]);
+    (qdst == dst.ip() && dport == dst.port()).then_some(Quote {
+        kind,
+        code,
+        src,
+        sport,
+        seq,
     })
 }
 
-/// `getsockopt(TCP_CONNECTION_INFO)` on `fd`, read as [`connection_info_fields`] says.
+/// macOS: a `SOCK_DGRAM` `IPPROTO_ICMP` / `IPPROTO_ICMPV6` socket (unprivileged), non-blocking;
+/// it gets a copy of every ICMP error this host receives.
 #[cfg(target_os = "macos")]
-fn connection_info(fd: i32) -> io::Result<ConnectionInfo> {
-    // SAFETY: a zeroed tcp_connection_info (plain integers) is valid to be overwritten by
-    // getsockopt.
-    let mut i: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
-    // SAFETY: `i` and `len` are valid for the size given; the kernel writes at most `len` bytes.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_CONNECTION_INFO,
-            (&mut i as *mut libc::tcp_connection_info).cast(),
-            &mut len,
-        )
+fn icmp_socket(v6: bool) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let (family, proto) = if v6 {
+        (libc::AF_INET6, libc::IPPROTO_ICMPV6)
+    } else {
+        (libc::AF_INET, libc::IPPROTO_ICMP)
     };
-    if rc != 0 {
+    // SAFETY: plain socket(2).
+    let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM, proto) };
+    if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    connection_info_fields(&i, len as usize)
+    // SAFETY: fd is a fresh socket this function owns.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    // SAFETY: fcntl on our fd.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned)
 }
 
+/// macOS: every datagram waiting on the ICMP socket `fd`, each matched to the probe whose
+/// destination, source address and port and initial sequence number it quotes.
+#[cfg(target_os = "macos")]
+fn read_icmp(fd: i32, dst: SocketAddr, probes: &mut [Probe]) {
+    for _ in 0..64 {
+        let mut b = [0u8; 2048];
+        // SAFETY: zeroed storage, valid buffers of the sizes given.
+        let mut from: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut fl = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: as above.
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                b.as_mut_ptr().cast(),
+                b.len(),
+                0,
+                (&mut from as *mut libc::sockaddr_storage).cast(),
+                &mut fl,
+            )
+        };
+        if n <= 0 {
+            return;
+        }
+        let Some(q) = icmp_quote(&b[..n as usize], dst) else {
+            continue;
+        };
+        // SAFETY: the kernel wrote a sockaddr of the socket's family into `from`.
+        let Some(sender) = (unsafe { sockaddr_ip((&from as *const libc::sockaddr_storage).cast()) }) else {
+            continue;
+        };
+        for p in probes.iter_mut() {
+            let src_ok = p.local.ip().is_unspecified() || p.local.ip() == q.src;
+            if p.local.port() == q.sport && p.isn == Some(q.seq) && src_ok {
+                p.icmp.push((q.kind, q.code, sender));
+            }
+        }
+    }
+}
+
+/// One round (see the module doc): the probes at hop limits `hops ..= hops + extra`, at once,
+/// waited for at most `wait`.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn observe(
+    addr: SocketAddr,
+    hops: u8,
+    extra: u8,
+    pin: &Pin,
+    wait: Duration,
+) -> Result<Vec<Obs>, String> {
+    use std::os::fd::AsRawFd;
+    // Before any probe leaves: its copy of the answers.
+    #[cfg(target_os = "macos")]
+    let ic = icmp_socket(addr.is_ipv6())
+        .map_err(|e| format!("an ICMP socket to read the probes' errors could not be opened: {e}"))?;
+    let mut probes = Vec::new();
+    for t in hops..=hops.saturating_add(extra) {
+        probes.push(Probe::open(addr, t, pin).map_err(|e| format!("a probe could not be sent: {e}"))?);
+    }
+    #[cfg(target_os = "macos")]
+    distinct_isns(&probes.iter().map(|p| p.isn).collect::<Vec<_>>())?;
+    let end = Instant::now() + wait;
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() || probes.iter().all(|p| p.end.is_some()) {
+            break;
+        }
+        let mut pf: Vec<libc::pollfd> = probes
+            .iter()
+            .filter(|p| p.end.is_none())
+            .map(|p| libc::pollfd {
+                fd: p.sock.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            })
+            .collect();
+        #[cfg(target_os = "macos")]
+        pf.push(libc::pollfd {
+            fd: ic.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        let ms = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        // SAFETY: a valid pollfd array of the length given.
+        let n = unsafe { libc::poll(pf.as_mut_ptr(), pf.len() as libc::nfds_t, ms) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("poll: {e}"));
+        }
+        for f in pf.iter().filter(|f| f.revents != 0) {
+            #[cfg(target_os = "macos")]
+            if f.fd == ic.as_raw_fd() {
+                read_icmp(ic.as_raw_fd(), addr, &mut probes);
+                continue;
+            }
+            if let Some(p) = probes.iter_mut().find(|p| p.sock.as_raw_fd() == f.fd) {
+                p.ready(f.revents);
+            }
+        }
+    }
+    // xnu tells TCP of an ICMP error (tcp_ctlinput) before it copies it to the ICMP socket
+    // (rip_input): a short drain.
+    #[cfg(target_os = "macos")]
+    {
+        let until = Instant::now() + Duration::from_millis(30);
+        while Instant::now() < until {
+            let mut q = libc::pollfd {
+                fd: ic.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd.
+            if unsafe { libc::poll(&mut q, 1, 10) } > 0 {
+                read_icmp(ic.as_raw_fd(), addr, &mut probes);
+            }
+        }
+    }
+    Ok(probes
+        .into_iter()
+        .map(|p| Obs {
+            ttl: p.ttl,
+            outcome: settle(p.end, &p.icmp),
+            local: Some(p.local),
+        })
+        .collect())
+}
+
+/// Why no destination is found far on this platform.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn confirm_once(_: SocketAddr, _: u8, _: Duration, _: Instant) -> ConfirmOutcome {
-    ConfirmOutcome::Failed("the check connection is supported on Linux and macOS only".into())
+const UNSUPPORTED: &str = "this platform gives the near-hop check no way to read which router's \
+                           ICMP error ended a probe (Windows: TCP_FAIL_CONNECT_ON_ICMP_ERROR and \
+                           TCP_ICMP_ERROR_INFO are not yet verified), so no destination is found far";
+
+/// Elsewhere (Windows): no round can be read; every decision refuses.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn observe(_: SocketAddr, _: u8, _: u8, _: &Pin, _: Duration) -> Result<Vec<Obs>, String> {
+    Err(UNSUPPORTED.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
+    const D4: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+    const R4: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+    const D6: IpAddr = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+    const R6: IpAddr = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x99));
+
+    fn o(ttl: u8, outcome: ProbeOutcome) -> Obs {
+        Obs {
+            ttl,
+            outcome,
+            local: None,
+        }
+    }
+
+    fn icmp(ttl: u8, kind: u8, code: u8, from: IpAddr) -> Obs {
+        o(ttl, ProbeOutcome::Icmp { kind, code, from })
+    }
+
+    fn te(ttl: u8) -> Obs {
+        icmp(ttl, 11, 0, R4)
+    }
+
+    fn far_at(v: &Verdict) -> Option<u8> {
+        match v {
+            Verdict::Far(e) => Some(e.ttl),
+            _ => None,
+        }
+    }
+
+    fn refused(v: &Verdict) -> bool {
+        matches!(v, Verdict::NoEvidence(_) | Verdict::Failed(_))
+    }
+
+    /// The rule (the S3 review's round-2 prototype cases and more): far only on a matched Time
+    /// Exceeded code 0 from a router at `N` or more with no answer at or below its hop limit;
+    /// near on any answer within `N`; everything else refused.
+    #[test]
+    fn the_rule_is_positive_evidence_only() {
+        use ProbeOutcome::*;
+        assert_eq!(far_at(&rule(D4, 2, &[te(2)])), Some(2));
+        assert_eq!(far_at(&rule(D4, 2, &[o(2, TimedOut), te(3)])), Some(3));
+        assert_eq!(far_at(&rule(D4, 2, &[te(2), o(5, Connected)])), Some(2), "an answer beyond");
+        assert_eq!(far_at(&rule(D4, 2, &[o(2, TimedOut), te(3), o(4, Connected)])), Some(3));
+        assert_eq!(rule(D4, 2, &[o(2, Connected), te(3)]), Verdict::Near("accepted a connection"));
+        assert_eq!(rule(D4, 2, &[o(1, Refused)]), Verdict::Near("refused a connection"));
+        assert_eq!(rule(D4, 2, &[o(2, Reset), te(2)]), Verdict::Near("reset a connection"));
+        assert!(matches!(rule(D4, 2, &[o(2, TimedOut)]), Verdict::NoEvidence(_)), "silence");
+        assert!(matches!(rule(D4, 2, &[]), Verdict::NoEvidence(_)), "nothing");
+        assert!(refused(&rule(D4, 2, &[o(2, TimedOut), o(3, Connected)])), "an answer only beyond N");
+        assert!(refused(&rule(D4, 2, &[icmp(2, 3, 1, R4)])), "destination unreachable");
+        assert!(refused(&rule(D4, 2, &[icmp(2, 3, 13, R4)])), "administratively prohibited");
+        assert!(refused(&rule(D4, 2, &[icmp(2, 11, 1, R4)])), "reassembly time exceeded");
+        assert!(refused(&rule(D4, 2, &[icmp(2, 11, 0, D4)])), "time exceeded from D");
+        assert!(refused(&rule(D4, 2, &[te(1)])), "below N");
+        assert!(refused(&rule(D4, 2, &[o(2, Unreachable)])), "unreachable without its ICMP");
+        assert!(matches!(rule(D4, 2, &[o(3, Connected), te(4)]), Verdict::Failed(w) if w.contains("inconsistent")));
+        assert!(matches!(rule(D4, 2, &[o(2, Failed("EPERM".into()))]), Verdict::Failed(w) if w.contains("EPERM")));
+        for bad in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "127.0.0.1", "2001:db8::99"] {
+            let from: IpAddr = bad.parse().unwrap();
+            assert!(refused(&rule(D4, 2, &[icmp(2, 11, 0, from)])), "{bad}");
+        }
+        // IPv6: Time Exceeded is type 3; IPv4's type 11 is not.
+        assert_eq!(far_at(&rule(D6, 2, &[icmp(2, 3, 0, R6)])), Some(2));
+        assert!(refused(&rule(D6, 2, &[icmp(2, 11, 0, R6)])), "the IPv4 type on IPv6");
+        assert!(refused(&rule(D6, 2, &[icmp(2, 1, 3, R6)])), "address unreachable");
+        assert!(refused(&rule(D6, 2, &[icmp(2, 3, 0, D6)])), "from D");
+        for bad in ["::", "ff02::1", "::1", "::ffff:198.51.100.1", "198.51.100.1"] {
+            let from: IpAddr = bad.parse().unwrap();
+            assert!(refused(&rule(D6, 2, &[icmp(2, 3, 0, from)])), "{bad}");
+        }
+        // Link-local routers are routers.
+        assert!(far_at(&rule(D6, 1, &[icmp(1, 3, 0, "fe80::1".parse().unwrap())])).is_some());
+    }
+
+    /// The evidence is the lowest hop limit's Time Exceeded, with the address its probe left from.
+    #[test]
+    fn far_names_the_probe_it_rests_on() {
+        let local: SocketAddr = "192.0.2.77:40000".parse().unwrap();
+        let other: SocketAddr = "192.0.2.77:40001".parse().unwrap();
+        let mut a = te(3);
+        a.local = Some(other);
+        let mut b = te(2);
+        b.local = Some(local);
+        assert_eq!(
+            rule(D4, 2, &[a, b]),
+            Verdict::Far(FarEvidence { ttl: 2, from: R4, local: Some(local) })
+        );
+    }
+
+    fn any_ip() -> impl Strategy<Value = IpAddr> {
+        prop_oneof![
+            Just(D4),
+            Just(R4),
+            Just(D6),
+            Just(R6),
+            Just("0.0.0.0".parse().unwrap()),
+            Just("224.0.0.9".parse().unwrap()),
+            Just("255.255.255.255".parse().unwrap()),
+            Just("127.0.0.1".parse().unwrap()),
+            Just("::ffff:198.51.100.1".parse().unwrap()),
+            Just("10.0.0.1".parse().unwrap()),
+        ]
+    }
+
+    fn any_outcome() -> impl Strategy<Value = ProbeOutcome> {
+        prop_oneof![
+            Just(ProbeOutcome::Connected),
+            Just(ProbeOutcome::Refused),
+            Just(ProbeOutcome::Reset),
+            Just(ProbeOutcome::Unreachable),
+            Just(ProbeOutcome::TimedOut),
+            Just(ProbeOutcome::Failed("x".into())),
+            (prop_oneof![Just(0u8), Just(1), Just(3), Just(4), Just(11), Just(12)], 0u8..3, any_ip())
+                .prop_map(|(kind, code, from)| ProbeOutcome::Icmp { kind, code, from }),
+        ]
+    }
+
+    fn any_obs() -> impl Strategy<Value = Vec<Obs>> {
+        prop::collection::vec((1u8..7, any_outcome()).prop_map(|(t, s)| o(t, s)), 0..9)
+    }
+
+    fn is_te0_from_router(ob: &Obs, dst: IpAddr) -> bool {
+        let (k, c) = time_exceeded(dst);
+        matches!(ob.outcome, ProbeOutcome::Icmp { kind, code, from } if kind == k && code == c && router_sent(from, dst))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// No combination of observations without a Time Exceeded code 0 from a router is ever
+        /// far.
+        #[test]
+        fn prop_nothing_but_a_time_exceeded_is_far(obs in any_obs(), v6 in any::<bool>(), hops in 1u8..4) {
+            let d = if v6 { D6 } else { D4 };
+            let obs: Vec<Obs> = obs.into_iter().filter(|ob| !is_te0_from_router(ob, d)).collect();
+            prop_assert!(!matches!(rule(d, hops, &obs), Verdict::Far(_)));
+        }
+
+        /// Far's evidence is real: a Time Exceeded code 0 from a router (not D) at its hop limit,
+        /// at `N` or more, with no answer at or below it; any answer within `N` is near.
+        #[test]
+        fn prop_far_is_sound(obs in any_obs(), v6 in any::<bool>(), hops in 1u8..4) {
+            let d = if v6 { D6 } else { D4 };
+            let v = rule(d, hops, &obs);
+            let answered_within = obs.iter().any(|ob| ob.ttl <= hops && ob.outcome.answered());
+            prop_assert_eq!(answered_within, matches!(v, Verdict::Near(_)));
+            if let Verdict::Far(e) = v {
+                prop_assert!(e.ttl >= hops && e.from != d && router_sent(e.from, d));
+                prop_assert!(obs.iter().any(|ob| ob.ttl == e.ttl && is_te0_from_router(ob, d)));
+                prop_assert!(!obs.iter().any(|ob| ob.ttl <= e.ttl && ob.outcome.answered()));
+            }
+        }
+
+        /// An answer at a hop limit `<= t` always beats a Time Exceeded at `t`; one from D is never
+        /// far.
+        #[test]
+        fn prop_an_answer_beats_a_time_exceeded_at_or_above_it(t in 2u8..6, below in 0u8..3, v6 in any::<bool>()) {
+            let (d, r) = if v6 { (D6, R6) } else { (D4, R4) };
+            let (k, c) = time_exceeded(d);
+            let at = t.saturating_sub(below).max(1);
+            let obs = [icmp(t, k, c, r), o(at, ProbeOutcome::Connected)];
+            prop_assert!(!matches!(rule(d, 2, &obs), Verdict::Far(_)));
+            prop_assert!(!matches!(rule(d, 2, &[icmp(t, k, c, d)]), Verdict::Far(_)));
+        }
+    }
+
+    /// The sk_err_soft trap (the S3 review's skeptic): a probe whose connection completed (or was
+    /// reset) is an answer, whatever ICMP errors were queued for it; an unreachable is its ICMP
+    /// error only when one kind was matched; an ICMP error the socket did not end on is no
+    /// evidence.
+    #[test]
+    fn an_answer_dominates_any_queued_icmp_error() {
+        let tex = [(11u8, 0u8, R4)];
+        for answer in [ProbeOutcome::Connected, ProbeOutcome::Refused, ProbeOutcome::Reset] {
+            assert_eq!(settle(Some(answer.clone()), &tex), answer);
+        }
+        assert_eq!(
+            settle(Some(ProbeOutcome::Unreachable), &tex),
+            ProbeOutcome::Icmp { kind: 11, code: 0, from: R4 }
+        );
+        assert_eq!(settle(Some(ProbeOutcome::Unreachable), &[tex[0], tex[0]]), ProbeOutcome::Icmp { kind: 11, code: 0, from: R4 });
+        assert!(matches!(settle(Some(ProbeOutcome::Unreachable), &[tex[0], (3, 1, R4)]), ProbeOutcome::Failed(_)));
+        assert_eq!(settle(Some(ProbeOutcome::Unreachable), &[]), ProbeOutcome::Unreachable);
+        assert_eq!(settle(None, &tex), ProbeOutcome::TimedOut, "a soft error alone");
+        // And so through the rule: the queued Time Exceeded of a probe that connected is near.
+        let obs = [o(2, settle(Some(ProbeOutcome::Connected), &tex)), te(3)];
+        assert!(matches!(rule(D4, 2, &obs), Verdict::Near(_)));
+    }
+
+    /// The decision's rounds, staged: the first that decides ends it; a second round follows one
+    /// that decided nothing; out of time or a round that cannot be sent is refused, never far.
+    #[test]
+    fn the_rounds_decide_as_the_rule_says() {
+        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+        let p = FixedProbe::far();
+        assert_eq!(far_at(&decide_until(&*p, addr, 2, &Pin::default(), far)), Some(2));
+        assert_eq!(*p.asked.lock().unwrap(), vec![(addr, 2)]);
+        // Round 1 silent (the routers' ICMP rate limit), round 2 a Time Exceeded: far.
+        let p = FixedProbe::rounds(vec![vec![], vec![(0, None)]], None);
+        assert_eq!(far_at(&decide_until(&*p, addr, 2, &Pin::default(), far)), Some(2));
+        // Round 1 silent, round 2 an answer within the limit: near.
+        let p = FixedProbe::rounds(vec![vec![], vec![(0, Some(ProbeOutcome::Connected))]], None);
+        assert!(matches!(decide_until(&*p, addr, 2, &Pin::default(), far), Verdict::Near(_)));
+        // Round 1 a Time Exceeded at N + 1, round 2 an answer at N: decided after round 1.
+        let p = FixedProbe::rounds(vec![vec![(1, None)], vec![(0, Some(ProbeOutcome::Connected))]], None);
+        assert_eq!(far_at(&decide_until(&*p, addr, 2, &Pin::default(), far)), Some(3));
+        // Silence twice: no evidence.
+        let p = FixedProbe::answering(ProbeOutcome::TimedOut);
+        assert!(matches!(decide_until(&*p, addr, 2, &Pin::default(), far), Verdict::NoEvidence(_)));
+        // Out of time: asked nothing.
+        let p = FixedProbe::far();
+        let v = decide_until(&*p, addr, 2, &Pin::default(), Instant::now() - Duration::from_millis(1));
+        assert_eq!(v, Verdict::Failed(OUT_OF_TIME.into()));
+        assert!(p.asked.lock().unwrap().is_empty());
+        // The pin is handed to the probe; an IPv4-mapped destination is probed as IPv4.
+        let pin = Pin { source: Some("192.0.2.9".parse().unwrap()), interface: Some(7) };
+        let p = FixedProbe::far();
+        decide_until(&*p, "[::ffff:192.0.2.1]:443".parse().unwrap(), 2, &pin, far);
+        assert_eq!(*p.pins.lock().unwrap(), vec![pin]);
+        assert_eq!(p.asked.lock().unwrap()[0].0, addr);
+    }
+
+    /// A round that cannot be sent: the first refuses (its reason); a later one decides nothing
+    /// more.
+    #[test]
+    fn a_round_that_cannot_be_sent_is_refused() {
+        #[derive(Debug)]
+        struct Broken(u32);
+        impl NearProbe for Broken {
+            #[allow(clippy::too_many_arguments)]
+            fn round(&self, round: u32, _: SocketAddr, hops: u8, _: u8, _: &Pin, _: Duration, _: Instant) -> Result<Vec<Obs>, String> {
+                if round >= self.0 {
+                    Err("no ICMP socket".into())
+                } else {
+                    Ok(vec![o(hops, ProbeOutcome::TimedOut)])
+                }
+            }
+            fn pause(&self) -> Duration {
+                Duration::ZERO
+            }
+        }
+        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+        assert!(matches!(decide_until(&Broken(0), addr, 2, &Pin::default(), far), Verdict::Failed(w) if w.contains("ICMP socket")));
+        assert!(matches!(decide_until(&Broken(1), addr, 2, &Pin::default(), far), Verdict::NoEvidence(_)));
+    }
+
+    /// The S3 review's lab cases (rounds 1-3: `S3REV/r1-measure`, `r2-evidence/lab2.sh`,
+    /// `r3-evidence`), as the observations they produced, through the decision. Topology: the
+    /// miner, r1 (hop 1), the near host or r2 (hop 2), the far host or r3 (hop 3), far4 (hop 4);
+    /// `N` = 2, probes at 2, 3, 4.
+    #[test]
+    fn the_lab_cases_decide_as_measured() {
+        use ProbeOutcome::*;
+        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+        let run = |round: Vec<(u8, Option<ProbeOutcome>)>| {
+            decide_until(&*FixedProbe::staged(round, None), addr, 2, &Pin::default(), far)
+        };
+        let d = addr.ip();
+        let ans = |k: u8| (k, Some(Connected));
+        // BASE: the near host answers at 2; far and far4 get r2's (r3's) Time Exceeded.
+        assert!(matches!(run(vec![ans(0), ans(1), ans(2)]), Verdict::Near(_)), "near");
+        assert_eq!(far_at(&run(vec![(0, None), (1, None), ans(2)])), Some(2), "far4");
+        assert_eq!(far_at(&run(vec![(0, None), ans(1), ans(2)])), Some(2), "far");
+        // r2silent: r2 sends no Time Exceeded; the far host (hop 3) answers at 3 only: refused;
+        // far4 gets r3's at 3: far.
+        assert!(refused(&run(vec![ans(1), ans(2)])), "far, r2 silent");
+        assert_eq!(far_at(&run(vec![(1, None), ans(2)])), Some(3), "far4, r2 silent");
+        // silent: no router sends any: refused.
+        assert!(refused(&run(vec![ans(2)])), "far4, all silent");
+        // HMIN / HBPF / H2b / H4 / H8: the near host drops (or delays, or answers with a hop
+        // limit of 1) every low-TTL SYN: silence, refused.
+        assert!(refused(&run(vec![])), "IP_MINTTL, cBPF, TTL filters, delay");
+        // H2 / H7: TTL < 2 dropped (on the host or by r1): answers only beyond N: refused.
+        assert!(refused(&run(vec![ans(1), ans(2)])), "TTL filter, on-path drop");
+        // H5 / H5b: low-TTL SYNs rejected with a Destination Unreachable (host, net, admin, port
+        // unreachable: the last reads as refused, near).
+        for (kind, code) in [(3u8, 1u8), (3, 0), (3, 13)] {
+            assert!(refused(&run(vec![(0, Some(Icmp { kind, code, from: d })), ans(1)])), "{kind}/{code}");
+            assert!(refused(&run(vec![(0, Some(Icmp { kind, code, from: R4 })), ans(1)])), "{kind}/{code} from r1");
+        }
+        // H6: r1 normalises every TTL to 64: answers everywhere, near.
+        assert!(matches!(run(vec![ans(0), ans(1), ans(2)]), Verdict::Near(_)));
+        // A2 / A3 / A4: a forged Time Exceeded from D, code 1, a Destination Unreachable: refused.
+        assert!(refused(&run(vec![(0, Some(Icmp { kind: 11, code: 0, from: d }))])));
+        assert!(refused(&run(vec![(0, Some(Icmp { kind: 11, code: 1, from: R4 }))])));
+        assert!(refused(&run(vec![(0, Some(Icmp { kind: 3, code: 1, from: R4 }))])));
+        // A5 / A6: wrong ISN or source port: the kernel matches nothing, silence: refused.
+        assert!(refused(&run(vec![])));
+        // A1c: a forged Time Exceeded racing the near host's SYN-ACK: whichever probe the answer
+        // reached is near.
+        assert!(matches!(run(vec![ans(0), (1, None)]), Verdict::Near(_)));
+        // C1: a container behind DNAT on the near host: Linux rewrites the Time Exceeded's
+        // source to D: refused.
+        assert!(refused(&run(vec![(0, Some(Icmp { kind: 11, code: 0, from: d })), ans(1)])));
+        // A1 / A7 (documented, assumption 1): a forger who sees the SYN (root on the near host,
+        // a hostile LAN) and drops it, then forges a Time Exceeded from another address: far.
+        assert_eq!(far_at(&run(vec![(0, None)])), Some(2), "forged: indistinguishable");
+    }
+
+    /// Induced loss (`loss_lab.sh`, r2 netem 50-90 %): a near host's answers lost leave silence or
+    /// answers beyond the limit, never far; a far host's Time Exceeded lost in round 1 can come in
+    /// round 2.
+    #[test]
+    fn loss_never_makes_a_near_host_far() {
+        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+        let answered = |k: u8| (k, Some(ProbeOutcome::Connected));
+        let near_rounds = [vec![], vec![answered(1)], vec![answered(2)], vec![answered(1), answered(2)]];
+        for r1 in &near_rounds {
+            for r2 in &near_rounds {
+                let p = FixedProbe::rounds(vec![r1.clone(), r2.clone()], None);
+                let v = decide_until(&*p, addr, 2, &Pin::default(), far);
+                assert!(refused(&v), "{r1:?} {r2:?}: {v:?}");
+            }
+        }
+        let p = FixedProbe::rounds(vec![vec![], vec![(1, None)]], None);
+        assert_eq!(far_at(&decide_until(&*p, addr, 2, &Pin::default(), far)), Some(3));
+    }
+
+    /// A listener on loopback is zero hops away: the probes connect (near); a loopback port with
+    /// nothing listening refuses (near). One round, one turn of the gate for its three probes.
     #[cfg(unix)]
     #[test]
-    fn outcomes_are_classified() {
-        let os = |e: i32| ProbeOutcome::of(Err(io::Error::from_raw_os_error(e)));
-        assert_eq!(
-            ProbeOutcome::of(Ok(())).verdict(),
-            Verdict::Near("accepted a connection")
-        );
-        assert_eq!(
-            os(libc::ECONNREFUSED).verdict(),
-            Verdict::Near("refused a connection")
-        );
-        assert_eq!(
-            os(libc::ECONNRESET).verdict(),
-            Verdict::Near("reset a connection")
-        );
-        assert_eq!(os(libc::EHOSTUNREACH).verdict(), Verdict::Far);
-        assert_eq!(os(libc::ENETUNREACH).verdict(), Verdict::Far);
-        // No answer decides nothing.
-        assert_eq!(os(libc::ETIMEDOUT).verdict(), Verdict::Undecided);
-        assert_eq!(
-            ProbeOutcome::of(Err(io::ErrorKind::TimedOut.into())).verdict(),
-            Verdict::Undecided
-        );
-        for e in [libc::EPERM, libc::EACCES, libc::EADDRNOTAVAIL, libc::EINVAL] {
-            assert!(matches!(os(e).verdict(), Verdict::Failed(_)), "{e}");
-        }
-    }
-
-    /// A probe without an answer is decided by the check connection: answered is near, unanswered
-    /// far, not connecting refused; a probe with an answer needs no check connection.
-    #[test]
-    fn a_timed_out_probe_is_decided_by_the_check_connection() {
-        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        for (confirmed, want) in [
-            (
-                ConfirmOutcome::Answered,
-                Verdict::Near("answered once connected (it had not answered the probe)"),
-            ),
-            (ConfirmOutcome::Unanswered, Verdict::Far),
-        ] {
-            let p = FixedProbe::with(ProbeOutcome::TimedOut, confirmed);
-            assert_eq!(decide(&*p, addr, 2), want);
-            assert_eq!(*p.confirms.lock().unwrap(), vec![(addr, 2)]);
-        }
-        let p = FixedProbe::with(
-            ProbeOutcome::TimedOut,
-            ConfirmOutcome::ConnectFailed("timed out".into()),
-        );
-        assert!(matches!(decide(&*p, addr, 2), Verdict::Failed(_)));
-        for outcome in [ProbeOutcome::Unreachable, ProbeOutcome::Connected] {
-            let p = FixedProbe::with(outcome, ConfirmOutcome::Answered);
-            decide(&*p, addr, 2);
-            assert!(p.confirms.lock().unwrap().is_empty());
-        }
-    }
-
-    /// A listener on loopback is zero hops away: the probe connects (near). A loopback port with
-    /// nothing listening refuses (near).
-    #[test]
-    fn a_local_listener_is_near() {
+    fn a_local_listener_is_near_in_one_round_of_one_turn() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        assert_eq!(
-            TtlProbe.probe(addr, 2, PROBE_TIMEOUT),
-            ProbeOutcome::Connected
-        );
-        drop(l);
-        assert_eq!(
-            TtlProbe.probe(addr, 2, PROBE_TIMEOUT),
-            ProbeOutcome::Refused
-        );
-    }
-
-    /// A near listener that drops SYNs while its accept queue is full (backlog 0, one connection
-    /// queued) gives the probe no answer; it drains its queue 4.5 seconds later and then answers
-    /// a connection. The check connection connects then, and its hop-limited FIN is acknowledged:
-    /// near, refused before any connection that carries data.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn a_near_listener_that_drops_syns_for_a_while_is_near() {
-        use socket2::{Domain, Socket, Type};
-        let l = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-        l.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+        let turns = TURNS_TAKEN.with(|t| t.get());
+        assert_eq!(decide(&TtlProbe, addr, 2), Verdict::Near("accepted a connection"));
+        assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 1);
+        let obs = TtlProbe
+            .round(0, addr, 2, EXTRA_HOPS, &Pin::default(), PROBE_TIMEOUT, Instant::now() + DECIDE_BUDGET)
             .unwrap();
-        l.listen(0).unwrap();
-        let addr = l.local_addr().unwrap().as_socket().unwrap();
-        let _first = std::net::TcpStream::connect(addr).unwrap();
-        // The probe alone: no answer within its time.
-        assert_eq!(
-            TtlProbe.probe(addr, 2, PROBE_TIMEOUT),
-            ProbeOutcome::TimedOut
-        );
-        // Drained once the probe has had all its attempts (1 s, 0.5 s, a 1 s pause, 1 s).
-        let drain = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(4500));
-            let accepted = l.accept();
-            std::thread::sleep(Duration::from_secs(12));
-            drop((l, accepted));
-        });
-        let t = std::time::Instant::now();
-        let v = decide(&TtlProbe, addr, 2);
-        // Near either way: the check connection's answer, or (review round 5: the probes are
-        // paced, and other tests' probes can delay its attempts past the drain) the probe's own.
-        assert!(
-            matches!(
-                v,
-                Verdict::Near("answered once connected (it had not answered the probe)")
-                    | Verdict::Near("accepted a connection")
-            ),
-            "{v:?} after {:?}",
-            t.elapsed()
-        );
-        drop(drain);
+        assert_eq!(obs.iter().map(|o| o.ttl).collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert!(obs.iter().all(|o| o.outcome == ProbeOutcome::Connected && o.local.is_some()), "{obs:?}");
+        assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 2);
+        drop(l);
+        assert!(matches!(decide(&TtlProbe, addr, 2), Verdict::Near(w) if w.contains("refused")));
     }
 
-    /// macOS: a near listener whose probe had no answer. (macOS answers SYNs with SYN cookies
-    /// when a listener's accept queue is full, so the Linux test's silent listener cannot be
-    /// staged without root; the probe's silence is staged instead, and everything after it is
-    /// real.) The check connection connects, its hop-limited FIN is acknowledged: near, refused.
-    #[cfg(target_os = "macos")]
+    /// The probes leave from the pin's source (and the interface that holds it).
+    #[cfg(unix)]
     #[test]
-    fn a_near_listener_that_gave_the_probe_no_answer_is_near_on_macos() {
-        #[derive(Debug)]
-        struct Silent;
-        impl NearProbe for Silent {
-            fn probe(&self, _: SocketAddr, _: u8, _: Duration) -> ProbeOutcome {
-                ProbeOutcome::TimedOut
-            }
-            fn confirm(&self, addr: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
-                TtlProbe.confirm(addr, hops, timeout)
-            }
-        }
+    fn the_probes_leave_from_the_pin() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let accept = std::thread::spawn(move || {
-            let c = l.accept();
-            std::thread::sleep(Duration::from_secs(2));
-            drop(c);
-        });
-        assert_eq!(
-            decide(&Silent, addr, 2),
-            Verdict::Near("answered once connected (it had not answered the probe)")
-        );
-        accept.join().unwrap();
-        // Nothing listening any more: the check connection does not connect, refused.
-        assert!(matches!(decide(&Silent, addr, 2), Verdict::Failed(_)));
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let interface = interface_of(lo).unwrap();
+        assert!(interface.is_some(), "loopback's interface");
+        let pin = Pin { source: Some(lo), interface };
+        let obs = TtlProbe
+            .round(0, addr, 2, 0, &pin, PROBE_TIMEOUT, Instant::now() + DECIDE_BUDGET)
+            .unwrap();
+        assert_eq!(obs[0].outcome, ProbeOutcome::Connected, "{obs:?}");
+        assert_eq!(obs[0].local.unwrap().ip(), lo);
+        // A source this host does not hold: the round cannot be sent (refused).
+        let pin = Pin { source: Some("192.0.2.200".parse().unwrap()), interface: None };
+        let e = TtlProbe
+            .round(0, addr, 2, 0, &pin, PROBE_TIMEOUT, Instant::now() + DECIDE_BUDGET)
+            .unwrap_err();
+        assert!(e.contains("could not be sent"), "{e}");
+        assert_eq!(interface_of("192.0.2.200".parse().unwrap()).unwrap(), None);
     }
 
-    /// Hardening 13: on macOS an unreachable that `connect` reports at once (no packet answered:
-    /// Local Network privacy, a Network Extension policy) is a failure, refused; one that arrives
-    /// while the connection is in progress (an ICMP "time exceeded") is still far; other errors
-    /// keep their meaning.
+    /// The real probe, on the real path: a probe of hop limit 1 to a public address runs out of
+    /// hops at the first router, whose Time Exceeded the kernel matches to it and names (Linux:
+    /// the error queue; macOS: the ICMP socket and the ISN). Skipped where 1.1.1.1 has no route,
+    /// or the first router sends none.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn the_router_that_ran_a_probe_out_is_named() {
+        let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            match observe(dst, 1, 0, &Pin::default(), Duration::from_millis(1500)) {
+                Ok(obs) => {
+                    if let ProbeOutcome::Icmp { kind, code, from } = obs[0].outcome {
+                        assert_eq!((kind, code), (11, 0), "{obs:?}");
+                        assert!(router_sent(from, dst.ip()), "{from}");
+                        assert!(obs[0].local.is_some_and(|l| l.port() != 0));
+                        eprintln!("hop 1 is {from}");
+                        return;
+                    }
+                    seen.push(format!("{obs:?}"));
+                }
+                Err(e) => seen.push(e),
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        crate::skipped(format!("no Time Exceeded from the first router here: {seen:?}"));
+    }
+
+    /// A destination nothing answers (TEST-NET-1, at a hop limit past every router): two rounds,
+    /// a turn each, no evidence; never far, and within the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_destination_is_no_evidence_after_two_rounds() {
+        let dst: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let turns = TURNS_TAKEN.with(|t| t.get());
+        let t = Instant::now();
+        // Other tests' probes share the gate: time enough for two turns however busy it is.
+        let v = decide_until(&TtlProbe, dst, 64, &Pin::default(), t + Duration::from_secs(30));
+        eprintln!("{dst} at 64 hops: {v:?} in {:?}", t.elapsed());
+        if matches!(&v, Verdict::Failed(w) if w.contains("before any packet")) {
+            crate::skipped(format!("no route to {dst} here: {v:?}"));
+            return;
+        }
+        assert!(matches!(&v, Verdict::NoEvidence(w) if w.contains("6 probes")), "{v:?}");
+        assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 2);
+        // A deadline that leaves no room for the second round ends the decision with the first's.
+        let t = Instant::now();
+        let v = decide_until(&TtlProbe, dst, 64, &Pin::default(), t + Duration::from_millis(1200));
+        assert!(!matches!(v, Verdict::Far(_) | Verdict::Near(_)), "{v:?}");
+        assert!(t.elapsed() < Duration::from_millis(1700), "{:?}", t.elapsed());
+    }
+
+    /// An IPv4-mapped destination is probed as its IPv4 address (review round 2, probe-2: an
+    /// IPv6 socket's hop limit did not limit the IPv4 packets a mapped connection sends).
+    #[cfg(unix)]
+    #[test]
+    fn a_mapped_address_is_probed_as_its_ipv4_address() {
+        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:1.1.1.1]:443".parse().unwrap();
+        assert_eq!(unmapped(mapped), v4);
+        assert_eq!(unmapped(v4), v4);
+        let v6: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        assert_eq!(unmapped(v6), v6);
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local: SocketAddr = format!("[::ffff:127.0.0.1]:{}", l.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        let obs = TtlProbe
+            .round(0, local, 2, 0, &Pin::default(), PROBE_TIMEOUT, Instant::now() + DECIDE_BUDGET)
+            .unwrap();
+        assert!(obs[0].local.is_some_and(|a| a.is_ipv4()), "{obs:?}");
+        assert!(matches!(decide(&TtlProbe, local, 2), Verdict::Near(_)));
+    }
+
+    /// macOS: the initial sequence number is read only from enough bytes, in `SYN_SENT`, and
+    /// never zero; equal ones in a round refuse.
+    #[test]
+    fn the_isn_is_read_only_when_it_can_be() {
+        let mut b = [0u8; 424];
+        b[0] = TCPS_SYN_SENT;
+        b[52..56].copy_from_slice(&1001u32.to_ne_bytes());
+        assert_eq!(isn_from(&b).unwrap(), Some(1000));
+        assert!(isn_from(&b[..TCP_INFO_NEEDED - 1]).is_err(), "too short");
+        assert_eq!(isn_from(&b[..TCP_INFO_NEEDED]).unwrap(), Some(1000));
+        b[52..56].copy_from_slice(&1u32.to_ne_bytes());
+        assert!(isn_from(&b).is_err(), "zero");
+        b[52..56].copy_from_slice(&0u32.to_ne_bytes());
+        assert!(isn_from(&b).is_err(), "nothing sent");
+        b[0] = 4;
+        assert_eq!(isn_from(&b).unwrap(), None, "established: not in SYN_SENT");
+        assert!(distinct_isns(&[Some(1), Some(2), None]).is_ok());
+        assert!(distinct_isns(&[Some(1), None, Some(1)]).is_err());
+    }
+
+    /// An ICMP error as macOS's ICMP socket hands it over, IPv4 (with its IP header) and ICMPv6.
+    #[allow(clippy::too_many_arguments)]
+    fn datagram_v4(kind: u8, code: u8, src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, seq: u32, proto: u8) -> Vec<u8> {
+        let mut b = vec![0x45, 0, 0, 56, 0, 0, 0, 0, 64, 1, 0, 0, 198, 51, 100, 1, 192, 0, 2, 9];
+        b.extend([kind, code, 0, 0, 0, 0, 0, 0]);
+        b.extend([0x45, 0, 0, 60, 0, 0, 0, 0, 1, proto, 0, 0]);
+        b.extend(src);
+        b.extend(dst);
+        b.extend(sport.to_be_bytes());
+        b.extend(dport.to_be_bytes());
+        b.extend(seq.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn an_icmp_copy_is_matched_by_what_it_quotes() {
+        let dst: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let b = datagram_v4(11, 0, [192, 0, 2, 9], [192, 0, 2, 1], 40000, 443, 77, 6);
+        assert_eq!(
+            icmp_quote(&b, dst),
+            Some(Quote { kind: 11, code: 0, src: "192.0.2.9".parse().unwrap(), sport: 40000, seq: 77 })
+        );
+        assert_eq!(icmp_quote(&datagram_v4(11, 0, [192, 0, 2, 9], [192, 0, 2, 2], 40000, 443, 77, 6), dst), None, "another destination");
+        assert_eq!(icmp_quote(&datagram_v4(11, 0, [192, 0, 2, 9], [192, 0, 2, 1], 40000, 80, 77, 6), dst), None, "another port");
+        assert_eq!(icmp_quote(&datagram_v4(11, 0, [192, 0, 2, 9], [192, 0, 2, 1], 40000, 443, 77, 17), dst), None, "not TCP");
+        assert_eq!(icmp_quote(&b[..b.len() - 1], dst), None, "cut short");
+        assert_eq!(icmp_quote(&[], dst), None);
+        // ICMPv6: no outer header; the quoted IPv6 header's next header is TCP.
+        let d6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let mut v6 = vec![3u8, 0, 0, 0, 0, 0, 0, 0, 0x60, 0, 0, 0, 0, 20, 6, 1];
+        v6.extend("2001:db8::9".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        v6.extend("2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        v6.extend(40001u16.to_be_bytes());
+        v6.extend(443u16.to_be_bytes());
+        v6.extend(99u32.to_be_bytes());
+        assert_eq!(
+            icmp_quote(&v6, d6),
+            Some(Quote { kind: 3, code: 0, src: "2001:db8::9".parse().unwrap(), sport: 40001, seq: 99 })
+        );
+        v6[14] = 17;
+        assert_eq!(icmp_quote(&v6, d6), None, "not TCP");
+    }
+
+    /// macOS: a real probe in `SYN_SENT` has its initial sequence number read.
     #[cfg(target_os = "macos")]
     #[test]
-    fn an_unreachable_at_once_is_no_answer_on_macos() {
-        let at_once =
-            |e: i32| ProbeOutcome::of(Err(unreachable_at_once(io::Error::from_raw_os_error(e))));
-        for e in [libc::EHOSTUNREACH, libc::ENETUNREACH] {
-            let o = at_once(e);
-            assert!(
-                matches!(&o, ProbeOutcome::Failed(w) if w.contains("before any packet")),
-                "{o:?}"
-            );
-            assert!(matches!(o.verdict(), Verdict::Failed(_)));
+    fn macos_a_probe_has_its_isn() {
+        let dst: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        match Probe::open(dst, 2, &Pin::default()) {
+            Ok(p) if p.end.is_none() => assert!(p.isn.is_some_and(|i| i != 0)),
+            Ok(p) => crate::skipped(format!("the probe ended at once: {:?}", p.end)),
+            Err(e) => crate::skipped(format!("no probe to {dst} here: {e}")),
         }
-        assert_eq!(at_once(libc::ECONNREFUSED), ProbeOutcome::Refused);
-        assert_eq!(
-            ProbeOutcome::of(Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))),
-            ProbeOutcome::Unreachable
-        );
-        // This host's router (on-link): without Local Network privacy granted the probe is denied
-        // at once and refused; with it the router answers within the limit. Never far.
+        assert_eq!(supported(), Ok(()));
+    }
+
+    /// macOS (hardening 13): an unreachable that `connect` reports at once (no packet answered:
+    /// Local Network privacy, a Network Extension policy) is a local failure, never evidence; a
+    /// reset is an answer. The router (on-link) is never far.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_at_once_is_a_local_failure() {
+        for e in [libc::EHOSTUNREACH, libc::ENETUNREACH, libc::EPERM] {
+            assert!(matches!(at_once(io::Error::from_raw_os_error(e)), ProbeOutcome::Failed(w) if w.contains("before any packet")));
+        }
+        assert_eq!(at_once(io::Error::from_raw_os_error(libc::ECONNREFUSED)), ProbeOutcome::Refused);
+        assert_eq!(ended(&io::Error::from_raw_os_error(libc::EHOSTUNREACH)), ProbeOutcome::Unreachable);
+        assert_eq!(ended(&io::Error::from_raw_os_error(libc::ECONNRESET)), ProbeOutcome::Reset);
+        assert!(matches!(ended(&io::Error::from_raw_os_error(libc::EACCES)), ProbeOutcome::Failed(_)));
         let (routes, _) = crate::routes::read_routing(&[]).unwrap();
         if let Some(g) = routes.iter().find_map(|r| match (r.prefix.len, r.hop) {
             (0, crate::routes::Hop::Via(g @ std::net::IpAddr::V4(_))) => Some(g),
             _ => None,
         }) {
-            let o = TtlProbe.probe(SocketAddr::new(g, 80), 2, PROBE_TIMEOUT);
-            eprintln!("the router, port 80, hop limit 2: {o:?}");
-            assert_ne!(o.verdict(), Verdict::Far, "{o:?}");
+            let v = decide(&TtlProbe, SocketAddr::new(g, 80), 2);
+            eprintln!("the router, port 80, hop limit 2: {v:?}");
+            assert!(!matches!(v, Verdict::Far(_)), "{v:?}");
         } else {
             crate::skipped("the router probe: no IPv4 default route");
         }
     }
 
-    /// probe-1: `TCP_CONNECTION_INFO` is read only within what the kernel wrote (112 bytes here,
-    /// the SDK's struct, while the libc crate's is 176), and fails when that does not reach
-    /// `tcpi_srtt`; the fields read are at the SDK's offsets.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn connection_info_is_read_within_what_the_kernel_wrote() {
-        use std::mem::offset_of;
-        use std::os::fd::AsRawFd;
-        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_state), 0);
-        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_rttcur), 40);
-        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_srtt), 44);
-        assert_eq!(offset_of!(libc::tcp_connection_info, tcpi_rto), 12);
-        assert_eq!(CONNECTION_INFO_NEEDED, 48);
-        // SAFETY: plain integers.
-        let mut i: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
-        i.tcpi_state = 4;
-        i.tcpi_srtt = 7;
-        i.tcpi_rto = 9;
-        let size = std::mem::size_of::<libc::tcp_connection_info>();
-        for len in [48, 112, size] {
-            assert_eq!(
-                connection_info_fields(&i, len).unwrap(),
-                ConnectionInfo {
-                    state: 4,
-                    rttcur_ms: 0,
-                    srtt_ms: 7,
-                    rto_ms: 9
-                }
-            );
-        }
-        for len in [0, 4, 40, 47, size + 1] {
-            assert!(connection_info_fields(&i, len).is_err(), "{len}");
-        }
-        // The kernel's answer for a real connection.
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        let mut len = size as libc::socklen_t;
-        // SAFETY: `i` and `len` are valid for the size given.
-        let rc = unsafe {
-            libc::getsockopt(
-                c.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_CONNECTION_INFO,
-                (&mut i as *mut libc::tcp_connection_info).cast(),
-                &mut len,
-            )
-        };
-        assert_eq!(rc, 0);
-        eprintln!("TCP_CONNECTION_INFO: the kernel wrote {len} of {size} bytes");
-        assert!(len as usize >= CONNECTION_INFO_NEEDED, "{len}");
-        // TCPS_ESTABLISHED.
-        assert_eq!(connection_info(c.as_raw_fd()).unwrap().state, 4);
-    }
-
-    /// Linux, live: the kernel's `TCP_CLOSE` is read by its pending error. A connection whose FIN
-    /// was acknowledged and that then got the peer's FIN (TIME_WAIT, which Linux does not show
-    /// on the socket) reads as [`TcpState::TimeWait`]; one the peer reset reads as
-    /// [`TcpState::Closed`]. Both on loopback, waited for until the socket leaves the states
-    /// before.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn linux_a_reset_and_a_completed_close_read_apart() {
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
-        let settle = |c: &std::net::TcpStream, want: TcpState| {
-            let t = std::time::Instant::now();
-            loop {
-                let i = conn_info(c.as_raw_fd()).unwrap();
-                if i.state == want || t.elapsed() > Duration::from_secs(3) {
-                    return i.state;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        // A completed close: this side's FIN acknowledged, the peer's FIN received.
-        let c = std::net::TcpStream::connect(addr).unwrap();
-        let (mut peer, _) = l.accept().unwrap();
-        c.shutdown(std::net::Shutdown::Write).unwrap();
-        let mut b = [0u8; 8];
-        assert_eq!(peer.read(&mut b).unwrap(), 0);
-        drop(peer);
-        assert_eq!(settle(&c, TcpState::TimeWait), TcpState::TimeWait);
-        // A reset: the peer closes with linger 0.
-        let c = std::net::TcpStream::connect(addr).unwrap();
-        let (peer, _) = l.accept().unwrap();
-        socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
-        drop(peer);
-        assert_eq!(settle(&c, TcpState::Closed), TcpState::Closed);
-    }
-
-    /// The check connection to a listener on loopback (zero hops) and to an IPv6 one: answered,
-    /// near. Its hop-limited FIN reaches them and is acknowledged.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    #[test]
-    fn the_check_connection_finds_a_local_listener_near() {
-        for bind in ["127.0.0.1:0", "[::1]:0"] {
-            let Ok(l) = std::net::TcpListener::bind(bind) else {
-                let tag = if bind.starts_with('[') { "[ipv6] " } else { "" };
-                crate::skipped(format!("{tag}no {bind} here"));
-                continue;
-            };
-            let addr = l.local_addr().unwrap();
-            let accept = std::thread::spawn(move || {
-                let c = l.accept();
-                std::thread::sleep(Duration::from_secs(2));
-                drop(c);
-            });
-            assert_eq!(
-                TtlProbe.confirm(addr, 2, Duration::from_secs(5)),
-                ConfirmOutcome::Answered,
-                "{addr}"
-            );
-            accept.join().unwrap();
-        }
-    }
-
-    /// The check connection against a far public host (Cloudflare's resolver): it connects, and
-    /// its FIN limited to 2 hops dies on the way: unanswered, far. Skipped where unreachable.
-    #[test]
-    fn the_check_connection_finds_a_public_host_far() {
-        let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        match TtlProbe.confirm(addr, 2, Duration::from_secs(5)) {
-            ConfirmOutcome::ConnectFailed(e) => {
-                crate::skipped(format!("{addr} unreachable here: {e}"))
-            }
-            other => assert_eq!(other, ConfirmOutcome::Unanswered),
-        }
-    }
-
-    /// probe-1 (macOS since review round 2, Linux since the Linux application): only an
-    /// acknowledgement of the check's FIN is an answer. A peer that closed or reset the connection
-    /// on its own is a failure (refused), never near by mistake and never far (`Check::step`
-    /// decides the rest). Both platforms' state numbers read as the same states.
-    #[test]
-    fn the_check_reads_only_an_acknowledged_fin_as_an_answer() {
-        use TcpState::*;
-        assert_eq!(fin_step(FinWait2, Conn::Check), Some(ConfirmOutcome::Answered));
-        assert_eq!(fin_step(TimeWait, Conn::Check), Some(ConfirmOutcome::Answered));
-        assert_eq!(fin_step(FinWait1, Conn::Check), None);
-        assert_eq!(fin_step(Closing, Conn::Check), None);
-        for (state, how) in [
-            (LastAck, "closed"),
-            (CloseWait, "closed"),
-            (Closed, "reset"),
-            (Established, "TCP state Established"),
-            (Other(10), "TCP state Other(10)"),
-        ] {
-            let o = fin_step(state, Conn::Check);
-            assert!(
-                matches!(&o, Some(ConfirmOutcome::Failed(w)) if w.contains(how)),
-                "{state:?}: {o:?}"
-            );
-            assert!(matches!(o.unwrap().verdict(), Verdict::Failed(_)));
-        }
-        assert!(matches!(peer_closed_first(CloseWait, Conn::Check), w if w.contains("closed")));
-        // Review round 5, probe-2: a failure names the connection it was read of, within the
-        // 120 characters a refusal shows.
-        for which in [Conn::Check, Conn::Control] {
-            for state in [LastAck, Closed] {
-                let why = peer_closed_first(state, which);
-                let name = if which == Conn::Check { "check connection" } else { "control connection" };
-                assert!(why.contains(name), "{why}");
-                assert!(why.chars().count() <= 120, "{} chars: {why}", why.chars().count());
-                let Verdict::Failed(shown) = ConfirmOutcome::Failed(why.clone()).verdict() else {
-                    panic!()
-                };
-                assert!(shown.contains(name) && shown.ends_with("how near it is"), "{shown}");
-            }
-        }
-        // Linux's <net/tcp_states.h> and macOS's <netinet/tcp_fsm.h>.
-        for (linux, macos, state) in [
-            (1, 4, Established),
-            (4, 6, FinWait1),
-            (5, 9, FinWait2),
-            (6, 10, TimeWait),
-            (7, 0, Closed),
-            (8, 5, CloseWait),
-            (9, 8, LastAck),
-            (11, 7, Closing),
-        ] {
-            assert_eq!(TcpState::from_linux(linux), state, "Linux {linux}");
-            assert_eq!(TcpState::from_macos(macos), state, "macOS {macos}");
-        }
-        // Linux's SYN_SENT, SYN_RECV, LISTEN, NEW_SYN_RECV; macOS's LISTEN, SYN_SENT, SYN_RECEIVED.
-        for s in [2, 3, 10, 12] {
-            assert_eq!(TcpState::from_linux(s), Other(s));
-        }
-        for s in [1, 2, 3] {
-            assert_eq!(TcpState::from_macos(s), Other(s));
-        }
-        // The old Linux reading (any state but FIN_WAIT1 near) is gone: a peer's own close,
-        // as Linux numbers it, is a failure, not an answer.
-        for linux in [7, 8, 9] {
-            assert!(
-                matches!(fin_step(TcpState::from_linux(linux), Conn::Check), Some(ConfirmOutcome::Failed(_))),
-                "{linux}"
-            );
-        }
-    }
-
-    /// Linux: `TCP_INFO` is read from the bytes the kernel wrote, at the kernel ABI's offsets
-    /// (`tcpi_state` 0, `tcpi_rto` 8, `tcpi_rtt` 68, microseconds), and fails when they do not
-    /// reach `tcpi_rtt`'s end.
-    #[cfg(unix)]
-    #[test]
-    fn linux_tcp_info_is_read_within_what_the_kernel_wrote() {
-        let mut b = [0u8; 256];
-        b[0] = 4;
-        b[8..12].copy_from_slice(&204_000u32.to_ne_bytes());
-        b[68..72].copy_from_slice(&1_500u32.to_ne_bytes());
-        // A field between them that must not be read as either.
-        b[64..68].copy_from_slice(&u32::MAX.to_ne_bytes());
-        for len in [72, 104, 232, 256] {
-            assert_eq!(
-                linux_conn_info(&b, len, || unreachable!()).unwrap(),
-                ConnInfo {
-                    state: TcpState::FinWait1,
-                    rto: Duration::from_millis(204),
-                    rtt: Duration::from_micros(1_500),
-                }
-            );
-        }
-        for len in [0, 8, 68, 71, 257] {
-            assert!(linux_conn_info(&b, len, || 0).is_err(), "{len}");
-        }
-        // TCP_CLOSE: the FIN acknowledged and the connection closed when no error is pending (a
-        // TIME_WAIT Linux does not show), a reset when one is.
-        b[0] = 7;
-        assert_eq!(linux_conn_info(&b, 104, || 0).unwrap().state, TcpState::TimeWait);
-        for e in [libc::ECONNRESET, libc::EPIPE, libc::ETIMEDOUT, -1] {
-            assert_eq!(linux_conn_info(&b, 104, || e).unwrap().state, TcpState::Closed, "{e}");
-        }
-        b[0] = 4;
-        assert_eq!(
-            linux_conn_info(&b, 104, || panic!("read only for TCP_CLOSE")).unwrap().state,
-            TcpState::FinWait1
-        );
-    }
-
-    /// Linux: the offsets [`linux_conn_info`] reads are glibc's `struct tcp_info`'s, and the
-    /// kernel's answer for a real connection is read: established, with a round trip and an RTO.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn linux_tcp_info_is_the_kernels() {
-        use std::os::fd::AsRawFd;
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        {
-            use std::mem::offset_of;
-            assert_eq!(offset_of!(libc::tcp_info, tcpi_state), 0);
-            assert_eq!(offset_of!(libc::tcp_info, tcpi_rto), 8);
-            assert_eq!(offset_of!(libc::tcp_info, tcpi_rtt), 68);
-            assert_eq!(offset_of!(libc::tcp_info, tcpi_rttvar), TCP_INFO_NEEDED);
-        }
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
-        let i = conn_info(c.as_raw_fd()).unwrap();
-        eprintln!("TCP_INFO of a loopback connection: {i:?}");
-        assert_eq!(i.state, TcpState::Established);
-        assert!(i.rto >= Duration::from_millis(200), "{i:?}");
-        assert!(i.rtt < Duration::from_secs(1), "{i:?}");
-    }
-
-    /// Review round 3, cross-1 (mutant X30): a connect whose `poll` reports a hang-up or an error
-    /// with no error set is a failed probe, never an unreachable (far); a pending error is that
-    /// error; neither is connected.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_hang_up_without_an_error_is_a_failed_probe_on_macos() {
-        for ev in [libc::POLLHUP, libc::POLLERR, libc::POLLHUP | libc::POLLOUT] {
-            let r = connect_result(ev, Ok(None));
-            let o = ProbeOutcome::of(r);
-            assert!(matches!(o, ProbeOutcome::Failed(_)), "{ev}: {o:?}");
-            assert!(matches!(o.verdict(), Verdict::Failed(_)));
-        }
-        let e = || io::Error::from_raw_os_error(libc::EHOSTUNREACH);
-        assert_eq!(
-            ProbeOutcome::of(connect_result(libc::POLLHUP, Ok(Some(e())))),
-            ProbeOutcome::Unreachable
-        );
-        assert_eq!(
-            ProbeOutcome::of(connect_result(libc::POLLOUT, Ok(Some(e())))),
-            ProbeOutcome::Unreachable
-        );
-        assert_eq!(
-            ProbeOutcome::of(connect_result(
-                libc::POLLHUP,
-                Err(io::Error::from_raw_os_error(libc::ECONNREFUSED))
-            )),
-            ProbeOutcome::Refused
-        );
-        assert_eq!(
-            ProbeOutcome::of(connect_result(libc::POLLOUT, Ok(None))),
-            ProbeOutcome::Connected
-        );
-    }
-
-    /// Review round 3, cross-1 (mutant X37; the reviewer's `x37_test.rs`): the real probe's own
-    /// timeout (`poll` returning 0) is no answer (a check connection follows), never unreachable
-    /// (far). TEST-NET-1 is routed out the default route and answered by nothing. Skipped when
-    /// the probe fails here (no default route).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_silent_destination_is_no_answer_to_the_real_probe_on_macos() {
-        let dst: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let o = TtlProbe.probe(dst, 64, Duration::from_millis(400));
-        eprintln!("{dst}: {o:?}");
-        if matches!(o, ProbeOutcome::Failed(_)) {
-            crate::skipped(format!("the probe of {dst} failed here: {o:?}"));
-            return;
-        }
-        assert_eq!(o, ProbeOutcome::TimedOut);
-        assert_eq!(o.verdict(), Verdict::Undecided);
-    }
-
-    /// Review round 3, probe-1, and round 4, probe-2 (every platform): a probe that timed out
-    /// is asked once more within the same time (two thirds, then the rest), and, timed out
-    /// again, a third time after a pause (a router's ICMP rate limit refills); any other outcome
-    /// of an attempt stands.
-    #[cfg(unix)]
-    #[test]
-    fn a_probe_that_timed_out_is_asked_again() {
-        let timeout = Duration::from_millis(1500);
-        let pause = Duration::from_secs(1);
-        let asked = std::cell::RefCell::new(Vec::new());
-        let r = probe_attempts(
-            timeout,
-            pause,
-            || Duration::from_secs(60),
-            |p| asked.borrow_mut().push(format!("pause {}", p.as_millis())),
-            |t| {
-                asked.borrow_mut().push(format!("probe {}", t.as_millis()));
-                Err(io::ErrorKind::TimedOut.into())
-            },
-        );
-        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert_eq!(
-            *asked.borrow(),
-            ["probe 1000", "probe 500", "pause 1000", "probe 1000"]
-        );
-        for answered_at in 1..=3 {
-            let mut n = 0;
-            let mut paused = false;
-            let r = probe_attempts(timeout, pause, || Duration::from_secs(60), |_| paused = true, |_| {
-                n += 1;
-                if n < answered_at {
-                    Err(io::ErrorKind::TimedOut.into())
-                } else {
-                    Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))
-                }
-            });
-            assert_eq!(ProbeOutcome::of(r), ProbeOutcome::Unreachable);
-            assert_eq!(n, answered_at);
-            assert_eq!(paused, answered_at == 3);
-        }
-        for first in [
-            Ok(()),
-            Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH)),
-            Err(io::Error::from_raw_os_error(libc::ECONNREFUSED)),
-        ] {
-            let mut first = Some(first);
-            let mut n = 0;
-            let _ = probe_attempts(timeout, pause, || Duration::from_secs(60), |_| {}, |_| {
-                n += 1;
-                first.take().unwrap()
-            });
-            assert_eq!(n, 1);
-        }
-    }
-
-    /// Review round 4, probe-2: at most [`PROBES_AT_ONCE`] probes are in flight in the process;
+    /// Review round 4, probe-2: at most [`PROBES_AT_ONCE`] rounds are in flight in the process;
     /// eight callers at once take turns.
     #[test]
     fn probes_take_turns() {
@@ -2082,9 +2023,9 @@ mod tests {
     }
 
     /// Review round 5 (probe-1, and the parse and probe lenses' suspicion): a turn is waited
-    /// for only until the caller's deadline; a probe that gets none in time fails (refused,
+    /// for only until the caller's deadline; a round that gets none in time fails (refused,
     /// never far) without sending anything, so an abandoned check stops and gives its turn
-    /// back; a decision already out of time asks nothing.
+    /// back.
     #[test]
     fn r5_a_probe_waits_for_a_turn_only_until_its_deadline() {
         let far = Instant::now() + Duration::from_secs(30);
@@ -2096,26 +2037,19 @@ mod tests {
         // Review round 6: at its deadline at the latest (sooner when the turns ahead cannot all
         // come in time: it sheds).
         assert!(t.elapsed() < Duration::from_secs(2));
-        // Nothing listens there: had the probe been sent, it would have been refused (near).
+        // Nothing listens there: had the probes been sent, they would have been refused (near).
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
         let t = Instant::now();
-        let o = TtlProbe.probe_until(addr, 2, PROBE_TIMEOUT, t + Duration::from_millis(300));
-        assert!(matches!(&o, ProbeOutcome::Failed(w) if w.contains("no turn")), "{o:?}");
+        let r = TtlProbe.round(0, addr, 2, 2, &Pin::default(), PROBE_TIMEOUT, t + Duration::from_millis(300));
+        assert!(matches!(&r, Err(w) if w.contains("no turn")), "{r:?}");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-        let v = decide_until(&TtlProbe, addr, 2, Instant::now() + Duration::from_millis(300));
+        let v = decide_until(&TtlProbe, addr, 2, &Pin::default(), Instant::now() + Duration::from_millis(300));
         assert!(matches!(&v, Verdict::Failed(w) if w.contains("no turn")), "{v:?}");
         drop(held);
         assert!(ProbeGate::enter_until(Instant::now() + Duration::from_secs(5)).is_some());
-        let probe = FixedProbe::far();
-        let v = decide_until(&*probe, addr, 2, Instant::now() - Duration::from_millis(1));
-        assert_eq!(v, Verdict::Failed(OUT_OF_TIME.into()));
-        assert!(probe.asked.lock().unwrap().is_empty());
-        let undecided = FixedProbe::answering(ProbeOutcome::TimedOut);
-        assert_eq!(decide_until(&*undecided, addr, 2, far), Verdict::Far);
-        assert_eq!(undecided.confirms.lock().unwrap().len(), 1);
     }
 
-    /// Review round 5 (the probe lens's suspicion): probes start at most [`PROBE_BURST`] at once
+    /// Review round 5 (the probe lens's suspicion): rounds start at most [`PROBE_BURST`] at once
     /// and [`PROBES_PER_SECOND`] after that, however many callers ask.
     #[test]
     fn r5_probes_are_paced() {
@@ -2145,300 +2079,8 @@ mod tests {
         }
         assert!(PACED.load(std::sync::atomic::Ordering::SeqCst) > before, "no turn waited for a token");
     }
-
-    /// Review round 4, probe-1: the two-connection check, every interleaving. An
-    /// acknowledgement of the hop-limited FIN is near whenever it comes (before the control's,
-    /// with it, after it, long after the window: the late ACK that read as far before); far only
-    /// once the control's FIN was acknowledged and the check's stayed unacknowledged for
-    /// `far_after`; the control unacknowledged (S3), a peer that closes or resets either
-    /// connection, an unreadable state, a path too slow: failures, never far.
-    #[test]
-    fn r4_the_two_connection_check_never_reads_a_late_ack_as_far() {
-        use TcpState::*;
-        let ms = Duration::from_millis;
-        let ok = |s: TcpState| -> io::Result<TcpState> { Ok(s) };
-        // A 20 ms path, RTO 220 ms: min_wait = max(330, 220 + 40 + 250) = 510 ms.
-        let fresh = || Check::new(ms(20), ms(220)).unwrap();
-        assert_eq!(fresh().min_wait, ms(510));
-        assert_eq!(fresh().control_wait, ms(510));
-        // Drive a sequence of (time, check, control); the first decision.
-        let run = |steps: &[(u64, TcpState, TcpState)]| {
-            let mut c = fresh();
-            for &(t, a, b) in steps {
-                if let Some(o) = c.step(ms(t), ok(a), ok(b)) {
-                    return Some((t, o));
-                }
-            }
-            None
-        };
-        // Far: the control acknowledged at 20 ms, the check never.
-        assert_eq!(
-            run(&[(0, FinWait1, FinWait1), (20, FinWait1, FinWait2), (509, FinWait1, FinWait2), (510, FinWait1, FinWait2)]),
-            Some((510, ConfirmOutcome::Unanswered))
-        );
-        // Near: the check acknowledged before the control, with it, after it, and late (after
-        // the old 1.5 s window, once the control had long answered) — as long as no decision
-        // was made, and the decision waits past the control's time again.
-        for steps in [
-            vec![(10, FinWait2, FinWait1)],
-            vec![(20, FinWait2, FinWait2)],
-            vec![(20, FinWait1, FinWait2), (30, TimeWait, FinWait2)],
-            vec![(20, FinWait1, TimeWait), (400, FinWait2, Closed)],
-        ] {
-            assert_eq!(run(&steps).map(|(_, o)| o), Some(ConfirmOutcome::Answered), "{steps:?}");
-        }
-        // Bufferbloat: the control's ACK comes at 1.6 s (the RTT grew); the check's, as late,
-        // at 1.65 s: near, not far (the old design restored the hop limit at 1.5 s).
-        assert_eq!(
-            run(&[(0, FinWait1, FinWait1), (1600, FinWait1, FinWait2), (1650, FinWait2, FinWait2)]),
-            Some((1650, ConfirmOutcome::Answered))
-        );
-        let mut c = fresh();
-        assert_eq!(c.step(ms(1600), ok(FinWait1), ok(FinWait2)), None);
-        assert_eq!(c.far_after(ms(1600)), ms(3200));
-        assert_eq!(c.step(ms(3199), ok(FinWait1), ok(FinWait1)), None, "the control stays acked");
-        assert_eq!(c.step(ms(3200), ok(FinWait1), ok(Closed)), Some(ConfirmOutcome::Unanswered));
-        // A lost ACK: the check's FIN retransmitted after its RTO (220 ms) is answered at
-        // 245 ms, before min_wait.
-        assert_eq!(
-            run(&[(20, FinWait1, FinWait2), (244, FinWait1, FinWait2), (245, FinWait2, FinWait2)]),
-            Some((245, ConfirmOutcome::Answered))
-        );
-        // The control connection made 100 ms after the check's FIN, acknowledged 20 ms after
-        // its own: far only at max(510, 120 + 250).
-        let mut c = fresh();
-        assert_eq!(c.step(ms(50), ok(FinWait1), ok(FinWait1)), None);
-        c.control_sent_at(ms(100));
-        assert_eq!(c.step(ms(120), ok(FinWait1), ok(FinWait2)), None);
-        assert_eq!(c.far_after(ms(120)), ms(510));
-        assert_eq!(c.step(ms(510), ok(FinWait1), ok(FinWait2)), Some(ConfirmOutcome::Unanswered));
-        // The control's round trip counts from its own FIN: sent at 400, acknowledged at 420.
-        let mut c = fresh();
-        c.control_sent_at(ms(400));
-        assert_eq!(c.far_after(ms(420)), ms(670));
-        let mut c = fresh();
-        c.control_sent_at(ms(100));
-        assert_eq!(c.step(ms(609), ok(FinWait1), ok(FinWait1)), None, "control_wait from its FIN");
-        assert_eq!(c.step(ms(610), ok(FinWait1), ok(FinWait1)), Some(ConfirmOutcome::Failed(UNACKED_FIN.into())));
-        // The control never acknowledged (S3): a failure at control_wait, never far.
-        let o = run(&[(0, FinWait1, FinWait1), (509, FinWait1, FinWait1), (510, FinWait1, FinWait1)]);
-        assert_eq!(o, Some((510, ConfirmOutcome::Failed(UNACKED_FIN.into()))));
-        // A peer that resets or closes either connection first: a failure.
-        for (a, b) in [(Closed, FinWait1), (LastAck, FinWait1), (CloseWait, FinWait1), (FinWait1, Closed), (FinWait1, LastAck), (Established, FinWait1)] {
-            let o = run(&[(5, a, b)]);
-            assert!(matches!(&o, Some((_, ConfirmOutcome::Failed(_)))), "{a:?} {b:?}: {o:?}");
-        }
-        // The peer's FIN crossed the check's (CLOSING) when the time is up: a failure.
-        let o = run(&[(20, Closing, FinWait2), (510, Closing, FinWait2)]);
-        assert!(matches!(&o, Some((510, ConfirmOutcome::Failed(w))) if w.contains("closed")), "{o:?}");
-        // An unreadable state: a failure.
-        let mut c = fresh();
-        assert!(matches!(c.step(ms(1), Err(io::Error::other("x")), ok(FinWait1)), Some(ConfirmOutcome::Failed(_))));
-        let mut c = fresh();
-        assert!(matches!(c.step(ms(1), ok(FinWait1), Err(io::Error::other("x"))), Some(ConfirmOutcome::Failed(_))));
-        // No cap shorter than the round trip: a 900 ms path waits 3.85 s; one too slow for
-        // MAX_CHECK_WAIT, or a control acknowledged too late, is refused.
-        let slow = Check::new(ms(900), ms(1100)).unwrap();
-        assert_eq!(slow.min_wait, ms(3850));
-        assert!(matches!(Check::new(ms(2600), ms(3000)), Err(ConfirmOutcome::Failed(w)) if w.contains("too long")));
-        let mut c = fresh();
-        assert!(matches!(c.step(ms(5100), ok(FinWait1), ok(FinWait2)), Some(ConfirmOutcome::Failed(w)) if w.contains("too long")));
-        // Every failure is refused, not far.
-        assert!(matches!(
-            ConfirmOutcome::Failed(UNACKED_FIN.into()).verdict(),
-            Verdict::Failed(_)
-        ));
-        assert!(UNACKED_FIN.chars().count() <= 120);
-    }
-
-    /// Review round 4, parse-2: a reset read once is a reset for good. On Linux the first read
-    /// of a reset's `TCP_CLOSE` takes its error (`SO_ERROR`, cleared by reading); a second read
-    /// would see `TCP_CLOSE` with no error, a completed close (acknowledged). Every read of the
-    /// check goes through [`sticky_closed`].
-    #[cfg(unix)]
-    #[test]
-    fn r4_a_reset_read_once_stays_a_reset() {
-        let sk_err = std::cell::Cell::new(libc::ECONNRESET);
-        let mut tcp_info = [0u8; 104];
-        tcp_info[0] = 7; // TCP_CLOSE
-        let closed = std::cell::Cell::new(None);
-        let read = || {
-            sticky_closed(&closed, || linux_conn_info(&tcp_info, 104, || sk_err.replace(0)))
-                .unwrap()
-                .state
-        };
-        assert_eq!(read(), TcpState::Closed);
-        assert_eq!(read(), TcpState::Closed, "the second read of the same TCP_CLOSE");
-        // Without it (the reviewers' race): the second read is a completed close.
-        let bare = || linux_conn_info(&tcp_info, 104, || sk_err.replace(0)).unwrap().state;
-        sk_err.set(libc::ECONNRESET);
-        assert_eq!(bare(), TcpState::Closed);
-        assert_eq!(bare(), TcpState::TimeWait);
-        // cross-6: an SO_ERROR that cannot be read is a reset, never a completed close.
-        assert_eq!(so_error_read(-1, 0), -1);
-        assert_eq!(so_error_read(0, 0), 0);
-        assert_eq!(so_error_read(0, libc::ECONNRESET), libc::ECONNRESET);
-        assert_eq!(
-            linux_conn_info(&tcp_info, 104, || so_error_read(-1, 0)).unwrap().state,
-            TcpState::Closed
-        );
-        // And the check, fed the sticky reads, fails; never far, never near.
-        let mut c = Check::new(Duration::from_millis(20), Duration::from_millis(220)).unwrap();
-        assert!(matches!(
-            c.step(Duration::from_millis(30), Ok(read()), Ok(TcpState::FinWait2)),
-            Some(ConfirmOutcome::Failed(w)) if w.contains("reset")
-        ));
-    }
-
-    /// Review round 3, probe-1, live: AWS S3's front ends never acknowledge a bare FIN, at any
-    /// hop limit (`r3-probe/finack-s3.log`), so the check connection read them as far at any
-    /// distance; with the control connection (review round 4: a second connection, no longer the
-    /// check connection's own hop limit restored) they are a failed check (refused when the probe
-    /// had no answer: the cost, docs/netguard-macos.md). Skipped when S3 cannot be reached, or when it
-    /// now acknowledges a bare FIN at the default hop limit.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    #[test]
-    fn a_peer_that_never_acknowledges_a_fin_is_not_far() {
-        use std::net::ToSocketAddrs;
-        use std::os::fd::AsRawFd;
-        let Some(addr) = ("s3.amazonaws.com", 443)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.find(SocketAddr::is_ipv4))
-        else {
-            crate::skipped("s3.amazonaws.com does not resolve here");
-            return;
-        };
-        // Does it acknowledge a bare FIN at the default hop limit within 2 s?
-        let Ok(c) = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)) else {
-            crate::skipped(format!("{addr} unreachable here"));
-            return;
-        };
-        c.shutdown(std::net::Shutdown::Write).unwrap();
-        let t = std::time::Instant::now();
-        let mut acked = false;
-        while t.elapsed() < Duration::from_secs(2) && !acked {
-            match conn_info(c.as_raw_fd()).map(|i| i.state) {
-                Ok(TcpState::FinWait2 | TcpState::TimeWait) => acked = true,
-                // Reset (or unreadable): final. On Linux `SO_ERROR` is read, and cleared, with
-                // the first `TCP_CLOSE`, so the state is never polled past it.
-                Ok(TcpState::Closed) | Err(_) => break,
-                Ok(_) => {}
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        drop(c);
-        if acked {
-            crate::skipped(format!("{addr} now acknowledges a bare FIN"));
-            return;
-        }
-        let o = TtlProbe.confirm(addr, 2, Duration::from_secs(5));
-        eprintln!("{addr}, hop limit 2: {o:?}");
-        if let ConfirmOutcome::ConnectFailed(e) = &o {
-            crate::skipped(format!("{addr} unreachable here: {e}"));
-            return;
-        }
-        assert!(matches!(o, ConfirmOutcome::Failed(_)), "{o:?}");
-        assert_ne!(o.verdict(), Verdict::Far);
-    }
-
-    /// probe-1, live: a loopback peer that closes, or resets, each connection as soon as it
-    /// accepts it is never found far, and is refused either way (near when the FIN was
-    /// acknowledged before the peer's close, a failure when the peer closed first). And a far
-    /// public peer that closes each connection at once (a NIST daytime server, port 13): its FIN
-    /// crosses the check's, which dies two hops out; the check is a failure, refused but not
-    /// near (before this change it was read as near). Skipped where that server is unreachable.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    #[test]
-    fn a_peer_that_closes_first_is_never_far() {
-        for (bind, reset) in [
-            ("127.0.0.1:0", false),
-            ("127.0.0.1:0", true),
-            ("[::1]:0", false),
-        ] {
-            let Ok(l) = std::net::TcpListener::bind(bind) else {
-                let tag = if bind.starts_with('[') { "[ipv6] " } else { "" };
-                crate::skipped(format!("{tag}no {bind} here"));
-                continue;
-            };
-            let addr = l.local_addr().unwrap();
-            let server = std::thread::spawn(move || {
-                for _ in 0..5 {
-                    let Ok((c, _)) = l.accept() else { return };
-                    if reset {
-                        let _ = socket2::SockRef::from(&c).set_linger(Some(Duration::ZERO));
-                    }
-                    drop(c);
-                }
-            });
-            for _ in 0..5 {
-                let o = TtlProbe.confirm(addr, 2, Duration::from_secs(5));
-                eprintln!("{addr} (reset {reset}): {o:?}");
-                // Near when the FIN was acknowledged before the peer's close, a failure when the
-                // peer closed first (or, under load, the connection was refused): never far.
-                assert_ne!(o, ConfirmOutcome::Unanswered, "{addr}");
-                assert_ne!(o.verdict(), Verdict::Far, "{addr}: {o:?}");
-            }
-            server.join().unwrap();
-        }
-        let far: SocketAddr = "129.6.15.28:13".parse().unwrap();
-        let o = TtlProbe.confirm(far, 2, Duration::from_secs(5));
-        eprintln!("{far}, hop limit 2: {o:?}");
-        match o {
-            ConfirmOutcome::ConnectFailed(e) => {
-                crate::skipped(format!("{far} unreachable here: {e}"))
-            }
-            o => assert!(
-                matches!(&o, ConfirmOutcome::Failed(w) if w.contains("closed")),
-                "{far}: {o:?}"
-            ),
-        }
-    }
-
-    /// probe-2 (every platform since the Linux application): the probe and the check connection
-    /// connect to an IPv4-mapped address as its IPv4 address, so the hop limit holds (on macOS an
-    /// IPv6 socket's hop limit did not limit the IPv4 packets a mapped connection sends: the
-    /// probe of a far host connected). Skipped where 1.1.1.1 is unreachable.
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    #[test]
-    fn a_mapped_address_is_probed_as_its_ipv4_address() {
-        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
-        let mapped: SocketAddr = "[::ffff:1.1.1.1]:443".parse().unwrap();
-        assert_eq!(unmapped(mapped), v4);
-        assert_eq!(unmapped(v4), v4);
-        let v6: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
-        assert_eq!(unmapped(v6), v6);
-        // A listener on 127.0.0.1 is still reached through its mapped address.
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let local: SocketAddr = format!("[::ffff:127.0.0.1]:{}", l.local_addr().unwrap().port())
-            .parse()
-            .unwrap();
-        assert_eq!(
-            TtlProbe.probe(local, 2, PROBE_TIMEOUT),
-            ProbeOutcome::Connected
-        );
-        drop(l);
-        if TtlProbe.probe(v4, 64, PROBE_TIMEOUT) != ProbeOutcome::Connected {
-            crate::skipped(format!("{v4} unreachable here"));
-            return;
-        }
-        for _ in 0..3 {
-            let o = TtlProbe.probe(mapped, 2, PROBE_TIMEOUT);
-            eprintln!("{mapped}, hop limit 2: {o:?}");
-            assert_ne!(o, ProbeOutcome::Connected, "the hop limit did not hold");
-        }
-        match TtlProbe.confirm(mapped, 2, Duration::from_secs(5)) {
-            ConfirmOutcome::ConnectFailed(e) => {
-                crate::skipped(format!("the check connection: {e}"))
-            }
-            c => assert_eq!(c, ConfirmOutcome::Unanswered, "{c:?}"),
-        }
-    }
 }
 
-
-/// Review round 6: the probe gate (parse-1, parse-4 = probe-2, probe-3), the deadlines (cross-7
-/// N11, N14), the last attempt (probe-4) and the far verdicts remembered (probe-3).
 #[cfg(test)]
 mod r6_tests {
     use super::*;
@@ -2498,15 +2140,8 @@ mod r6_tests {
         drop(s);
         // Nothing listens there: had a probe been sent, it would have been refused at once.
         let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let r = probe_turn(addr, 2, PROBE_TIMEOUT, past);
-        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::TimedOut);
-        let asked = std::cell::Cell::new(0);
-        let r = probe_attempts(PROBE_TIMEOUT, PROBE_PAUSE, || Duration::ZERO, |_| {}, |_| {
-            asked.set(asked.get() + 1);
-            Err(io::ErrorKind::TimedOut.into())
-        });
-        assert!(r.is_err());
-        assert_eq!(asked.get(), 1, "out of time: no further attempt");
+        let r = TtlProbe.round(0, addr, 2, 2, &Pin::default(), PROBE_TIMEOUT, past);
+        assert!(matches!(&r, Err(w) if w == OUT_OF_TIME), "{r:?}");
     }
 
     /// probe-3: first come, first served; a caller whose turn cannot come in time (the turns
@@ -2631,196 +2266,20 @@ mod r6_tests {
         drop(held);
     }
 
-    /// cross-7 N14: an attempt never runs past the caller's deadline (a listener whose accept
-    /// queue is full drops SYNs: the attempt would wait its whole timeout).
+    /// cross-7 N14: a round never runs past the time it is given (TEST-NET-1 at a hop limit past
+    /// every router: answered by nobody).
     #[cfg(unix)]
     #[test]
-    fn r6_a_probe_attempt_ends_at_the_deadline() {
-        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into()).unwrap();
-        sock.listen(0).unwrap();
-        let addr = sock.local_addr().unwrap().as_socket().unwrap();
-        let mut fill = Vec::new();
-        for _ in 0..64 {
-            let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-            s.set_nonblocking(true).unwrap();
-            let _ = s.connect(&addr.into());
-            fill.push(s);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        // A full queue on loopback drops SYNs on Linux; macOS completes the connection, so there
-        // TEST-NET-1 (routed, answered by nobody: one SYN, dropped) stands in.
-        let mut silent = None;
-        for to in [addr, "192.0.2.1:9".parse().unwrap()] {
-            let t = Instant::now();
-            let r = probe_turn(to, 64, Duration::from_secs(2), t + Duration::from_millis(300));
-            if matches!(&r, Err(e) if e.kind() == io::ErrorKind::TimedOut) {
-                silent = Some((to, t.elapsed()));
-                break;
+    fn r6_a_round_ends_at_its_time() {
+        let dst: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let t = Instant::now();
+        let r = TtlProbe.round(0, dst, 64, 2, &Pin::default(), Duration::from_millis(300), t + Duration::from_secs(5));
+        let took = t.elapsed();
+        match r {
+            Ok(obs) if obs.iter().all(|o| o.outcome == ProbeOutcome::TimedOut) => {
+                assert!(took < Duration::from_millis(700), "{took:?}")
             }
+            other => crate::skipped(format!("{dst} is not silent here: {other:?}")),
         }
-        match silent {
-            Some((to, took)) => assert!(took < Duration::from_millis(700), "{to}: {took:?}"),
-            None => crate::skipped("no destination that drops SYNs here"),
-        }
-    }
-
-    /// A probe that records what it was asked.
-    #[derive(Debug)]
-    struct Recording {
-        confirm: ConfirmOutcome,
-        last: ProbeOutcome,
-        confirm_timeouts: Mutex<Vec<Duration>>,
-        lasts: Mutex<usize>,
-    }
-
-    impl NearProbe for Recording {
-        fn probe(&self, _: SocketAddr, _: u8, _: Duration) -> ProbeOutcome {
-            ProbeOutcome::TimedOut
-        }
-        fn confirm(&self, _: SocketAddr, _: u8, timeout: Duration) -> ConfirmOutcome {
-            self.confirm_timeouts.lock().unwrap().push(timeout);
-            self.confirm.clone()
-        }
-        fn probe_last_until(&self, _: SocketAddr, _: u8, _: Duration, _: Instant) -> ProbeOutcome {
-            *self.lasts.lock().unwrap() += 1;
-            self.last.clone()
-        }
-    }
-
-    fn recording(confirm: ConfirmOutcome, last: ProbeOutcome) -> Recording {
-        Recording { confirm, last, confirm_timeouts: Mutex::new(Vec::new()), lasts: Mutex::new(0) }
-    }
-
-    /// probe-1 (`r6_macos_rto_zero_reads_a_retransmitted_near_ack_as_far`, live
-    /// `r6-probe/exp/rto-macos.log`: macOS reads 0 before the FIN): an unknown RTO is never
-    /// zero, so the far margin always covers a retransmission of the FIN (macOS and Linux alike).
-    #[test]
-    fn r6_the_check_never_uses_a_zero_rto() {
-        let ms = Duration::from_millis;
-        assert_eq!(check_rto(ms(0), Some(ms(242))), ms(242));
-        assert_eq!(check_rto(ms(0), None), UNKNOWN_RTO);
-        assert_eq!(check_rto(ms(0), Some(ms(0))), UNKNOWN_RTO);
-        assert_eq!(check_rto(ms(300), Some(ms(200))), ms(300));
-        // The reviewer's case: rtt 14 ms, the near peer's ACK of the retransmitted FIN at
-        // ~rto + rtt; with the RTO read as 0 the check read far at ~306 ms.
-        let c = Check::new(ms(14), check_rto(ms(0), None)).unwrap();
-        assert!(c.far_after(ms(0)) > UNKNOWN_RTO + ms(14), "{c:?}");
-    }
-
-    /// probe-1, live: the RTO the check connection used is not zero (a local listener: near).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn r6_the_live_check_uses_a_nonzero_rto() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let _keep = std::thread::spawn(move || {
-            let held: Vec<_> = l.incoming().take(2).collect();
-            std::thread::sleep(Duration::from_secs(3));
-            drop(held);
-        });
-        let o = confirm_once(addr, 2, Duration::from_secs(2), Instant::now() + Duration::from_secs(10));
-        assert_eq!(o, ConfirmOutcome::Answered, "{o:?}");
-        assert!(LAST_RTO.load(std::sync::atomic::Ordering::SeqCst) > 0);
-    }
-
-    /// cross-7 N11: the check connection's connect is bounded by the caller's deadline.
-    #[test]
-    fn r6_the_check_connection_is_bounded_by_the_deadline() {
-        let p = recording(ConfirmOutcome::Unanswered, ProbeOutcome::TimedOut);
-        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        assert_eq!(decide_until(&p, addr, 2, Instant::now() + Duration::from_secs(1)), Verdict::Far);
-        let t = p.confirm_timeouts.lock().unwrap();
-        assert!(t.len() == 1 && t[0] <= Duration::from_secs(1), "{t:?}");
-    }
-
-    /// probe-4: a destination whose probe had no answer and whose check connection failed (every
-    /// AWS S3 front end) is probed once more when the time allows; its answer decides.
-    #[test]
-    fn r6_a_failed_check_is_followed_by_one_more_probe() {
-        let addr: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let reset = ConfirmOutcome::Failed("the peer reset the control connection".into());
-        let far = Instant::now() + Duration::from_secs(30);
-        let p = recording(reset.clone(), ProbeOutcome::Unreachable);
-        assert_eq!(decide_until(&p, addr, 2, far), Verdict::Far);
-        assert_eq!(*p.lasts.lock().unwrap(), 1);
-        let p = recording(reset.clone(), ProbeOutcome::Connected);
-        assert!(matches!(decide_until(&p, addr, 2, far), Verdict::Near(_)));
-        let p = recording(reset.clone(), ProbeOutcome::TimedOut);
-        assert!(matches!(decide_until(&p, addr, 2, far), Verdict::Failed(w) if w.contains("reset")));
-        // Not when the time left cannot hold it.
-        let p = recording(reset, ProbeOutcome::Unreachable);
-        let soon = Instant::now() + PROBE_LAST_PAUSE;
-        assert!(matches!(decide_until(&p, addr, 2, soon), Verdict::Failed(_)));
-        assert_eq!(*p.lasts.lock().unwrap(), 0);
-        // A check that decided is never followed by it.
-        let p = recording(ConfirmOutcome::Answered, ProbeOutcome::Unreachable);
-        assert!(matches!(decide_until(&p, addr, 2, far), Verdict::Near(_)));
-        assert_eq!(*p.lasts.lock().unwrap(), 0);
-    }
-
-    /// probe-3: callers deciding the same key at once wait for the one decision running; a
-    /// verdict other than far is not shared (each decides again).
-    #[test]
-    fn r6_one_decision_runs_per_destination_at_a_time() {
-        let key = ("203.0.113.77:443".parse().unwrap(), 2, 0xfa_0002u64, 9);
-        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hs: Vec<_> = (0..8)
-            .map(|_| {
-                let ran = ran.clone();
-                std::thread::spawn(move || {
-                    decide_remembered(Some(key), Instant::now() + Duration::from_secs(5), || {
-                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(100));
-                        Verdict::Far
-                    })
-                })
-            })
-            .collect();
-        for h in hs {
-            assert_eq!(h.join().unwrap(), Verdict::Far);
-        }
-        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let key = ("203.0.113.78:443".parse().unwrap(), 2, 0xfa_0002u64, 9);
-        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hs: Vec<_> = (0..4)
-            .map(|_| {
-                let ran = ran.clone();
-                std::thread::spawn(move || {
-                    decide_remembered(Some(key), Instant::now() + Duration::from_secs(5), || {
-                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Verdict::Near("answered")
-                    })
-                })
-            })
-            .collect();
-        for h in hs {
-            assert!(matches!(h.join().unwrap(), Verdict::Near(_)));
-        }
-        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
-    }
-
-    /// probe-3: a far verdict is remembered for FAR_TTL, for its exact destination and port, hop
-    /// limit, facts and probe.
-    #[test]
-    fn r6_far_verdicts_are_remembered_only_for_the_same_destination_and_facts() {
-        let a: SocketAddr = "198.51.100.7:443".parse().unwrap();
-        let facts = 0xfa_0001u64;
-        let t0 = Instant::now();
-        let key = (a, 2, facts, 1);
-        assert!(!remembered_far(key, t0));
-        remember_far(key, t0);
-        assert!(remembered_far(key, t0 + FAR_TTL - Duration::from_millis(1)));
-        assert!(!remembered_far(key, t0 + FAR_TTL));
-        remember_far(key, t0);
-        for other in [
-            ("198.51.100.8:443".parse().unwrap(), 2, facts, 1),
-            ("198.51.100.7:80".parse().unwrap(), 2, facts, 1),
-            (a, 3, facts, 1),
-            (a, 2, facts, 2),
-        ] {
-            assert!(!remembered_far(other, t0), "{other:?}");
-        }
-        assert!(!remembered_far((a, 2, facts + 1, 1), t0), "other facts");
     }
 }

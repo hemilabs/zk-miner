@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::nearhop::{ConfirmOutcome, NearProbe, ProbeOutcome};
+use crate::nearhop::{NearProbe, Obs, Pin};
 use crate::routes::{Hop, Link, Route};
 use crate::{
     admit, is_global, Denied, FactsOptions, HostFacts, NetMode, NetPolicy, Prefix, RawFacts,
@@ -254,18 +254,25 @@ fn a_public_address_is_admitted_and_vetted() {
 }
 
 /// A destination within the hop limit is refused before any connection carries data: a listener
-/// on loopback stands in for a public address (the real probe and check connection are sent to
-/// the listener in its place), as the Linux tests stage near destinations.
+/// on loopback stands in for a public address (the real probes are sent to the listener in its
+/// place), as the Linux tests stage near destinations.
 #[test]
 fn a_destination_within_the_hop_limit_is_refused() {
     #[derive(Debug)]
     struct To(SocketAddr);
     impl NearProbe for To {
-        fn probe(&self, _: SocketAddr, hops: u8, timeout: Duration) -> ProbeOutcome {
-            TtlProbe.probe(self.0, hops, timeout)
-        }
-        fn confirm(&self, _: SocketAddr, hops: u8, timeout: Duration) -> ConfirmOutcome {
-            TtlProbe.confirm(self.0, hops, timeout)
+        #[allow(clippy::too_many_arguments)]
+        fn round(
+            &self,
+            round: u32,
+            _: SocketAddr,
+            hops: u8,
+            extra: u8,
+            pin: &Pin,
+            wait: Duration,
+            deadline: std::time::Instant,
+        ) -> Result<Vec<Obs>, String> {
+            TtlProbe.round(round, self.0, hops, extra, pin, wait, deadline)
         }
     }
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
