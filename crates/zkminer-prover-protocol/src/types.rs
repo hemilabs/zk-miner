@@ -1088,6 +1088,26 @@ pub const SP1_SERVER_INSTALL_ENV: &str = "ZKMINER_SP1_SERVER_INSTALL";
 /// miner runs it before the worker's first Low-integrity start, which cannot write `~/.sp1/bin`.
 pub const INSTALL_BUNDLED_SERVER_ARG: &str = "--install-bundled-server";
 
+/// The risc0 and SP1 workers' argument to install what their warm-up downloads or builds in the
+/// user's profile (risc0's `risc0-groth16` component in `~/.risc0`; SP1's server, its Groth16
+/// circuit artifacts in `~/.sp1/circuits` and the stripped circuit) and exit, with no GPU and no
+/// guest. It answers on stdout as a `Warmup` does: `SetupProgress` frames, then `WarmupDone` or
+/// `Error`, all with request id 0. The Windows miner runs it, at its own integrity, before the
+/// warm-up of a worker at Low integrity, which cannot write there (and must not: what a Low process
+/// could write there, every worker would read).
+pub const INSTALL_ARTIFACTS_ARG: &str = "--install-artifacts";
+
+/// Set to `1` in the environment of a worker the Windows miner starts at Low integrity: its warm-up
+/// then installs nothing in the user's profile (the miner did, `INSTALL_ARTIFACTS_ARG`) and says so
+/// when something is missing there, rather than failing on a write it may not make.
+pub const LOW_INTEGRITY_WORKER_ENV: &str = "ZKMINER_LOW_INTEGRITY_WORKER";
+
+/// Whether this process is a worker the Windows miner started at Low integrity
+/// ([`LOW_INTEGRITY_WORKER_ENV`]).
+pub fn is_low_integrity_worker() -> bool {
+    std::env::var(LOW_INTEGRITY_WORKER_ENV).is_ok_and(|v| v == "1")
+}
+
 /// Host budget the STOCK SP1 defaults are assumed to need.
 ///
 /// A lower bound turned into a working figure. The defaults were measured dying at 25.0 GiB against

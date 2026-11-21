@@ -146,6 +146,130 @@ fn worker_env(
     env
 }
 
+/// Windows, before the warm-up of a worker at Low integrity: what the warm-up downloads or builds
+/// in the user's profile (`~/.risc0`, `~/.sp1`), installed by the worker binary at `path` run with
+/// `--install-artifacts` at the miner's own (Medium) integrity, as any worker would run, with the
+/// environment its slot's workers get but no Low directory. A Low process cannot write those
+/// directories, and must not be able to: every worker reads what is there. No GPU and no guest in
+/// it, and it reads nothing a Low process can write but the SP1 Groth16 queue's lock files.
+/// `progress` is told each step, as a warm-up's are; ended at `timeout`. Once it succeeded for a
+/// binary (and SP1 server build) it is not run again in this process. What it said it did, or why
+/// it failed, with its last output.
+#[cfg(windows)]
+pub(crate) fn install_artifacts_at_medium(
+    backend: &str,
+    path: &Path,
+    env_overrides: &HashMap<String, String>,
+    timeout: Duration,
+    progress: &mut dyn FnMut(zkminer_prover_protocol::SetupStep),
+) -> Result<String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static DONE: std::sync::Mutex<std::collections::BTreeSet<(PathBuf, Option<String>)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let key = (
+        path.to_path_buf(),
+        env_overrides.get("SP1_GPU_SERVER_NAME").cloned(),
+    );
+    if DONE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&key)
+    {
+        return Ok("installed already in this run".to_string());
+    }
+    let env = worker_env(backend, std::env::vars_os(), env_overrides);
+    let mut child = Command::new(path)
+        .arg(zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .env_remove(zkminer_prover_protocol::types::LOW_INTEGRITY_WORKER_ENV)
+        // Its own hidden console: the miner's Ctrl+C is not for it.
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("cannot run {} to install its artifacts", path.display()))?;
+    let pid = child.id();
+    let started = crate::memory::pid_starttime(pid);
+    // Its last lines, for a failure; read to the end, so it never blocks on a full pipe.
+    let tail = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::BufReader::new(stderr)
+                .take(16 * 1024 * 1024)
+                .read_to_string(&mut text);
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines[lines.len().saturating_sub(4)..]
+                .iter()
+                .map(|l| sanitize_worker_line(l))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    });
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if done.load(Ordering::Acquire) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            !done.load(Ordering::Acquire) && crate::memory::terminate_if_our_worker(pid, started)
+        })
+    };
+    let mut stdout = BufReader::new(child.stdout.take().context("no stdout")?);
+    let answer = loop {
+        match read_message::<_, WorkerResponse>(&mut stdout) {
+            Ok(WorkerResponse::SetupProgress {
+                status,
+                done_bytes,
+                total_bytes,
+                ..
+            }) => progress(zkminer_prover_protocol::SetupStep {
+                status,
+                done_bytes,
+                total_bytes,
+            }),
+            Ok(WorkerResponse::WarmupDone { summary, .. }) => break Ok(summary),
+            Ok(WorkerResponse::Error { message, .. }) => break Err(message),
+            Ok(other) => break Err(format!("it answered {other:?}")),
+            Err(e) => break Err(format!("no answer ({e})")),
+        }
+    };
+    done.store(true, Ordering::Release);
+    let timed_out = watchdog.join().unwrap_or(false);
+    let status = child.wait();
+    let tail = tail.and_then(|t| t.join().ok()).unwrap_or_default();
+    match answer {
+        Ok(summary) => {
+            DONE.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+            Ok(summary)
+        }
+        Err(why) => {
+            let mut why = format!(
+                "{} {} failed: {why}",
+                path.display(),
+                zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG
+            );
+            if timed_out {
+                why.push_str(&format!(" (ended after {} s)", timeout.as_secs()));
+            } else if let Ok(status) = status {
+                why.push_str(&format!(" ({status})"));
+            }
+            if !tail.is_empty() {
+                why.push_str(&format!("; its last output: {tail}"));
+            }
+            bail!(why)
+        }
+    }
+}
+
 /// A worker's last lines of output, kept whether or not they are forwarded: the dashboard suppresses
 /// forwarding, and a worker that crashed otherwise said only "process died (EOF)".
 type RecentOutput = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
@@ -1117,8 +1241,14 @@ impl WorkerHandle {
             // would be any Low process's to trigger. It fails like any spawn, paged, and the
             // dispatcher starts the next one at Low after its back-off. See `windows_sandbox`.
             if let Err(e) = handle.handshake() {
+                // Its last words name what failed (a GPU runtime's call, a DLL that did not load).
+                let note = handle.death_note(Duration::from_millis(500));
                 drop(handle);
-                crate::windows_sandbox::low_il_worker_failed(backend, &format!("{e:#}"));
+                crate::windows_sandbox::low_il_worker_failed(
+                    backend,
+                    path,
+                    &format!("{e:#}; {note}"),
+                );
                 return Err(e);
             }
             return Ok(handle);
@@ -1402,6 +1532,12 @@ impl WorkerHandle {
                 }
             }
         }
+    }
+
+    /// Windows: whether the worker runs at Low integrity (`windows_sandbox`).
+    #[cfg(windows)]
+    pub fn is_low_integrity(&self) -> bool {
+        self.child.is_low_integrity()
     }
 
     /// Check if the worker process is still alive.
