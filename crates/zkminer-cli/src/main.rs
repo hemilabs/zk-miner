@@ -568,20 +568,17 @@ fn main() -> Result<()> {
         );
     }
     let cli = Cli::parse();
-    // Windows: no mining as LocalSystem, LocalService or NetworkService (every worker, and so every
-    // requester's guest, would run as it too), unless the operator says so. See `windows_sandbox`.
+    // Windows: no mining as LocalSystem, LocalService or NetworkService, or as an administrator
+    // under a service logon (every worker, and so every requester's guest, would run as it too),
+    // nor when the account cannot be told, unless the operator says so. See `windows_sandbox`.
     #[cfg(windows)]
     if matches!(cli.command, Commands::Run { .. }) {
         use zkminer_prover::windows_sandbox as sandbox;
-        match sandbox::account_risk() {
-            Ok(risk) => {
-                if let Some(refusal) =
-                    sandbox::account_refusal(risk, sandbox::privileged_account_allowed())
-                {
-                    anyhow::bail!("{refusal}");
-                }
-            }
-            Err(e) => eprintln!("warning: could not tell which account the miner runs as ({e})"),
+        if let Some(refusal) = sandbox::account_refusal(
+            &sandbox::account_risk(),
+            sandbox::privileged_account_allowed(),
+        ) {
+            anyhow::bail!("{refusal}");
         }
         // Every privilege but traverse checking and two GPU runtimes may use, removed for good
         // before any thread or child starts: a service logon's SeImpersonatePrivilege (the SERVICE

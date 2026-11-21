@@ -1,4 +1,5 @@
-//! The account the miner runs as on Windows: the privileges its token carries.
+//! The account the miner runs as on Windows: the privileges its token carries, and whether it is an
+//! administrator.
 //!
 //! - A service logon's token holds the SERVICE group, and Windows grants that group
 //!   `SeImpersonatePrivilege`: from a worker a requester's guest broke out of, that is one
@@ -7,6 +8,10 @@
 //!   it runs ([`strip_worker`]). A removed privilege cannot be enabled again, and a process gets a
 //!   copy of its creator's token, so nothing the miner starts gets one back. A worker whose token
 //!   still holds one of [`DANGEROUS_PRIVILEGES`] afterwards is not started.
+//! - An administrator is told by the Administrators group in its token ([`admin_state`]): enabled
+//!   (an elevated console, or a service logon, which UAC never filters) or kept for deny only (an
+//!   administrator's console that is not elevated). `TokenElevation` is not used: a token holding
+//!   one of the privileges above counts as elevated without being an administrator's.
 
 use std::ffi::c_void;
 use std::io;
@@ -88,6 +93,7 @@ const PRIVILEGE_NAMES: [(u32, &str); 35] = [
 const TOKEN_DUPLICATE: u32 = 0x0002;
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
+const TOKEN_GROUPS: i32 = 2;
 const TOKEN_PRIVILEGES: i32 = 3;
 const SE_PRIVILEGE_REMOVED: u32 = 0x4;
 const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
@@ -96,6 +102,8 @@ const ERROR_NOT_ALL_ASSIGNED: i32 = 1300;
 #[link(name = "kernel32")]
 extern "system" {
     fn GetCurrentProcess() -> Handle;
+    fn GetCurrentProcessId() -> u32;
+    fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -399,6 +407,119 @@ pub fn strip_check() -> io::Result<Vec<String>> {
     strip_token(copy.as_raw_handle())
 }
 
+/// Whether a token is an administrator's, by its Administrators group (S-1-5-32-544).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminState {
+    /// The group is enabled: an elevated console, or a service logon (UAC filters only interactive
+    /// and remote logons). The token's holder has administrator rights now.
+    Full,
+    /// The group is there for deny only: an administrator's console that is not elevated. UAC is
+    /// not a security boundary, so a process at this level can still become an administrator.
+    Filtered,
+    /// Not a member.
+    None,
+}
+
+/// A SID (binary) and its attributes in a token's groups.
+pub type Group = (Vec<u8>, u32);
+
+/// BUILTIN\Administrators, S-1-5-32-544.
+const ADMINISTRATORS_SID: [u8; 16] = [1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x20, 2, 0, 0];
+/// NT AUTHORITY\SERVICE, S-1-5-6: every service logon has it.
+const SERVICE_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 6, 0, 0, 0];
+
+/// The [`AdminState`] of a token whose groups are `groups`.
+pub fn admin_state_of(groups: &[Group]) -> AdminState {
+    const SE_GROUP_ENABLED: u32 = 0x4;
+    const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+    match groups.iter().find(|(sid, _)| sid[..] == ADMINISTRATORS_SID) {
+        Some((_, attributes)) if attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 => {
+            AdminState::Filtered
+        }
+        Some((_, attributes)) if attributes & SE_GROUP_ENABLED != 0 => AdminState::Full,
+        // Neither enabled nor deny-only: present, but it grants nothing now.
+        Some(_) => AdminState::Filtered,
+        None => AdminState::None,
+    }
+}
+
+/// Whether a token whose groups are `groups`, in session `session`, is a service's: it holds the
+/// SERVICE group, or it runs in session 0, where no console logon is.
+pub fn service_logon_of(groups: &[Group], session: Option<u32>) -> bool {
+    groups.iter().any(|(sid, _)| sid[..] == SERVICE_SID) || session == Some(0)
+}
+
+/// The groups of this process's token.
+fn this_process_groups() -> io::Result<Vec<Group>> {
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *const u8,
+        attributes: u32,
+    }
+    #[repr(C)]
+    struct TokenGroupsHead {
+        count: u32,
+        first: SidAndAttributes,
+    }
+    // SAFETY: the pseudo-handle of this process.
+    let token = process_token(unsafe { GetCurrentProcess() }, TOKEN_QUERY)?;
+    let buf = token_information(token.as_raw_handle(), TOKEN_GROUPS)?;
+    let bytes = buf.len() * 8;
+    // SAFETY: TOKEN_GROUPS as Windows wrote it into `buf`, which outlives every read: the count,
+    // then that many SID_AND_ATTRIBUTES, whose SIDs point into the same buffer. Each SID is
+    // revision, sub-authority count, 6-byte authority, then 4 bytes per sub-authority.
+    unsafe {
+        let base = buf.as_ptr().cast::<u8>();
+        let count = *base.cast::<u32>() as usize;
+        let first = std::mem::offset_of!(TokenGroupsHead, first);
+        let size = std::mem::size_of::<SidAndAttributes>();
+        if first + count * size > bytes {
+            return Err(io::Error::other("a malformed TOKEN_GROUPS"));
+        }
+        let entries = base.add(first).cast::<SidAndAttributes>();
+        Ok((0..count)
+            .map(|i| {
+                let entry = &*entries.add(i);
+                let length = 8 + 4 * usize::from(*entry.sid.add(1));
+                (
+                    std::slice::from_raw_parts(entry.sid, length).to_vec(),
+                    entry.attributes,
+                )
+            })
+            .collect())
+    }
+}
+
+/// This process's [`AdminState`].
+pub fn admin_state() -> io::Result<AdminState> {
+    Ok(admin_state_of(&this_process_groups()?))
+}
+
+/// Whether this process runs under a service logon ([`service_logon_of`]).
+pub fn is_service_logon() -> io::Result<bool> {
+    let mut session = 0u32;
+    // SAFETY: plain kernel32 calls; `session` outlives the call.
+    let session = (unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0)
+        .then_some(session);
+    Ok(service_logon_of(&this_process_groups()?, session))
+}
+
+/// `S-1-…` for a binary SID, or `None` if `sid` is not one.
+pub fn sid_string(sid: &[u8]) -> Option<String> {
+    let count = usize::from(*sid.get(1)?);
+    if sid.len() < 8 + 4 * count || sid[0] != 1 {
+        return None;
+    }
+    let authority = sid[2..8].iter().fold(0u64, |a, b| (a << 8) | u64::from(*b));
+    let mut text = format!("S-1-{authority}");
+    for i in 0..count {
+        let at = 8 + 4 * i;
+        let sub = u32::from_le_bytes(sid[at..at + 4].try_into().ok()?);
+        text.push_str(&format!("-{sub}"));
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +576,41 @@ mod tests {
             DANGEROUS_PRIVILEGES.len()
         );
     }
+
+    #[test]
+    fn administrators_are_told_by_their_group_not_by_elevation() {
+        let admins = ADMINISTRATORS_SID.to_vec();
+        let service = SERVICE_SID.to_vec();
+        let users = vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0];
+        assert_eq!(admin_state_of(&[(admins.clone(), 0x7)]), AdminState::Full);
+        assert_eq!(
+            admin_state_of(&[(admins.clone(), 0x10)]),
+            AdminState::Filtered
+        );
+        assert_eq!(admin_state_of(&[(users.clone(), 0x7)]), AdminState::None);
+        // The README's service account: SERVICE, no Administrators.
+        let svc = [(users, 0x7), (service.clone(), 0x7)];
+        assert_eq!(admin_state_of(&svc), AdminState::None);
+        assert!(service_logon_of(&svc, Some(3)));
+        assert!(service_logon_of(&[], Some(0)));
+        assert!(!service_logon_of(&[(admins, 0x7)], Some(1)));
+        assert!(!service_logon_of(&[], None));
+        assert_eq!(sid_string(&ADMINISTRATORS_SID).unwrap(), "S-1-5-32-544");
+        assert_eq!(sid_string(&service).unwrap(), "S-1-5-6");
+        assert_eq!(sid_string(&[1, 1, 0]), None);
+    }
+
+    /// This test process: its own token's groups and admin state can be read.
+    #[test]
+    fn this_process_token_can_be_read() {
+        let groups = this_process_groups().unwrap();
+        assert!(!groups.is_empty());
+        assert!(groups.iter().all(|(sid, _)| sid_string(sid).is_some()));
+        admin_state().unwrap();
+        is_service_logon().unwrap();
+        assert!(!this_process_privileges().unwrap().is_empty());
+    }
+
     /// `doctor`'s dry run strips a copy of this process's token and leaves this one alone.
     #[test]
     fn a_copy_of_the_token_is_stripped_not_this_one() {
