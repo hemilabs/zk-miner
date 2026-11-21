@@ -109,6 +109,18 @@ pub struct JournalEntry {
     /// inline job and in every format-1 entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<WitnessBundleRef>,
+    /// Proofs of this job that started and never ended: each start counts one, and the proof's end
+    /// in the same run (proved, failed or stopped) takes it back, so what is left counts runs that
+    /// ended in the middle of its proof (the miner killed or crashed). A guest that breaks out of
+    /// its worker and ends the miner every time the job is proven again leaves one more each time,
+    /// and the job is released at a limit rather than proven forever (`run::crash_loop_refusal`).
+    /// Absent (0) in an entry written before it was recorded; an older build ignores it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub prove_starts: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 impl Default for JournalEntry {
@@ -127,6 +139,7 @@ impl Default for JournalEntry {
             measured_cycles: None,
             measured_execute_secs: None,
             witness: None,
+            prove_starts: 0,
         }
     }
 }
@@ -414,6 +427,7 @@ impl JobJournal {
             measured_cycles: None,
             measured_execute_secs: None,
             witness: None,
+            prove_starts: 0,
         });
         // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
         // read showing the new claim pending, at a higher reopen count, would look like proof that
@@ -458,6 +472,7 @@ impl JobJournal {
             measured_cycles: None,
             measured_execute_secs: None,
             witness: None,
+            prove_starts: 0,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -529,6 +544,25 @@ impl JobJournal {
         if let Some(e) = self.entries.get_mut(&job_id) {
             e.state = JournalState::Proving;
         }
+    }
+
+    /// A proof of `job_id` starts: one more unfinished start ([`JournalEntry::prove_starts`]).
+    pub fn note_prove_start(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = e.prove_starts.saturating_add(1);
+        }
+    }
+
+    /// That proof ended in this run, however: its start no longer counts.
+    pub fn note_prove_end(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = e.prove_starts.saturating_sub(1);
+        }
+    }
+
+    /// How many proofs of `job_id` started in runs that ended before they did.
+    pub fn prove_starts(&self, job_id: B256) -> u8 {
+        self.entries.get(&job_id).map_or(0, |e| e.prove_starts)
     }
 
     pub fn mark_fulfilling(&mut self, job_id: B256) {
@@ -816,6 +850,33 @@ mod tests {
         assert_eq!(j.entries[&jid].state, JournalState::Fulfilling);
         j.remove(jid);
         assert!(!j.entries.contains_key(&jid));
+    }
+
+    /// A proof that ends in its run takes its start back; one whose run ended first (the miner
+    /// killed mid-proof) stays counted across a save and a load, and an entry written before the
+    /// count existed (or with none) loads at 0 and writes none.
+    #[test]
+    fn unfinished_proof_starts_survive_a_restart() {
+        let path = tmp_path("prove-starts");
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x07);
+        j.mark_claimed(jid, None, 100);
+        j.note_prove_start(jid);
+        j.note_prove_end(jid);
+        assert_eq!(j.prove_starts(jid), 0);
+        assert!(!serde_json::to_string(&j).unwrap().contains("prove_starts"));
+        for _ in 0..2 {
+            j.note_prove_start(jid);
+            j.save_to(&path).unwrap();
+            j = JobJournal::load_checked_from(&path).unwrap();
+        }
+        assert_eq!(j.prove_starts(jid), 2);
+        j.note_prove_end(jid);
+        j.note_prove_end(jid);
+        j.note_prove_end(jid);
+        assert_eq!(j.prove_starts(jid), 0, "never below 0");
+        assert_eq!(j.prove_starts(B256::ZERO), 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
