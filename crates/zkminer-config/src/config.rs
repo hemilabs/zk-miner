@@ -480,6 +480,18 @@ pub struct ProverConfig {
     /// to start claiming jobs immediately on fresh installs.
     #[serde(default = "default_skip_benchmark_gate")]
     pub skip_benchmark_gate: bool,
+    /// The most of the total stake that every lock this miner holds and has not settled (fulfilled,
+    /// released, slashed) may come to together, from more than 0 up to 1. A job that would take the
+    /// locks held over it waits until some settle. A miner that cannot reach the chain until its
+    /// locks' deadlines pass is slashed for all of them, and job submitters cost nothing to make, so
+    /// this bounds what such an outage (a targeted DDoS, say) can cost. `1` lets the whole stake be
+    /// locked. Never under the deployment's per-job minimum, so a small stake still holds one job.
+    #[serde(default = "default_max_locked_stake_fraction")]
+    pub max_locked_stake_fraction: f64,
+}
+
+fn default_max_locked_stake_fraction() -> f64 {
+    0.5
 }
 
 fn default_skip_benchmark_gate() -> bool {
@@ -585,6 +597,7 @@ impl Default for ProverConfig {
             risc0_groth16_selector: None,
             risc0_job_po2: HashMap::new(),
             skip_benchmark_gate: default_skip_benchmark_gate(),
+            max_locked_stake_fraction: default_max_locked_stake_fraction(),
         }
     }
 }
@@ -869,6 +882,13 @@ impl ZkMinerConfig {
                 );
             }
         }
+        let f = self.prover.max_locked_stake_fraction;
+        if !(f.is_finite() && f > 0.0 && f <= 1.0) {
+            anyhow::bail!(
+                "prover.max_locked_stake_fraction must be more than 0 and at most 1 (got {f}): the \
+                 share of the stake every lock held at once may come to; omit it for the default 0.5"
+            );
+        }
         if self.contracts.hemi_prove.is_empty() {
             anyhow::bail!(
                 "hemi_prove address not set. Run `zkminer init` and edit ~/.zkminer/config.toml"
@@ -921,6 +941,30 @@ mod validation_tests {
 
     fn parse(toml_text: &str) -> Result<ZkMinerConfig> {
         Ok(toml::from_str(toml_text)?)
+    }
+
+    /// The share of the stake every held lock may come to together: half unless set, and only from
+    /// more than 0 up to 1.
+    #[test]
+    fn max_locked_stake_fraction_defaults_to_half_and_is_held_to_its_range() {
+        let default = |c: ZkMinerConfig| c.prover.max_locked_stake_fraction;
+        assert_eq!(default(ZkMinerConfig::default()), 0.5);
+        assert_eq!(default(parse("[prover]\n").unwrap()), 0.5);
+        let c = parse("[prover]\nmax_locked_stake_fraction = 0.3\n").unwrap();
+        assert_eq!(c.prover.max_locked_stake_fraction, 0.3);
+        let refused = |f: f64| {
+            let mut c = ZkMinerConfig::default();
+            c.prover.max_locked_stake_fraction = f;
+            c.validate_for_chain()
+                .err()
+                .is_some_and(|e| e.to_string().contains("max_locked_stake_fraction"))
+        };
+        for f in [0.0, -0.5, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(refused(f), "{f}");
+        }
+        for f in [0.01, 0.5, 1.0] {
+            assert!(!refused(f), "{f}");
+        }
     }
 
     #[test]

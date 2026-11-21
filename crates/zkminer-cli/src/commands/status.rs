@@ -83,6 +83,21 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
                 "Available:          {} HEMI",
                 format_token(stake.available_collateral)
             );
+            // What `run` lets every lock it holds come to together (`[prover]
+            // max_locked_stake_fraction`): a job that would take them over it waits.
+            let lock_cap = super::run::collateral::CapPolicy {
+                fraction: config.prover.max_locked_stake_fraction,
+                floor: per_claim,
+            }
+            .cap(stake.total_staked);
+            if let Some(cap) = lock_cap {
+                println!(
+                    "Lock cap:           {} HEMI held at once ({:.0}% of the stake, \
+                     [prover] max_locked_stake_fraction)",
+                    format_token(cap),
+                    config.prover.max_locked_stake_fraction * 100.0
+                );
+            }
             // Derived verdict: `status` printed the three numbers and left the division to
             // the reader, which is how a 4.25 HEMI shortfall idled a GPU unnoticed.
             // Reported as ADDITIONAL slots: from chain alone a live lock is indistinguishable

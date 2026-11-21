@@ -2153,10 +2153,10 @@ impl WitnessRuntime {
         Ok(run::claim_exposure(info, price, terms))
     }
 
-    /// The collateral cap at the stake last read (`None`: off, or the stake not known yet).
-    async fn collateral_cap(&self) -> Option<u128> {
+    /// The collateral caps at the stake last read (each `None`: off, or the stake not known yet).
+    async fn collateral_cap(&self) -> run::collateral::Caps {
         let total = self.state.read().await.stake_info.as_ref().map_or(0, |s| s.total_staked);
-        run::collateral::policy().cap(total)
+        run::collateral::caps(total)
     }
 
     // ── the lock (§5.2 step 9) ────────────────────────────────────────────────
@@ -2493,8 +2493,8 @@ impl WitnessRuntime {
     async fn run_locked(self: &Arc<Self>, mut l: LockCtx) {
         let jid = l.job_id;
         let caller = l.caller;
-        // A lock held and not proven yet counts against its program's and caller's share of the stake
-        // (a recovered one too), at what it locked.
+        // A lock held and not settled yet counts against its program's and caller's share of the
+        // stake, and the stake's (a recovered one too), at what it locked.
         run::collateral::record(
             jid,
             run::collateral::Exposure {
@@ -3907,8 +3907,9 @@ fn terminal_state(rec: &JobRecord) -> Option<TerminalState> {
 
 /// The witness verdict for a collateral-cap refusal (`run::collateral`), `None` when admitted: a job
 /// whose terms alone ask for more than one job may lock is over this host's limit (looked at again
-/// when the host changes: a larger stake, another fraction); one over its program's or caller's share
-/// is not admitted now (deferred: their jobs here are proven soon). Neither is the caller's doing.
+/// when the host changes: a larger stake, another fraction); one over its program's or caller's share,
+/// or the stake's, is not admitted now (deferred: the locks here settle soon). Neither is the
+/// caller's doing.
 fn cap_refusal(v: run::collateral::CapVerdict) -> Option<(SkipReason, String)> {
     let why = v.describe()?;
     Some((if v.is_final() { SkipReason::LimitsAboveHostMaxima } else { SkipReason::NotAdmitted }, why))

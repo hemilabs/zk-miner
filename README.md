@@ -224,6 +224,7 @@ key_env_var = "ZKMINER_PRIVATE_KEY"
 [prover]
 max_concurrent_proofs = 0           # 0 = one proof per detected GPU
 skip_benchmark_gate   = true
+max_locked_stake_fraction = 0.5     # every held lock together: at most this share of the stake
 
 [egress]                            # optional
 deny_cidrs = ["203.0.113.0/24"]     # the rest of your fleet, your VPC's ranges
@@ -523,10 +524,27 @@ Worth knowing:
   per-job floor (`MIN_COLLATERAL_AMOUNT`, 100 HEMI on 743111), so a stake of 100–199 HEMI can still
   claim one job (the miner says so once at startup). A job whose collateral at its maximum price is
   over the cap is set aside, not claimed; one that would take the jobs of its program, or of its
-  submitter, that this miner holds and has not proven yet over the cap waits until they are proven.
-  Witness jobs are held to the same cap, inline and witness locks counting together, and
-  `run --watch-only` reports a job over it. A value that is not a number from 0 up is warned
-  about and the default used.
+  submitter, that this miner holds and has not settled yet (fulfilled, released or slashed) over
+  the cap waits until they settle. Witness jobs are held to the same cap, inline and witness locks
+  counting together, and `run --watch-only` reports a job over it. A value that is not a number
+  from 0 up is warned about and the default used.
+- **Every lock held at once comes to at most half the stake.** Programs and submitters cost
+  nothing to make, so the per-program and per-submitter caps alone let a few of them lock nearly
+  the whole stake together. `[prover] max_locked_stake_fraction` (default `0.5`, more than 0 and
+  at most 1; `1` lets the whole stake be locked) bounds the collateral of every lock this miner
+  holds and has not settled, across programs and submitters, with the same per-job floor. A lock
+  counts until it settles, not until its proof is done, and the locks found at a restart count
+  again. A job that would take them over the cap waits. `zkminer status` and the startup log show
+  the cap in HEMI.
+- **A miner cut off from the chain is slashed for every lock it holds.** A lock that is neither
+  fulfilled nor released by its deadline (plus grace) is slashed in full, and the miner reaches the
+  chain through one `[chain] rpc_url`. A submitter can single a miner out (a job assigned to it, or
+  one only it measures), learn its IP from the ELF download, and then flood that link, or drop its
+  traffic from an on-path position, until the deadlines pass: a home connection or a small VPS
+  without DDoS protection is the realistic target. The cap above bounds what that costs to its
+  share of the stake; it does not stop the slash. Stake only what you accept losing, lower
+  `max_locked_stake_fraction` on a link a booter can saturate, and prefer a DDoS-protected host
+  with an RPC endpoint you trust.
 - **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
   sha, bigint) by what they cost to prove, where the instruction count counted each as one.
   Benchmarks saved by an older miner count SP1 instructions per second, which is close for code

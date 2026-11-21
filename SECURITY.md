@@ -641,6 +641,15 @@ no second one):
 
 ## Known limits
 
+- **A targeted outage slashes every lock held.** A submitter can single out one miner (assign it a
+  job, or post one only it measures), learn its IP address from the ELF download, and then flood
+  its link, or drop its traffic from an on-path position, until the locks pass their deadline and
+  grace: each is then slashed in full, and the miner reaches the chain through one RPC endpoint.
+  The miner bounds the collateral of every lock it holds and has not settled, across programs and
+  submitters, to `[prover] max_locked_stake_fraction` of the stake (default 0.5), counting each
+  lock until it settles. That bounds the loss; it does not prevent it. Size the stake to what you
+  accept losing, and run on a DDoS-protected link where you can.
+
 - **DNS lookups leak, to public resolvers.** Resolving a requester's name tells the
   DNS-over-HTTPS resolver the name, and the name's own DNS servers that the resolver asked, and
   when (not this host's subnet: Client Subnet is asked off). Where the compiled-in resolvers are

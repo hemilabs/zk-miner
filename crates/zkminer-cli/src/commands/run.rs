@@ -29,8 +29,9 @@ use zkminer_chain::adapter::AdapterInfo;
 /// Witness-construction jobs: routing, the witness runtime and its pure policy (see its docs).
 mod witness;
 
-/// The collateral cap: what one job, and the unproven jobs of one program or submitter, may lock.
-mod collateral;
+/// The collateral cap: what one job, the unsettled jobs of one program or submitter, and every lock
+/// held here together, may lock.
+pub(crate) mod collateral;
 
 /// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
 mod segment_disk;
@@ -3586,6 +3587,7 @@ pub async fn run(
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
+    collateral::set_stake_fraction(config.prover.max_locked_stake_fraction);
     let client = match watch {
         Some(w) => {
             WATCH_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3959,7 +3961,15 @@ pub async fn run(
                     let locked = fmt_hemi(stake.locked_collateral);
                     let total = fmt_hemi(stake.total_staked);
                     tracing::info!(
-                        "Collateral: {avail} HEMI available, {locked} locked, {total} staked"
+                        "Collateral: {avail} HEMI available, {locked} locked, {total} staked; locks \
+                         held here may come to {} HEMI together ({:.0}% of the stake, {})",
+                        fmt_hemi(
+                            collateral::stake_policy()
+                                .cap(stake.total_staked)
+                                .unwrap_or(stake.total_staked)
+                        ),
+                        collateral::stake_fraction() * 100.0,
+                        collateral::STAKE_FRACTION_KEY,
                     );
                     if stake.total_staked > 0
                         && stake.available_collateral < stake.total_staked / 10
@@ -7674,9 +7684,9 @@ async fn miner_brain(
             if in_flight.contains_key(&jid) && proved.insert(jid) {
                 queue_model.settle(&jid.0);
             }
-            // Proven (or never going to be): no longer counted against its program's and
-            // submitter's share of the stake, and its segments are gone.
-            collateral::forget(jid);
+            // Proven (or never going to be): its segments are gone. Its lock still counts against the
+            // collateral caps until it settles (its task ends, above): a proof whose fulfil cannot be
+            // sent loses the lock all the same.
             segment_disk::release(jid);
         }
         // Only jobs still held. Every path that reaps one removes it here too, but an entry left
@@ -7684,11 +7694,11 @@ async fn miner_brain(
         // recovery pass's own reap, and the planner's model then never matched again.
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
-        // Held and unproven, or a witness task's (claiming, or holding a lock the brain has not been
-        // told of yet): anything else left the count (a claim that did not land, a task that ended).
+        // Held (proven or not: until its lock settles), or a witness task's (claiming, or holding a
+        // lock the brain has not been told of yet): anything else left the count (a claim that did
+        // not land, a task that ended).
         collateral::retain(|j| {
-            (in_flight.contains_key(j) && !proved.contains(j))
-                || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
+            in_flight.contains_key(j) || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
         });
         prune_lock_blocks(&in_flight);
         refresh_kept_locks(&state, &journal, &in_flight, &mut kept_rows).await;
@@ -8877,8 +8887,9 @@ async fn miner_brain(
         // a stranded lock is in `on_chain_locked` but not in `in_flight`, so max() dropped it.)
         let stake_read_block = stake_info.as_ref().and_then(|si| si.read_block);
         let lock_blocks = lock_blocks();
-        // The most one job, and the unproven jobs of one program or submitter, may lock
-        // (`collateral`): a share of the total stake, at least the deployment's per-job floor.
+        // The most one job, and the unsettled jobs of one program or submitter, may lock, and the
+        // most every lock held here may come to together (`collateral`): shares of the total stake,
+        // each at least the deployment's per-job floor.
         if collateral::floor().is_none()
             && last_floor_read.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
         {
@@ -8892,7 +8903,7 @@ async fn miner_brain(
         }
         let total_staked = stake_info.as_ref().map_or(0, |si| si.total_staked);
         collateral::note_stake(total_staked);
-        let job_collateral_cap = collateral::policy().cap(total_staked);
+        let collateral_caps = collateral::caps(total_staked);
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
@@ -10057,11 +10068,11 @@ async fn miner_brain(
                 (job_min_collateral, u128::from(effective_bps)),
             );
             let required_collateral = exposure.collateral;
-            // No job may lock more than its share of the stake, nor the unproven jobs of its program
-            // or submitter held here with it (`collateral`). One whose terms alone ask for more is
-            // set aside: they are fixed while it is Open. One over a program's or submitter's share
-            // waits for their jobs to be proven.
-            let cap_verdict = collateral::check(jid, &exposure, job_collateral_cap);
+            // No job may lock more than its share of the stake, nor the unsettled jobs of its program
+            // or submitter held here with it, nor every lock held here with it more than theirs
+            // (`collateral`). One whose terms alone ask for more is set aside: they are fixed while it
+            // is Open. One over a share waits for the locks in it to settle.
+            let cap_verdict = collateral::check(jid, &exposure, collateral_caps);
             if let Some(why) = cap_verdict.describe() {
                 if cap_verdict.is_final() {
                     tracing::warn!("job {}: {why} — setting it aside", short_id(jid));
@@ -10593,15 +10604,15 @@ async fn miner_brain(
                 }
             }
             // The cap again, deciding and recording in one step: a witness claim may have taken the
-            // program's or submitter's room since the check above.
+            // program's, submitter's or stake's room since the check above.
             if would_commit
                 && matches!(eval.recommendation, Recommendation::Claim)
-                && collateral::admit(jid, exposure, job_collateral_cap)
+                && collateral::admit(jid, exposure, collateral_caps)
                     != collateral::CapVerdict::Admit
             {
                 segment_disk::release(jid);
                 tracing::debug!(
-                    "job {}: its program's or submitter's share of the stake is taken — not now",
+                    "job {}: its program's, submitter's or the stake's share of locks is taken — not now",
                     short_id(jid)
                 );
                 continue;
@@ -11676,8 +11687,12 @@ async fn watch_inspect(
         .stake_info
         .as_ref()
         .map_or(0, |s| s.total_staked);
-    let cap = collateral::policy().cap(total_staked);
-    let verdict = collateral::decide(job_id, &exposure, cap, &HashMap::new());
+    let verdict = collateral::decide(
+        job_id,
+        &exposure,
+        collateral::caps(total_staked),
+        &HashMap::new(),
+    );
     if let (true, Some(why)) = (verdict.is_final(), verdict.describe()) {
         return Inspected::Done(
             "over the collateral cap",
@@ -17600,13 +17615,18 @@ fn spawn_recovery_actions(
             _ => None,
         };
         in_flight.insert(jid, 0);
+        // A lock released here counts toward every lock held together until its release settles, at
+        // the deployment's floor (its program and price are not read for a release).
+        if let RecoveryAction::Release(_) = &action {
+            collateral::record_settling(jid, collateral::floor().unwrap_or(0));
+        }
         if let RecoveryAction::Drive {
             job, descriptor, ..
         } = &action
         {
-            // A lock held and not proven yet counts against its program's and submitter's share of
-            // the stake: at what its settled price locks under its terms when they are known, and at
-            // least the deployment's floor, which every lock locks.
+            // A lock held and not settled yet counts against its program's and submitter's share of
+            // the stake, and the stake's: at what its settled price locks under its terms when they
+            // are known, and at least the deployment's floor, which every lock locks.
             let floor = collateral::floor().unwrap_or(0);
             let locked = job_collateral_terms(jid).map_or(floor, |(min, bps)| {
                 zkminer_chain::auction::compute_collateral(
