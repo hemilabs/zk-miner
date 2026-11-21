@@ -261,9 +261,10 @@ fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
-/// This process's user SID as a string (`S-1-5-21-…`), from its token.
+/// This process's user SID as a string (`S-1-5-21-…`), from its token. (Also the user the miner's
+/// own process and threads are locked to, in `zkminer_prover::windows_sandbox`.)
 #[cfg(windows)]
-fn current_user_sid() -> std::io::Result<String> {
+pub fn current_user_sid() -> std::io::Result<String> {
     use std::ffi::c_void;
     #[link(name = "kernel32")]
     extern "system" {

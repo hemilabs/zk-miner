@@ -3554,6 +3554,14 @@ pub async fn run(
 ) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    // Windows, with Low-integrity workers: the key file, `.env` and the journal unreadable to them.
+    #[cfg(windows)]
+    zkminer_prover::windows_sandbox::protect_secrets(
+        (config.wallet.key_source == "file")
+            .then(|| config.wallet.key_file_path.as_deref().map(Path::new))
+            .flatten(),
+        &JobJournal::default_path(),
+    );
     if let Some(banner) = config.dev_mode_banner() {
         tracing::warn!("{banner}");
     }

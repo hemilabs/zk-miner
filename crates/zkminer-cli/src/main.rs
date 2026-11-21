@@ -558,6 +558,15 @@ fn main() -> Result<()> {
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
+    // Windows has no dumpable flag: the miner's process and threads refuse every other process of
+    // this user (a prover worker that a guest took over included) all but seeing and ending it, so
+    // none can read its memory or run code in it. See `windows_sandbox`.
+    #[cfg(windows)]
+    if let Err(e) = zkminer_prover::windows_sandbox::lock_down_this_process() {
+        eprintln!(
+            "warning: the miner's process could not be locked to this user ({e}): other processes              of this user can read its memory"
+        );
+    }
     let cli = Cli::parse();
     // `--password-fd N` is taken now, while every open descriptor above 2 is one the caller passed:
     // once the runtime, the network guard or a connection has opened its own, a number the caller

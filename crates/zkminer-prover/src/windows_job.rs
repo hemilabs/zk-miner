@@ -8,13 +8,27 @@
 //! joins a job that kills everything in it when its last handle closes. The only handle is the
 //! miner's, which the system closes however the miner ends. (The SP1 worker puts itself in a job
 //! of its own too; jobs nest.)
+//!
+//! Each worker is also in a job of its own inside that one ([`new_worker_job`]), which keeps it
+//! from the desktop: the clipboard, other processes' windows, the global atom table, the display
+//! and system settings. Those limits are never put on the miner's job, which the miner is in.
 
 use std::ffi::c_void;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::sync::OnceLock;
 
+const JOB_OBJECT_BASIC_UI_RESTRICTIONS: i32 = 4;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+const JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION: u32 = 0x0400;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+const JOB_OBJECT_UILIMIT_HANDLES: u32 = 0x0001;
+const JOB_OBJECT_UILIMIT_READCLIPBOARD: u32 = 0x0002;
+const JOB_OBJECT_UILIMIT_WRITECLIPBOARD: u32 = 0x0004;
+const JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS: u32 = 0x0008;
+const JOB_OBJECT_UILIMIT_DISPLAYSETTINGS: u32 = 0x0010;
+const JOB_OBJECT_UILIMIT_GLOBALATOMS: u32 = 0x0020;
+const JOB_OBJECT_UILIMIT_DESKTOP: u32 = 0x0040;
+const JOB_OBJECT_UILIMIT_EXITWINDOWS: u32 = 0x0080;
 
 #[repr(C)]
 #[derive(Default)]
@@ -108,13 +122,13 @@ pub(crate) fn join() {
     }
 }
 
-/// Make `child` end when this process ends. Never fails the spawn: without it a worker outlives an
-/// abruptly ended miner, as it did before. (A child started after [`join`] is in the job already;
-/// assigning it again is harmless.)
-pub(crate) fn end_with_this_process(child: &std::process::Child) {
+/// Make the process `process` (pid `pid`) end when this process ends. Never fails the spawn: without
+/// it a worker outlives an abruptly ended miner, as it did before. (A child started after [`join`]
+/// is in the job already; assigning it again is harmless.)
+pub(crate) fn end_with_this_process(process: RawHandle, pid: u32) {
     let result = job().and_then(|job| {
         // SAFETY: a valid job handle and the live child's process handle.
-        let ok = unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) };
+        let ok = unsafe { AssignProcessToJobObject(job, process) };
         if ok == 0 {
             Err(std::io::Error::last_os_error().to_string())
         } else {
@@ -125,9 +139,76 @@ pub(crate) fn end_with_this_process(child: &std::process::Child) {
         tracing::warn!(
             "worker pid {} will not end with the miner ({e}): if the miner is killed or its window \
              closed, end the worker by hand before the next start",
-            child.id()
+            pid
         );
     }
+}
+
+/// A job for one worker, to be assigned before the worker runs (it is started suspended). It nests
+/// in the miner's job, so the worker still ends with the miner. It ends everything in it when its
+/// handle closes (the worker's handle holds it), lets nothing in it break away, ends a process on an
+/// unhandled exception rather than waiting on an error dialog, and keeps its processes from the
+/// desktop: other processes' windows and hooks, the clipboard, the global atom table, other
+/// desktops, display and system settings, and logging off or shutting down. A prover needs none of
+/// it (the GPU runtimes do not go through the desktop for compute).
+///
+/// No limit on processes (the SP1 worker starts `sp1-gpu-server`, the risc0 one its Groth16 helper
+/// and `nvidia-smi`) nor on memory: Windows charges a process's VRAM to its commit, so a commit
+/// limit would fail GPU allocations.
+pub(crate) fn new_worker_job() -> std::io::Result<OwnedHandle> {
+    #[repr(C)]
+    struct UiRestrictions {
+        class: u32,
+    }
+    // SAFETY: plain kernel32 calls; the handle is owned at once, and every `info` outlives its call.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = OwnedHandle::from_raw_handle(job);
+        let mut info = ExtendedLimitInformation::default();
+        info.basic.limit_flags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+        if SetInformationJobObject(
+            job.as_raw_handle(),
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (&info as *const ExtendedLimitInformation).cast(),
+            std::mem::size_of::<ExtendedLimitInformation>() as u32,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ui = UiRestrictions {
+            class: JOB_OBJECT_UILIMIT_HANDLES
+                | JOB_OBJECT_UILIMIT_READCLIPBOARD
+                | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+                | JOB_OBJECT_UILIMIT_GLOBALATOMS
+                | JOB_OBJECT_UILIMIT_DESKTOP
+                | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+                | JOB_OBJECT_UILIMIT_EXITWINDOWS
+                | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
+        };
+        if SetInformationJobObject(
+            job.as_raw_handle(),
+            JOB_OBJECT_BASIC_UI_RESTRICTIONS,
+            (&ui as *const UiRestrictions).cast(),
+            std::mem::size_of::<UiRestrictions>() as u32,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+}
+
+/// Put `process` in `job` (a [`new_worker_job`]).
+pub(crate) fn assign(job: &OwnedHandle, process: RawHandle) -> std::io::Result<()> {
+    // SAFETY: a valid job handle and a live process handle.
+    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,7 +229,10 @@ mod tests {
             // As a worker is started: in a console of its own.
             crate::worker::isolate_from_console(&mut cmd);
             let child = cmd.spawn().unwrap();
-            super::end_with_this_process(&child);
+            {
+                use std::os::windows::io::AsRawHandle;
+                super::end_with_this_process(child.as_raw_handle(), child.id());
+            }
             println!("CHILD_PID={}", child.id());
             // Ends abruptly, as a killed miner would.
             std::process::exit(0);

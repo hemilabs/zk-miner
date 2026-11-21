@@ -373,8 +373,12 @@ impl JobJournal {
         let mut out = self.clone();
         out.format_version = JOURNAL_FORMAT_VERSION;
         let content = serde_json::to_string_pretty(&out).context("Failed to serialize journal")?;
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("Failed to write journal tmp {}", tmp.display()))?;
+        // Windows, with Low-integrity workers: unreadable to them from its creation.
+        #[cfg(windows)]
+        let written = zkminer_prover::windows_sandbox::write_secret_file(&tmp, content.as_bytes());
+        #[cfg(not(windows))]
+        let written = std::fs::write(&tmp, content);
+        written.with_context(|| format!("Failed to write journal tmp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("Failed to rename journal tmp to {}", path.display()))?;
         Ok(())
