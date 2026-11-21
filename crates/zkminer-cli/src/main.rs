@@ -131,6 +131,14 @@ enum Commands {
         #[arg(long, requires = "wait", value_name = "SECS")]
         timeout: Option<u64>,
     },
+    /// Allow new claims again after the slash latch stopped them. After a slash (or a stake fall
+    /// nothing of this miner's explains) the miner takes no new work, across restarts, until this
+    /// is run; held locks are driven throughout. Prints what tripped it first.
+    ResumeClaims {
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Run benchmarks to measure proving performance
     Benchmark {
         /// Output results as JSON instead of a formatted table
@@ -788,6 +796,7 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             yes,
         } => commands::unstake::run_withdraw(config_path, dry_run, force, yes).await,
         Commands::Doctor => commands::doctor::run(config_path).await,
+        Commands::ResumeClaims { yes } => commands::run::slash_latch::resume(yes),
         Commands::Stop {
             keep_locks,
             abandon,

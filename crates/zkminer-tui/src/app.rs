@@ -1037,6 +1037,15 @@ fn draw(f: &mut Frame, state: &MinerState) {
         ));
     }
 
+    // A lock was slashed: no new claims until `zkminer resume-claims`. Never out of sight.
+    if state.claims_latched.is_some() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            " SLASHED: CLAIMS STOPPED (zkminer resume-claims) ",
+            theme::badge_error(),
+        ));
+    }
+
     // Paused badge (STOPPING once the miner is shutting down: it is paused for that, and `p`
     // cannot resume it)
     if state.shutdown.is_some() {

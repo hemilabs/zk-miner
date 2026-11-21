@@ -34,6 +34,9 @@ pub(crate) mod collateral;
 /// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
 mod segment_disk;
 
+/// The slash latch: after a slash, no new claims until `zkminer resume-claims` (review r6 M6-1).
+pub(crate) mod slash_latch;
+
 /// A miner run as root: a `PAGE:` on a bare host (review r4 LD2).
 #[cfg(target_os = "linux")]
 pub(crate) mod privilege;
@@ -1269,8 +1272,8 @@ pub(crate) fn instance_lock_holder() -> Option<String> {
 }
 
 /// Whether new claims on a job of `proof_system_id` from `submitter` for `program_id` are held right
-/// now: the deployment or (risc0) the proof system failed verification, or the post-claim divergence
-/// breaker holds them.
+/// now: the deployment or (risc0) the proof system failed verification, the post-claim divergence
+/// breaker holds them, or the slash latch is tripped.
 fn claims_held_for(
     proof_system_id: B256,
     submitter: alloy::primitives::Address,
@@ -1281,6 +1284,7 @@ fn claims_held_for(
         || (backend == Some("risc0") && !risc0_claimable())
         || (backend == Some("sp1") && !sp1_claimable())
         || backend.is_some_and(|b| divergence_blocks_claim(submitter, program_id, b))
+        || slash_latch::tripped().is_some()
 }
 
 /// Whether the deployment itself last passed `verify_deployment` (this chain's live stack, wired to
@@ -2641,6 +2645,12 @@ async fn record_lock_ends(
             MinerJobStatus::Fulfilled { .. } => (LogLevel::Info, "was fulfilled"),
             _ => (LogLevel::Info, "is no longer locked to this miner"),
         };
+        if matches!(end, MinerJobStatus::EndedPastDeadline) {
+            slash_latch::note_lock_lost(
+                job_id,
+                "ended past its deadline (slashed, or a late release)",
+            );
+        }
         s.record_finished(job_id, end);
         s.add_log(level, format!("Job {} {what}", short_id(job_id)));
     }
@@ -3902,6 +3912,8 @@ pub async fn run(
         }
         None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
     };
+    // Before the first state read, which it watches; a watch-only run never writes it.
+    slash_latch::init(client.chain_id, client.address, !watch_only());
 
     splash.status("Verifying the deployment contracts");
     // Before ANY transaction (handoff §13 tests 1-2): the configured stack must be the live
@@ -4249,6 +4261,7 @@ pub async fn run(
         match client.get_refresh_batch().await {
             Ok(data) => {
                 hydrated = true;
+                slash_latch::observe(data.stats.as_ref(), data.stake.as_ref());
                 if let Some(block) = data.head {
                     s.block_number = block;
                 }
@@ -4592,7 +4605,9 @@ pub async fn run(
                 let mut s = state_refresh.write().await;
                 s.rpc_total = rpc_total;
                 s.rpc_last_minute = rpc_min;
+                s.claims_latched = slash_latch::tripped().map(|t| t.summary());
             }
+            slash_latch::page_again_if_due();
             // 429 CIRCUIT-BREAKER: while the endpoint is rate-limiting, SKIP the
             // Multicall3 refresh — it would just deepen the backlog, and its OWN 429 re-arms
             // the backoff meter every 15s, which would keep the brain's
@@ -4615,6 +4630,7 @@ pub async fn run(
             // done OUTSIDE the state lock so we don't hold it during I/O.
             match refresh_client.get_refresh_batch().await {
                 Ok(data) => {
+                    slash_latch::observe(data.stats.as_ref(), data.stake.as_ref());
                     let mut s = state_refresh.write().await;
                     // Apply each field only if its sub-call succeeded; a single
                     // failed read never wipes the others (they share one snapshot).
@@ -8879,6 +8895,13 @@ async fn miner_brain(
                 &mut last_claim_summary,
             )
             .await;
+            continue;
+        }
+
+        // A lock of this prover was slashed, or its stake fell unexplained (`slash_latch`): no new
+        // collateral until the operator clears it. Held locks continue.
+        if let Some(why) = slash_latch::hold_reason() {
+            publish_claim_hold(&state, why, &mut last_claim_summary).await;
             continue;
         }
 
@@ -17203,6 +17226,9 @@ async fn release_and_clean_with_nonce(
             }
             let mut s = state.write().await;
             let slashed = matches!(ended, Some(MinerJobStatus::EndedPastDeadline));
+            if slashed {
+                slash_latch::note_lock_lost(job_id, why);
+            }
             if let Some(ended) = ended {
                 s.record_finished(job_id, ended);
             }
@@ -17267,6 +17293,10 @@ async fn release_and_clean_with_nonce(
                             short_id(job_id)
                         );
                         tracing::warn!("{detail}");
+                        slash_latch::note_lock_lost(
+                            job_id,
+                            "ran past its deadline and this miner slashed it itself",
+                        );
                         let mut s = state.write().await;
                         s.record_finished(job_id, MinerJobStatus::Slashed { by_us: true });
                         s.active_jobs.retain(|j| j.info.job_id != job_id);
@@ -17338,6 +17368,8 @@ async fn release_and_clean_with_nonce(
     }
 
     let seen = lock_seen(journal, job_id);
+    // Its penalty, read beside the release (no delay to it) while the lock is still on record.
+    let penalty_read = tokio::spawn(slash_latch::release_penalty(client.clone(), job_id));
     let mut release = client.release_job_with_nonce(job_id, pre_nonce, seen).await;
     // Inside the release margin there may be no time for a recovery pass: retry in place while the
     // window is open. A ladder can burn out in seconds on a burst of refused sends. A typed revert is
@@ -17388,6 +17420,11 @@ async fn release_and_clean_with_nonce(
         && client.get_job_status_view(job_id).await.is_ok_and(|v| {
             v.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED && v.prover == client.address
         });
+    let penalty = penalty_read.await.ok().flatten();
+    if release_ok && !fulfilled {
+        // So the slash latch reads the stake it takes as ours, not as a slash.
+        slash_latch::note_own_release(job_id, penalty);
+    }
     let mut s = state.write().await;
     if release_ok {
         s.record_finished(
@@ -17395,7 +17432,9 @@ async fn release_and_clean_with_nonce(
             if fulfilled {
                 MinerJobStatus::Fulfilled { payout: 0 }
             } else {
-                MinerJobStatus::Released { penalty: 0 }
+                MinerJobStatus::Released {
+                    penalty: penalty.unwrap_or(0),
+                }
             },
         );
     }

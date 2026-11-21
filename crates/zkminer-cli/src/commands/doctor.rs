@@ -412,6 +412,17 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
         ),
         Err(e) => report.say(Level::Warn, "stake", format!("unreadable: {}", redact(&e))),
     }
+    // The slash latch: tripped, `run` takes no new work until `zkminer resume-claims`.
+    let (latched, lines) = super::run::slash_latch::describe(client.chain_id, client.address);
+    let slashed = client
+        .get_prover_stats(client.address)
+        .await
+        .map_or_else(|_| "unreadable".to_string(), |s| s.jobs_slashed.to_string());
+    report.say(
+        if latched { Level::Fail } else { Level::Pass },
+        "slash latch",
+        format!("{} (jobsSlashed on chain: {slashed})", lines.join("; ")),
+    );
     if let Ok(exit) = client.get_exit_state(client.address).await {
         for line in super::unstake::describe_exit(&exit) {
             // `status` aligns these in columns; here they follow a label.

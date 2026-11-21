@@ -163,12 +163,24 @@ true figure is lower)"
         Err(e) => println!("\nProver stats:   Error: {}", e),
     }
 
+    // The slash latch: while it is tripped `run` claims nothing new, and this exits 2 so a cron or
+    // monitoring check can alert on it.
+    let (latched, lines) = super::run::slash_latch::describe(client.chain_id, client.address);
+    println!();
+    for (i, line) in lines.iter().enumerate() {
+        let label = if i == 0 { "Slash latch:" } else { "" };
+        println!("{label:<20}{line}");
+    }
+
     // Block number
     match client.get_block_number().await {
         Ok(block) => println!("\nCurrent Block:      {}", block),
         Err(e) => println!("\nBlock number:   Error: {}", e),
     }
 
+    if latched {
+        std::process::exit(2);
+    }
     Ok(())
 }
 

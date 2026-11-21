@@ -687,6 +687,9 @@ pub struct MinerState {
     /// A lock whose cutoff is within this of now is too close for a keep-locks stop to keep: it is
     /// released first. 0 until the miner sets it.
     pub keep_horizon_secs: u64,
+    /// The slash latch while it is tripped (what tripped it, and when): no new claims until
+    /// `zkminer resume-claims`. `None` when claims are allowed.
+    pub claims_latched: Option<String>,
     pub connected: bool,
     pub block_number: u64,
     pub errors: Vec<String>,
@@ -1186,6 +1189,7 @@ impl Default for MinerState {
             shutdown: None,
             release_margin_secs: 0,
             keep_horizon_secs: 0,
+            claims_latched: None,
             connected: false,
             block_number: 0,
             errors: Vec::new(),

@@ -1801,9 +1801,13 @@ impl WitnessRuntime {
         .flatten()
     }
 
-    /// Why new witness work must not start now, though nothing is wrong with any job: the operator
-    /// paused claiming (or the miner drives held locks only), or switched risc0 off.
+    /// Why new witness work must not start now, though nothing is wrong with any job: a lock of
+    /// this prover was slashed (the slash latch), the operator paused claiming (or the miner drives
+    /// held locks only), or switched risc0 off.
     async fn claims_held(&self) -> Option<&'static str> {
+        if run::slash_latch::tripped().is_some() {
+            return Some(run::slash_latch::HOLD_SHORT);
+        }
         let st = self.state.read().await;
         claims_held_reason(
             run::held_locks_only(),
@@ -1815,6 +1819,9 @@ impl WitnessRuntime {
     /// [`Self::claims_held`] for the brain's routing, without waiting on the state: `None` while it
     /// is being written just now (the task's own check then decides).
     fn claims_held_now(&self) -> Option<&'static str> {
+        if run::slash_latch::tripped().is_some() {
+            return Some(run::slash_latch::HOLD_SHORT);
+        }
         let st = self.state.try_read().ok()?;
         claims_held_reason(
             run::held_locks_only(),
