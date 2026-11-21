@@ -1417,6 +1417,10 @@ struct Measured {
     /// cache) let the hash be dropped while the measurement survived, re-opening the window — hence the
     /// move into the measurement entry.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The registry `elf_hash` the measured ELF was fetched under (its keccak; the fetch checked it).
+    /// `Some` only for a real measurement of a backend bound by that hash (SP1). A claim whose
+    /// registry now names another hash is not claimed on this measurement (see [`ElfHashChanged`]).
+    registry_elf_hash: Option<alloy::primitives::B256>,
     /// The journal this execution committed, which a journal-bound job's binding is checked against
     /// before it is claimed (`zkminer_chain::binding`). In THIS entry for the same reason as
     /// `verified_elf_hash`: a claim that resolves a measurement gets that measurement's journal in the
@@ -1731,6 +1735,7 @@ fn insert_measured(
             peak_host_bytes: 0,
             retry_after: None,
             verified_elf_hash: None,
+            registry_elf_hash: None,
             journal: None,
             execute_secs: 0,
         },
@@ -1740,8 +1745,9 @@ fn insert_measured(
 /// Insert a real measurement: its cycle count, the execute's peak host footprint, and — for risc0 —
 /// the keccak of the image-id-verified ELF, the journal and how long the execute took (0: not
 /// known), stored in ONE value so they co-evict (finding C-8 and the independent-eviction residual).
-/// Expires only without a journal (`MEASURED_NO_JOURNAL_TTL`). `verified_elf_hash` is `Some` only for
-/// a real risc0 measurement; pass `None` for SP1 and for callers without a verified hash.
+/// Expires only without a journal (`MEASURED_NO_JOURNAL_TTL`). `elf_hash` is the keccak of the
+/// measured ELF: for risc0 the image-id-verified bytes (`verified_elf_hash`), for another backend the
+/// registry `elf_hash` they were fetched under (`registry_elf_hash`). `None` without one.
 #[allow(clippy::too_many_arguments)]
 fn insert_measurement(
     cache: &MeasuredCache,
@@ -1751,10 +1757,11 @@ fn insert_measurement(
     input_hash: alloy::primitives::B256,
     cycles: u64,
     peak_host_bytes: u64,
-    verified_elf_hash: Option<alloy::primitives::B256>,
+    elf_hash: Option<alloy::primitives::B256>,
     journal: Option<std::sync::Arc<[u8]>>,
     execute_secs: u64,
 ) {
+    let risc0 = backend == zkminer_prover_protocol::BACKEND_RISC0;
     insert_measured_value(
         cache,
         backend,
@@ -1767,7 +1774,8 @@ fn insert_measurement(
             retry_after: journal
                 .is_none()
                 .then(|| std::time::Instant::now() + MEASURED_NO_JOURNAL_TTL),
-            verified_elf_hash,
+            verified_elf_hash: elf_hash.filter(|_| risc0),
+            registry_elf_hash: elf_hash.filter(|_| !risc0),
             journal,
             execute_secs,
         },
@@ -1798,6 +1806,7 @@ fn insert_unmeasurable(
             peak_host_bytes: 0,
             retry_after: Some(std::time::Instant::now() + UNMEASURABLE_RETRY_TTL),
             verified_elf_hash: None,
+            registry_elf_hash: None,
             journal: None,
             execute_secs: 0,
         },
@@ -3220,6 +3229,8 @@ struct ResolvedMeasurement {
     peak_host_bytes: u64,
     /// The keccak of an image-id-verified risc0 ELF one of its sizes was measured from.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The registry `elf_hash` an SP1 measurement's ELF was fetched under.
+    registry_elf_hash: Option<alloy::primitives::B256>,
     /// The journal, when every size reported it and it was the same at all of them.
     journal: MeasuredJournal,
     /// The slowest execute, in whole seconds.
@@ -3232,6 +3243,7 @@ impl ResolvedMeasurement {
             cycles: UNMEASURABLE_CYCLES,
             peak_host_bytes: 0,
             verified_elf_hash: None,
+            registry_elf_hash: None,
             journal: None,
             execute_secs: 0,
         }
@@ -3262,7 +3274,13 @@ fn resolve_measured_at(
     for &po2 in sizes {
         let key = (backend_tag(backend), po2, program_id, input_hash);
         match m.get(&key) {
-            Some(e) if e.retry_after.is_some_and(|until| now >= until) => {
+            // Expired, or measured from an ELF the registry has since replaced (not this job's
+            // measurement any more): dropped, so the measure path sizes it again.
+            Some(e)
+                if e.retry_after.is_some_and(|until| now >= until)
+                    || e.registry_elf_hash
+                        .is_some_and(|h| registry_elf_hash_superseded(program_id, h)) =>
+            {
                 m.remove(&key);
                 missing = true;
             }
@@ -3292,6 +3310,7 @@ fn resolve_measured_at(
         cycles: entries.iter().map(|e| e.cycles).max().unwrap_or(0),
         peak_host_bytes: entries.iter().map(|e| e.peak_host_bytes).max().unwrap_or(0),
         verified_elf_hash: hash,
+        registry_elf_hash: entries.iter().find_map(|e| e.registry_elf_hash),
         journal,
         execute_secs: entries.iter().map(|e| e.execute_secs).max().unwrap_or(0),
     })
@@ -9473,6 +9492,7 @@ async fn miner_brain(
                         },
                     ));
                     snapshot.verified_elf_hash = r.verified_elf_hash;
+                    snapshot.measured_registry_elf_hash = r.registry_elf_hash;
                     // The journal the lifecycle checks a bound job's binding against before the
                     // claim, from the same entries as the cycles.
                     snapshot.measured_journal = r.journal;
@@ -10747,6 +10767,10 @@ struct JobStatusSnapshot {
     /// swap is rejected at the re-fetch rather than reaching prove as a penalized release + permanent
     /// blacklist. `None` for SP1 (bound by `elf_hash`), recovery, and risc0 with no measured binding.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The registry `elf_hash` this (program, input)'s SP1 measurement was made under, from the same
+    /// cache entry as `measured_cycles`. The pre-claim ELF step compares it with the registry's now
+    /// (see [`ElfHashChanged`]). `None` for risc0, recovery, and without a measurement.
+    measured_registry_elf_hash: Option<alloy::primitives::B256>,
     /// The journal this (program, input) measured, with the keccak of that input, resolved from the
     /// same cache entry as `measured_cycles`. The lifecycle checks a journal-bound job's binding
     /// against it before claiming. `None` on recovery and wherever no whole journal was measured.
@@ -10797,6 +10821,7 @@ impl JobStatusSnapshot {
             preferred_device: None,
             eligible_devices: Vec::new(),
             verified_elf_hash: None,
+            measured_registry_elf_hash: None,
             measured_journal: None,
             measured_execute_secs: None,
             measured_po2s: Vec::new(),
@@ -11791,37 +11816,93 @@ async fn process_job_lifecycle(
     // into a release.
     let mut elf_in_hand: Option<Vec<u8>> = None;
     if !is_recovery {
-        match tokio::time::timeout(
+        let honor_registry_hash = resolve_backend(snapshot.proof_system_id) != Some("risc0");
+        // From the cache only, so a slow or withheld ELF never holds this claim slot: a miss puts the
+        // job back and fetches the ELF in the background (`schedule_elf_prefetch`). Only bytes that
+        // fetch would cache are left to it; unbound risc0 bytes are not cached, so they are still
+        // fetched here.
+        let cache_only = honor_registry_hash || snapshot.verified_elf_hash.is_some();
+        let fetched = tokio::time::timeout(
             MEASURE_FETCH_BUDGET,
             // Enforce the risc0 ELF binding co-resolved with this job's measurement: a swapped,
-            // still-retrievable ELF fails the keccak here and becomes a free pre-claim skip.
-            fetch_or_download_elf(
+            // still-retrievable ELF fails the keccak here and becomes a free pre-claim skip. An SP1
+            // job measured under another registry `elf_hash` is measured again first.
+            fetch_elf(
                 client,
                 state,
                 program_id,
                 snapshot.verified_elf_hash,
-                resolve_backend(snapshot.proof_system_id) != Some("risc0"),
+                honor_registry_hash,
+                snapshot.measured_registry_elf_hash,
+                !cache_only,
             ),
         )
         .await
         .map_err(|_| anyhow::anyhow!("ELF fetch exceeded the pre-claim budget"))
-        .and_then(|r| r)
-        {
-            Ok(elf) => {
+        .and_then(|r| r);
+        match preclaim_elf_action(&fetched, || note_preclaim_elf_failure(job_id)) {
+            PreclaimElfAction::Claim => {
                 clear_preclaim_elf_failures(job_id);
-                elf_in_hand = Some(elf)
+                elf_in_hand = fetched.ok();
             }
-            Err(e) => {
-                tracing::warn!(
-                    "not claiming {}: its ELF is not obtainable now ({}) — skipping before locking \
-                     collateral (the submitter may have withdrawn the stored program)",
-                    short_id(job_id),
-                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            PreclaimElfAction::RequeuePrefetch => {
+                // No job strike: copies of a job under new ids would each start over at none. A
+                // failing fetch strikes the program instead.
+                tracing::debug!(
+                    "not claiming {} yet: its ELF is not cached, fetching it in the background",
+                    short_id(job_id)
                 );
+                note_job_retry_after(
+                    job_id,
+                    ELF_PREFETCH_RETRY,
+                    "waiting for its ELF to download",
+                );
+                requeue_open_job(state, requeue_job.clone()).await;
+                schedule_elf_prefetch(
+                    client,
+                    state,
+                    program_id,
+                    snapshot.verified_elf_hash,
+                    honor_registry_hash,
+                );
+                return Ok(());
+            }
+            PreclaimElfAction::Remeasure => {
+                // Its measurement is dropped at the next resolve, and the measure path fetches the
+                // new ELF under its own budget and strikes. The change counts against the program.
+                if let Some(now) = fetched
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<ElfHashChanged>())
+                {
+                    note_registry_elf_hash(program_id, now.0);
+                }
+                tracing::debug!(
+                    "not claiming {} yet: its program's registry ELF hash changed since it was \
+                     measured, measuring it again",
+                    short_id(job_id)
+                );
+                note_job_retry_after(
+                    job_id,
+                    ELF_PREFETCH_RETRY,
+                    "to be measured again: its program's ELF changed",
+                );
+                requeue_open_job(state, requeue_job.clone()).await;
+                return Ok(());
+            }
+            action => {
+                if let Err(e) = &fetched {
+                    tracing::warn!(
+                        "not claiming {}: its ELF is not obtainable now ({}) — skipping before \
+                         locking collateral (the submitter may have withdrawn the stored program)",
+                        short_id(job_id),
+                        zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                    );
+                }
                 // Possibly transient (a storage outage): keep it a candidate behind an escalating
                 // back-off, up to a limit — a withheld ELF must not re-take a claim slot forever.
                 note_transient_preclaim_failure(job_id);
-                if note_preclaim_elf_failure(job_id) < MAX_PRECLAIM_ELF_FAILURES {
+                if action == PreclaimElfAction::RequeueStrike {
                     requeue_open_job(state, requeue_job.clone()).await;
                 } else {
                     // Past the limit: off the market list (it stays listed while it is claimed).
@@ -14743,6 +14824,17 @@ async fn measure_cycles(
     // binding; SP1 is bound by the mandatory registry `elf_hash` gate above instead.
     let capture_risc0_keccak = backend == "risc0";
     let elf = std::sync::Arc::new(elf);
+    // Another backend's bytes were checked against the registry `elf_hash` by the fetch above, so
+    // their keccak is that hash. Stored with the measurement, so a claim can tell when the registry
+    // has since named other bytes (see [`ElfHashChanged`]).
+    let registry_elf_hash = if capture_risc0_keccak {
+        None
+    } else {
+        let elf = elf.clone();
+        tokio::task::spawn_blocking(move || alloy::primitives::keccak256(&elf[..]))
+            .await
+            .ok()
+    };
     let input = std::sync::Arc::new(input);
     // One execute per missing size, side by side (the brain admitted as many as had free workers; the
     // rest race for one): blocking, since the worker protocol is synchronous, and each bounded by the
@@ -14887,7 +14979,8 @@ async fn measure_cycles(
                     // measurement a claim rides survives). A later claim's ELF re-fetch binds to it,
                     // catching a post-measure ELF swap as a clean pre-claim skip rather than a
                     // prove-time penalized release + permanent blacklist. `elf_keccak` is `Some` only
-                    // for a real risc0 measurement; SP1 and the infeasible branches pass `None`.
+                    // for a real risc0 measurement; SP1 passes its registry `elf_hash` instead, and the
+                    // infeasible branches pass `None`.
                     let measured_journal: MeasuredJournal =
                         journal.map(|j| (input_hash, std::sync::Arc::from(j)));
                     insert_measurement(
@@ -14898,7 +14991,7 @@ async fn measure_cycles(
                         input_hash,
                         cycles,
                         peak_host_bytes,
-                        elf_keccak,
+                        elf_keccak.or(registry_elf_hash),
                         measured_journal.as_ref().map(|(_, j)| j.clone()),
                         duration_secs.max(0.0).ceil() as u64,
                     );
@@ -15149,6 +15242,31 @@ pub(crate) async fn fetch_or_download_elf(
     // the image id already binds the bytes to the programId, so it can only purge good bytes.
     honor_registry_hash: bool,
 ) -> Result<Vec<u8>> {
+    fetch_elf(
+        client,
+        state,
+        program_id,
+        expected_risc0_hash,
+        honor_registry_hash,
+        None,
+        true,
+    )
+    .await
+}
+
+/// [`fetch_or_download_elf`], with two more checks for the pre-claim step. `measured_registry_hash`
+/// is the registry `elf_hash` the job was measured under: when the registry now names another, this
+/// fails with [`ElfHashChanged`] before reading anything. Without `allow_download`, an ELF that is not
+/// in the cache fails with [`ElfNotCached`] instead of being downloaded.
+async fn fetch_elf(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    program_id: alloy::primitives::B256,
+    expected_risc0_hash: Option<alloy::primitives::B256>,
+    honor_registry_hash: bool,
+    measured_registry_hash: Option<alloy::primitives::B256>,
+    allow_download: bool,
+) -> Result<Vec<u8>> {
     let cache = zkminer_chain::programs::ElfCache::new();
     // Query the registry for the canonical content hash so we can verify cached
     // bytes. For SP1 `program_id` is the vkey (not keccak256(elf)), so we cannot
@@ -15238,6 +15356,13 @@ pub(crate) async fn fetch_or_download_elf(
     } else {
         expected_risc0_hash
     };
+    if let (true, Some(then), Some(now)) =
+        (honor_registry_hash, measured_registry_hash, info.elf_hash)
+    {
+        if then != now {
+            return Err(ElfHashChanged(now).into());
+        }
+    }
     let expected_cache_hash = integrity_hash;
     let cache_read = cache.clone();
     let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
@@ -15247,6 +15372,9 @@ pub(crate) async fn fetch_or_download_elf(
     if let Some(elf) = cached {
         tracing::info!("Using cached ELF for {} ({} bytes)", program_id, elf.len());
         return Ok(elf);
+    }
+    if !allow_download {
+        return Err(ElfNotCached.into());
     }
     {
         let mut s = state.write().await;
@@ -15315,6 +15443,265 @@ impl std::fmt::Display for RegistryUnavailable {
     }
 }
 impl std::error::Error for RegistryUnavailable {}
+
+/// The ELF is not in the cache, and the caller asked not to download it (see [`fetch_elf`]). The
+/// pre-claim step then puts the job back and leaves the download to [`schedule_elf_prefetch`], so a
+/// slow or withheld ELF never holds a claim slot.
+#[derive(Debug)]
+pub(crate) struct ElfNotCached;
+
+impl std::fmt::Display for ElfNotCached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("its ELF is not in the cache")
+    }
+}
+impl std::error::Error for ElfNotCached {}
+
+/// The registry `elf_hash` (carried) is not the one the job was measured under: its measurement is of
+/// other bytes, so it is measured again before it is claimed (see [`note_registry_elf_hash`]).
+#[derive(Debug)]
+pub(crate) struct ElfHashChanged(alloy::primitives::B256);
+
+impl std::fmt::Display for ElfHashChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the registry has named another ELF ({}) since it was measured",
+            short_id(self.0)
+        )
+    }
+}
+impl std::error::Error for ElfHashChanged {}
+
+/// What the pre-claim step does with the result of its ELF fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreclaimElfAction {
+    /// The ELF is in hand: go on to the claim.
+    Claim,
+    /// Not cached: put the job back for [`ELF_PREFETCH_RETRY`] with no strike, and fetch the ELF in
+    /// the background.
+    RequeuePrefetch,
+    /// The registry names another ELF than the one measured: put the job back with no strike, to be
+    /// measured again, and count the change against the program.
+    Remeasure,
+    /// Any other failure: put the job back behind a job strike.
+    RequeueStrike,
+    /// Any other failure, at [`MAX_PRECLAIM_ELF_FAILURES`]: drop the job.
+    Drop,
+}
+
+/// Decide [`PreclaimElfAction`] for a pre-claim fetch result. `elf_failures` records one more failure
+/// of this job and returns how many there have been; it is called only for a failure the job is
+/// struck for.
+fn preclaim_elf_action(
+    fetched: &Result<Vec<u8>>,
+    elf_failures: impl FnOnce() -> u32,
+) -> PreclaimElfAction {
+    match fetched {
+        Ok(_) => PreclaimElfAction::Claim,
+        Err(e) if e.downcast_ref::<ElfNotCached>().is_some() => PreclaimElfAction::RequeuePrefetch,
+        Err(e) if e.downcast_ref::<ElfHashChanged>().is_some() => PreclaimElfAction::Remeasure,
+        Err(_) if elf_failures() < MAX_PRECLAIM_ELF_FAILURES => PreclaimElfAction::RequeueStrike,
+        Err(_) => PreclaimElfAction::Drop,
+    }
+}
+
+/// How long a job whose ELF is not cached waits before its next pre-claim step: about one
+/// background fetch.
+const ELF_PREFETCH_RETRY: Duration = Duration::from_secs(60);
+/// Background ELF fetches running at once, over all programs.
+const MAX_ELF_PREFETCHES: usize = 2;
+/// Failed background fetches of a program's ELF after which its jobs are skipped for
+/// `NO_ELF_SOURCE_TTL` (see [`mark_program_no_elf_source`]).
+const MAX_PROGRAM_ELF_STRIKES: u32 = 3;
+
+/// Programs whose ELF is being fetched in the background. Jobs of one program share its fetch.
+static ELF_PREFETCHES: std::sync::Mutex<Option<std::collections::HashSet<B256>>> =
+    std::sync::Mutex::new(None);
+
+/// Failed background fetches per program, and when the next may start. Kept per program, not per
+/// job, so copies of one job under new ids cannot each start a fetch. Cleared by a success.
+static PROGRAM_ELF_STRIKES: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, (u32, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// The wait before the next background fetch of a program after its `strikes`-th failure: 60 s,
+/// doubling, up to 30 min.
+fn program_elf_backoff(strikes: u32) -> Duration {
+    Duration::from_secs(60 << strikes.saturating_sub(1).min(5)).min(Duration::from_secs(1800))
+}
+
+/// Count a failed background fetch against `program_id`; returns its strikes. At
+/// [`MAX_PROGRAM_ELF_STRIKES`] its jobs are skipped for `NO_ELF_SOURCE_TTL`.
+fn note_program_elf_strike(program_id: B256) -> u32 {
+    let k = {
+        let mut g = PROGRAM_ELF_STRIKES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        let k = m.get(&program_id).map_or(0, |e| e.0).saturating_add(1);
+        let until = std::time::Instant::now() + program_elf_backoff(k);
+        bounded_insert(m, program_id, (k, until), MEASURED_CYCLES_CAP);
+        k
+    };
+    if k >= MAX_PROGRAM_ELF_STRIKES {
+        mark_program_no_elf_source(program_id);
+    }
+    k
+}
+
+fn clear_program_elf_strikes(program_id: B256) {
+    let mut g = PROGRAM_ELF_STRIKES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(m) = g.as_mut() {
+        m.remove(&program_id);
+    }
+}
+
+fn program_elf_backing_off(program_id: B256) -> bool {
+    let g = PROGRAM_ELF_STRIKES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&program_id))
+        .is_some_and(|&(_, until)| std::time::Instant::now() < until)
+}
+
+/// A program's place among the running background fetches, given up when dropped.
+struct ElfPrefetchSlot(B256);
+
+impl Drop for ElfPrefetchSlot {
+    fn drop(&mut self) {
+        let mut g = ELF_PREFETCHES.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = g.as_mut() {
+            s.remove(&self.0);
+        }
+    }
+}
+
+/// A slot for a background fetch of `program_id`'s ELF, or `None` when one is running for it already,
+/// [`MAX_ELF_PREFETCHES`] are running, or the program is backing off or has no ELF source.
+fn try_begin_elf_prefetch(program_id: B256) -> Option<ElfPrefetchSlot> {
+    if program_has_no_elf_source(program_id) || program_elf_backing_off(program_id) {
+        return None;
+    }
+    let mut g = ELF_PREFETCHES.lock().unwrap_or_else(|p| p.into_inner());
+    let running = g.get_or_insert_with(Default::default);
+    if running.contains(&program_id) || running.len() >= MAX_ELF_PREFETCHES {
+        return None;
+    }
+    running.insert(program_id);
+    Some(ElfPrefetchSlot(program_id))
+}
+
+/// Fetch `program_id`'s ELF into the cache in the background, for a job the pre-claim step put back
+/// on a cache miss. Bounded by [`try_begin_elf_prefetch`], and outside `in_flight`, so it never counts
+/// toward the claim limit. A failure strikes the program (see [`note_program_elf_strike`]), not the
+/// job: copies of a job under new ids would each start over at no strikes.
+fn schedule_elf_prefetch(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    program_id: B256,
+    expected_risc0_hash: Option<B256>,
+    honor_registry_hash: bool,
+) {
+    let Some(slot) = try_begin_elf_prefetch(program_id) else {
+        return;
+    };
+    let (client, state) = (client.clone(), state.clone());
+    tokio::spawn(async move {
+        let _slot = slot;
+        let fetched = tokio::time::timeout(
+            MEASURE_FETCH_BUDGET,
+            fetch_or_download_elf(
+                &client,
+                &state,
+                program_id,
+                expected_risc0_hash,
+                honor_registry_hash,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "ELF fetch exceeded the {}s budget",
+                MEASURE_FETCH_BUDGET.as_secs()
+            )
+        })
+        .and_then(|r| r);
+        match fetched {
+            Ok(_) => clear_program_elf_strikes(program_id),
+            Err(e)
+                if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>()
+                    .is_some() =>
+            {
+                mark_program_no_elf_source(program_id);
+            }
+            // An RPC failure says nothing about the program.
+            Err(e) if e.downcast_ref::<RegistryUnavailable>().is_some() => {
+                tracing::debug!(
+                    "ELF prefetch for {}: {}",
+                    short_id(program_id),
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+            }
+            Err(e) => {
+                let k = note_program_elf_strike(program_id);
+                tracing::warn!(
+                    "ELF prefetch for program {} failed (#{k} of {MAX_PROGRAM_ELF_STRIKES}): {}",
+                    short_id(program_id),
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+            }
+        }
+    });
+}
+
+/// Registry `elf_hash` changes per hour past which a program's jobs are skipped for
+/// `NO_ELF_SOURCE_TTL`: each change makes its jobs measured, and their ELF fetched, again.
+const MAX_ELF_HASH_CHANGES_PER_HOUR: usize = 2;
+
+/// Per program, the registry `elf_hash` the pre-claim step last saw, and when it saw it change within
+/// the last hour.
+static REGISTRY_ELF_HASH: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, (B256, Vec<std::time::Instant>)>>,
+> = std::sync::Mutex::new(None);
+
+/// Record that the registry names `now` for `program_id`, seen at a job measured under another hash.
+/// A change is counted once per new hash, not once per job. Returns the changes in the last hour;
+/// past [`MAX_ELF_HASH_CHANGES_PER_HOUR`] the program is marked as having no ELF source.
+fn note_registry_elf_hash(program_id: B256, now: B256) -> usize {
+    let changes = {
+        let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        let (mut current, mut times) = m
+            .get(&program_id)
+            .cloned()
+            .unwrap_or((B256::ZERO, Vec::new()));
+        times.retain(|t| t.elapsed() < Duration::from_secs(3600));
+        if current != now {
+            current = now;
+            times.push(std::time::Instant::now());
+        }
+        let changes = times.len();
+        bounded_insert(m, program_id, (current, times), MEASURED_CYCLES_CAP);
+        changes
+    };
+    if changes > MAX_ELF_HASH_CHANGES_PER_HOUR {
+        mark_program_no_elf_source(program_id);
+    }
+    changes
+}
+
+/// Whether the registry is known to name another ELF for `program_id` than `measured_under` (see
+/// [`note_registry_elf_hash`]): a measurement made under it is not of the ELF a claim would prove.
+fn registry_elf_hash_superseded(program_id: B256, measured_under: B256) -> bool {
+    let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&program_id))
+        .is_some_and(|(current, _)| *current != measured_under)
+}
 
 /// What a read pinned at or after the block where we last saw our lock says about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19081,6 +19468,159 @@ mod r2_sizing_tests {
         );
     }
 
+    // E3: a pre-claim cache miss and a changed registry hash put the job back with no job strike;
+    // only the remaining failures strike the job, and drop it at the limit.
+    #[test]
+    fn preclaim_elf_action_strikes_the_job_only_for_other_failures() {
+        let not_called = || -> u32 { panic!("a job strike for a cache miss or a changed hash") };
+        assert_eq!(
+            preclaim_elf_action(&Ok(vec![1]), not_called),
+            PreclaimElfAction::Claim
+        );
+        assert_eq!(
+            preclaim_elf_action(&Err(ElfNotCached.into()), not_called),
+            PreclaimElfAction::RequeuePrefetch
+        );
+        assert_eq!(
+            preclaim_elf_action(&Err(ElfHashChanged(B256::ZERO).into()), not_called),
+            PreclaimElfAction::Remeasure
+        );
+        // Wrapped in context, as the timeout and download errors are.
+        let wrapped: Result<Vec<u8>> = Err(anyhow::Error::from(ElfNotCached).context("pre-claim"));
+        assert_eq!(
+            preclaim_elf_action(&wrapped, not_called),
+            PreclaimElfAction::RequeuePrefetch
+        );
+        let other = || Err(anyhow::anyhow!("cache read failed"));
+        assert_eq!(
+            preclaim_elf_action(&other(), || 1),
+            PreclaimElfAction::RequeueStrike
+        );
+        assert_eq!(
+            preclaim_elf_action(&other(), || MAX_PRECLAIM_ELF_FAILURES - 1),
+            PreclaimElfAction::RequeueStrike
+        );
+        assert_eq!(
+            preclaim_elf_action(&other(), || MAX_PRECLAIM_ELF_FAILURES),
+            PreclaimElfAction::Drop
+        );
+    }
+
+    #[test]
+    fn program_elf_strikes_back_off_and_mark_the_program_at_three() {
+        let secs: Vec<u64> = (1..=7).map(|k| program_elf_backoff(k).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 1800, 1800]);
+
+        let prog = keccak256(b"e3-program-strikes");
+        assert!(try_begin_elf_prefetch(prog).is_some());
+        assert_eq!(note_program_elf_strike(prog), 1);
+        assert!(program_elf_backing_off(prog));
+        assert!(!program_has_no_elf_source(prog));
+        // Backing off: no new fetch until the wait is over.
+        assert!(try_begin_elf_prefetch(prog).is_none());
+        assert_eq!(note_program_elf_strike(prog), 2);
+        assert!(!program_has_no_elf_source(prog));
+        assert_eq!(note_program_elf_strike(prog), MAX_PROGRAM_ELF_STRIKES);
+        assert!(program_has_no_elf_source(prog));
+
+        // A success clears the strikes.
+        let healed = keccak256(b"e3-program-heals");
+        note_program_elf_strike(healed);
+        clear_program_elf_strikes(healed);
+        assert!(!program_elf_backing_off(healed));
+        assert_eq!(note_program_elf_strike(healed), 1);
+    }
+
+    #[test]
+    fn elf_prefetches_are_shared_per_program_and_bounded() {
+        let (a, b, c) = (
+            keccak256(b"e3-prefetch-a"),
+            keccak256(b"e3-prefetch-b"),
+            keccak256(b"e3-prefetch-c"),
+        );
+        let slot_a = try_begin_elf_prefetch(a).expect("first fetch of a");
+        // Jobs of one program share its fetch.
+        assert!(try_begin_elf_prefetch(a).is_none());
+        let _slot_b = try_begin_elf_prefetch(b).expect("first fetch of b");
+        // At most MAX_ELF_PREFETCHES at once.
+        assert_eq!(MAX_ELF_PREFETCHES, 2);
+        assert!(try_begin_elf_prefetch(c).is_none());
+        drop(slot_a);
+        assert!(try_begin_elf_prefetch(c).is_some());
+    }
+
+    #[test]
+    fn an_sp1_measurement_under_a_replaced_registry_hash_is_unmeasured() {
+        let (measured, desc_input) = fresh();
+        let prog = keccak256(b"e3-sp1-churn");
+        let desc = keccak256(b"e3-sp1-churn-desc");
+        let ih = keccak256(b"e3-sp1-churn-input");
+        insert_desc_input(&desc_input, desc, ih);
+        let (h1, h2, h3) = (
+            keccak256(b"elf-1"),
+            keccak256(b"elf-2"),
+            keccak256(b"elf-3"),
+        );
+
+        // SP1 stores the registry hash it was measured under, not a verified risc0 hash.
+        insert_measurement(
+            &measured,
+            "sp1",
+            NO_PO2,
+            prog,
+            ih,
+            5_000,
+            7,
+            Some(h1),
+            None,
+            0,
+        );
+        let r = resolve_measured_at(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc).unwrap();
+        assert_eq!((r.verified_elf_hash, r.registry_elf_hash), (None, Some(h1)));
+        assert!(!registry_elf_hash_superseded(prog, h1));
+
+        // The registry now names H2: one change, and the job is unmeasured.
+        assert_eq!(note_registry_elf_hash(prog, h2), 1);
+        assert!(registry_elf_hash_superseded(prog, h1));
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            None
+        );
+        assert!(measured.lock().unwrap().is_empty());
+        // Measured again under H2, it sizes the job.
+        insert_measurement(
+            &measured,
+            "sp1",
+            NO_PO2,
+            prog,
+            ih,
+            6_000,
+            7,
+            Some(h2),
+            None,
+            0,
+        );
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            Some(6_000)
+        );
+
+        // Seen again at a sibling job: not another change.
+        assert_eq!(note_registry_elf_hash(prog, h2), 1);
+        assert!(!program_has_no_elf_source(prog));
+        assert_eq!(note_registry_elf_hash(prog, h3), 2);
+        assert!(!program_has_no_elf_source(prog));
+        // More than two changes in an hour: the program is skipped.
+        assert_eq!(note_registry_elf_hash(prog, h2), 3);
+        assert!(program_has_no_elf_source(prog));
+
+        // risc0 stores its hash as the verified one, and never as a registry hash.
+        let r0prog = keccak256(b"e3-risc0");
+        insert_measurement(&measured, "risc0", R0, r0prog, ih, 1, 0, Some(h1), None, 0);
+        let r = resolve_measured_at(&measured, &desc_input, "risc0", &[R0], r0prog, desc).unwrap();
+        assert_eq!((r.verified_elf_hash, r.registry_elf_hash), (Some(h1), None));
+    }
+
     // A later cycle-only write to the SAME (program, input) replaces the whole entry, so a stale hash
     // can never outlive the measurement it belonged to.
     #[test]
@@ -19448,6 +19988,7 @@ mod r2_sizing_tests {
                 peak_host_bytes: 0,
                 retry_after: Some(std::time::Instant::now() - Duration::from_secs(1)),
                 verified_elf_hash: None,
+                registry_elf_hash: None,
                 journal: None,
                 execute_secs: 0,
             },
@@ -19549,6 +20090,7 @@ mod r2_sizing_tests {
             peak_host_bytes: cycles / 1000,
             retry_after: None,
             verified_elf_hash: hash,
+            registry_elf_hash: None,
             journal: journal.map(std::sync::Arc::from),
             execute_secs: secs,
         }
