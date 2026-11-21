@@ -49,7 +49,7 @@ fn random_b256(rng: &mut impl Rng) -> B256 {
 
 fn seed_state(state: &mut zkminer_tui::state::MinerState) {
     state.address = format!("{}", mock_address());
-    state.connected = true;
+    state.last_refresh = Some(chrono::Utc::now());
     state.block_number = START_BLOCK;
     state.eth_balance = INITIAL_ETH;
     state.hemi_balance = INITIAL_HEMI.saturating_sub(INITIAL_STAKE);

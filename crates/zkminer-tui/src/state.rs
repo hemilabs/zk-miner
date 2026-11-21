@@ -690,7 +690,6 @@ pub struct MinerState {
     /// The slash latch while it is tripped (what tripped it, and when): no new claims until
     /// `zkminer resume-claims`. `None` when claims are allowed.
     pub claims_latched: Option<String>,
-    pub connected: bool,
     pub block_number: u64,
     pub errors: Vec<String>,
 
@@ -1190,7 +1189,6 @@ impl Default for MinerState {
             release_margin_secs: 0,
             keep_horizon_secs: 0,
             claims_latched: None,
-            connected: false,
             block_number: 0,
             errors: Vec::new(),
             rpc_total: 0,
@@ -1230,6 +1228,50 @@ impl TuiContext {
     pub fn with_client(mut self, client: zkminer_chain::client::ChainClient) -> Self {
         self.chain_client = Some(client);
         self
+    }
+}
+
+/// How fresh the chain data is, for the connection badges: from the age of the last successful
+/// state refresh (`MinerState::last_refresh`), so a lost RPC shows as lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainLink {
+    /// Read within [`CHAIN_UP_SECS`].
+    Up,
+    /// Last read this many seconds ago, within [`CHAIN_DOWN_SECS`].
+    Stale(u64),
+    /// Never read, or not for [`CHAIN_DOWN_SECS`].
+    Down,
+}
+
+/// A refresh younger than this is current (two refresh periods).
+pub const CHAIN_UP_SECS: u64 = 30;
+/// A refresh older than this is a lost chain.
+pub const CHAIN_DOWN_SECS: u64 = 120;
+
+impl ChainLink {
+    /// The link for a last refresh at `last`, seen at `now`.
+    pub fn of(
+        last: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let Some(last) = last else {
+            return ChainLink::Down;
+        };
+        let age = (now - last).num_seconds().max(0) as u64;
+        if age < CHAIN_UP_SECS {
+            ChainLink::Up
+        } else if age < CHAIN_DOWN_SECS {
+            ChainLink::Stale(age)
+        } else {
+            ChainLink::Down
+        }
+    }
+}
+
+impl MinerState {
+    /// The chain link now (`ChainLink::of` the last refresh).
+    pub fn chain_link(&self) -> ChainLink {
+        ChainLink::of(self.last_refresh, chrono::Utc::now())
     }
 }
 
@@ -1574,6 +1616,22 @@ pub type SharedState = Arc<RwLock<MinerState>>;
 
 pub fn new_shared_state() -> SharedState {
     Arc::new(RwLock::new(MinerState::default()))
+}
+
+#[cfg(test)]
+mod chain_link_tests {
+    use super::ChainLink;
+
+    #[test]
+    fn the_badge_follows_the_age_of_the_last_refresh() {
+        let now = chrono::Utc::now();
+        let ago = |s: i64| Some(now - chrono::Duration::seconds(s));
+        assert_eq!(ChainLink::of(ago(5), now), ChainLink::Up);
+        assert_eq!(ChainLink::of(ago(45), now), ChainLink::Stale(45));
+        assert_eq!(ChainLink::of(ago(119), now), ChainLink::Stale(119));
+        assert_eq!(ChainLink::of(ago(120), now), ChainLink::Down);
+        assert_eq!(ChainLink::of(None, now), ChainLink::Down);
+    }
 }
 
 #[cfg(test)]

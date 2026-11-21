@@ -37,6 +37,9 @@ mod segment_disk;
 /// The slash latch: after a slash, no new claims until `zkminer resume-claims` (review r6 M6-1).
 pub(crate) mod slash_latch;
 
+/// Pages when the chain is lost while locks are held (review r6 D2).
+mod chain_watch;
+
 /// A miner run as root: a `PAGE:` on a bare host (review r4 LD2).
 #[cfg(target_os = "linux")]
 pub(crate) mod privilege;
@@ -4242,7 +4245,6 @@ pub async fn run(
         s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(true);
 
         s.address = format!("{}", client.address);
-        s.connected = true;
         s.chain_id = config.chain.chain_id;
         if let Some(banner) = config.dev_mode_banner() {
             s.dev_private_network = true;
@@ -4758,6 +4760,9 @@ pub async fn run(
         )
         .await;
     });
+    // Chain-loss pages and the outage worker recycle; nothing to watch in a watch-only run.
+    let watch_handle = (!watch_only())
+        .then(|| chain_watch::spawn(state.clone(), journal.clone()));
 
     // Escalating shutdown. Each signal advances one stage:
     //   1st -> DRAIN   : stop claiming, let in-flight proofs FINISH and fulfil.
@@ -6090,6 +6095,9 @@ pub async fn run(
     brain_handle.abort();
     refresh_handle.abort();
     hw_handle.abort();
+    if let Some(h) = watch_handle {
+        h.abort();
+    }
 
     // Close the dashboard, then print what the shutdown reported on it, so the verdict stays in
     // the terminal's scrollback.
@@ -9158,8 +9166,11 @@ async fn miner_brain(
                     last_rpc_backoff_warn = Some(now);
                     tracing::warn!(
                         "Pausing claims — collateral/state data is stale (last refresh >{}s ago); \
-                         RPC or the state-refresh read may be failing. In-flight jobs unaffected.",
-                        CLAIM_FRESHNESS_MAX.as_secs()
+                         RPC or the state-refresh read may be failing. If the RPC is unreachable, \
+                         held locks can be neither fulfilled nor released either (PAGE: \
+                         CHAIN-UNREACHABLE once that lasts {}s with locks held).",
+                        CLAIM_FRESHNESS_MAX.as_secs(),
+                        chain_watch::UNREACHABLE_AFTER.as_secs()
                     );
                 }
                 publish_claim_hold(

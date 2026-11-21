@@ -867,6 +867,11 @@ Worth knowing:
 - **`PAGE:` lines need a human.** They say claiming has stopped (the deployment or proof
   system failed its check, the protocol is paused, the clock is off, funds are short) or a
   lock is at risk. The dashboard shows them; headless, they go to stderr.
+  `PAGE: CHAIN-UNREACHABLE` says no chain read has succeeded for a minute while locks are held
+  (repeated every 5 minutes): fulfils and releases go through the same RPC, so the locks can be
+  neither proven nor given back until it returns. `PAGE: LOCK-AT-RISK <job>` follows for each lock
+  whose cutoff comes inside its release margin meanwhile. The dashboard's link badge shows the age
+  of the last chain read (`STALE`, then `DISCONNECTED` after 2 minutes).
   `PAGE: ESTIMATE-OVERRUN <card>` says jobs claimed on that card's benchmark rate overran their
   cutoff (a release penalty each) after its learned rate had refused them: the card is proving
   slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
