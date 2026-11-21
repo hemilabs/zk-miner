@@ -659,7 +659,7 @@ static PACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::n
 static TURNS_TAKEN: std::sync::Mutex<Vec<(std::thread::ThreadId, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// The turns this thread took (tests).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn turns_taken() -> usize {
     let me = std::thread::current().id();
     let t = TURNS_TAKEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1047,6 +1047,28 @@ fn at_once(e: io::Error) -> ProbeOutcome {
     }
 }
 
+/// How a probe's socket ended once `poll` reported `revents` on it, from its pending error (read
+/// first: `SO_ERROR`), whether it is connected, and how many error-queue entries were read: an
+/// error is how it ended; connected is an answer; no error with an ICMP error queued is Linux's
+/// soft error (the connection goes on: not ended, how it ends decides); neither is a failure.
+#[cfg(unix)]
+fn socket_end(
+    error: io::Result<Option<io::Error>>,
+    connected: bool,
+    queued: usize,
+    revents: libc::c_short,
+) -> Option<ProbeOutcome> {
+    match error {
+        Err(e) => Some(ProbeOutcome::Failed(e.to_string())),
+        Ok(Some(e)) => Some(ended(&e)),
+        Ok(None) if connected => Some(ProbeOutcome::Connected),
+        Ok(None) if queued > 0 => None,
+        Ok(None) => Some(ProbeOutcome::Failed(format!(
+            "the socket reported {revents:#x} with neither an error nor a connection"
+        ))),
+    }
+}
+
 /// One probe of a round.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 struct Probe {
@@ -1112,17 +1134,7 @@ impl Probe {
         let queued = self.read_errqueue();
         #[cfg(target_os = "macos")]
         let queued = 0;
-        self.end = match error {
-            Err(e) => Some(ProbeOutcome::Failed(e.to_string())),
-            Ok(Some(e)) => Some(ended(&e)),
-            Ok(None) if self.sock.peer_addr().is_ok() => Some(ProbeOutcome::Connected),
-            // An ICMP error queued while the connection goes on (Linux's soft error): how it
-            // ends decides.
-            Ok(None) if queued > 0 => None,
-            Ok(None) => Some(ProbeOutcome::Failed(format!(
-                "the socket reported {revents:#x} with neither an error nor a connection"
-            ))),
-        };
+        self.end = socket_end(error, self.sock.peer_addr().is_ok(), queued, revents);
     }
 
     /// Linux: every ICMP error queued for the probe (`MSG_ERRQUEUE`), kept when it is an ICMP
@@ -1727,6 +1739,21 @@ mod tests {
         assert!(!decided(D4, 2, &[(2, None), (3, None), (4, None)]));
     }
 
+    /// A probe's socket: its error is how it ended, connected is an answer (whatever was
+    /// queued), and an ICMP error queued while the connection goes on (Linux's soft error) ends
+    /// nothing; a hang-up with neither is a failure, never an unreachable.
+    #[cfg(unix)]
+    #[test]
+    fn a_soft_icmp_error_ends_no_probe() {
+        let e = |n: i32| Ok(Some(io::Error::from_raw_os_error(n)));
+        assert_eq!(socket_end(e(libc::EHOSTUNREACH), false, 1, libc::POLLERR), Some(ProbeOutcome::Unreachable));
+        assert_eq!(socket_end(e(libc::ECONNREFUSED), false, 0, libc::POLLERR), Some(ProbeOutcome::Refused));
+        assert_eq!(socket_end(Ok(None), true, 1, libc::POLLOUT | libc::POLLERR), Some(ProbeOutcome::Connected));
+        assert_eq!(socket_end(Ok(None), false, 1, libc::POLLERR), None, "soft error: not ended");
+        assert!(matches!(socket_end(Ok(None), false, 0, libc::POLLHUP), Some(ProbeOutcome::Failed(_))));
+        assert!(matches!(socket_end(Err(io::Error::other("x")), false, 0, 0), Some(ProbeOutcome::Failed(_))));
+    }
+
     /// The decision's rounds, staged: the first that decides ends it; a second round follows one
     /// that decided nothing; out of time or a round that cannot be sent is refused, never far.
     #[test]
@@ -1994,6 +2021,53 @@ mod tests {
             .unwrap();
         assert!(obs[0].local.is_some_and(|a| a.is_ipv4()), "{obs:?}");
         assert!(matches!(decide(&TtlProbe, local, 2), Verdict::Near(_)));
+    }
+
+    /// Linux: an error-queue message is read as the ICMP error it holds only when its origin is
+    /// ICMP of the probe's family and the control message holds the whole extended error and the
+    /// offender's address.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn linux_an_error_queue_entry_is_read_only_when_whole() {
+        let build = |origin: u8, v6: bool, short: bool| -> Option<(u8, u8, IpAddr)> {
+            let mut cbuf = [0u64; 64];
+            let (level, kind, alen) = if v6 {
+                (libc::IPPROTO_IPV6, libc::IPV6_RECVERR, std::mem::size_of::<libc::sockaddr_in6>())
+            } else {
+                (libc::IPPROTO_IP, libc::IP_RECVERR, std::mem::size_of::<libc::sockaddr_in>())
+            };
+            let full = std::mem::size_of::<libc::sock_extended_err>() + alen;
+            // SAFETY: a zeroed msghdr over our buffer; the CMSG macros stay within it.
+            unsafe {
+                let mut m: libc::msghdr = std::mem::zeroed();
+                m.msg_control = cbuf.as_mut_ptr().cast();
+                m.msg_controllen = libc::CMSG_SPACE(full as u32) as _;
+                let c = libc::CMSG_FIRSTHDR(&m);
+                (*c).cmsg_level = level;
+                (*c).cmsg_type = kind;
+                (*c).cmsg_len = libc::CMSG_LEN(if short { full as u32 - 4 } else { full as u32 }) as _;
+                let e = libc::CMSG_DATA(c) as *mut libc::sock_extended_err;
+                (*e).ee_origin = origin;
+                (*e).ee_type = if v6 { 3 } else { 11 };
+                (*e).ee_code = 0;
+                let off = e.add(1) as *mut u8;
+                if v6 {
+                    let a = &mut *(off as *mut libc::sockaddr_in6);
+                    a.sin6_family = libc::AF_INET6 as _;
+                    a.sin6_addr.s6_addr = "2001:db8::99".parse::<std::net::Ipv6Addr>().unwrap().octets();
+                } else {
+                    let a = &mut *(off as *mut libc::sockaddr_in);
+                    a.sin_family = libc::AF_INET as _;
+                    a.sin_addr.s_addr = u32::from_ne_bytes([198, 51, 100, 1]);
+                }
+                errqueue_entry(&m, v6)
+            }
+        };
+        assert_eq!(build(libc::SO_EE_ORIGIN_ICMP, false, false), Some((11, 0, R4)));
+        assert_eq!(build(libc::SO_EE_ORIGIN_ICMP6, true, false), Some((3, 0, R6)));
+        assert_eq!(build(libc::SO_EE_ORIGIN_LOCAL, false, false), None, "a local error");
+        assert_eq!(build(libc::SO_EE_ORIGIN_ICMP6, false, false), None, "ICMPv6 on IPv4");
+        assert_eq!(build(libc::SO_EE_ORIGIN_ICMP, false, true), None, "cut short");
     }
 
     /// macOS: the initial sequence number is read only from enough bytes, in `SYN_SENT`, and
