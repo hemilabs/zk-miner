@@ -794,24 +794,23 @@ fn prepare_low_dirs(local: &Path, home: &Path) -> Result<Vec<(&'static str, Path
     Ok(dirs)
 }
 
-/// [`prepare_low_dirs`] in this user's profile, done once it has succeeded (a failure is tried
-/// again at the next Low worker).
-fn low_dirs() -> Result<Vec<(&'static str, PathBuf)>, String> {
-    static DIRS: Mutex<Option<Vec<(&'static str, PathBuf)>>> = Mutex::new(None);
-    let mut done = DIRS.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(dirs) = &*done {
-        return Ok(dirs.clone());
+/// [`prepare_low_dirs`] for the next Low worker: in this user's profile, or below `root` (tests).
+/// Done again before every Low worker, not once per process: a Low worker can delete any of these
+/// directories or put a file or a link in its place, and the next one must not inherit that.
+fn low_dirs(root: Option<&Path>) -> Result<Vec<(&'static str, PathBuf)>, String> {
+    match root {
+        Some(root) => prepare_low_dirs(&root.join("local"), &root.join("home")),
+        None => {
+            let local = dirs::data_local_dir().ok_or("no local application data directory")?;
+            let home = dirs::home_dir().ok_or("no home directory")?;
+            prepare_low_dirs(&local, &home)
+        }
     }
-    let local = dirs::data_local_dir().ok_or("no local application data directory")?;
-    let home = dirs::home_dir().ok_or("no home directory")?;
-    let dirs = prepare_low_dirs(&local, &home)?;
-    *done = Some(dirs.clone());
-    Ok(dirs)
 }
 
 /// For `zkminer doctor`, read only: the Low directories ([`prepare_low_dirs`]) that are a file or a
 /// link, not a directory. Only a Low process (or the operator) puts one there; the miner replaces
-/// it with a directory before its next Low worker.
+/// it with a directory before each Low worker it starts.
 pub fn low_dirs_tampered() -> Vec<String> {
     let (Some(local), Some(home)) = (dirs::data_local_dir(), dirs::home_dir()) else {
         return Vec::new();
@@ -829,9 +828,9 @@ pub fn low_dirs_tampered() -> Vec<String> {
 }
 
 /// Directories a worker is pointed at by its environment that it writes (the witness proofs'
-/// segment directory, an operator's SP1 queue directory): labelled once each.
+/// segment directory, an operator's SP1 queue directory): made and labelled before every Low
+/// worker, as [`low_dirs`] are (one a Low worker deleted is made again; a link there is refused).
 fn label_env_dirs(env: &[(OsString, OsString)]) -> Result<(), String> {
-    static DONE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
     let written = [
         zkminer_prover_protocol::types::WITNESS_SEGMENT_DIR_ENV,
         "SP1_GROTH16_QUEUE_DIR",
@@ -841,12 +840,7 @@ fn label_env_dirs(env: &[(OsString, OsString)]) -> Result<(), String> {
             continue;
         }
         let dir = PathBuf::from(v);
-        let mut done = DONE.lock().unwrap_or_else(|p| p.into_inner());
-        if done.contains(&dir) {
-            continue;
-        }
         label_low_writable(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        done.insert(dir);
     }
     Ok(())
 }
@@ -946,17 +940,15 @@ pub(crate) fn spawn_worker(
     let test_root: Option<PathBuf> = None;
     let low = low_il_workers() || test_root.is_some();
     if low {
-        let dirs = match &test_root {
-            Some(root) => prepare_low_dirs(&root.join("local"), &root.join("home")),
-            None => low_dirs(),
-        }
-        .and_then(|dirs| label_env_dirs(&env).map(|()| dirs))
-        .map_err(|e| {
-            let why =
-                format!("the directories a Low-integrity worker writes could not be prepared: {e}");
-            low_il_worker_failed(backend, &why);
-            io::Error::other(why)
-        })?;
+        let dirs = low_dirs(test_root.as_deref())
+            .and_then(|dirs| label_env_dirs(&env).map(|()| dirs))
+            .map_err(|e| {
+                let why = format!(
+                    "the directories a Low-integrity worker writes could not be prepared: {e}"
+                );
+                low_il_worker_failed(backend, &why);
+                io::Error::other(why)
+            })?;
         // Last, so they win over the miner's own: a Low process cannot write those.
         env.extend(
             dirs.iter()
@@ -2017,6 +2009,39 @@ mod tests {
         assert!(status.success(), "{status:?}\n{out}");
         assert!(out.contains("WRITE_LOW Ok(())"), "{out}");
         assert!(out.contains("WRITE_MEDIUM Err(Some(5))"), "{out}");
+    }
+
+    /// What a Low worker broke in the Low directories after one started (a file where `tmp` goes,
+    /// `risc0-segments` deleted) is repaired before the next one, not left for the rest of the run.
+    #[test]
+    fn low_dirs_are_repaired_before_every_low_worker() {
+        let root = std::env::temp_dir().join(format!("zkminer-low-respawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let whoami = system.join("System32").join("whoami.exe");
+        let env: Vec<(OsString, OsString)> = vec![("SystemRoot".into(), system.into())];
+        TEST_LOW_ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
+        let spawn_once = || {
+            let mut child = spawn_worker("risc0", &whoami, env.clone()).unwrap();
+            assert!(child.is_low_integrity());
+            let _ = child.wait();
+        };
+        spawn_once();
+        let tmp = root
+            .join("local")
+            .join("zkminer")
+            .join("worker")
+            .join("tmp");
+        let segments = root.join("home").join(".zkminer").join("risc0-segments");
+        assert!(tmp.is_dir() && segments.is_dir());
+        std::fs::remove_dir_all(&tmp).unwrap();
+        std::fs::write(&tmp, b"planted").unwrap();
+        std::fs::remove_dir_all(&segments).unwrap();
+        spawn_once();
+        TEST_LOW_ROOT.with(|r| *r.borrow_mut() = None);
+        let repaired = [tmp.is_dir(), segments.is_dir()];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(repaired, [true, true], "tmp, risc0-segments");
     }
 
     /// LocalSystem, LocalService and NetworkService are refused whatever their admin state, and so
