@@ -1132,6 +1132,11 @@ pub fn sp1_groth16_queue_dir(home: &std::path::Path) -> std::path::PathBuf {
 /// a worker will run, to check that the card can run its GPU code.
 pub const SP1_SERVER_INSTALL_ENV: &str = "ZKMINER_SP1_SERVER_INSTALL";
 
+/// The SP1 worker's argument to install the `sp1-gpu-server` shipped beside it and exit (0 when it
+/// is installed or there is nothing to install), speaking no IPC and starting no GPU. The Windows
+/// miner runs it before the worker's first Low-integrity start, which cannot write `~/.sp1/bin`.
+pub const INSTALL_BUNDLED_SERVER_ARG: &str = "--install-bundled-server";
+
 /// Host budget the STOCK SP1 defaults are assumed to need.
 ///
 /// A lower bound turned into a working figure. The defaults were measured dying at 25.0 GiB against

@@ -804,6 +804,15 @@ Worth knowing:
   the miner's account is refused or elevated, and when the key's variable is kept in the
   machine's, a service's or the user's environment; the miner's start-up pages both.
 
+  `ZKMINER_WINDOWS_LOW_IL_WORKERS=1` (off by default, as not every GPU runtime is known to work
+  there) runs the workers at Low integrity: they can then read neither the key file, `.env` nor
+  the job journal, open neither the miner nor each other but to see and end them, and write only
+  where Low processes may (their temporary, cache and segment directories). It fails closed: a
+  worker that cannot start at Low is never started at Medium instead; its slot proves nothing,
+  with `PAGE: LOW-IL-WORKER-FAILED`, and the miner tries it again at Low with back-off. If a
+  zkVM works on your card only at Medium, leave the flag unset. The SP1 server is installed into
+  `~/.sp1/bin` by the miner itself before its first Low SP1 worker.
+
   Moving from LocalSystem: stop the old service with `zkminer stop --wait` run as LocalSystem
   (`psexec -s`; its home was `C:\Windows\System32\config\systemprofile\.zkminer`) so it finishes
   or releases its locks, then change the account. A miner started in the new account's home does
