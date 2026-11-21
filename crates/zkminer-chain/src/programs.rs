@@ -448,6 +448,23 @@ impl ElfCache {
     /// is a verifying key rather than the ELF hash, and the registry URI was
     /// not consulted yet).
     pub fn get(&self, program_id: &B256, expected_content_hash: Option<B256>) -> Option<Vec<u8>> {
+        self.read(program_id, expected_content_hash, true)
+    }
+
+    /// [`Self::get`], except that bytes not matching `expected_content_hash` are a miss and stay
+    /// cached: for a hash someone else can change at will (a registry `elf_hash`), where the bytes
+    /// on disk were verified under the hash before and may be named again. A download that matches
+    /// the new hash replaces them ([`Self::put`] writes atomically).
+    pub fn get_keeping(&self, program_id: &B256, expected_content_hash: B256) -> Option<Vec<u8>> {
+        self.read(program_id, Some(expected_content_hash), false)
+    }
+
+    fn read(
+        &self,
+        program_id: &B256,
+        expected_content_hash: Option<B256>,
+        purge_mismatch: bool,
+    ) -> Option<Vec<u8>> {
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         let bytes = std::fs::read(&path).ok()?;
         // Nothing caches an empty ELF: an empty entry is a torn write (a crash before writes were
@@ -458,6 +475,15 @@ impl ElfCache {
         }
         if let Some(expected) = expected_content_hash {
             let actual_hash = alloy::primitives::keccak256(&bytes);
+            if actual_hash != expected && !purge_mismatch {
+                tracing::debug!(
+                    "ELF cache miss for {}: cached {} is not the expected {} — kept",
+                    program_id,
+                    actual_hash,
+                    expected,
+                );
+                return None;
+            }
             if actual_hash != expected {
                 tracing::warn!(
                     "ELF cache miss for {}: hash mismatch (got {}, expected {}) — deleting corrupt entry",
@@ -909,6 +935,36 @@ mod security_tests {
         );
         assert_eq!(cache.get(&id, None), None, "entry is gone after the purge");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RP1: a read against a registry `elf_hash` that moved is a miss, but the bytes verified under
+    /// the earlier hash stay, so a change back to it does not download them again.
+    #[test]
+    fn cache_get_keeping_misses_on_a_mismatch_without_purging() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-elf-keep-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+        let id = B256::repeat_byte(0x7f);
+        let bytes = b"the-sp1-elf-under-h1".to_vec();
+        let h1 = alloy::primitives::keccak256(&bytes);
+        let h2 = B256::repeat_byte(0xee);
+        cache.put(&id, &bytes).unwrap();
+        assert_eq!(cache.get_keeping(&id, h2), None, "a mismatch is a miss");
+        assert!(
+            dir.join(format!("{id}.elf")).exists(),
+            "and the entry stays"
+        );
+        assert_eq!(
+            cache.get_keeping(&id, h1).as_deref(),
+            Some(bytes.as_slice())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
