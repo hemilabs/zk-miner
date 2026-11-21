@@ -571,6 +571,34 @@ impl std::fmt::Display for NoStorageUris {
 }
 impl std::error::Error for NoStorageUris {}
 
+/// No URI served bytes that hash to the expected `elf_hash`, and at least one served bytes that hash
+/// to something else. `served` holds those other hashes, so a caller can tell a registry `elf_hash`
+/// that changed before its new bytes were uploaded (the URIs still serve the old ones) from a URI
+/// that serves anything.
+#[derive(Debug, Clone)]
+pub struct ElfHashMismatch {
+    /// The whole-ELF keccak of each mismatching download, at most one per URI tried.
+    pub served: Vec<B256>,
+    message: String,
+}
+
+impl std::fmt::Display for ElfHashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ElfHashMismatch {}
+
+impl ElfHashMismatch {
+    /// The error for downloads that served the bytes hashing to `served`, described by `message`.
+    pub fn new(served: Vec<B256>, message: impl Into<String>) -> Self {
+        Self {
+            served,
+            message: message.into(),
+        }
+    }
+}
+
 /// Download an ELF binary from a list of storage URIs, through `fetcher`'s network guard.
 /// Tries each URI in order until one succeeds.
 pub async fn download_elf(
@@ -597,6 +625,8 @@ pub async fn download_elf(
 
     // Why the last URI tried failed, for the final error (the per-URI warnings say more).
     let mut last_failure: Option<String> = None;
+    // The hashes of the bytes served that were not `expected_hash` (see [`ElfHashMismatch`]).
+    let mut served_mismatch: Vec<B256> = Vec::new();
     for uri_info in uris.iter().take(MAX_ELF_URIS) {
         let url = match storage_url(uri_info) {
             Ok(Some(url)) => url,
@@ -708,6 +738,7 @@ pub async fn download_elf(
                                 actual
                             );
                             last_failure = Some("ELF hash mismatch".into());
+                            served_mismatch.push(actual);
                             continue;
                         }
                     }
@@ -735,13 +766,17 @@ pub async fn download_elf(
         }
     }
 
-    match last_failure {
-        Some(why) => bail!(
+    let message = match last_failure {
+        Some(why) => format!(
             "Failed to download ELF from any of {} URIs (last: {why})",
             uris.len()
         ),
-        None => bail!("Failed to download ELF from any of {} URIs", uris.len()),
+        None => format!("Failed to download ELF from any of {} URIs", uris.len()),
+    };
+    if served_mismatch.is_empty() {
+        bail!(message)
     }
+    Err(ElfHashMismatch::new(served_mismatch, message).into())
 }
 
 #[cfg(test)]
@@ -1132,12 +1167,19 @@ mod fetch_tests {
         .await
         .unwrap_err();
         assert!(format!("{e:#}").contains("ELF hash mismatch"), "{e:#}");
+        // The hash of what was served instead is carried, for a caller to recognise old bytes.
+        assert_eq!(
+            e.downcast_ref::<ElfHashMismatch>()
+                .map(|m| m.served.clone()),
+            Some(vec![good])
+        );
         let mut wrong_content = uri.clone();
         wrong_content.content_hash = B256::repeat_byte(2);
         let e = download_elf(&fetcher, &[wrong_content], None)
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("content hash mismatch"), "{e:#}");
+        assert!(e.downcast_ref::<ElfHashMismatch>().is_none());
         assert_eq!(hits(&server), 3);
     }
 
