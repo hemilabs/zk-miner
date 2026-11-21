@@ -568,6 +568,22 @@ fn main() -> Result<()> {
         );
     }
     let cli = Cli::parse();
+    // Windows: no mining as LocalSystem, LocalService or NetworkService (every worker, and so every
+    // requester's guest, would run as it too), unless the operator says so. See `windows_sandbox`.
+    #[cfg(windows)]
+    if matches!(cli.command, Commands::Run { .. }) {
+        use zkminer_prover::windows_sandbox as sandbox;
+        match sandbox::account_risk() {
+            Ok(risk) => {
+                if let Some(refusal) =
+                    sandbox::account_refusal(risk, sandbox::privileged_account_allowed())
+                {
+                    anyhow::bail!("{refusal}");
+                }
+            }
+            Err(e) => eprintln!("warning: could not tell which account the miner runs as ({e})"),
+        }
+    }
     // `--password-fd N` is taken now, while every open descriptor above 2 is one the caller passed:
     // once the runtime, the network guard or a connection has opened its own, a number the caller
     // did not open could name one of them (and reading it to the end would close it).

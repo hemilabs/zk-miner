@@ -3566,6 +3566,9 @@ pub async fn run(
             .flatten(),
         &JobJournal::default_path(),
     );
+    // Windows: a service account `main` was told to let through, or an elevated token, paged.
+    #[cfg(windows)]
+    zkminer_prover::windows_sandbox::page_account_risk();
     // Windows, an `env` key: a copy of its variable kept in the registry outlives its removal from
     // this process, readable there by every user of this PC (the machine's or a service's
     // environment) or by every process of this one (`setx`). Not a refusal: the key is out

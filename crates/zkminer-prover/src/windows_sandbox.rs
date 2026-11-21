@@ -21,6 +21,12 @@
 //!
 //! Without the flag a worker can still read every file of the user's, the key file and `.env`
 //! included (`zkminer doctor` says so).
+//!
+//! All of this assumes the miner runs as an ordinary user. As LocalSystem the lock-down grants
+//! every worker everything (its DACL grants SYSTEM all rights), and as LocalService or
+//! NetworkService a worker reaches every other service run as that account; so `zkminer run`
+//! refuses these accounts unless [`ALLOW_PRIVILEGED_ACCOUNT_ENV`] is set, and pages an elevated
+//! token ([`account_refusal`], [`page_account_risk`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_void, OsStr, OsString};
@@ -211,6 +217,13 @@ extern "system" {
         new_token: *mut Handle,
     ) -> i32;
     fn SetTokenInformation(token: Handle, class: i32, info: *const c_void, length: u32) -> i32;
+    fn GetTokenInformation(
+        token: Handle,
+        class: i32,
+        info: *mut c_void,
+        length: u32,
+        returned: *mut u32,
+    ) -> i32;
     fn CreateProcessAsUserW(
         token: Handle,
         application: *const u16,
@@ -377,6 +390,109 @@ fn lock_running_threads(descriptor: *mut c_void) -> io::Result<()> {
             more = Thread32Next(snapshot.as_raw_handle(), &mut entry) != 0;
         }
         failed.map_or(Ok(()), Err)
+    }
+}
+
+/// Set to `1` to let `zkminer run` start as LocalSystem, LocalService or NetworkService anyway
+/// ([`account_refusal`]). Its workers then run as that account: a requester's guest that breaks
+/// out of one has that account's rights, and the lock-down above keeps no worker out of the miner.
+pub const ALLOW_PRIVILEGED_ACCOUNT_ENV: &str = "ZKMINER_DANGEROUSLY_ALLOW_PRIVILEGED_ACCOUNT";
+
+/// Why the account the miner runs as is a bad one for running requesters' guests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountRisk {
+    /// LocalSystem, LocalService or NetworkService (named). Under LocalSystem a worker is the
+    /// whole machine, and the lock-down's DACL, which grants SYSTEM everything, grants it to every
+    /// worker too; the other two are shared with other services, which a worker would reach.
+    ServiceAccount(&'static str),
+    /// A token with administrator rights (an elevated console): so are the workers' tokens.
+    Elevated,
+}
+
+/// What a token whose user is `user_sid` (`S-1-5-…`), elevated or not, is: see [`AccountRisk`].
+pub fn classify_account(user_sid: &str, elevated: bool) -> Option<AccountRisk> {
+    match user_sid.trim().to_ascii_uppercase().as_str() {
+        "S-1-5-18" => Some(AccountRisk::ServiceAccount("LocalSystem")),
+        "S-1-5-19" => Some(AccountRisk::ServiceAccount("LocalService")),
+        "S-1-5-20" => Some(AccountRisk::ServiceAccount("NetworkService")),
+        _ if elevated => Some(AccountRisk::Elevated),
+        _ => None,
+    }
+}
+
+/// This process's [`AccountRisk`], from its token.
+pub fn account_risk() -> io::Result<Option<AccountRisk>> {
+    let user = zkminer_config::wallet::current_user_sid()?;
+    Ok(classify_account(&user, token_elevated()?))
+}
+
+/// Whether this process's token is elevated (`TokenElevation`).
+fn token_elevated() -> io::Result<bool> {
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: i32 = 20;
+    // SAFETY: plain advapi32 calls; the token is owned at once and `elevated` outlives the call.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = OwnedHandle::from_raw_handle(token);
+        // TOKEN_ELEVATION { DWORD TokenIsElevated }
+        let (mut elevated, mut returned) = (0u32, 0u32);
+        if GetTokenInformation(
+            token.as_raw_handle(),
+            TOKEN_ELEVATION,
+            (&mut elevated as *mut u32).cast(),
+            4,
+            &mut returned,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(elevated != 0)
+    }
+}
+
+/// Whether [`ALLOW_PRIVILEGED_ACCOUNT_ENV`] is `1`.
+pub fn privileged_account_allowed() -> bool {
+    std::env::var(ALLOW_PRIVILEGED_ACCOUNT_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
+/// Why `zkminer run` refuses to start as `risk`, or `None` if it starts: a service account
+/// (LocalSystem, LocalService, NetworkService) is refused unless `allowed`
+/// ([`ALLOW_PRIVILEGED_ACCOUNT_ENV`]); an elevated token is not refused ([`page_account_risk`]).
+pub fn account_refusal(risk: Option<AccountRisk>, allowed: bool) -> Option<String> {
+    match risk {
+        Some(AccountRisk::ServiceAccount(account)) if !allowed => Some(format!(
+            "refusing to run as {account}: every prover worker would run as {account} too, so a \
+             requester's guest program that broke out of one would have {account}'s rights, and \
+             no worker could be kept out of the miner (and its signing key). Run the miner as a \
+             dedicated standard user (README: Windows service). To run as {account} anyway, \
+             accepting that, set {ALLOW_PRIVILEGED_ACCOUNT_ENV}=1"
+        )),
+        _ => None,
+    }
+}
+
+/// For `zkminer run`, once logging is up: pages the operator of a service account it was allowed
+/// to start as, or of an elevated token, which it starts as anyway ([`account_refusal`]).
+pub fn page_account_risk() {
+    match account_risk() {
+        Ok(Some(AccountRisk::ServiceAccount(account))) => tracing::error!(
+            "PAGE: PRIVILEGED-ACCOUNT — the miner runs as {account} \
+             ({ALLOW_PRIVILEGED_ACCOUNT_ENV}=1): its prover workers run as {account}, a \
+             requester's guest that breaks out of one has {account}'s rights, and the miner's \
+             process lock-down cannot keep the workers out of the miner. Run it as a dedicated \
+             standard user (README: Windows service)"
+        ),
+        Ok(Some(AccountRisk::Elevated)) => tracing::error!(
+            "PAGE: ELEVATED — the miner runs with administrator rights (an elevated console): its \
+             prover workers do too, so a requester's guest that breaks out of one is an \
+             administrator of this PC. Run it from a console that is not elevated, or as a \
+             dedicated standard user"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("could not tell which account the miner runs as ({e})"),
     }
 }
 
@@ -1091,16 +1207,6 @@ mod tests {
         fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
         fn GetCurrentThreadId() -> u32;
     }
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn GetTokenInformation(
-            token: Handle,
-            class: i32,
-            info: *mut c_void,
-            length: u32,
-            returned: *mut u32,
-        ) -> i32;
-    }
     const PROCESS_VM_READ: u32 = 0x0010;
     const PROCESS_VM_WRITE: u32 = 0x0020;
     const PROCESS_CREATE_THREAD: u32 = 0x0002;
@@ -1424,6 +1530,43 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         assert!(!child.wait().unwrap().success());
+    }
+
+    /// LocalSystem, LocalService and NetworkService are refused whatever their elevation, unless
+    /// overridden, and the refusal names the override; an elevated user is not refused (it is
+    /// paged), nor is a standard one.
+    #[test]
+    fn service_accounts_are_refused_and_elevation_is_not() {
+        let user = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        for (sid, account) in [
+            ("S-1-5-18", "LocalSystem"),
+            ("s-1-5-19", "LocalService"),
+            ("S-1-5-20", "NetworkService"),
+        ] {
+            for elevated in [false, true] {
+                let risk = classify_account(sid, elevated);
+                assert_eq!(risk, Some(AccountRisk::ServiceAccount(account)), "{sid}");
+                let refusal = account_refusal(risk, false).expect("refused");
+                assert!(
+                    refusal.contains(account) && refusal.contains(ALLOW_PRIVILEGED_ACCOUNT_ENV),
+                    "{refusal}"
+                );
+                assert_eq!(account_refusal(risk, true), None);
+            }
+        }
+        // Not to be confused with a domain or local account that merely starts the same way.
+        assert_eq!(classify_account("S-1-5-180", false), None);
+        assert_eq!(classify_account(user, true), Some(AccountRisk::Elevated));
+        assert_eq!(account_refusal(Some(AccountRisk::Elevated), false), None);
+        assert_eq!(classify_account(user, false), None);
+        assert_eq!(account_refusal(None, false), None);
+        // This process: a standard or elevated account, never refused (tests do not run as a
+        // service account).
+        let here = account_risk().unwrap();
+        assert!(
+            matches!(here, None | Some(AccountRisk::Elevated)),
+            "{here:?}"
+        );
     }
 
     #[test]
