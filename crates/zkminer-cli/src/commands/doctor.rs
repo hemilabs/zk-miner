@@ -145,8 +145,53 @@ fn key_on_disk_warning(
     })
 }
 
+/// Windows, an `env` key source: what to say of each copy of the key's variable kept in the
+/// registry (`zkminer_config::wallet_win`), given as (where, readable by every user of this PC).
+#[cfg(any(windows, test))]
+fn key_env_copy_findings(copies: &[(String, bool)]) -> Vec<(Level, String)> {
+    copies
+        .iter()
+        .map(|(place, machine_wide)| {
+            if *machine_wide {
+                (
+                    Level::Fail,
+                    format!(
+                        "{place} holds the key's variable: every user of this PC can read it \
+                         there, and so can any process of theirs, Low-integrity ones included. \
+                         Move the key to a key file only the miner's account can read \
+                         (key_source = \"file\"; README: Windows service), then delete that value"
+                    ),
+                )
+            } else {
+                (
+                    Level::Warn,
+                    format!(
+                        "{place} holds the key's variable (setx or System Properties): every \
+                         process of this user can read it there, Low-integrity workers included. \
+                         Move the key to a key file (key_source = \"file\"), then delete that \
+                         value"
+                    ),
+                )
+            }
+        })
+        .collect()
+}
+
 async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
     report.section("Chain and funds");
+    // Before the key is loaded: a copy kept in the registry is there whether or not this
+    // process was given the variable.
+    #[cfg(windows)]
+    if config.wallet.key_source == "env" {
+        let copies: Vec<(String, bool)> =
+            zkminer_config::wallet_win::persisted_key_env_copies(&config.wallet.key_env_var)
+                .into_iter()
+                .map(|c| (c.location, c.machine_wide))
+                .collect();
+        for (level, finding) in key_env_copy_findings(&copies) {
+            report.say(level, "key", finding);
+        }
+    }
     let signer = match zkminer_config::wallet::load_signer(&config.wallet) {
         Ok(s) => s,
         Err(e) => {
@@ -990,6 +1035,37 @@ mod tests {
         std::fs::write(home.0.join(".env"), "").unwrap();
         let w = key_on_disk_warning(&wallet, &home.0, false).unwrap();
         assert!(w.contains(".env, if it holds the key,"), "{w}");
+    }
+
+    /// Windows, an `env` key: a copy in the machine's or a service's environment fails (every user
+    /// reads it), one in the user's own environment warns, and each names where it is and what to
+    /// do instead.
+    #[test]
+    fn doctor_flags_a_key_kept_in_a_readable_environment() {
+        assert!(key_env_copy_findings(&[]).is_empty());
+        let found = key_env_copy_findings(&[
+            (
+                r"HKLM\SYSTEM\CurrentControlSet\Services\zkminer\Parameters (AppEnvironmentExtra)"
+                    .into(),
+                true,
+            ),
+            (r"HKCU\Environment (ZKMINER_PRIVATE_KEY)".into(), false),
+        ]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, Level::Fail);
+        assert!(
+            found[0].1.contains("AppEnvironmentExtra")
+                && found[0].1.contains("every user of this PC")
+                && found[0].1.contains("key file"),
+            "{}",
+            found[0].1
+        );
+        assert_eq!(found[1].0, Level::Warn);
+        assert!(
+            found[1].1.contains(r"HKCU\Environment") && found[1].1.contains("Low-integrity"),
+            "{}",
+            found[1].1
+        );
     }
 
     #[test]

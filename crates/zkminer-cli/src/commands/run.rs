@@ -3566,6 +3566,33 @@ pub async fn run(
             .flatten(),
         &JobJournal::default_path(),
     );
+    // Windows, an `env` key: a copy of its variable kept in the registry outlives its removal from
+    // this process, readable there by every user of this PC (the machine's or a service's
+    // environment) or by every process of this one (`setx`). Not a refusal: the key is out
+    // already, and refusing would only leave held locks undriven.
+    #[cfg(windows)]
+    if config.wallet.key_source == "env" {
+        for copy in
+            zkminer_config::wallet_win::persisted_key_env_copies(&config.wallet.key_env_var)
+        {
+            if copy.machine_wide {
+                tracing::error!(
+                    "PAGE: KEY-IN-MACHINE-ENVIRONMENT — {} holds the signing key's variable, \
+                     which every user of this PC can read; move the key to a key file only the \
+                     miner's account can read (key_source = \"file\", README: Windows service), \
+                     delete that value, and consider the key exposed",
+                    copy.location
+                );
+            } else {
+                tracing::warn!(
+                    "{} holds the signing key's variable, which every process of this user can \
+                     read, Low-integrity workers included; move the key to a key file \
+                     (key_source = \"file\") and delete that value",
+                    copy.location
+                );
+            }
+        }
+    }
     if let Some(banner) = config.dev_mode_banner() {
         tracing::warn!("{banner}");
     }
