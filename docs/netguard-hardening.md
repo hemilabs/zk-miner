@@ -694,8 +694,10 @@ that drops SYNs (and FINs) is now refused for want of evidence, never far.
 it: `Vetted` carries the far probe's local port and interface, and the guarded client's hops and
 the witness broker's connector make the connection with `Vetted::socket`, bound to the vetted
 source address and that port (`EADDRINUSE` fails the attempt; it is never made from another
-port), on that interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`, Linux `IP_UNICAST_IF` /
-`IPV6_UNICAST_IF`), and on Linux with `IPV6_AUTOFLOWLABEL` off on the probes and the connection.
+port), on that interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` /
+`IPV6_UNICAST_IF`, but measured on kernel 7.0 a TCP connect ignores them, and `SO_BINDTODEVICE`
+needs `CAP_NET_RAW`, so on Linux the source address, port and recheck pin the path; the IPv6
+option in host byte order failed with `EADDRNOTAVAIL`, found on the VM and fixed), and on Linux with `IPV6_AUTOFLOWLABEL` off on the probes and the connection.
 `recheck_connected` also checks the port. The connection is made right after the verdict.
 
 **The far cache is dropped** (`FAR_TTL` 10 s, the single-flight `decide_remembered` and the facts'

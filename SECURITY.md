@@ -202,7 +202,9 @@ Every connection a requester can cause goes through one guard
   **The connection that follows** is pinned to the probe that found the far evidence: it is
   made from the same source address and the same local port (a port another socket holds then
   fails the attempt; it is never made from another port), on the same interface (macOS
-  `IP_BOUND_IF` / `IPV6_BOUND_IF`, Linux `IP_UNICAST_IF` / `IPV6_UNICAST_IF`), and on Linux
+  `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, which a TCP
+  connect does not follow there, measured on kernel 7.0, so on Linux the source address, the port
+  and the check once connected pin the path), and on Linux
   with the IPv6 flow label fixed (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), so
   a per-connection load balancer hashes it as it hashed the probe; the check once connected
   also checks the port. A far verdict is not remembered for other connections: it belongs to
