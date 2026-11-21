@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 mod commands;
 mod journal;
+mod logging;
 
 /// Forwards each WARN/ERROR event whose message starts with `PAGE` to the dashboard's log (see
 /// `commands::run::note_page`).
@@ -51,8 +52,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show prover status (balance, stake, stats)
-    Status,
+    /// Show prover status (held locks, recent pages, balance, stake, stats). Exits 2 while a page
+    /// is unacknowledged or locks are held with no miner running to drive them.
+    Status {
+        /// Acknowledge the pages shown (`~/.zkminer/logs/pages.log`): they no longer make the
+        /// exit code 2
+        #[arg(long)]
+        ack: bool,
+    },
     /// Add collateral so more GPU slots can be funded (approve + stake, in HEMI)
     Stake {
         /// Amount in HEMI (e.g. `500`, or `4.25`). NOT wei.
@@ -746,13 +753,18 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             .with(EnvFilter::new(filter))
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
+                    .with_writer(logging::RedactingMake(non_blocking))
                     .with_target(false)
                     .with_ansi(false),
             )
             // PAGE lines (claims stopped, a lock at risk) also reach the dashboard: in this mode the
             // log file is all the operator would otherwise see of them.
             .with(PageToDashboard)
+            // And to `pages.log` and the event log (review 6 D1), except a mock run's.
+            .with(
+                matches!(cli.command, Commands::Run { mock: false, .. })
+                    .then(|| logging::PageSink::new(log_dir.clone())),
+            )
             .init();
     } else {
         let filter = match cli.verbose {
@@ -766,18 +778,25 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
         // Logs go to STDERR so stdout carries only command output. Without this
         // `zkminer benchmark --json` interleaves INFO lines with the JSON document
         // and emits unparseable output (the default `fmt()` writer is stdout).
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            // Colour codes only for a terminal: journald and `docker logs` show them as text.
-            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-            .init();
+        if matches!(cli.command, Commands::Run { mock: false, .. }) {
+            // A headless run (a service's included) also keeps the rolling file and its pages,
+            // which a service wrapper may otherwise drop with stderr (review 6 D1).
+            _log_guard = Some(logging::init_headless_run(filter, &logging::logs_dir()));
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new(filter))
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                // Colour codes only for a terminal: journald and `docker logs` show them as text.
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+                .init();
+        }
     }
     if no_terminal {
         tracing::warn!(
             "stdout is not a terminal, so the dashboard cannot start: running headless (logs on \
-             stderr). Pass --headless to make this explicit."
+             stderr and in {}). Pass --headless to make this explicit.",
+            logging::logs_dir().display()
         );
     }
 
@@ -793,7 +812,7 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
     }
 
     match cli.command {
-        Commands::Status => commands::status::run(config_path).await,
+        Commands::Status { ack } => commands::status::run(config_path, ack).await,
         Commands::Stake {
             amount,
             dry_run,

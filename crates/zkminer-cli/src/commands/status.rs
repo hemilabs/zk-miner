@@ -82,7 +82,64 @@ pub(crate) fn local() -> Local {
     )
 }
 
-pub async fn run(config_path: Option<&Path>) -> Result<()> {
+/// The recent pages (`pages.log`, review 6 D1), and how many are unacknowledged.
+pub(crate) struct Pages {
+    pub lines: Vec<String>,
+    pub unacked: usize,
+}
+
+/// How many of the pages shown at most.
+const PAGES_SHOWN: usize = 10;
+
+/// [`Pages`] from the logs directory `dir` at `now` (unix seconds); `ack` acknowledges them first.
+pub(crate) fn pages_report(dir: &Path, ack: bool, now: i64) -> Pages {
+    use crate::logging;
+    let pages = logging::read_pages(dir);
+    let mut acked = logging::read_ack(dir);
+    let mut lines = Vec::new();
+    if ack {
+        match logging::write_ack(dir, now) {
+            Ok(()) => acked = now,
+            Err(e) => lines.push(format!("Pages:          could not acknowledge them: {e}")),
+        }
+    }
+    let unacked = pages.iter().filter(|(at, _)| *at > acked).count();
+    if pages.is_empty() {
+        lines.push("Pages:          none".to_string());
+        return Pages { lines, unacked };
+    }
+    lines.push(format!(
+        "Pages:          {} in {}{}",
+        pages.len(),
+        logging::pages_path(dir).display(),
+        match unacked {
+            0 => ", all acknowledged".to_string(),
+            n => format!(
+                "; [!] {n} unacknowledged (`zkminer status --ack` once they are dealt with)"
+            ),
+        }
+    ));
+    let first = pages.len().saturating_sub(PAGES_SHOWN);
+    for (at, line) in &pages[first..] {
+        lines.push(format!(
+            "  {} {line}",
+            if *at > acked { "[new]" } else { "     " }
+        ));
+    }
+    Pages { lines, unacked }
+}
+
+/// `zkminer status`'s exit code: 2 while a page is unacknowledged or locks are held with nothing
+/// to drive them, else 0 (a status that could not be read is an error, 1).
+pub(crate) fn exit_code(local: &Local, pages: &Pages) -> i32 {
+    if local.harmful || pages.unacked > 0 {
+        2
+    } else {
+        0
+    }
+}
+
+pub async fn run(config_path: Option<&Path>, ack: bool) -> Result<()> {
     println!("zkminer status");
     println!("══════════════════════════════════════════════════");
     // This home's own state first: it needs no chain, and an operator moving a service checks it.
@@ -90,6 +147,30 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
     for line in &local.lines {
         println!("{line}");
     }
+    let pages = pages_report(
+        &crate::logging::logs_dir(),
+        ack,
+        chrono::Utc::now().timestamp(),
+    );
+    for line in &pages.lines {
+        println!("{line}");
+    }
+    let chain = chain_status(config_path).await;
+    match exit_code(&local, &pages) {
+        0 => chain,
+        code => {
+            if let Err(e) = &chain {
+                eprintln!("Error: {}", super::simulate::redact_urls(&format!("{e:#}")));
+            }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code)
+        }
+    }
+}
+
+/// The chain's half of `zkminer status`.
+async fn chain_status(config_path: Option<&Path>) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
     let signer = load_signer(&config.wallet)?;
@@ -318,5 +399,50 @@ mod tests {
         );
         let unread = held_locks(&Err("denied".into()), now, Some(false));
         assert!(unread.lines[0].contains("unknown") && !unread.harmful);
+    }
+
+    /// Review 6 D1: the pages section from a fixture `pages.log`, acknowledgement, and the exit
+    /// code (2 for an unacknowledged page or locks held with no miner, else 0).
+    #[test]
+    fn pages_and_the_exit_code() {
+        let dir = std::env::temp_dir().join(format!("zkminer-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quiet = Local {
+            lines: Vec::new(),
+            harmful: false,
+        };
+        let none = pages_report(&dir, false, 1_900_000_000);
+        assert_eq!(none.lines, ["Pages:          none"]);
+        assert_eq!(exit_code(&quiet, &none), 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = String::new();
+        for n in 0..12 {
+            log.push_str(&format!(
+                "2026-11-21T10:{n:02}:00Z PAGE: LOCK-LATE — job {n}\n"
+            ));
+        }
+        std::fs::write(dir.join("pages.log"), log).unwrap();
+        let fresh = pages_report(&dir, false, 1_900_000_000);
+        assert_eq!(fresh.unacked, 12);
+        // A header and the last ten.
+        assert_eq!(fresh.lines.len(), 1 + PAGES_SHOWN);
+        assert!(
+            fresh.lines[0].contains("12 unacknowledged"),
+            "{:?}",
+            fresh.lines
+        );
+        assert!(fresh.lines[1].contains("[new]") && fresh.lines[1].contains("job 2"));
+        assert_eq!(exit_code(&quiet, &fresh), 2);
+        let acked = pages_report(&dir, true, 1_900_000_000);
+        assert_eq!(acked.unacked, 0);
+        assert_eq!(exit_code(&quiet, &acked), 0);
+        assert_eq!(pages_report(&dir, false, 1_900_000_001).unacked, 0);
+        // Locks held with nothing to drive them: 2 even with every page acknowledged.
+        let stranded = Local {
+            lines: Vec::new(),
+            harmful: true,
+        };
+        assert_eq!(exit_code(&stranded, &acked), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

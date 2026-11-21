@@ -9,6 +9,8 @@
 //! - NSSM's exit actions and stop timeout (review 6 OJ-2). NSSM restarts the program after every
 //!   exit unless told otherwise, so `zkminer stop` (exit 0) only restarted the miner; and its
 //!   default 1.5 s console stop timeout cuts a drain off.
+//! - Where the service's output goes (review 6 D1): NSSM drops stdout and stderr unless
+//!   `AppStdout`/`AppStderr` name a file, and the `zkminer` event source is registered once.
 //!
 //! Only the service's own key and its NSSM `Parameters` values named here are read, never
 //! `AppEnvironmentExtra`, which may hold a key.
@@ -464,6 +466,9 @@ pub(crate) struct Nssm {
     pub exit_for: Vec<(u32, Option<String>)>,
     /// `AppStopMethodConsole` (ms).
     pub stop_console_ms: Option<u32>,
+    /// `AppStdout` and `AppStderr`: the files NSSM keeps the miner's output in (none: dropped).
+    pub app_stdout: Option<String>,
+    pub app_stderr: Option<String>,
 }
 
 /// The [`Nssm`] settings of service `name`, or `None` when it is not run by NSSM (no
@@ -479,6 +484,8 @@ pub(crate) fn nssm_of(name: &str) -> Option<Nssm> {
             .map(|code| (*code, reg_string(&exit, Some(&code.to_string()))))
             .collect(),
         stop_console_ms: reg_dword(&params, "AppStopMethodConsole"),
+        app_stdout: reg_string(&params, Some("AppStdout")).filter(|v| !v.trim().is_empty()),
+        app_stderr: reg_string(&params, Some("AppStderr")).filter(|v| !v.trim().is_empty()),
     })
 }
 
@@ -564,6 +571,7 @@ pub(crate) fn service_nssm_findings() -> Vec<(Finding, String, String)> {
         for text in [
             restart_warning(&name, &nssm),
             stop_timeout_warning(&name, &nssm),
+            output_warning(&name, &nssm),
         ]
         .into_iter()
         .flatten()
@@ -575,16 +583,67 @@ pub(crate) fn service_nssm_findings() -> Vec<(Finding, String, String)> {
             out.push((
                 Finding::Pass,
                 what,
-                "stops when the miner stops, and waits for a drain".to_string(),
+                "stops when the miner stops, waits for a drain, and keeps its output".to_string(),
             ));
         }
     }
+    if !out.is_empty() && !event_source_registered() {
+        out.push((
+            Finding::Warn,
+            "event log".to_string(),
+            "the event source `zkminer` is not registered: pages still reach the Application log, \
+             but Event Viewer shows them under \"description not found\". As an administrator, \
+             once: `New-EventLog -LogName Application -Source zkminer`"
+                .to_string(),
+        ));
+    }
     out
+}
+
+// ---- Where a service's output goes (D1) ----
+
+/// For `doctor`: the warning that service `name` keeps none of the miner's output, or `None`.
+/// NSSM drops stdout and stderr unless `AppStdout` or `AppStderr` names a file; the miner's own
+/// log file and `pages.log` (`~/.zkminer/logs`) are kept either way, but a panic, a start-up
+/// error or a refusal is said on stderr only.
+pub(crate) fn output_warning(name: &str, nssm: &Nssm) -> Option<String> {
+    (nssm.app_stdout.is_none() && nssm.app_stderr.is_none()).then(|| {
+        format!(
+            "service {name} (NSSM) keeps none of the miner's output: a start-up error, a refusal \
+             or a crash is lost. `nssm set {name} AppStdout <home>\\zkminer-service.log`, \
+             the same for AppStderr, `nssm set {name} AppRotateFiles 1` and `nssm set {name} \
+             AppRotateBytes 10485760`"
+        )
+    })
+}
+
+/// Whether the event source `zkminer` is registered (`New-EventLog -Source zkminer`).
+pub(crate) fn event_source_registered() -> bool {
+    reg_string(
+        r"SYSTEM\CurrentControlSet\Services\EventLog\Application\zkminer",
+        Some("EventMessageFile"),
+    )
+    .is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 6 D1: a service that keeps neither stdout nor stderr is warned of; either one will do.
+    #[test]
+    fn a_service_that_drops_its_output_is_warned_of() {
+        let text = output_warning("zkminer", &Nssm::default()).unwrap();
+        assert!(
+            text.contains("AppStdout") && text.contains("AppRotateBytes"),
+            "{text}"
+        );
+        let kept = Nssm {
+            app_stderr: Some(r"C:\Users\zkminer\zkminer-service.log".into()),
+            ..Nssm::default()
+        };
+        assert_eq!(output_warning("zkminer", &kept), None);
+    }
 
     /// Review 6 OJ-2: NSSM's exit actions as the README recipe sets them stop on every deliberate
     /// stop's code and restart on 75; unset, or set only as a default, they restart on everything.
@@ -594,6 +653,7 @@ mod tests {
             exit_default: Some("Restart".into()),
             exit_for: vec![(0, Some("Exit".into())), (130, Some("Exit".into()))],
             stop_console_ms: Some(MIN_STOP_CONSOLE_MS),
+            ..Nssm::default()
         };
         assert_eq!(exit_action(&recipe, 0), "Exit");
         assert_eq!(exit_action(&recipe, 75), "Restart");
