@@ -307,8 +307,6 @@ pub struct HostFacts {
     /// The uplink signature NAT64 discovery runs on for facts read from this host, whose unheld
     /// marks are read live ([`Self::nat64_unheld`]).
     nat64_uplink: Option<u64>,
-    /// The whole uplink's signature, for facts read from this host ([`Self::path_key`]).
-    uplink: Option<u64>,
     /// The nexthop objects (Linux), for the default routes through one ([`default_path_known`]).
     nexthops: Vec<crate::routes::Nexthop>,
 }
@@ -618,16 +616,6 @@ impl UplinkId {
         }
     }
 
-    /// Both families' signatures as one value.
-    pub(crate) fn whole(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        if self.families[0] == self.families[1] {
-            return self.families[0];
-        }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.families.hash(&mut h);
-        h.finish()
-    }
 }
 
 /// See the macOS one. A neighbour table that cannot be read (a dump that is denied, unsupported
@@ -1123,7 +1111,6 @@ impl HostFacts {
             nat64_unsettled: false,
             nat64_unheld: None,
             nat64_uplink: None,
-            uplink: None,
             nexthops: Vec::new(),
         }
     }
@@ -1214,7 +1201,6 @@ impl HostFacts {
             nat64_unsettled: raw.nat64_unsettled,
             nat64_unheld: raw.nat64_unheld,
             nat64_uplink: None,
-            uplink: None,
             nexthops: raw.nexthops,
         }
     }
@@ -1260,33 +1246,13 @@ impl HostFacts {
     #[cfg(test)]
     pub(crate) fn on_nat64_uplink(mut self, signature: u64) -> Self {
         self.nat64_uplink = Some(signature);
-        self.uplink = Some(signature);
         self
     }
 
     /// These facts, read on uplink `id`.
     pub(crate) fn on_uplink(mut self, id: UplinkId) -> Self {
         self.nat64_uplink = Some(id.families[1]);
-        self.uplink = Some(id.whole());
         self
-    }
-
-    /// For facts read from this host: a value that changes with anything a path depends on (the
-    /// routes, the rules, the interfaces' addresses and prefixes, the uplink signature), which a
-    /// remembered far verdict is tied to ([`crate::nearhop::remembered_far`]); `None` for facts
-    /// given by the caller.
-    pub(crate) fn path_key(&self) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
-        let uplink = self.uplink?;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        uplink.hash(&mut h);
-        self.routes.routes().hash(&mut h);
-        self.routes.local_routes().hash(&mut h);
-        self.routes.steered().hash(&mut h);
-        self.own.hash(&mut h);
-        self.connected.hash(&mut h);
-        self.nexthops.hash(&mut h);
-        Some(h.finish())
     }
 
     /// These facts without the kernel's cached verdicts (a refresh failed: what the kernel
@@ -3982,26 +3948,6 @@ mod r6_tests {
         }
         let eth = vec![Link { index: 2, name: "eth0".into(), kind: None }];
         assert!(!tunnelled_ipv4(&v4_default_links(&plain, &eth, &[])));
-    }
-
-    /// probe-3: a remembered far verdict is tied to the facts' path key, which changes with a
-    /// route, a rule's steering, an address and the uplink (fix-r6 mutation F13).
-    #[test]
-    fn r6_the_path_key_changes_with_what_a_path_depends_on() {
-        let facts = |routes: Vec<Route>, own: Vec<IpAddr>| {
-            HostFacts::assemble(RawFacts { routes, interface_addresses: own, ..RawFacts::default() }, &FactsOptions::default())
-                .on_uplink(UplinkId::both(7))
-        };
-        let base = facts(table().routes().to_vec(), vec![ip("192.168.1.100")]).path_key();
-        assert!(base.is_some());
-        let mut more = table().routes().to_vec();
-        more.push(Route::via(p("52.0.0.0/8"), ip("192.168.1.254"), 2));
-        assert_ne!(facts(more, vec![ip("192.168.1.100")]).path_key(), base, "a route");
-        assert_ne!(facts(table().routes().to_vec(), vec![ip("192.168.1.101")]).path_key(), base, "an address");
-        let other = HostFacts::assemble(RawFacts { routes: table().routes().to_vec(), interface_addresses: vec![ip("192.168.1.100")], ..RawFacts::default() }, &FactsOptions::default()).on_uplink(UplinkId::both(8));
-        assert_ne!(other.path_key(), base, "the uplink");
-        assert_eq!(facts(table().routes().to_vec(), vec![ip("192.168.1.100")]).path_key(), base);
-        assert_eq!(HostFacts::new(vec![], vec![]).path_key(), None, "facts given by the caller");
     }
 
     /// Review round 6 (fix-r6 mutation L02, Linux, live): asking for a neighbour makes the kernel

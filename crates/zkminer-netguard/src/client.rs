@@ -6,11 +6,12 @@
 //! - resolves every name itself, once per hop, through the [`GuardedResolver`] (in public mode
 //!   over DNS-over-HTTPS to fixed public resolvers, [`crate::doh`]; the system resolver in
 //!   developer mode), keeping only the admitted addresses;
-//! - **vets each address right before connecting** ([`NetPolicy::vet_connection`]): its route
-//!   asked of the kernel with the destination port, then the near-hop probe
-//!   ([`crate::nearhop`]), and connects only to the addresses that pass: each hop gets an HTTP
-//!   client pinned to exactly those addresses (reqwest resolves nothing itself, and an IP-literal
-//!   host is vetted the same way);
+//! - **vets each address right before connecting** ([`NetPolicy::vet_path`]): its route asked
+//!   of the kernel with the destination port, then the near-hop decision ([`crate::nearhop`]:
+//!   far only on a router's Time Exceeded past the limit, never on silence), and connects only to
+//!   the addresses that pass, each from the address and port of the probe that found it far
+//!   ([`crate::Vetted::socket`]): each hop gets an HTTP client pinned to exactly those addresses
+//!   (reqwest resolves nothing itself, and an IP-literal host is vetted the same way);
 //! - **checks each connection once made**, before anything is written on it
 //!   ([`NetPolicy::recheck_connected`]: the connection's own peer and source addresses must be
 //!   the vetted ones, and the destination is admitted again with the kernel asked afresh), and
@@ -46,7 +47,10 @@ use crate::resolve::{GuardedResolver, Lookup, ResolveError, SystemLookup};
 pub const USER_AGENT: &str = "zkminer";
 
 /// A family's addresses are given up after this many near-hop checks that could not tell
-/// (review round 6, cross-3).
+/// (review round 6, cross-3): [`Denied::NearCheckFailed`], which since the S3 review is also
+/// every decision without positive evidence (no router past the limit sent a Time Exceeded). On
+/// a path that silent for one family its other addresses would fare alike; a near answer or
+/// another refusal does not count.
 const MAX_UNANSWERED_PER_FAMILY: usize = 2;
 
 /// Timeouts of a guarded client.
@@ -149,12 +153,10 @@ struct RecheckLayer {
 }
 
 impl RecheckLayer {
-    /// The source address the connection to `connect` was vetted with (the one to bind it to).
-    fn source_of(&self, connect: SocketAddr) -> Option<IpAddr> {
-        self.vetted
-            .iter()
-            .find(|v| v.connect == unmapped(connect))
-            .and_then(|v| v.source)
+    /// What the connection to `connect` was vetted as (its socket is made from it: the source
+    /// address, the near-hop probe's port and interface).
+    fn vetted_for(&self, connect: SocketAddr) -> Option<&Vetted> {
+        self.vetted.iter().find(|v| v.connect == unmapped(connect))
     }
 
     /// The check for a connection whose own addresses are `local` and `peer` (on the blocking
@@ -818,24 +820,19 @@ mod tests {
     }
 
     impl crate::nearhop::NearProbe for DeadlineProbe {
-        fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> crate::nearhop::ProbeOutcome {
-            self.asked.lock().unwrap().push((addr, Instant::now() + crate::nearhop::DECIDE_BUDGET));
-            crate::nearhop::ProbeOutcome::Unreachable
-        }
-
-        fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> crate::nearhop::ConfirmOutcome {
-            crate::nearhop::ConfirmOutcome::Unanswered
-        }
-
-        fn probe_until(
+        #[allow(clippy::too_many_arguments)]
+        fn round(
             &self,
+            round: u32,
             addr: SocketAddr,
-            _: u8,
-            _: Duration,
+            hops: u8,
+            extra: u8,
+            pin: &crate::nearhop::Pin,
+            wait: Duration,
             deadline: Instant,
-        ) -> crate::nearhop::ProbeOutcome {
+        ) -> Result<Vec<crate::nearhop::Obs>, String> {
             self.asked.lock().unwrap().push((addr, deadline));
-            crate::nearhop::ProbeOutcome::Unreachable
+            crate::nearhop::FixedProbe::far().round(round, addr, hops, extra, pin, wait, deadline)
         }
     }
 
@@ -889,27 +886,24 @@ mod tests {
     }
 
     impl crate::nearhop::NearProbe for SlowIpv6 {
-        fn probe(&self, addr: SocketAddr, hops: u8, t: Duration) -> crate::nearhop::ProbeOutcome {
-            self.probe_until(addr, hops, t, Instant::now() + crate::nearhop::DECIDE_BUDGET)
-        }
-
-        fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> crate::nearhop::ConfirmOutcome {
-            crate::nearhop::ConfirmOutcome::ConnectFailed("timed out".into())
-        }
-
-        fn probe_until(
+        #[allow(clippy::too_many_arguments)]
+        fn round(
             &self,
+            round: u32,
             addr: SocketAddr,
-            _: u8,
-            _: Duration,
+            hops: u8,
+            extra: u8,
+            pin: &crate::nearhop::Pin,
+            wait: Duration,
             deadline: Instant,
-        ) -> crate::nearhop::ProbeOutcome {
+        ) -> Result<Vec<crate::nearhop::Obs>, String> {
             self.asked.lock().unwrap().push(addr);
             if addr.is_ipv6() {
                 std::thread::sleep(self.slow.min(deadline.saturating_duration_since(Instant::now())));
-                return crate::nearhop::ProbeOutcome::TimedOut;
+                return crate::nearhop::FixedProbe::answering(crate::nearhop::ProbeOutcome::TimedOut)
+                    .round(round, addr, hops, extra, pin, wait, deadline);
             }
-            crate::nearhop::ProbeOutcome::Unreachable
+            crate::nearhop::FixedProbe::far().round(round, addr, hops, extra, pin, wait, deadline)
         }
     }
 
@@ -950,9 +944,9 @@ mod tests {
     /// other addresses are never probed); refusals of another kind do not count.
     #[tokio::test]
     async fn r6_a_family_is_given_up_after_two_checks_that_could_not_tell() {
-        use crate::nearhop::{ConfirmOutcome, FixedProbe, ProbeOutcome};
+        use crate::nearhop::{FixedProbe, ProbeOutcome};
         let server = canned_server(&[OK_ELF]);
-        let probe = FixedProbe::with(ProbeOutcome::TimedOut, ConfirmOutcome::Failed("no answer".into()));
+        let probe = FixedProbe::answering(ProbeOutcome::TimedOut);
         let to_loopback: crate::resolve::ConnectMap = Arc::new(|_| IpAddr::from([127, 0, 0, 1]));
         let lookup = FakeLookup::with(&[(
             "v6.example.com",
@@ -1445,6 +1439,8 @@ mod tests {
             addr: "93.184.216.34:443".parse().unwrap(),
             connect: peer,
             source: Some("127.0.0.1".parse().unwrap()),
+            port: None,
+            interface: None,
         };
         let c = std::net::TcpStream::connect(peer).unwrap();
         let (local, remote) = (c.local_addr().unwrap(), c.peer_addr().unwrap());
@@ -1518,18 +1514,22 @@ mod tests {
                     addr: "93.184.216.35:443".parse().unwrap(),
                     connect: other,
                     source: Some(sources[0].parse().unwrap()),
+                    port: None,
+                    interface: None,
                 },
                 Vetted {
                     addr: "93.184.216.34:443".parse().unwrap(),
                     connect: peer,
                     source: Some(sources[1].parse().unwrap()),
+                    port: None,
+                    interface: None,
                 },
             ]
             .into(),
         };
         // Checked against the second (its peer): its source is the connection's.
         let ok = layer(["192.168.1.33", "127.0.0.1"]);
-        assert_eq!(ok.source_of(peer), Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(ok.vetted_for(peer).and_then(|v| v.source), Some("127.0.0.1".parse().unwrap()));
         let r = ok.check(local, peer).await;
         assert!(!matches!(r, Err(Denied::PathChanged { .. })), "{r:?}");
         // Against the first's source it would have been refused.
@@ -1539,7 +1539,7 @@ mod tests {
         let stranger: SocketAddr = "127.0.0.3:443".parse().unwrap();
         let e = ok.check(local, stranger).await.unwrap_err();
         assert!(matches!(&e, Denied::PathChanged { why, .. } if why.contains("not vetted")), "{e:?}");
-        assert_eq!(ok.source_of(stranger), None);
+        assert!(ok.vetted_for(stranger).is_none());
     }
 
     /// Review round 4, cross-3: the vetted source is the kernel's answer for a TCP connection
@@ -1634,6 +1634,8 @@ mod tests {
                 addr: peer,
                 connect: peer,
                 source: Some(lan),
+                port: None,
+                interface: None,
             }]
             .into(),
         };
@@ -1656,5 +1658,77 @@ mod tests {
         let v = &recheck.vetted[0];
         assert_eq!(v.addr, "93.184.216.34:8080".parse::<SocketAddr>().unwrap());
         assert_eq!(v.source, Some("127.0.0.1".parse().unwrap()));
+    }
+
+    /// The S3 review (R4): the connection is the far evidence's probe's 4-tuple: vetted with the
+    /// probe's port (and only when the probe left from the vetted source), checked once made
+    /// against it, and its socket bound to it; a port taken now refuses (`EADDRINUSE`), it is
+    /// never connected from another.
+    #[test]
+    fn the_connection_leaves_from_the_far_probes_port() {
+        use crate::policy::connected_as_vetted;
+        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let Ok(src) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|u| u.connect(addr).map(|()| u))
+            .and_then(|u| u.local_addr())
+            .map(|a| a.ip())
+        else {
+            crate::skipped("no IPv4 route here");
+            return;
+        };
+        let facts = HostFacts::new(vec![], vec![]);
+        let probe = crate::nearhop::FixedProbe::far_from(SocketAddr::new(src, 45678));
+        let policy = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new()).with_near_probe(probe.clone());
+        let v = policy.vet_path(addr, addr).unwrap();
+        assert_eq!((v.source, v.port), (Some(src), Some(45678)));
+        assert_eq!(probe.pins.lock().unwrap()[0].source, Some(src), "probed from it");
+        assert_eq!(connected_as_vetted(&v, SocketAddr::new(src, 45678), addr), Ok(()));
+        let why = connected_as_vetted(&v, SocketAddr::new(src, 45679), addr).unwrap_err();
+        assert!(why.contains("port 45679, not port 45678"), "{why}");
+        // A probe that left from another source is no evidence for this connection.
+        let other = crate::nearhop::FixedProbe::far_from("192.0.2.234:45678".parse().unwrap());
+        let policy = NetPolicy::with_facts(NetMode::Public, facts, Vec::new()).with_near_probe(other);
+        assert!(matches!(policy.vet_path(addr, addr), Err(Denied::NearCheckFailed { .. })));
+        // The socket: bound to the port; one another socket holds is refused, saying why.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let mut v = Vetted {
+            addr,
+            connect: "127.0.0.1:9".parse().unwrap(),
+            source: Some("127.0.0.1".parse().unwrap()),
+            port: Some(taken),
+            interface: None,
+        };
+        let e = v.socket().unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+        assert!(e.to_string().contains("taken now"), "{e}");
+        drop(held);
+        let s = v.socket().unwrap();
+        assert_eq!(s.local_addr().unwrap().as_socket().unwrap().port(), taken);
+        v.port = None;
+        assert_ne!(v.socket().unwrap().local_addr().unwrap().as_socket().unwrap().port(), taken);
+    }
+
+    /// The hop's connection binds the vetted port: it leaves from it.
+    #[tokio::test]
+    async fn the_hop_connects_from_the_vetted_port() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = l.local_addr().unwrap();
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
+        let layer = RecheckLayer {
+            policy: dev,
+            vetted: vec![Vetted {
+                addr: peer,
+                connect: peer,
+                source: Some("127.0.0.1".parse().unwrap()),
+                port: Some(free),
+                interface: None,
+            }]
+            .into(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let tcp = hop::connect_checked(&[peer], &layer, &ClientOptions::default(), deadline).await.unwrap();
+        assert_eq!(tcp.local_addr().unwrap().port(), free);
     }
 }

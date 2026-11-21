@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::facts::{EgressPath, FactsOptions, HostFacts};
 use crate::host::HostDenied;
 use crate::ip::{canonical_ip, is_global, prefix_is_global, Prefix};
-use crate::nearhop::{NearProbe, TtlProbe, Verdict};
+use crate::nearhop::{FarEvidence, NearProbe, Pin, TtlProbe, Verdict};
 
 /// Whether connections a requester causes may reach non-public destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -95,9 +95,11 @@ pub enum Denied {
         hops: u8,
         what: String,
     },
-    /// The near-hop check could not tell whether the destination is within `hops` hops (the
-    /// probe failed, or neither the probe nor the check connection decided): `why` (review round
-    /// 4, cross-5: this was a [`Denied::NearHop`], "on its own network").
+    /// The near-hop check found no positive evidence that the destination is farther than
+    /// `hops` hops (no router past the limit said a probe ran out of hops: silence, a Destination
+    /// Unreachable, an answer only beyond the limit), or its probes failed: `why` (review round
+    /// 4, cross-5: this was a [`Denied::NearHop`], "on its own network"). Silence is never taken
+    /// as far (the S3 review).
     NearCheckFailed {
         addr: SocketAddr,
         hops: u8,
@@ -356,9 +358,11 @@ impl Denied {
     }
 }
 
-/// What a connection was vetted as ([`NetPolicy::vet_path`]), for the check once it is made
-/// ([`NetPolicy::recheck_connected`]).
+/// What a connection was vetted as ([`NetPolicy::vet_path`]), for the connection itself
+/// ([`Vetted::socket`]: pinned to the probe that found it far) and the check once it is made
+/// ([`NetPolicy::recheck_connected`]). Only the guard makes one.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Vetted {
     /// The address judged, as the connection names it.
     pub addr: SocketAddr,
@@ -368,6 +372,55 @@ pub struct Vetted {
     /// The source address the kernel chose for a connection to `connect` right before it was
     /// made (`None` in developer mode, which checks nothing).
     pub source: Option<IpAddr>,
+    /// The local port of the probe whose Time Exceeded found the destination far
+    /// ([`crate::nearhop::FarEvidence::local`]): the connection leaves from it, so that it is the
+    /// probe's 4-tuple (a per-connection balancer sends it where it sent the probe). `None` in
+    /// developer mode and for a test's stand-in.
+    pub port: Option<u16>,
+    /// The interface that holds `source` (the connection is bound to it where the platform can:
+    /// [`crate::nearhop`]).
+    pub interface: Option<u32>,
+}
+
+impl Vetted {
+    /// A vetted connection as a test stages it (test builds only: the `test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn staged(addr: SocketAddr, connect: SocketAddr, source: Option<IpAddr>, port: Option<u16>) -> Self {
+        Vetted {
+            addr,
+            connect: unmapped(connect),
+            source,
+            port,
+            interface: None,
+        }
+    }
+
+    /// The socket for the connection to [`Self::connect`], pinned as the probe was (see
+    /// [`crate::nearhop`]): the interface, a fixed IPv6 flow label (Linux), bound to the source
+    /// address and the probe's port. Non-blocking. A port another socket holds now
+    /// (`EADDRINUSE`) is an error: the connection is not made (refused), never made from another
+    /// port.
+    pub fn socket(&self) -> io::Result<socket2::Socket> {
+        let sock = crate::nearhop::new_socket(self.connect)?;
+        let pin = Pin {
+            source: self.source,
+            interface: self.interface,
+        };
+        crate::nearhop::pin_socket(&sock, self.connect, &pin, self.port.unwrap_or(0)).map_err(|e| {
+            match (self.port, e.kind()) {
+                (Some(p), io::ErrorKind::AddrInUse) => io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "local port {p}, which the near-hop probe that found {} far left from, is                          taken now: not connected from another port",
+                        self.addr
+                    ),
+                ),
+                _ => e,
+            }
+        })?;
+        sock.set_nonblocking(true)?;
+        Ok(sock)
+    }
 }
 
 /// An IPv4-mapped IPv6 address as its IPv4 address (what a connection to it reaches).
@@ -417,6 +470,14 @@ pub fn connected_as_vetted(
             return Err(format!(
                 "it left from {from}, and the kernel chose {source} for it when it was checked \
                  (the route changed between the check and the connection)"
+            ));
+        }
+    }
+    if let Some(port) = vetted.port {
+        if local.port() != port {
+            return Err(format!(
+                "it left from port {}, not port {port}, the near-hop probe's that found it far",
+                local.port()
             ));
         }
     }
@@ -985,6 +1046,7 @@ impl NetPolicy {
         };
         if mode == NetMode::Public {
             usable(&facts, &options)?;
+            crate::nearhop::warn_if_unsupported();
         }
         let policy = Self::build(mode, facts, refresh, deny, options);
         if mode == NetMode::Public {
@@ -1109,61 +1171,60 @@ impl NetPolicy {
     }
 
     /// The last check before a connection to `addr` is made, right before it (public mode;
-    /// developer mode admits everything): [`Self::admit_to`], then the near-hop probe
-    /// ([`crate::nearhop::decide`]): refused when the destination answers within `[egress]
-    /// near_hop_limit` hops — to the probe, or, when the probe had no answer, to a check
-    /// connection's hop-limited FIN — or the probe fails. Blocking (up to the probe's timeout, plus
-    /// a check connection when it had no answer): call it off an async runtime's worker threads.
+    /// developer mode admits everything): [`Self::admit_to`], then the near-hop decision
+    /// ([`crate::nearhop::decide`]): admitted only when a router past `[egress] near_hop_limit`
+    /// hops said a probe ran out of hops (positive evidence); refused when the destination
+    /// answered within the limit, and when there is no evidence either way. The probes leave
+    /// from the kernel's choice of source; a connection made after this is not pinned to them, so
+    /// a real connection is vetted with [`Self::vet_path`]. Blocking (up to
+    /// [`crate::nearhop::DECIDE_BUDGET`]): call it off an async runtime's worker threads.
     pub fn vet_connection(&self, addr: SocketAddr) -> Result<(), Denied> {
         self.vet_connection_until(addr, Instant::now() + crate::nearhop::DECIDE_BUDGET)
     }
 
     /// [`Self::vet_connection`], given up on at `deadline` (refused: review round 5, probe-1): a
-    /// caller that stops waiting passes its own, so the probe and check connection it abandons
-    /// stop too ([`crate::nearhop::decide_until`]).
+    /// caller that stops waiting passes its own, so the probes it abandons stop too
+    /// ([`crate::nearhop::decide_until`]).
     pub fn vet_connection_until(&self, addr: SocketAddr, deadline: Instant) -> Result<(), Denied> {
         if self.mode == NetMode::DevPrivate {
             return Ok(());
         }
         self.admit_to(addr)?;
-        // An IPv4-mapped address is connected to as its IPv4 address: probe that.
-        let target = match addr.ip() {
-            IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map_or(addr, |v4| SocketAddr::new(IpAddr::V4(v4), addr.port())),
-            IpAddr::V4(_) => addr,
-        };
+        self.decide_near(addr, &Pin::default(), deadline).map(|_| ())
+    }
+
+    /// The near-hop decision for `addr` from `pin` (an IPv4-mapped address probed as its IPv4
+    /// address): the far evidence, or the refusal.
+    fn decide_near(
+        &self,
+        addr: SocketAddr,
+        pin: &Pin,
+        deadline: Instant,
+    ) -> Result<FarEvidence, Denied> {
+        let target = unmapped(addr);
         let hops = self.near_hop_limit();
-        // Review round 6, probe-3: a far verdict of the last few seconds, on the same facts, for
-        // the same destination and port (facts read from this host only).
-        let far_key = self.facts().path_key().map(|k| {
-            (target, hops, k, std::sync::Arc::as_ptr(&self.probe) as *const () as usize)
-        });
-        let verdict = crate::nearhop::decide_remembered(far_key, deadline, || {
-            crate::nearhop::decide_until(&*self.probe, target, hops, deadline)
-        });
-        match verdict {
-            Verdict::Far => Ok(()),
+        // The S3 review: no far verdict is remembered for another connection (it belongs to the
+        // probe's 4-tuple, which the connection reuses), so each connection is decided afresh.
+        match crate::nearhop::decide_until(&*self.probe, target, hops, pin, deadline) {
+            Verdict::Far(e) => Ok(e),
             Verdict::Near(how) => Err(Denied::NearHop {
                 addr,
                 hops,
                 what: format!("it {how}"),
             }),
-            Verdict::Failed(why) => Err(Denied::NearCheckFailed { addr, hops, why }),
-            Verdict::Undecided => Err(Denied::NearCheckFailed {
-                addr,
-                hops,
-                why: "no answer either way".into(),
-            }),
+            Verdict::NoEvidence(why) | Verdict::Failed(why) => {
+                Err(Denied::NearCheckFailed { addr, hops, why })
+            }
         }
     }
 
     /// [`Self::vet_connection`] for a connection to `addr` that is made to `connect` (`addr`
-    /// itself, but for test seams that stand a loopback server in for it), then what the
-    /// connection must look like once made: the source address the kernel chooses for a
-    /// connection to `connect` now (a UDP socket connected to it: nothing is sent), read right
-    /// before the real connection. [`Self::recheck_connected`] checks the connection against it.
-    /// Blocking, like [`Self::vet_connection`].
+    /// itself, but for test seams that stand a loopback server in for it), and what the
+    /// connection must be: the source address the kernel chooses for a connection to `connect`
+    /// now (a UDP socket connected to it: nothing is sent), read before the probes, which leave
+    /// from it and the interface that holds it; then the far evidence's probe port, which the
+    /// connection binds ([`Vetted::socket`]). [`Self::recheck_connected`] checks the connection
+    /// against it. Connect right after it. Blocking, like [`Self::vet_connection`].
     pub fn vet_path(&self, addr: SocketAddr, connect: SocketAddr) -> Result<Vetted, Denied> {
         self.vet_path_until(addr, connect, Instant::now() + crate::nearhop::DECIDE_BUDGET)
     }
@@ -1175,31 +1236,62 @@ impl NetPolicy {
         connect: SocketAddr,
         deadline: Instant,
     ) -> Result<Vetted, Denied> {
-        self.vet_connection_until(addr, deadline)?;
         let connect = unmapped(connect);
         if self.mode == NetMode::DevPrivate {
             return Ok(Vetted {
                 addr,
                 connect,
                 source: None,
+                port: None,
+                interface: None,
             });
         }
+        self.admit_to(addr)?;
         // The kernel's own choice for a TCP connection where it can say (Linux's TCP route
         // query: review round 4, cross-3), else a connected UDP socket's.
         let kernel = self
             .facts()
             .kernel_source(unmapped_ip(connect.ip()), Some(connect.port()));
-        let source = kernel.map_or_else(|| source_for(connect), Ok).map_err(|e| Denied::RouteQueryFailed {
+        let route_failed = |e: io::Error| Denied::RouteQueryFailed {
             ip: addr.ip(),
             why: format!(
                 "a socket to it could not be connected (nothing sent): {}",
                 crate::printable(&e.to_string(), 120)
             ),
-        })?;
+        };
+        let source = kernel.map_or_else(|| source_for(connect), Ok).map_err(route_failed)?;
+        // The probes leave as the connection will (a test's stand-in for a public address is
+        // probed by the test's own probe, from anywhere).
+        let real = connect == unmapped(addr);
+        let pin = if real {
+            Pin {
+                source: Some(source),
+                interface: crate::nearhop::interface_of(source).map_err(route_failed)?,
+            }
+        } else {
+            Pin::default()
+        };
+        let evidence = self.decide_near(addr, &pin, deadline)?;
+        let port = match evidence.local {
+            Some(local) if real && unmapped_ip(local.ip()) != unmapped_ip(source) => {
+                return Err(Denied::NearCheckFailed {
+                    addr,
+                    hops: self.near_hop_limit(),
+                    why: format!(
+                        "the probe that found it far left from {}, not from {source}",
+                        local.ip()
+                    ),
+                })
+            }
+            Some(local) if real => Some(local.port()),
+            _ => None,
+        };
         Ok(Vetted {
             addr,
             connect,
             source: Some(source),
+            port,
+            interface: pin.interface,
         })
     }
 
@@ -2021,34 +2113,20 @@ mod tests {
         );
     }
 
-    /// Review round 6, probe-3: a far verdict is remembered for the same destination and port on
-    /// the same facts (read from a host); near and failed never are, nor anything on facts given
-    /// by the caller, and other facts ask again.
+    /// The S3 review (replacing review round 6, probe-3's far cache): no far verdict is
+    /// remembered: it belongs to the 4-tuple of the probe that found it, which the connection it
+    /// was found for reuses, so every connection is decided afresh, on any facts.
     #[test]
-    fn r6_a_far_verdict_is_remembered_on_the_same_facts_only() {
-        use crate::nearhop::{FixedProbe, ProbeOutcome};
+    fn s3_no_far_verdict_is_remembered() {
+        use crate::nearhop::FixedProbe;
         let facts = |uplink: u64| HostFacts::new(vec![], vec![]).on_nat64_uplink(uplink);
         let a: SocketAddr = "9.9.9.9:443".parse().unwrap();
         let far = FixedProbe::far();
         let p = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a12), vec![]).with_near_probe(far.clone());
-        assert_eq!(p.vet_connection(a), Ok(()));
-        assert_eq!(p.vet_connection(a), Ok(()));
-        assert_eq!(far.asked.lock().unwrap().len(), 1, "remembered");
-        p.vet_connection("9.9.9.9:80".parse().unwrap()).unwrap();
-        assert_eq!(far.asked.lock().unwrap().len(), 2, "another port is asked");
-        let q = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a13), vec![]).with_near_probe(far.clone());
-        q.vet_connection(a).unwrap();
-        assert_eq!(far.asked.lock().unwrap().len(), 3, "other facts ask again");
-        let given = NetPolicy::with_facts(NetMode::Public, HostFacts::new(vec![], vec![]), vec![])
-            .with_near_probe(far.clone());
-        given.vet_connection(a).unwrap();
-        given.vet_connection(a).unwrap();
-        assert_eq!(far.asked.lock().unwrap().len(), 5, "facts given by the caller: never remembered");
-        let near = FixedProbe::answering(ProbeOutcome::Connected);
-        let n = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a14), vec![]).with_near_probe(near.clone());
-        assert!(n.vet_connection(a).is_err());
-        assert!(n.vet_connection(a).is_err());
-        assert_eq!(near.asked.lock().unwrap().len(), 2, "near: asked each time");
+        for n in 1..=3 {
+            assert_eq!(p.vet_connection(a), Ok(()));
+            assert_eq!(far.asked.lock().unwrap().len(), n, "asked each time");
+        }
     }
 
     /// Review round 6 (the parse lens's suspicion): a mark made between two facts reads (the

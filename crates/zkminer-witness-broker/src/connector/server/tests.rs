@@ -712,8 +712,8 @@ async fn a_cancelled_read_keeps_the_partial_frame() {
     assert!(matches!(frames.read(&ours).await, Ok(None)));
 }
 
-/// A probe that takes `delay` and then finds the destination far: a path whose hop at the limit
-/// is silent (three attempts and a pause, review round 5, probe-1).
+/// A probe that takes `delay` and then finds the destination far (a slow path, review round 5,
+/// probe-1).
 #[derive(Debug)]
 struct SlowFar {
     delay: Duration,
@@ -721,14 +721,20 @@ struct SlowFar {
 }
 
 impl zkminer_netguard::NearProbe for SlowFar {
-    fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::ProbeOutcome {
+    #[allow(clippy::too_many_arguments)]
+    fn round(
+        &self,
+        round: u32,
+        addr: SocketAddr,
+        hops: u8,
+        extra: u8,
+        pin: &zkminer_netguard::nearhop::Pin,
+        wait: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<zkminer_netguard::nearhop::Obs>, String> {
         lock(&self.asked).push(addr);
         std::thread::sleep(self.delay);
-        zkminer_netguard::ProbeOutcome::Unreachable
-    }
-
-    fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::nearhop::ConfirmOutcome {
-        zkminer_netguard::nearhop::ConfirmOutcome::Unanswered
+        zkminer_netguard::FixedProbe::far().round(round, addr, hops, extra, pin, wait, deadline)
     }
 }
 
@@ -776,7 +782,8 @@ async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
-    let fd = connect_tcp(mapped, Some("127.0.0.1".parse().unwrap())).await.expect("connected");
+    let vetted = zkminer_netguard::Vetted::staged(mapped, mapped, Some("127.0.0.1".parse().unwrap()), None);
+    let fd = connect_tcp(mapped, Some(&vetted)).await.expect("connected");
     let stream = std::net::TcpStream::from(fd);
     assert_eq!(stream.peer_addr().unwrap(), format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap());
     assert!(stream.local_addr().unwrap().is_ipv4());
@@ -784,9 +791,8 @@ async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
     assert!(std::net::TcpStream::from(fd).local_addr().unwrap().is_ipv4());
 }
 
-/// A probe on a host one of whose families is blackholed: every check of an address of that
-/// family takes `delay` and cannot tell (a probe without an answer and a check connection that
-/// does not connect); the other family is far.
+/// A probe on a host one of whose families is blackholed: every round of probes of an address of
+/// that family takes `delay` (within the deadline) and finds no evidence; the other family is far.
 #[derive(Debug)]
 struct Blackholed {
     v6: bool,
@@ -795,18 +801,26 @@ struct Blackholed {
 }
 
 impl zkminer_netguard::NearProbe for Blackholed {
-    fn probe(&self, addr: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::ProbeOutcome {
-        lock(&self.asked).push(addr);
-        if addr.is_ipv6() == self.v6 {
-            std::thread::sleep(self.delay);
-            zkminer_netguard::ProbeOutcome::TimedOut
-        } else {
-            zkminer_netguard::ProbeOutcome::Unreachable
+    #[allow(clippy::too_many_arguments)]
+    fn round(
+        &self,
+        round: u32,
+        addr: SocketAddr,
+        hops: u8,
+        extra: u8,
+        pin: &zkminer_netguard::nearhop::Pin,
+        wait: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<zkminer_netguard::nearhop::Obs>, String> {
+        if round == 0 {
+            lock(&self.asked).push(addr);
         }
-    }
-
-    fn confirm(&self, _: SocketAddr, _: u8, _: Duration) -> zkminer_netguard::nearhop::ConfirmOutcome {
-        zkminer_netguard::nearhop::ConfirmOutcome::ConnectFailed("timed out".into())
+        if addr.is_ipv6() == self.v6 {
+            std::thread::sleep(self.delay.min(deadline.saturating_duration_since(std::time::Instant::now())));
+            return zkminer_netguard::FixedProbe::answering(zkminer_netguard::ProbeOutcome::TimedOut)
+                .round(round, addr, hops, extra, pin, wait, deadline);
+        }
+        zkminer_netguard::FixedProbe::far().round(round, addr, hops, extra, pin, wait, deadline)
     }
 }
 
