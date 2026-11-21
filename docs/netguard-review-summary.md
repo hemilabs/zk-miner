@@ -49,7 +49,7 @@ their round and are covered (the live forge test; the NAT64 caps).
   limits, a lost wakeup in the gate, macOS's zero RTO. Then: two-connection check, paced and fair
   gate, deadlines everywhere. The S3 review: silence and unreachables read as far (bypassable by a
   near host), and a gate that gave back turns it never gave. Now: far only on a router's matched
-  Time Exceeded past the limit, the connection pinned to the far probe's 4-tuple, no far cache,
+  Time Exceeded past the limit, the connection pinned to the probes' source address and interface, no far cache,
   the same paced and fair gate (one token per round of three probes).
 - **Fixes that opened holes** (rounds 3, 5, 6's reviews of 2, 4, 5): a debounce that kept the old
   network, a cap that accumulated withdrawn entries, a pacer that lost wakeups. Round 6 states an
@@ -110,12 +110,9 @@ their round and are covered (the live forge test; the NAT64 caps).
    the S3 review):
    constants with stated reasoning; change them if the trade-offs differ for your deployments.
 6. **The macOS CI change** (hardening.md) is ready to apply on `item/W11-ON37`.
-7. **OPEN: port reuse versus strict NATs.** The connection after a far verdict reuses the probe's
-   local port, so it takes the probe's path. On this Mac's IPv4 home path (a home NAT router, then
-   the ISP's carrier-grade NAT) that fails: the real SYN gets no answer whenever it follows the
-   probe's by more than about 20 ms, for at least 125 s, while a new port connects at once (IPv6,
-   without NAT, works; Linux conntrack alone reuses fine). Likely a stateful NAT or firewall
-   holding the probe's session with its ISN. So behind such NATs every IPv4 connection after a far
-   verdict fails, closed. Choose between keeping the port pin (the same-path assumption mitigated,
-   IPv4 broken there) and pinning only the source address, interface and flow label (IPv4 works,
-   a per-connection balancer can again send the connection another way than the probe).
+7. **Decided: no port reuse.** The connection after a far verdict does not reuse the far probe's
+   local port: stateful home and carrier-grade NATs drop a second SYN on the probe's 4-tuple
+   (measured on this project's IPv4 home path: every such connection timed out). It is pinned to
+   the probes' source address, interface and IPv6 flow label; a per-connection multi-WAN
+   balancer routing connections over unequal paths can send it another way than its probe (lab:
+   4 of 13 reached the near host), a documented residual as before the S3 review.

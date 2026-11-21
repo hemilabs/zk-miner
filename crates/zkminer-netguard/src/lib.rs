@@ -29,8 +29,8 @@
 //! - [`NetPolicy::vet_connection`] / [`NetPolicy::vet_path`]: the last check right before a
 //!   connection, with its port: the kernel's route for it, and the near-hop decision
 //!   ([`nearhop`]: a destination is admitted as far only on positive evidence, a router past the
-//!   limit saying a probe ran out of hops, never on silence; the connection then leaves from that
-//!   probe's address and port, [`Vetted::socket`]);
+//!   limit saying a probe ran out of hops, never on silence; the connection then leaves from the
+//!   probes' source address and interface, [`Vetted::socket`]);
 //! - with the `client` feature (default): [`GuardedResolver`], which hands a connection only
 //!   admitted addresses from one lookup (no DNS rebinding), over DNS-over-HTTPS to fixed public
 //!   resolvers in public mode ([`doh`]), and [`guarded_client`], an HTTP client that refuses

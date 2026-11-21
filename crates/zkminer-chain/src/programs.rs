@@ -82,7 +82,7 @@ const ARWEAVE_GATEWAY: &str = "https://arweave.net";
 /// with the port), not in `[egress] deny_cidrs` or `internal_ranges`, on a path whose public
 /// address is known, and — probed right before the connection — found farther than `[egress]
 /// near_hop_limit` hops on positive evidence only (a router past the limit said a probe ran out
-/// of hops; silence refuses), the connection then made from that probe's address and port. No
+/// of hops; silence refuses), the connection then made from the probes' source address. No
 /// proxy is used. The only way to reach a private address is `[dev]
 /// private_network = true` with `[dev] chain_id` ([`NetMode::DevPrivate`]), which is refused on
 /// mainnet; there is no environment-variable bypass.
