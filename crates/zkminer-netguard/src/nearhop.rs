@@ -45,14 +45,16 @@
 //! An answer always dominates an ICMP error queued for the same probe (Linux can queue an error
 //! and still complete the connection: `sk_err_soft` while the socket is owned by the user).
 //!
-//! **The connection that follows** is pinned to the probe that produced the far evidence
-//! ([`FarEvidence::local`], carried by [`crate::Vetted`]): the same source address and local port
-//! (`EADDRINUSE` refuses), the same interface where the platform can bind one (macOS
-//! `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, which TCP does
-//! not follow there), and on Linux a
-//! fixed IPv6 flow label (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), so a
-//! per-connection balancer hashes it as it hashed the probe. A far verdict is not remembered for
-//! other connections: it belongs to that 4-tuple.
+//! **The connection that follows** leaves as the probes did: from the same source address, by
+//! the same interface where the platform can bind one (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`;
+//! Linux sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, which TCP does not follow there), and on Linux
+//! with a fixed IPv6 flow label (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), from
+//! a new local port ([`crate::Vetted::socket`]). It does not reuse the far probe's port: a
+//! stateful home or carrier-grade NAT keeps the probe's session and drops a second SYN on its
+//! 4-tuple (measured: every IPv4 connection failed on this project's home path), so a
+//! per-connection multi-WAN balancer that routes connections over unequal paths can send the
+//! connection another way than the probe (the owner's decision; as before the S3 review). A far
+//! verdict is not remembered for other connections.
 //!
 //! **What "within `N` hops" means, and what it assumes.** A hop is a router that decrements the hop
 //! count; a Time Exceeded at hop limit `t` proves only that the probe's own path crossed `t`

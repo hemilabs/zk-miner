@@ -9,7 +9,7 @@
 //! - **vets each address right before connecting** ([`NetPolicy::vet_path`]): its route asked
 //!   of the kernel with the destination port, then the near-hop decision ([`crate::nearhop`]:
 //!   far only on a router's Time Exceeded past the limit, never on silence), and connects only to
-//!   the addresses that pass, each from the address and port of the probe that found it far
+//!   the addresses that pass, each from the source address and interface the probes left by
 //!   ([`crate::Vetted::socket`]): each hop gets an HTTP client pinned to exactly those addresses
 //!   (reqwest resolves nothing itself, and an IP-literal host is vetted the same way);
 //! - **checks each connection once made**, before anything is written on it
@@ -154,7 +154,7 @@ struct RecheckLayer {
 
 impl RecheckLayer {
     /// What the connection to `connect` was vetted as (its socket is made from it: the source
-    /// address, the near-hop probe's port and interface).
+    /// address and the interface the near-hop probes left by).
     fn vetted_for(&self, connect: SocketAddr) -> Option<&Vetted> {
         self.vetted.iter().find(|v| v.connect == unmapped(connect))
     }
@@ -1439,7 +1439,6 @@ mod tests {
             addr: "93.184.216.34:443".parse().unwrap(),
             connect: peer,
             source: Some("127.0.0.1".parse().unwrap()),
-            port: None,
             interface: None,
         };
         let c = std::net::TcpStream::connect(peer).unwrap();
@@ -1514,14 +1513,12 @@ mod tests {
                     addr: "93.184.216.35:443".parse().unwrap(),
                     connect: other,
                     source: Some(sources[0].parse().unwrap()),
-                    port: None,
                     interface: None,
                 },
                 Vetted {
                     addr: "93.184.216.34:443".parse().unwrap(),
                     connect: peer,
                     source: Some(sources[1].parse().unwrap()),
-                    port: None,
                     interface: None,
                 },
             ]
@@ -1634,7 +1631,6 @@ mod tests {
                 addr: peer,
                 connect: peer,
                 source: Some(lan),
-                port: None,
                 interface: None,
             }]
             .into(),
@@ -1660,12 +1656,13 @@ mod tests {
         assert_eq!(v.source, Some("127.0.0.1".parse().unwrap()));
     }
 
-    /// The S3 review (R4): the connection is the far evidence's probe's 4-tuple: vetted with the
-    /// probe's port (and only when the probe left from the vetted source), checked once made
-    /// against it, and its socket bound to it; a port taken now refuses (`EADDRINUSE`), it is
-    /// never connected from another.
+    /// The S3 review (R4, as the owner decided): the probes and the connection leave from the
+    /// vetted source address and the interface that holds it, with the fixed IPv6 flow label on
+    /// Linux; the connection takes a new local port (not the far probe's: stateful NATs drop a
+    /// second SYN on the probe's 4-tuple); evidence from a probe that left from another source
+    /// is refused.
     #[test]
-    fn the_connection_leaves_from_the_far_probes_port() {
+    fn the_connection_leaves_from_the_vetted_source_and_interface() {
         use crate::policy::connected_as_vetted;
         let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let Ok(src) = std::net::UdpSocket::bind("0.0.0.0:0")
@@ -1680,59 +1677,48 @@ mod tests {
         let probe = crate::nearhop::FixedProbe::far_from(SocketAddr::new(src, 45678));
         let policy = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new()).with_near_probe(probe.clone());
         let v = policy.vet_path(addr, addr).unwrap();
-        assert_eq!((v.source, v.port), (Some(src), Some(45678)));
+        assert_eq!(v.source, Some(src));
         let interface = crate::nearhop::interface_of(src).unwrap();
         assert!(interface.is_some());
         assert_eq!(v.interface, interface, "the interface that holds the source");
         assert_eq!(probe.pins.lock().unwrap()[0].interface, interface, "probed through it");
         assert_eq!(probe.pins.lock().unwrap()[0].source, Some(src), "probed from it");
-        assert_eq!(connected_as_vetted(&v, SocketAddr::new(src, 45678), addr), Ok(()));
-        let why = connected_as_vetted(&v, SocketAddr::new(src, 45679), addr).unwrap_err();
-        assert!(why.contains("port 45679, not port 45678"), "{why}");
+        // Any local port: the connection is not the probe's 4-tuple.
+        assert_eq!(connected_as_vetted(&v, SocketAddr::new(src, 45679), addr), Ok(()));
         // A probe that left from another source is no evidence for this connection.
         let other = crate::nearhop::FixedProbe::far_from("192.0.2.234:45678".parse().unwrap());
         let policy = NetPolicy::with_facts(NetMode::Public, facts, Vec::new()).with_near_probe(other);
         assert!(matches!(policy.vet_path(addr, addr), Err(Denied::NearCheckFailed { .. })));
-        // The socket: bound to the port; one another socket holds is refused, saying why.
-        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let taken = held.local_addr().unwrap().port();
-        let mut v = Vetted {
-            addr,
-            connect: "127.0.0.1:9".parse().unwrap(),
-            source: Some("127.0.0.1".parse().unwrap()),
-            port: Some(taken),
-            interface: None,
-        };
-        let e = v.socket().unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
-        assert!(e.to_string().contains("taken now"), "{e}");
-        drop(held);
+        // The socket: bound to the source, a fresh port, the interface and flow label set.
         let s = v.socket().unwrap();
-        assert_eq!(s.local_addr().unwrap().as_socket().unwrap().port(), taken);
-        v.port = None;
-        assert_ne!(v.socket().unwrap().local_addr().unwrap().as_socket().unwrap().port(), taken);
-    }
-
-    /// The hop's connection binds the vetted port: it leaves from it.
-    #[tokio::test]
-    async fn the_hop_connects_from_the_vetted_port() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let peer = l.local_addr().unwrap();
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let dev = NetPolicy::with_facts(NetMode::DevPrivate, HostFacts::empty(), Vec::new());
-        let layer = RecheckLayer {
-            policy: dev,
-            vetted: vec![Vetted {
-                addr: peer,
-                connect: peer,
-                source: Some("127.0.0.1".parse().unwrap()),
-                port: Some(free),
-                interface: None,
-            }]
-            .into(),
+        let bound = s.local_addr().unwrap().as_socket().unwrap();
+        assert_eq!(bound.ip(), src);
+        assert_ne!(bound.port(), 45678);
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut i: libc::c_int = 0;
+            let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a valid fd, an int option and its length.
+            let rc = unsafe { libc::getsockopt(s.as_raw_fd(), libc::IPPROTO_IP, libc::IP_BOUND_IF, (&mut i as *mut libc::c_int).cast(), &mut l) };
+            assert_eq!((rc, Some(i as u32)), (0, interface), "IP_BOUND_IF");
+        }
+        let lo6 = Vetted {
+            addr: "[2001:db8::1]:443".parse().unwrap(),
+            connect: "[::1]:9".parse().unwrap(),
+            source: Some("::1".parse().unwrap()),
+            interface: crate::nearhop::interface_of("::1".parse().unwrap()).unwrap(),
         };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let tcp = hop::connect_checked(&[peer], &layer, &ClientOptions::default(), deadline).await.unwrap();
-        assert_eq!(tcp.local_addr().unwrap().port(), free);
+        let s6 = lo6.socket().expect("an IPv6 socket pinned to loopback");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd;
+            let mut f: libc::c_int = -1;
+            let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a valid fd, an int option and its length.
+            let rc = unsafe { libc::getsockopt(s6.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_AUTOFLOWLABEL, (&mut f as *mut libc::c_int).cast(), &mut l) };
+            assert_eq!((rc, f), (0, 0), "the flow label is fixed");
+        }
+        let _ = s6;
     }
 }

@@ -782,14 +782,12 @@ async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
-    // The S3 review: from the vetted source and the near-hop probe's port too.
-    let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let vetted = zkminer_netguard::Vetted::staged(mapped, mapped, Some("127.0.0.1".parse().unwrap()), Some(free));
+    let vetted = zkminer_netguard::Vetted::staged(mapped, mapped, Some("127.0.0.1".parse().unwrap()), None);
     let fd = connect_tcp(mapped, Some(&vetted)).await.expect("connected");
     let stream = std::net::TcpStream::from(fd);
     assert_eq!(stream.peer_addr().unwrap(), format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap());
     assert!(stream.local_addr().unwrap().is_ipv4());
-    assert_eq!(stream.local_addr().unwrap().port(), free, "the probe's port");
+    assert_eq!(stream.local_addr().unwrap().ip(), "127.0.0.1".parse::<IpAddr>().unwrap(), "the vetted source");
     let fd = connect_tcp(mapped, None).await.expect("connected without a source too");
     assert!(std::net::TcpStream::from(fd).local_addr().unwrap().is_ipv4());
 }

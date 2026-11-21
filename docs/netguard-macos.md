@@ -302,9 +302,10 @@ refused. What is macOS-specific is how the Time Exceeded is read:
   two probes with the same one, refuses. This is an undocumented layout Apple may change: a Mac
   where the ICMP socket cannot be opened or `TCP_INFO` cannot be read refuses every requester
   connection, said once at startup.
-- **The pin.** The connection that follows is made from the far probe's source address and local
-  port, bound to its interface with `IP_BOUND_IF` / `IPV6_BOUND_IF`. (Linux's fixed IPv6 flow
-  label has no macOS counterpart.)
+- **The pin.** The connection that follows is made from the probes' source address, bound to
+  its interface with `IP_BOUND_IF` / `IPV6_BOUND_IF`, from a new local port (the far probe's port
+  is not reused: a stateful NAT on the path drops a second SYN on its 4-tuple, measured on this
+  Mac's IPv4 home path). (Linux's fixed IPv6 flow label has no macOS counterpart.)
 
 The probes connect to an IPv4-mapped address as its IPv4 address (probe-2 of round 2: an IPv6
 socket's hop limit does not limit the IPv4 packets of a mapped connection).

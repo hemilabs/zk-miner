@@ -124,8 +124,8 @@ pub(super) fn later(now: tokio::time::Instant, d: Duration) -> tokio::time::Inst
 /// [`ATTEMPT_DELAY`] later or as soon as the one before failed, each within its own connect
 /// timeout and `deadline`, from the source address it was vetted with (review round 4, cross-3:
 /// the source the kernel chose for the vetted path, so a rule that picks a path by protocol
-/// cannot make the check's source and the connection's differ) and the local port and interface
-/// of the near-hop probe that found it far ([`crate::Vetted::socket`]), and checked once made
+/// cannot make the check's source and the connection's differ) and the interface the near-hop
+/// probes left by ([`crate::Vetted::socket`]), and checked once made
 /// ([`RecheckLayer::check`]) before anything is written on it. The first that connects and
 /// passes the check is used; every other attempt is dropped then (closed before a byte is
 /// written). A check that refuses a connection refuses the hop (a path that changed is not
@@ -204,9 +204,8 @@ async fn attempt(
     options: &ClientOptions,
     deadline: tokio::time::Instant,
 ) -> Result<tokio::net::TcpStream, FetchError> {
-    // From the vetted source, the near-hop probe's port and interface (the S3 review: the
-    // connection is the probe's 4-tuple, so it takes the path the probe was judged on; a port
-    // taken now fails the attempt, it is never made from another).
+    // From the vetted source and interface, with the probes' fixed IPv6 flow label
+    // (`Vetted::socket`; a new local port: the S3 review's owner decision).
     let vetted = recheck.vetted_for(addr).cloned();
     let connect = async {
         let sock = match vetted {
@@ -217,11 +216,7 @@ async fn attempt(
         sock.connect(addr).await
     };
     let limit = attempt_limit(tokio::time::Instant::now(), options.connect_timeout, deadline);
-    let pinned = recheck.vetted_for(addr).and_then(|v| v.port);
-    let what = match pinned {
-        Some(p) => format!("connecting to {addr} from the near-hop probe's port {p}"),
-        None => format!("connecting to {addr}"),
-    };
+    let what = format!("connecting to {addr}");
     let tcp = match tokio::time::timeout_at(limit, connect).await {
         Ok(Ok(tcp)) => tcp,
         Ok(Err(e)) => return Err(failed(&what, e)),

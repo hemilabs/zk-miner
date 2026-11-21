@@ -908,8 +908,7 @@ const MAX_UNANSWERED: usize = 2;
 
 /// A fresh TCP connection to `addr` (`socket` + `connect`), as an owned fd: for a vetted address
 /// the socket the floor pins ([`zkminer_netguard::Vetted::socket`]: the vetted source address,
-/// the local port of the near-hop probe that found it far, its interface; a port taken now fails
-/// the attempt, never connected from another), otherwise a plain one. An IPv4-mapped address is
+/// its interface, the fixed IPv6 flow label), otherwise a plain one. An IPv4-mapped address is
 /// connected to as its IPv4 address, on an IPv4 socket (review round 5, bypass-5: an IPv6 socket
 /// bound to the IPv4 source the check vetted failed with `EINVAL`; the vetted socket is of the
 /// unmapped address's family), as the guarded client's hops do.
