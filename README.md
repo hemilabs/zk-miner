@@ -485,6 +485,11 @@ Worth knowing:
   .\nssm set zkminer AppExit 0 Exit
   .\nssm set zkminer AppExit 130 Exit
   .\nssm set zkminer AppRestartDelay 30000
+  .\nssm set zkminer AppStdout C:\Users\zkminer\zkminer-service.log
+  .\nssm set zkminer AppStderr C:\Users\zkminer\zkminer-service.log
+  .\nssm set zkminer AppRotateFiles 1
+  .\nssm set zkminer AppRotateBytes 10485760
+  New-EventLog -LogName Application -Source zkminer
   sc.exe privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
   ```
 
@@ -582,7 +587,20 @@ Worth knowing:
   another home or on another host. `--watch-only` takes no lock.
 - **`PAGE:` lines need a human.** They say claiming has stopped (the deployment or proof
   system failed its check, the protocol is paused, the clock is off, funds are short) or a
-  lock is at risk. The dashboard shows them; headless, they go to stderr.
+  lock is at risk. The dashboard shows them; headless, they go to stderr. Either way `zkminer
+  run` also keeps its log in `~/.zkminer/logs/zkminer.log` (daily, two weeks; worker output
+  stays out of it) and every page in `~/.zkminer/logs/pages.log` (1 MB and one `.1`), with URLs
+  cut to their host in both (an RPC URL's key never reaches a file). On Windows each page also
+  goes to the Application event log, source `zkminer`, at most once per code every 5 minutes,
+  with a fixed event id per code (`SLASHED` 100, `LOCK-LATE` 101, `JOB-CRASH-LOOP` 106,
+  `SECRETS-UNLABELLED` 110, `PRIVILEGED-ACCOUNT` 111, `PASSWORD-EXPIRES` 117, others 199; see
+  `crates/zkminer-cli/src/logging.rs`): a Task Scheduler task "On an event" (log Application,
+  source zkminer) or a monitoring agent can alert on them. `zkminer status` prints the last ten
+  pages and exits 2 while one is unacknowledged or locks are held with no miner running to drive
+  them (0 otherwise, 1 when it cannot run); `zkminer status --ack` acknowledges the pages shown.
+  The NSSM recipe above keeps the service's own stdout and stderr in the account's
+  `zkminer-service.log` (a start-up error or a refusal is said there only); `zkminer doctor`
+  warns of a service that keeps neither, and of an unregistered event source.
   `PAGE: CHAIN-UNREACHABLE` says no chain read has succeeded for a minute while locks are held
   (repeated every 5 minutes): fulfils and releases go through the same RPC, so the locks can be
   neither proven nor given back until it returns. `PAGE: LOCK-AT-RISK <job>` follows for each lock
