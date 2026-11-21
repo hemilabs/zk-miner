@@ -1838,7 +1838,9 @@ mod tests {
             .round(0, addr, 2, EXTRA_HOPS, &Pin::default(), PROBE_TIMEOUT, Instant::now() + DECIDE_BUDGET)
             .unwrap();
         assert_eq!(obs.iter().map(|o| o.ttl).collect::<Vec<_>>(), vec![2, 3, 4]);
-        assert!(obs.iter().all(|o| o.outcome == ProbeOutcome::Connected && o.local.is_some()), "{obs:?}");
+        // The round ends once decided (the answer at 2): the others may still be pending.
+        assert_eq!(obs[0].outcome, ProbeOutcome::Connected, "{obs:?}");
+        assert!(obs.iter().all(|o| o.local.is_some()), "{obs:?}");
         assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 2);
         drop(l);
         assert!(matches!(decide(&TtlProbe, addr, 2), Verdict::Near(w) if w.contains("refused")));
