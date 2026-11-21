@@ -271,6 +271,39 @@ impl Descriptor {
         Ok(sacl)
     }
 
+    /// The parts `information` names, as SDDL.
+    fn to_sddl(&self, information: u32) -> io::Result<String> {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor: *mut c_void,
+                revision: u32,
+                information: u32,
+                sddl: *mut *mut u16,
+                length: *mut u32,
+            ) -> i32;
+        }
+        let (mut text, mut length) = (std::ptr::null_mut(), 0u32);
+        // SAFETY: a valid descriptor and out-pointers; the string is read (its length is in UTF-16
+        // units, the NUL included) and freed here.
+        unsafe {
+            if ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                self.0,
+                SDDL_REVISION_1,
+                information,
+                &mut text,
+                &mut length,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let units = std::slice::from_raw_parts(text, length.saturating_sub(1) as usize);
+            let sddl = String::from_utf16_lossy(units);
+            LocalFree(text.cast());
+            Ok(sddl.trim_end_matches('\0').to_string())
+        }
+    }
+
     /// Kept for the life of the process (the thread hook below reads it from any thread).
     fn leak(self) -> *mut c_void {
         let p = self.0;
@@ -700,30 +733,266 @@ fn label_no_read_up(path: &Path) -> io::Result<()> {
     set_label(path, NO_READ_UP_FILE)
 }
 
+/// [`label_no_read_up`] on a file whose DACL does not give this user `WRITE_OWNER`, which setting a
+/// label needs: one made private with `icacls <file> /inheritance:r /grant:r <account>:R`, say.
+/// As its owner this user may still change its DACL (an owner's implicit `WRITE_DAC`), so it adds
+/// `WRITE_OWNER` for itself, sets the label, and puts the DACL back as it was. Fails where this user
+/// is not the owner either.
+fn label_no_read_up_as_owner(path: &Path) -> io::Result<()> {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetSecurityInfo(
+            handle: Handle,
+            object_type: i32,
+            information: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            descriptor: *mut *mut c_void,
+        ) -> u32;
+    }
+    let dacl_handle = open_for(path, READ_CONTROL | WRITE_DAC)?;
+    let (mut original, mut dacl) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: an open handle and out-pointers; the descriptor is owned by `Descriptor` at once.
+    let status = unsafe {
+        GetSecurityInfo(
+            dacl_handle.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut original,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let original = Descriptor(original);
+    // Written back as it was read: an auto-inherited DACL keeps that flag only when the descriptor
+    // asks for it (`AR`).
+    let original_sddl = with_auto_inherit_kept(&original.to_sddl(DACL_SECURITY_INFORMATION)?);
+    let user = zkminer_config::wallet::current_user_sid()?;
+    let granted = Descriptor::from_sddl(&format!("{original_sddl}(A;;WO;;;{user})"))?;
+    let original = Descriptor::from_sddl(&original_sddl)?;
+    set_dacl(dacl_handle.as_raw_handle(), granted.0)?;
+    // A handle opened now, as access is checked at the open.
+    let labelled = open_for(path, WRITE_OWNER).and_then(|owner_handle| {
+        let label = Descriptor::from_sddl(NO_READ_UP_FILE)?;
+        set_security(
+            owner_handle.as_raw_handle(),
+            LABEL_SECURITY_INFORMATION,
+            label.0,
+        )
+    });
+    // The DACL as it was, whether or not the label took.
+    let restored = set_dacl(dacl_handle.as_raw_handle(), original.0);
+    labelled.and(restored)
+}
+
+/// `sddl`, a DACL (`D:<flags>(...)`), with `AR` among its flags if `AI` is: so that setting it keeps
+/// the auto-inherited flag, which the kernel drops otherwise.
+fn with_auto_inherit_kept(sddl: &str) -> String {
+    let Some(rest) = sddl.strip_prefix("D:") else {
+        return sddl.to_string();
+    };
+    let flags_end = rest.find('(').unwrap_or(rest.len());
+    let (flags, aces) = rest.split_at(flags_end);
+    if flags.contains("AI") && !flags.contains("AR") {
+        format!("D:{}ARAI{aces}", flags.replace("AI", ""))
+    } else {
+        sddl.to_string()
+    }
+}
+
+/// `path` (the file it names, a link followed) opened for `access` and nothing else.
+fn open_for(path: &Path, access: u32) -> io::Result<OwnedHandle> {
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let name = wide(path.as_os_str());
+    // SAFETY: a NUL-terminated path; the handle is owned at once.
+    unsafe {
+        let handle = CreateFileW(
+            name.as_ptr(),
+            access,
+            FILE_SHARE_ALL,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if handle as isize == -1 || handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedHandle::from_raw_handle(handle))
+    }
+}
+
+/// Whether `path` has a label at Medium or above with no-read-up, as [`label_no_read_up`] sets:
+/// read back, so that a label that did not take never passes for one that did.
+fn has_no_read_up_label(path: &Path) -> io::Result<bool> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            name: *const u16,
+            object_type: i32,
+            information: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut c_void,
+            sacl: *mut *mut c_void,
+            descriptor: *mut *mut c_void,
+        ) -> u32;
+    }
+    let name = wide(path.as_os_str());
+    let (mut sacl, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut());
+    // SAFETY: a NUL-terminated path and out-pointers; the descriptor is owned by `Descriptor` at
+    // once. Reading a label needs only READ_CONTROL.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sacl,
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let sddl = Descriptor(descriptor).to_sddl(LABEL_SECURITY_INFORMATION)?;
+    Ok(label_keeps_low_from_reading(&sddl))
+}
+
+/// Whether the label in `sddl` (`S:(ML;<flags>;<policy>;;;<level>)`) has no-read-up at Medium or
+/// above.
+fn label_keeps_low_from_reading(sddl: &str) -> bool {
+    sddl.split('(').skip(1).any(|ace| {
+        let fields: Vec<&str> = ace.trim_end_matches(')').split(';').collect();
+        matches!(fields.as_slice(), ["ML", _, policy, _, _, level]
+            if policy.contains("NR") && matches!(*level, "ME" | "MP" | "HI" | "SI"))
+    })
+}
+
+/// Label `path` unreadable to Low processes, as this user's own file or as its owner, and check
+/// that the label holds; what went wrong, otherwise.
+fn label_secret(path: &Path) -> Result<(), String> {
+    let labelled = label_no_read_up(path).or_else(|e| {
+        label_no_read_up_as_owner(path).map_err(|as_owner| format!("{e}; as its owner: {as_owner}"))
+    });
+    match labelled.and_then(|()| has_no_read_up_label(path).map_err(|e| e.to_string())) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("the label did not take".to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+/// [`label_secret`] on each of the key file (if the key comes from one), `<home>/.zkminer/.env` and
+/// the journal that exists: those that could not be labelled, in one message with the remedy.
+fn label_secrets(
+    key_file: Option<&Path>,
+    home: Option<&Path>,
+    journal: &Path,
+) -> Result<(), String> {
+    let env_file = home.map(|h| h.join(".zkminer").join(".env"));
+    let failed: Vec<String> = key_file
+        .into_iter()
+        .chain(env_file.as_deref())
+        .chain([journal])
+        .filter(|path| path.exists())
+        .filter_map(|path| {
+            label_secret(path)
+                .err()
+                .map(|e| format!("{} ({e})", path.display()))
+        })
+        .collect();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let one = failed.len() == 1;
+    Err(format!(
+        "{} could not be labelled unreadable to Low-integrity processes, so a Low-integrity worker \
+         could read {}: no worker is started until {} labelled. Setting the label needs the right \
+         to change the file's owner, which a file made private with `icacls /grant:r <account>:R` \
+         does not give the miner's account unless the account owns it: as an administrator, run \
+         `icacls \"<file>\" /grant <account>:(WO)` (or make the account its owner), then start \
+         the miner again",
+        failed.join(", "),
+        if one { "it" } else { "them" },
+        if one { "it is" } else { "they are" },
+    ))
+}
+
+/// What [`protect_secrets`] found: `None` until it ran, then whether every secret is labelled.
+static SECRETS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
 /// With Low workers, label the key file (if the key comes from one), `~/.zkminer/.env` and the lock
 /// journal so no Low process can read them; a file that does not exist is skipped. Labels, never
-/// reads, them. Does nothing without the flag.
+/// reads, them, and reads each label back. A file this user may neither label nor, as its owner,
+/// open to labelling is paged (`SECRETS-UNLABELLED`), and no Low worker is started in this process
+/// ([`spawn_worker`]): a Low worker never runs beside a key it could read. Does nothing without the
+/// flag. Every command that starts workers calls it first; a process that starts a Low worker
+/// without (a test) has `.env` and the journal labelled before its first.
 pub fn protect_secrets(key_file: Option<&Path>, journal: &Path) {
     if !low_il_workers() {
         return;
     }
-    let env_file = dirs::home_dir().map(|h| h.join(".zkminer").join(".env"));
-    for path in key_file
-        .into_iter()
-        .chain(env_file.as_deref())
-        .chain([journal])
-    {
-        if !path.exists() {
-            continue;
-        }
-        if let Err(e) = label_no_read_up(path) {
-            tracing::warn!(
-                "{} could not be labelled unreadable to the Low-integrity workers ({e}); they can \
-                 read it",
-                path.display()
-            );
-        }
+    let labelled = label_secrets(key_file, dirs::home_dir().as_deref(), journal);
+    if let Err(why) = &labelled {
+        tracing::error!("PAGE: SECRETS-UNLABELLED — {why}");
     }
+    *SECRETS.lock().unwrap_or_else(|p| p.into_inner()) = Some(labelled);
+}
+
+/// Before a Low worker: whether the secrets are labelled ([`protect_secrets`]), labelling `.env`
+/// and the default journal first if nothing did.
+fn secrets_labelled() -> Result<(), String> {
+    let mut state = SECRETS.lock().unwrap_or_else(|p| p.into_inner());
+    if state.is_none() {
+        let home = dirs::home_dir();
+        // `JobJournal::default_path` in the CLI.
+        let journal = home
+            .as_deref()
+            .unwrap_or(Path::new("."))
+            .join(".zkminer")
+            .join("job_journal.json");
+        let labelled = label_secrets(None, home.as_deref(), &journal);
+        if let Err(why) = &labelled {
+            tracing::error!("PAGE: SECRETS-UNLABELLED — {why}");
+        }
+        *state = Some(labelled);
+    }
+    state.clone().unwrap_or(Ok(()))
+}
+
+/// For `zkminer doctor`, read only: those of the key file, `<home>/.zkminer/.env` and the journal
+/// that exist and have no label that keeps Low processes from reading them, each with whether this
+/// account could label it ([`protect_secrets`] does at the miner's start): it may change the
+/// file's label, or, as its owner, its DACL. Nothing is changed.
+pub fn secrets_unlabelled(
+    key_file: Option<&Path>,
+    home: &Path,
+    journal: &Path,
+) -> Vec<(PathBuf, bool)> {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    let env_file = home.join(".zkminer").join(".env");
+    key_file
+        .into_iter()
+        .chain([env_file.as_path(), journal])
+        .filter(|path| path.exists() && !has_no_read_up_label(path).unwrap_or(false))
+        .map(|path| {
+            let labellable = open_for(path, WRITE_OWNER).is_ok()
+                || open_for(path, READ_CONTROL | WRITE_DAC).is_ok();
+            (path.to_path_buf(), labellable)
+        })
+        .collect()
 }
 
 /// Write `contents` to a new `path` (an existing one is replaced), labelled from its creation so Low
@@ -956,9 +1225,10 @@ impl WorkerChild {
 /// events, Ctrl+C above all, must not reach it), in the miner's job and a job of its own, at Low
 /// integrity when that is on (see the module docs). Nothing else of the miner's is inherited.
 ///
-/// With Low workers on, a worker whose directories cannot be prepared is not started at all (the
-/// flag fails closed, [`low_il_worker_failed`]), and before the first SP1 worker the server it
-/// runs is installed from here ([`install_sp1_server`]).
+/// With Low workers on, a worker whose directories cannot be prepared, or beside a key file it could
+/// read ([`protect_secrets`]), is not started at all (the flag fails closed,
+/// [`low_il_worker_failed`]), and before the first SP1 worker the server it runs is installed from
+/// here ([`install_sp1_server`]).
 pub(crate) fn spawn_worker(
     backend: &str,
     program: &Path,
@@ -970,6 +1240,13 @@ pub(crate) fn spawn_worker(
     let test_root: Option<PathBuf> = None;
     let low = low_il_workers() || test_root.is_some();
     if low {
+        // Never beside a key it could read (`protect_secrets`). Tests label no secrets of theirs.
+        if test_root.is_none() {
+            secrets_labelled().map_err(|why| {
+                low_il_worker_failed(backend, &why);
+                io::Error::other(why)
+            })?;
+        }
         let dirs = low_dirs(test_root.as_deref())
             .and_then(|dirs| label_env_dirs(&env).map(|()| dirs))
             .map_err(|e| {
@@ -1789,6 +2066,149 @@ mod tests {
         assert!(out.contains("READ_JOURNAL Err(Some(5))"), "{out}");
         assert!(out.contains("WRITE_LOW Ok(())"), "{out}");
         assert!(out.contains("WRITE_MEDIUM Err(Some(5))"), "{out}");
+    }
+
+    /// `icacls <path> <args>`, which must succeed.
+    fn icacls(path: &Path, args: &[&str]) {
+        let out = std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "icacls {args:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// The file's DACL, as SDDL.
+    fn dacl_of(path: &Path) -> String {
+        const READ_CONTROL: u32 = 0x0002_0000;
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn GetSecurityInfo(
+                handle: Handle,
+                object_type: i32,
+                information: u32,
+                owner: *mut *mut c_void,
+                group: *mut *mut c_void,
+                dacl: *mut *mut c_void,
+                sacl: *mut *mut c_void,
+                descriptor: *mut *mut c_void,
+            ) -> u32;
+        }
+        let file = open_for(path, READ_CONTROL).unwrap();
+        let (mut dacl, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: an open handle and out-pointers; the descriptor is owned at once.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0);
+        Descriptor(descriptor)
+            .to_sddl(DACL_SECURITY_INFORMATION)
+            .unwrap()
+    }
+
+    /// KL1: a key file made private as the README said (`/inheritance:r /grant:r <account>:R`) no
+    /// longer lets its user set the label directly, but its owner still labels it, leaves its DACL
+    /// as it was, and a Low worker then cannot read it.
+    #[test]
+    fn a_private_key_file_is_still_labelled_by_its_owner() {
+        let dir = std::env::temp_dir().join(format!("zkminer-key-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("miner.key");
+        std::fs::write(&key, b"not a key").unwrap();
+        let user = zkminer_config::wallet::current_user_sid().unwrap();
+        icacls(&key, &["/inheritance:r", "/grant:r", &format!("*{user}:R")]);
+        let private = dacl_of(&key);
+        let journal = dir.join("journal.json");
+        let before = secrets_unlabelled(Some(&key), &dir, &journal);
+        let direct = label_no_read_up(&key).map_err(|e| e.raw_os_error());
+        let labelled = label_secret(&key);
+        let label_held = has_no_read_up_label(&key).unwrap();
+        let after = dacl_of(&key);
+        let unlabelled_after = secrets_unlabelled(Some(&key), &dir, &journal);
+        let mut child = low_helper_child(
+            "windows_sandbox::tests::low_helper",
+            &[
+                (HELPER, "low".into()),
+                ("ZKMINER_TEST_PARENT", std::process::id().to_string()),
+                ("ZKMINER_TEST_SECRET", key.display().to_string()),
+                ("ZKMINER_TEST_JOURNAL", journal.display().to_string()),
+                ("ZKMINER_TEST_LOW_DIR", dir.display().to_string()),
+                ("ZKMINER_TEST_MEDIUM_DIR", dir.display().to_string()),
+            ],
+        );
+        let out = read_all(&mut child);
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(direct, Err(Some(5)), "the direct label needs WRITE_OWNER");
+        assert_eq!(labelled, Ok(()));
+        assert!(label_held);
+        assert_eq!(after, private, "the DACL was not put back");
+        assert_eq!(
+            before,
+            vec![(key.clone(), true)],
+            "doctor: labellable as its owner"
+        );
+        assert!(unlabelled_after.is_empty(), "{unlabelled_after:?}");
+        assert!(status.success(), "{status:?}\n{out}");
+        assert!(out.contains("READ_SECRET Err(Some(5))"), "{out}");
+    }
+
+    /// KL1: a key file this user can neither label nor, as its owner, open to labelling (its owner's
+    /// rights taken away) is reported, with the remedy, and doctor finds it unlabelled.
+    #[test]
+    fn a_key_file_that_cannot_be_labelled_is_refused() {
+        let dir = std::env::temp_dir().join(format!("zkminer-key-nolabel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("miner.key");
+        std::fs::write(&key, b"not a key").unwrap();
+        let user = zkminer_config::wallet::current_user_sid().unwrap();
+        icacls(
+            &key,
+            &[
+                "/inheritance:r",
+                "/grant:r",
+                &format!("*{user}:R"),
+                "/grant:r",
+                "*S-1-3-4:R",
+            ],
+        );
+        let journal = dir.join("job_journal.json");
+        let refused = label_secrets(Some(&key), None, &journal);
+        let unlabelled = secrets_unlabelled(Some(&key), &dir, &journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let why = refused.unwrap_err();
+        assert!(
+            why.contains("miner.key")
+                && why.contains("no worker is started")
+                && why.contains("(WO)"),
+            "{why}"
+        );
+        assert_eq!(unlabelled, vec![(key, false)]);
+    }
+
+    #[test]
+    fn which_labels_keep_low_from_reading() {
+        assert!(label_keeps_low_from_reading("S:(ML;;NWNR;;;ME)"));
+        assert!(label_keeps_low_from_reading("S:(ML;;NRNW;;;HI)"));
+        assert!(!label_keeps_low_from_reading("S:(ML;;NW;;;ME)"));
+        assert!(!label_keeps_low_from_reading("S:(ML;;NWNR;;;LW)"));
+        assert!(!label_keeps_low_from_reading("S:"));
+        assert!(!label_keeps_low_from_reading(""));
     }
 
     /// The same process at Medium: its environment and pipes work, it gets no handle it was not

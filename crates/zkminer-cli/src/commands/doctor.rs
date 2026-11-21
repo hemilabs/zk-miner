@@ -145,6 +145,40 @@ fn key_on_disk_warning(
     })
 }
 
+/// Windows, Low-integrity workers on: what to say of the key file, `.env` and the journal found
+/// without a label that keeps the workers from reading them
+/// (`windows_sandbox::secrets_unlabelled`), given as (file, whether this account can label it).
+#[cfg(any(windows, test))]
+fn secret_label_findings(unlabelled: &[(PathBuf, bool)]) -> Vec<(Level, String)> {
+    unlabelled
+        .iter()
+        .map(|(file, labellable)| {
+            if *labellable {
+                (
+                    Level::Info,
+                    format!(
+                        "{} is not labelled yet: the miner labels it unreadable to its \
+                         Low-integrity workers when it starts",
+                        file.display()
+                    ),
+                )
+            } else {
+                (
+                    Level::Fail,
+                    format!(
+                        "{} cannot be labelled unreadable to Low-integrity workers by this account \
+                         (it is private to it without the right to change its owner), so the \
+                         miner starts no worker (PAGE: SECRETS-UNLABELLED). As an administrator, \
+                         run `icacls \"{}\" /grant <account>:(WO)`, or make the account its owner",
+                        file.display(),
+                        file.display()
+                    ),
+                )
+            }
+        })
+        .collect()
+}
+
 /// Windows, an `env` key source: what to say of each copy of the key's variable kept in the
 /// registry (`zkminer_config::wallet_win`), given as (where, readable by every user of this PC).
 #[cfg(any(windows, test))]
@@ -211,6 +245,22 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
         zkminer_prover::windows_sandbox::low_il_workers(),
     ) {
         report.say(Level::Warn, "key", warning);
+    }
+    // With Low-integrity workers, the label that keeps them from the key: there, or settable.
+    #[cfg(windows)]
+    if zkminer_prover::windows_sandbox::low_il_workers() {
+        let key_file = (config.wallet.key_source == "file")
+            .then(|| config.wallet.key_file_path.as_deref().map(Path::new))
+            .flatten();
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let unlabelled = zkminer_prover::windows_sandbox::secrets_unlabelled(
+            key_file,
+            &home,
+            &crate::journal::JobJournal::default_path(),
+        );
+        for (level, finding) in secret_label_findings(&unlabelled) {
+            report.say(level, "key", finding);
+        }
     }
     let host = rpc_host(&config.chain.rpc_url);
     let client = match tokio::time::timeout(
@@ -1392,6 +1442,28 @@ mod tests {
         std::fs::write(home.0.join(".env"), "").unwrap();
         let w = key_on_disk_warning(&wallet, &home.0, false).unwrap();
         assert!(w.contains(".env, if it holds the key,"), "{w}");
+    }
+
+    /// Windows, Low-integrity workers: an unlabelled secret the miner can label is only noted; one
+    /// it cannot fails, with the icacls remedy naming the file.
+    #[test]
+    fn doctor_fails_a_secret_the_miner_cannot_label() {
+        assert!(secret_label_findings(&[]).is_empty());
+        let found = secret_label_findings(&[
+            (PathBuf::from(r"C:\keys\miner.key"), false),
+            (PathBuf::from(r"C:\Users\z\.zkminer\.env"), true),
+        ]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, Level::Fail);
+        assert!(
+            found[0]
+                .1
+                .contains(r#"icacls "C:\keys\miner.key" /grant <account>:(WO)"#),
+            "{}",
+            found[0].1
+        );
+        assert_eq!(found[1].0, Level::Info);
+        assert!(found[1].1.contains("labels it"), "{}", found[1].1);
     }
 
     /// Windows, an `env` key: a copy in the machine's or a service's environment fails (every user

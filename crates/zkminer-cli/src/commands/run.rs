@@ -3632,6 +3632,19 @@ mod refused_account_tests {
     }
 }
 
+/// Windows, with Low-integrity workers: the key file (if `config` names one), `.env` and the journal
+/// labelled unreadable to them before any worker starts (`windows_sandbox::protect_secrets`). Every
+/// command that starts workers calls it first.
+#[cfg(windows)]
+pub(crate) fn protect_secrets(config: &ZkMinerConfig) {
+    zkminer_prover::windows_sandbox::protect_secrets(
+        (config.wallet.key_source == "file")
+            .then(|| config.wallet.key_file_path.as_deref().map(Path::new))
+            .flatten(),
+        &JobJournal::default_path(),
+    );
+}
+
 pub async fn run(
     config_path: Option<&Path>,
     headless: bool,
@@ -3641,12 +3654,7 @@ pub async fn run(
     config.validate_for_chain()?;
     // Windows, with Low-integrity workers: the key file, `.env` and the journal unreadable to them.
     #[cfg(windows)]
-    zkminer_prover::windows_sandbox::protect_secrets(
-        (config.wallet.key_source == "file")
-            .then(|| config.wallet.key_file_path.as_deref().map(Path::new))
-            .flatten(),
-        &JobJournal::default_path(),
-    );
+    protect_secrets(&config);
     // Windows: a service account `main` was told to let through, or an elevated token, paged.
     #[cfg(windows)]
     zkminer_prover::windows_sandbox::page_account_risk();
