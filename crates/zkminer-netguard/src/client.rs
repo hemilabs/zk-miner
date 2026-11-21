@@ -1681,6 +1681,10 @@ mod tests {
         let policy = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new()).with_near_probe(probe.clone());
         let v = policy.vet_path(addr, addr).unwrap();
         assert_eq!((v.source, v.port), (Some(src), Some(45678)));
+        let interface = crate::nearhop::interface_of(src).unwrap();
+        assert!(interface.is_some());
+        assert_eq!(v.interface, interface, "the interface that holds the source");
+        assert_eq!(probe.pins.lock().unwrap()[0].interface, interface, "probed through it");
         assert_eq!(probe.pins.lock().unwrap()[0].source, Some(src), "probed from it");
         assert_eq!(connected_as_vetted(&v, SocketAddr::new(src, 45678), addr), Ok(()));
         let why = connected_as_vetted(&v, SocketAddr::new(src, 45679), addr).unwrap_err();
