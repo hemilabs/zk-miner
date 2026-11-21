@@ -655,6 +655,8 @@ async fn shutdown_stage(
 pub(crate) fn force_exit() -> ! {
     // Stops the dashboard drawing before the terminal is handed back (a no-op without one).
     restore_terminal_bounded();
+    // The operator's force exit is not a crash either (`ProveStart`).
+    end_counted_prove_starts();
     let now = zkminer_chain::client::chain_now_floor();
     let journal = crate::journal::JobJournal::load();
     let live: Vec<u64> = journal
@@ -6017,6 +6019,8 @@ pub async fn run(
         break;
     }
 
+    // An exit on purpose: the proofs still running did not end in a crash.
+    end_counted_prove_starts();
     set_ladder_phase(PHASE_FINISHING);
     shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
     shutdown_status(&state, headless, "stopping the provers...".to_string()).await;
@@ -13130,7 +13134,16 @@ async fn process_job_lifecycle(
             format!("Proving job {} with {}...", short_id(job_id), backend),
         );
     }
+    // A job whose proof the miner has died in the middle of, run after run, is released rather than
+    // proven once more (`crash_loop_refusal`).
+    let crash_loop = crash_loop_refusal(&journal.lock().unwrap_or_else(|p| p.into_inner()), job_id);
+    if let Some(why) = crash_loop {
+        tracing::error!("PAGE: JOB-CRASH-LOOP — {why}");
+        return Err(anyhow::anyhow!("{why}"));
+    }
     journal_update(journal, |j| j.mark_proving(job_id));
+    // Counted until the proof below ends, however it ends.
+    let prove_start = ProveStart::counted(journal, job_id);
 
     let pool = zkminer_prover::engine::worker_pool()
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
@@ -14188,6 +14201,7 @@ async fn process_job_lifecycle(
             }
         }
     };
+    drop(prove_start);
 
     card.release();
     if let Some(slot) = &proved_on {
@@ -17413,6 +17427,78 @@ fn journal_update(journal: &SharedJournal, f: impl FnOnce(&mut JobJournal)) {
     save_journal_or_warn(&j);
 }
 
+/// How many runs in a row may end in the middle of one job's proof before the job is released
+/// rather than proven again (`crash_loop_refusal`).
+const MAX_UNFINISHED_PROVE_STARTS: u8 = 3;
+
+/// Why `job_id` is released rather than proven again, if it is: its proof started
+/// [`MAX_UNFINISHED_PROVE_STARTS`] times in runs that ended before it did
+/// ([`JournalEntry::prove_starts`](crate::journal::JournalEntry::prove_starts)). Whatever ends the
+/// miner (a crash, a kill, or a requester's guest that broke out of its worker and ends it each time
+/// its job is proven again), every lock the miner holds would otherwise be driven to its deadline
+/// one restart after another, and slashed.
+fn crash_loop_refusal(journal: &JobJournal, job_id: B256) -> Option<String> {
+    let starts = journal.prove_starts(job_id);
+    (starts >= MAX_UNFINISHED_PROVE_STARTS).then(|| {
+        format!(
+            "job {}: its proof started {starts} times, and each time the miner ended before it \
+             did (a crash, a kill, or a guest that broke out of its worker and ended the miner). \
+             Releasing it rather than proving it again, so that it cannot keep the miner from \
+             its other locks",
+            short_id(job_id)
+        )
+    })
+}
+
+/// The proof starts counted in the journal ([`ProveStart`]) whose proofs have not ended:
+/// (token, job, journal).
+static COUNTED_PROVE_STARTS: Mutex<Vec<(u64, B256, SharedJournal)>> = Mutex::new(Vec::new());
+
+/// A proof start counted in the journal (`note_prove_start`), taken back when the proof ends in
+/// this run, however it ends (dropped), or when the miner exits on purpose with it still running
+/// ([`end_counted_prove_starts`]): only a run that ended some other way leaves it counted.
+struct ProveStart(u64);
+
+impl ProveStart {
+    fn counted(journal: &SharedJournal, job_id: B256) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        journal_update(journal, |j| j.note_prove_start(job_id));
+        COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((token, job_id, journal.clone()));
+        Self(token)
+    }
+}
+
+impl Drop for ProveStart {
+    fn drop(&mut self) {
+        let mut counted = COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(at) = counted.iter().position(|(token, ..)| *token == self.0) else {
+            return;
+        };
+        let (_, job_id, journal) = counted.swap_remove(at);
+        drop(counted);
+        journal_update(&journal, |j| j.note_prove_end(job_id));
+    }
+}
+
+/// The miner is exiting on purpose (a stop, keep-locks included): the proofs still running are not
+/// a crash, so their starts no longer count.
+fn end_counted_prove_starts() {
+    let counted = std::mem::take(
+        &mut *COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    );
+    for (_, job_id, journal) in counted {
+        journal_update(&journal, |j| j.note_prove_end(job_id));
+    }
+}
+
 /// True if the shared journal currently holds an entry for `job_id`.
 fn journal_has(journal: &SharedJournal, job_id: B256) -> bool {
     journal
@@ -18347,6 +18433,30 @@ mod tests {
         // No rate, no card.
         assert!(!fits(1, 0.0, 3000));
         assert!(!fits(1, f64::NAN, 3000));
+    }
+
+    /// A job whose proof the miner died in the middle of in three runs in a row is released, not
+    /// proven a fourth time; a proof that ended in its run (proved, failed, stopped) does not count.
+    #[test]
+    fn a_job_the_miner_keeps_dying_while_proving_is_released() {
+        let mut journal = JobJournal::default();
+        let job = B256::repeat_byte(0x3c);
+        journal.mark_claimed(job, None, u64::MAX);
+        // Proofs that end in their run, however many.
+        for _ in 0..5 {
+            journal.note_prove_start(job);
+            journal.note_prove_end(job);
+        }
+        assert_eq!(crash_loop_refusal(&journal, job), None);
+        // Runs that end mid-proof: the miner killed each time the job is proven again.
+        for run in 0..MAX_UNFINISHED_PROVE_STARTS {
+            assert_eq!(crash_loop_refusal(&journal, job), None, "run {run}");
+            journal.note_prove_start(job);
+        }
+        let why = crash_loop_refusal(&journal, job).expect("released");
+        assert!(why.contains("started 3 times"), "{why}");
+        // Another job is not affected.
+        assert_eq!(crash_loop_refusal(&journal, B256::repeat_byte(0x3d)), None);
     }
 
     /// Raising the proving timeout brings back the jobs skipped as too long for the old one at once,

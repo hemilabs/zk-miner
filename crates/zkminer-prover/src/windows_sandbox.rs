@@ -8,15 +8,17 @@
 //! - The miner's process, and each of its threads, grants this user only what a process manager
 //!   needs: query its name and times, wait for it, end it ([`lock_down_this_process`]). No other
 //!   process of the user's, a worker included, can read its memory, inject code, or change that
-//!   back; an elevated process with `SeDebugPrivilege` still can.
+//!   back; an elevated process with `SeDebugPrivilege` still can. Its label (Medium, no write, read
+//!   or execute up) keeps even those from Low processes: a Low worker cannot end the miner.
 //! - Every worker starts suspended in a job of its own (`windows_job::new_worker_job`: no desktop,
 //!   no clipboard, no breakaway) and is resumed once it is in it ([`spawn_worker`]).
 //! - With `ZKMINER_WINDOWS_LOW_IL_WORKERS=1`, every worker runs at Low integrity: it cannot open the
-//!   miner (or any process of the user's at Medium) at all, nor write a file or registry key at
-//!   Medium. Its temporary, cache and segment directories are made writable at Low before it starts,
-//!   and the key file, `~/.zkminer/.env` and the lock journal get a label Low processes cannot read
-//!   through ([`protect_secrets`], [`write_secret_file`]). No other Low worker can open it but to see
-//!   it ([`low_worker_descriptors`]). Off by default until each GPU runtime is known to work at Low.
+//!   miner at all (another process of the user's at Medium, only to see and end it), nor write a
+//!   file or registry key at Medium. Its temporary, cache and segment directories are made writable
+//!   at Low before it starts, and the key file, `~/.zkminer/.env` and the lock journal get a label
+//!   Low processes cannot read through ([`protect_secrets`], [`write_secret_file`]). No other Low
+//!   worker can open its process or first thread at all ([`low_worker_descriptors`]). Off by
+//!   default until each GPU runtime is known to work at Low.
 //!   The flag fails closed: a worker that cannot start at Low (its handshake fails, or its
 //!   directories cannot be prepared) is not started at Medium instead but paged and tried again at
 //!   Low after a back-off ([`low_il_worker_failed`]), as a Low process could otherwise force the
@@ -57,6 +59,7 @@ const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
 const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
 
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
 const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
@@ -282,9 +285,13 @@ impl Drop for Descriptor {
 }
 
 fn set_dacl(handle: Handle, descriptor: *mut c_void) -> io::Result<()> {
-    // SAFETY: a handle with WRITE_DAC (or a pseudo-handle, which has every right) and a valid
-    // descriptor.
-    if unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor) } == 0 {
+    set_security(handle, DACL_SECURITY_INFORMATION, descriptor)
+}
+
+fn set_security(handle: Handle, information: u32, descriptor: *mut c_void) -> io::Result<()> {
+    // SAFETY: a handle with WRITE_DAC, and WRITE_OWNER for a label (or a pseudo-handle, which has
+    // every right), and a valid descriptor.
+    if unsafe { SetKernelObjectSecurity(handle, information, descriptor) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -296,6 +303,24 @@ fn set_dacl(handle: Handle, descriptor: *mut c_void) -> io::Result<()> {
 fn locked_dacl(user: &str, user_rights: u32, all: u32) -> String {
     format!("D:P(A;;{user_rights:#x};;;{user})(A;;{all:#x};;;SY)(A;;{user_rights:#x};;;OW)")
 }
+
+/// The label of the miner's process and threads, and of a Low worker's: Medium, no write, read or
+/// execute up. A Low process gets no right on it at all, not even the generic execute ones no
+/// write or read policy withholds (`TERMINATE`, `SYNCHRONIZE`, `QUERY_LIMITED_INFORMATION`): a Low
+/// worker can neither end the miner (nor a sibling) nor tell when one ends. Processes at Medium or
+/// above, `zkminer stop` and the miner itself included, are not affected.
+const NO_UP_LABEL: &str = "S:(ML;;NWNRNX;;;ME)";
+
+/// [`locked_dacl`] with [`NO_UP_LABEL`].
+fn locked_descriptor(user: &str, user_rights: u32, all: u32) -> io::Result<Descriptor> {
+    Descriptor::from_sddl(&format!(
+        "{}{NO_UP_LABEL}",
+        locked_dacl(user, user_rights, all)
+    ))
+}
+
+/// What [`lock_down_this_process`] sets: the DACL and the label.
+const LOCKED_INFORMATION: u32 = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
 
 /// The descriptor every thread of the miner gets once [`lock_down_this_process`] ran.
 static THREAD_DESCRIPTOR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
@@ -311,9 +336,7 @@ unsafe extern "system" fn on_thread_attach(_module: *mut c_void, reason: u32, _:
         let descriptor = THREAD_DESCRIPTOR.load(Ordering::Acquire);
         if !descriptor.is_null() {
             // SAFETY: the pseudo-handle of the calling thread and a descriptor that is never freed.
-            unsafe {
-                SetKernelObjectSecurity(GetCurrentThread(), DACL_SECURITY_INFORMATION, descriptor)
-            };
+            unsafe { SetKernelObjectSecurity(GetCurrentThread(), LOCKED_INFORMATION, descriptor) };
         }
     }
 }
@@ -334,11 +357,15 @@ static ON_THREAD_ATTACH: unsafe extern "system" fn(*mut c_void, u32, *mut c_void
 /// keeps its handle. Elevated processes with `SeDebugPrivilege` are not stopped.
 pub fn lock_down_this_process() -> io::Result<()> {
     let user = zkminer_config::wallet::current_user_sid()?;
-    let process =
-        Descriptor::from_sddl(&locked_dacl(&user, PROCESS_USER_RIGHTS, PROCESS_ALL_ACCESS))?;
-    // SAFETY: the pseudo-handle of this process.
-    set_dacl(unsafe { GetCurrentProcess() }, process.0)?;
-    let thread = Descriptor::from_sddl(&locked_dacl(&user, THREAD_USER_RIGHTS, THREAD_ALL_ACCESS))?;
+    let process = locked_descriptor(&user, PROCESS_USER_RIGHTS, PROCESS_ALL_ACCESS)?;
+    // SAFETY: the pseudo-handle of this process. Its label may be set at or below this process's
+    // own level with no privilege (WRITE_OWNER, which the pseudo-handle has).
+    set_security(
+        unsafe { GetCurrentProcess() },
+        LOCKED_INFORMATION,
+        process.0,
+    )?;
+    let thread = locked_descriptor(&user, THREAD_USER_RIGHTS, THREAD_ALL_ACCESS)?;
     let thread = thread.leak();
     // The threads started from now on lock themselves, then the ones running now are locked.
     THREAD_DESCRIPTOR.store(thread, Ordering::Release);
@@ -365,10 +392,12 @@ fn lock_running_threads(descriptor: *mut c_void) -> io::Result<()> {
         let mut failed = None;
         while more {
             if entry.owner_process_id == me {
-                let thread = OpenThread(WRITE_DAC, 0, entry.thread_id);
+                let thread = OpenThread(WRITE_DAC | WRITE_OWNER, 0, entry.thread_id);
                 if !thread.is_null() {
                     let thread = OwnedHandle::from_raw_handle(thread);
-                    if let Err(e) = set_dacl(thread.as_raw_handle(), descriptor) {
+                    if let Err(e) =
+                        set_security(thread.as_raw_handle(), LOCKED_INFORMATION, descriptor)
+                    {
                         failed = Some(e);
                     }
                 }
@@ -573,7 +602,6 @@ fn make_plain_dir(path: &Path) -> io::Result<()> {
 /// is refused, not followed, so a label meant for the Low tree never lands on what it points at.
 fn set_dir_label(path: &Path, sddl: &str) -> io::Result<()> {
     const READ_CONTROL: u32 = 0x0002_0000;
-    const WRITE_OWNER: u32 = 0x0008_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_SHARE_ALL: u32 = 0x7;
     const OPEN_EXISTING: u32 = 3;
@@ -1113,16 +1141,14 @@ fn environment_block(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
 /// What this user keeps on a Low worker's process: what the miner opens one by pid for (see it, its
 /// times and memory figures, wait for it, end it).
 const LOW_WORKER_USER_RIGHTS: u32 = PROCESS_USER_RIGHTS | PROCESS_VM_READ;
-/// A Low worker's process and first thread are labelled Medium, no read and no write up: a Low
-/// process (another Low worker) gets none of the rights above but seeing and waiting for it.
-const LOW_WORKER_LABEL: &str = "S:(ML;;NWNR;;;ME)";
 
 /// The descriptors of a Low worker's process and first thread. A Low worker's token keeps this
 /// user's SID, and its default DACL grants that SID everything, so without these any other Low
 /// worker could read another's memory (another requester's guest and inputs), run code in it or
 /// end it before its handshake. With them, this user gets only [`LOW_WORKER_USER_RIGHTS`] (on the
-/// thread, [`THREAD_USER_RIGHTS`]), and the Medium label keeps even those from Low processes but
-/// for seeing and waiting. Threads the worker starts later have its token's default DACL.
+/// thread, [`THREAD_USER_RIGHTS`]), and the Medium label ([`NO_UP_LABEL`]) keeps every one of those
+/// from Low processes, the worker itself by its pid included. Threads the worker starts later have
+/// its token's default DACL.
 ///
 /// No object can be created with a label above its creator's token's, and the handles a process's
 /// creator gets are checked against the descriptor it gives, which cannot tell the miner from a
@@ -1139,14 +1165,8 @@ fn low_worker_descriptors() -> io::Result<LowWorkerDescriptors> {
     let user = zkminer_config::wallet::current_user_sid()?;
     let pair = |process_rights: u32, thread_rights: u32| -> io::Result<_> {
         Ok((
-            Descriptor::from_sddl(&format!(
-                "{}{LOW_WORKER_LABEL}",
-                locked_dacl(&user, process_rights, PROCESS_ALL_ACCESS)
-            ))?,
-            Descriptor::from_sddl(&format!(
-                "{}{LOW_WORKER_LABEL}",
-                locked_dacl(&user, thread_rights, THREAD_ALL_ACCESS)
-            ))?,
+            locked_descriptor(&user, process_rights, PROCESS_ALL_ACCESS)?,
+            locked_descriptor(&user, thread_rights, THREAD_ALL_ACCESS)?,
         ))
     };
     Ok(LowWorkerDescriptors {
@@ -1581,6 +1601,14 @@ mod tests {
             .unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("child-ok"));
         crate::windows_job::join();
+        // It still opens itself by its pid, as the miner does for its own times and memory.
+        assert_eq!(
+            open_process(
+                std::process::id(),
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+            ),
+            Ok(())
+        );
         println!(
             "READY pid={} main={main_tid} new={new_tid}",
             std::process::id()
@@ -1592,8 +1620,9 @@ mod tests {
     /// A process of this user, at the same integrity, can no longer read the locked-down miner's
     /// memory, write it, start a thread in it, change its DACL back, or touch its threads' contexts
     /// (one running at the lock-down and one started after); it can still see it and end it.
-    #[test]
-    fn a_locked_down_process_refuses_this_user() {
+    /// [`locked_down_helper`] started (at this process's level), once it is locked down: it, and
+    /// its pid and main and new thread ids.
+    fn locked_down_child() -> (std::process::Child, u32, u32, u32) {
         let mut child = helper(
             "windows_sandbox::tests::locked_down_helper",
             &[(HELPER, "dacl".into())],
@@ -1618,6 +1647,12 @@ mod tests {
                 .unwrap()
         };
         let (pid, main, new) = (field("pid"), field("main"), field("new"));
+        (child, pid, main, new)
+    }
+
+    #[test]
+    fn a_locked_down_process_refuses_this_user() {
+        let (mut child, pid, main, new) = locked_down_child();
         let denied = Err(ERROR_ACCESS_DENIED);
         let checks = [
             ("VM_READ", open_process(pid, PROCESS_VM_READ)),
@@ -1868,13 +1903,83 @@ mod tests {
         ] {
             println!("OPEN {what} {:?}", open_process(target, access));
         }
+        // And the threads `ZKMINER_TEST_TARGET_THREADS` (ids, comma-separated), if given.
+        let threads = std::env::var("ZKMINER_TEST_TARGET_THREADS").unwrap_or_default();
+        for tid in threads.split(',').filter_map(|t| t.parse::<u32>().ok()) {
+            const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+            for (what, access) in [
+                (
+                    "CONTEXT",
+                    THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                ),
+                ("ALL", THREAD_ALL_ACCESS),
+                ("QUERY", THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE),
+            ] {
+                println!("THREAD {tid} {what} {:?}", open_thread(tid, access));
+            }
+        }
     }
 
-    /// One Low worker cannot read, write, start a thread in, suspend or re-DACL another; it can
-    /// see it, wait for it and end it (a process's generic execute right, which no label keeps
-    /// from a Low process: since a Low worker that fails is not started at Medium instead, that
-    /// costs only the worker). The miner (here, at Medium) still opens it as it does by pid, for
-    /// its times and memory figures and to end it, and no more.
+    /// A Low process gets nothing on the locked-down miner: it can neither end it nor wait for
+    /// it, read it or touch its threads (a thread running at the lock-down and one started after).
+    /// A process of this user at Medium (`zkminer stop`, a process manager) still sees and ends it.
+    #[test]
+    fn a_low_process_cannot_end_or_open_the_miner() {
+        let (mut miner, pid, main, new) = locked_down_child();
+        let mut probe = low_helper_child(
+            "windows_sandbox::tests::low_probing_helper",
+            &[
+                (HELPER, "probe".into()),
+                ("ZKMINER_TEST_TARGET", pid.to_string()),
+                ("ZKMINER_TEST_TARGET_THREADS", format!("{main},{new}")),
+            ],
+        );
+        let out = read_all(&mut probe);
+        let probed = probe.wait().unwrap();
+        let still_alive = miner.try_wait().unwrap().is_none();
+        let by_medium = [
+            open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE),
+            open_process(pid, PROCESS_TERMINATE),
+        ];
+        drop(miner.stdin.take());
+        let _ = miner.kill();
+        let _ = miner.wait();
+        assert!(probed.success(), "{probed:?}\n{out}");
+        assert!(
+            out.contains("LEVEL 0x1000"),
+            "the probe is not at Low:\n{out}"
+        );
+        for what in [
+            "VM_READ",
+            "VM_WRITE",
+            "CREATE_THREAD",
+            "DUP_HANDLE",
+            "SUSPEND_RESUME",
+            "TERMINATE",
+            "WRITE_DAC",
+            "QUERY",
+        ] {
+            assert!(
+                out.contains(&format!("OPEN {what} Err({ERROR_ACCESS_DENIED})")),
+                "{what} was not refused:\n{out}"
+            );
+        }
+        for tid in [main, new] {
+            for what in ["CONTEXT", "ALL", "QUERY"] {
+                assert!(
+                    out.contains(&format!("THREAD {tid} {what} Err({ERROR_ACCESS_DENIED})")),
+                    "thread {tid} {what} was not refused:\n{out}"
+                );
+            }
+        }
+        assert!(still_alive, "the Low probe ended the miner");
+        assert_eq!(by_medium, [Ok(()), Ok(())]);
+    }
+
+    /// One Low worker cannot read, write, start a thread in, suspend, re-DACL, end or even wait for
+    /// another (the label withholds a process's generic execute rights from Low processes too). The
+    /// miner (here, at Medium) still opens it as it does by pid, for its times and memory figures
+    /// and to end it, and no more.
     #[test]
     fn low_workers_cannot_open_each_other() {
         let mut target = low_helper_child(
@@ -1913,14 +2018,14 @@ mod tests {
             "DUP_HANDLE",
             "SUSPEND_RESUME",
             "WRITE_DAC",
+            "TERMINATE",
+            "QUERY",
         ] {
             assert!(
                 out.contains(&format!("OPEN {what} Err({ERROR_ACCESS_DENIED})")),
                 "{what} was not refused:\n{out}"
             );
         }
-        assert!(out.contains("OPEN QUERY Ok(())"), "{out}");
-        assert!(out.contains("OPEN TERMINATE Ok(())"), "{out}");
         // VM_WRITE, refused to the miner too.
         assert_eq!(by_miner, [Ok(()), Ok(()), Err(ERROR_ACCESS_DENIED)]);
         assert!(still_alive, "the probe ended the other worker");

@@ -100,15 +100,27 @@ pub struct JournalEntry {
     /// another rule can say that this lock's guest may now commit something else. `None` in a
     /// breadcrumb written before the rule was recorded.
     pub sys_rand_rule: Option<String>,
-    /// For a witness-construction lock, the bundle it is proven from (format 2). `None` for an
-    /// inline job and in every format-1 entry.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub witness: Option<WitnessBundleRef>,
     /// The cycles the job measured at before it was claimed, and how long that execution took in
     /// seconds, so a restart still shows how far its proof is. `None` in a breadcrumb written before
     /// they were recorded.
     pub measured_cycles: Option<u64>,
     pub measured_execute_secs: Option<u64>,
+    /// For a witness-construction lock, the bundle it is proven from (format 2). `None` for an
+    /// inline job and in every format-1 entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness: Option<WitnessBundleRef>,
+    /// Proofs of this job that started and never ended: each start counts one, and the proof's end
+    /// in the same run (proved, failed or stopped) takes it back, so what is left counts runs that
+    /// ended in the middle of its proof (the miner killed or crashed). A guest that breaks out of
+    /// its worker and ends the miner every time the job is proven again leaves one more each time,
+    /// and the job is released at a limit rather than proven forever (`run::crash_loop_refusal`).
+    /// Absent (0) in an entry written before it was recorded; an older build ignores it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub prove_starts: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 impl Default for JournalEntry {
@@ -124,9 +136,10 @@ impl Default for JournalEntry {
             lock_reopens: None,
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
-            witness: None,
             measured_cycles: None,
             measured_execute_secs: None,
+            witness: None,
+            prove_starts: 0,
         }
     }
 }
@@ -285,6 +298,17 @@ impl JobJournal {
         Ok(j)
     }
 
+    /// The journal at the default path as it is, for a report (`zkminer doctor`, `zkminer stop`, a
+    /// forced exit): empty when it is missing, unreadable or does not parse, and never moved aside,
+    /// which only a run that takes the journal over does ([`Self::load_checked`]).
+    pub fn peek() -> Self {
+        std::fs::read_to_string(Self::default_path())
+            .ok()
+            .and_then(|content| parse_journal(&content).ok())
+            .map(|(j, _)| j)
+            .unwrap_or_default()
+    }
+
     /// [`Self::load_checked_from`] without the logging, for tests.
     pub fn load_reporting(path: &Path) -> std::result::Result<(Self, LoadReport), JournalLoadError> {
         let content = match std::fs::read_to_string(path) {
@@ -400,9 +424,10 @@ impl JobJournal {
             lock_reopens: None,
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
-            witness: None,
             measured_cycles: None,
             measured_execute_secs: None,
+            witness: None,
+            prove_starts: 0,
         });
         // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
         // read showing the new claim pending, at a higher reopen count, would look like proof that
@@ -444,9 +469,10 @@ impl JobJournal {
             lock_reopens: None,
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
-            witness: None,
             measured_cycles: None,
             measured_execute_secs: None,
+            witness: None,
+            prove_starts: 0,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -518,6 +544,25 @@ impl JobJournal {
         if let Some(e) = self.entries.get_mut(&job_id) {
             e.state = JournalState::Proving;
         }
+    }
+
+    /// A proof of `job_id` starts: one more unfinished start ([`JournalEntry::prove_starts`]).
+    pub fn note_prove_start(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = e.prove_starts.saturating_add(1);
+        }
+    }
+
+    /// That proof ended in this run, however: its start no longer counts.
+    pub fn note_prove_end(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = e.prove_starts.saturating_sub(1);
+        }
+    }
+
+    /// How many proofs of `job_id` started in runs that ended before they did.
+    pub fn prove_starts(&self, job_id: B256) -> u8 {
+        self.entries.get(&job_id).map_or(0, |e| e.prove_starts)
     }
 
     pub fn mark_fulfilling(&mut self, job_id: B256) {
@@ -807,6 +852,33 @@ mod tests {
         assert!(!j.entries.contains_key(&jid));
     }
 
+    /// A proof that ends in its run takes its start back; one whose run ended first (the miner
+    /// killed mid-proof) stays counted across a save and a load, and an entry written before the
+    /// count existed (or with none) loads at 0 and writes none.
+    #[test]
+    fn unfinished_proof_starts_survive_a_restart() {
+        let path = tmp_path("prove-starts");
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x07);
+        j.mark_claimed(jid, None, 100);
+        j.note_prove_start(jid);
+        j.note_prove_end(jid);
+        assert_eq!(j.prove_starts(jid), 0);
+        assert!(!serde_json::to_string(&j).unwrap().contains("prove_starts"));
+        for _ in 0..2 {
+            j.note_prove_start(jid);
+            j.save_to(&path).unwrap();
+            j = JobJournal::load_checked_from(&path).unwrap();
+        }
+        assert_eq!(j.prove_starts(jid), 2);
+        j.note_prove_end(jid);
+        j.note_prove_end(jid);
+        j.note_prove_end(jid);
+        assert_eq!(j.prove_starts(jid), 0, "never below 0");
+        assert_eq!(j.prove_starts(B256::ZERO), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_claims_measured_sizes_are_kept_across_a_restart() {
         let path = tmp_path("po2s");
@@ -843,7 +915,7 @@ mod tests {
         // A later claim without a measurement keeps the one recorded.
         j.note_measured_cycles(jid, None, None);
         j.save_to(&path).unwrap();
-        let e = JobJournal::load_from(&path).entries[&jid].clone();
+        let e = JobJournal::load_checked_from(&path).unwrap().entries[&jid].clone();
         assert_eq!(
             (e.measured_cycles, e.measured_execute_secs),
             (Some(85_000_000), Some(4))
