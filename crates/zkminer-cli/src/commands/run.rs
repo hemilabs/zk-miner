@@ -2664,15 +2664,28 @@ fn kept_reason_of(job_id: B256) -> Option<String> {
 /// that was seen. Every job of such a program is skipped by the candidate loop BEFORE the measure
 /// budget for `NO_ELF_SOURCE_TTL`, so a flood of decoys on one unregistered program costs one
 /// registry read per TTL, not a measure slot per job per tick. Self-healing: a later registration is
-/// picked up after the TTL.
-static NO_ELF_SOURCE: std::sync::Mutex<Option<std::collections::HashMap<B256, std::time::Instant>>> =
-    std::sync::Mutex::new(None);
+/// picked up after the TTL. Each entry is when it was marked and for how long (`NO_ELF_SOURCE_TTL`,
+/// or longer: [`rollout_backoff`]).
+static NO_ELF_SOURCE: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, (std::time::Instant, Duration)>>,
+> = std::sync::Mutex::new(None);
 const NO_ELF_SOURCE_TTL: Duration = Duration::from_secs(600);
 
 fn mark_program_no_elf_source(program_id: B256) {
+    mark_program_no_elf_source_for(program_id, NO_ELF_SOURCE_TTL);
+}
+
+/// [`mark_program_no_elf_source`] for `ttl`. A mark that already runs longer is kept.
+fn mark_program_no_elf_source_for(program_id: B256, ttl: Duration) {
     let mut g = NO_ELF_SOURCE.lock().unwrap_or_else(|p| p.into_inner());
     let m = g.get_or_insert_with(Default::default);
-    bounded_insert(m, program_id, std::time::Instant::now(), MEASURED_CYCLES_CAP);
+    let now = std::time::Instant::now();
+    if m.get(&program_id)
+        .is_some_and(|(at, held)| (*at + *held) > now + ttl)
+    {
+        return;
+    }
+    bounded_insert(m, program_id, (now, ttl), MEASURED_CYCLES_CAP);
 }
 
 fn program_has_no_elf_source(program_id: B256) -> bool {
@@ -2681,7 +2694,7 @@ fn program_has_no_elf_source(program_id: B256) -> bool {
         return false;
     };
     match m.get(&program_id) {
-        Some(t) if t.elapsed() < NO_ELF_SOURCE_TTL => true,
+        Some((t, ttl)) if t.elapsed() < *ttl => true,
         Some(_) => {
             m.remove(&program_id);
             false
@@ -12115,6 +12128,7 @@ async fn process_job_lifecycle(
         match preclaim_elf_action(&fetched, || note_preclaim_elf_failure(job_id)) {
             PreclaimElfAction::Claim => {
                 clear_preclaim_elf_failures(job_id);
+                note_registry_fetch_ok(program_id);
                 elf_in_hand = fetched.ok();
             }
             PreclaimElfAction::RequeuePrefetch => {
@@ -15048,9 +15062,12 @@ async fn measure_cycles(
     )
     .await
     {
-        Ok(Ok(e)) => e,
+        Ok(Ok(e)) => {
+            note_registry_fetch_ok(program_id);
+            e
+        }
         Ok(Err(e))
-            if measure_fetch_failure(&e, registry_elf_hash_previous(program_id))
+            if measure_fetch_failure(&e, registry_rollout_state(program_id))
                 == MeasureFetchFailure::NoSource =>
         {
             // Not registered yet, or registered with no URIs yet: says nothing about the program's
@@ -15071,20 +15088,24 @@ async fn measure_cycles(
             return;
         }
         Ok(Err(e))
-            if measure_fetch_failure(&e, registry_elf_hash_previous(program_id))
+            if measure_fetch_failure(&e, registry_rollout_state(program_id))
                 == MeasureFetchFailure::RolloutPending =>
         {
             // The registry names a new `elf_hash`, and its URIs still serve the bytes of the one
-            // before: the new ELF is not uploaded yet. Says nothing of this input, so no strike; the
-            // program waits, as one with no ELF source does, and its next read sees the new bytes.
+            // before: the new ELF is not uploaded yet. Says nothing of this input, so no strike, a
+            // bounded number of times per change (`ROLLOUT_PENDING_MAX`); the program waits, longer
+            // each time until a fetch succeeds (`rollout_backoff`), and its next read may see the
+            // new bytes.
+            let k = note_rollout_pending(program_id);
             if paces_claims {
                 note_transient_preclaim_failure(job_id);
-                mark_program_no_elf_source(program_id);
+                mark_program_no_elf_source_for(program_id, rollout_backoff(k));
             }
-            tracing::info!(
-                "measure {}: its URIs still serve the ELF of the registry's previous elf_hash — \
-                 backing off until the new one is uploaded",
-                short_id(program_id)
+            tracing::warn!(
+                "ROLLOUT-PENDING measure {}: its URIs still serve the ELF of the registry's previous \
+                 elf_hash (#{k} since its last good fetch) — skipping the program for {} min",
+                short_id(program_id),
+                rollout_backoff(k).as_secs() / 60
             );
             return;
         }
@@ -15739,11 +15760,18 @@ async fn fetch_elf(
         }
     }
     let expected_cache_hash = integrity_hash;
+    // Checked against the registry `elf_hash` alone (no measurement binding), which its registrant
+    // can change at will: a mismatch is a miss, and the bytes verified under the earlier hash stay
+    // for a change back, instead of being purged and downloaded again on every flip (RP1).
+    let keep_mismatch = honor_registry_hash && expected_risc0_hash.is_none();
     let cache_read = cache.clone();
-    let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
-        .await
-        .ok()
-        .flatten();
+    let cached = tokio::task::spawn_blocking(move || match expected_cache_hash {
+        Some(h) if keep_mismatch => cache_read.get_keeping(&program_id, h),
+        h => cache_read.get(&program_id, h),
+    })
+    .await
+    .ok()
+    .flatten();
     if let Some(elf) = cached {
         tracing::info!("Using cached ELF for {} ({} bytes)", program_id, elf.len());
         return Ok(elf);
@@ -16037,6 +16065,23 @@ fn schedule_elf_prefetch(
 /// `NO_ELF_SOURCE_TTL`: each change makes its jobs measured, and their ELF fetched, again.
 const MAX_ELF_HASH_CHANGES_PER_HOUR: usize = 2;
 
+/// Measure fetches a change of the registry `elf_hash` may answer with the previous hash's bytes
+/// (`MeasureFetchFailure::RolloutPending`) before they strike like any other failure: a rollout
+/// whose new bytes are not up by then is not waited on for free. Each such fetch holds a measure
+/// slot for up to `MEASURE_FETCH_BUDGET`, and with no bound a few programs flipped once held every
+/// SP1 slot for good (RP1).
+const ROLLOUT_PENDING_MAX: u32 = 2;
+/// How long after a change of the registry `elf_hash` the previous hash's bytes still read as a
+/// rollout in progress: past it, `previous` is forgotten for that purpose.
+const ROLLOUT_GRACE: Duration = Duration::from_secs(3600);
+
+/// How long a program whose URIs serve its previous `elf_hash`'s bytes is skipped, after the `k`th
+/// such result since its last good fetch: `NO_ELF_SOURCE_TTL` doubling, to 16 times it (10, 20, 40,
+/// 80, then 160 minutes).
+fn rollout_backoff(k: u32) -> Duration {
+    NO_ELF_SOURCE_TTL * (1u32 << k.saturating_sub(1).min(4))
+}
+
 /// What is known of one program's registry `elf_hash` (see [`REGISTRY_ELF_HASH`]).
 #[derive(Clone)]
 struct RegistryElfHash {
@@ -16046,6 +16091,25 @@ struct RegistryElfHash {
     previous: Option<B256>,
     /// When it changed, within the last hour.
     changes: Vec<std::time::Instant>,
+    /// When `current` was first read after a change (`None`: seeded, never seen to change).
+    changed_at: Option<std::time::Instant>,
+    /// Measure fetches answered with `previous`'s bytes under this `current` (at most
+    /// [`ROLLOUT_PENDING_MAX`] go without a strike).
+    rollout_pending: u32,
+    /// Such answers since the program's last good fetch, across changes: what its back-off grows
+    /// with ([`rollout_backoff`]).
+    rollout_backoffs: u32,
+}
+
+/// A program's rollout as a failed measure fetch is judged against (see [`measure_fetch_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RolloutState {
+    /// The registry `elf_hash` before the current one.
+    previous: B256,
+    /// Fetches already answered with `previous`'s bytes under the current hash.
+    pending: u32,
+    /// Since the change.
+    age: Duration,
 }
 
 /// Per program, the registry `elf_hash` at the last read of it on any path (measure, pre-claim,
@@ -16071,6 +16135,9 @@ fn record_registry_elf_hash(program_id: B256, now: B256, count_unknown: bool) ->
                 current: if count_unknown { B256::ZERO } else { now },
                 previous: None,
                 changes: Vec::new(),
+                changed_at: None,
+                rollout_pending: 0,
+                rollout_backoffs: 0,
             },
         };
         entry
@@ -16080,6 +16147,9 @@ fn record_registry_elf_hash(program_id: B256, now: B256, count_unknown: bool) ->
             entry.previous = (entry.current != B256::ZERO).then_some(entry.current);
             entry.current = now;
             entry.changes.push(std::time::Instant::now());
+            entry.changed_at = Some(std::time::Instant::now());
+            // A new hash gets its own free answers; the back-off keeps growing until a good fetch.
+            entry.rollout_pending = 0;
         }
         let changes = entry.changes.len();
         bounded_insert(m, program_id, entry, MEASURED_CYCLES_CAP);
@@ -16124,11 +16194,48 @@ fn registry_elf_hash_superseded(program_id: B256, measured_under: B256) -> bool 
 }
 
 /// The registry `elf_hash` `program_id` had before its current one, when a change was seen.
+#[cfg(test)]
 fn registry_elf_hash_previous(program_id: B256) -> Option<B256> {
     let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
     g.as_ref()
         .and_then(|m| m.get(&program_id))
         .and_then(|e| e.previous)
+}
+
+/// `program_id`'s rollout, when a change of its registry `elf_hash` was seen (see
+/// [`RolloutState`]).
+fn registry_rollout_state(program_id: B256) -> Option<RolloutState> {
+    let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    let e = g.as_ref()?.get(&program_id)?;
+    Some(RolloutState {
+        previous: e.previous?,
+        pending: e.rollout_pending,
+        age: e.changed_at?.elapsed(),
+    })
+}
+
+/// Counts a measure fetch of `program_id` answered with its previous `elf_hash`'s bytes and let go
+/// without a strike. Returns how many there have been since its last good fetch, for
+/// [`rollout_backoff`].
+fn note_rollout_pending(program_id: B256) -> u32 {
+    let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    match g.as_mut().and_then(|m| m.get_mut(&program_id)) {
+        Some(e) => {
+            e.rollout_pending = e.rollout_pending.saturating_add(1);
+            e.rollout_backoffs = e.rollout_backoffs.saturating_add(1);
+            e.rollout_backoffs
+        }
+        None => 1,
+    }
+}
+
+/// A fetch of `program_id`'s ELF succeeded: its rollout is over, and its back-off starts over.
+fn note_registry_fetch_ok(program_id: B256) {
+    let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = g.as_mut().and_then(|m| m.get_mut(&program_id)) {
+        e.rollout_pending = 0;
+        e.rollout_backoffs = 0;
+    }
 }
 
 /// What the measure path does with a failed ELF fetch.
@@ -16137,16 +16244,17 @@ enum MeasureFetchFailure {
     /// No ELF source now: not registered, no URIs, or the registry unreadable. A back-off.
     NoSource,
     /// The URIs still serve the bytes of the registry's previous `elf_hash`: the new hash was set
-    /// before its bytes were uploaded. A back-off, never a strike: a strike-out here would retire
-    /// the input for good over a rollout.
+    /// before its bytes were uploaded. A back-off, not a strike: a strike-out here would retire the
+    /// input for good over a rollout. Only [`ROLLOUT_PENDING_MAX`] times per change, and within
+    /// [`ROLLOUT_GRACE`] of it: past that it is a [`MeasureFetchFailure::Strike`].
     RolloutPending,
     /// Anything else: a strike toward a permanent UNMEASURABLE verdict.
     Strike,
 }
 
-/// Classify a measure-path ELF fetch failure. `previous` is the registry `elf_hash` the program had
-/// before its current one (see [`registry_elf_hash_previous`]).
-fn measure_fetch_failure(e: &anyhow::Error, previous: Option<B256>) -> MeasureFetchFailure {
+/// Classify a measure-path ELF fetch failure. `rollout` is the program's change of registry
+/// `elf_hash`, when one was seen (see [`registry_rollout_state`]).
+fn measure_fetch_failure(e: &anyhow::Error, rollout: Option<RolloutState>) -> MeasureFetchFailure {
     if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>()
         .is_some()
         || e.downcast_ref::<RegistryUnavailable>().is_some()
@@ -16154,8 +16262,12 @@ fn measure_fetch_failure(e: &anyhow::Error, previous: Option<B256>) -> MeasureFe
         MeasureFetchFailure::NoSource
     } else if e
         .downcast_ref::<zkminer_chain::programs::ElfHashMismatch>()
-        .zip(previous)
-        .is_some_and(|(m, previous)| m.served.contains(&previous))
+        .zip(rollout)
+        .is_some_and(|(m, r)| {
+            m.served.contains(&r.previous)
+                && r.pending < ROLLOUT_PENDING_MAX
+                && r.age < ROLLOUT_GRACE
+        })
     {
         MeasureFetchFailure::RolloutPending
     } else {
@@ -20266,7 +20378,8 @@ mod r2_sizing_tests {
     }
 
     /// N1: a download whose bytes hash to the registry's previous `elf_hash` is a rollout in
-    /// progress (the new hash set before its bytes were uploaded): a back-off, not a strike.
+    /// progress (the new hash set before its bytes were uploaded): a back-off, not a strike. RP1:
+    /// only `ROLLOUT_PENDING_MAX` times per change, and within `ROLLOUT_GRACE` of it.
     #[test]
     fn old_bytes_after_an_elf_hash_change_back_off_instead_of_striking() {
         use zkminer_chain::programs::{ElfHashMismatch, NoStorageUris};
@@ -20275,28 +20388,47 @@ mod r2_sizing_tests {
             anyhow::Error::from(ElfHashMismatch::new(served, "ELF hash mismatch"))
                 .context("ELF download failed")
         };
+        let rollout = |pending: u32, age_secs: u64| {
+            Some(RolloutState {
+                previous: old,
+                pending,
+                age: Duration::from_secs(age_secs),
+            })
+        };
         use MeasureFetchFailure::*;
         assert_eq!(
-            measure_fetch_failure(&mismatch(vec![old]), Some(old)),
+            measure_fetch_failure(&mismatch(vec![old]), rollout(0, 60)),
             RolloutPending
         );
         assert_eq!(
-            measure_fetch_failure(&mismatch(vec![other, old]), Some(old)),
+            measure_fetch_failure(&mismatch(vec![other, old]), rollout(1, 60)),
             RolloutPending
+        );
+        // Past the free answers for this change, or its grace: a strike like any other failure.
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![old]), rollout(ROLLOUT_PENDING_MAX, 60)),
+            Strike
+        );
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![old]), rollout(0, ROLLOUT_GRACE.as_secs())),
+            Strike
         );
         // Bytes of anything else, or no earlier hash known: a strike, as before.
         assert_eq!(
-            measure_fetch_failure(&mismatch(vec![other]), Some(old)),
+            measure_fetch_failure(&mismatch(vec![other]), rollout(0, 60)),
             Strike
         );
         assert_eq!(measure_fetch_failure(&mismatch(vec![old]), None), Strike);
         assert_eq!(
-            measure_fetch_failure(&anyhow::anyhow!("HTTP 500"), Some(old)),
+            measure_fetch_failure(&anyhow::anyhow!("HTTP 500"), rollout(0, 60)),
             Strike
         );
         // No ELF source: a back-off, as before.
         assert_eq!(
-            measure_fetch_failure(&anyhow::Error::from(NoStorageUris).context("x"), Some(old)),
+            measure_fetch_failure(
+                &anyhow::Error::from(NoStorageUris).context("x"),
+                rollout(ROLLOUT_PENDING_MAX, 7_200)
+            ),
             NoSource
         );
         assert_eq!(
@@ -20306,6 +20438,81 @@ mod r2_sizing_tests {
             ),
             NoSource
         );
+    }
+
+    /// RP1: each change of the registry `elf_hash` starts its own free answers; a good fetch ends
+    /// the rollout and starts the program's back-off over. The back-off doubles from 10 minutes and
+    /// stops at 160.
+    #[test]
+    fn rollout_answers_reset_on_a_change_or_a_good_fetch_and_the_back_off_grows() {
+        let prog = keccak256(b"rp1-reset");
+        let (h1, h2, h3) = (
+            keccak256(b"rp1-reset-1"),
+            keccak256(b"rp1-reset-2"),
+            keccak256(b"rp1-reset-3"),
+        );
+        assert_eq!(observe_registry_elf_hash(prog, h1), 0);
+        assert_eq!(registry_rollout_state(prog), None, "seeded: no change seen");
+        assert_eq!(observe_registry_elf_hash(prog, h2), 1);
+        let s = registry_rollout_state(prog).expect("a change was seen");
+        assert_eq!((s.previous, s.pending), (h1, 0));
+        assert!(s.age < Duration::from_secs(60));
+        assert_eq!(note_rollout_pending(prog), 1);
+        assert_eq!(note_rollout_pending(prog), 2);
+        assert_eq!(registry_rollout_state(prog).unwrap().pending, 2);
+        // Another change: its own free answers, but the back-off keeps growing.
+        assert_eq!(observe_registry_elf_hash(prog, h3), 2);
+        assert_eq!(registry_rollout_state(prog).unwrap().pending, 0);
+        assert_eq!(note_rollout_pending(prog), 3);
+        // A good fetch: both start over.
+        note_registry_fetch_ok(prog);
+        assert_eq!(registry_rollout_state(prog).unwrap().pending, 0);
+        assert_eq!(note_rollout_pending(prog), 1);
+
+        let mins = |k| rollout_backoff(k).as_secs() / 60;
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6, 100].map(mins),
+            [10, 20, 40, 80, 160, 160, 160]
+        );
+        // A program skipped for longer keeps the longer mark.
+        let p = keccak256(b"rp1-mark");
+        mark_program_no_elf_source_for(p, rollout_backoff(5));
+        mark_program_no_elf_source(p);
+        let g = NO_ELF_SOURCE.lock().unwrap();
+        assert_eq!(g.as_ref().unwrap()[&p].1, rollout_backoff(5));
+    }
+
+    /// RP1 regression: a registrant flips its program's `elf_hash` once and keeps serving the old
+    /// bytes. Before, every measure fetch was a free back-off for the life of the process; now the
+    /// (program, input) strikes out by the fifth fetch (two free answers, then three strikes).
+    #[test]
+    fn a_flip_with_the_old_bytes_still_served_strikes_out_by_the_fifth_fetch() {
+        use zkminer_chain::programs::ElfHashMismatch;
+        let prog = keccak256(b"rp1-flip");
+        let (h1, h2) = (keccak256(b"rp1-flip-1"), keccak256(b"rp1-flip-2"));
+        observe_registry_elf_hash(prog, h1);
+        observe_registry_elf_hash(prog, h2);
+        let served_h1 = || {
+            anyhow::Error::from(ElfHashMismatch::new(vec![h1], "ELF hash mismatch"))
+                .context("ELF download failed")
+        };
+        let mut strikes = 0u8;
+        let mut struck_out_at = None;
+        for fetch in 1..=5 {
+            match measure_fetch_failure(&served_h1(), registry_rollout_state(prog)) {
+                MeasureFetchFailure::RolloutPending => {
+                    note_rollout_pending(prog);
+                }
+                MeasureFetchFailure::Strike => {
+                    strikes += 1;
+                    if strikes >= MEASURE_TIMEOUT_STRIKES && struck_out_at.is_none() {
+                        struck_out_at = Some(fetch);
+                    }
+                }
+                MeasureFetchFailure::NoSource => panic!("not a missing source"),
+            }
+        }
+        assert_eq!(struck_out_at, Some(5));
     }
 
     // A later cycle-only write to the SAME (program, input) replaces the whole entry, so a stale hash
