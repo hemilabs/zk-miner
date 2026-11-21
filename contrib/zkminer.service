@@ -9,6 +9,14 @@
 #   sudo systemctl daemon-reload && sudo systemctl enable --now zkminer
 #   journalctl -u zkminer -f
 #
+# Memory: the miner puts every worker in a cgroup of its own, with a memory ceiling and no swap,
+# below its own cgroup, which Delegate= hands it (cpu, memory and pids are the controllers it
+# needs; cgroup v2 only). Without it the workers run with no ceiling at all, which the miner reports
+# at start-up as `PAGE: WORKERS-UNCAPPED`. OOMPolicy=continue: when the kernel kills a worker for
+# memory, the miner sees it and carries on, where systemd's default (stop) would stop the whole
+# unit over one proof (a drain, then a restart). After changing either, `systemctl daemon-reload`
+# and restart; `zkminer doctor` checks both.
+#
 # Stopping:
 #   sudo systemctl stop zkminer
 #       Drains: no new claims, the proofs in flight are fulfilled and paid, then it exits (up to
@@ -77,6 +85,31 @@ KillSignal=SIGINT
 KillMode=mixed
 # Drain (up to 3000 s) plus the releases after it (up to 800 s).
 TimeoutStopSec=4200
+
+# The unit's cgroup is the miner's to divide among its workers (see Memory above); systemd runs
+# ExecStop in a `.control` cgroup of its own below it, and still kills every worker cgroup after
+# the miner exits (KillMode=mixed).
+Delegate=cpu memory pids
+# A worker killed for memory fails its proof; the miner carries on.
+OOMPolicy=continue
+
+# Hardening. Running as an unprivileged user is what matters most here; the workers confine
+# themselves on top of it (Landlock, seccomp, no capabilities). /usr, /boot and /etc read-only:
+ProtectSystem=full
+# Left out on purpose:
+# - PrivateTmp=yes: the CPU risc0 worker's Docker Groth16 wrap mounts a directory under /tmp into
+#   the container, and the Docker daemon, outside this unit, would not see a private /tmp.
+# - NoNewPrivileges=yes, CapabilityBoundingSet=, and what implies NoNewPrivileges for a unit with
+#   User= (SystemCallFilter=, RestrictAddressFamilies=, RestrictNamespaces=, LockPersonality=,
+#   RestrictRealtime=, RestrictSUIDSGID=, MemoryDenyWriteExecute=, ProtectKernelModules=,
+#   ProtectKernelLogs=, ProtectHostname=): NVIDIA's libraries create missing device nodes and load
+#   nvidia-uvm through the setuid nvidia-modprobe, which these would stop. Each worker sets
+#   NO_NEW_PRIVS itself when it confines itself.
+# - PrivateDevices=, DevicePolicy=, DeviceAllow=, ProtectClock= (which adds a device allow-list):
+#   the GPUs' device nodes.
+# - ProtectControlGroups=, ProtectKernelTunables=: the delegated cgroup, under /sys/fs/cgroup, must
+#   stay writable.
+# - ProtectHome=: the miner's home holds its config, workers and job journal.
 
 # Exit 75: the miner stopped with locks held, or a keep-locks stop. Start it again so the new
 # start finishes or releases them.

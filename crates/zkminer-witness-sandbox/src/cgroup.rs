@@ -190,7 +190,7 @@ pub(crate) fn missing_controllers(available: &str) -> Vec<&'static str> {
 
 /// Which systemd manager owns the unit a cgroup belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SystemdUnit {
+pub enum SystemdUnit {
     /// No unit on the path (a cgroup namespace root, a host without systemd): nothing to ask.
     None,
     /// A unit of the system manager (`systemctl show`).
@@ -416,7 +416,8 @@ fn enable_controllers(dir: &Path) -> Result<(), SandboxError> {
 /// - `cpu`, `memory` and `pids` are listed in `<own>/cgroup.controllers` (the parent grants them).
 ///
 /// Launch the miner with `systemd-run --user --scope -p Delegate=yes -- zkminer ...` or from a
-/// unit with `Delegate=yes`.
+/// unit with `Delegate=yes` (for a system unit with `User=`, `Delegate=cpu memory pids`: systemd
+/// then hands the unit's cgroup to that user).
 ///
 /// It then makes `<own>` usable under cgroup v2's rules: no process may live in a cgroup that
 /// enables controllers for its children, and moving a process needs write access to the common
@@ -469,6 +470,35 @@ pub fn delegated_root() -> Result<PathBuf, SandboxError> {
     mkdir_if_missing(&sandboxes)?;
     enable_controllers(&sandboxes)?;
     Ok(sandboxes)
+}
+
+/// The systemd unit this process runs in, and its manager ([`SystemdUnit`]), from
+/// `/proc/self/cgroup`; `None` where there is no cgroup v2 to read it from.
+pub fn own_systemd_unit() -> Option<SystemdUnit> {
+    let mount = cgroup2_mount().ok()?;
+    let own = own_cgroup().ok()?;
+    Some(systemd_unit(own.strip_prefix(&mount).ok()?))
+}
+
+/// Whether this process runs in a cgroup delegated to it, as [`delegated_root`] would find it, but
+/// read-only: nothing is created or moved (for `zkminer doctor`, beside a running miner). The
+/// cgroup, or why it is not one: the reasons [`delegated_root`] would fail with.
+pub fn delegation_status() -> Result<PathBuf, String> {
+    let own = own_cgroup().map_err(|e| e.to_string())?;
+    // A process `delegated_root` already moved into `<own>/supervisor`.
+    let dir = match own.parent() {
+        Some(parent)
+            if own.file_name().is_some_and(|n| n == SUPERVISOR)
+                && delegation_problem(parent).is_none() =>
+        {
+            parent.to_path_buf()
+        }
+        _ => own,
+    };
+    match delegation_problem(&dir) {
+        None => Ok(dir),
+        Some(reason) => Err(format!("{}: {reason}", dir.display())),
+    }
 }
 
 /// A cgroup the miner created and owns, one per sandboxed process.

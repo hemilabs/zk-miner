@@ -641,9 +641,13 @@ rclone, ...) are not, whatever they call themselves. Unmount them, or run the mi
 user (another user's FUSE mount without `allow_other` is closed to it) or in a container or mount
 namespace that leaves them out. Confined workers also
 change no file's mode, owner, attributes or times. Nothing a worker starts outlives it: each worker
-runs in a cgroup of its own, killed with `cgroup.kill` when the worker ends (below the miner's when
-the miner runs in a cgroup delegated to it, such as under `systemd-run --user --scope -p
-Delegate=yes zkminer run`, else in a scope of your systemd user manager); a small reaper process
+runs in a cgroup of its own, with its memory ceiling, killed with `cgroup.kill` when the worker
+ends (below the miner's when the miner runs in a cgroup delegated to it, such as under
+`systemd-run --user --scope -p Delegate=yes zkminer run` or
+[`contrib/zkminer.service`](contrib/zkminer.service), which has `Delegate=cpu memory pids`, else
+in a scope of your systemd user manager; a system unit has no user manager, so one without
+`Delegate=` leaves every worker with no memory ceiling, which the miner reports at start-up as
+`PAGE: WORKERS-UNCAPPED` and `zkminer doctor` as a warning); a small reaper process
 (`zkminer-worker-reaper`) kills every worker if the miner dies abruptly; and the miner kills every
 worker the moment a filesystem that is not local is mounted. The CPU risc0 worker's Docker Groth16 wrap runs in
 a helper process that accepts only a strictly checked prover input, with the image pinned by digest
@@ -736,7 +740,12 @@ Worth knowing:
   Kubernetes, releases every held lock at once, because a supervisor kills the process
   before any drain could finish. [`contrib/zkminer.service`](contrib/zkminer.service) sets
   `KillSignal=SIGINT`, `KillMode=mixed` and a long `TimeoutStopSec`, so `systemctl stop`
-  drains, and `Restart=on-failure`, so `zkminer stop --keep-locks` restarts it in place. To
+  drains, and `Restart=on-failure`, so `zkminer stop --keep-locks` restarts it in place. It
+  also sets `Delegate=cpu memory pids`, which gives every worker a memory ceiling, and
+  `OOMPolicy=continue`, without which systemd stops the whole unit (a drain, then a restart)
+  when the kernel kills one worker for memory; a unit installed from an older copy has neither:
+  copy the new one over it, `systemctl daemon-reload`, and restart the miner when its locks
+  allow (`zkminer doctor` says whether the installed unit has both). To
   upgrade, `install -m755` the new miner and every worker over the old ones (all of them: a
   worker from another build is refused), then `zkminer stop --keep-locks`. For Docker, run
   with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and keep `~/.zkminer`
