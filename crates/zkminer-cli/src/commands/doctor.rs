@@ -349,6 +349,8 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     {
         let (level, detail) = root_verdict(super::run::privilege::root_run_here());
         report.say(level, "user", detail);
+        let (level, detail) = worker_memory_verdict();
+        report.say(level, "worker memory", detail);
     }
     if super::run::stop_request_path().exists() {
         report.say(
@@ -536,6 +538,124 @@ fn root_verdict(run: super::run::privilege::RootRun) -> (Level, String) {
              (contrib/zkminer.service); only the dashboard's GPU tuning needs root"
                 .to_string(),
         ),
+    }
+}
+
+/// The systemd unit the miner is documented to run as (`contrib/zkminer.service`).
+#[cfg(target_os = "linux")]
+const SERVICE: &str = "zkminer.service";
+
+/// Linux: whether workers get a memory ceiling and a cgroup of their own (review r4 LD1). When
+/// [`SERVICE`] is installed, its settings answer (doctor itself runs from a shell, not in it): it
+/// needs `Delegate=` with `cpu memory pids`, and `OOMPolicy=continue`, or a worker's OOM kill stops
+/// the whole miner. Otherwise, as run from here: a delegated cgroup, else the user's systemd
+/// manager, which caps each worker in a scope of its own.
+#[cfg(target_os = "linux")]
+fn worker_memory_verdict() -> (Level, String) {
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args([
+        "show",
+        "--property=LoadState,Delegate,DelegateControllers,OOMPolicy",
+        "--",
+        SERVICE,
+    ])
+    .stdin(std::process::Stdio::null());
+    let (outcome, props) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        &mut cmd,
+        Duration::from_secs(5),
+        16 * 1024,
+    );
+    let ran = matches!(
+        outcome,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    );
+    if ran && unit_property(&props, "LoadState") == Some("loaded") {
+        return unit_verdict(SERVICE, &props);
+    }
+    match zkminer_witness_sandbox::delegation_status() {
+        Ok(dir) => (
+            Level::Pass,
+            format!(
+                "this cgroup is delegated ({}): each worker gets a cgroup of its own, with a \
+                 memory ceiling",
+                dir.display()
+            ),
+        ),
+        Err(why) if zkminer_prover::containment::user_bus_reachable() => (
+            Level::Info,
+            format!(
+                "not in a delegated cgroup ({why}); run from here, each worker is capped in a \
+                 scope of your systemd user manager"
+            ),
+        ),
+        Err(why) => (
+            Level::Warn,
+            format!(
+                "not in a delegated cgroup ({why}), and no systemd user manager: run from here, \
+                 workers would have no memory ceiling. Run it as contrib/zkminer.service \
+                 (Delegate=cpu memory pids, OOMPolicy=continue) or under `systemd-run --user \
+                 --scope -p Delegate=yes`"
+            ),
+        ),
+    }
+}
+
+/// The value of `key` in `systemctl show` output (`Key=Value` lines).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unit_property<'a>(props: &'a str, key: &str) -> Option<&'a str> {
+    props
+        .lines()
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+        .map(str::trim)
+}
+
+/// What a loaded unit's `Delegate`, `DelegateControllers` and `OOMPolicy` mean for its workers.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unit_verdict(unit: &str, props: &str) -> (Level, String) {
+    let mut problems = Vec::new();
+    if unit_property(props, "Delegate") != Some("yes") {
+        problems.push(
+            "no Delegate=, so workers get no memory ceiling and no cgroup of their own".to_string(),
+        );
+    } else if let Some(given) =
+        unit_property(props, "DelegateControllers").filter(|c| !c.is_empty())
+    {
+        let missing: Vec<&str> = ["cpu", "memory", "pids"]
+            .into_iter()
+            .filter(|c| !given.split_whitespace().any(|g| g == *c))
+            .collect();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "Delegate= leaves out {}, without which the miner uses no delegation",
+                missing.join(" ")
+            ));
+        }
+    }
+    // systemd before 243 has neither the property nor the stop.
+    if unit_property(props, "OOMPolicy") == Some("stop") {
+        problems.push(
+            "OOMPolicy=stop, so a worker's OOM kill stops the whole miner (a drain, then a \
+             restart)"
+                .to_string(),
+        );
+    }
+    if problems.is_empty() {
+        (
+            Level::Pass,
+            format!(
+                "{unit} delegates its cgroup (each worker gets one of its own, with a memory \
+                 ceiling) and keeps running when one is OOM-killed"
+            ),
+        )
+    } else {
+        (
+            Level::Warn,
+            format!(
+                "{unit}: {}. Add Delegate=cpu memory pids and OOMPolicy=continue to it \
+                 (contrib/zkminer.service has both), then `systemctl daemon-reload` and restart it",
+                problems.join("; ")
+            ),
+        )
     }
 }
 
@@ -748,6 +868,86 @@ mod tests {
         assert_eq!(level, Level::Warn);
         assert!(detail.contains("unprivileged user"), "{detail}");
         assert!(!detail.contains("  "), "{detail}");
+    }
+
+    /// Review r4 LD1: a unit without delegation, or with `OOMPolicy=stop`, is a warning naming the
+    /// fix; the shipped unit's settings pass.
+    #[test]
+    fn doctor_checks_the_units_delegation_and_oom_policy() {
+        let shipped = "LoadState=loaded\nDelegate=yes\nDelegateControllers=cpu memory pids\n\
+                       OOMPolicy=continue\n";
+        assert_eq!(unit_verdict("zkminer.service", shipped).0, Level::Pass);
+        // Delegate=yes alone delegates every controller.
+        let all = "LoadState=loaded\nDelegate=yes\nDelegateControllers=cpu cpuacct cpuset io \
+                   blkio memory devices pids bpf-firewall bpf-devices\nOOMPolicy=continue\n";
+        assert_eq!(unit_verdict("zkminer.service", all).0, Level::Pass);
+        // The unit as it was: no delegation, systemd's default OOMPolicy.
+        let old = "LoadState=loaded\nDelegate=no\nDelegateControllers=\nOOMPolicy=stop\n";
+        let (level, detail) = unit_verdict("zkminer.service", old);
+        assert_eq!(level, Level::Warn);
+        assert!(detail.contains("no Delegate="), "{detail}");
+        assert!(detail.contains("OOMPolicy=stop"), "{detail}");
+        assert!(
+            detail.contains("Delegate=cpu memory pids and OOMPolicy=continue"),
+            "{detail}"
+        );
+        let partial = "Delegate=yes\nDelegateControllers=memory\nOOMPolicy=continue\n";
+        let (level, detail) = unit_verdict("zkminer.service", partial);
+        assert_eq!(level, Level::Warn);
+        assert!(detail.contains("leaves out cpu pids"), "{detail}");
+        let only_oom = "Delegate=yes\nDelegateControllers=cpu memory pids\nOOMPolicy=stop\n";
+        assert_eq!(unit_verdict("zkminer.service", only_oom).0, Level::Warn);
+        // systemd before 243: no OOMPolicy at all, and nothing to warn about there.
+        assert_eq!(
+            unit_verdict("zkminer.service", "Delegate=yes\nDelegateControllers=\n").0,
+            Level::Pass
+        );
+        for (_, d) in [unit_verdict("u", old), unit_verdict("u", shipped)] {
+            assert!(!d.contains("  "), "{d}");
+        }
+        assert_eq!(unit_property("DelegateControllers=cpu\n", "Delegate"), None);
+        assert_eq!(
+            unit_property(" \nLoadState=loaded\n", "LoadState"),
+            Some("loaded")
+        );
+    }
+
+    /// The shipped unit keeps what the miner relies on: a delegated cgroup with the controllers the
+    /// worker cgroups need, OOM kills of workers not stopping the unit, and a stop that drains.
+    #[test]
+    fn the_shipped_systemd_unit_delegates_and_drains() {
+        let unit = include_str!("../../../../contrib/zkminer.service");
+        let service: Vec<(&str, &str)> = unit
+            .lines()
+            .skip_while(|l| l.trim() != "[Service]")
+            .take_while(|l| l.trim() != "[Install]")
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .collect();
+        let value = |key: &str| {
+            service
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, v)| *v)
+                .next_back()
+        };
+        let delegate = value("Delegate").expect("Delegate= in [Service]");
+        for c in ["cpu", "memory", "pids"] {
+            assert!(
+                delegate == "yes" || delegate.split_whitespace().any(|d| d == c),
+                "Delegate={delegate} leaves out {c}"
+            );
+        }
+        assert_eq!(value("OOMPolicy"), Some("continue"));
+        assert_eq!(value("KillMode"), Some("mixed"));
+        assert_eq!(value("KillSignal"), Some("SIGINT"));
+        // A private /tmp would hide the Docker Groth16 helper's work directory from the daemon.
+        assert_ne!(value("PrivateTmp"), Some("yes"));
+        // Each of these would put the GPU nodes or the delegated cgroup out of reach.
+        for key in ["PrivateDevices", "ProtectControlGroups", "DevicePolicy"] {
+            assert_eq!(value(key), None, "{key}");
+        }
     }
 
     /// The RPC URL is shown by host only: providers put API keys in the path or query.

@@ -3519,6 +3519,13 @@ pub async fn run(
                 }
             }
         }
+        // Workers with no memory ceiling (no delegated cgroup, no user manager): a PAGE, once, at
+        // start-up; each spawn still logs its own warning (review r4 LD1).
+        #[cfg(target_os = "linux")]
+        if let Some(msg) = zkminer_prover::containment::workers_uncapped_page() {
+            tracing::error!("{msg}");
+            note_page(msg);
+        }
     }
     // The lock journal, read before anything starts. One this build must not rewrite (a newer format)
     // or cannot read is left as it is, and this run drives only the locks it holds (the chain scan

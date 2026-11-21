@@ -411,11 +411,17 @@ executor:
   `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`) are
   refused like the rest.
 - **Ending.** Nothing a worker started outlives it. Where the miner runs in a cgroup delegated to
-  it (as witness jobs need: a systemd service with `Delegate=yes`, or
+  it (as witness jobs need: a systemd service with `Delegate=yes`, such as
+  `contrib/zkminer.service` with `Delegate=cpu memory pids`, or
   `systemd-run --user --scope -p Delegate=yes`), each worker starts in a cgroup of its own below
   it (`zkminer-worker-<miner pid>-<n>`), joined before `exec`, with the worker's memory ceiling as
   its `memory.max`. Elsewhere the user's systemd manager adopts the worker into a transient scope,
-  and the miner sends it nothing (so no guest runs in it) until the scope holds it. Every end of a
+  and the miner sends it nothing (so no guest runs in it) until the scope holds it. Where neither
+  is possible (a system unit without `Delegate=` has no user manager), workers run with no memory
+  ceiling and no cgroup of their own: the miner says so at start-up (`PAGE: WORKERS-UNCAPPED`) and
+  `zkminer doctor` warns. A unit also needs `OOMPolicy=continue` (the contrib unit has it): a
+  worker's OOM kill counts in the unit's `memory.events`, and systemd's default `OOMPolicy=stop`
+  would stop the whole miner over it. Every end of a
   worker (a recycle, a timeout, a kill, its death, shutdown) writes that cgroup's `cgroup.kill`,
   which reaches every process in it whatever its process group or session. If the miner dies,
   however abruptly (SIGKILL, the OOM killer), a reaper it started with its first worker

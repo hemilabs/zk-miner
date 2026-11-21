@@ -63,7 +63,7 @@ mod spawn;
 pub mod supervise;
 
 pub use caps::{capabilities_cleared, drop_all_capabilities};
-pub use cgroup::{delegated_root, Cgroup};
+pub use cgroup::{delegated_root, delegation_status, own_systemd_unit, Cgroup, SystemdUnit};
 pub use restrict::{
     landlock_abi, restrict_self, seal_socket_creation, set_socket_option, SocketOption, BROKER_SOCKET_OPTION,
     MIN_LANDLOCK_ABI, REFUSED_SOCKET_OPTIONS, SOCKET_TIMEOUT_OPTIONS,
