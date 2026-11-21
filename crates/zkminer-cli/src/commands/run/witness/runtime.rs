@@ -1401,6 +1401,9 @@ impl WitnessRuntime {
     /// `po2s` (the host's sizes) only seed the floor when no card is enabled.
     async fn prove_plan(&self, po2s: &[u8]) -> WitnessPlan {
         let cards = run::current_risc0_cards(&self.state, true).await;
+        let vram: std::collections::HashMap<String, Option<u64>> = zkminer_prover::engine::worker_pool()
+            .map(|p| p.risc0_slots().into_iter().map(|(slot, _, vram)| (slot, vram)).collect())
+            .unwrap_or_default();
         let st = self.state.read().await;
         let margin = st.runtime_settings.deadline_safety_margin;
         let margin = if margin.is_finite() && margin >= 1.0 { margin } else { 1.0 };
@@ -1414,8 +1417,13 @@ impl WitnessRuntime {
                         .find(|d| d.device_id == c.device && d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0)
                 });
                 let cpu = c.device == "cpu";
+                // Priced down above the largest size the card's VRAM holds, as admission prices it.
+                let fit = zkminer_prover::benchmark::risc0_largest_fitting_po2(
+                    vram.get(&c.slot).copied().flatten(),
+                    c.slot.split(':').nth(1).unwrap_or(""),
+                );
                 let measured = row
-                    .map(|r| zkminer_prover::benchmark::risc0_job_throughput(r, c.po2))
+                    .map(|r| zkminer_prover::benchmark::risc0_job_throughput(r, c.po2, fit))
                     .filter(|t| t.is_finite() && *t > 0.0);
                 let cps = measured.unwrap_or_else(|| {
                     if cpu {
@@ -2716,7 +2724,7 @@ impl WitnessRuntime {
         let mut only_slot: Option<String> = None;
         loop {
             attempt += 1;
-            run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await;
+            run::refresh_lock_deadline(&self.client, &self.state, &self.journal, jid, &mut l.lock_deadline).await;
             let cutoff = self.proving_cutoff(l);
             let abort_at = match run::deadline_proof_budget(cutoff) {
                 None => None,
@@ -2878,7 +2886,7 @@ impl WitnessRuntime {
                 Err(e) => {
                     let msg = zkminer_chain::programs::sanitize_log(&format!("{e:#}"));
                     if e.downcast_ref::<ProofDeadlineReached>().is_some() {
-                        if run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await
+                        if run::refresh_lock_deadline(&self.client, &self.state, &self.journal, jid, &mut l.lock_deadline).await
                             && run::deadline_proof_budget(self.proving_cutoff(l))
                                 .is_some_and(|b| b >= Duration::from_secs(run::MIN_ATTEMPT_BUDGET_SECS))
                         {
@@ -2955,11 +2963,9 @@ impl WitnessRuntime {
                         j.gpu_bus_id = bus;
                         j.prover_backend = slot_key;
                     }
-                    j.gpu_bus_id = bus;
-                    j.prover_backend = slot_key;
-                }
-            });
-        })
+                });
+            },
+        )
     }
 
     /// A journal divergence (§15.3): the new journal is checked against the binding and the
@@ -3129,7 +3135,7 @@ impl WitnessRuntime {
         // A release because a verifier swap's readyAt comes first is governance's: no caller's.
         let swap_cut = Some(LockFailure::host(PostLockFailureClass::GasOrRpc));
         loop {
-            run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await;
+            run::refresh_lock_deadline(&self.client, &self.state, &self.journal, jid, &mut l.lock_deadline).await;
             let min = Duration::from_secs(run::MIN_ATTEMPT_BUDGET_SECS);
             let cutoff = self.proving_cutoff(l);
             let swap = cutoff < l.lock_deadline;
@@ -3223,7 +3229,7 @@ impl WitnessRuntime {
             }
             match run::deadline_proof_budget(l.lock_deadline) {
                 Some(b) if b <= run::FULFIL_RETRY_WAIT + min => {
-                    if run::refresh_lock_deadline(&self.client, &self.journal, jid, &mut l.lock_deadline).await {
+                    if run::refresh_lock_deadline(&self.client, &self.state, &self.journal, jid, &mut l.lock_deadline).await {
                         continue;
                     }
                     if run::clock_stopped_or_unknown(&self.client, psid, b).await {
