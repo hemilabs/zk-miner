@@ -543,6 +543,15 @@ Worth knowing:
   cutoff (a release penalty each) after its learned rate had refused them: the card is proving
   slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
   for it are sized on the learned rate; re-run `zkminer benchmark` once the cause is fixed.
+- **After a slash the miner stops claiming until you say so.** `PAGE: SLASHED` says a lock of
+  this prover was slashed (the on-chain `jobsSlashed` rose, a lock ended past its deadline, or the
+  miner slashed its own expired lock); `PAGE: STAKE-DROP` says the stake fell by more than a
+  withdrawal and the miner's own release penalties explain. Either trips the slash latch,
+  `~/.zkminer/slash_latch.json`: no new claims, across restarts, until `zkminer resume-claims`
+  (it prints what tripped it, then clears it; `--yes` skips the prompt). Locks already held are
+  still fulfilled or released. The page repeats every 30 minutes while it holds; `zkminer status`
+  shows it and exits 2, `zkminer doctor` fails on it, and the dashboard shows `SLASHED`. Find out
+  why the lock was lost (the link, the RPC, the card) before resuming: see the cut-off point below.
 - **Drain before an upgrade that changes the `sys_rand` rule.** risc0 guests' randomness is a
   public function of the program and input (`crates/zkminer-prover-protocol/src/sys_rand.rs`), so
   a measurement and the proof after it agree on any host, and no key needs keeping (an old
@@ -583,10 +592,13 @@ Worth knowing:
   chain through one `[chain] rpc_url`. A submitter can single a miner out (a job assigned to it, or
   one only it measures), learn its IP from the ELF download, and then flood that link, or drop its
   traffic from an on-path position, until the deadlines pass: a home connection or a small VPS
-  without DDoS protection is the realistic target. The cap above bounds what that costs to its
-  share of the stake; it does not stop the slash. Stake only what you accept losing, lower
-  `max_locked_stake_fraction` on a link a booter can saturate, and prefer a DDoS-protected host
-  with an RPC endpoint you trust.
+  without DDoS protection is the realistic target. The cap above bounds what one such round costs
+  to its share of the stake, not what an incident costs: the cap is taken of the stake that is
+  left, so every further round could take that share again. The slash latch (above) is what stops
+  the next round: after a slash the miner claims nothing new until `zkminer resume-claims`, so do
+  not clear it while the cause is still there. Neither stops the slash itself. Stake only what you
+  accept losing, lower `max_locked_stake_fraction` on a link a booter can saturate, and prefer a
+  DDoS-protected host with an RPC endpoint you trust.
 - **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
   sha, bigint) by what they cost to prove, where the instruction count counted each as one.
   Benchmarks saved by an older miner count SP1 instructions per second, which is close for code

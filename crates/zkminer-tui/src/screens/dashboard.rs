@@ -621,7 +621,9 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
         state.address.clone()
     };
 
-    let (status_tag, status_bg) = if state.paused {
+    let (status_tag, status_bg) = if state.claims_latched.is_some() {
+        (" SLASHED ", theme::red())
+    } else if state.paused {
         (" PAUSED ", theme::yellow())
     } else if state.connected {
         ("  UP  ", theme::green())

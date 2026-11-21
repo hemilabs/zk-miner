@@ -689,8 +689,15 @@ no second one):
   grace: each is then slashed in full, and the miner reaches the chain through one RPC endpoint.
   The miner bounds the collateral of every lock it holds and has not settled, across programs and
   submitters, to `[prover] max_locked_stake_fraction` of the stake (default 0.5), counting each
-  lock until it settles. That bounds the loss; it does not prevent it. Size the stake to what you
-  accept losing, and run on a DDoS-protected link where you can.
+  lock until it settles. That bounds the loss of one round, not of an incident: the cap is taken of
+  the stake that is left, so a miner that went on claiming could be lured and cut off again, each
+  round taking that share of what remains. So a slash (the on-chain `jobsSlashed` rising, a lock
+  ending past its deadline) or a stake fall that a withdrawal and the miner's own release penalties
+  do not explain trips a persisted slash latch (`~/.zkminer/slash_latch.json`, labelled against
+  Low-integrity workers on Windows): `PAGE: SLASHED` / `PAGE: STAKE-DROP`, no new claims across
+  restarts until the operator runs `zkminer resume-claims`, held locks still driven. Clearing it
+  while the cause remains allows another round. None of this prevents the slash. Size the stake to
+  what you accept losing, and run on a DDoS-protected link where you can.
 
 - **DNS lookups leak, to public resolvers.** Resolving a requester's name tells the
   DNS-over-HTTPS resolver the name, and the name's own DNS servers that the resolver asked, and
