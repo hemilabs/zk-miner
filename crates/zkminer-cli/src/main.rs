@@ -545,6 +545,20 @@ struct Early {
     /// `artifact publish --password-fd N`, checked and owned.
     #[cfg(target_os = "linux")]
     password_fd: Option<std::os::fd::OwnedFd>,
+    /// Windows: `run` refused its account with locks in the journal (the refusal): it releases
+    /// them, starting no worker, then exits with it (`commands::run::release_for_refused_account`).
+    #[cfg(windows)]
+    refused_account: Option<String>,
+}
+
+impl Early {
+    /// Whether this run only releases what a refused account holds.
+    fn refused_account(&self) -> bool {
+        #[cfg(windows)]
+        return self.refused_account.is_some();
+        #[cfg(not(windows))]
+        false
+    }
 }
 
 fn main() -> Result<()> {
@@ -572,20 +586,40 @@ fn main() -> Result<()> {
     // under a service logon (every worker, and so every requester's guest, would run as it too),
     // nor when the account cannot be told, unless the operator says so. See `windows_sandbox`.
     #[cfg(windows)]
+    let mut refused_account = None;
+    #[cfg(windows)]
     if matches!(cli.command, Commands::Run { .. }) {
         use zkminer_prover::windows_sandbox as sandbox;
         if let Some(refusal) = sandbox::account_refusal(
             &sandbox::account_risk(),
             sandbox::privileged_account_allowed(),
         ) {
-            anyhow::bail!("{refusal}");
+            // Locks in the journal (a LocalSystem service upgraded in place to this build): released
+            // first, with no worker started, rather than stranded until slashed. A run that holds
+            // none (watch-only, mock) is refused at once.
+            let holds = matches!(
+                cli.command,
+                Commands::Run {
+                    watch_only: false,
+                    mock: false,
+                    ..
+                }
+            );
+            refused_account = Some(
+                commands::run::refused_account_mode(
+                    refusal,
+                    holds.then(journal::JobJournal::load_checked),
+                )
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))?,
+            );
         }
         // Every privilege but traverse checking and two GPU runtimes may use, removed for good
         // before any thread or child starts: a service logon's SeImpersonatePrivilege (the SERVICE
         // group's) would let a requester's guest that broke out of a worker reach SYSTEM. Each
-        // worker's token is a copy of this one, and is checked again before it runs.
+        // worker's token is a copy of this one, and is checked again before it runs. (A refused
+        // account's release starts none.)
         if let Err(e) = zkminer_prover::windows_account::strip_this_process() {
-            if !sandbox::privileged_account_allowed() {
+            if !sandbox::privileged_account_allowed() && refused_account.is_none() {
                 anyhow::bail!(
                     "refusing to run: this process's privileges could not be removed ({e}), and \
                      its prover workers would hold them too (with SeImpersonatePrivilege, a \
@@ -602,6 +636,10 @@ fn main() -> Result<()> {
     // did not open could name one of them (and reading it to the end would close it).
     #[allow(unused_mut)]
     let mut early = Early::default();
+    #[cfg(windows)]
+    {
+        early.refused_account = refused_account;
+    }
     #[cfg(target_os = "linux")]
     if let Commands::Artifact {
         command:
@@ -626,7 +664,7 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
     // In TUI mode, any stderr output (from any thread) corrupts the alternate screen.
     let tui_requested = matches!(&cli.command,
         Commands::Run { headless, watch_only, .. } if !headless && !watch_only
-    );
+    ) && !early.refused_account();
     // The TUI draws on stdout. Without a terminal there (a systemd unit, `nohup`, `docker run`
     // without `-t`) it cannot start, and the miner used to come up, fail to enter raw mode, log that
     // to a file and shut down. Run headless instead, and say so.
@@ -713,6 +751,12 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
     }
 
     let config_path = cli.config.as_deref().map(std::path::Path::new);
+
+    // Windows: a refused account's held locks, released (no worker, no claim), then the refusal.
+    #[cfg(windows)]
+    if let Some(refusal) = &early.refused_account {
+        return commands::run::release_for_refused_account(config_path, refusal).await;
+    }
 
     match cli.command {
         Commands::Status => commands::status::run(config_path).await,

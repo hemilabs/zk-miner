@@ -828,7 +828,11 @@ Worth knowing:
   Moving from LocalSystem: stop the old service with `zkminer stop --wait` run as LocalSystem
   (`psexec -s`; its home was `C:\Windows\System32\config\systemprofile\.zkminer`) so it finishes
   or releases its locks, then change the account. A miner started in the new account's home does
-  not see the old journal, so locks kept there are never driven. Consider a key that was in
+  not see the old journal, so locks kept there are never driven. A LocalSystem service upgraded
+  in place to this build while it holds locks does not prove them: it releases each one (at its
+  penalty, starting no worker), pages `PRIVILEGED-ACCOUNT`, and exits with the refusal and the
+  list of what it released; what it could not release is tried again at the next start. Consider
+  a key that was in
   `AppEnvironmentExtra` exposed. A service wrapper's stop (NSSM sends Ctrl+C, then kills the
   process after its timeout) starts a drain it then cuts off: run `zkminer stop --wait` (as the
   service account) before stopping the service, or keep NSSM's timeout long enough for a drain
