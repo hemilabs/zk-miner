@@ -816,10 +816,13 @@ Worth knowing:
   variable in the machine's environment, and every user of the PC can read both. `zkminer init
   --generate-key --network <network>` run as the account writes the key to its `.zkminer` with
   an ACL for that account and SYSTEM only; for a key file made another way, `icacls <file>
-  /inheritance:r /grant:r zkminer:R` leaves only the account on it. `zkminer doctor` says when
-  the miner's account is refused or elevated, which dangerous privileges it holds, and when the
-  key's variable is kept in the
-  machine's, a service's or the user's environment; the miner's start-up pages both.
+  /inheritance:r /grant:r zkminer:(R,WO)` leaves only the account on it. Keep `WO`: the miner
+  labels the key file so that its Low-integrity workers cannot read it, which needs the right to
+  change the file's owner (the account's own files have it). A key file it can neither label nor,
+  as its owner, open to labelling is paged (`PAGE: SECRETS-UNLABELLED`) and no worker starts
+  until it is fixed. `zkminer doctor` says when the miner's account is refused or elevated,
+  which dangerous privileges it holds, when the key file cannot be labelled, and when the key's variable is kept in the machine's, a
+  service's or the user's environment; the miner's start-up pages each.
 
   `ZKMINER_WINDOWS_LOW_IL_WORKERS=1` (off by default, as not every GPU runtime is known to work
   there) runs the workers at Low integrity: they can then read neither the key file, `.env` nor

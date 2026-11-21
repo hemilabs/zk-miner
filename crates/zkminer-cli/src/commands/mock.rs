@@ -90,6 +90,12 @@ pub async fn run(headless: bool) -> Result<()> {
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Looking for GPUs and prover workers");
     let state = new_shared_state();
+    // Windows, with Low-integrity workers: the key file of the default config, `.env` and the
+    // journal unreadable to them.
+    #[cfg(windows)]
+    if let Ok(config) = zkminer_config::ZkMinerConfig::load(None) {
+        super::run::protect_secrets(&config);
+    }
 
     // Spawn worker pool so GPU provers are available for real benchmarks.
     // This discovers binaries in ~/.zkminer/provers/, $PATH, etc.

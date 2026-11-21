@@ -1661,6 +1661,10 @@ pub async fn run(config_path: Option<&Path>, opts: SimulateOptions) -> Result<()
     if let Some(banner) = config.dev_mode_banner() {
         tracing::warn!("{banner}");
     }
+    // Windows, with Low-integrity workers: the key file, `.env` and the journal unreadable to the
+    // workers that run the job's guest below.
+    #[cfg(windows)]
+    super::run::protect_secrets(&config);
     // No key is read (the client signs with a throwaway one), so none must reach a worker either.
     if config.wallet.key_source == "env" {
         std::env::remove_var(&config.wallet.key_env_var);

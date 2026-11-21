@@ -24,6 +24,9 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // config degrades to the default worker search paths rather than failing.
     let config = ZkMinerConfig::load(config_path)?;
     let benchmark_timeout = config.prover.benchmark_timeout();
+    // Windows, with Low-integrity workers: the key file, `.env` and the journal unreadable to them.
+    #[cfg(windows)]
+    super::run::protect_secrets(&config);
     let mut pool = WorkerPool::new(
         config
             .prover
