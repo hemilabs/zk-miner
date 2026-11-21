@@ -6239,16 +6239,22 @@ fn next_learned_rate(
 /// `((device id, backend), cycles per second)` for one proof, or `None` for a slot that is not a
 /// card or a proof with nothing to measure.
 fn observed_rate(slot: &str, cycles: u64, duration: Duration) -> Option<((String, String), f64)> {
+    if cycles == 0 || duration.is_zero() {
+        return None;
+    }
+    Some((card_key(slot)?, cycles as f64 / duration.as_secs_f64()))
+}
+
+/// The `(device id, backend)` a proving slot's rates are kept under (`OBSERVED_THROUGHPUT`, the
+/// planner rows), or `None` for a slot that is not a card.
+fn card_key(slot: &str) -> Option<(String, String)> {
     let mut parts = slot.splitn(3, ':');
     let (backend, tag, index) = (parts.next()?, parts.next()?, parts.next()?);
-    if !matches!(tag, "cuda" | "rocm" | "intel") || cycles == 0 || duration.is_zero() {
+    if !matches!(tag, "cuda" | "rocm" | "intel") {
         return None;
     }
     let device = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(tag, index);
-    Some((
-        (device, backend.to_string()),
-        cycles as f64 / duration.as_secs_f64(),
-    ))
+    Some((device, backend.to_string()))
 }
 
 /// The learned rates, for the planner.
@@ -7042,25 +7048,140 @@ fn count_estimate_refusal(
 
 /// Records that `job_id` was released after a refusal before its proof started. Each one costs a
 /// release penalty with no submitter to blame, so more than `ESTIMATE_REFUSALS_PAGE` in an hour
-/// pages the operator: the estimates and what admission claims on disagree.
+/// (with the overruns after a retry, `note_estimate_overrun`) pages the operator: the estimates and
+/// what admission claims on disagree.
 fn note_estimate_refusal(job_id: B256, detail: &str) {
-    let count = count_estimate_refusal(
-        &mut ESTIMATE_REFUSALS.lock().unwrap_or_else(|e| e.into_inner()),
-        std::time::Instant::now(),
-    );
-    if count > ESTIMATE_REFUSALS_PAGE {
-        tracing::error!(
-            "PAGE: ESTIMATE-REFUSAL {count} jobs in the last hour were released before their proof \
-             started, the latest {} ({detail}): this host's card estimates refuse jobs its admission \
-             claims",
-            short_id(job_id)
-        );
-    } else {
+    if !count_estimate_release(job_id, detail, std::time::Instant::now()) {
         tracing::warn!(
-            "{} released before its proof started ({detail}); {count} such in the last hour",
+            "{} released before its proof started ({detail}); counted with the others of the last hour",
             short_id(job_id)
         );
     }
+}
+
+/// Counts a release on this host's estimates (refused before the start, or overrun after the
+/// benchmark-rate retry) and pages past `ESTIMATE_REFUSALS_PAGE` in an hour. Whether it paged.
+fn count_estimate_release(job_id: B256, detail: &str, now: std::time::Instant) -> bool {
+    let count = count_estimate_refusal(
+        &mut ESTIMATE_REFUSALS.lock().unwrap_or_else(|e| e.into_inner()),
+        now,
+    );
+    if count <= ESTIMATE_REFUSALS_PAGE {
+        return false;
+    }
+    tracing::error!(
+        "PAGE: ESTIMATE-REFUSAL {count} jobs in the last hour were released before their proof \
+         started or overran after a retry, the latest {} ({detail}): this host's card estimates \
+         refuse jobs its admission claims",
+        short_id(job_id)
+    );
+    true
+}
+
+/// Overruns per card after which its admission uses its learned rate (`note_estimate_overrun`).
+const ESTIMATE_OVERRUN_PAGE: usize = 2;
+/// How long a card's admission uses its learned rate after that.
+const ADMISSION_OBSERVED_FOR: Duration = Duration::from_secs(6 * 3600);
+
+/// Per proving slot, when a job proved there overran its cutoff after the benchmark-rate retry,
+/// over the last `ESTIMATE_REFUSAL_WINDOW`.
+static ESTIMATE_OVERRUNS: Mutex<
+    Option<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
+> = Mutex::new(None);
+
+/// Cards whose admission uses the learned rate (`(device id, backend)`, as `card_key`), and until
+/// when.
+static ADMISSION_USE_OBSERVED: Mutex<Option<HashMap<(String, String), std::time::Instant>>> =
+    Mutex::new(None);
+
+/// Adds an overrun on `slot` at `now` to `overruns`: how many that slot has had in the window.
+fn count_estimate_overrun(
+    overruns: &mut HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    slot: &str,
+    now: std::time::Instant,
+) -> usize {
+    // A few cards, but bounded all the same.
+    if overruns.len() >= 256 && !overruns.contains_key(slot) {
+        overruns.clear();
+    }
+    count_estimate_refusal(overruns.entry(slot.to_string()).or_default(), now)
+}
+
+/// Records that `job_id`, claimed on the benchmark's rate and started on it after the card's learned
+/// rate refused it (`RetryOnBenchmark`), then overran its cutoff on `slot` and was released. Its
+/// submitter is not marked: our learned rate had said so. But it is a release penalty all the same,
+/// so it counts with the refusals before the start, and from `ESTIMATE_OVERRUN_PAGE` in an hour on
+/// one card the operator is paged and that card's admission uses its learned rate for
+/// `ADMISSION_OBSERVED_FOR`: the claims that would overrun the same way are not made.
+fn note_estimate_overrun(job_id: B256, slot: Option<&str>, detail: &str) {
+    let now = std::time::Instant::now();
+    count_estimate_release(job_id, detail, now);
+    let Some(slot) = slot else {
+        tracing::warn!(
+            "{} overran its cutoff after the benchmark-rate retry ({detail})",
+            short_id(job_id)
+        );
+        return;
+    };
+    let count = count_estimate_overrun(
+        ESTIMATE_OVERRUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new),
+        slot,
+        now,
+    );
+    if count < ESTIMATE_OVERRUN_PAGE {
+        tracing::warn!(
+            "{} overran its cutoff on {slot} after the benchmark-rate retry ({detail}); {count} such \
+             on it in the last hour",
+            short_id(job_id)
+        );
+        return;
+    }
+    if let Some(card) = card_key(slot) {
+        ADMISSION_USE_OBSERVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(card, now + ADMISSION_OBSERVED_FOR);
+    }
+    let msg = format!(
+        "PAGE: ESTIMATE-OVERRUN {slot}: {count} jobs claimed on the benchmark rate overran mid-proof \
+         in the last hour after this card's learned rate refused them, the latest {} ({detail}); \
+         claims for it now use the learned rate for {} h",
+        short_id(job_id),
+        ADMISSION_OBSERVED_FOR.as_secs() / 3600
+    );
+    tracing::error!("{msg}");
+    note_page(msg);
+}
+
+/// The cards whose admission uses the learned rate now (`note_estimate_overrun`).
+fn admission_observed_cards() -> std::collections::HashSet<(String, String)> {
+    let now = std::time::Instant::now();
+    let mut g = ADMISSION_USE_OBSERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_mut() else {
+        return Default::default();
+    };
+    m.retain(|_, until| *until > now);
+    m.keys().cloned().collect()
+}
+
+/// The learned rates admission prices on: every one without a measured suite (`measured`), else
+/// those of the cards in `forced` only.
+fn admission_observed(
+    measured: bool,
+    observed: &HashMap<(String, String), f64>,
+    forced: &std::collections::HashSet<(String, String)>,
+) -> HashMap<(String, String), f64> {
+    observed
+        .iter()
+        .filter(|(k, _)| !measured || forced.contains(*k))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
 }
 
 /// The risc0 cards that prove jobs: each slot with a size, unless the operator switched it (or risc0)
@@ -8963,10 +9084,13 @@ async fn miner_brain(
                 v.push((d.device_id.clone(), d.prover_backend.clone(), throughput));
             }
             fill_risc0_rows(&mut v, &risc0_cards);
-            // No measured suite: what the cards have actually proved at, where they have.
-            if !measured {
-                v = with_observed(v, &observed);
-            }
+            // No measured suite: what the cards have actually proved at, where they have. With one,
+            // the learned rate only for a card whose benchmark-rate claims kept overrunning
+            // (`note_estimate_overrun`).
+            v = with_observed(
+                v,
+                &admission_observed(measured, &observed, &admission_observed_cards()),
+            );
             v
         };
         // The planner models only the jobs it placed, and is used only while that covers every job
@@ -13471,6 +13595,10 @@ async fn process_job_lifecycle(
                         }
                         if before_start {
                             note_estimate_refusal(job_id, &msg);
+                        } else if retried_on_benchmark {
+                            // Started on the benchmark's rate after the learned one refused it, and
+                            // overran: not the submitter's, but counted per card (`RP2`).
+                            note_estimate_overrun(job_id, used_slot.as_deref(), &msg);
                         }
                         return Err(anyhow::anyhow!(
                             "proving stopped for {} (deadline): {msg}",
@@ -21771,6 +21899,82 @@ mod r2_sizing_tests {
                 "{before_start} {retried} {used_observed} {rode}"
             );
         }
+    }
+
+    /// RP2: overruns after the benchmark-rate retry are counted per card over the last hour.
+    #[test]
+    fn estimate_overruns_are_counted_per_card_over_an_hour() {
+        let now = std::time::Instant::now();
+        let mut m = HashMap::new();
+        assert_eq!(count_estimate_overrun(&mut m, "sp1:cuda:0", now), 1);
+        assert_eq!(count_estimate_overrun(&mut m, "sp1:cuda:1", now), 1);
+        assert_eq!(
+            count_estimate_overrun(&mut m, "sp1:cuda:0", now + Duration::from_secs(60)),
+            2
+        );
+        assert_eq!(
+            count_estimate_overrun(&mut m, "sp1:cuda:0", now + ESTIMATE_REFUSAL_WINDOW),
+            2,
+            "the first has aged out"
+        );
+    }
+
+    /// RP2: the second overrun on a card in an hour pages ESTIMATE-OVERRUN and switches that card's
+    /// admission to its learned rate; another card, and the submitter, are untouched.
+    #[test]
+    fn a_second_overrun_on_a_card_pages_and_switches_its_admission_to_the_learned_rate() {
+        // A card index no other test uses: the counters are process-wide.
+        let slot = "risc0:cuda:97";
+        let card = card_key(slot).unwrap();
+        assert_eq!(card.1, "risc0");
+        assert_eq!(card_key("cpu:0"), None);
+        let job = B256::repeat_byte(0x97);
+        let paged = |n: usize| {
+            let q = PAGES.lock().unwrap_or_else(|p| p.into_inner());
+            q.iter()
+                .filter(|p| p.contains("ESTIMATE-OVERRUN") && p.contains(slot))
+                .count()
+                == n
+        };
+        note_estimate_overrun(job, Some(slot), "cut at its cutoff");
+        assert!(!admission_observed_cards().contains(&card));
+        note_estimate_overrun(job, Some(slot), "cut at its cutoff");
+        assert!(admission_observed_cards().contains(&card));
+        assert!(paged(1), "an ESTIMATE-OVERRUN page for the card");
+        // An overrun with no card known is counted, never switches anything.
+        note_estimate_overrun(job, None, "cut at its cutoff");
+        // The submitter stays unmarked: the action after a retry is unchanged.
+        assert_eq!(
+            deadline_refusal_action(false, true, true, true),
+            DeadlineRefusalAction::ReleaseNoMark
+        );
+    }
+
+    /// RP2: with a measured suite admission prices on benchmark rows, except for a card switched to
+    /// its learned rate; without one, on every learned rate, as before.
+    #[test]
+    fn admission_uses_the_learned_rate_only_for_switched_cards() {
+        let key = |d: &str| (d.to_string(), "sp1".to_string());
+        let observed = HashMap::from([(key("gpu0"), 1.0e6), (key("gpu1"), 2.0e6)]);
+        let forced = std::collections::HashSet::from([key("gpu1")]);
+        let rows = vec![
+            ("gpu0".to_string(), "sp1".to_string(), 3.0e6),
+            ("gpu1".to_string(), "sp1".to_string(), 3.0e6),
+        ];
+        let mut got = with_observed(rows.clone(), &admission_observed(true, &observed, &forced));
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("gpu0".to_string(), "sp1".to_string(), 3.0e6),
+                ("gpu1".to_string(), "sp1".to_string(), 2.0e6),
+            ]
+        );
+        assert!(admission_observed(true, &observed, &Default::default()).is_empty());
+        assert_eq!(
+            admission_observed(false, &observed, &Default::default()),
+            observed
+        );
     }
 
     /// Refusals before the start are counted over the last hour.
