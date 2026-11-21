@@ -3672,6 +3672,21 @@ pub(crate) fn protect_secrets(config: &ZkMinerConfig) {
     );
 }
 
+/// Windows: page the crashes recorded since the last start (`windows_crash`), each once.
+#[cfg(windows)]
+fn page_previous_crashes() {
+    if let Some(lines) = zkminer_prover::windows_crash::take_previous_crashes() {
+        tracing::error!(
+            "PAGE: MINER-CRASHED — the miner crashed since its last start and was ended with the \
+             exception's code (recorded in {}): {}",
+            zkminer_prover::windows_crash::crash_dir()
+                .map(|d| d.join("crash.log").display().to_string())
+                .unwrap_or_else(|| "crash.log".into()),
+            lines.lines().collect::<Vec<_>>().join(" | ")
+        );
+    }
+}
+
 pub async fn run(
     config_path: Option<&Path>,
     headless: bool,
@@ -3694,6 +3709,9 @@ pub async fn run(
     // page if it could not and was told to start anyway.
     #[cfg(windows)]
     zkminer_prover::windows_account::log_startup_strip();
+    // Windows: a crash of an earlier run, which its crash handler recorded.
+    #[cfg(windows)]
+    page_previous_crashes();
     // Windows, an `env` key: a copy of its variable kept in the registry outlives its removal from
     // this process, readable there by every user of this PC (the machine's or a service's
     // environment) or by every process of this one (`setx`). Not a refusal: the key is out

@@ -605,6 +605,10 @@ fn main() -> Result<()> {
             "warning: the miner's process could not be locked to this user ({e}): other processes              of this user can read its memory"
         );
     }
+    // Windows Error Reporting cannot open the locked-down process, so a crash would hang it: record
+    // the crash in ~/.zkminer/crashes and exit with its code instead. See `windows_crash`.
+    #[cfg(windows)]
+    zkminer_prover::windows_crash::install();
     let cli = Cli::parse();
     // Windows: no mining as LocalSystem, LocalService or NetworkService, or as an administrator
     // under a service logon (every worker, and so every requester's guest, would run as it too),
