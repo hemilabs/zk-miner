@@ -346,6 +346,12 @@ fn main() {
     if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
         eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
     }
+    // Windows: its threads, those running and those to come, closed to every other process of the
+    // user, another worker included (`zkminer_prover_protocol::threads`).
+    #[cfg(windows)]
+    if let Err(e) = zkminer_prover_protocol::threads::lock_threads() {
+        eprintln!("zkminer: this worker could not close its threads to other processes ({e})");
+    }
 
     // Started by the SDK as `~/.sp1/bin/zkminer-confined-<server>`: the shim that runs the real
     // `sp1-gpu-server` confined (confinement.rs). Before anything else but the above; it does not

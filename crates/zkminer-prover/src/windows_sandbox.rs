@@ -17,8 +17,10 @@
 //!   file or registry key at Medium. Its temporary, cache and segment directories are made writable
 //!   at Low before it starts, and the key file, `~/.zkminer/.env` and the lock journal get a label
 //!   Low processes cannot read through ([`protect_secrets`], [`write_secret_file`]). No other Low
-//!   worker can open its process or first thread at all ([`low_worker_descriptors`]). Off by
-//!   default until each GPU runtime is known to work at Low.
+//!   worker can open its process or first thread at all ([`low_worker_descriptors`]), nor a thread
+//!   it starts later but to see it (`zkminer_prover_protocol::threads`); the processes it starts
+//!   (SP1's `sp1-gpu-server`) are still open to them. Off by default until each GPU runtime is
+//!   known to work at Low.
 //!   The flag fails closed: a worker that cannot start at Low (its handshake fails, or its
 //!   directories cannot be prepared) is not started at Medium instead but paged and tried again at
 //!   Low after a back-off ([`low_il_worker_failed`]), as a Low process could otherwise force the
@@ -1147,8 +1149,9 @@ const LOW_WORKER_USER_RIGHTS: u32 = PROCESS_USER_RIGHTS | PROCESS_VM_READ;
 /// worker could read another's memory (another requester's guest and inputs), run code in it or
 /// end it before its handshake. With them, this user gets only [`LOW_WORKER_USER_RIGHTS`] (on the
 /// thread, [`THREAD_USER_RIGHTS`]), and the Medium label ([`NO_UP_LABEL`]) keeps every one of those
-/// from Low processes, the worker itself by its pid included. Threads the worker starts later have
-/// its token's default DACL.
+/// from Low processes, the worker itself by its pid included. The threads the worker starts later
+/// close themselves (`zkminer_prover_protocol::threads`); the processes it starts (SP1's
+/// `sp1-gpu-server`) keep its token's default DACL, which grants this user every right.
 ///
 /// No object can be created with a label above its creator's token's, and the handles a process's
 /// creator gets are checked against the descriptor it gives, which cannot tell the miner from a
@@ -1918,6 +1921,104 @@ mod tests {
                 println!("THREAD {tid} {what} {:?}", open_thread(tid, access));
             }
         }
+    }
+
+    /// A Low worker as the workers start (`zkminer_prover_protocol::threads::lock_threads`) that,
+    /// once running, starts a thread and a process (as SP1's worker starts its server), says their
+    /// ids, then waits for its stdin to close and ends its process.
+    #[test]
+    #[ignore = "run by threads_a_low_worker_starts_later_are_closed_to_its_siblings"]
+    fn low_later_helper() {
+        if std::env::var(HELPER).as_deref() != Ok("later") {
+            return;
+        }
+        zkminer_prover_protocol::threads::lock_threads().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: plain kernel32 call.
+            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+        let tid = rx.recv().unwrap();
+        // The worker itself still opens its own thread by its id, to see it.
+        println!(
+            "OWN_THREAD {:?}",
+            open_thread(tid, THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)
+        );
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "set /p X="])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        println!("READY later={tid} child={}", child.id());
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+        println!(
+            "KILL_CHILD {:?}",
+            child.kill().map_err(|e| e.raw_os_error())
+        );
+        println!("WAIT_CHILD {:?}", child.wait().map(|s| s.success()).ok());
+        drop(thread);
+    }
+
+    /// RL2: a thread a Low worker starts once running is closed to another Low worker as its first
+    /// thread is: no context, no suspending, no end; only seeing it. The worker still starts and
+    /// ends a process of its own.
+    #[test]
+    fn threads_a_low_worker_starts_later_are_closed_to_its_siblings() {
+        let mut worker = low_helper_child(
+            "windows_sandbox::tests::low_later_helper",
+            &[(HELPER, "later".into())],
+        );
+        let mut stdout = std::io::BufReader::new(worker.stdout.take().unwrap());
+        let mut out = String::new();
+        let mut line = String::new();
+        while !line.contains("READY") {
+            line.clear();
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "the helper ended early:\n{out}"
+            );
+            out.push_str(&line);
+        }
+        let later: u32 = line
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("later="))
+            .unwrap_or_else(|| panic!("no thread id in {line:?}"))
+            .parse()
+            .unwrap();
+        let mut probe = low_helper_child(
+            "windows_sandbox::tests::low_probing_helper",
+            &[
+                (HELPER, "probe".into()),
+                ("ZKMINER_TEST_TARGET", worker.id().to_string()),
+                ("ZKMINER_TEST_TARGET_THREADS", later.to_string()),
+            ],
+        );
+        let probed_out = read_all(&mut probe);
+        let probed = probe.wait().unwrap();
+        drop(worker.stdin.take());
+        stdout.read_to_string(&mut out).unwrap();
+        let status = worker.wait().unwrap();
+        assert!(status.success(), "{status:?}\n{out}");
+        assert!(probed.success(), "{probed:?}\n{probed_out}");
+        assert!(
+            probed_out.contains("LEVEL 0x1000"),
+            "the probe is not at Low:\n{probed_out}"
+        );
+        for what in ["CONTEXT", "ALL"] {
+            assert!(
+                probed_out.contains(&format!("THREAD {later} {what} Err({ERROR_ACCESS_DENIED})")),
+                "the later thread's {what} was not refused:\n{probed_out}"
+            );
+        }
+        assert!(
+            probed_out.contains(&format!("THREAD {later} QUERY Ok(())")),
+            "{probed_out}"
+        );
+        assert!(out.contains("OWN_THREAD Ok(())"), "{out}");
+        assert!(out.contains("KILL_CHILD Ok(())"), "{out}");
+        assert!(out.contains("WAIT_CHILD Some(false)"), "{out}");
     }
 
     /// A Low process gets nothing on the locked-down miner: it can neither end it nor wait for
