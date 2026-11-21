@@ -363,36 +363,55 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
 }
 
 /// Windows: what to say of the account this runs as (`windows_sandbox::account_risk`), as `run`
-/// would treat it: a service account fails (`run` refuses it, unless `allowed`), an elevated token
-/// warns.
+/// would treat it: a service account or an administrator's service logon fails (`run` refuses it,
+/// unless `allowed`), an administrator's console warns, elevated or not.
 #[cfg(windows)]
 fn account_finding(
     risk: Option<zkminer_prover::windows_sandbox::AccountRisk>,
     allowed: bool,
 ) -> (Level, String) {
     use zkminer_prover::windows_sandbox::{AccountRisk, ALLOW_PRIVILEGED_ACCOUNT_ENV};
+    let run = if allowed {
+        format!("runs ({ALLOW_PRIVILEGED_ACCOUNT_ENV}=1), paged,")
+    } else {
+        "refuses to run".to_string()
+    };
     match risk {
         Some(AccountRisk::ServiceAccount(account)) => (
             Level::Fail,
             format!(
-                "{account}: `zkminer run` {} as it: every prover worker would run as {account} \
+                "{account}: `zkminer run` {run} as it: every prover worker would run as {account} \
                  too, and the miner could keep none of them from its key. Run the miner as a \
-                 dedicated standard user (README: Windows service)",
-                if allowed {
-                    format!("runs ({ALLOW_PRIVILEGED_ACCOUNT_ENV}=1), paged,")
-                } else {
-                    "refuses to run".to_string()
-                }
+                 dedicated standard user (README: Windows service)"
+            ),
+        ),
+        Some(AccountRisk::AdminService) => (
+            Level::Fail,
+            format!(
+                "an administrator under a service logon: `zkminer run` {run} as it: every prover \
+                 worker would be an administrator of this PC. Run the miner as a dedicated \
+                 standard user (README: Windows service)"
             ),
         ),
         Some(AccountRisk::Elevated) => (
             Level::Warn,
-            "elevated (administrator rights): the prover workers would be too, so a requester's \
+            "an administrator, elevated: the prover workers would be too, so a requester's \
              guest that broke out of one would be an administrator of this PC. Run the miner \
              from a console that is not elevated, or as a dedicated standard user"
                 .to_string(),
         ),
-        None => (Level::Pass, "a standard account, not elevated".to_string()),
+        Some(AccountRisk::FilteredAdmin) => (
+            Level::Warn,
+            "an administrator, not elevated: UAC is not a security boundary, so a requester's \
+             guest that broke out of a prover worker could become an administrator of this PC. \
+             Run the miner as a dedicated standard user, or with \
+             ZKMINER_WINDOWS_LOW_IL_WORKERS=1"
+                .to_string(),
+        ),
+        None => (
+            Level::Pass,
+            "a standard account, not an administrator".to_string(),
+        ),
     }
 }
 
@@ -522,9 +541,14 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
         use zkminer_prover::windows_sandbox as sandbox;
         let (level, detail) = match sandbox::account_risk() {
             Ok(risk) => account_finding(risk, sandbox::privileged_account_allowed()),
+            // `run` refuses to start then (unless overridden): it fails closed.
             Err(e) => (
-                Level::Warn,
-                format!("could not be read from this process's token ({e})"),
+                Level::Fail,
+                format!(
+                    "could not be read from this process's token ({e}): `zkminer run` refuses to \
+                     start unless {}=1",
+                    sandbox::ALLOW_PRIVILEGED_ACCOUNT_ENV
+                ),
             ),
         };
         report.say(level, "account", detail);
@@ -1223,7 +1247,8 @@ mod tests {
     }
 
     /// Windows: a service account fails (refused, or run paged with the override), an elevated
-    /// token warns, a standard one passes.
+    /// token warns, a standard one passes. An administrator under a service logon fails; an
+    /// administrator's console warns, elevated or not.
     #[cfg(windows)]
     #[test]
     fn doctor_reports_a_privileged_account() {
@@ -1241,10 +1266,25 @@ mod tests {
             account_finding(Some(AccountRisk::ServiceAccount("NetworkService")), true);
         assert_eq!(level, Level::Fail);
         assert!(text.contains(ALLOW_PRIVILEGED_ACCOUNT_ENV), "{text}");
+        let (level, text) = account_finding(Some(AccountRisk::AdminService), false);
+        assert_eq!(level, Level::Fail);
+        assert!(
+            text.contains("administrator under a service logon") && text.contains("refuses"),
+            "{text}"
+        );
         let (level, text) = account_finding(Some(AccountRisk::Elevated), false);
         assert_eq!(level, Level::Warn);
-        assert!(text.contains("elevated"), "{text}");
-        assert_eq!(account_finding(None, false).0, Level::Pass);
+        assert!(text.contains("administrator, elevated"), "{text}");
+        // An administrator's console that is not elevated is said to be one, not a standard account.
+        let (level, text) = account_finding(Some(AccountRisk::FilteredAdmin), false);
+        assert_eq!(level, Level::Warn);
+        assert!(
+            text.contains("administrator, not elevated") && !text.contains("standard account,"),
+            "{text}"
+        );
+        let (level, text) = account_finding(None, false);
+        assert_eq!(level, Level::Pass);
+        assert!(text.contains("not an administrator"), "{text}");
     }
 
     /// Windows: SeImpersonate (a service logon's) warns, naming `sc privs`; a strip that fails

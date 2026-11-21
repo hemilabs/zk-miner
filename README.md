@@ -453,8 +453,11 @@ Worth knowing:
   account of its own with no other rights. `zkminer run` refuses LocalSystem, LocalService and
   NetworkService (NSSM's default is LocalSystem): a guest that broke out of a worker would have
   that account's rights, and under LocalSystem the miner could not keep any worker from its key.
+  It refuses an administrator's account as a service too (UAC filters no service logon), and a
+  start that cannot tell which account it runs as.
   `ZKMINER_DANGEROUSLY_ALLOW_PRIVILEGED_ACCOUNT=1` runs it anyway, paged at every start. An
-  elevated (administrator) console is paged too, not refused. From an administrator console:
+  elevated (administrator) console is paged, not refused, and an administrator's console that is
+  not elevated is warned of. From an administrator console:
 
   ```
   net user zkminer * /add
