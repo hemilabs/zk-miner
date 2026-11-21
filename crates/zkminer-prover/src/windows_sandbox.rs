@@ -464,8 +464,9 @@ pub enum AccountRisk {
     /// An administrator's account under a service logon, whose token UAC never filters: every
     /// worker is an administrator of this PC, as good as SYSTEM.
     AdminService,
-    /// An administrator's token with the Administrators group enabled in a console (an elevated
-    /// console): so are the workers' tokens.
+    /// An administrator's token with the Administrators group enabled outside a service logon (an
+    /// elevated console, or in session 0 an administrator's OpenSSH, WinRM or PsExec logon or a
+    /// "highest privileges" scheduled task): so are the workers' tokens.
     Elevated,
     /// An administrator's console that is not elevated (the Administrators group is there for deny
     /// only). UAC is not a security boundary: a worker a guest broke out of can elevate.
@@ -562,10 +563,11 @@ pub fn page_account_risk() {
              as a dedicated standard user (README: Windows service)"
         ),
         Ok(Some(AccountRisk::Elevated)) => tracing::error!(
-            "PAGE: ELEVATED — the miner runs in an elevated console (its token has the \
-             Administrators group enabled): its prover workers do too, so a requester's guest \
-             that breaks out of one is an administrator of this PC. Run it from a console that \
-             is not elevated, or as a dedicated standard user"
+            "PAGE: ELEVATED — the miner runs as an administrator with the Administrators \
+             group enabled (an elevated console, or an OpenSSH, WinRM or PsExec logon or a \
+             \"highest privileges\" scheduled task): its prover workers do too, so a \
+             requester's guest that breaks out of one is an administrator of this PC. Run it \
+             from a console that is not elevated, or as a dedicated standard user"
         ),
         Ok(Some(AccountRisk::FilteredAdmin)) => tracing::warn!(
             "the miner runs as an administrator, in a console that is not elevated: UAC is not a \

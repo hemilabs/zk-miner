@@ -168,6 +168,11 @@ enum Commands {
         /// is never used)
         #[arg(long, requires = "watch_only")]
         address: Option<alloy::primitives::Address>,
+        /// Windows, when `run` refuses its account with locks held: release them all at once,
+        /// rather than each near its cutoff (which leaves time to restart the miner as the right
+        /// account and prove them)
+        #[arg(long, conflicts_with_all = ["mock", "watch_only"])]
+        release_held: bool,
     },
     /// Measure jobs as the miner sizes them before a claim, whatever their state, and print one JSON
     /// line per job: cycles, or why not. Signs and sends nothing; starts measure workers only.
@@ -553,8 +558,9 @@ struct Early {
     /// `artifact publish --password-fd N`, checked and owned.
     #[cfg(target_os = "linux")]
     password_fd: Option<std::os::fd::OwnedFd>,
-    /// Windows: `run` refused its account with locks in the journal (the refusal): it releases
-    /// them, starting no worker, then exits with it (`commands::run::release_for_refused_account`).
+    /// Windows: `run` refused its account with locks in the journal (the refusal): it holds them,
+    /// starting no worker, releases each near its cutoff, then exits with it
+    /// (`commands::run::release_for_refused_account`).
     #[cfg(windows)]
     refused_account: Option<String>,
 }
@@ -628,13 +634,30 @@ fn main() -> Result<()> {
         // account's release starts none.)
         if let Err(e) = zkminer_prover::windows_account::strip_this_process() {
             if !sandbox::privileged_account_allowed() && refused_account.is_none() {
-                anyhow::bail!(
+                let refusal = format!(
                     "refusing to run: this process's privileges could not be removed ({e}), and \
                      its prover workers would hold them too (with SeImpersonatePrivilege, a \
                      requester's guest that broke out of one could reach SYSTEM). Run the miner \
                      as a dedicated standard user (README: Windows service). To run anyway, \
                      accepting that, set {}=1",
                     sandbox::ALLOW_PRIVILEGED_ACCOUNT_ENV
+                );
+                // Review 6 M6-3: locks in the journal are held and released as a refused
+                // account's are, rather than stranded.
+                let holds = matches!(
+                    cli.command,
+                    Commands::Run {
+                        watch_only: false,
+                        mock: false,
+                        ..
+                    }
+                );
+                refused_account = Some(
+                    commands::run::refused_account_mode(
+                        refusal,
+                        holds.then(journal::JobJournal::load_checked),
+                    )
+                    .map_err(|refusal| anyhow::anyhow!("{refusal}"))?,
                 );
             }
         }
@@ -760,10 +783,13 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
 
     let config_path = cli.config.as_deref().map(std::path::Path::new);
 
-    // Windows: a refused account's held locks, released (no worker, no claim), then the refusal.
+    // Windows: a refused account's held locks, each released near its cutoff (no worker, no
+    // claim), then the refusal.
     #[cfg(windows)]
     if let Some(refusal) = &early.refused_account {
-        return commands::run::release_for_refused_account(config_path, refusal).await;
+        let release_held = matches!(cli.command, Commands::Run { release_held: true, .. });
+        return commands::run::release_for_refused_account(config_path, refusal, release_held)
+            .await;
     }
 
     match cli.command {

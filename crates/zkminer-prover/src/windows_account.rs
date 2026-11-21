@@ -106,8 +106,6 @@ const ERROR_NOT_ALL_ASSIGNED: i32 = 1300;
 #[link(name = "kernel32")]
 extern "system" {
     fn GetCurrentProcess() -> Handle;
-    fn GetCurrentProcessId() -> u32;
-    fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -484,10 +482,12 @@ pub fn admin_state_of(groups: &[Group]) -> AdminState {
     }
 }
 
-/// Whether a token whose groups are `groups`, in session `session`, is a service's: it holds the
-/// SERVICE group, or it runs in session 0, where no console logon is.
-pub fn service_logon_of(groups: &[Group], session: Option<u32>) -> bool {
-    groups.iter().any(|(sid, _)| sid[..] == SERVICE_SID) || session == Some(0)
+/// Whether a token whose groups are `groups` is a service's: it holds the SERVICE group, which the
+/// service control manager gives every service logon. Session 0 alone is not one: an
+/// administrator's OpenSSH, WinRM or PsExec logon and a "highest privileges" scheduled task run
+/// there too, with a person (or a script of theirs) behind them, and are elevated consoles.
+pub fn service_logon_of(groups: &[Group]) -> bool {
+    groups.iter().any(|(sid, _)| sid[..] == SERVICE_SID)
 }
 
 /// The groups of this process's token.
@@ -538,11 +538,7 @@ pub fn admin_state() -> io::Result<AdminState> {
 
 /// Whether this process runs under a service logon ([`service_logon_of`]).
 pub fn is_service_logon() -> io::Result<bool> {
-    let mut session = 0u32;
-    // SAFETY: plain kernel32 calls; `session` outlives the call.
-    let session = (unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0)
-        .then_some(session);
-    Ok(service_logon_of(&this_process_groups()?, session))
+    Ok(service_logon_of(&this_process_groups()?))
 }
 
 /// `S-1-…` for a binary SID, or `None` if `sid` is not one.
@@ -933,13 +929,71 @@ mod tests {
         // The README's service account: SERVICE, no Administrators.
         let svc = [(users, 0x7), (service.clone(), 0x7)];
         assert_eq!(admin_state_of(&svc), AdminState::None);
-        assert!(service_logon_of(&svc, Some(3)));
-        assert!(service_logon_of(&[], Some(0)));
-        assert!(!service_logon_of(&[(admins, 0x7)], Some(1)));
-        assert!(!service_logon_of(&[], None));
+        assert!(service_logon_of(&svc));
+        assert!(!service_logon_of(&[(admins, 0x7)]));
+        assert!(!service_logon_of(&[]));
         assert_eq!(sid_string(&ADMINISTRATORS_SID).unwrap(), "S-1-5-32-544");
         assert_eq!(sid_string(&service).unwrap(), "S-1-5-6");
         assert_eq!(sid_string(&[1, 1, 0]), None);
+    }
+
+    /// Review 6 CR6-1: only the SERVICE group makes a service logon. An administrator in session 0
+    /// without it (OpenSSH, WinRM, PsExec, a "highest privileges" scheduled task) is an elevated
+    /// administrator, paged and not refused; with it, refused. A standard account is neither.
+    #[test]
+    fn only_the_service_group_makes_a_service_logon() {
+        use crate::windows_sandbox::{account_refusal, classify_account, AccountRisk};
+        let admins_on = (ADMINISTRATORS_SID.to_vec(), 0x7);
+        let admins_deny = (ADMINISTRATORS_SID.to_vec(), 0x10);
+        let service = (SERVICE_SID.to_vec(), 0x7);
+        let users = (
+            vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0],
+            0x7,
+        );
+        let user = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        // (what, the token's groups, its risk, refused)
+        let table: [(&str, Vec<Group>, Option<AccountRisk>, bool); 6] = [
+            (
+                "admin over SSH/WinRM/PsExec or a scheduled task (session 0)",
+                vec![users.clone(), admins_on.clone()],
+                Some(AccountRisk::Elevated),
+                false,
+            ),
+            (
+                "admin as a service",
+                vec![users.clone(), admins_on.clone(), service.clone()],
+                Some(AccountRisk::AdminService),
+                true,
+            ),
+            (
+                "admin console, not elevated",
+                vec![users.clone(), admins_deny.clone()],
+                Some(AccountRisk::FilteredAdmin),
+                false,
+            ),
+            (
+                "filtered admin under a service logon",
+                vec![users.clone(), admins_deny, service.clone()],
+                Some(AccountRisk::FilteredAdmin),
+                false,
+            ),
+            (
+                "the README's service account",
+                vec![users.clone(), service],
+                None,
+                false,
+            ),
+            ("a standard console", vec![users], None, false),
+        ];
+        for (what, groups, risk, refused) in table {
+            let got = classify_account(user, admin_state_of(&groups), service_logon_of(&groups));
+            assert_eq!(got, risk, "{what}");
+            assert_eq!(
+                account_refusal(&Ok(got), false).is_some(),
+                refused,
+                "{what}"
+            );
+        }
     }
 
     /// This test process: its own token's groups and admin state can be read.
