@@ -335,6 +335,10 @@ enum Commands {
         /// is kept, never overwritten) and point the config at it
         #[arg(long)]
         generate_key: bool,
+        /// Where the miner takes its key from: "file" (a key file, as --generate-key; the default
+        /// on Windows) or "env" (the ZKMINER_PRIVATE_KEY variable; the default elsewhere)
+        #[arg(long, value_parser = ["file", "env"])]
+        key_source: Option<String>,
     },
 }
 
@@ -1031,7 +1035,13 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             force,
             network,
             generate_key,
-        } => commands::init::run(config_path, force, &network, generate_key),
+            key_source,
+        } => commands::init::run(
+            config_path,
+            force,
+            &network,
+            commands::init::key_file_wanted(generate_key, key_source.as_deref())?,
+        ),
         Commands::Witness { command } => match command {
             WitnessCommand::InitStore {
                 dir,

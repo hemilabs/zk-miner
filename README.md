@@ -335,6 +335,7 @@ chain_id` set to the test network's chain id.
 
 ```bash
 zkminer init --generate-key   # a key file only you can read (or: read -rs ZKMINER_PRIVATE_KEY; export ZKMINER_PRIVATE_KEY)
+                              # on Windows the key file is the default; --key-source env keeps the variable
 
 zkminer status                # balance, stake, collateral, job stats
 zkminer benchmark             # measure real per-GPU proving throughput
@@ -539,8 +540,11 @@ Worth knowing:
   variable is kept in the machine's, a service's or the user's environment; the miner's start-up
   pages each.
 
-  On Windows the workers run at Low integrity. They read neither the key file, `.env` nor the job
-  journal; they cannot open or end the miner, nor open each other or the threads each starts; and
+  On Windows the workers run at Low integrity. They read neither the key file, `.env`, the job
+  journal nor PowerShell's command histories (which the miner labels too: a key typed at a
+  prompt stays in them); an `env` key's variable kept in your registry environment (`setx`),
+  which they could read, keeps them from starting (`PAGE: SECRETS-UNLABELLED`, with the command
+  that deletes it). They cannot open or end the miner, nor open each other or the threads each starts; and
   they write only where Low processes may (their temporary, cache and segment directories, which
   the miner repairs before each Low worker it starts). What their first warm-up downloads or builds
   in your profile (the SP1 server in `~/.sp1/bin`, the Groth16 artifacts in `~/.risc0` and

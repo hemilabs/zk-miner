@@ -1012,6 +1012,91 @@ fn label_secrets(
     ))
 }
 
+/// PowerShell's command histories (PSReadLine's `*_history.txt`) below `appdata` (the roaming
+/// application data directory): where `$env:ZKMINER_PRIVATE_KEY = "0x..."`, typed at a prompt, is
+/// kept for good. PSReadLine's filter for secrets does not match that variable's name.
+fn command_histories(appdata: &Path) -> Vec<PathBuf> {
+    let dir = appdata
+        .join("Microsoft")
+        .join("Windows")
+        .join("PowerShell")
+        .join("PSReadLine");
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = read
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_ascii_lowercase().ends_with("_history.txt"))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// What else may hold the key where a Low worker can read it, beside the files [`label_secrets`]
+/// labels: PowerShell's command histories below `appdata`, labelled like them (labelled, never
+/// read: one may hold an `env` key typed at a prompt); and, for an `env` key whose variable is
+/// `key_env_var`, a copy of the variable kept in this user's registry environment (`setx`), which
+/// every process of this user can read and no label can close. `copies` lists the variable's
+/// copies in the registry (`wallet_win::persisted_key_env_copies`). What is wrong, with the
+/// remedy, if anything.
+fn other_key_copies(
+    key_env_var: Option<&str>,
+    appdata: Option<&Path>,
+    copies: impl Fn(&str) -> Vec<zkminer_config::wallet_win::KeyEnvCopy>,
+) -> Result<(), String> {
+    let mut wrong = Vec::new();
+    let unlabelled: Vec<String> = appdata
+        .map(command_histories)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|path| {
+            label_secret(path)
+                .err()
+                .map(|e| format!("{} ({e})", path.display()))
+        })
+        .collect();
+    if !unlabelled.is_empty() {
+        wrong.push(format!(
+            "PowerShell's command history {} could not be labelled unreadable to Low-integrity \
+             processes, and may hold the key if it was ever typed at a prompt",
+            unlabelled.join(", ")
+        ));
+    }
+    if let Some(var) = key_env_var {
+        for copy in copies(var).into_iter().filter(|c| !c.machine_wide) {
+            wrong.push(format!(
+                "{} holds a copy of the key's variable, which every process of this user can \
+                 read, Low-integrity workers included: delete it (in PowerShell: \
+                 [Environment]::SetEnvironmentVariable('{var}', $null, 'User')), move the key to \
+                 a key file (`zkminer init --force --generate-key`, or key_source = \"file\"), \
+                 and consider the key exposed",
+                copy.location
+            ));
+        }
+    }
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{}; no Low worker is started until it is fixed",
+        wrong.join("; ")
+    ))
+}
+
+/// `a` and `b`, with both errors when both failed.
+fn both(a: Result<(), String>, b: Result<(), String>) -> Result<(), String> {
+    match (a, b) {
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        (a, b) => a.and(b),
+    }
+}
+
 /// What [`protect_secrets`] found: `None` until it ran, then whether every secret is labelled.
 static SECRETS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 
@@ -1023,12 +1108,23 @@ static SECRETS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 /// Medium (the opt-out), labels nothing and pages that instead ([`page_medium_workers`]). Every
 /// command that starts workers calls it first; a process that starts a Low worker without (a test)
 /// has `.env` and the journal labelled before its first.
-pub fn protect_secrets(key_file: Option<&Path>, journal: &Path) {
+///
+/// PowerShell's command histories are labelled too, and with an `env` key (its variable
+/// `key_env_var`) a copy of the variable in this user's registry environment refuses Low workers
+/// the same way ([`other_key_copies`]).
+pub fn protect_secrets(key_file: Option<&Path>, key_env_var: Option<&str>, journal: &Path) {
     if !low_il_workers() {
         page_medium_workers();
         return;
     }
-    let labelled = label_secrets(key_file, dirs::home_dir().as_deref(), journal);
+    let labelled = both(
+        label_secrets(key_file, dirs::home_dir().as_deref(), journal),
+        other_key_copies(
+            key_env_var,
+            dirs::config_dir().as_deref(),
+            zkminer_config::wallet_win::persisted_key_env_copies,
+        ),
+    );
     if let Err(why) = &labelled {
         tracing::error!("PAGE: SECRETS-UNLABELLED — {why}");
     }
@@ -1047,7 +1143,10 @@ fn secrets_labelled() -> Result<(), String> {
             .unwrap_or(Path::new("."))
             .join(".zkminer")
             .join("job_journal.json");
-        let labelled = label_secrets(None, home.as_deref(), &journal);
+        let labelled = both(
+            label_secrets(None, home.as_deref(), &journal),
+            other_key_copies(None, dirs::config_dir().as_deref(), |_| Vec::new()),
+        );
         if let Err(why) = &labelled {
             tracing::error!("PAGE: SECRETS-UNLABELLED — {why}");
         }
@@ -2321,6 +2420,71 @@ mod tests {
             "{why}"
         );
         assert_eq!(unlabelled, vec![(key, false)]);
+    }
+
+    /// PowerShell's command histories are labelled unreadable to Low processes (never read), and a
+    /// copy of an `env` key's variable in this user's registry environment refuses Low workers; a
+    /// machine-wide copy is paged elsewhere, and a file key has no variable to look for.
+    #[test]
+    fn command_histories_are_labelled_and_a_user_registry_copy_refuses() {
+        use zkminer_config::wallet_win::KeyEnvCopy;
+        let dir = std::env::temp_dir().join(format!("zkminer-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let histories = dir
+            .join("Microsoft")
+            .join("Windows")
+            .join("PowerShell")
+            .join("PSReadLine");
+        std::fs::create_dir_all(&histories).unwrap();
+        let console = histories.join("ConsoleHost_history.txt");
+        let code = histories.join("Visual Studio Code Host_history.txt");
+        let other = histories.join("notes.txt");
+        for f in [&console, &code, &other] {
+            std::fs::write(f, b"Get-ChildItem\r\n").unwrap();
+        }
+        assert_eq!(command_histories(&dir), vec![console.clone(), code.clone()]);
+        let none = |_: &str| Vec::new();
+        assert_eq!(
+            other_key_copies(Some("ZKMINER_PRIVATE_KEY"), Some(&dir), none),
+            Ok(())
+        );
+        let labelled = [&console, &code].map(|f| has_no_read_up_label(f).unwrap());
+        let other_labelled = has_no_read_up_label(&other).unwrap();
+
+        let user = |name: &str| {
+            vec![
+                KeyEnvCopy {
+                    location: format!(r"HKLM\SYSTEM\...\Environment ({name})"),
+                    machine_wide: true,
+                },
+                KeyEnvCopy {
+                    location: format!(r"HKCU\Environment ({name})"),
+                    machine_wide: false,
+                },
+            ]
+        };
+        let refused = other_key_copies(Some("ZKMINER_PRIVATE_KEY"), None, user).unwrap_err();
+        let machine = |name: &str| {
+            vec![KeyEnvCopy {
+                location: format!("HKLM ({name})"),
+                machine_wide: true,
+            }]
+        };
+        let machine_only = other_key_copies(Some("ZKMINER_PRIVATE_KEY"), None, machine);
+        let file_key = other_key_copies(None, None, user);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(labelled, [true, true]);
+        assert!(!other_labelled, "a file not a history was labelled");
+        assert!(
+            refused.contains(r"HKCU\Environment (ZKMINER_PRIVATE_KEY)")
+                && refused.contains("SetEnvironmentVariable('ZKMINER_PRIVATE_KEY', $null, 'User')")
+                && refused.contains("no Low worker is started")
+                && !refused.contains("HKLM"),
+            "{refused}"
+        );
+        assert_eq!(machine_only, Ok(()));
+        assert_eq!(file_key, Ok(()));
+        assert!(both(Err("a".into()), Err("b".into())).unwrap_err() == "a; b");
     }
 
     #[test]
