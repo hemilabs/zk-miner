@@ -74,6 +74,12 @@ fn main() {
     if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
         eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
     }
+    // Windows: its threads, those running and those to come, closed to every other process of the
+    // user, another worker included (`zkminer_prover_protocol::threads`).
+    #[cfg(windows)]
+    if let Err(e) = zkminer_prover_protocol::threads::lock_threads() {
+        eprintln!("zkminer: this worker could not close its threads to other processes ({e})");
+    }
 
     // `--groth16-docker-helper`: the Docker Groth16 wrap's helper process (groth16_wrap.rs), which
     // never runs a guest. It does not return.
