@@ -1036,6 +1036,27 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     }
 }
 
+/// Windows: the services that run this miner, as a service logon will find them (review 6 OJ-1):
+/// their account's password. See `windows_service`.
+#[cfg(windows)]
+fn service_checks(report: &mut Report) {
+    use super::windows_service as service;
+    let findings = service::service_password_findings();
+    if findings.is_empty() {
+        return;
+    }
+    report.section("Windows service");
+    for (finding, what, text) in findings {
+        let level = match finding {
+            service::Finding::Pass => Level::Pass,
+            service::Finding::Info => Level::Info,
+            service::Finding::Warn => Level::Warn,
+            service::Finding::Fail => Level::Fail,
+        };
+        report.say(level, &what, text);
+    }
+}
+
 /// Linux: what running as this user means for the workers (review r4 LD2). Root on a bare host is
 /// a warning: the workers drop every capability, but as uid 0 they can still read root's files
 /// (`run::privilege`).
@@ -1364,6 +1385,8 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
         replaceable_checks(&mut host_report, &host_config, &config_file);
         #[cfg(target_os = "linux")]
         linux_replaceable_checks(&mut host_report, &host_config, &config_file);
+        #[cfg(windows)]
+        service_checks(&mut host_report);
         host_report
     })
     .await?;

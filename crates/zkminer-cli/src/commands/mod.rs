@@ -23,3 +23,5 @@ pub mod stop;
 pub mod unstake;
 pub mod witness;
 pub mod witness_tools;
+#[cfg(windows)]
+pub mod windows_service;
