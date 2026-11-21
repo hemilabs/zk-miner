@@ -3114,6 +3114,11 @@ fn staging_capacity(room: u64, each: u64) -> usize {
         .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
+/// Whether a claimed proof can preempt an in-flight measurement on this platform
+/// (`WorkerPool::preempt_one_measure`). Where it cannot, what measurements hold is not counted as
+/// coming back for a claim.
+const MEASURES_PREEMPTIBLE: bool = cfg!(any(unix, windows));
+
 /// Would a proof fit with the in-flight measurements preempted? Their whole `charged` comes off what is
 /// reserved, as the ledger gives it back, but only what they are `holding` right now comes back to
 /// live memory. A charge is the measurement's cap, whatever its guest touches: crediting all of it
@@ -4114,6 +4119,8 @@ struct MemoryWaiter {
     /// What it needs beyond what its worker holds: RAM, and commit (Windows).
     ram: u64,
     commit: u64,
+    /// Its whole RAM charge, `ram` plus what its worker holds: what the ledger reserves for it.
+    peak: u64,
 }
 
 impl MemoryWaiter {
@@ -4160,6 +4167,32 @@ fn holds_up_waiter(
         return false;
     };
     my_finish.is_none_or(|f| f > fits_at) && have.saturating_sub(mine) < need
+}
+
+/// Whether a measurement charging `want` host RAM would hold up a claimed proof waiting in the
+/// memory line for `peak` (`ram` of it beyond what its worker holds), with `reserved` charged and
+/// `available` free now. It does unless the waiter would still be admitted beside the measurement's
+/// charge. A waiter larger than the host can never be admitted, and nothing is kept for it.
+fn measure_holds_up_waiter(
+    want: u64,
+    peak: u64,
+    ram: u64,
+    reserved: u64,
+    available: u64,
+    total: u64,
+    reserve: u64,
+) -> bool {
+    if peak == 0 || peak.saturating_add(reserve) > total {
+        return false;
+    }
+    !crate::memory::can_admit(
+        peak,
+        peak.saturating_sub(ram),
+        reserved.saturating_add(want),
+        available.saturating_sub(want),
+        total,
+        reserve,
+    )
 }
 
 /// This thread's estimate for `key` (`with_slot_estimates`).
@@ -8140,6 +8173,10 @@ impl WorkerPool {
                 crate::memory::RISC0_EXECUTE_PEAK_BYTES
                     .min(crate::memory::max_admissible_budget(total))
             };
+            // Speculative work does not take memory a claimed proof is waiting for.
+            if let Some(kept) = self.measure_held_for_waiter(key, want) {
+                return Err(kept);
+            }
             let reservation = self
                 .reserve_host_memory(want, key)
                 .or_else(|| self.make_measure_room(key, want));
@@ -8178,6 +8215,9 @@ impl WorkerPool {
             // cannot each under-count into the host reserve (finding H4 / residual 8).
             let want = crate::memory::RISC0_EXECUTE_PEAK_BYTES
                 .min(crate::memory::max_admissible_budget(total));
+            if let Some(kept) = self.measure_held_for_waiter(key, want) {
+                return Err(kept);
+            }
             match self.reserve_host_memory(want, key) {
                 Some(r) => Some(r),
                 None => {
@@ -9015,6 +9055,7 @@ impl WorkerPool {
                 seen: now,
                 ram: 0,
                 commit: 0,
+                peak: 0,
             }
             .place();
             line.iter()
@@ -9126,9 +9167,8 @@ impl WorkerPool {
             return;
         };
         let now = Instant::now();
-        let ram = self
-            .host_want(key, po2, execute_peak_bytes)
-            .saturating_sub(self.current_host_bytes_for_slot(key).unwrap_or(0));
+        let peak = self.host_want(key, po2, execute_peak_bytes);
+        let ram = peak.saturating_sub(self.current_host_bytes_for_slot(key).unwrap_or(0));
         let commit = crate::memory::commit_figures().map_or(0, |c| {
             self.slot_commit_peak_in(key, po2, c.total)
                 .saturating_sub(self.current_commit_bytes_for_slot(key).unwrap_or(0))
@@ -9148,6 +9188,7 @@ impl WorkerPool {
                 w.seen = now;
                 w.ram = ram;
                 w.commit = commit;
+                w.peak = peak;
             }
             None => line.push(MemoryWaiter {
                 job,
@@ -9156,6 +9197,7 @@ impl WorkerPool {
                 seen: now,
                 ram,
                 commit,
+                peak,
             }),
         }
     }
@@ -9196,6 +9238,51 @@ impl WorkerPool {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|w| w.job != tag);
+    }
+
+    /// Whether a measurement on `key` charging `want` host RAM must not start, because a claimed
+    /// proof is waiting in the memory line for memory the charge would take
+    /// (`measure_holds_up_waiter`). Then the typed shortage to return, marked `MemoryKeptForWaiter`,
+    /// which the measure path treats as transient (no strike). Without it each charge a measurement
+    /// gave back could be taken by the next one before the proof asked again, and a stream of slow
+    /// measurements kept a bonded proof waiting until it was released at a penalty, wherever the
+    /// running ones could not be preempted. Only claimed proofs (with a deadline) are waited for.
+    fn measure_held_for_waiter(&self, key: &str, want: u64) -> Option<anyhow::Error> {
+        let now = Instant::now();
+        let waiting: Vec<(u64, u64)> = self
+            .memory_waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|w| w.order.is_some())
+            .filter(|w| now.saturating_duration_since(w.seen) < MEMORY_WAITER_TTL)
+            .map(|w| (w.peak, w.ram))
+            .collect();
+        if waiting.is_empty() {
+            return None;
+        }
+        let total = crate::memory::mem_total_bytes()?;
+        let available = self.admission_available()?;
+        let reserved = self.reserved_host_memory();
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        let (peak, _) = waiting.into_iter().find(|&(peak, ram)| {
+            measure_holds_up_waiter(want, peak, ram, reserved, available, total, reserve)
+        })?;
+        tracing::debug!(
+            "{key}: not measuring now, a claimed proof is waiting for host memory ({:.1} GiB)",
+            peak as f64 / (1u64 << 30) as f64,
+        );
+        Some(
+            anyhow::Error::new(zkminer_prover_protocol::types::HostMemoryShortage {
+                kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
+                attempted: false,
+                slot_key: key.to_string(),
+                needed: want,
+                reserved,
+                available,
+            })
+            .context(zkminer_prover_protocol::types::MemoryKeptForWaiter),
+        )
     }
 
     /// `prove_on_slot` for `prove_min_vram`, keeping the job's place in the memory line: refused host
@@ -10652,7 +10739,7 @@ impl WorkerPool {
     ) -> Option<zkminer_prover_protocol::types::HostMemoryShortage> {
         let measures = self.inflight_measures_snapshot();
         let preemptable = |bytes: fn(&InflightMeasure) -> u64| {
-            if !committed {
+            if !committed || !MEASURES_PREEMPTIBLE {
                 return 0;
             }
             measures
@@ -10724,7 +10811,7 @@ impl WorkerPool {
     /// it cannot deadlock against the measurement; the only work done under the lock is a `/proc`
     /// read, `unlink_group_sp1_shm` (bounded, whatever the worker is stuck on) and two `kill(2)`s,
     /// none of which re-enter `inflight_measures`.
-    #[cfg_attr(not(unix), allow(unused_variables))]
+    #[cfg_attr(not(any(unix, windows)), allow(unused_variables))]
     fn preempt_one_measure(&self, key: &str, m: &InflightMeasure) -> bool {
         let map = self
             .inflight_measures
@@ -10790,7 +10877,38 @@ impl WorkerPool {
                 false
             }
         }
-        #[cfg(not(unix))]
+        // Windows has no process groups: the worker itself is terminated, under the same identity
+        // check as the watchdog's (`memory::terminate_if_our_worker`: the pid must still be the
+        // process created at the recorded time). What it started goes with it: the SP1 measure worker
+        // puts itself in a kill-on-close job (`windows_job`), and the risc0 one executes in-process.
+        #[cfg(windows)]
+        {
+            let pid = live.pid.load(Ordering::Acquire);
+            let start = live.pid_starttime.load(Ordering::Acquire);
+            if pid == 0 || start == 0 {
+                return false;
+            }
+            if pid != live.expected_pid || start != live.expected_starttime {
+                tracing::debug!(
+                    "not preempting measurement {key}: identity moved (pid {}/{} -> {pid}/{start})",
+                    live.expected_pid,
+                    live.expected_starttime
+                );
+                return false;
+            }
+            if crate::memory::terminate_if_our_worker(pid, Some(start)) {
+                tracing::warn!(
+                    "preempted in-flight measurement {key} (pid {pid}) to free resources for a                      claimed proof"
+                );
+                true
+            } else {
+                tracing::debug!(
+                    "not preempting measurement {key}: pid {pid} is no longer our worker"
+                );
+                false
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             false
         }
@@ -11698,6 +11816,9 @@ impl WorkerPool {
         // behind it and a measurement has none (`preempt_measures_for_host`). Refusing the claim here
         // means that never happens, and lets a submitter hold off SP1 claims for free by keeping
         // measurements running.
+        if !MEASURES_PREEMPTIBLE {
+            return false;
+        }
         let measures = self.inflight_measures_snapshot();
         let charged = measures
             .iter()
@@ -20437,6 +20558,138 @@ mod preemption_tests {
             budget <= left - MIN_ABORT_START_BUDGET,
             "reclaim wait {budget:?} would eat the {MIN_ABORT_START_BUDGET:?} start floor of a {left:?} deadline"
         );
+    }
+
+    /// A measurement does not take memory a claimed proof is waiting for (finding Q1): on a 64 GiB
+    /// box a 40 GiB SP1 proof and a 24 GiB measurement charge do not fit together, so the next
+    /// measurement does not start while the proof waits, even with every charge given back.
+    #[test]
+    fn a_measurement_does_not_take_memory_a_claimed_proof_waits_for() {
+        const G: u64 = 1 << 30;
+        // In GiB: the measurement's charge, the waiter's peak and what it needs beyond its worker,
+        // then what is reserved, available and in total, with 3 kept for the OS.
+        let held = |want: u64, peak: u64, ram: u64, reserved: u64, available: u64, total: u64| {
+            measure_holds_up_waiter(
+                want * G,
+                peak * G,
+                ram * G,
+                reserved * G,
+                available * G,
+                total * G,
+                3 * G,
+            )
+        };
+        // Another measurement still charged, or none: either way 24 + 40 + 3 exceeds 64.
+        assert!(held(24, 40, 40, 24, 60, 64));
+        assert!(held(24, 40, 40, 0, 60, 64));
+        // A large host fits both: the measurement goes.
+        assert!(!held(24, 40, 40, 0, 120, 128));
+        // Live memory is short beside it, though the ledger is not: still held. A warm worker's
+        // holdings are not wanted twice.
+        assert!(held(8, 40, 40, 0, 45, 128));
+        assert!(!held(8, 40, 20, 0, 45, 128));
+        // A waiter that can never be admitted here, or needs nothing, keeps nothing.
+        assert!(!held(24, 62, 62, 0, 60, 64));
+        assert!(!held(24, 0, 0, 0, 0, 64));
+    }
+
+    /// `execute_cycles` asks `measure_held_for_waiter` before charging a measurement: a claimed
+    /// proof in the memory line that the charge would hold up stops it, with a transient typed
+    /// shortage; a waiter with no deadline (not claimed), or one that stopped asking, does not.
+    #[test]
+    fn a_measurement_yields_only_to_a_claimed_proof_still_waiting() {
+        let Some(total) = crate::memory::mem_total_bytes() else {
+            return;
+        };
+        let pool = empty_pool();
+        let reserve = crate::memory::DEFAULT_HOST_RESERVE_BYTES;
+        // Fits only with nothing else charged, so any measurement holds it up.
+        let peak = total - reserve;
+        let waiter = |order: Option<Instant>, seen: Instant| MemoryWaiter {
+            job: 7,
+            order,
+            since: seen,
+            seen,
+            ram: peak,
+            commit: 0,
+            peak,
+        };
+        let want = 1 << 30;
+        assert!(pool
+            .measure_held_for_waiter("sp1:measure:0", want)
+            .is_none());
+        let now = Instant::now();
+        let set = |w: MemoryWaiter| *pool.memory_waiters.lock().unwrap() = vec![w];
+
+        set(waiter(None, now));
+        assert!(
+            pool.measure_held_for_waiter("sp1:measure:0", want)
+                .is_none(),
+            "not claimed: nothing is kept for it"
+        );
+        if let Some(stale) = now.checked_sub(MEMORY_WAITER_TTL) {
+            set(waiter(Some(now + Duration::from_secs(600)), stale));
+            assert!(
+                pool.measure_held_for_waiter("sp1:measure:0", want)
+                    .is_none(),
+                "it stopped asking: it has left the line"
+            );
+        }
+        set(waiter(Some(now + Duration::from_secs(600)), now));
+        let Some(err) = pool.measure_held_for_waiter("sp1:measure:0", want) else {
+            // Memory unreadable here: no opinion.
+            assert!(pool.admission_available().is_none());
+            return;
+        };
+        let shortage = err
+            .downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .expect("a typed shortage, which the measure path treats as transient");
+        assert!(!shortage.attempted);
+        assert_eq!(shortage.needed, want);
+        assert!(err
+            .downcast_ref::<zkminer_prover_protocol::types::MemoryKeptForWaiter>()
+            .is_some());
+    }
+
+    /// Windows has no process groups and no signals: a claimed proof preempts a measurement by
+    /// terminating its worker, under the same identity check as the watchdog (finding Q1). A worker
+    /// whose creation time no longer matches the registration is left running.
+    #[cfg(windows)]
+    #[test]
+    fn preempt_one_measure_terminates_the_worker_on_windows() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        let pid = child.id();
+        let start = crate::memory::pid_starttime(pid).expect("a live child has a creation time");
+        let pool = empty_pool();
+        let register = |expected_starttime: u64| {
+            let (mut m, flag) = fake_measure(8 << 30);
+            m.pid = Arc::new(AtomicU32::new(pid));
+            m.pid_starttime = Arc::new(AtomicU64::new(start));
+            m.expected_pid = pid;
+            m.expected_starttime = expected_starttime;
+            pool.inflight_measures
+                .lock()
+                .unwrap()
+                .insert("sp1:measure:0".to_string(), m.clone());
+            (m, flag)
+        };
+
+        // The identity moved since it registered: nothing is terminated.
+        let (moved, _) = register(start.wrapping_add(1));
+        assert!(!pool.preempt_one_measure("sp1:measure:0", &moved));
+        assert!(child.try_wait().unwrap().is_none(), "still running");
+
+        let (m, flag) = register(start);
+        assert!(pool.preempt_one_measure("sp1:measure:0", &m));
+        assert!(
+            flag.load(Ordering::Acquire),
+            "reported as preempted, not as a crash"
+        );
+        child.wait().expect("the terminated worker is reaped");
     }
 }
 
