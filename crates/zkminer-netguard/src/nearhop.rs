@@ -1908,23 +1908,23 @@ mod tests {
         assert!(matches!(&r, Ok(o) if matches!(&o[0].outcome, ProbeOutcome::Failed(_))), "{r:?}");
     }
 
-    /// The real probe, on the real path: a probe of hop limit 1 to a public address runs out of
-    /// hops at the first router, whose Time Exceeded the kernel matches to it and names (Linux:
-    /// the error queue; macOS: the ICMP socket and the ISN). Skipped where 1.1.1.1 has no route,
-    /// or the first router sends none.
+    /// The real probe, on the real path: a probe of hop limit 1 (or 2: a VM's NAT sends none) to
+    /// a public address runs out of hops at a router, whose Time Exceeded the kernel matches to it
+    /// and names (Linux: the error queue; macOS: the ICMP socket and the ISN). Skipped where
+    /// 1.1.1.1 has no route, or the first two routers send none.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn the_router_that_ran_a_probe_out_is_named() {
         let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
         let mut seen = Vec::new();
-        for _ in 0..3 {
-            match observe(dst, 1, 0, &Pin::default(), Duration::from_millis(1500)) {
+        for hops in [1, 2, 1, 2] {
+            match observe(dst, hops, 0, &Pin::default(), Duration::from_millis(1500)) {
                 Ok(obs) => {
                     if let ProbeOutcome::Icmp { kind, code, from } = obs[0].outcome {
                         assert_eq!((kind, code), (11, 0), "{obs:?}");
                         assert!(router_sent(from, dst.ip()), "{from}");
                         assert!(obs[0].local.is_some_and(|l| l.port() != 0));
-                        eprintln!("hop 1 is {from}");
+                        eprintln!("hop {hops} is {from}");
                         return;
                     }
                     seen.push(format!("{obs:?}"));
