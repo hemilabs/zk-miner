@@ -486,6 +486,7 @@ impl ElfCache {
         use std::io::Write;
         use std::sync::atomic::{AtomicU64, Ordering};
         std::fs::create_dir_all(&self.cache_dir).context("Failed to create ELF cache directory")?;
+        self.sweep_stale_temp(std::time::Duration::from_secs(3600));
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         static TMP: AtomicU64 = AtomicU64::new(0);
         let tmp = self.cache_dir.join(format!(
@@ -510,6 +511,33 @@ impl ElfCache {
         // and this cache is written even on the PRE-CLAIM measurement path, for jobs never claimed.
         self.prune_to_budget();
         Ok(())
+    }
+
+    /// Remove the temporary files of [`Self::put`]s that never finished (a process killed while
+    /// writing one, which can be up to 256 MiB): `.<id>.<pid>.<n>.tmp` files untouched for `age`.
+    /// Nothing else counts them, so they would stay for good. A put still writing one touches it
+    /// far more often than `age`.
+    fn sweep_stale_temp(&self, age: std::time::Duration) {
+        let Ok(read) = std::fs::read_dir(&self.cache_dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !(name.starts_with('.') && name.ends_with(".tmp")) {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= age);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Maximum total bytes kept in the on-disk ELF cache. Override with
@@ -835,6 +863,36 @@ mod security_tests {
         assert!(dir.join(format!("{}.elf", ids[1])).exists(), "pinned ELF #2 must survive");
         assert!(!dir.join(format!("{}.elf", ids[2])).exists(), "unpinned ELF must be evicted");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A put's temporary file left by a killed process is removed once stale; a fresh one (a put
+    /// in progress) and the cached ELFs are kept.
+    #[test]
+    fn stale_put_temp_files_are_swept() {
+        let dir = std::env::temp_dir().join(format!("zkminer-elf-tmp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+        let id = B256::repeat_byte(0x44);
+        let old = dir.join(format!(".{id}.1234.0.tmp"));
+        let fresh = dir.join(format!(".{id}.1234.1.tmp"));
+        let elf = dir.join(format!("{id}.elf"));
+        for p in [&old, &fresh, &elf] {
+            std::fs::write(p, b"\x7fELF").unwrap();
+        }
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        cache.sweep_stale_temp(std::time::Duration::from_secs(3600));
+        assert!(!old.exists(), "a stale temp file was kept");
+        assert!(fresh.exists() && elf.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

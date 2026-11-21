@@ -1,6 +1,8 @@
 pub mod codec;
 #[cfg(windows)]
 pub mod ipc;
+#[cfg(windows)]
+pub mod liveness;
 pub mod proc;
 pub mod sp1_shm;
 pub mod suite;
