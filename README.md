@@ -821,8 +821,9 @@ Worth knowing:
   change the file's owner (the account's own files have it). A key file it can neither label nor,
   as its owner, open to labelling is paged (`PAGE: SECRETS-UNLABELLED`) and no worker starts
   until it is fixed. `zkminer doctor` says when the miner's account is refused or elevated,
-  which dangerous privileges it holds, when the key file cannot be labelled, and when the key's variable is kept in the machine's, a
-  service's or the user's environment; the miner's start-up pages each.
+  which dangerous privileges it holds, when the key file cannot be labelled, and when the key's
+  variable is kept in the machine's, a service's or the user's environment; the miner's start-up
+  pages each.
 
   On Windows the workers run at Low integrity. They read neither the key file, `.env` nor the job
   journal; they cannot open or end the miner, nor open each other or the threads each starts; and
