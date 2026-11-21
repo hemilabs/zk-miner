@@ -570,8 +570,7 @@ impl Connector {
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
             // From the source the check vetted (the kernel's for a TCP connection: review round
             // 4, cross-3), so the connection leaves from it.
-            let source = vetted.as_ref().and_then(|v: &zkminer_netguard::Vetted| v.source);
-            let connected = tokio::time::timeout(share, connect_tcp(addr, source)).await;
+            let connected = tokio::time::timeout(share, connect_tcp(addr, vetted.as_ref())).await;
             connect_left = connect_left.saturating_sub(now.elapsed());
             match connected {
                 Ok(Ok(fd)) => {
@@ -907,19 +906,23 @@ const FAMILY_DELAY: Duration = Duration::from_millis(250);
 /// A family's chain stops after this many checks that could not tell (review round 6, cross-3).
 const MAX_UNANSWERED: usize = 2;
 
-/// A fresh TCP connection to `addr` (`socket` + `connect`, bound to `source` when given), as an
-/// owned fd. An IPv4-mapped address is connected to as its IPv4 address, on an IPv4 socket
-/// (review round 5, bypass-5: an IPv6 socket bound to the IPv4 source the check vetted failed
-/// with `EINVAL`), as the guarded client's hops do.
-async fn connect_tcp(addr: SocketAddr, source: Option<IpAddr>) -> io::Result<OwnedFd> {
+/// A fresh TCP connection to `addr` (`socket` + `connect`), as an owned fd: for a vetted address
+/// the socket the floor pins ([`zkminer_netguard::Vetted::socket`]: the vetted source address,
+/// the local port of the near-hop probe that found it far, its interface; a port taken now fails
+/// the attempt, never connected from another), otherwise a plain one. An IPv4-mapped address is
+/// connected to as its IPv4 address, on an IPv4 socket (review round 5, bypass-5: an IPv6 socket
+/// bound to the IPv4 source the check vetted failed with `EINVAL`; the vetted socket is of the
+/// unmapped address's family), as the guarded client's hops do.
+async fn connect_tcp(addr: SocketAddr, vetted: Option<&zkminer_netguard::Vetted>) -> io::Result<OwnedFd> {
     let addr = match addr.ip() {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, |v4| SocketAddr::new(IpAddr::V4(v4), addr.port())),
         IpAddr::V4(_) => addr,
     };
-    let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
-    if let Some(src) = source {
-        sock.bind(SocketAddr::new(src, 0))?;
-    }
+    let sock = match vetted {
+        Some(v) => tokio::net::TcpSocket::from_std_stream(v.socket()?.into()),
+        None if addr.is_ipv4() => tokio::net::TcpSocket::new_v4()?,
+        None => tokio::net::TcpSocket::new_v6()?,
+    };
     let stream = sock.connect(addr).await?;
     Ok(OwnedFd::from(stream.into_std()?))
 }

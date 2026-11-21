@@ -26,9 +26,11 @@
 //!   the URL standard's parser must agree with, host hygiene, and IP literals through [`admit`]);
 //! - [`NetPolicy`]: the mode, refreshing host facts and the operator's deny CIDRs, as one value;
 //! - [`ipfs_gateway_url`] / [`arweave_gateway_url`]: content ids syntax-checked into gateway URLs;
-//! - [`NetPolicy::vet_connection`]: the last check right before a connection, with its port: the
-//!   kernel's route for it, and the near-hop probe ([`nearhop`]: a destination that answers within
-//!   a few hops of this host is its own network);
+//! - [`NetPolicy::vet_connection`] / [`NetPolicy::vet_path`]: the last check right before a
+//!   connection, with its port: the kernel's route for it, and the near-hop decision
+//!   ([`nearhop`]: a destination is admitted as far only on positive evidence, a router past the
+//!   limit saying a probe ran out of hops, never on silence; the connection then leaves from that
+//!   probe's address and port, [`Vetted::socket`]);
 //! - with the `client` feature (default): [`GuardedResolver`], which hands a connection only
 //!   admitted addresses from one lookup (no DNS rebinding), over DNS-over-HTTPS to fixed public
 //!   resolvers in public mode ([`doh`]), and [`guarded_client`], an HTTP client that refuses
@@ -67,7 +69,7 @@ pub use facts::{
 };
 pub use host::{check_host_name, HostDenied, INTERNAL_SUFFIXES};
 pub use ip::{canonical_ip, is_global, prefix_is_global, Prefix, PrefixParseError};
-pub use nearhop::{NearProbe, ProbeOutcome, TtlProbe};
+pub use nearhop::{FarEvidence, NearProbe, Pin, ProbeOutcome, TtlProbe, Verdict};
 pub use policy::{
     admit, admit_prefix, admit_to, connected_as_vetted, Denied, NetMode, NetPolicy, RouteKind,
     UrlDenied, Vetted, FACTS_TTL, FORCED_REFRESH_MIN_AGE,
@@ -200,7 +202,7 @@ mod tests {
         // Review round 4, cross-7: an explicit token, not a part of the text.
         assert!(skip_fails(Some("1"), Some("IPv6"), why), "a token is matched exactly");
         assert!(skip_fails(Some("1"), Some("6"), why));
-        let untagged = "52.217.141.232:443 now acknowledges a bare FIN (no IPv6 here either)";
+        let untagged = "52.217.141.232:443 sent no time exceeded (no IPv6 here either)";
         assert!(skip_fails(Some("1"), Some("ipv6,IPv6"), untagged));
         assert!(skip_fails(Some("1"), Some("ipv6"), "[] nothing"));
         assert!(skip_fails(Some("1"), Some("ipv6"), "[ipv6 no closing bracket"));
