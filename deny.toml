@@ -5,13 +5,6 @@
 [advisories]
 yanked = "warn"
 ignore = [
-    # Reachable, waiting on a lockfile bump (rustls >= 0.23.46, h2 >= 0.4.16).
-    { id = "RUSTSEC-2026-0346", reason = "rustls 0.23.45: Debug of client session values; the miner never formats them. Bump pending." },
-    { id = "RUSTSEC-2026-0347", reason = "rustls 0.23.45: ECH is not enabled. Bump pending." },
-    { id = "RUSTSEC-2026-0348", reason = "rustls 0.23.45: certificate compression (brotli) is not enabled. Bump pending." },
-    { id = "RUSTSEC-2026-0349", reason = "rustls 0.23.45: a downgrade of the post-quantum hybrid key exchange to classical X25519. Bump pending." },
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.4.13: a malicious HTTP/2 server can make a client spin on empty DATA frames. Bump pending." },
-
     # Not reachable from a running miner.
     { id = "RUSTSEC-2023-0071", reason = "rsa: only through rzup, risc0's toolchain installer; the miner never decrypts or signs with RSA." },
     { id = "RUSTSEC-2025-0055", reason = "tracing-subscriber 0.2: ark-relations' constraint tracing; no requester text is logged through it." },
