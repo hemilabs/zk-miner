@@ -1464,9 +1464,10 @@ job content can cause — ELF downloads from ProgramRegistry URIs, builder fetch
 mirrors — goes only to globally routable addresses outside the host's own addresses (public NAT
 addresses included), its connected prefixes, its sites (the /32 around its global IPv6 addresses by
 default, the /16 around its global IPv4 interface addresses) and the operator's `[egress]
-internal_ranges`, that do not answer a hop-limited probe sent right before the connection
-(`near_hop_limit`, default 2: the host's router and anything it hairpins to; when the probe gets no
-answer, a check connection whose FIN, limited to the same hop count, must go unanswered). Names pass host-name hygiene and are resolved
+internal_ranges`, that hop-limited probes sent right before the connection show to be farther
+than `near_hop_limit` hops (default 2: the host's router and anything it hairpins to; far only on
+positive evidence, an ICMP "time exceeded" from a router past the limit, never on silence; the
+connection is then made from that probe's address, port and interface). Names pass host-name hygiene and are resolved
 over DNS-over-HTTPS at fixed public resolvers, never the host's resolver (§14.7), and the vetted
 address is pinned for the connection. It fails closed: while the host's public address on a routed
 family is unknown (neither confirmed by the reflectors nor stated in `[egress] public_addresses`),
@@ -1522,7 +1523,8 @@ and IPv4 sites, the internal ranges, routes off the default path, local routes, 
 rules, NAT64 prefixes, the DNS servers and the deny CIDRs, on a family whose public address is
 known, confirmed by a per-destination kernel route query (with the destination port and, for IPv4,
 the source the kernel picks) — then, right before connecting, refuses an address that answers the
-near-hop probe (with its check connection when the probe gets no answer), connects, and returns the connected socket (`SCM_RIGHTS`). A malformed frame, a
+near-hop probes or that they cannot show to be farther (no "time exceeded" from a router past the
+limit), connects from the far probe's address, port and interface, and returns the connected socket (`SCM_RIGHTS`). A malformed frame, a
 descriptor sent to the connector, more than 64 requests in flight (a request is in flight until its
 answer is handed to the socket, so unread answers count), a reused request id, more than 8 requests
 for missing endpoints within a minute (counted before the refusal is answered), an answer left
@@ -2045,7 +2047,7 @@ key. The rows marked *(broker file)* below are keys of that file.
 | `[egress] internal_ranges` | unset | Refused like deny CIDRs; required in public mode on a host with a global IPv4 interface address or an uplink that is not plainly physical (§14), judged at startup and again on every change; `[]` states there are none |
 | `[egress] ipv6_site_prefix_len`, `ipv4_site_prefix_len` | 32 (16..=64), 16 (8..=32) | Sites refused around the host's own global addresses |
 | `[egress] public_addresses`, `discover_public_addresses` | `[]`, `true` | The host's public addresses; unknown on a routed family ⇒ nothing goes out over it; discovery off needs an address per routed family. Discovery confirms by the HTTPS reflector, or by both DNS reflectors unless the HTTPS reflector was answered by an impostor; a confirmation lasts 10 minutes and belongs to the uplink it was made on |
-| `[egress] near_hop_limit` | 2 (2..=16) | Hop limit of the probe sent right before each connection under the floor, with a check connection when the probe gets no answer |
+| `[egress] near_hop_limit` | 2 (2..=16) | Hop limit of the probes sent right before each connection under the floor (at `N`, `N+1`, `N+2`); far only on a router's "time exceeded" past the limit, anything else refused |
 | `[egress] doh_resolvers` | Cloudflare, Google, Quad9 | DNS-over-HTTPS resolvers for requester names: https URLs with a public IP-literal host |
 | `[witness] builder_binary`, `execute_binary`, `execute_memory_bytes`; `[broker] binary`, `memory_bytes` | next to `zkminer`; 10 GiB; 1 GiB | Sandboxed binaries and their memory caps |
 

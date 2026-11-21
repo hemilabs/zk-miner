@@ -7,8 +7,8 @@ the code path, on purpose: this changes what PR #37 decides on Linux and Windows
 (each connection checked again once made) applies on every platform, macOS included.
 
 The logic is the macOS one, lifted out of `cfg(target_os = "macos")` into shared code; what
-differs per platform is only the primitive behind it (netlink or the routing socket, `TCP_INFO`
-or `TCP_CONNECTION_INFO`, the neighbour table or configd). Decisions are pure functions where
+differs per platform is only the primitive behind it (netlink or the routing socket, the ICMP
+error queue or an ICMP socket with the private `TCP_INFO`, the neighbour table or configd). Decisions are pure functions where
 they can be, so their tests run on every platform.
 
 ## What every platform does now
@@ -35,17 +35,12 @@ they can be, so their tests run on every platform.
    Since review round 4 (cross-2, bypass-3): an entry that goes missing, or first appears, changes
    nothing, and another known address counts only once it holds for 3 reads and 2 s; a neighbour
    dump that fails no longer fails the facts read (the addresses are taken as unknown).
-4. **Only an acknowledged FIN answers the check connection.** One `confirm_once` for Linux,
-   Android and macOS, deciding from a platform-neutral `TcpState`: `FIN_WAIT_2` / `TIME_WAIT`
-   (this side's FIN acknowledged) is near; a peer that closed or reset first is a failed check,
-   never near and never far. Linux never shows `TIME_WAIT` on the socket (it hands the
-   connection to a timewait mini-socket and the socket reads `TCP_CLOSE`), so `TCP_CLOSE` with
-   no pending error (`SO_ERROR` 0) reads as acknowledged-and-closed, with one (`ECONNRESET`,
-   `EPIPE`, …) as reset; since review round 4 (parse-2) a reset read once stays a reset for that
-   socket, and an unreadable `SO_ERROR` is a reset. Before, Linux read every state but
-   `FIN_WAIT1` as near.
-5. **IPv4-mapped addresses are unmapped inside the probe and the check connection**, on every
-   platform (Windows' probe too).
+4. **Only an acknowledged FIN answered the check connection** (`confirm_once`, `TcpState`, one
+   decision for Linux, Android and macOS). *Removed by the S3 review (2026-11):* there is no
+   check connection any more; the near-hop decision is the positive-evidence rule ("Near-hop
+   rule: positive evidence", below).
+5. **IPv4-mapped addresses are unmapped inside the probes**, on every platform (Windows' probe
+   too).
 6. **Each connection is checked again once made**, before any request byte is written (new on
    every platform). `NetPolicy::vet_path` vets as before and then records the source address the
    kernel chooses for the connection (a UDP socket connected to it: nothing sent);
@@ -74,22 +69,12 @@ they can be, so their tests run on every platform.
    policy reads them again at once and judges once more). Before, Linux admitted any default-like
    route of an ordinary table until the next facts read.
 9. **The positive control, and a second probe attempt.** A FIN unacknowledged within the hop
-   limit is far only if the peer acknowledges a FIN at the default hop limit; otherwise a failed
-   check, refused. (Since review round 4, probe-1, the control is a second connection and the
-   check connection keeps its low hop limit; the probe has a third attempt: below.) The probe is asked twice within its 1.5 s (1 s,
-   then 0.5 s after a timeout), on every platform, Windows included (where a probe without an
-   answer is refused outright, so the second attempt saves refusals). Linux's early "far" from
-   an ICMP error for the FIN (`SO_ERROR`) is gone: Linux keeps such an error as a soft error that
-   `SO_ERROR` does not report without `IP_RECVERR`, and a far verdict from it would skip the
-   control. **The S3 trade-off:** AWS S3's front ends never acknowledge a bare FIN, at any hop
-   limit, so on a path whose first two routers send no ICMP "time exceeded" (some corporate and
-   cloud networks; an EC2 instance's first hops often send none) every S3 download is refused;
-   on a home path about 3% of attempts (each decided anew) are. The refusal now names the cause
-   within the 120 characters a refusal shows of it: `the peer acknowledged the check's FIN
-   neither within the hop limit nor at the default one (AWS S3 never does)` (the old text was
-   cut before it named anything). Dropping the control is a one-line change in `Check::step`
-   (the `None` arm) if S3-hosted programs matter more than a near device that never acknowledges
-   a bare FIN and drops the probe's SYN.
+   limit was far only if the peer acknowledged a FIN at the default hop limit, which AWS S3's
+   front ends never do; the probe was asked more than once. *Removed by the S3 review
+   (2026-11):* the control and check connections are gone, and with them the S3 trade-off; a
+   decision is now up to two rounds of probes at hop limits `N`, `N+1`, `N+2`, far only on a
+   router's ICMP "time exceeded" past the limit, so S3 is judged by distance like any other
+   server ("Near-hop rule: positive evidence", below).
 10. **CI.** `.github/workflows/netguard-linux.yml` runs the suite with `ZKMINER_CI_STRICT=1`
     (`ZKMINER_CI_ALLOW_SKIP=ipv6`, a token a skip reason starts with: GitHub's runners have no
     IPv6) and clippy `--all-targets -D warnings`, and since review round 4 a `callers` job
@@ -178,12 +163,12 @@ type-checked (`cargo check` and `clippy --all-targets`) with stub C compilers.
 | 1 facts unreadable refuse | new: `FactsCell` single flight and grace, `FactsUnreadable`, `unreadable_reason` | same (shared code) | unchanged (the code it came from) | run on Linux (aarch64, x86_64) and macOS: `a_failing_refresh_refuses_after_its_grace_and_recovers` (staged failure through the test seam); Windows type-checked |
 | 2 single flight, bounded wait, off the runtime | new: as macOS; admit loops in `spawn_blocking` | same | `spawn_blocking` is new | run: `stale_facts_are_re_read_once_for_every_caller`, `a_slow_refresh_holds_only_the_caller_that_runs_it`, `the_admit_loop_runs_off_the_runtime`, `the_server_check_runs_off_the_runtime` |
 | 3 gateway link-layer address in the signature | new (`RTM_GETNEIGH`) | n/a (routes alone, as before) | unchanged (configd) | pure: `two_networks_behind_the_same_router_address_are_two_uplinks_on_linux` (every platform); Linux live: `neighbour_messages_parse`, `this_hosts_neighbour_table_is_read` (unprivileged dump, the gateway's address read); after `ip neigh flush` one DNS query brought the IPv4 gateway's entry back, the IPv6 one stayed missing (`vm-neigh-flush.log`) |
-| 4 only an acknowledged FIN | new: shared `confirm_once`, `TcpState`, `TCP_INFO` parsed from bytes, `TCP_CLOSE` read with `SO_ERROR` | n/a (no check connection) | same decisions, now shared | pure on every platform: `the_check_reads_only_an_acknowledged_fin_as_an_answer`, `linux_tcp_info_is_read_within_what_the_kernel_wrote`; Linux live: `linux_tcp_info_is_the_kernels` (glibc's offsets on x86_64), `linux_a_reset_and_a_completed_close_read_apart`, `a_peer_that_closes_first_is_never_far` (loopback, and NIST's daytime server: "closed"), `the_check_connection_finds_a_local_listener_near`, `a_near_listener_that_drops_syns_for_a_while_is_near` |
+| 4 only an acknowledged FIN (removed by the S3 review) | new: shared `confirm_once`, `TcpState`, `TCP_INFO` parsed from bytes, `TCP_CLOSE` read with `SO_ERROR` | n/a (no check connection) | same decisions, now shared | pure on every platform: `the_check_reads_only_an_acknowledged_fin_as_an_answer`, `linux_tcp_info_is_read_within_what_the_kernel_wrote`; Linux live: `linux_tcp_info_is_the_kernels` (glibc's offsets on x86_64), `linux_a_reset_and_a_completed_close_read_apart`, `a_peer_that_closes_first_is_never_far` (loopback, and NIST's daytime server: "closed"), `the_check_connection_finds_a_local_listener_near`, `a_near_listener_that_drops_syns_for_a_while_is_near` |
 | 5 unmap in the primitives | new | new (probe) | unchanged | run: `a_mapped_address_is_probed_as_its_ipv4_address` (Linux and macOS: `[::ffff:1.1.1.1]:443` at hop limit 2 is unreachable, never connected) |
 | 6 checked again once made | new | new | **new** | run on Linux and macOS: `a_route_that_changes_between_the_check_and_the_connection_drops_it` (fetch refused, server got no request), `a_connection_that_left_by_another_path_is_refused` (real socket addresses), `the_vetted_source_is_the_kernels`; every guarded fetch in the suite and `zkminer-chain`'s real downloads go through the layer. The broker connector's re-check is type-checked only: no broker test reaches a connection that the public floor admits (loopback stands in, and the floor refuses it); its suite, run as x86_64 Linux under Rosetta, passes as at af17e48 (below) |
 | 7 NAT64 per uplink, server order, PREF64 | new; PREF64 listener | per uplink and order (no PREF64) | unchanged but the signature computed once per read | pure: `a_new_uplink_is_asked_for_its_prefix_at_once`, `a_new_uplink_signature_is_unsettled_at_first`, `a_new_ipv6_only_uplink_is_unsettled_until_its_round_ends`, `ipv6_is_refused_while_a_new_uplinks_nat64_prefix_is_learned`, `the_active_and_routed_servers_are_asked_first`, `resolv_conf_servers_keep_their_order`, `pref64_options_of_router_advertisements_are_read`; Linux live: `the_pref64_listener_joins_unprivileged`, and with a staged RA carrying PREF64 `2001:db8:6464::/96` on a veth whose other end sat in a network namespace, the unprivileged test received and learned it (`vm-pref64-ra.log`) |
 | 8 default-like answer held by the facts | new | same (no oracle there) | unchanged | run: `a_new_uplink_is_refused_until_the_facts_hold_it`, `the_kernels_answer_per_destination_is_judged` (changed, below); the real-host tests on the VM's kernel |
-| 9 positive control, second attempt | new (control); new (attempt) | new (attempt) | unchanged; message shortened | pure: `a_fin_acknowledged_at_no_hop_limit_is_never_far`, `a_probe_that_timed_out_is_asked_again_once`; Linux live: `the_check_connection_finds_a_public_host_far` (1.1.1.1 acknowledged the restored FIN: far), `a_peer_that_never_acknowledges_a_fin_is_not_far` (an S3 front end: refused, the message naming S3) |
+| 9 positive control, second attempt (removed by the S3 review) | new (control); new (attempt) | new (attempt) | unchanged; message shortened | pure: `a_fin_acknowledged_at_no_hop_limit_is_never_far`, `a_probe_that_timed_out_is_asked_again_once`; Linux live: `the_check_connection_finds_a_public_host_far` (1.1.1.1 acknowledged the restored FIN: far), `a_peer_that_never_acknowledges_a_fin_is_not_far` (an S3 front end: refused, the message naming S3) |
 | 10 CI | workflow added | n/a | diff above | `actionlint` clean; the strict suite run in the VM (no global IPv6) |
 
 **Shared test assertions changed on purpose.** `policy::tests::the_kernels_answer_per_destination_is_judged`:
@@ -206,8 +191,8 @@ everywhere are listed per item, and six nearhop tests lost their `_on_macos` suf
   VM);
 - Android at all: `cargo check --target aarch64-linux-android` (stub C compilers) passes with
   no warnings at HEAD; at af17e48 it did not compile (`libc::tcp_info` does not exist for
-  Android, which the old Linux `confirm_once` used; the check connection now parses `TCP_INFO`
-  from bytes);
+  Android, which the old Linux `confirm_once` used; the check connection then parsed `TCP_INFO`
+  from bytes; since the S3 review there is no check connection);
 - the witness broker connector's re-check once connected (no test reaches it: above); the crate
   does not build on aarch64 Linux (`libc::SYS_fchmodat2` is not defined for aarch64, before and
   after this change), and its suite ran as x86_64 under Rosetta: 135 unit tests, of which
@@ -218,7 +203,8 @@ everywhere are listed per item, and six nearhop tests lost their `_on_macos` suf
 **Windows** changes (type-checked only): `FactsCell`'s grace and single flight, `FactsUnreadable`
 and `Nat64Unsettled`, NAT64 per uplink with the ordered servers, the probe asked twice and
 unmapped, the post-connect check in the guarded client, the admit loops off the runtime, and the
-check-connection stub's message ("Linux and macOS only"). Windows still refuses every requester
+check-connection stub's message ("Linux and macOS only"; since the S3 review every near-hop
+decision on Windows refuses, for want of a way to read the routers' ICMP errors). Windows still refuses every requester
 connection in public mode (it has no route oracle), so none of these changes what it admits.
 
 **Mutation run.** `fix-linux/mut/run.py` and `muts.py`, on macOS over a copy of the branch:
@@ -339,9 +325,10 @@ kernel denies (the fallback's glue is tested with a staged error); Android at al
 stub compilers).
 
 **Open for the owner.** S3: the control connection still refuses a peer that never acknowledges
-a bare FIN, on a path whose first hops send no ICMP (unchanged decision). The third probe attempt
+a bare FIN, on a path whose first hops send no ICMP (unchanged decision; resolved by the S3
+review, below: no control connection, S3 judged by distance). The third probe attempt
 and the gate add latency to a probe without an answer (worst case 3.5 s before the check
-connection, from 1.5 s), and a name's addresses are probed one after another (one per family
+connection, from 1.5 s; since the S3 review a decision is at most two rounds), and a name's addresses are probed one after another (one per family
 pinned, so a connection that fails on the first IPv4 address no longer falls back to the next
 one). A network that names more NAT64 prefixes than the caps refuses IPv6 on any host, a dual-
 stack one included (fail closed: a hostile DHCP server or router can make a dual-stack host
@@ -434,14 +421,17 @@ signature (parsed from built messages; the compat-0 repro ran the route side); A
   ICMP "time exceeded" for a SYN in `SYN-SENT` as a failed connect (`WSAEHOSTUNREACH` /
   `WSAENETUNREACH`) at all is unverified; if it does not, every probe times out there and, with no
   check connection on Windows, every public host is refused. It needs a Windows runner: probe a
-  far public host with hop limit 2 and see whether the connect fails fast.
+  far public host with hop limit 2 and see whether the connect fails fast. (Since the S3 review a
+  failed connect is not evidence anyway: Windows needs the ICMP error's type and sender, still
+  open, below.)
 - **CLAT detection** is by address and interface name; a CLAT numbered otherwise is not seen
   (its host then admits `<NSP>::10.x` until the prefix is learned, as before).
 - **A flapping or spoofed gateway MAC** now makes the Linux guard learn its public addresses
   again on each change (it fails closed; round 4 had debounced it).
 - **Probe pacing** (6, then 3 a second) adds latency only past a burst: a redirect chain of many
   dual-stack hosts may wait for tokens.
-- Unchanged from round 4: S3 behind first hops without ICMP; caps that refuse IPv6 on a network
+- Unchanged from round 4: S3 behind first hops without ICMP (since the S3 review, every
+  destination behind such hops is refused alike); caps that refuse IPv6 on a network
   naming more NAT64 prefixes than the guard holds (now cleared as soon as the source names what
   fits).
 
@@ -510,7 +500,9 @@ only on the example. Logs: `fix-r6/` (`/Users/user/zkminer/scratch/w11/NGREV/fix
   change here); a port is in the key because a router can send one port elsewhere (a
   transparent proxy at hop 1); a prefix is not, because a prefix can hold both a far and a near
   host. Near and failed verdicts are never remembered, so remembering can only skip a probe that
-  would have said far.
+  would have said far. *Removed by the S3 review (2026-11):* a far verdict is now the 4-tuple
+  of the probe that found it, which the connection reuses, so it is not remembered at all
+  ("Near-hop rule: positive evidence", below).
 - *Linux uplink identity (items 5, 6).* Per family: whenever the known MAC of the family's
   gateway shows, the signature is the known network's; differing MACs that never hold are one
   other signature; IPv4's gateway never moves IPv6's signature; a move over a carrier change is
@@ -619,10 +611,13 @@ denies; Android at all. `NHA_GATEWAY` from a real dump ran live (`r6-cross/vm-r6
 **Open for the owner.**
 - **Windows and ICMP time exceeded** in `SYN-SENT`: unverified (no Windows runner); if Windows
   does not surface it, every probe times out there and, with no check connection, every public
-  host is refused.
+  host is refused. (Since the S3 review Windows refuses every decision until a way to read the
+  ICMP error is verified there.)
 - **S3's positive control**: the control connection refuses a peer that never acknowledges a
   bare FIN (every AWS S3 front end); the last probe attempt makes S3 pass when its first hops
   answer ICMP (20/20 here), but behind first hops that never send ICMP S3 is refused every time.
+  (Resolved by the S3 review: no control connection; S3 passes by distance where the first hops
+  send ICMP, and is refused like every other destination where they do not.)
 - **CLAT heuristics**: by address (192.0.0.0/29) and interface name or kind; a CLAT numbered
   and named otherwise is not recognised; such a host is now warned, once, to set
   `[egress] nat64_prefixes`, and admits `<NSP>::10.x` until it does (or the prefix is learned).
@@ -634,6 +629,151 @@ denies; Android at all. `NHA_GATEWAY` from a real dump ran live (`r6-cross/vm-r6
   IPv6 refused while it sends, and up to 95 minutes after (typically until the gateway's next
   advertisement); refusing less would admit what is under a prefix the network may still use.
 - **The far-verdict memory** trades a probe for 10 s of trust in an unchanged path; set
-  `FAR_TTL` to zero (a constant) if that is not wanted.
+  `FAR_TTL` to zero (a constant) if that is not wanted. (Dropped by the S3 review: no far
+  verdict is remembered.)
 - **The 4th probe attempt** adds up to 3 s to a refusal that would have come anyway (a check
-  connection that failed), only when the deadline allows.
+  connection that failed), only when the deadline allows. (Dropped by the S3 review: at most
+  two rounds.)
+
+## Near-hop rule: positive evidence
+
+The S3 review (three rounds, 2026-11-21: measurement, threat, design, evidence, identity and
+integration lenses, then a skeptic) asked whether the near-hop check could admit AWS S3 behind
+first hops that send no ICMP without admitting anything near. It found the strict check itself
+unsound: it read silence, and an unreachable, as far. In the lab an unprivileged near Linux
+listener using `IP_MINTTL` (it ignores SYNs that arrive with a low hop count), a TTL filter
+(cBPF or `iptables` dropping low-TTL packets), a near host answering low-TTL SYNs with a
+host-unreachable, and, now and then, induced loss each made a near destination read as far.
+The check is therefore replaced by a rule that admits far only on positive evidence. No method
+found, this one included, is safe without assumptions; the wording to use is the one below.
+
+**The rule.** "The network guard admits a destination as far only on positive evidence (a router
+past the limit said the probe ran out of hops), never on silence."
+
+- Fresh TCP sockets connect to the exact destination address and port with hop limits `N`,
+  `N+1` and `N+2` at once (`N` is `[egress] near_hop_limit`, default 2; `EXTRA_HOPS`), from the
+  source address and interface the real connection will use. A round waits at most
+  `PROBE_TIMEOUT` (1.5 s) and ends as soon as it is decided; a second round follows after
+  `ROUND_PAUSE` (1 s) only when the first decided nothing (`ROUNDS` 2, `DECIDE_BUDGET` 8 s). No
+  data is written; a probe that connected is reset. A round takes one turn and one token of the
+  probe gate (`PROBES_AT_ONCE` 2 rounds in flight per family, `PROBE_BURST` 6,
+  `PROBES_PER_SECOND` 3): each router expires at most one of a round's three SYNs, so its ICMP
+  load is that of one probe before the review.
+- **Near** (`Denied::NearHop`): the destination answered (SYN-ACK, reset, `ECONNREFUSED`) a probe
+  of at most `N` hops.
+- **Far**: some probe of `t >= N` hops got an ICMP Time Exceeded code 0 (IPv4 11/0, ICMPv6 3/0)
+  the kernel matched to it (4-tuple and initial sequence number), from a unicast, specified
+  sender that is not the destination, and the destination answered no probe of at most `t`
+  hops.
+- **Everything else refuses** (`Denied::NearCheckFailed`, "could not tell how near"): silence,
+  any Destination Unreachable, Time Exceeded code 1, a Time Exceeded from the destination, an
+  answer only beyond `N`, an unreachable without its ICMP message, inconsistent results, local
+  errors, missing ICMP plumbing. An answer always dominates an ICMP error queued for the same
+  probe (Linux can queue an error and still complete the connection: `sk_err_soft` while the
+  socket is owned by the user).
+- **Linux and Android:** `IP_RECVERR` / `IPV6_RECVERR` and `MSG_ERRQUEUE` (`sock_extended_err`,
+  `SO_EE_ORIGIN_ICMP(6)`, `ee_type` / `ee_code`, `SO_EE_OFFENDER`), verified live in `SYN_SENT`.
+  **macOS:** an unprivileged `SOCK_DGRAM` `IPPROTO_ICMP(V6)` socket opened before the probes;
+  a copy counts only if it quotes the probe's destination address and port, source address and
+  port and ISN (from the private `getsockopt(IPPROTO_TCP, TCP_INFO 0x200)`, `tcpi_snd_nxt - 1`,
+  only in `SYN_SENT`, its length checked; a zero or repeated ISN refuses) and the probe's own
+  socket failed with `EHOSTUNREACH` / `ENETUNREACH`; late copies are drained for 30 ms. A Mac
+  where the ICMP socket or `TCP_INFO` cannot be read refuses everything (warned once at
+  startup). An error `connect` reports at once (Local Network privacy, a Network Extension
+  policy) is a local failure, never evidence. **Windows:** no implementation; every decision
+  refuses (it already refused every requester connection in public mode).
+  `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are a possible future path,
+  unverified; it must fail closed until verified on a Windows host.
+
+**Removed.** The check and control connections (the hop-limited FIN, the `TCP_INFO` /
+`TCP_CONNECTION_INFO` state readers, the RTO margins, the "AWS S3 never acknowledges a bare FIN"
+refusal, the last probe attempt and the 3+1 attempts), and "unreachable is far". A near host
+that drops SYNs (and FINs) is now refused for want of evidence, never far.
+
+**Pinning.** A far verdict rests on one probe's 4-tuple, so the connection that follows reuses
+it: `Vetted` carries the far probe's local port and interface, and the guarded client's hops and
+the witness broker's connector make the connection with `Vetted::socket`, bound to the vetted
+source address and that port (`EADDRINUSE` fails the attempt; it is never made from another
+port), on that interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`, Linux `IP_UNICAST_IF` /
+`IPV6_UNICAST_IF`), and on Linux with `IPV6_AUTOFLOWLABEL` off on the probes and the connection.
+`recheck_connected` also checks the port. The connection is made right after the verdict.
+
+**The far cache is dropped** (`FAR_TTL` 10 s, the single-flight `decide_remembered` and the facts'
+path key). A far verdict is tied to the 4-tuple of the probe that found it, which the connection
+it was found for reuses; another connection (another port) may take another path (per-connection
+balancers, measured in round 3), and a port-keyed cache could never be hit while the first
+connection holds the port or its `TIME_WAIT`. Cost: every connection is decided afresh, at most 3
+decisions a second per family after a burst of 6. `MAX_UNANSWERED_PER_FAMILY` (the client) and
+the broker's `MAX_UNANSWERED` still count `NearCheckFailed`, which now includes every decision
+without evidence: a family whose path gives no evidence twice is given up.
+
+**Assumptions and definition.** The far verdict holds under four assumptions: (1) no party that
+sees the probe's SYN forges ICMP (root on a near host, an on-path or on-link attacker: a hostile
+LAN gets no protection from this check, as from any distance test); (2) routers send Time
+Exceeded only for packets they forward (RFC 1812 5.3.1), not for their own addresses reached
+through policy routing or a VRF leak; (3) the real connection follows the probe's path (the pin;
+a stateless per-packet balancer, a transient loop or a route change can still break it); (4) the
+kernel's matching of the ICMP error to the probe (on macOS through a private `TCP_INFO` layout).
+"Within `N` hops" means `N - 1` TTL-decrementing routers before the destination. Boxes that hide
+hops (a double NAT behind the ISP's router, a VM's NAT, a VPN, a userspace NAT64) move the limit:
+`near_hop_limit` 2 then does not reach the ISP's first box. The default stays 2 (raising it
+refuses more far destinations on paths with silent hops). Paths whose first hops send no Time
+Exceeded refuse every destination.
+
+**What holds** (the review's lab, Linux and macOS, a C prototype and the Rust one; no far for a
+near destination in any case without forgery): an `IP_MINTTL` listener, cBPF and `iptables` TTL
+filters, Destination Unreachable rejects, a silent on-path drop, FIN/ACK drops, delay, a reply
+with TTL 1, a normaliser (near); loss of 50-90 % (0 far in 120); forged Time Exceeded from the
+destination, with code 1, a Destination Unreachable, a wrong ISN or a wrong port: refused; a Time
+Exceeded racing the SYN-ACK: near; a container DNAT whose Time Exceeded has the destination as
+its source: refused. Unprivileged Linux and macOS processes cannot send or spoof a Time Exceeded
+(ping sockets `EINVAL`, raw sockets `EPERM`, a user namespace's network namespace isolated); 40
+concurrent decisions (12 processes on macOS) were never misattributed; draining a router's ICMP
+rate limit causes refusals only. Round 3 reran every round 2 lab decision (74) with identical
+results. The far set is a strict subset of the old check's.
+
+**What does not hold.** A root process on a near host, or an on-path or on-link attacker, that
+forges a Time Exceeded from another source (IPv4 spoofing past a loose `rp_filter`, IPv6) makes a
+near destination far; Linux and xnu abort a connecting socket on the first ICMP error they accept,
+so injection alone suffices. This is the documented exception, as for every distance test.
+Definitional cases that read far (they did at the old HEAD too): VRF and policy-routing hairpins
+to a router's own addresses (measured, the miner's gateway included), a userspace NAT64 (tayga:
+three hop-limit units in one box, measured), a VM's NAT hiding a hop (measured: the ISP's CGNAT
+box far at `N` 2), a CGNAT hairpin to the operator's own PCP mapping, a transient routing loop
+(measured), a stateless per-packet balancer. A per-connection balancer with unequal paths
+(mwan3 style) read far 12 of 20 times per family with a new port and reached the near host on 12
+of 15 connections; with the probe's port reused, 0 of 19.
+
+**Availability.** Home paths whose hop 2 sends Time Exceeded (this Mac's and its Linux VM's): no
+change, 61 of 61 addresses decided at start hop 2 (S3 18 of 18). Measured by starting the probes
+deeper to stand in for silent first hops: hops 2-3 silent, non-S3 destinations about 93 %
+(AWS-hosted ones lost); hops 2-5 silent, about 49 % (CDNs lost). Corporate edges and cloud
+networks that filter ICMP (EC2: AWS-internal hops 4 to 9 silent): refused, every destination; the
+witness broker's endpoints alike. Windows: unchanged (refused). LTE/5G: not measured.
+
+**S3.** S3 now works by distance, like any other server, on paths whose first hops send ICMP
+(18 of 18 S3 endpoints from the home paths). An identity path for ICMP-silent paths (S3 admitted
+by a TLS 1.3 connection pinned to Amazon's roots with a constant SNI, a different promise: "an
+Amazon-keyed S3 front end", not "not near") was designed and deferred by the owner; it is not
+implemented. Cloud servers (EC2 and the like, whose provider hops send no ICMP) are out of scope
+for now.
+
+**Open: port reuse and strict NATs (owner decision pending).** On this Mac's home path (hop 1 the
+home NAT router, hop 2 the ISP's carrier-grade NAT), reusing the probe's local port for the real
+IPv4 connection fails: the real SYN gets no answer (the connect times out) whenever it follows the
+probe's SYN by more than about 20 ms, for at least 125 s, while a new port connects at once. IPv6
+(no NAT) reuse works. The likely cause is a stateful NAT or firewall (the ISP's CGNAT, or pf-style
+strict TCP tracking) that holds a session for the probe's 4-tuple with the probe's ISN and drops a
+second SYN on it with another ISN. In the Linux VM behind the Mac's NAT it works only when the
+connection follows within milliseconds; Linux-conntrack-only paths (the network-namespace lab)
+reuse fine. So on IPv4 paths through such a NAT every connection after a far verdict fails,
+closed (`connecting to ... from the near-hop probe's port ...: timed out`; never retried from
+another port). The owner must choose between keeping the port pin (assumption 3 mitigated, IPv4
+broken behind strict NATs, CGNATs and pf) and pinning only the source address, interface and flow
+label (IPv4 works; a per-connection balancer can again send the connection another way than the
+probe).
+
+**Fixed on the way.** `ProbeGate::enter_until` (and the IPv6 gate) built the gate with
+`then_some`, so a caller that timed out or was shed gave back a turn it never held, and more
+rounds could be in flight than `PROBES_AT_ONCE` (seen on the Linux VM); now the gate is made only
+once given, with a regression test (`a_caller_without_a_turn_gives_none_back`).

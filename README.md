@@ -226,8 +226,9 @@ neighbour on a network it is connected to or routes to other than through its de
 (the kernel is asked, per destination and port, how it would route the connection, policy rules
 included), an address a `local` route delivers to this host, the rest of its IPv6 site (a /32)
 or of the IPv4 /16 around a public address on its interfaces, the DNS servers it uses, a
-private address behind NAT64, a destination that answers within 2 hops of this host (its router,
-a neighbour in the same VPC: a hop-limited probe asks right before each connection), or a name
+private address behind NAT64, a destination within 2 hops of this host (its router, a neighbour
+in the same VPC: hop-limited probes ask right before each connection, and a destination is taken
+as farther only when a router past the limit says a probe ran out of hops, never on silence), or a name
 only a local resolver answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label
 names, …). Requester host names are resolved over DNS-over-HTTPS by public resolvers, never
 through this host's own resolver. Anycast service addresses (`2001:1::/32`, AMT, AS112) are
@@ -247,8 +248,11 @@ in `[egress] deny_cidrs` if it cannot.
 
 **macOS.** The guard makes the same decisions on a Mac, unprivileged: the routing table comes
 from the BSD routing socket's sysctl (what `netstat -rn` shows), the kernel is asked per
-destination with an `RTM_GET` (what `route -n get` shows), and the near-hop probe and its check
-connection work as on Linux (`TCP_CONNECTION_INFO` in place of `TCP_INFO`). macOS has no
+destination with an `RTM_GET` (what `route -n get` shows), and the near-hop probes follow the
+same rule as on Linux: the routers' ICMP "time exceeded" is read from an unprivileged ICMP socket
+and matched to its probe by addresses, ports and initial sequence number, which macOS gives only
+through a private `TCP_INFO` option (a Mac where either cannot be read refuses every requester
+connection, and says so once at startup). macOS has no
 policy-routing rules; its interface-scoped routes (netstat's `I` flag, such as the system's
 `utun` interfaces' IPv6 defaults) carry no ordinary connection, so they are neither default
 routes nor uplinks, and a connection whose socket would leave by another interface than its
@@ -274,13 +278,21 @@ routing-socket call the guard needs (none known among those the miner supports).
 platform ([docs/netguard-hardening.md](docs/netguard-hardening.md)). If every requester
 connection is refused with `this host's network facts ... could not be read again`, the message
 names what failed (on Linux a netlink read: the interfaces, routes, rules). A download refused
-with `could not tell how near ... is (whether it is within 2 hops of this host): the peer
-acknowledged the check's FIN neither within the hop limit nor at the default one (AWS S3 never
-does)` comes from a store whose servers never acknowledge a bare
-TCP FIN (AWS S3) on a path whose first two routers did not answer the hop-limited probe (they
-filter or rate-limit ICMP, as many cloud and corporate networks do): the guard cannot tell how
-near such a server is, so it refuses (another attempt usually gets the probe answered; on a
-host whose first hops never send ICMP, S3 is refused every time). Right after a host with IPv6
+with `could not tell how near ... is (whether it is within 2 hops of this host): no router past 2
+hops said a probe ran out of hops (a time exceeded), and silence is not taken as far (...)` comes
+from a path whose routers at hops 2 to 4 sent no ICMP "time exceeded" for the probes (they filter
+or rate-limit ICMP, as many cloud and corporate networks do, or the destination was down): the
+guard admits a destination only on that evidence, so it refuses. Another attempt usually gets the
+evidence on a rate-limited path; on a host whose first hops never send ICMP, every destination is
+refused every time (cloud servers such as EC2 are not supported for now). This applies to every
+store alike, AWS S3 included: from a path whose routers send ICMP, S3 is judged by distance like
+any other server. A connection that fails with `connecting to ... from the near-hop probe's port
+...: timed out` right after its destination was found far is the open problem in
+[SECURITY.md](SECURITY.md) ("The near-hop probe's own limits"): the connection must reuse the
+probe's local port so it takes the probe's path, and some NAT routers (strict carrier-grade NAT,
+pf-style firewalls) drop a second SYN on that port; it is refused (fails closed), never retried
+from another port. On the one IPv4 home path measured behind such a NAT, every IPv4 connection
+after a far verdict failed this way; IPv6 was not affected. Right after a host with IPv6
 and no IPv4 (or IPv4 only through a CLAT, 464XLAT) joins a network, IPv6 destinations are refused
 for up to 2 s (`NAT64 prefix is still being learned`); on any host they are refused while the
 network names NAT64 prefixes the guard does not believe or cannot hold (more than two in one DNS
@@ -321,7 +333,7 @@ the job is retried unblamed (up to 6 times) when its builder gave up or trapped.
 | `[egress] ipv4_site_prefix_len` | `16` | The site refused around each global IPv4 address on this host's interfaces: its enclosing /N, 8 to 32. |
 | `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes from fixed reflectors — `ns1.google.com` and `1.1.1.1` over DNS, and Cloudflare's `https://1.1.1.1/cdn-cgi/trace` over HTTPS (also over IPv6, and on an IPv6-only host through its NAT64 prefix) — and refuse every address any reports. A family counts as known only when the HTTPS reflector or both DNS reflectors confirm it (and the DNS agreement counts for nothing when the HTTPS reflector's connection was made but its TLS or answer failed), for 10 minutes after the last confirmation, and only on the uplink it was learned on (discovery runs again when the default route changes); while a family this host routes is unknown, requester connections over it are refused. Off: `public_addresses` must name an address of every family this host routes, or the miner does not start. |
 | `[egress] public_addresses` | `[]` | This host's public addresses as you know them (behind NAT, your router's; on an IPv6-only host, the NAT64 translator's IPv4 address). Refused as its own, and a family named here counts as known: set it where outbound DNS or HTTPS to the reflectors is filtered or intercepted. |
-| `[egress] near_hop_limit` | `2` | Right before every requester-caused connection, a probe whose packets may cross at most this many hops connects to the destination: one that answers (accepts, or refuses with a reset) is this host's own network and is refused. When the probe gets no answer, a check connection decides: once connected, its FIN, limited to the same hop count, must go unanswered. 2 to 16. |
+| `[egress] near_hop_limit` | `2` | Right before every requester-caused connection, probes limited to this many hops, one more and two more (`N`, `N+1`, `N+2`) connect to the destination at once, from the address the connection will use (a second round a second later if the first told nothing): a destination that answers one limited to `N` hops or fewer (accepts, or refuses with a reset) is this host's own network and is refused; it is admitted only when a router past the limit sends an ICMP "time exceeded" for a probe (and the destination answered none at that limit or below), and the connection is then made from that probe's address, port and interface. Silence, an unreachable or anything else refuses (`could not tell how near`). A "hop" is a router that decrements the hop count: a box that hides one (a second NAT router behind the ISP's, a VM's NAT, a VPN) moves the limit. 2 to 16. |
 | `[egress] doh_resolvers` | Cloudflare, Google, Quad9 | The DNS-over-HTTPS resolvers requester host names are resolved with (never this host's resolver, `/etc/hosts` or a local stub): `https://` URLs whose host is a public IP literal, e.g. `["https://9.9.9.9/dns-query"]`. |
 | `[egress] nat64_prefixes` | `[]` | NAT64 prefixes this host's translator uses besides the well-known `64:ff9b::/96` (RFC 6052: a `/32`, `/40`, `/48`, `/56`, `/64` or `/96`, e.g. `"2001:db8:64::/96"`). An address under one is judged by the IPv4 address it carries, so `<prefix>::10.0.0.1` is refused. The prefix a DNS64 resolver uses is learned at startup from this host's DNS servers (`ipv4only.arpa`, RFC 7050); name it here when it cannot be. |
 | `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine (names then resolve through the system resolver, and no near-hop probe is sent). The only way to turn the guard off (there is no environment variable or flag). Needs `[dev] chain_id`; refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
