@@ -136,11 +136,14 @@ fn key_on_disk_warning(
     };
     Some(if low_il {
         format!(
-            "{what} can be read by any process run as this user; the prover workers cannot (they              run at Low integrity)"
+            "{what} can be read by any process run as this user; the prover workers cannot (they \
+             run at Low integrity)"
         )
     } else {
         format!(
-            "{what} can be read by any process run as this user, a prover worker included (and the              guest programs it runs, should one break out). Set ZKMINER_WINDOWS_LOW_IL_WORKERS=1 to              keep the workers from it"
+            "{what} can be read by any process run as this user, a prover worker included (and the \
+             guest programs it runs, should one break out): ZKMINER_WINDOWS_LOW_IL_WORKERS=0 runs \
+             the workers at Medium. Unset it to keep them from it"
         )
     })
 }
@@ -507,32 +510,37 @@ fn privilege_finding(held: &[String], strip: Result<Vec<String>, String>) -> (Le
 }
 
 /// Windows: what to say of the Low-integrity workers (`windows_sandbox`): whether they are on
-/// (`on`), the flag's value if it is set to something other than `1` (`misset`), and the Low
-/// directories found to be a file or a link (`tampered`).
+/// (`on`; the default, off only with the flag at `0`), the flag's value if it is set to something
+/// other than `0` or `1` (`misset`), and the Low directories found to be a file or a link
+/// (`tampered`).
 #[cfg(any(windows, test))]
 fn low_il_findings(on: bool, misset: Option<&str>, tampered: &[String]) -> Vec<(Level, String)> {
     let mut findings = Vec::new();
-    if let Some(value) = misset {
-        findings.push((
-            Level::Warn,
-            format!(
-                "ZKMINER_WINDOWS_LOW_IL_WORKERS is {value:?}, not 1: the workers run at Medium \
-                 integrity"
-            ),
-        ));
-    } else if on {
+    if on {
         findings.push((
             Level::Pass,
-            "on: the workers run at Low integrity. A worker that cannot start there is not \
-             started at Medium instead: its slot proves nothing (PAGE: LOW-IL-WORKER-FAILED) \
-             until one starts at Low, tried again with back-off"
+            "on (the default): the workers run at Low integrity, kept from the key file, .env and \
+             the job journal. A worker that cannot start there is not started at Medium instead: \
+             its slot proves nothing (PAGE: LOW-IL-WORKER-FAILED) until one starts at Low, tried \
+             again with back-off"
                 .to_string(),
         ));
+        if let Some(value) = misset {
+            findings.push((
+                Level::Info,
+                format!(
+                    "ZKMINER_WINDOWS_LOW_IL_WORKERS is {value:?}, which is not 0: the workers run \
+                     at Low integrity all the same"
+                ),
+            ));
+        }
     } else {
         findings.push((
-            Level::Info,
-            "off: the workers run at Medium integrity, able to read this user's files. \
-             ZKMINER_WINDOWS_LOW_IL_WORKERS=1 runs them at Low"
+            Level::Warn,
+            "off (ZKMINER_WINDOWS_LOW_IL_WORKERS=0): the workers run at Medium integrity, able to \
+             read every file of this user's, the key file and .env included, should a guest \
+             program break out of one (PAGE: MEDIUM-WORKERS at every start). Unset it to run \
+             them at Low"
                 .to_string(),
         ));
     }
@@ -542,8 +550,8 @@ fn low_il_findings(on: bool, misset: Option<&str>, tampered: &[String]) -> Vec<(
                 Level::Warn,
                 format!(
                     "{dir}, not a directory: only a Low-integrity process (a worker) or this \
-                     account puts one there. The miner replaces it with a directory before its \
-                     next Low worker"
+                     account puts one there. The miner replaces it with a directory before each \
+                     Low worker it starts"
                 ),
             ));
         }
@@ -1432,7 +1440,7 @@ mod tests {
         };
         let w = key_on_disk_warning(&wallet, &home.0, false).unwrap();
         assert!(
-            w.contains("miner.key") && w.contains("ZKMINER_WINDOWS_LOW_IL_WORKERS=1"),
+            w.contains("miner.key") && w.contains("ZKMINER_WINDOWS_LOW_IL_WORKERS=0"),
             "{w}"
         );
         let w = key_on_disk_warning(&wallet, &home.0, true).unwrap();
@@ -1631,8 +1639,9 @@ mod tests {
         }
     }
 
-    /// Windows' Low-integrity workers as doctor reports them: on (failing closed), off, a flag
-    /// set to something other than 1 (which is off), and a Low directory that was tampered with.
+    /// Windows' Low-integrity workers as doctor reports them: on by default (failing closed), the
+    /// opt-out (a warning), a flag set to something other than 0 or 1 (still on), and a Low
+    /// directory that was tampered with.
     #[test]
     fn doctor_reports_the_low_integrity_workers_as_they_are() {
         let on = low_il_findings(true, None, &[]);
@@ -1645,11 +1654,16 @@ mod tests {
         );
         let off = low_il_findings(false, None, &["ignored".into()]);
         assert_eq!(off.len(), 1, "{off:?}");
-        assert_eq!(off[0].0, Level::Info);
-        assert!(off[0].1.contains("Medium"), "{}", off[0].1);
-        let misset = low_il_findings(false, Some("true"), &[]);
-        assert_eq!(misset[0].0, Level::Warn);
-        assert!(misset[0].1.contains("\"true\""), "{}", misset[0].1);
+        assert_eq!(off[0].0, Level::Warn);
+        assert!(
+            off[0].1.contains("Medium") && off[0].1.contains("MEDIUM-WORKERS"),
+            "{}",
+            off[0].1
+        );
+        let misset = low_il_findings(true, Some("true"), &[]);
+        assert_eq!(misset[0].0, Level::Pass);
+        assert_eq!(misset[1].0, Level::Info);
+        assert!(misset[1].1.contains("\"true\""), "{}", misset[1].1);
         let tampered = low_il_findings(true, None, &[r"C:\x\worker\neo is a file".into()]);
         assert_eq!(tampered.len(), 2);
         assert_eq!(tampered[1].0, Level::Warn);

@@ -6723,6 +6723,31 @@ impl WorkerPool {
             entry.publish_pid(h.pid());
         }
         self.bail_if_closing(&mut slot, entry, key)?;
+        // Windows: a worker at Low integrity cannot write what its warm-up downloads or builds in
+        // the user's profile; its binary installs that first, at Medium
+        // (`worker::install_artifacts_at_medium`), and the warm-up then finds it there.
+        #[cfg(windows)]
+        let low = slot.handle.as_ref().is_some_and(|h| h.is_low_integrity());
+        #[cfg(windows)]
+        if low {
+            let installed = crate::worker::install_artifacts_at_medium(
+                backend,
+                &slot.path,
+                &slot.spawn_env,
+                timeout,
+                &mut |step| self.set_setup_status(key, Some(step)),
+            );
+            self.set_setup_status(key, None);
+            let summary = installed.map_err(|e| {
+                e.context(format!(
+                    "{key}: what its Low-integrity worker's warm-up needs was not installed"
+                ))
+            })?;
+            tracing::info!("{key}: installed at Medium integrity for its Low worker: {summary}");
+        }
+        // Its binary, to name it in a page.
+        #[cfg(windows)]
+        let program = slot.path.clone();
         entry.intentional_kill.store(false, Ordering::Release);
         let handle = slot
             .handle
@@ -6770,6 +6795,22 @@ impl WorkerPool {
             }
         };
         self.set_setup_status(key, None);
+        // Where a GPU runtime needs something Low integrity denies, a Low worker's warm-up is where it
+        // shows first: paged, with the worker's own words.
+        #[cfg(windows)]
+        if low {
+            let why = match &response {
+                Err(e) => Some(format!(
+                    "{e:#}; {}",
+                    handle.death_note(Duration::from_millis(500))
+                )),
+                Ok(WorkerResponse::Error { message, .. }) => Some(message.clone()),
+                Ok(_) => None,
+            };
+            if let Some(why) = why {
+                crate::windows_sandbox::low_il_setup_failed(key, &program, &why);
+            }
+        }
         slot.note_used(UseKind::Other);
         if response.is_err() {
             if entry.intentional_kill.load(Ordering::Acquire) {

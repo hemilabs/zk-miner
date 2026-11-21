@@ -505,6 +505,16 @@ fn main() {
         }
     }
 
+    // `--install-artifacts`: what a `Warmup` installs in the user's profile (the server above, the
+    // Groth16 circuit artifacts, the stripped circuit), answered as a `Warmup` is, then exit. For the
+    // Windows miner, at its own integrity, before a Low-integrity worker's warm-up. No GPU, no guest.
+    if args
+        .iter()
+        .any(|a| a == zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG)
+    {
+        std::process::exit(install_artifacts(ipc_stdout));
+    }
+
     // Workers that run requester guests are confined, and so is their server (confinement.rs): a
     // private temporary directory, named by TMPDIR from here on, and for a worker that proves, the
     // SDK's server started through the confining shim. While the process has one thread.
@@ -1901,6 +1911,43 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
 const SP1_PROGRESS_FILE_ENV: &str = "SP1_PROGRESS_FILE";
 
 /// This worker's progress file: one per worker process, so two cards' servers never share one.
+/// `--install-artifacts` (`zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG`): the warm-up's
+/// installs (`warmup::warm_up`, which uses no GPU), its progress and outcome written to `out` as a
+/// `Warmup`'s are. The exit status: 0 once installed.
+fn install_artifacts(mut out: impl io::Write) -> i32 {
+    if let Some(failure) = bundled_server::install_failure() {
+        tracing::warn!("{failure}");
+    }
+    let resp = match warmup::warm_up(&mut |status, done_bytes, total_bytes| {
+        // A closed pipe is reported by the final answer's write below.
+        let _ = write_message(
+            &mut out,
+            &WorkerResponse::SetupProgress {
+                request_id: 0,
+                status: status.to_string(),
+                done_bytes,
+                total_bytes,
+            },
+        );
+    }) {
+        Ok(report) => WorkerResponse::WarmupDone {
+            request_id: 0,
+            summary: report.summary,
+            groth16_helper: report.groth16_helper,
+        },
+        Err(e) => WorkerResponse::Error {
+            request_id: 0,
+            kind: ErrorKind::Internal,
+            message: format!("installing the SP1 Groth16 artifacts failed: {e:#}"),
+        },
+    };
+    let installed = matches!(resp, WorkerResponse::WarmupDone { .. });
+    match write_message(&mut out, &resp) {
+        Ok(()) if installed => 0,
+        _ => 1,
+    }
+}
+
 fn progress_file_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("zkminer-sp1-progress-{}.txt", std::process::id()))
 }

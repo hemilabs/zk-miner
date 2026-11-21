@@ -12,22 +12,26 @@
 //!   or execute up) keeps even those from Low processes: a Low worker cannot end the miner.
 //! - Every worker starts suspended in a job of its own (`windows_job::new_worker_job`: no desktop,
 //!   no clipboard, no breakaway) and is resumed once it is in it ([`spawn_worker`]).
-//! - With `ZKMINER_WINDOWS_LOW_IL_WORKERS=1`, every worker runs at Low integrity: it cannot open the
-//!   miner at all (another process of the user's at Medium, only to see and end it), nor write a
-//!   file or registry key at Medium. Its temporary, cache and segment directories are made writable
-//!   at Low before it starts, and the key file, `~/.zkminer/.env` and the lock journal get a label
-//!   Low processes cannot read through ([`protect_secrets`], [`write_secret_file`]). No other Low
-//!   worker can open its process or first thread at all ([`low_worker_descriptors`]), nor a thread
-//!   it starts later but to see it (`zkminer_prover_protocol::threads`); the processes it starts
-//!   (SP1's `sp1-gpu-server`) are still open to them. Off by default until each GPU runtime is
-//!   known to work at Low.
-//!   The flag fails closed: a worker that cannot start at Low (its handshake fails, or its
+//! - Every worker runs at Low integrity ([`low_il_workers`]): it cannot open the miner at all
+//!   (another process of the user's at Medium, only to see and end it), nor write a file or
+//!   registry key at Medium. Its temporary, cache and segment directories are made writable at Low
+//!   before each Low worker starts ([`low_dirs`]), and the key file, `~/.zkminer/.env` and the lock
+//!   journal get a label Low processes cannot read through ([`protect_secrets`],
+//!   [`write_secret_file`]); a Low worker is never started beside one that could not be labelled.
+//!   What its warm-up downloads or builds in the profile (`~/.risc0`, `~/.sp1`) its binary installs
+//!   first, at Medium (`worker::install_artifacts_at_medium`, and [`install_sp1_server`]). No other
+//!   Low worker can open its process or first thread at all ([`low_worker_descriptors`]), nor a
+//!   thread it starts later but to see it (`zkminer_prover_protocol::threads`); the processes it
+//!   starts (SP1's `sp1-gpu-server`) are still open to them, and it shares its temporary and cache
+//!   directories with them. It still has the network.
+//!   Low workers fail closed: a worker that cannot start at Low (its handshake fails, or its
 //!   directories cannot be prepared) is not started at Medium instead but paged and tried again at
 //!   Low after a back-off ([`low_il_worker_failed`]), as a Low process could otherwise force the
 //!   fallback.
 //!
-//! Without the flag a worker can still read every file of the user's, the key file and `.env`
-//! included (`zkminer doctor` says so).
+//! `ZKMINER_WINDOWS_LOW_IL_WORKERS=0` runs the workers at Medium instead, for a GPU runtime that
+//! does not work at Low: they can then read every file of the user's, the key file and `.env`
+//! included. It is paged at every start ([`page_medium_workers`]), and `zkminer doctor` warns.
 //!
 //! All of this assumes the miner runs as an ordinary user. As LocalSystem the lock-down grants
 //! every worker everything (its DACL grants SYSTEM all rights), and as LocalService or
@@ -47,7 +51,8 @@ use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// Set to `1` to run every worker at Low integrity (see the module docs).
+/// Workers run at Low integrity unless this is `0` (see the module docs): the opt-out, paged at every
+/// start ([`page_medium_workers`]). `1`, or anything else, leaves them at Low.
 pub const LOW_IL_WORKERS_ENV: &str = "ZKMINER_WINDOWS_LOW_IL_WORKERS";
 
 type Handle = *mut c_void;
@@ -575,30 +580,73 @@ pub fn page_account_risk() {
     }
 }
 
-/// Whether workers are to run at Low integrity (`ZKMINER_WINDOWS_LOW_IL_WORKERS=1`), read once.
+/// Whether workers are to run at Low integrity, read once: yes, unless [`LOW_IL_WORKERS_ENV`] is
+/// `0` ([`low_il_from`]).
 pub fn low_il_workers() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var(LOW_IL_WORKERS_ENV).is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| low_il_from(std::env::var(LOW_IL_WORKERS_ENV).ok().as_deref()))
 }
 
-/// The flag's value when it is set to something other than `1` (which leaves the workers at
-/// Medium), for `zkminer doctor`.
+/// Whether [`LOW_IL_WORKERS_ENV`] set to `value` (`None`: unset) runs the workers at Low: every
+/// value but `0`, so that a typo never leaves them at Medium.
+pub fn low_il_from(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// The flag's value when it is set to something other than `0`, `1` or nothing (which leaves the
+/// workers at Low all the same), for `zkminer doctor`.
 pub fn low_il_workers_misset() -> Option<String> {
     std::env::var(LOW_IL_WORKERS_ENV)
         .ok()
-        .filter(|v| v.trim() != "1" && !v.trim().is_empty())
+        .filter(|v| !matches!(v.trim(), "0" | "1" | ""))
 }
 
-/// A Low worker of `backend` did not start (`why`). The flag fails closed: it is not started at
-/// Medium instead, which a Low process could otherwise bring about at will (by ending a sibling
-/// before its handshake, or by planting a file where a Low directory goes). The slot stays without
-/// a worker and the dispatcher starts one again, at Low, after its back-off.
-pub(crate) fn low_il_worker_failed(backend: &str, why: &str) {
+/// The opt-out ([`LOW_IL_WORKERS_ENV`]`=0`), paged at every start of a command that runs workers:
+/// they run at Medium integrity, as the operator's own processes, and a requester's guest that
+/// breaks out of one can read the key file, `.env` and the journal, and send them anywhere.
+pub fn page_medium_workers() {
     tracing::error!(
-        "PAGE: LOW-IL-WORKER-FAILED ({backend}) — a worker at Low integrity did not start ({why}). \
-         It is not started at Medium integrity instead ({LOW_IL_WORKERS_ENV}=1 fails closed): \
+        "PAGE: MEDIUM-WORKERS — {LOW_IL_WORKERS_ENV}=0: the prover workers run at Medium \
+         integrity, with every right this user has. A requester's guest program that breaks out of \
+         one can read the key file, .env and the job journal and send them anywhere: the wallet \
+         and the stake. Unset {LOW_IL_WORKERS_ENV} to run them at Low integrity, the default"
+    );
+}
+
+/// The worker binary's file name, which names its GPU vendor (`zkminer-prove-risc0-cuda.exe`).
+fn worker_name(program: &Path) -> std::borrow::Cow<'_, str> {
+    program.file_name().map_or_else(
+        || program.as_os_str().to_string_lossy(),
+        |n| n.to_string_lossy(),
+    )
+}
+
+/// A Low worker of `backend` (`program`) did not start (`why`: what failed, the worker's last words
+/// when it said any). Low workers fail closed: it is not started at Medium instead, which a Low
+/// process could otherwise bring about at will (by ending a sibling before its handshake, or by
+/// planting a file where a Low directory goes). The slot stays without a worker and the dispatcher
+/// starts one again, at Low, after its back-off.
+pub(crate) fn low_il_worker_failed(backend: &str, program: &Path, why: &str) {
+    let name = worker_name(program);
+    tracing::error!(
+        "PAGE: LOW-IL-WORKER-FAILED ({backend}, {name}) — a worker at Low integrity did not start: \
+         {why}. It is not started at Medium integrity instead (Low-integrity workers fail closed): \
          this {backend} slot proves nothing until a Low worker starts, which is tried again with \
-         back-off. If {backend} works here only at Medium, unset {LOW_IL_WORKERS_ENV}"
+         back-off. If {name} works on this card only at Medium, {LOW_IL_WORKERS_ENV}=0 runs every \
+         worker at Medium, where a guest that breaks out can read the key"
+    );
+}
+
+/// A Low worker's warm-up failed (`why`) on slot `key`, run by `program`: where a GPU runtime needs
+/// something Low integrity denies, this is where it shows first, so it is paged with the worker's
+/// own words, which name the call that failed.
+pub(crate) fn low_il_setup_failed(key: &str, program: &Path, why: &str) {
+    let name = worker_name(program);
+    tracing::error!(
+        "PAGE: LOW-IL-WARMUP-FAILED ({key}, {name}) — a worker at Low integrity failed its \
+         warm-up: {why}. If {name} warms up on this card at Medium ({LOW_IL_WORKERS_ENV}=0, where \
+         a guest that breaks out can read the key), its GPU runtime needs something Low integrity \
+         denies: the call above is the one to report"
     );
 }
 
@@ -937,11 +985,13 @@ static SECRETS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 /// journal so no Low process can read them; a file that does not exist is skipped. Labels, never
 /// reads, them, and reads each label back. A file this user may neither label nor, as its owner,
 /// open to labelling is paged (`SECRETS-UNLABELLED`), and no Low worker is started in this process
-/// ([`spawn_worker`]): a Low worker never runs beside a key it could read. Does nothing without the
-/// flag. Every command that starts workers calls it first; a process that starts a Low worker
-/// without (a test) has `.env` and the journal labelled before its first.
+/// ([`spawn_worker`]): a Low worker never runs beside a key it could read. With the workers at
+/// Medium (the opt-out), labels nothing and pages that instead ([`page_medium_workers`]). Every
+/// command that starts workers calls it first; a process that starts a Low worker without (a test)
+/// has `.env` and the journal labelled before its first.
 pub fn protect_secrets(key_file: Option<&Path>, journal: &Path) {
     if !low_il_workers() {
+        page_medium_workers();
         return;
     }
     let labelled = label_secrets(key_file, dirs::home_dir().as_deref(), journal);
@@ -1239,11 +1289,15 @@ pub(crate) fn spawn_worker(
     #[cfg(not(test))]
     let test_root: Option<PathBuf> = None;
     let low = low_il_workers() || test_root.is_some();
+    // Set below for a Low worker, and only by the miner.
+    env.retain(|(k, _)| {
+        !k.eq_ignore_ascii_case(zkminer_prover_protocol::types::LOW_INTEGRITY_WORKER_ENV)
+    });
     if low {
-        // Never beside a key it could read (`protect_secrets`). Tests label no secrets of theirs.
-        if test_root.is_none() {
+        // Never beside a key it could read (`protect_secrets`). Unit tests label none of the user's.
+        if test_root.is_none() && !cfg!(test) {
             secrets_labelled().map_err(|why| {
-                low_il_worker_failed(backend, &why);
+                low_il_worker_failed(backend, program, &why);
                 io::Error::other(why)
             })?;
         }
@@ -1253,7 +1307,7 @@ pub(crate) fn spawn_worker(
                 let why = format!(
                     "the directories a Low-integrity worker writes could not be prepared: {e}"
                 );
-                low_il_worker_failed(backend, &why);
+                low_il_worker_failed(backend, program, &why);
                 io::Error::other(why)
             })?;
         // Last, so they win over the miner's own: a Low process cannot write those.
@@ -1264,12 +1318,22 @@ pub(crate) fn spawn_worker(
         if backend == "sp1" {
             install_sp1_server(program, &env);
         }
+        // Its warm-up installs nothing in the profile, which the miner does at Medium
+        // (`worker::install_artifacts_at_medium`).
+        env.push((
+            zkminer_prover_protocol::types::LOW_INTEGRITY_WORKER_ENV.into(),
+            "1".into(),
+        ));
     }
     #[cfg(test)]
     TEST_SPAWNS.with(|spawns| spawns.borrow_mut().push(low));
     spawn(program, &[], &env, low).inspect_err(|e| {
         if low {
-            low_il_worker_failed(backend, &format!("it could not be started at Low: {e}"));
+            low_il_worker_failed(
+                backend,
+                program,
+                &format!("it could not be started at Low: {e}"),
+            );
         }
     })
 }
@@ -2668,6 +2732,35 @@ mod tests {
         let repaired = [tmp.is_dir(), segments.is_dir()];
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(repaired, [true, true], "tmp, risc0-segments");
+    }
+
+    /// X-B: workers run at Low unless the operator opts out with exactly `0`; nothing else (unset,
+    /// `1`, a typo) leaves them at Medium. And a worker started with the flag unset is at Low.
+    #[test]
+    fn low_integrity_is_the_default() {
+        assert!(low_il_from(None));
+        assert!(low_il_from(Some("1")));
+        assert!(low_il_from(Some("")));
+        assert!(low_il_from(Some("off")));
+        assert!(!low_il_from(Some("0")));
+        assert!(!low_il_from(Some(" 0 ")));
+        if std::env::var_os(LOW_IL_WORKERS_ENV).is_none() {
+            assert!(low_il_workers());
+            let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+            let whoami = system.join("System32").join("whoami.exe");
+            let env = vec![
+                ("SystemRoot".into(), system.into_os_string()),
+                (
+                    zkminer_prover_protocol::types::LOW_INTEGRITY_WORKER_ENV.into(),
+                    "1".into(),
+                ),
+            ];
+            TEST_SPAWNS.with(|s| s.borrow_mut().clear());
+            let mut child = spawn_worker("risc0", &whoami, env).unwrap();
+            let _ = child.wait();
+            assert!(child.is_low_integrity());
+            assert_eq!(TEST_SPAWNS.with(|s| s.borrow().clone()), vec![true]);
+        }
     }
 
     /// LocalSystem, LocalService and NetworkService are refused whatever their admin state, and so

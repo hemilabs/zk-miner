@@ -672,6 +672,48 @@ Linux with Landlock ABI 6 or later is required; a worker with more than one thre
 it confines itself (the SP1 worker, a GPU runtime's threads) needs ABI 8
 (`LANDLOCK_RESTRICT_SELF_TSYNC`), or it refuses to run guests.
 
+## Windows workers: Low integrity
+
+Windows has no Landlock or seccomp, and `confine()` does nothing there. The workers are kept
+from the operator's key by the Windows integrity levels instead
+(`crates/zkminer-prover/src/windows_sandbox.rs`), on the same assumption that a guest can
+escape its executor:
+
+- **Low integrity, by default.** Each worker is created suspended, lowered to Low and resumed
+  in a job of its own (no desktop, clipboard or breakaway). `ZKMINER_WINDOWS_LOW_IL_WORKERS=0`
+  runs them at Medium instead, as the operator's own processes; that is paged at every start
+  (`PAGE: MEDIUM-WORKERS`) and `zkminer doctor` warns.
+- **The key.** The key file, `~/.zkminer/.env` and the job journal carry a Medium no-read-up
+  label, read back after it is set. A file the account can neither label nor, as its owner, open
+  to labelling (one another account owns and made private to it without `WO`) is paged
+  (`PAGE: SECRETS-UNLABELLED`), and no Low worker starts until it is fixed.
+- **The miner.** Its process and threads grant the user only seeing, waiting for and ending them,
+  and carry a Medium no-write, no-read, no-execute-up label: a Low worker can neither read nor
+  end the miner. A job whose proof the miner died in the middle of in three runs in a row is
+  released (`PAGE: JOB-CRASH-LOOP`), so a guest that ends the miner each time cannot hold every
+  lock past its deadline.
+- **Other workers.** A Low worker cannot open another's process or first thread (the same
+  label), nor the threads it starts later (each worker narrows its own, as the miner does).
+- **Files.** A Low worker writes only its temporary, cache and segment directories, which the
+  miner makes plain directories again before each Low worker (a file or a link a Low process
+  put there is removed, never followed). What a warm-up downloads or builds in the profile (the
+  SP1 server, the Groth16 artifacts) the worker binary installs first at Medium
+  (`--install-artifacts`), so no Low process writes anything a worker later runs or reads from
+  there.
+- **What an escaped guest in a Low worker can still do.** Use the network: a Low process has it,
+  and no firewall rule is installed. Read what the user's files grant Everyone or Users and the
+  user's files without a label (the operator's documents, `config.toml` with a keyed RPC URL,
+  unless they are kept elsewhere or labelled). Open, read and end the processes another Low
+  worker starts (SP1's `sp1-gpu-server`) and their threads, which keep the token's default DACL,
+  and tamper with the temporary and cache directories every Low worker shares (a poisoned kernel
+  cache, or a full disk), which can fail other jobs' proofs. Reach the GPU driver's kernel
+  interface. It cannot read the key, the miner's memory or the journal, nor write a file a
+  Medium worker or the miner later runs.
+
+Each GPU runtime must work at Low: a worker that fails there is paged with its binary's name and
+its last output (`PAGE: LOW-IL-WORKER-FAILED`, `PAGE: LOW-IL-WARMUP-FAILED`) and never falls back
+to Medium on its own.
+
 ## Witness jobs: the broker
 
 A witness job's builder asks the miner's broker (`zkminer-witness-broker`, sandboxed) for data.

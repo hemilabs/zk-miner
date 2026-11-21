@@ -824,14 +824,22 @@ Worth knowing:
   which dangerous privileges it holds, when the key file cannot be labelled, and when the key's variable is kept in the machine's, a
   service's or the user's environment; the miner's start-up pages each.
 
-  `ZKMINER_WINDOWS_LOW_IL_WORKERS=1` (off by default, as not every GPU runtime is known to work
-  there) runs the workers at Low integrity: they can then read neither the key file, `.env` nor
-  the job journal, open neither the miner nor each other but to see and end them, and write only
-  where Low processes may (their temporary, cache and segment directories). It fails closed: a
-  worker that cannot start at Low is never started at Medium instead; its slot proves nothing,
-  with `PAGE: LOW-IL-WORKER-FAILED`, and the miner tries it again at Low with back-off. If a
-  zkVM works on your card only at Medium, leave the flag unset. The SP1 server is installed into
-  `~/.sp1/bin` by the miner itself before its first Low SP1 worker.
+  On Windows the workers run at Low integrity. They read neither the key file, `.env` nor the job
+  journal; they cannot open or end the miner, nor open each other or the threads each starts; and
+  they write only where Low processes may (their temporary, cache and segment directories, which
+  the miner repairs before each Low worker it starts). What their first warm-up downloads or builds
+  in your profile (the SP1 server in `~/.sp1/bin`, the Groth16 artifacts in `~/.risc0` and
+  `~/.sp1/circuits`) the miner installs itself, at Medium, before it. What they still can do: use
+  the network, see and end the processes a sibling starts (SP1's `sp1-gpu-server`) and use the
+  temporary and cache directories every Low worker shares. It fails closed: a worker that cannot
+  start at Low is never started at Medium instead; its slot proves nothing, with `PAGE:
+  LOW-IL-WORKER-FAILED` naming the worker binary and its last words (`PAGE: LOW-IL-WARMUP-FAILED`
+  for one whose warm-up fails), and the miner tries it again at Low with back-off. A job whose
+  proof the miner has died in the middle of three runs in a row (a crash, or a guest that broke
+  out and ended it) is released, with `PAGE: JOB-CRASH-LOOP`, rather than proven again. If a zkVM
+  works on your card only at Medium, `ZKMINER_WINDOWS_LOW_IL_WORKERS=0` runs every worker at
+  Medium, where a guest that breaks out can read the key: it is paged at every start (`PAGE:
+  MEDIUM-WORKERS`) and `zkminer doctor` warns.
 
   Moving from LocalSystem: stop the old service with `zkminer stop --wait` run as LocalSystem
   (`psexec -s`; its home was `C:\Windows\System32\config\systemprofile\.zkminer`) so it finishes

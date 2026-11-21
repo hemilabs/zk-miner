@@ -374,6 +374,12 @@ fn main() {
     // Said on stderr before logging was up; again through it.
     segments::log_fallback();
 
+    // `--install-artifacts`: the Groth16 component only, answered as a `Warmup` is, then exit. For the
+    // Windows miner, at its own integrity, before a Low-integrity worker's warm-up. No GPU, no guest.
+    if std::env::args().any(|a| a == zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG) {
+        std::process::exit(install_artifacts(ipc_stdout));
+    }
+
     // W7-M10: with `ZKMINER_METAL_ENFORCE_BUDGET=1` the HAL enforces the limit this worker plans
     // with (the dispatcher's figure for this job tier); set before the first request, so before
     // any proof or HAL runtime reads it. rayon's (idle) pool and the Metal device `gpu_refusal`
@@ -412,6 +418,40 @@ fn main() {
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// `--install-artifacts` (`zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG`): what a `Warmup`
+/// installs in the user's profile, its progress and outcome written to `out` as a `Warmup`'s are.
+/// The exit status: 0 once installed.
+fn install_artifacts(mut out: impl io::Write) -> i32 {
+    let resp = match groth16_component::ensure_installed(&mut |status, done_bytes, total_bytes| {
+        // A closed pipe is reported by the final answer's write below.
+        let _ = write_message(
+            &mut out,
+            &WorkerResponse::SetupProgress {
+                request_id: 0,
+                status: status.to_string(),
+                done_bytes,
+                total_bytes,
+            },
+        );
+    }) {
+        Ok(summary) => WorkerResponse::WarmupDone {
+            request_id: 0,
+            summary,
+            groth16_helper: false,
+        },
+        Err(e) => WorkerResponse::Error {
+            request_id: 0,
+            kind: ErrorKind::Internal,
+            message: format!("installing the risc0-groth16 component failed: {e:#}"),
+        },
+    };
+    let installed = matches!(resp, WorkerResponse::WarmupDone { .. });
+    match write_message(&mut out, &resp) {
+        Ok(()) if installed => 0,
+        _ => 1,
     }
 }
 
@@ -1953,17 +1993,14 @@ impl risc0_zkvm::SessionEvents for SegmentProgress {
     }
 }
 
-/// `prove_with_opts` for a job, reporting each proven segment to the host. The same calls it makes
-/// (`LocalProver::prove_with_ctx` → `ProverServer::prove_with_ctx`), taken one level down so the
-/// session can carry a hook: the prover server first (its GPU warm-up and Groth16 key load overlap
-/// the execution), then the execution, then `prove_session`. The segment size is always set here,
-/// so the server's own choice of one, the only other thing `prove_with_ctx` does, never applies.
+/// `groth16_wrap::prove` for a job, reporting each proven segment to the host: the execution, then
+/// `groth16_wrap::prove_session`, taken one level down from `prove_with_opts` so the session can
+/// carry a hook. The segment size is always set here, so the server's own choice of one, the only
+/// other thing `prove_with_ctx` does, never applies.
 fn prove_reporting_segments(
     env: risc0_zkvm::ExecutorEnv<'_>,
     elf: &[u8],
-    opts: &risc0_zkvm::ProverOpts,
 ) -> Result<risc0_zkvm::ProveInfo> {
-    let server = risc0_zkvm::get_prover_server(opts)?;
     // A start, also on a retry inside this worker (`run_proof`): the host starts its progress over.
     send_to_host(|request_id| WorkerResponse::Progress {
         request_id,
@@ -1976,8 +2013,8 @@ fn prove_reporting_segments(
     let total = u32::try_from(session.segments.len()).unwrap_or(u32::MAX);
     report_stage(zkminer_prover_protocol::ProveStage::Prove, 0, total);
     session.add_hook(SegmentProgress { total });
-    let ctx = risc0_zkvm::VerifierContext::default().with_dev_mode(opts.dev_mode());
-    server.prove_session(&ctx, &session)
+    // In-process, or to a succinct receipt the Groth16 helper wraps (`groth16_wrap`).
+    groth16_wrap::prove_session(&session)
 }
 
 fn run_proof(
@@ -2152,7 +2189,6 @@ fn run_proof_once(
     // This performs STARK proving followed by Groth16 SNARK compression,
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
-    let opts = ProverOpts::groth16().with_dev_mode(false);
     #[cfg(feature = "metal")]
     if let Some(limit) = metal_host::working_set_limit() {
         // Above the default but under the hard ceiling `run_proof` enforces (`po2_refusal`).
@@ -2173,7 +2209,7 @@ fn run_proof_once(
         // Releases on unwind too: a prove-path panic (a Metal budget panic mid-STARK) must not skip
         // returning the recursion provers' memory. The normal path releases when this scope ends.
         let _release = ReleaseOnDrop;
-        prove_reporting_segments(env, elf, &opts)
+        prove_reporting_segments(env, elf)
     };
     #[cfg(feature = "metal")]
     sampler.phase("proof");
