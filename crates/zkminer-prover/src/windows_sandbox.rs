@@ -1174,7 +1174,31 @@ fn prepare_low_dirs(local: &Path, home: &Path) -> Result<Vec<(&'static str, Path
         make_plain_dir(dir).map_err(at(dir))?;
         set_dir_label(dir, LOW_WRITABLE_DIR).map_err(at(dir))?;
     }
+    sweep_dead_progress_files(&base.join("tmp"));
     Ok(dirs)
+}
+
+/// What dead SP1 workers left in the Low workers' shared `tmp` directory: their progress files
+/// (`zkminer-sp1-progress-<pid>.txt`), removed once no process runs under the pid. Nothing else
+/// removes them, and nothing on Windows cleans that directory. Only plain files of that name: a
+/// link a Low process put there is not a file to this (never followed, never removed).
+fn sweep_dead_progress_files(tmp: &Path) {
+    use zkminer_prover_protocol::liveness::{liveness, Liveness};
+    let Ok(read) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("zkminer-sp1-progress-"))
+            .and_then(|n| n.strip_suffix(".txt"))
+            .and_then(|n| n.parse::<u32>().ok());
+        let Some(pid) = pid else { continue };
+        if entry.file_type().is_ok_and(|t| t.is_file()) && liveness(pid) == Liveness::Gone {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// [`prepare_low_dirs`] for the next Low worker: in this user's profile, or below `root` (tests).
@@ -2684,7 +2708,17 @@ mod tests {
         std::fs::create_dir_all(home.join(".zkminer")).unwrap();
         junction(&home.join(".zkminer").join("locks"), &medium);
 
+        // Progress files of SP1 workers: a dead one's goes, a live one's stays.
+        let tmp = worker.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dead = tmp.join("zkminer-sp1-progress-4000000001.txt");
+        let live = tmp.join(format!("zkminer-sp1-progress-{}.txt", std::process::id()));
+        for p in [&dead, &live] {
+            std::fs::write(p, b"3/7").unwrap();
+        }
+
         let dirs = prepare_low_dirs(&local, &home).unwrap();
+        assert!(!dead.exists() && live.exists(), "progress files");
         for name in ["neo", "sycl"] {
             let m = std::fs::symlink_metadata(worker.join(name)).unwrap();
             assert!(

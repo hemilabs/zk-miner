@@ -16,10 +16,17 @@
 //! `<start>` is the process's start time, so the directory of a killed worker whose pid this one
 //! reuses is never taken for this one's. A worker that was killed cannot empty its own: the next
 //! worker to start removes the directories of workers that are gone, told by their pid and start
-//! time in `/proc`. On macOS a directory is named by the pid alone and removed once no process has
+//! time (`/proc` on Linux; on Windows the process's creation time, `zkminer_prover_protocol::
+//! liveness`). On macOS a directory is named by the pid alone and removed once no process has
 //! that pid (a killed Metal worker's segments would otherwise stay under `~/.zkminer` for good; a
-//! reused pid keeps it until that process is gone too). On another OS every directory is kept. Workers sharing the directory from
-//! different pid namespaces cannot see each other, and would remove each other's.
+//! reused pid keeps it until that process is gone too). On another OS every directory is kept.
+//! Workers sharing the directory from different pid namespaces cannot see each other, and would
+//! remove each other's.
+//!
+//! On Windows the directory is writable by every Low-integrity worker, so one of them may have put
+//! a junction or a symbolic link there, named like a dead worker's directory or inside one. Neither
+//! is ever followed: a link is not a directory to [`remove_stale`], and `remove_dir_all` removes a
+//! link inside a directory, not what it points at.
 //!
 //! Without a directory (no home directory, or a directory on the way that is not this user's
 //! alone), segments go where risc0 puts them by default; [`log_fallback`] says so once logging is up.
@@ -401,8 +408,15 @@ fn running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// Whether a process runs under `pid` (one this worker may not open counts as running).
+#[cfg(windows)]
+fn running(pid: u32) -> bool {
+    use zkminer_prover_protocol::liveness::{liveness, Liveness};
+    liveness(pid) != Liveness::Gone
+}
+
 /// Where a pid's liveness cannot be read, every directory is kept.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn running(_pid: u32) -> bool {
     true
 }
@@ -416,9 +430,103 @@ fn start_time(pid: u32) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// When process `pid` started: its creation time (100 ns since 1601).
+#[cfg(windows)]
+fn start_time(pid: u32) -> Option<u64> {
+    use zkminer_prover_protocol::liveness::{liveness, Liveness};
+    match liveness(pid) {
+        Liveness::Running(start) => start,
+        Liveness::Gone => None,
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn start_time(_pid: u32) -> Option<u64> {
     None
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// A pid no process has: not a multiple of 4.
+    const GONE: u32 = 4_000_000_001;
+
+    fn me() -> (u32, u64) {
+        let pid = std::process::id();
+        (pid, start_time(pid).expect("this process's start time"))
+    }
+
+    /// The directories of workers that are gone (by pid, or by a reused pid's start time) are
+    /// removed, and a live worker's, this one's and anything not named by a worker are kept.
+    #[test]
+    fn the_directories_of_workers_that_are_gone_are_removed() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(BASE);
+        let (pid, start) = me();
+        let gone = base.join(GONE.to_string());
+        let gone_new = base.join(format!("{GONE}-5"));
+        // This process's pid, but started at another time: a worker whose pid this one reuses.
+        let reused = base.join(format!("{pid}-{}", start + 1));
+        let own = base.join(format!("{pid}-{start}"));
+        let other = base.join("not-a-pid");
+        for d in [&gone, &gone_new, &reused, &own, &other] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("0.bincode"), b"segment").unwrap();
+        }
+        remove_stale(&base, &dir_name(pid, Some(start)));
+        for d in [&gone, &gone_new, &reused] {
+            assert!(
+                !d.exists(),
+                "a dead worker's segments are kept: {}",
+                d.display()
+            );
+        }
+        for d in [&own, &other] {
+            assert!(d.exists(), "{} was removed", d.display());
+        }
+    }
+
+    /// A junction a Low worker planted, as a dead worker's directory or inside one, is never
+    /// followed: what it points at survives.
+    #[test]
+    fn a_planted_junction_is_never_followed() {
+        let home = tempfile::tempdir().unwrap();
+        let base = home.path().join(BASE);
+        std::fs::create_dir_all(&base).unwrap();
+        let precious = home.path().join("precious");
+        std::fs::create_dir_all(&precious).unwrap();
+        std::fs::write(precious.join("key"), b"keep me").unwrap();
+        // `BASE` is spelled with a `/`, which `mklink` would take for a switch.
+        let native = |p: &Path| p.to_string_lossy().replace('/', "\\");
+        let junction = |link: &Path| {
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(native(link))
+                .arg(native(&precious))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        // As a dead worker's directory itself.
+        junction(&base.join(GONE.to_string()));
+        // Inside a dead worker's real directory.
+        let dead = base.join(format!("{GONE}-7"));
+        std::fs::create_dir_all(&dead).unwrap();
+        junction(&dead.join("0.bincode"));
+        remove_stale(&base, "1-1");
+        assert!(!dead.exists(), "the dead worker's directory is kept");
+        assert_eq!(std::fs::read(precious.join("key")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_workers_directory_is_named_by_its_pid_and_start() {
+        let (pid, start) = me();
+        assert_eq!(dir_name(pid, start_time(pid)), format!("{pid}-{start}"));
+        assert!(!gone(&dir_name(pid, Some(start))));
+        assert!(gone(&dir_name(pid, Some(start + 1))));
+        assert!(gone(&GONE.to_string()));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
