@@ -199,17 +199,18 @@ Every connection a requester can cause goes through one guard
     an unreachable whose ICMP message could not be read, inconsistent results, any local error
     (a local firewall's). An answer always outweighs an ICMP error queued for the same probe.
 
-  **The connection that follows** is pinned to the probe that found the far evidence: it is
-  made from the same source address and the same local port (a port another socket holds then
-  fails the attempt; it is never made from another port), on the same interface (macOS
-  `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, which a TCP
-  connect does not follow there, measured on kernel 7.0, so on Linux the source address, the port
-  and the check once connected pin the path), and on Linux
-  with the IPv6 flow label fixed (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), so
-  a per-connection load balancer hashes it as it hashed the probe; the check once connected
-  also checks the port. A far verdict is not remembered for other connections: it belongs to
-  that probe's address and port pair, and another connection (another port) may take another
-  path, so every connection is decided afresh. At most two rounds at a time per address
+  **The connection that follows** leaves as the probes did: from the same source address, on
+  the same interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` /
+  `IPV6_UNICAST_IF`, which a TCP connect does not follow there, measured on kernel 7.0, so on
+  Linux the source address and the check once connected pin the path), and on Linux with the
+  IPv6 flow label fixed (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), but from a
+  new local port. It does not reuse the far probe's port (the owner's decision after the S3
+  review): stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
+  probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
+  probe's port timed out, a new port connected at once). So a per-connection
+  multi-WAN balancer that routes connections over unequal paths can send the connection another
+  way than its probe (a documented residual, as before the S3 review). A far verdict is not
+  remembered for other connections: every connection is decided afresh. At most two rounds at a time per address
   family, started at most six in a burst and three a second (one token per round of three
   probes: each router expires at most one of them, so its ICMP load is that of a single probe),
   first come first served; a name's addresses one after another per family (the two families
@@ -678,8 +679,8 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   probes; an address that answers within `near_hop_limit` hops (an operator node in the same VPC
   by its public address) is refused and never connected to, and so is one no router past the
   limit sent a "time exceeded" for (no evidence: refused, so an endpoint on a path whose routers
-  send no ICMP is lost); the connection is made from the far probe's address, port and
-  interface;
+  send no ICMP is lost); the connection is made from the probes' source address and
+  interface, from a new port;
 - connects with the configured connect timeout, and paces attempts (64 at once, 16 a second: a
   hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
   `max_concurrency` in flight);
@@ -820,18 +821,14 @@ no second one):
     (many cloud providers' networks, EC2 included, and corporate edges that filter ICMP)
     refuses every destination, every time; a router rate-limiting its ICMP refuses some. Cloud
     servers are out of scope for now. Windows refuses every decision (no ICMP plumbing yet).
-  - **Port reuse and strict NATs (open, the owner's decision pending).** The connection must
-    reuse the far probe's local port so that it takes the probe's path. On a measured IPv4 home
-    path (a home NAT router, then the ISP's carrier-grade NAT) the real connection's SYN then got
-    no answer whenever it followed the probe's by more than about 20 ms, for at least 125 s,
-    while a new port connected at once; IPv6 (no NAT) was not affected, and Linux conntrack
-    alone (the lab) reuses the port fine. The likely cause is a stateful NAT or firewall (the
-    carrier's NAT, or pf-style strict TCP tracking) that keeps the probe's session with its
-    sequence number and drops a second SYN on it. On such paths every IPv4 connection after a
-    far verdict fails, refused (`connecting to ... from the near-hop probe's port ...: timed
-    out`; never retried from another port). The alternative is to pin only the source address,
-    interface and flow label, which works there but leaves a per-connection balancer free to
-    send the connection another way than the probe.
+  - **Per-connection balancers.** The connection is made from a new local port, not the far
+    probe's (the owner's decision: stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
+    probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
+    probe's port timed out, a new port connected at once). A per-connection multi-WAN balancer
+    (mwan3 style) that routes connections over unequal paths can therefore send the connection another way than its probe:
+    in the lab, with paths of 2 and 4 hops to the same near host, 4 of 13 connections after a far
+    verdict reached it over the 2-hop path (with the probe's port reused, 0 of 18). The same
+    residual as before the S3 review.
   - **What the probes cost.** A near host does receive the probes' SYNs (and answers them: a
     handshake or a reset, never data) before the connection is refused. A transparent proxy
     within the limit answers for every destination, so every connection through it is refused.

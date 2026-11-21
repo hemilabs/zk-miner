@@ -500,8 +500,8 @@ only on the example. Logs: `fix-r6/` (`/Users/user/zkminer/scratch/w11/NGREV/fix
   change here); a port is in the key because a router can send one port elsewhere (a
   transparent proxy at hop 1); a prefix is not, because a prefix can hold both a far and a near
   host. Near and failed verdicts are never remembered, so remembering can only skip a probe that
-  would have said far. *Removed by the S3 review (2026-11):* a far verdict is now the 4-tuple
-  of the probe that found it, which the connection reuses, so it is not remembered at all
+  would have said far. *Removed by the S3 review (2026-11):* a far verdict is now evidence about
+  one probe's 4-tuple, so it is not remembered at all
   ("Near-hop rule: positive evidence", below).
 - *Linux uplink identity (items 5, 6).* Per family: whenever the known MAC of the family's
   gateway shows, the signature is the known network's; differing MACs that never hold are one
@@ -690,21 +690,24 @@ past the limit said the probe ran out of hops), never on silence."
 refusal, the last probe attempt and the 3+1 attempts), and "unreachable is far". A near host
 that drops SYNs (and FINs) is now refused for want of evidence, never far.
 
-**Pinning.** A far verdict rests on one probe's 4-tuple, so the connection that follows reuses
-it: `Vetted` carries the far probe's local port and interface, and the guarded client's hops and
-the witness broker's connector make the connection with `Vetted::socket`, bound to the vetted
-source address and that port (`EADDRINUSE` fails the attempt; it is never made from another
-port), on that interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` /
-`IPV6_UNICAST_IF`, but measured on kernel 7.0 a TCP connect ignores them, and `SO_BINDTODEVICE`
-needs `CAP_NET_RAW`, so on Linux the source address, port and recheck pin the path; the IPv6
-option in host byte order failed with `EADDRNOTAVAIL`, found on the VM and fixed), and on Linux with `IPV6_AUTOFLOWLABEL` off on the probes and the connection.
-`recheck_connected` also checks the port. The connection is made right after the verdict.
+**Pinning.** The connection that follows leaves as the probes did: `Vetted` carries the source
+address the probes were bound to and the interface that holds it, and the guarded client's hops
+and the witness broker's connector make the connection with `Vetted::socket`, bound to that source
+(a far probe that left from another source is refused), on that interface (macOS `IP_BOUND_IF` /
+`IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, but measured on kernel 7.0 a TCP
+connect ignores them, and `SO_BINDTODEVICE` needs `CAP_NET_RAW`, so on Linux the source address
+and the recheck pin the path; the IPv6 option in host byte order failed with `EADDRNOTAVAIL`, found
+on the VM and fixed), and on Linux with `IPV6_AUTOFLOWLABEL` off on the probes and the connection,
+from a new local port. The far probe's port was reused at first (the review's R4 mitigation) and
+then dropped by the owner's decision: stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
+probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
+probe's port timed out, a new port connected at once). The connection is made right after the verdict.
 
 **The far cache is dropped** (`FAR_TTL` 10 s, the single-flight `decide_remembered` and the facts'
-path key). A far verdict is tied to the 4-tuple of the probe that found it, which the connection
-it was found for reuses; another connection (another port) may take another path (per-connection
-balancers, measured in round 3), and a port-keyed cache could never be hit while the first
-connection holds the port or its `TIME_WAIT`. Cost: every connection is decided afresh, at most 3
+path key). A far verdict is evidence about one probe's 4-tuple; another connection may take
+another path (per-connection balancers, measured in round 3), so nothing is remembered: the
+safer of the review's two options (the other, a cache keyed to the probe's port and very short,
+could never be hit while the first connection held the port or its `TIME_WAIT`). Cost: every connection is decided afresh, at most 3
 decisions a second per family after a burst of 6. `MAX_UNANSWERED_PER_FAMILY` (the client) and
 the broker's `MAX_UNANSWERED` still count `NearCheckFailed`, which now includes every decision
 without evidence: a family whose path gives no evidence twice is given up.
@@ -743,8 +746,10 @@ to a router's own addresses (measured, the miner's gateway included), a userspac
 three hop-limit units in one box, measured), a VM's NAT hiding a hop (measured: the ISP's CGNAT
 box far at `N` 2), a CGNAT hairpin to the operator's own PCP mapping, a transient routing loop
 (measured), a stateless per-packet balancer. A per-connection balancer with unequal paths
-(mwan3 style) read far 12 of 20 times per family with a new port and reached the near host on 12
-of 15 connections; with the probe's port reused, 0 of 19.
+(mwan3 style) reads far about half the time per family (lab: 11 of 20, 10 of 20) and, since the
+connection takes a new port (the owner's decision), reaches the near host over the short path on
+some connections: 4 of 13 in the lab (round 3's prototype: 12 of 15); with the probe's port
+reused it was 0 of 18 (0 of 19). A documented residual, as before the S3 review.
 
 **Availability.** Home paths whose hop 2 sends Time Exceeded (this Mac's and its Linux VM's): no
 change, 61 of 61 addresses decided at start hop 2 (S3 18 of 18). Measured by starting the probes
@@ -760,20 +765,14 @@ Amazon-keyed S3 front end", not "not near") was designed and deferred by the own
 implemented. Cloud servers (EC2 and the like, whose provider hops send no ICMP) are out of scope
 for now.
 
-**Open: port reuse and strict NATs (owner decision pending).** On this Mac's home path (hop 1 the
-home NAT router, hop 2 the ISP's carrier-grade NAT), reusing the probe's local port for the real
-IPv4 connection fails: the real SYN gets no answer (the connect times out) whenever it follows the
-probe's SYN by more than about 20 ms, for at least 125 s, while a new port connects at once. IPv6
-(no NAT) reuse works. The likely cause is a stateful NAT or firewall (the ISP's CGNAT, or pf-style
-strict TCP tracking) that holds a session for the probe's 4-tuple with the probe's ISN and drops a
-second SYN on it with another ISN. In the Linux VM behind the Mac's NAT it works only when the
-connection follows within milliseconds; Linux-conntrack-only paths (the network-namespace lab)
-reuse fine. So on IPv4 paths through such a NAT every connection after a far verdict fails,
-closed (`connecting to ... from the near-hop probe's port ...: timed out`; never retried from
-another port). The owner must choose between keeping the port pin (assumption 3 mitigated, IPv4
-broken behind strict NATs, CGNATs and pf) and pinning only the source address, interface and flow
-label (IPv4 works; a per-connection balancer can again send the connection another way than the
-probe).
+**Decided: no port reuse.** Reusing the far probe's local port for the real connection was
+implemented first and measured to fail on this Mac's IPv4 home path (hop 1 the home NAT router,
+hop 2 the ISP's carrier-grade NAT): the real SYN got no answer whenever it followed the probe's by
+more than about 20 ms, for at least 125 s, while a new port connected at once (in the Linux VM
+behind the Mac's NAT too; Linux-conntrack-only paths reused fine). A stateful NAT keeps the
+probe's session with its sequence number and drops a second SYN on its 4-tuple. Every IPv4
+connection after a far verdict failed there, so the owner chose to pin the source address,
+interface and flow label only, and to document the per-connection balancer residual above.
 
 **Fixed on the way.** `ProbeGate::enter_until` (and the IPv6 gate) built the gate with
 `then_some`, so a caller that timed out or was shed gave back a turn it never held, and more

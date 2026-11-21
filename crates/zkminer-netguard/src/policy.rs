@@ -359,7 +359,8 @@ impl Denied {
 }
 
 /// What a connection was vetted as ([`NetPolicy::vet_path`]), for the connection itself
-/// ([`Vetted::socket`]: pinned to the probe that found it far) and the check once it is made
+/// ([`Vetted::socket`]: pinned to the source and interface the probes left from) and the check
+/// once it is made
 /// ([`NetPolicy::recheck_connected`]). Only the guard makes one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -372,11 +373,6 @@ pub struct Vetted {
     /// The source address the kernel chose for a connection to `connect` right before it was
     /// made (`None` in developer mode, which checks nothing).
     pub source: Option<IpAddr>,
-    /// The local port of the probe whose Time Exceeded found the destination far
-    /// ([`crate::nearhop::FarEvidence::local`]): the connection leaves from it, so that it is the
-    /// probe's 4-tuple (a per-connection balancer sends it where it sent the probe). `None` in
-    /// developer mode and for a test's stand-in.
-    pub port: Option<u16>,
     /// The interface that holds `source` (the connection is bound to it where the platform can:
     /// [`crate::nearhop`]).
     pub interface: Option<u32>,
@@ -385,39 +381,28 @@ pub struct Vetted {
 impl Vetted {
     /// A vetted connection as a test stages it (test builds only: the `test-util` feature).
     #[cfg(any(test, feature = "test-util"))]
-    pub fn staged(addr: SocketAddr, connect: SocketAddr, source: Option<IpAddr>, port: Option<u16>) -> Self {
+    pub fn staged(addr: SocketAddr, connect: SocketAddr, source: Option<IpAddr>, interface: Option<u32>) -> Self {
         Vetted {
             addr,
             connect: unmapped(connect),
             source,
-            port,
-            interface: None,
+            interface,
         }
     }
 
-    /// The socket for the connection to [`Self::connect`], pinned as the probe was (see
+    /// The socket for the connection to [`Self::connect`], pinned as the probes were (see
     /// [`crate::nearhop`]): the interface, a fixed IPv6 flow label (Linux), bound to the source
-    /// address and the probe's port. Non-blocking. A port another socket holds now
-    /// (`EADDRINUSE`) is an error: the connection is not made (refused), never made from another
-    /// port.
+    /// address, from a new local port. (The owner's decision after the S3 review: not the far
+    /// probe's port; a stateful home or carrier-grade NAT drops a second SYN on the probe's
+    /// 4-tuple, measured on this project's own home path, so every IPv4 connection failed.)
+    /// Non-blocking.
     pub fn socket(&self) -> io::Result<socket2::Socket> {
         let sock = crate::nearhop::new_socket(self.connect)?;
         let pin = Pin {
             source: self.source,
             interface: self.interface,
         };
-        crate::nearhop::pin_socket(&sock, self.connect, &pin, self.port.unwrap_or(0)).map_err(|e| {
-            match (self.port, e.kind()) {
-                (Some(p), io::ErrorKind::AddrInUse) => io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "local port {p}, which the near-hop probe that found {} far left from, is                          taken now: not connected from another port",
-                        self.addr
-                    ),
-                ),
-                _ => e,
-            }
-        })?;
+        crate::nearhop::pin_socket(&sock, self.connect, &pin, 0)?;
         sock.set_nonblocking(true)?;
         Ok(sock)
     }
@@ -470,14 +455,6 @@ pub fn connected_as_vetted(
             return Err(format!(
                 "it left from {from}, and the kernel chose {source} for it when it was checked \
                  (the route changed between the check and the connection)"
-            ));
-        }
-    }
-    if let Some(port) = vetted.port {
-        if local.port() != port {
-            return Err(format!(
-                "it left from port {}, not port {port}, the near-hop probe's that found it far",
-                local.port()
             ));
         }
     }
@@ -1222,8 +1199,8 @@ impl NetPolicy {
     /// itself, but for test seams that stand a loopback server in for it), and what the
     /// connection must be: the source address the kernel chooses for a connection to `connect`
     /// now (a UDP socket connected to it: nothing is sent), read before the probes, which leave
-    /// from it and the interface that holds it; then the far evidence's probe port, which the
-    /// connection binds ([`Vetted::socket`]). [`Self::recheck_connected`] checks the connection
+    /// from it and the interface that holds it, as the connection does ([`Vetted::socket`]; the
+    /// far probe left from that source, or the evidence is refused). [`Self::recheck_connected`] checks the connection
     /// against it. Connect right after it. Blocking, like [`Self::vet_connection`].
     pub fn vet_path(&self, addr: SocketAddr, connect: SocketAddr) -> Result<Vetted, Denied> {
         self.vet_path_until(addr, connect, Instant::now() + crate::nearhop::DECIDE_BUDGET)
@@ -1242,7 +1219,6 @@ impl NetPolicy {
                 addr,
                 connect,
                 source: None,
-                port: None,
                 interface: None,
             });
         }
@@ -1272,7 +1248,7 @@ impl NetPolicy {
             Pin::default()
         };
         let evidence = self.decide_near(addr, &pin, deadline)?;
-        let port = match evidence.local {
+        match evidence.local {
             Some(local) if real && unmapped_ip(local.ip()) != unmapped_ip(source) => {
                 return Err(Denied::NearCheckFailed {
                     addr,
@@ -1283,14 +1259,12 @@ impl NetPolicy {
                     ),
                 })
             }
-            Some(local) if real => Some(local.port()),
-            _ => None,
-        };
+            _ => {}
+        }
         Ok(Vetted {
             addr,
             connect,
             source: Some(source),
-            port,
             interface: pin.interface,
         })
     }

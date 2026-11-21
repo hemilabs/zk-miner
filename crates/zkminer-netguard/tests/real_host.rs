@@ -121,12 +121,12 @@ fn public_hosts_are_far_and_reachable() {
             .find(|a| policy.admit(a.ip()).is_ok())
             .expect("a public anycast address the floor admits");
         assert_eq!(policy.vet_connection(addr), Ok(()), "{addr}");
-        // The path vetted is pinned to the far probe: its source and port.
+        // The path vetted is pinned to the probes' source address and its interface.
         let v = policy.vet_path(addr, addr).expect("vetted");
-        assert!(v.source.is_some() && v.port.is_some(), "{v:?}");
+        assert!(v.source.is_some() && v.interface.is_some(), "{v:?}");
         let sock = v.socket().expect("the pinned socket");
         let bound = sock.local_addr().unwrap().as_socket().unwrap();
-        assert_eq!((Some(bound.ip()), Some(bound.port())), (v.source, v.port));
+        assert_eq!(Some(bound.ip()), v.source);
     }
 }
 

@@ -1467,7 +1467,7 @@ default, the /16 around its global IPv4 interface addresses) and the operator's 
 internal_ranges`, that hop-limited probes sent right before the connection show to be farther
 than `near_hop_limit` hops (default 2: the host's router and anything it hairpins to; far only on
 positive evidence, an ICMP "time exceeded" from a router past the limit, never on silence; the
-connection is then made from that probe's address, port and interface). Names pass host-name hygiene and are resolved
+connection is then made from the probes' source address and interface, from a new port). Names pass host-name hygiene and are resolved
 over DNS-over-HTTPS at fixed public resolvers, never the host's resolver (§14.7), and the vetted
 address is pinned for the connection. It fails closed: while the host's public address on a routed
 family is unknown (neither confirmed by the reflectors nor stated in `[egress] public_addresses`),
@@ -1524,7 +1524,7 @@ rules, NAT64 prefixes, the DNS servers and the deny CIDRs, on a family whose pub
 known, confirmed by a per-destination kernel route query (with the destination port and, for IPv4,
 the source the kernel picks) — then, right before connecting, refuses an address that answers the
 near-hop probes or that they cannot show to be farther (no "time exceeded" from a router past the
-limit), connects from the far probe's address, port and interface, and returns the connected socket (`SCM_RIGHTS`). A malformed frame, a
+limit), connects from the probes' source address and interface (a new port), and returns the connected socket (`SCM_RIGHTS`). A malformed frame, a
 descriptor sent to the connector, more than 64 requests in flight (a request is in flight until its
 answer is handed to the socket, so unread answers count), a reused request id, more than 8 requests
 for missing endpoints within a minute (counted before the refusal is answered), an answer left
