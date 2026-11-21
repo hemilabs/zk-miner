@@ -38,6 +38,10 @@ mod segment_disk;
 #[cfg(target_os = "linux")]
 pub(crate) mod privilege;
 
+/// Linux: the key's files readable by others, and who can replace the miner (review r6 LS1, LS3).
+#[cfg(target_os = "linux")]
+pub(crate) mod file_access;
+
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
@@ -3777,6 +3781,13 @@ pub async fn run(
                 );
             }
         }
+    }
+    // Linux: a key file, or the unit's environment file, that other users of the host can read
+    // or change (review r6 LS1). Not a refusal, as on Windows.
+    #[cfg(target_os = "linux")]
+    for msg in file_access::key_file_pages(&config.wallet) {
+        tracing::error!("{msg}");
+        note_page(msg);
     }
     if let Some(banner) = config.dev_mode_banner() {
         tracing::warn!("{banner}");

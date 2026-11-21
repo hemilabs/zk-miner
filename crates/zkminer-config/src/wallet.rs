@@ -47,7 +47,9 @@ fn load_from_file(path: Option<&str>) -> Result<PrivateKeySigner> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("Failed to read metadata for key file: {}", path))?;
         let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
+        // Owner-only (0600, or 0400 as systemd's `LoadCredential=` leaves it): anything for the
+        // group or others is too much.
+        if mode & 0o077 != 0 {
             tracing::warn!(
                 "Key file {} has permissions {:04o} — should be 0600. \
                  Fix with: chmod 600 {}",

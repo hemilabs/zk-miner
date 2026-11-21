@@ -68,8 +68,19 @@ Group=zkminer
 SupplementaryGroups=render video
 WorkingDirectory=~
 # The key: either `key_source = "file"` in ~/.zkminer/config.toml (`zkminer init --generate-key`
-# writes one), or ZKMINER_PRIVATE_KEY in this file, readable by root only:
+# writes one), or ZKMINER_PRIVATE_KEY in this file, readable by root only. Create it that way
+# before the key goes in: an editor or `tee` alone makes it readable by every user of the host.
+#   sudo install -d -m 700 -o root -g root /etc/zkminer
+#   sudo install -m 600 -o root -g root /dev/null /etc/zkminer/env
+#   sudoedit /etc/zkminer/env                             # ZKMINER_PRIVATE_KEY=0x...
+# Or keep the key in a root-only file and pass it as a systemd credential (systemd 247+), which
+# only this unit's processes can read: create /etc/zkminer/key the same way, uncomment
+# LoadCredential= below, and set `key_source = "file"` and `key_file_path =
+# "/run/credentials/zkminer.service/zkminer-key"` in the config. (`zkminer doctor`, run outside the
+# unit, cannot read that key.) The miner pages KEY-FILE-READABLE, and `zkminer doctor` fails, when
+# other users can read or change the key's file. The workers cannot read /etc/zkminer at all.
 EnvironmentFile=-/etc/zkminer/env
+#LoadCredential=zkminer-key:/etc/zkminer/key
 ExecStart=/usr/local/bin/zkminer run --headless
 # A stop (systemctl stop, a reboot) asks the miner to drain and waits for it to exit, so a stop
 # already under way (`zkminer stop`, a keep-locks stop) is not escalated by systemd's own signal;

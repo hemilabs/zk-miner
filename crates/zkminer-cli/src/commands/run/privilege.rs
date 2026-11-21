@@ -4,8 +4,10 @@
 //! and their seccomp filters refuse the host-control syscalls, so a guest that escaped its executor
 //! in one gets neither the kernel nor the clock. They still run as uid 0, though, and Landlock's
 //! grants do not look at the uid: what a worker may read (`/etc` among the system paths, its own
-//! directory) includes files only root may read, such as `/etc/shadow`, SSH host keys and a
-//! service's `EnvironmentFile`. So the miner is not refused as root (the dashboard's GPU tuning
+//! directory) includes files only root may read. `/etc/shadow`, SSH host keys and the miner's own
+//! files in `/etc` are kept from every worker (`confine::ETC_DENIED`, review r6 LS1), but others
+//! are not: TLS private keys under `/etc/ssl/private`, saved network passwords, another service's
+//! `EnvironmentFile`. So the miner is not refused as root (the dashboard's GPU tuning
 //! needs root), but a bare-metal run as root is a `PAGE:`, and `zkminer doctor` warns of it.
 //!
 //! A container's root is another matter: its `/etc` holds nothing of the host's, and Docker's
