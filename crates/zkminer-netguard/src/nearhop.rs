@@ -653,10 +653,16 @@ static PROBE_TURN_V6: std::sync::Condvar = std::sync::Condvar::new();
 #[cfg(test)]
 static PACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The turns each thread took (tests: a round takes one).
 #[cfg(test)]
-thread_local! {
-    /// The turns this thread took (tests: a round takes one).
-    static TURNS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+static TURNS_TAKEN: std::sync::Mutex<Vec<(std::thread::ThreadId, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The turns this thread took (tests).
+#[cfg(test)]
+fn turns_taken() -> usize {
+    let me = std::thread::current().id();
+    let t = TURNS_TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+    t.iter().find(|(id, _)| *id == me).map_or(0, |(_, n)| *n)
 }
 
 /// A turn of either family.
@@ -676,7 +682,12 @@ impl Turn {
         };
         #[cfg(test)]
         if turn.is_some() {
-            TURNS_TAKEN.with(|t| t.set(t.get() + 1));
+            let me = std::thread::current().id();
+            let mut t = TURNS_TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+            match t.iter_mut().find(|(id, _)| *id == me) {
+                Some((_, n)) => *n += 1,
+                None => t.push((me, 1)),
+            }
         }
         turn
     }
@@ -1850,9 +1861,9 @@ mod tests {
     fn a_local_listener_is_near_in_one_round_of_one_turn() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        let turns = TURNS_TAKEN.with(|t| t.get());
+        let turns = turns_taken();
         assert_eq!(decide(&TtlProbe, addr, 2), Verdict::Near("accepted a connection"));
-        assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 1);
+        assert_eq!(turns_taken(), turns + 1);
         let obs = TtlProbe
             .round(0, addr, 2, EXTRA_HOPS, &Pin::default(), PROBE_TIMEOUT, Instant::now() + DECIDE_BUDGET)
             .unwrap();
@@ -1860,7 +1871,7 @@ mod tests {
         // The round ends once decided (the answer at 2): the others may still be pending.
         assert_eq!(obs[0].outcome, ProbeOutcome::Connected, "{obs:?}");
         assert!(obs.iter().all(|o| o.local.is_some()), "{obs:?}");
-        assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 2);
+        assert_eq!(turns_taken(), turns + 2);
         drop(l);
         assert!(matches!(decide(&TtlProbe, addr, 2), Verdict::Near(w) if w.contains("refused")));
     }
@@ -1931,7 +1942,7 @@ mod tests {
     #[test]
     fn a_silent_destination_is_no_evidence_after_two_rounds() {
         let dst: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        let turns = TURNS_TAKEN.with(|t| t.get());
+        let turns = turns_taken();
         let t = Instant::now();
         // Other tests' probes share the gate: time enough for two turns however busy it is.
         let v = decide_until(&TtlProbe, dst, 64, &Pin::default(), t + Duration::from_secs(30));
@@ -1941,7 +1952,7 @@ mod tests {
             return;
         }
         assert!(matches!(&v, Verdict::NoEvidence(w) if w.contains("6 probes")), "{v:?}");
-        assert_eq!(TURNS_TAKEN.with(|t| t.get()), turns + 2);
+        assert_eq!(turns_taken(), turns + 2);
         // A deadline that leaves no room for the second round ends the decision with the first's.
         let t = Instant::now();
         let v = decide_until(&TtlProbe, dst, 64, &Pin::default(), t + Duration::from_millis(1200));
