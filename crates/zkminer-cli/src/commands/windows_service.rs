@@ -6,6 +6,9 @@
 //!   service then fails to log on at its next start (SCM error 1069/1330): nothing runs, and every
 //!   lock kept for that start is slashed. Read with `NetUserGetInfo` level 1 and
 //!   `NetUserModalsGet` level 0.
+//! - NSSM's exit actions and stop timeout (review 6 OJ-2). NSSM restarts the program after every
+//!   exit unless told otherwise, so `zkminer stop` (exit 0) only restarted the miner; and its
+//!   default 1.5 s console stop timeout cuts a drain off.
 //!
 //! Only the service's own key and its NSSM `Parameters` values named here are read, never
 //! `AppEnvironmentExtra`, which may hold a key.
@@ -416,9 +419,221 @@ pub(crate) fn watch_own_password() {
         });
 }
 
+// ---- NSSM's exit and stop settings (OJ-2) ----
+
+/// What NSSM does when the miner exits 0 (every deliberate stop: a drain, an abandon) and 130 (a
+/// force exit): it must stop, or `zkminer stop` only restarts the miner. 75 (a keep-locks stop,
+/// or locks left for the next start) restarts it.
+pub(crate) const STOP_EXIT_CODES: [u32; 2] = [0, 130];
+
+/// The shortest `AppStopMethodConsole` (ms) that lets a drain finish: the miner's own drain budget
+/// and its release ladder, as the README recipe sets it.
+pub(crate) const MIN_STOP_CONSOLE_MS: u32 = 3_900_000;
+
+/// NSSM's `AppStopMethodConsole` when it is not set.
+const NSSM_DEFAULT_STOP_CONSOLE_MS: u32 = 1_500;
+
+/// A DWORD value of `HKLM\<sub_key>`.
+fn reg_dword(sub_key: &str, value: &str) -> Option<u32> {
+    const RRF_RT_REG_DWORD: u32 = 0x10;
+    let key = wide(sub_key);
+    let name = wide(value);
+    let mut data = 0u32;
+    let mut size = 4u32;
+    // SAFETY: a 4-byte buffer and out-pointers that outlive the call.
+    (unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut data as *mut u32).cast(),
+            &mut size,
+        )
+    } == 0)
+        .then_some(data)
+}
+
+/// The NSSM settings of a service that runs the miner, as read from its `Parameters` key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Nssm {
+    /// The `AppExit` key's default value (NSSM's default action: Restart when unset).
+    pub exit_default: Option<String>,
+    /// `AppExit\<code>` for each of [`STOP_EXIT_CODES`].
+    pub exit_for: Vec<(u32, Option<String>)>,
+    /// `AppStopMethodConsole` (ms).
+    pub stop_console_ms: Option<u32>,
+}
+
+/// The [`Nssm`] settings of service `name`, or `None` when it is not run by NSSM (no
+/// `Parameters\Application`).
+pub(crate) fn nssm_of(name: &str) -> Option<Nssm> {
+    let params = format!(r"{SERVICES}\{name}\Parameters");
+    reg_string(&params, Some("Application"))?;
+    let exit = format!(r"{params}\AppExit");
+    Some(Nssm {
+        exit_default: reg_string(&exit, None),
+        exit_for: STOP_EXIT_CODES
+            .iter()
+            .map(|code| (*code, reg_string(&exit, Some(&code.to_string()))))
+            .collect(),
+        stop_console_ms: reg_dword(&params, "AppStopMethodConsole"),
+    })
+}
+
+/// What NSSM does on exit code `code`: its `AppExit\<code>`, else the default, else Restart.
+pub(crate) fn exit_action(nssm: &Nssm, code: u32) -> &str {
+    nssm.exit_for
+        .iter()
+        .find(|(c, _)| *c == code)
+        .and_then(|(_, a)| a.as_deref())
+        .or(nssm.exit_default.as_deref())
+        .map_or("Restart", str::trim)
+}
+
+/// The codes of [`STOP_EXIT_CODES`] on which NSSM does not stop: anything but `Exit` (`Restart`
+/// starts the miner again; `Ignore` leaves the service running with nothing in it; `Suicide` ends
+/// NSSM, which the service's recovery actions may restart).
+pub(crate) fn restarting_codes(nssm: &Nssm) -> Vec<u32> {
+    STOP_EXIT_CODES
+        .iter()
+        .copied()
+        .filter(|code| !exit_action(nssm, *code).eq_ignore_ascii_case("Exit"))
+        .collect()
+}
+
+/// For `zkminer stop` and `doctor`: the warning that service `name` starts the miner again after it
+/// stops, or `None`.
+pub(crate) fn restart_warning(name: &str, nssm: &Nssm) -> Option<String> {
+    let codes = restarting_codes(nssm);
+    if codes.is_empty() {
+        return None;
+    }
+    let sets: Vec<String> = codes
+        .iter()
+        .map(|c| format!("`nssm set {name} AppExit {c} Exit`"))
+        .collect();
+    Some(format!(
+        "service {name} (NSSM) restarts the miner after it exits (exit code(s) {}: {}), so \
+         `zkminer stop` only restarts it, claiming again. Stop the service itself (`nssm stop \
+         {name}`, as an administrator), or set it to stop when the miner does: {}",
+        codes
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        codes
+            .iter()
+            .map(|c| exit_action(nssm, *c).to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        sets.join(", ")
+    ))
+}
+
+/// For `doctor`: the warning that service `name`'s stop timeout cuts a drain off, or `None`.
+pub(crate) fn stop_timeout_warning(name: &str, nssm: &Nssm) -> Option<String> {
+    let ms = nssm.stop_console_ms.unwrap_or(NSSM_DEFAULT_STOP_CONSOLE_MS);
+    (ms < MIN_STOP_CONSOLE_MS).then(|| {
+        format!(
+            "service {name} (NSSM) waits {ms} ms after Ctrl+C before it kills the miner: a drain \
+             started by stopping the service is cut off, and its locks stay held. `nssm set \
+             {name} AppStopMethodConsole {MIN_STOP_CONSOLE_MS}`"
+        )
+    })
+}
+
+/// The restart warnings of every NSSM service that runs this miner, for `zkminer stop`.
+pub(crate) fn restart_warnings() -> Vec<String> {
+    services_of_this_exe()
+        .iter()
+        .filter_map(|name| restart_warning(name, &nssm_of(name)?))
+        .collect()
+}
+
+/// For `zkminer doctor`: each NSSM service's exit and stop settings, as (level, what, text).
+pub(crate) fn service_nssm_findings() -> Vec<(Finding, String, String)> {
+    let mut out = Vec::new();
+    for name in services_of_this_exe() {
+        let Some(nssm) = nssm_of(&name) else {
+            continue;
+        };
+        let what = format!("service {name}: NSSM");
+        let mut fine = true;
+        for text in [
+            restart_warning(&name, &nssm),
+            stop_timeout_warning(&name, &nssm),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fine = false;
+            out.push((Finding::Warn, what.clone(), text));
+        }
+        if fine {
+            out.push((
+                Finding::Pass,
+                what,
+                "stops when the miner stops, and waits for a drain".to_string(),
+            ));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 6 OJ-2: NSSM's exit actions as the README recipe sets them stop on every deliberate
+    /// stop's code and restart on 75; unset, or set only as a default, they restart on everything.
+    #[test]
+    fn nssm_exit_actions_are_weighed() {
+        let recipe = Nssm {
+            exit_default: Some("Restart".into()),
+            exit_for: vec![(0, Some("Exit".into())), (130, Some("Exit".into()))],
+            stop_console_ms: Some(MIN_STOP_CONSOLE_MS),
+        };
+        assert_eq!(exit_action(&recipe, 0), "Exit");
+        assert_eq!(exit_action(&recipe, 75), "Restart");
+        assert!(restarting_codes(&recipe).is_empty());
+        assert_eq!(restart_warning("zkminer", &recipe), None);
+        assert_eq!(stop_timeout_warning("zkminer", &recipe), None);
+
+        let unset = Nssm::default();
+        assert_eq!(restarting_codes(&unset), vec![0, 130]);
+        let text = restart_warning("zkminer", &unset).unwrap();
+        assert!(
+            text.contains("nssm stop zkminer")
+                && text.contains("`nssm set zkminer AppExit 0 Exit`")
+                && text.contains("`nssm set zkminer AppExit 130 Exit`"),
+            "{text}"
+        );
+        assert!(stop_timeout_warning("zkminer", &unset)
+            .unwrap()
+            .contains("1500 ms"));
+
+        // A default of Exit stops on everything (75 included, which is the operator's choice).
+        let all_exit = Nssm {
+            exit_default: Some(" exit ".into()),
+            ..Nssm::default()
+        };
+        assert!(restarting_codes(&all_exit).is_empty());
+        // Ignore and Suicide do not stop the service cleanly either.
+        for action in ["Ignore", "Suicide"] {
+            let n = Nssm {
+                exit_for: vec![(0, Some(action.into())), (130, Some("Exit".into()))],
+                ..Nssm::default()
+            };
+            assert_eq!(restarting_codes(&n), vec![0], "{action}");
+        }
+        let short = Nssm {
+            stop_console_ms: Some(30_000),
+            ..recipe
+        };
+        assert!(stop_timeout_warning("zkminer", &short).is_some());
+    }
 
     /// Review 6 OJ-1: the password verdict from the account's flags, its password's age and the
     /// policy's maximum age.

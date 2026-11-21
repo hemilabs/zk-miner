@@ -20,7 +20,7 @@ const WAIT_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether a process holds `~/.zkminer/miner.lock` (a miner, a benchmark, or a stake / unstake /
 /// withdraw at its prompt). Probes by taking the lock and dropping it at once.
-fn instance_running() -> Result<bool> {
+pub(crate) fn instance_running() -> Result<bool> {
     let path = zkminer_home().join("miner.lock");
     let file = match std::fs::OpenOptions::new()
         .create(false)
@@ -104,6 +104,12 @@ fn held_report(mode: StopMode) -> String {
 
 pub fn run(mode: StopMode, wait: bool, timeout: Option<u64>) -> Result<()> {
     let home = zkminer_home();
+    // Windows: a service that starts the miner again once it exits turns this stop into a restart
+    // (review 6 OJ-2).
+    #[cfg(windows)]
+    for warning in super::windows_service::restart_warnings() {
+        eprintln!("warning: {warning}");
+    }
     if !instance_running()? {
         bail!(
             "no miner is running under {} (its miner.lock is free) — nothing to stop. A miner run \

@@ -1037,11 +1037,13 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
 }
 
 /// Windows: the services that run this miner, as a service logon will find them (review 6 OJ-1):
-/// their account's password. See `windows_service`.
+/// their account's password; and whether NSSM stops when the miner does and waits for a drain
+/// (OJ-2). See `windows_service`.
 #[cfg(windows)]
 fn service_checks(report: &mut Report) {
     use super::windows_service as service;
-    let findings = service::service_password_findings();
+    let mut findings = service::service_password_findings();
+    findings.extend(service::service_nssm_findings());
     if findings.is_empty() {
         return;
     }

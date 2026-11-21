@@ -4,14 +4,96 @@ use zkminer_chain::client::ChainClient;
 use zkminer_config::wallet::load_signer;
 use zkminer_config::ZkMinerConfig;
 
+/// What this home's own files say, read before (and without) the chain: the locks the journal
+/// holds, and whether a miner is running to drive them.
+pub(crate) struct Local {
+    pub lines: Vec<String>,
+    /// Locks held with no miner running to drive them: each is slashed unless one starts in time.
+    pub harmful: bool,
+}
+
+/// [`Local`] for `journal` (the default path's, or why it could not be read) at `now` (unix
+/// seconds), with a miner `running` here or not (`None`: unknown).
+pub(crate) fn held_locks(
+    journal: &std::result::Result<crate::journal::JobJournal, String>,
+    now: u64,
+    running: Option<bool>,
+) -> Local {
+    let journal = match journal {
+        Ok(j) => j,
+        Err(e) => {
+            return Local {
+                lines: vec![format!(
+                    "Held locks:     unknown: the job journal could not be read ({e})"
+                )],
+                harmful: false,
+            }
+        }
+    };
+    let live: Vec<u64> = journal
+        .iter()
+        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+        .map(|e| e.lock_deadline)
+        .collect();
+    let past = journal.iter().count() - live.len();
+    let mut lines = Vec::new();
+    if live.is_empty() && past == 0 {
+        lines.push("Held locks:     none".to_string());
+        return Local {
+            lines,
+            harmful: false,
+        };
+    }
+    let by = super::run::start_by(live.iter().copied())
+        .map(|t| format!(", start a miner by {t}"))
+        .unwrap_or_default();
+    lines.push(format!(
+        "Held locks:     {} in the job journal{}",
+        live.len(),
+        if past > 0 {
+            format!(" (and {past} past its cutoff, for the next start to clear up)")
+        } else {
+            String::new()
+        }
+    ));
+    let harmful = running == Some(false) && !live.is_empty();
+    match running {
+        Some(true) => lines.push("Miner:          running here, driving them".to_string()),
+        Some(false) if live.is_empty() => {
+            lines.push("Miner:          not running here".to_string())
+        }
+        Some(false) => lines.push(format!(
+            "Miner:          [!] NOT running here: nothing drives them{by}, or they are slashed"
+        )),
+        None => lines.push("Miner:          unknown (miner.lock could not be checked)".to_string()),
+    }
+    Local { lines, harmful }
+}
+
+/// [`Local`] for this home now.
+pub(crate) fn local() -> Local {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    held_locks(
+        &crate::journal::JobJournal::peek_checked(),
+        now,
+        super::stop::instance_running().ok(),
+    )
+}
+
 pub async fn run(config_path: Option<&Path>) -> Result<()> {
+    println!("zkminer status");
+    println!("══════════════════════════════════════════════════");
+    // This home's own state first: it needs no chain, and an operator moving a service checks it.
+    let local = local();
+    for line in &local.lines {
+        println!("{line}");
+    }
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
     let signer = load_signer(&config.wallet)?;
     let client = ChainClient::new(&config, signer).await?;
-
-    println!("zkminer status");
-    println!("══════════════════════════════════════════════════");
     if let Some(banner) = config.dev_mode_banner() {
         println!("!! {banner} !!");
         println!("══════════════════════════════════════════════════");
@@ -201,4 +283,40 @@ fn format_token(value: u128) -> String {
     let whole = value / 1_000_000_000_000_000_000;
     let frac = (value % 1_000_000_000_000_000_000) / 1_000_000_000_000_000;
     format!("{}.{:03}", whole, frac)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::JobJournal;
+    use alloy_primitives::B256;
+
+    /// The held-locks lines: none, held with a miner running, held with none (harmful), and a
+    /// journal that could not be read.
+    #[test]
+    fn held_locks_are_reported_from_the_journal() {
+        let now = 1_900_000_000;
+        let empty = held_locks(&Ok(JobJournal::default()), now, Some(false));
+        assert_eq!(empty.lines, ["Held locks:     none"]);
+        assert!(!empty.harmful);
+        let mut j = JobJournal::default();
+        j.record_claim_intent(B256::repeat_byte(1), now + 7_200, None);
+        j.record_claim_intent(B256::repeat_byte(2), now - 10, None);
+        let held = Ok(j);
+        let running = held_locks(&held, now, Some(true));
+        assert!(
+            running.lines[0].contains("1 in the job journal")
+                && running.lines[0].contains("1 past")
+        );
+        assert!(!running.harmful);
+        let stopped = held_locks(&held, now, Some(false));
+        assert!(stopped.harmful);
+        assert!(
+            stopped.lines[1].contains("NOT running"),
+            "{:?}",
+            stopped.lines
+        );
+        let unread = held_locks(&Err("denied".into()), now, Some(false));
+        assert!(unread.lines[0].contains("unknown") && !unread.harmful);
+    }
 }

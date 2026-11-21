@@ -481,6 +481,10 @@ Worth knowing:
   .\nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
   .\nssm set zkminer ObjectName .\zkminer <password>
   .\nssm set zkminer AppStopMethodConsole 3900000
+  .\nssm set zkminer AppExit Default Restart
+  .\nssm set zkminer AppExit 0 Exit
+  .\nssm set zkminer AppExit 130 Exit
+  .\nssm set zkminer AppRestartDelay 30000
   sc.exe privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
   ```
 
@@ -492,6 +496,15 @@ Worth knowing:
   account has a password that can expire, has expired, or is disabled or locked out, and the
   miner pages it at start-up (`PAGE: PASSWORD-EXPIRES`, again daily once it is two weeks away).
   Log on as the account (`runas /user:zkminer cmd`) only after the flag is set.
+
+  NSSM restarts its program after every exit unless told otherwise. The `AppExit` lines make it
+  stop the service when the miner stops on purpose (exit 0: a drain or an abandon; 130: a force
+  exit) and start it again otherwise (75, a keep-locks stop or locks left for the next start; a
+  crash), 30 s later. Without them `zkminer stop` only restarts the miner, which claims again.
+  `AppStopMethodConsole` is how long NSSM waits after its Ctrl+C (which starts a drain) before it
+  kills the miner: 65 minutes covers a drain and its releases, where NSSM's default 1.5 s cuts it
+  off. `zkminer doctor` and `zkminer stop` warn of a service that restarts on 0 or 130, and
+  doctor of a shorter stop timeout.
 
   A service logon gives the account `SeImpersonatePrivilege` through the SERVICE group, and with
   it a guest that broke out of a worker could make itself SYSTEM. `sc privs` leaves the service
@@ -538,18 +551,31 @@ Worth knowing:
   Medium, where a guest that breaks out can read the key: it is paged at every start (`PAGE:
   MEDIUM-WORKERS`) and `zkminer doctor` warns.
 
-  Moving from LocalSystem: stop the old service with `zkminer stop --wait` run as LocalSystem
-  (`psexec -s`; its home was `C:\Windows\System32\config\systemprofile\.zkminer`) so it finishes
-  or releases its locks, then change the account. A miner started in the new account's home does
-  not see the old journal, so locks kept there are never driven. A LocalSystem service upgraded
-  in place to this build while it holds locks does not prove them: it holds them and releases
-  each one near its cutoff (above), then exits with the refusal and the list of what it
-  released; what it could not release is tried again at the next start. Consider
-  a key that was in
-  `AppEnvironmentExtra` exposed. A service wrapper's stop (NSSM sends Ctrl+C, then kills the
-  process after its timeout) starts a drain it then cuts off: run `zkminer stop --wait` (as the
-  service account) before stopping the service, or keep NSSM's timeout long enough for a drain
-  (`AppStopMethodConsole` above).
+  Moving from LocalSystem: a miner started in the new account's home does not see the old
+  journal (`C:\Windows\System32\config\systemprofile\.zkminer\job_journal.json`), so locks still
+  held there are never driven. Drain them first, from an administrator console:
+
+  1. `nssm set zkminer AppExit 0 Exit` and `nssm set zkminer AppExit 130 Exit`, so that the
+     miner's stop stops the service instead of restarting it.
+  2. `psexec -s "C:\Program Files\zkminer\zkminer.exe" stop --wait`: it proves what it holds,
+     or releases it, and exits; the service stays stopped.
+  3. Check that the old journal holds nothing: `psexec -s "C:\Program Files\zkminer\zkminer.exe"
+     status` says "Held locks: none". If some are left (a release that did not confirm), start
+     the service again and repeat step 2, or end them with `stop --abandon --wait`.
+  4. Only then change the account (`nssm set zkminer ObjectName .\zkminer <password>`) and
+     `nssm start zkminer`.
+
+  A LocalSystem service upgraded in place to this build while it holds locks does not prove
+  them: it holds them and releases each one near its cutoff (above), then exits with the refusal
+  and the list of what it released; what it could not release is tried again at its next start.
+  Leave it running as LocalSystem until `psexec -s ... status` shows no held locks (or `psexec -s
+  ... stop --abandon --wait` to release them now), and change the account after that. Consider a
+  key that was in `AppEnvironmentExtra` exposed.
+
+  A service wrapper's stop (NSSM sends Ctrl+C, then kills the process after its timeout) starts
+  a drain: keep NSSM's timeout long enough for one (`AppStopMethodConsole` above), or run
+  `zkminer stop --wait` (as the service account) first. To upgrade: `nssm stop zkminer` (it
+  waits for the drain), replace the files, `nssm start zkminer`.
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in
