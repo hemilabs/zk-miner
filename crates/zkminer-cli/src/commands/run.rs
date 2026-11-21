@@ -5938,33 +5938,104 @@ static OBSERVED_THROUGHPUT: std::sync::Mutex<Option<HashMap<(String, String), f6
 /// Weight of the newest proof in `OBSERVED_THROUGHPUT`'s moving average.
 const OBSERVED_THROUGHPUT_WEIGHT: f64 = 0.3;
 
-/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`): its STARK rate, net
-/// of the card's fixed part (`card_fixed_secs`, at most half the proof). A whole-proof rate depends
-/// on the job's size: one learned on a 50 M-cycle SP1 proof (most of it the wrap) priced a 2 B one
-/// at twice what it took, and sent it to the slower card.
-fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration) {
+/// Seconds of STARK work at a card's benchmark rate a proof must hold to teach it a rate: below
+/// that, what does not scale with cycles (worker start, the first segment's setup) is too much of
+/// it. About 150 M cycles on a 5090, 10 M on an A770.
+const MIN_LEARN_STARK_SECS: f64 = 60.0;
+
+/// The cycles a proof must hold to teach a rate to a card with no benchmark rate.
+const MIN_LEARN_CYCLES_FALLBACK: u64 = 50_000_000;
+
+/// The range a learned rate is held to, as fractions of the card's benchmark STARK rate: room for a
+/// real slowdown (a spill into shared memory, a hot card, an SP1 shard size lowered after an
+/// out-of-memory), none for one proof to make the card look ten times slower than it is.
+const LEARNED_RATE_FLOOR: f64 = 0.5;
+const LEARNED_RATE_CEILING: f64 = 2.0;
+
+/// Seconds of STARK work at the benchmark rate for a proof to move the average by the full
+/// `OBSERVED_THROUGHPUT_WEIGHT`; a smaller one moves it by its share of that.
+const LEARN_FULL_WEIGHT_SECS: f64 = 300.0;
+
+/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`), as
+/// `next_learned_rate` makes it from the card's benchmark STARK rate (`CARD_BENCH_STARK_RATE`), its
+/// wrap (`card_fixed_secs`, without the SP1 server's setup, which runs before the proof's timer)
+/// and `execute_secs` for running the guest inside the proof. A whole-proof rate depends on the
+/// job's size: one learned on a 50 M-cycle SP1 proof (most of it the wrap) priced a 2 B one at
+/// twice what it took, and sent it to the slower card. And one learned on a small proof after a
+/// restart was taken as it was: about a tenth of the card's rate, at which the next large job was
+/// refused on the card it was claimed for, and released at a penalty.
+fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration, execute_secs: u64) {
     let backend = slot.split(':').next().unwrap_or(slot);
     let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(slot);
-    let fixed = CARD_FIXED_SECS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|m| m.get(&(device, backend.to_string())).copied())
-        .unwrap_or(0.0);
-    let stark = duration
-        .saturating_sub(Duration::from_secs_f64(fixed))
-        .max(duration / 2);
-    let Some((key, rate)) = observed_rate(slot, cycles, stark) else {
+    let card = (device, backend.to_string());
+    let noted = |m: &std::sync::Mutex<Option<HashMap<(String, String), f64>>>| {
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&card).copied())
+    };
+    let setup = if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        SP1_PROOF_SETUP_SECS
+    } else {
+        0.0
+    };
+    let wrap = noted(&CARD_FIXED_SECS).map_or(0.0, |f| (f - setup).max(0.0));
+    let bench = noted(&CARD_BENCH_STARK_RATE);
+    let Some((key, _)) = observed_rate(slot, cycles, duration) else {
         return;
     };
     let mut seen = OBSERVED_THROUGHPUT
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let entry = seen
-        .get_or_insert_with(HashMap::new)
-        .entry(key)
-        .or_insert(rate);
-    *entry += OBSERVED_THROUGHPUT_WEIGHT * (rate - *entry);
+    let seen = seen.get_or_insert_with(HashMap::new);
+    let learned = next_learned_rate(
+        seen.get(&key).copied(),
+        bench,
+        cycles,
+        duration,
+        wrap + execute_secs as f64,
+    );
+    if let Some(rate) = learned {
+        seen.insert(key, rate);
+    }
+}
+
+/// A card's learned rate after a proof of `cycles` that took `duration`, `fixed` seconds of it not
+/// STARK work (the wrap and the guest's execute), from what was learned before (`prev`) and its
+/// benchmark STARK rate (`bench`). `None` leaves it as it was: the proof is too small to say
+/// (`MIN_LEARN_STARK_SECS`, or `MIN_LEARN_CYCLES_FALLBACK` without a benchmark), or the fixed part
+/// is most of it. With a benchmark the average starts there, not at the first proof, moves by at
+/// most `OBSERVED_THROUGHPUT_WEIGHT` (less for a proof under `LEARN_FULL_WEIGHT_SECS`), and stays
+/// within `LEARNED_RATE_FLOOR`..`LEARNED_RATE_CEILING` of it.
+fn next_learned_rate(
+    prev: Option<f64>,
+    bench: Option<f64>,
+    cycles: u64,
+    duration: Duration,
+    fixed: f64,
+) -> Option<f64> {
+    let total = duration.as_secs_f64();
+    let net = total - fixed.max(0.0);
+    if cycles == 0 || total <= 0.0 || net < total / 2.0 {
+        return None;
+    }
+    let bench = bench.filter(|b| b.is_finite() && *b > 0.0);
+    let min_cycles = bench.map_or(MIN_LEARN_CYCLES_FALLBACK as f64, |b| {
+        b * MIN_LEARN_STARK_SECS
+    });
+    if (cycles as f64) < min_cycles {
+        return None;
+    }
+    let sample = cycles as f64 / net;
+    let Some(bench) = bench else {
+        let prev = prev.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(sample);
+        return Some(prev + OBSERVED_THROUGHPUT_WEIGHT * (sample - prev));
+    };
+    let held = |r: f64| r.clamp(LEARNED_RATE_FLOOR * bench, LEARNED_RATE_CEILING * bench);
+    let prev = held(prev.filter(|p| p.is_finite()).unwrap_or(bench));
+    let weight =
+        OBSERVED_THROUGHPUT_WEIGHT * (cycles as f64 / (bench * LEARN_FULL_WEIGHT_SECS)).min(1.0);
+    Some(held(prev + weight * (held(sample) - prev)))
 }
 
 /// `((device id, backend), cycles per second)` for one proof, or `None` for a slot that is not a
@@ -6406,6 +6477,22 @@ fn retry_pin_after(
 static CARD_FIXED_SECS: std::sync::Mutex<Option<HashMap<(String, String), f64>>> =
     std::sync::Mutex::new(None);
 
+/// Each card's benchmark STARK rate by `(device id, backend)` (`bench_stark_rate`), noted beside
+/// `CARD_FIXED_SECS`: what `note_observed_throughput` starts a card's learned rate at and holds it
+/// near.
+static CARD_BENCH_STARK_RATE: std::sync::Mutex<Option<HashMap<(String, String), f64>>> =
+    std::sync::Mutex::new(None);
+
+/// A card's STARK rate from its benchmark row: the slower of the cycle-weighted rate and the mean
+/// of the programs' rates (see `card_estimate_secs`). `None` without a usable one.
+fn bench_stark_rate(row: &zkminer_prover::benchmark::DeviceBenchmark) -> Option<f64> {
+    let positive = |r: &f64| r.is_finite() && *r > 0.0;
+    row.stark_rate()
+        .filter(positive)
+        .map(|r| r.min(row.throughput))
+        .filter(positive)
+}
+
 /// Seconds an SP1 proof spends before its first shard: the server's setup for the program.
 const SP1_PROOF_SETUP_SECS: f64 = 15.0;
 
@@ -6445,6 +6532,14 @@ fn card_estimate_secs(
 ) -> Option<f64> {
     let positive = |r: &f64| r.is_finite() && *r > 0.0;
     let fixed = card_fixed_secs(backend, row);
+    // Held to the range a learned rate is kept in around the benchmark (`next_learned_rate`), for
+    // a rate learned before the card was benchmarked again.
+    let observed = match (observed, row.and_then(bench_stark_rate)) {
+        (Some(rate), Some(bench)) if positive(&rate) => {
+            Some(rate.clamp(LEARNED_RATE_FLOOR * bench, LEARNED_RATE_CEILING * bench))
+        }
+        (observed, _) => observed,
+    };
     let secs = if let Some(rate) = observed.filter(positive) {
         // The observed rate holds a proof's execute at the average: a third of the allowance (which
         // is three times this job's measured execute) on top, for a guest slower than its cycles.
@@ -6468,20 +6563,28 @@ fn card_estimate_secs(
 }
 
 /// How long a job of `cycles` takes on each of `backend`'s slots, by slot key (`card_estimate_secs`,
-/// with `execute` seconds for executing the guest). For `with_slot_estimates`; empty with nothing
-/// known of any slot's card.
+/// with `execute` seconds for executing the guest), and whether any of them rests on a rate learned
+/// this run. Without `use_observed`, on the benchmark alone. For `with_slot_estimates`; empty with
+/// nothing known of any slot's card.
 async fn slot_estimates_for(
     backend: &'static str,
     cycles: u64,
     execute: u64,
-) -> HashMap<String, Duration> {
+    use_observed: bool,
+) -> (HashMap<String, Duration>, bool) {
     let keys = zkminer_prover::engine::worker_pool()
         .map(|p| p.slot_keys_for(backend))
         .unwrap_or_default();
-    let observed = observed_throughputs();
+    let observed = if use_observed {
+        observed_throughputs()
+    } else {
+        HashMap::new()
+    };
     tokio::task::spawn_blocking(move || {
         let suite = zkminer_prover::benchmark::load_cached_benchmark();
-        keys.into_iter()
+        let mut used_observed = false;
+        let estimates = keys
+            .into_iter()
             .filter_map(|key| {
                 let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&key);
                 let rate = observed
@@ -6499,10 +6602,19 @@ async fn slot_estimates_for(
                         .get_or_insert_with(HashMap::new)
                         .insert((device.clone(), backend.to_string()), fixed);
                 }
+                if let Some(bench) = row.and_then(bench_stark_rate) {
+                    CARD_BENCH_STARK_RATE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(HashMap::new)
+                        .insert((device.clone(), backend.to_string()), bench);
+                }
                 let secs = card_estimate_secs(backend, cycles, execute, rate, row)?;
+                used_observed |= rate.is_some_and(|r| r.is_finite() && r > 0.0);
                 Some((key, Duration::from_secs_f64(secs)))
             })
-            .collect()
+            .collect();
+        (estimates, used_observed)
     })
     .await
     .unwrap_or_default()
@@ -6669,6 +6781,87 @@ fn refused_before_start(e: &anyhow::Error) -> bool {
             .is_some_and(|h| !h.attempted)
 }
 
+/// What the prove loop does with a deadline refusal (`deadline_refusal_action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineRefusalAction {
+    /// Send the job back to the dispatcher once, on the benchmark's rates alone.
+    RetryOnBenchmark,
+    /// Release it, and blame no one: nothing of the job's guest ran before the refusal.
+    ReleaseNoMark,
+    /// Release it, and mark its program and submitter divergent (`note_post_claim_divergence`).
+    ReleaseAndMark,
+}
+
+/// What to do with a job's deadline refusal (`ProofDeadlineReached`). One refused before any proof
+/// of it started (`before_start`) was refused on this host's estimates, so it says nothing of the
+/// guest: it is never marked divergent, and when those estimates used a rate learned this run
+/// (`used_observed`) it is tried once more on the benchmark's (`retried`: that was done). After a
+/// restart one small proof taught a card a tenth of its rate, and every job claimed on the
+/// benchmark's was then refused there before it started, and its submitter blamed. A proof stopped
+/// at its cutoff marks a measured job's submitter (`rode_measurement`), as before.
+fn deadline_refusal_action(
+    before_start: bool,
+    retried: bool,
+    used_observed: bool,
+    rode_measurement: bool,
+) -> DeadlineRefusalAction {
+    if before_start && used_observed && !retried {
+        DeadlineRefusalAction::RetryOnBenchmark
+    } else if before_start || !rode_measurement {
+        DeadlineRefusalAction::ReleaseNoMark
+    } else {
+        DeadlineRefusalAction::ReleaseAndMark
+    }
+}
+
+/// When jobs were released after a refusal before their proof started (`note_estimate_refusal`),
+/// over the last `ESTIMATE_REFUSAL_WINDOW`.
+static ESTIMATE_REFUSALS: Mutex<std::collections::VecDeque<std::time::Instant>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The window `ESTIMATE_REFUSALS` counts over, and how many in it page the operator.
+const ESTIMATE_REFUSAL_WINDOW: Duration = Duration::from_secs(3600);
+const ESTIMATE_REFUSALS_PAGE: usize = 3;
+
+/// Adds a refusal at `now` to `recent`, dropping those older than `ESTIMATE_REFUSAL_WINDOW`: how
+/// many are left.
+fn count_estimate_refusal(
+    recent: &mut std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+) -> usize {
+    while recent
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= ESTIMATE_REFUSAL_WINDOW)
+    {
+        recent.pop_front();
+    }
+    recent.push_back(now);
+    recent.len()
+}
+
+/// Records that `job_id` was released after a refusal before its proof started. Each one costs a
+/// release penalty with no submitter to blame, so more than `ESTIMATE_REFUSALS_PAGE` in an hour
+/// pages the operator: the estimates and what admission claims on disagree.
+fn note_estimate_refusal(job_id: B256, detail: &str) {
+    let count = count_estimate_refusal(
+        &mut ESTIMATE_REFUSALS.lock().unwrap_or_else(|e| e.into_inner()),
+        std::time::Instant::now(),
+    );
+    if count > ESTIMATE_REFUSALS_PAGE {
+        tracing::error!(
+            "PAGE: ESTIMATE-REFUSAL {count} jobs in the last hour were released before their proof \
+             started, the latest {} ({detail}): this host's card estimates refuse jobs its admission \
+             claims",
+            short_id(job_id)
+        );
+    } else {
+        tracing::warn!(
+            "{} released before its proof started ({detail}); {count} such in the last hour",
+            short_id(job_id)
+        );
+    }
+}
+
 /// The risc0 cards that prove jobs: each slot with a size, unless the operator switched it (or risc0)
 /// off.
 fn risc0_job_cards(
@@ -6807,7 +7000,9 @@ fn prove_watchdog(cycles: u64, planning_cps: Option<f64>, fixed: u64, cap: Durat
 /// for a risc0 job fewer risc0 jobs (all in flight but `other_backend` ones) than `risc0_cards`, or a
 /// risc0 card none of them can go to (`card_left_free`, see `risc0_card_left_free`). A job is admitted
 /// to start now, one per card, and automatic concurrency counts every GPU, so a card with no risc0
-/// size would otherwise queue a second risc0 job behind the first's card.
+/// size would otherwise queue a second risc0 job behind the first's card. A job that can finish on
+/// only some of the cards (`eligible_subset`) needs one of those free (`card_left_free` over them):
+/// fewer jobs than cards says nothing of which cards they are on.
 fn risc0_bypass_room(
     in_flight: usize,
     other_backend: usize,
@@ -6815,19 +7010,23 @@ fn risc0_bypass_room(
     risc0_job: bool,
     risc0_cards: usize,
     card_left_free: bool,
+    eligible_subset: bool,
 ) -> bool {
-    in_flight < max_concurrent
-        && (!risc0_job || in_flight.saturating_sub(other_backend) < risc0_cards || card_left_free)
+    let fewer_than_cards =
+        !eligible_subset && in_flight.saturating_sub(other_backend) < risc0_cards;
+    in_flight < max_concurrent && (!risc0_job || fewer_than_cards || card_left_free)
 }
 
 /// Where a risc0 job in its prove loop can go: the slot its attempt runs on, or while it waits, the
 /// slots it is kept off (one it just failed on, one switched off, one it cannot finish on inside the
-/// proving timeout). Set by the prove loop at each attempt and removed when the loop ends, for the
-/// claim gate's count of free risc0 cards (`risc0_card_left_free`).
+/// proving timeout), and those of the cards it was not admitted on (`ineligible`, which the
+/// dispatcher never sends it to). Set by the prove loop at each attempt and removed when the loop
+/// ends, for the claim gate's count of free risc0 cards (`risc0_card_left_free`).
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Risc0Placement {
     proving_on: Option<String>,
     barred: Vec<String>,
+    ineligible: Vec<String>,
 }
 
 static RISC0_PLACEMENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<B256, Risc0Placement>>> =
@@ -6849,21 +7048,33 @@ impl Drop for Risc0PlacementGuard {
     }
 }
 
-/// Whether one of the risc0 `cards` (slots) is a card no risc0 job in flight can go to, so a new one
-/// would start there now rather than queue: a job proving is on its own card; one waiting can take any
-/// card it is not kept off (every card, when it is kept off all of them, as the dispatcher then
-/// restores them); and one not yet at its prove loop (`None`) any card. A job kept off a card after
-/// failing there counted as that card's otherwise, and the card sat idle while it waited for another.
-fn risc0_card_left_free(cards: &[String], jobs: &[Option<Risc0Placement>]) -> bool {
-    cards.iter().any(|card| {
+/// Whether one of `open` (risc0 slots: those of the risc0 `cards` the new job can go to) is a card no
+/// risc0 job in flight can go to, so a new one would start there now rather than queue: a job proving
+/// is on its own card; one waiting can take any card it was admitted on (not `ineligible`) and is not
+/// kept off (every such card, when it is kept off all of them, as the dispatcher then restores
+/// them); and one not yet at its prove loop (`None`) any card. A job kept off a card after failing
+/// there counted as that card's otherwise, and the card sat idle while it waited for another.
+fn risc0_card_left_free(
+    cards: &[String],
+    open: &[String],
+    jobs: &[Option<Risc0Placement>],
+) -> bool {
+    open.iter().any(|card| {
         !jobs.iter().any(|job| match job {
             None => true,
             Some(Risc0Placement {
                 proving_on: Some(on),
                 ..
             }) => on == card,
-            Some(Risc0Placement { barred, .. }) => {
-                !barred.contains(card) || cards.iter().all(|c| barred.contains(c))
+            Some(Risc0Placement {
+                barred, ineligible, ..
+            }) => {
+                !ineligible.contains(card)
+                    && (!barred.contains(card)
+                        || cards
+                            .iter()
+                            .filter(|c| !ineligible.contains(c))
+                            .all(|c| barred.contains(c)))
             }
         })
     })
@@ -7785,13 +7996,24 @@ async fn miner_brain(
             )
         };
 
-        // The cards as a witness lock sees them: inline jobs still needing one, and the cap.
+        // The cards as a witness lock sees them: inline jobs still needing one, the cap, and the
+        // cards inline jobs are proving on.
         if let Some(w) = &witness_rt {
-            let inline_needing = in_flight
-                .keys()
-                .filter(|j| !proved.contains(*j) && !witness_held.contains(*j))
-                .count();
-            w.note_cards(inline_needing, max_concurrent);
+            let inline = || {
+                in_flight
+                    .keys()
+                    .filter(|j| !proved.contains(*j) && !witness_held.contains(*j))
+            };
+            let busy: Vec<String> = {
+                let placements = risc0_placements();
+                inline()
+                    .filter_map(|j| placements.get(j)?.proving_on.clone())
+                    .map(|slot| {
+                        zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&slot)
+                    })
+                    .collect()
+            };
+            w.note_cards(inline().count(), max_concurrent, busy);
         }
 
         // Each risc0 card's job size (see `risc0_job_po2`), published for the Settings screen before
@@ -9419,13 +9641,35 @@ async fn miner_brain(
             // With the planner, which places jobs on cards as if each card ran its own, only the turn a
             // backend waits for memory (fewer of it side by side than there are cards: one SP1 proof
             // at a time on a ~100 GB Windows host) is added.
+            // Before any wait: a job admitted on only some cards waits for those (below).
+            let unqueued_window = prove_window;
+            let outstanding: Vec<(u64, &str)> = inflight_work
+                .iter()
+                .filter(|(j, _)| !proved.contains(*j))
+                .map(|(_, w)| *w)
+                .collect();
+            let side_by_side = zkminer_prover::engine::worker_pool().map_or(usize::MAX, |p| {
+                p.backend_side_by_side(backend_opt.unwrap_or(""))
+            });
+            // Each card's rate for backend `b` as observed this run where it has proved, else
+            // planned, fastest first: of every card, or of those named in `on`.
+            let card_rates = |b: &str, on: Option<&[String]>| -> Vec<f64> {
+                let mut rates: Vec<f64> = device_backend_throughputs
+                    .iter()
+                    .filter(|(d, rb, _)| rb == b && on.is_none_or(|on| on.contains(d)))
+                    .map(|(d, rb, t)| {
+                        observed
+                            .get(&(d.clone(), rb.clone()))
+                            .copied()
+                            .unwrap_or(*t)
+                    })
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .collect();
+                rates.sort_by(|x, y| y.total_cmp(x));
+                rates
+            };
             let prove_window = {
                 let backend = backend_opt.unwrap_or("");
-                let outstanding: Vec<(u64, &str)> = inflight_work
-                    .iter()
-                    .filter(|(j, _)| !proved.contains(*j))
-                    .map(|(_, w)| *w)
-                    .collect();
                 let mut cards: Vec<&str> = device_backend_throughputs
                     .iter()
                     .map(|(d, _, _)| d.as_str())
@@ -9433,8 +9677,6 @@ async fn miner_brain(
                     .collect();
                 cards.sort_unstable();
                 cards.dedup();
-                let side_by_side = zkminer_prover::engine::worker_pool()
-                    .map_or(usize::MAX, |p| p.backend_side_by_side(backend));
                 let card_count = if planner_active {
                     if side_by_side >= cards.len() {
                         0
@@ -9452,22 +9694,7 @@ async fn miner_brain(
                         backend,
                         card_count,
                         side_by_side,
-                        |b| {
-                            // Each card's rate as observed this run where it has proved, else planned.
-                            let mut rates: Vec<f64> = device_backend_throughputs
-                                .iter()
-                                .filter(|(_, rb, _)| rb == b)
-                                .map(|(d, rb, t)| {
-                                    observed
-                                        .get(&(d.clone(), rb.clone()))
-                                        .copied()
-                                        .unwrap_or(*t)
-                                })
-                                .filter(|t| t.is_finite() && *t > 0.0)
-                                .collect();
-                            rates.sort_by(|x, y| y.total_cmp(x));
-                            rates
-                        },
+                        |b| card_rates(b, None),
                         |b| fixed_proving_allowance_secs(b) as f64,
                     )
                 };
@@ -9533,23 +9760,57 @@ async fn miner_brain(
             // refuse every job too big for it, on every card; and fallback dispatch sent jobs to it
             // while faster cards were free. When no card can, nothing changes: the gates below refuse
             // the job on the slowest card's figure, as before.
+            let finishes_within = |cycles: u64, rate: f64, window: u64| {
+                card_finishes_in_time(
+                    cycles,
+                    rate,
+                    deadline_safety_margin,
+                    (backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0) + execute_allowance)
+                        as f64,
+                    proving_timeout.as_secs_f64(),
+                    window,
+                )
+            };
             let eligible_rows: Vec<(String, f64)> = match measured_for_job {
                 Some(cycles) => genuine_rows
                     .iter()
-                    .filter(|(_, rate)| {
-                        card_finishes_in_time(
-                            cycles,
-                            *rate,
-                            deadline_safety_margin,
-                            (backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0)
-                                + execute_allowance) as f64,
-                            proving_timeout.as_secs_f64(),
-                            prove_window,
-                        )
-                    })
+                    .filter(|(_, rate)| finishes_within(cycles, *rate, prove_window))
                     .cloned()
                     .collect(),
                 None => Vec::new(),
+            };
+            // Without the planner, a job admitted on only some of the cards waits for one of those:
+            // the wait above, over every card, is none while any card is free, one it cannot finish
+            // on included. So its wait is reckoned again over those cards alone, counting every job
+            // outstanding (any of them may hold one), and it keeps the cards it still finishes on
+            // after that wait. None: it is not claimed.
+            let eligible_rows = match measured_for_job {
+                Some(cycles)
+                    if !planner_active
+                        && !eligible_rows.is_empty()
+                        && eligible_rows.len() < genuine_rows.len() =>
+                {
+                    let on: Vec<String> = eligible_rows.iter().map(|(d, _)| d.clone()).collect();
+                    let wait = expected_queue_wait_secs(
+                        &outstanding,
+                        backend_name,
+                        on.len().clamp(1, max_concurrent.max(1)),
+                        side_by_side,
+                        |b| card_rates(b, Some(&on)),
+                        |b| fixed_proving_allowance_secs(b) as f64,
+                    );
+                    let window = unqueued_window.saturating_sub(wait);
+                    let rows: Vec<(String, f64)> = eligible_rows
+                        .into_iter()
+                        .filter(|(_, rate)| finishes_within(cycles, *rate, window))
+                        .collect();
+                    if rows.is_empty() {
+                        declines.note(jid, "the cards it can finish on are busy past its window");
+                        continue;
+                    }
+                    rows
+                }
+                _ => eligible_rows,
             };
             let sizing_rows = if eligible_rows.is_empty() {
                 &genuine_rows
@@ -9562,6 +9823,39 @@ async fn miner_brain(
                 by_speed.sort_by(|a, b| b.1.total_cmp(&a.1));
                 by_speed.into_iter().map(|(d, _)| d).collect()
             };
+            // The host-memory gate above charged a risc0 job for a card it could start on now,
+            // before it was known which cards it can finish on: the free 4070's figure for a job
+            // that then waits for the busy 5090. Charged again over the cards it can finish on.
+            // (No worker pool in sim mode, so none there.)
+            if backend_name == zkminer_prover_protocol::BACKEND_RISC0 {
+                let cards: Vec<(String, u8)> = risc0_cards
+                    .iter()
+                    .filter(|c| snapshot.eligible_devices.contains(&c.device))
+                    .map(|c| (c.slot.clone(), c.po2))
+                    .collect();
+                let charge = zkminer_prover::engine::worker_pool()
+                    .filter(|_| !cards.is_empty() && cards.len() < risc0_cards.len())
+                    .and_then(|pool| Some((pool, pool.risc0_claim_charge(&cards)?)));
+                if let Some((pool, (want, slot, po2))) = charge {
+                    let outstanding = needing_card(&in_flight, &proved);
+                    let sp1_outstanding = sp1_in_flight
+                        .iter()
+                        .filter(|j| in_flight.contains_key(*j) && !proved.contains(*j))
+                        .count();
+                    if !pool.backend_fits_for_claim_at_po2(
+                        want,
+                        backend_name,
+                        outstanding,
+                        outstanding.saturating_sub(sp1_outstanding),
+                        max_concurrent,
+                        Some(po2),
+                        Some(slot.as_str()),
+                    ) {
+                        declines.note(jid, "not enough host RAM on the cards it can finish on");
+                        continue;
+                    }
+                }
+            }
             let slowest_eligible = if genuine_throughputs.is_empty() {
                 throughputs_for_backend(&device_backend_throughputs, backend_name)
                     .iter()
@@ -10126,6 +10420,18 @@ async fn miner_brain(
             // counts every GPU, and one with no risc0 size would queue a second job behind the first's
             // card).
             let risc0_job = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
+            // The risc0 cards this job can finish on (`eligible_devices`; none named: every one).
+            // Only those count as free for it: a job that only the busy 5090 can finish waited
+            // there while the free 4070 was counted for it, and was refused at its cutoff.
+            let eligible_slots: Vec<String> = risc0_cards
+                .iter()
+                .filter(|c| {
+                    snapshot.eligible_devices.is_empty()
+                        || snapshot.eligible_devices.contains(&c.device)
+                })
+                .map(|c| c.slot.clone())
+                .collect();
+            let eligible_subset = risc0_job && eligible_slots.len() < risc0_cards.len();
             let card_left_free = risc0_job && {
                 let placements = risc0_placements();
                 let jobs: Vec<Option<Risc0Placement>> = in_flight
@@ -10134,7 +10440,7 @@ async fn miner_brain(
                     .map(|j| placements.get(j).cloned())
                     .collect();
                 let slots: Vec<String> = risc0_cards.iter().map(|c| c.slot.clone()).collect();
-                risc0_card_left_free(&slots, &jobs)
+                risc0_card_left_free(&slots, &eligible_slots, &jobs)
             };
             let bypass_room = risc0_bypass_room(
                 needing_card(&in_flight, &proved),
@@ -10146,6 +10452,7 @@ async fn miner_brain(
                 risc0_job,
                 risc0_cards.len(),
                 card_left_free,
+                eligible_subset,
             );
             let would_commit = admission.is_some() || (queue_bypass && measurable && bypass_room);
             tally.note(Candidate {
@@ -12459,6 +12766,12 @@ async fn process_job_lifecycle(
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
+        // Set once a proof of this job has started on a worker (its `Started` event), by any
+        // attempt: a deadline refusal after that is not one the guest had no part in.
+        let proof_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Set once a refusal on the rates learned this run sent the job back to the dispatcher on
+        // the benchmark's rates alone (`deadline_refusal_action`); every attempt after uses those.
+        let mut retried_on_benchmark = false;
         // Set once an attempt's worker declined (`WorkerDeclined`): it found, before running this
         // job's guest, that its backend cannot run on this host. An environment fault, so if every
         // attempt then fails the program and submitter are not marked divergent.
@@ -12694,21 +13007,35 @@ async fn process_job_lifecycle(
             // Cloned per attempt: the closure below moves into `spawn_blocking`, and the retry loop
             // needs the list again next time round.
             let disabled_for_prove = disabled_slots.clone();
+            // The cards this job was admitted on (a hard filter) and the order to try them in: the card
+            // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
+            // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
+            let eligible_for_prove = snapshot.eligible_devices.clone();
             if backend == zkminer_prover_protocol::BACKEND_RISC0 {
                 let mut barred = excluded.clone();
                 barred.extend(disabled_slots.iter().cloned());
+                // The slots of the cards it was not admitted on, which it never goes to.
+                let ineligible: Vec<String> = if eligible_for_prove.is_empty() {
+                    Vec::new()
+                } else {
+                    pool.slot_keys_for(backend)
+                        .into_iter()
+                        .filter(|k| {
+                            let device =
+                                zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(k);
+                            !eligible_for_prove.contains(&device)
+                        })
+                        .collect()
+                };
                 risc0_placements().insert(
                     job_id,
                     Risc0Placement {
                         proving_on: None,
                         barred,
+                        ineligible,
                     },
                 );
             }
-            // The cards this job was admitted on (a hard filter) and the order to try them in: the card
-            // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
-            // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
-            let eligible_for_prove = snapshot.eligible_devices.clone();
             // An SP1 job whose card's shard size an out-of-memory lowered goes back there first, to
             // prove at the smaller size (`take_sp1_retry_card`); else the card it was planned for.
             let planned = preferred_device(retry_card.as_ref(), snapshot.preferred_device.as_ref());
@@ -12722,8 +13049,14 @@ async fn process_job_lifecycle(
             // How long it would take on each slot, as of this attempt (a re-benchmark, or a rate
             // observed since, counts): the dispatcher starts it only where it can finish before its
             // cutoff and queues it by its latest start.
-            let estimates_for_prove =
-                slot_estimates_for(backend, sizing_cycles, estimate_allowance).await;
+            let (estimates_for_prove, estimates_used_observed) = slot_estimates_for(
+                backend,
+                sizing_cycles,
+                estimate_allowance,
+                !retried_on_benchmark,
+            )
+            .await;
+            let started_flag = proof_started.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
@@ -12807,6 +13140,7 @@ async fn process_job_lifecycle(
                 let mark_started = move |event: zkminer_prover_protocol::ProveEvent,
                                          slot_key: &str| {
                     if matches!(event, zkminer_prover_protocol::ProveEvent::Started) {
+                        started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         if let Some(p) = risc0_placements().get_mut(&job_id) {
                             p.proving_on = Some(slot_key.to_string());
                         }
@@ -12884,9 +13218,13 @@ async fn process_job_lifecycle(
                     // on-chain job. Since this arm is terminal with zero retries, a substring match
                     // let a submitter end their own provable job and collect the release penalty.
                     // The substring predicate this replaced is gone, not kept.
-                    if e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
-                        .is_some()
+                    if let Some(refusal) =
+                        e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
                     {
+                        // Refused before any proof of this job started: on this host's estimates
+                        // and queue alone.
+                        let before_start = refusal.before_start
+                            && !proof_started.load(std::sync::atomic::Ordering::SeqCst);
                         // Unless the deadline itself moved out meanwhile (a pause began during this
                         // proof): then the kill was against a stale cutoff, and there is room to prove
                         // again. The refund is bounded — every one needs the deadline to have moved.
@@ -12903,8 +13241,29 @@ async fn process_job_lifecycle(
                             attempt = attempt.saturating_sub(1);
                             continue;
                         }
-                        if rode_measurement {
-                            note_post_claim_divergence(program_id, backend, submitter, "proof overran its deadline budget");
+                        match deadline_refusal_action(
+                            before_start,
+                            retried_on_benchmark,
+                            estimates_used_observed,
+                            rode_measurement,
+                        ) {
+                            DeadlineRefusalAction::RetryOnBenchmark => {
+                                tracing::warn!(
+                                    "{}: no card here could finish it by the rates learned this \
+                                     run ({msg}); trying once more on the benchmark's rates",
+                                    short_id(job_id)
+                                );
+                                retried_on_benchmark = true;
+                                attempt = attempt.saturating_sub(1);
+                                continue;
+                            }
+                            DeadlineRefusalAction::ReleaseNoMark => {}
+                            DeadlineRefusalAction::ReleaseAndMark => {
+                                note_post_claim_divergence(program_id, backend, submitter, "proof overran its deadline budget");
+                            }
+                        }
+                        if before_start {
+                            note_estimate_refusal(job_id, &msg);
                         }
                         return Err(anyhow::anyhow!(
                             "proving stopped for {} (deadline): {msg}",
@@ -13340,7 +13699,14 @@ async fn process_job_lifecycle(
     card.release();
     if let Some(slot) = &proved_on {
         tracing::info!("Job {} proved on {}", short_id(job_id), slot);
-        note_observed_throughput(slot, proof.cycles, proof.duration);
+        // The guest's execute is inside a risc0 proof's time, once at the measured figure; SP1's
+        // runs before the timer starts.
+        let execute = if backend == zkminer_prover_protocol::BACKEND_RISC0 {
+            snapshot.measured_execute_secs.unwrap_or(0)
+        } else {
+            0
+        };
+        note_observed_throughput(slot, proof.cycles, proof.duration, execute);
     }
     {
         let mut s = state.write().await;
@@ -17603,6 +17969,7 @@ mod tests {
 
         let real: anyhow::Error = anyhow::Error::new(ProofDeadlineReached {
             detail: "proof on risc0:cuda:1 stopped: job deadline reached mid-proof".to_string(),
+            before_start: false,
         });
         assert!(real.downcast_ref::<ProofDeadlineReached>().is_some());
 
@@ -20418,13 +20785,165 @@ mod r2_sizing_tests {
         assert_eq!(observed_rate("risc0:cuda:0", 1_000, Duration::ZERO), None);
         assert_eq!(observed_rate("risc0:cuda:0", 0, secs(1)), None);
 
-        // Smoothed: the first proof sets it, a later one moves it part of the way.
-        note_observed_throughput("openvm:cuda:7", 10_000_000, secs(10));
+        // Smoothed: with no benchmark rate the first proof sets it, a later one moves it part of
+        // the way.
+        note_observed_throughput("openvm:cuda:7", 100_000_000, secs(100), 0);
         let key = ("gpu7".to_string(), "openvm".to_string());
         assert_eq!(observed_throughputs()[&key], 1_000_000.0);
-        note_observed_throughput("openvm:cuda:7", 20_000_000, secs(10));
+        note_observed_throughput("openvm:cuda:7", 200_000_000, secs(100), 0);
         let expected = 1_000_000.0 + OBSERVED_THROUGHPUT_WEIGHT * 1_000_000.0;
         assert!((observed_throughputs()[&key] - expected).abs() < 1e-6);
+    }
+
+    /// A proof too small to say, or one mostly fixed cost, teaches its card nothing.
+    #[test]
+    fn a_small_or_fixed_cost_proof_teaches_no_rate() {
+        let secs = Duration::from_secs;
+        // Under the fallback minimum with no benchmark: no entry at all.
+        note_observed_throughput("openvm:cuda:31", 10_000_000, secs(10), 0);
+        assert!(!observed_throughputs().contains_key(&("gpu31".to_string(), "openvm".to_string())));
+        // Under a minute of STARK work at the benchmark's 2.5 M cycles/s.
+        assert_eq!(
+            next_learned_rate(None, Some(2.5e6), 100_000_000, secs(100), 5.0),
+            None
+        );
+        // Over it, but the wrap and execute are most of the proof.
+        assert_eq!(
+            next_learned_rate(None, Some(2.5e6), 200_000_000, secs(100), 60.0),
+            None
+        );
+        assert!(next_learned_rate(None, Some(2.5e6), 200_000_000, secs(100), 40.0).is_some());
+        assert_eq!(next_learned_rate(None, None, 0, secs(100), 0.0), None);
+    }
+
+    /// With a benchmark rate the average starts there: a first proof moves it part of the way, not
+    /// all of it, and a run of slow proofs leaves it at no less than half the benchmark's.
+    #[test]
+    fn a_learned_rate_starts_at_the_benchmark_and_stays_near_it() {
+        let secs = Duration::from_secs_f64;
+        let bench = 2e6;
+        // 600 M cycles (300 s at the benchmark rate, full weight) at 1.5 M cycles/s.
+        let first = next_learned_rate(None, Some(bench), 600_000_000, secs(400.0), 0.0).unwrap();
+        assert!((first - (bench + OBSERVED_THROUGHPUT_WEIGHT * (1.5e6 - bench))).abs() < 1e-6);
+        // Twenty proofs at 1% of it.
+        let mut rate = None;
+        for _ in 0..20 {
+            rate = next_learned_rate(rate, Some(bench), 600_000_000, secs(30_000.0), 0.0);
+        }
+        let rate = rate.unwrap();
+        assert!(rate >= LEARNED_RATE_FLOOR * bench, "{rate}");
+        let row = zkminer_prover::benchmark::DeviceBenchmark {
+            throughput: bench,
+            program_stages: vec![zkminer_prover::benchmark::ProgramStage {
+                program_name: "p".to_string(),
+                cycles: 2_000_000_000,
+                stark_secs: 1000.0,
+                wrap_secs: Some(5.0),
+            }],
+            device_id: "gpu0".to_string(),
+            device_label: String::new(),
+            prover_backend: "risc0".to_string(),
+            power_watts: 300.0,
+            optimal_po2: 20,
+            memory_usage_bytes: 1,
+            max_feasible_po2: 22,
+            program_throughputs: HashMap::new(),
+            po2_samples: Vec::new(),
+            pci_bus_id: String::new(),
+            host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
+        };
+        let benchmark_only =
+            card_estimate_secs("risc0", 1_000_000_000, 0, None, Some(&row)).unwrap();
+        let learned =
+            card_estimate_secs("risc0", 1_000_000_000, 0, Some(rate), Some(&row)).unwrap();
+        assert!(
+            learned <= 2.2 * benchmark_only,
+            "{learned} against {benchmark_only}"
+        );
+        // A rate learned before the card was benchmarked again is held to the same range.
+        let stale = card_estimate_secs("risc0", 1_000_000_000, 0, Some(2e4), Some(&row)).unwrap();
+        assert!(
+            stale <= 2.2 * benchmark_only,
+            "{stale} against {benchmark_only}"
+        );
+        // And one proof cannot more than double it.
+        let fast = next_learned_rate(None, Some(bench), 600_000_000, secs(1.0), 0.0).unwrap();
+        assert!(fast <= LEARNED_RATE_CEILING * bench);
+    }
+
+    /// The guest's execute inside the proof is not counted as STARK work.
+    #[test]
+    fn a_learned_rate_is_net_of_the_execute() {
+        let secs = Duration::from_secs;
+        let without = next_learned_rate(None, None, 100_000_000, secs(100), 0.0).unwrap();
+        let with = next_learned_rate(None, None, 100_000_000, secs(100), 20.0).unwrap();
+        assert_eq!(without, 1e6);
+        assert_eq!(with, 1.25e6);
+    }
+
+    /// A refusal before the proof started blames no one, and a refusal on learned rates is tried
+    /// once more on the benchmark's; a proof cut at its cutoff marks a measured job, as before.
+    #[test]
+    fn a_refusal_before_the_proof_started_is_not_the_submitters() {
+        use DeadlineRefusalAction::*;
+        // (before_start, retried, used_observed, rode_measurement)
+        let table = [
+            ((true, false, true, true), RetryOnBenchmark),
+            ((true, false, true, false), RetryOnBenchmark),
+            ((true, true, true, true), ReleaseNoMark),
+            ((true, false, false, true), ReleaseNoMark),
+            ((true, true, false, false), ReleaseNoMark),
+            ((false, false, true, true), ReleaseAndMark),
+            ((false, true, false, true), ReleaseAndMark),
+            ((false, false, true, false), ReleaseNoMark),
+        ];
+        for ((before_start, retried, used_observed, rode), want) in table {
+            assert_eq!(
+                deadline_refusal_action(before_start, retried, used_observed, rode),
+                want,
+                "{before_start} {retried} {used_observed} {rode}"
+            );
+        }
+    }
+
+    /// Refusals before the start are counted over the last hour.
+    #[test]
+    fn estimate_refusals_are_counted_over_an_hour() {
+        let now = std::time::Instant::now();
+        let mut recent = std::collections::VecDeque::new();
+        for i in 0..4u64 {
+            assert_eq!(
+                count_estimate_refusal(&mut recent, now + Duration::from_secs(i * 60)),
+                i as usize + 1
+            );
+        }
+        // An hour after the first, it has aged out.
+        assert_eq!(
+            count_estimate_refusal(&mut recent, now + ESTIMATE_REFUSAL_WINDOW),
+            4
+        );
+    }
+
+    /// A job admitted on one card of two, with one job outstanding, waits for it, though by the
+    /// count of all cards one is free.
+    #[test]
+    fn a_job_waits_for_the_cards_it_can_finish_on() {
+        let outstanding = [(1_000_000_000u64, "risc0")];
+        let rates = |_: &str| vec![2e6];
+        assert_eq!(
+            expected_queue_wait_secs(
+                &outstanding,
+                "risc0",
+                2,
+                2,
+                |_: &str| vec![2e6, 1e6],
+                |_| 0.0
+            ),
+            0
+        );
+        assert!(expected_queue_wait_secs(&outstanding, "risc0", 1, 2, rates, |_| 0.0) >= 500);
     }
 
     /// Learned rates replace what the rows said for that card and backend, keep the rest, and add a
@@ -20775,23 +21294,23 @@ mod r2_sizing_tests {
     #[test]
     fn a_risc0_job_is_held_to_the_risc0_cards_without_look_ahead() {
         // Two GPUs, one with no risc0 size: one risc0 job at a time...
-        assert!(risc0_bypass_room(0, 0, 2, true, 1, false));
-        assert!(!risc0_bypass_room(1, 0, 2, true, 1, false));
+        assert!(risc0_bypass_room(0, 0, 2, true, 1, false, false));
+        assert!(!risc0_bypass_room(1, 0, 2, true, 1, false, false));
         // ...but an SP1 job in flight on the other card takes no risc0 room.
-        assert!(risc0_bypass_room(1, 1, 2, true, 1, false));
+        assert!(risc0_bypass_room(1, 1, 2, true, 1, false, false));
         assert!(
-            !risc0_bypass_room(2, 1, 2, true, 1, false),
+            !risc0_bypass_room(2, 1, 2, true, 1, false, false),
             "the total cap still holds"
         );
         // Another backend's job is held to the total alone.
-        assert!(risc0_bypass_room(1, 0, 2, false, 1, false));
+        assert!(risc0_bypass_room(1, 0, 2, false, 1, false, false));
         assert!(
-            !risc0_bypass_room(0, 0, 2, true, 0, false),
+            !risc0_bypass_room(0, 0, 2, true, 0, false, false),
             "no risc0 card, no risc0 job"
         );
         // A risc0 card no job in flight can go to takes one more, within the total.
-        assert!(risc0_bypass_room(2, 0, 4, true, 2, true));
-        assert!(!risc0_bypass_room(4, 0, 4, true, 2, true));
+        assert!(risc0_bypass_room(2, 0, 4, true, 2, true, false));
+        assert!(!risc0_bypass_room(4, 0, 4, true, 2, true, false));
     }
 
     /// A job kept off the card it failed on waits for the other: the card it left is free for a new
@@ -20803,26 +21322,31 @@ mod r2_sizing_tests {
             Some(Risc0Placement {
                 proving_on: Some(s.to_string()),
                 barred: Vec::new(),
+                ineligible: Vec::new(),
             })
         };
         let waiting = |barred: &[&str]| {
             Some(Risc0Placement {
                 proving_on: None,
                 barred: barred.iter().map(|s| s.to_string()).collect(),
+                ineligible: Vec::new(),
             })
         };
         // One on the 4070, one waiting for it after failing on the 5090: the 5090 is free.
         assert!(risc0_card_left_free(
+            &cards,
             &cards,
             &[proving("risc0:cuda:1"), waiting(&["risc0:cuda:0"])]
         ));
         // A waiting job that may go anywhere takes the free card.
         assert!(!risc0_card_left_free(
             &cards,
+            &cards,
             &[proving("risc0:cuda:1"), waiting(&[])]
         ));
         // Kept off every card, it may go anywhere (the dispatcher restores them).
         assert!(!risc0_card_left_free(
+            &cards,
             &cards,
             &[
                 proving("risc0:cuda:1"),
@@ -20832,12 +21356,60 @@ mod r2_sizing_tests {
         // A job not yet at its prove loop may go anywhere.
         assert!(!risc0_card_left_free(
             &cards,
+            &cards,
             &[proving("risc0:cuda:1"), None]
         ));
         // Both cards proving: none free.
         assert!(!risc0_card_left_free(
             &cards,
+            &cards,
             &[proving("risc0:cuda:0"), proving("risc0:cuda:1")]
+        ));
+    }
+
+    /// A job that can finish only on the 5090 is not admitted while the 5090 proves another, though
+    /// the 4070 is free: it would wait for the 5090 and be refused at its cutoff.
+    #[test]
+    fn a_job_needs_a_free_card_among_those_it_can_finish_on() {
+        let cards = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let only_5090 = vec!["risc0:cuda:0".to_string()];
+        let on_5090 = Some(Risc0Placement {
+            proving_on: Some("risc0:cuda:0".to_string()),
+            ..Default::default()
+        });
+        let free = risc0_card_left_free(&cards, &only_5090, std::slice::from_ref(&on_5090));
+        assert!(!free);
+        assert!(!risc0_bypass_room(1, 0, 2, true, 2, free, true));
+        // Before: one job on two cards was room, whichever card it held.
+        assert!(risc0_bypass_room(1, 0, 2, true, 2, free, false));
+        // Eligible on both, the 4070 is free for it.
+        assert!(risc0_card_left_free(&cards, &cards, &[on_5090]));
+    }
+
+    /// A job waiting for the 5090, the only card it was admitted on, leaves the 4070 free for a job
+    /// that can finish there, also when it is kept off the 5090 (restored to it, not to the 4070).
+    #[test]
+    fn a_waiting_job_holds_no_card_it_was_not_admitted_on() {
+        let cards = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let only_4070 = vec!["risc0:cuda:1".to_string()];
+        let waiting = |barred: &[&str]| {
+            Some(Risc0Placement {
+                proving_on: None,
+                barred: barred.iter().map(|s| s.to_string()).collect(),
+                ineligible: vec!["risc0:cuda:1".to_string()],
+            })
+        };
+        assert!(risc0_card_left_free(&cards, &only_4070, &[waiting(&[])]));
+        assert!(risc0_card_left_free(
+            &cards,
+            &only_4070,
+            &[waiting(&["risc0:cuda:0"])]
+        ));
+        // A job that may go anywhere still takes the 4070.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &only_4070,
+            &[Some(Risc0Placement::default())]
         ));
     }
 
