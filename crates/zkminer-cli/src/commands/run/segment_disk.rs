@@ -140,7 +140,36 @@ pub(crate) fn free_bytes(dir: &Path) -> std::io::Result<u64> {
     Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
-#[cfg(not(unix))]
+/// Bytes available to this user (quotas included) on the volume holding `dir`.
+#[cfg(windows)]
+pub(crate) fn free_bytes(dir: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free_to_caller: *mut u64,
+            total: *mut u64,
+            total_free: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let mut free = 0u64;
+    // SAFETY: a NUL-terminated path, one out-pointer to a local; the others may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(free)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn free_bytes(_dir: &Path) -> std::io::Result<u64> {
     Err(std::io::Error::other(
         "free space is not read on this platform",
@@ -205,5 +234,26 @@ mod tests {
         assert_eq!(inline_need(u64::MAX), u64::MAX);
         let missing = Path::new("/definitely/not/here/inline");
         assert_eq!(existing(missing), Path::new("/"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The free-space read works here: a failed read refuses every inline risc0 claim.
+    #[test]
+    fn free_space_is_read() {
+        let free = free_bytes(&std::env::temp_dir()).expect("free space read");
+        assert!(free > 0);
+    }
+
+    /// A path whose volume does not exist reads as an error, not as zero bytes free.
+    #[test]
+    fn a_missing_volume_is_an_error() {
+        assert!(free_bytes(Path::new(
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\"
+        ))
+        .is_err());
     }
 }
