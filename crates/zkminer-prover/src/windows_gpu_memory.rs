@@ -182,6 +182,18 @@ fn luid_for_pci(adapters: &[(AdapterLuid, u32, u32, u32)], pci: &str) -> Option<
     hits.next().is_none().then_some(first)
 }
 
+/// The PCI vendor id of each display adapter, by its PCI address (`0000:bb:dd.f`), from the kernel
+/// thunks D3D itself uses (no admin, no vendor library): `None` if they cannot be listed.
+pub(crate) fn adapter_vendors() -> Option<Vec<(String, u32)>> {
+    Some(
+        d3dkmt::vendors()?
+            .into_iter()
+            .filter(|(b, d, f, _)| *b <= 255 && *d <= 31 && *f <= 7)
+            .map(|(b, d, f, vendor)| (format!("0000:{b:02x}:{d:02x}.{f:x}"), vendor))
+            .collect(),
+    )
+}
+
 /// MiB each pid holds on `luid`, summed over its `phys_<n>` parts, and the adapter's own figure in
 /// MiB, if listed.
 fn on_adapter(
@@ -262,7 +274,21 @@ mod d3dkmt {
         h_adapter: u32,
     }
 
+    /// `D3DKMT_QUERY_DEVICE_IDS`: a physical adapter's index in, its PCI ids out.
+    #[repr(C)]
+    #[derive(Default)]
+    struct QueryDeviceIds {
+        physical_adapter_index: u32,
+        vendor_id: u32,
+        device_id: u32,
+        sub_vendor_id: u32,
+        sub_system_id: u32,
+        revision_id: u32,
+        bus_type: u32,
+    }
+
     const KMTQAITYPE_ADAPTERADDRESS: i32 = 6;
+    const KMTQAITYPE_PHYSICALADAPTERDEVICEIDS: i32 = 31;
     const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
 
     #[link(name = "gdi32")]
@@ -274,6 +300,27 @@ mod d3dkmt {
 
     /// `(luid, bus, device, function)` of every adapter, or `None` if they cannot be listed.
     pub(super) fn adapters() -> Option<Vec<(AdapterLuid, u32, u32, u32)>> {
+        listed(false).map(|all| {
+            all.into_iter()
+                .map(|(luid, bus, device, function, _)| (luid, bus, device, function))
+                .collect()
+        })
+    }
+
+    /// `(bus, device, function, PCI vendor id)` of every adapter whose ids can be read, or `None`
+    /// if they cannot be listed.
+    pub(super) fn vendors() -> Option<Vec<(u32, u32, u32, u32)>> {
+        listed(true).map(|all| {
+            all.into_iter()
+                .filter_map(|(_, bus, device, function, vendor)| {
+                    Some((bus, device, function, vendor?))
+                })
+                .collect()
+        })
+    }
+
+    /// [`adapters`], each with its PCI vendor id when `with_vendor` asks for it and it can be read.
+    fn listed(with_vendor: bool) -> Option<Vec<(AdapterLuid, u32, u32, u32, Option<u32>)>> {
         let mut probe = EnumAdapters2 {
             num_adapters: 0,
             p_adapters: std::ptr::null_mut(),
@@ -311,6 +358,10 @@ mod d3dkmt {
                 };
                 // SAFETY: an open adapter handle and a buffer of the size the query names.
                 if unsafe { D3DKMTQueryAdapterInfo(&mut query) } == 0 {
+                    let vendor = with_vendor
+                        .then(|| device_ids(adapter.h_adapter))
+                        .flatten()
+                        .map(|ids| ids.vendor_id);
                     out.push((
                         AdapterLuid {
                             high: adapter.luid.high_part as u32,
@@ -319,6 +370,7 @@ mod d3dkmt {
                         address.bus,
                         address.device,
                         address.function,
+                        vendor,
                     ));
                 }
                 // SAFETY: every handle the listing opened is closed, once.
@@ -333,6 +385,19 @@ mod d3dkmt {
         None
     }
 
+    /// The PCI ids of the open adapter `h_adapter`'s first physical adapter (WDDM 2.4 and up).
+    fn device_ids(h_adapter: u32) -> Option<QueryDeviceIds> {
+        let mut ids = QueryDeviceIds::default();
+        let mut query = QueryAdapterInfo {
+            h_adapter,
+            kind: KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
+            data: (&mut ids as *mut QueryDeviceIds).cast(),
+            size: std::mem::size_of::<QueryDeviceIds>() as u32,
+        };
+        // SAFETY: an open adapter handle and a buffer of the size the query names.
+        (unsafe { D3DKMTQueryAdapterInfo(&mut query) } == 0).then_some(ids)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -343,6 +408,7 @@ mod d3dkmt {
             assert_eq!(std::mem::size_of::<EnumAdapters2>(), 16);
             assert_eq!(std::mem::size_of::<QueryAdapterInfo>(), 24);
             assert_eq!(std::mem::size_of::<AdapterAddress>(), 12);
+            assert_eq!(std::mem::size_of::<QueryDeviceIds>(), 28);
         }
     }
 }
@@ -678,6 +744,22 @@ mod tests {
         };
         for _ in 0..3 {
             assert_eq!(d3dkmt::adapters().map(|a| a.len()), Some(adapters.len()));
+        }
+    }
+
+    /// On this machine: every PCI display adapter's vendor can be read, and is a GPU vendor's.
+    #[test]
+    fn the_adapters_vendors_can_be_read_without_privileges() {
+        let (Some(vendors), Some(adapters)) = (adapter_vendors(), d3dkmt::adapters()) else {
+            return; // no display adapters (a service session)
+        };
+        let at_pci = adapters
+            .iter()
+            .filter(|(_, b, d, f)| *b <= 255 && *d <= 31 && *f <= 7);
+        assert_eq!(vendors.len(), at_pci.count(), "{vendors:x?}");
+        for (pci, vendor) in &vendors {
+            assert!(pci.starts_with("0000:"), "{pci}");
+            assert_ne!(*vendor, 0, "{pci}");
         }
     }
 }

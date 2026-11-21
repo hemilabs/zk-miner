@@ -226,13 +226,12 @@ unsafe impl Send for Igcl {}
 
 impl Igcl {
     pub(super) fn load() -> anyhow::Result<Self> {
-        // SAFETY: loading the driver's own library, whose initialization has no preconditions.
-        let library = unsafe { libloading::Library::new("ControlLib.dll") }?;
         // Never unloaded (the function pointers below point into it). ctlInit leaves work on the
-        // process's thread pool that runs after it returns, failed or not: unloading the library
-        // when it failed (as on a machine whose only GPUs are not Intel's: 0x40000001) made that
-        // work jump into unmapped code and crash the miner, seconds later and only now and then.
-        let library: &'static libloading::Library = Box::leak(Box::new(library));
+        // process's thread pool and event-tracing providers registered, failed or not: unloading
+        // the library when it failed (as on a machine whose only GPUs are not Intel's:
+        // 0x40000001) made them jump into unmapped code and crash the miner, seconds or hours
+        // later. See `load_system_library`.
+        let library = super::load_system_library("ControlLib.dll")?;
         // SAFETY: the signatures are `igcl_api.h`'s; the pointers are kept with the library.
         let (init, close, enumerate, properties, pci_state, telemetry) = unsafe {
             (
@@ -255,7 +254,15 @@ impl Igcl {
         let mut api: Handle = std::ptr::null_mut();
         // SAFETY: both pointers are valid for the call.
         let result = unsafe { init(&mut args, &mut api) };
-        anyhow::ensure!(result == CTL_RESULT_SUCCESS, "ctlInit returned {result:#x}");
+        if result != CTL_RESULT_SUCCESS {
+            // A failed ctlInit can still hand back a handle, with its providers registered:
+            // ctlClose unregisters them.
+            if !api.is_null() {
+                // SAFETY: `api` came from ctlInit, and the library is never unloaded.
+                unsafe { close(api) };
+            }
+            anyhow::bail!("ctlInit returned {result:#x}");
+        }
         let mut igcl = Igcl {
             api,
             close,

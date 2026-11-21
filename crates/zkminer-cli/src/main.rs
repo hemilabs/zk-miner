@@ -593,6 +593,9 @@ fn main() -> Result<()> {
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
+    // Windows: libraries loaded by name come from beside the program or System32 only.
+    #[cfg(windows)]
+    zkminer_prover::windows_sandbox::restrict_library_search();
     // Windows has no dumpable flag: the miner's process and threads refuse every other process of
     // this user (a prover worker that a guest took over included) all but seeing and ending it, so
     // none can read its memory or run code in it. See `windows_sandbox`.
