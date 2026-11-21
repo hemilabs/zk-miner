@@ -6920,7 +6920,9 @@ enum DeadlineRefusalAction {
 /// (`used_observed`) it is tried once more on the benchmark's (`retried`: that was done). After a
 /// restart one small proof taught a card a tenth of its rate, and every job claimed on the
 /// benchmark's was then refused there before it started, and its submitter blamed. A proof stopped
-/// at its cutoff marks a measured job's submitter (`rode_measurement`), as before.
+/// at its cutoff marks a measured job's submitter (`rode_measurement`), as before, unless it ran on
+/// the benchmark's rates after that retry: our learned rate had already said it would not finish, so
+/// the overrun is our estimate's, not the guest's.
 fn deadline_refusal_action(
     before_start: bool,
     retried: bool,
@@ -6929,7 +6931,7 @@ fn deadline_refusal_action(
 ) -> DeadlineRefusalAction {
     if before_start && used_observed && !retried {
         DeadlineRefusalAction::RetryOnBenchmark
-    } else if before_start || !rode_measurement {
+    } else if before_start || retried || !rode_measurement {
         DeadlineRefusalAction::ReleaseNoMark
     } else {
         DeadlineRefusalAction::ReleaseAndMark
@@ -14987,6 +14989,40 @@ async fn measure_cycles(
         return;
     }
 
+    // A size measured by execution a moment ago and gone again (dropped because the registry hash
+    // moved, or evicted) waits out its re-measure cooldown, so no path executes one (program, input)
+    // on every tick.
+    let mut rerun_wait: Option<Duration> = None;
+    let missing: Vec<u8> = missing
+        .into_iter()
+        .filter(
+            |&p| match measure_rerun_wait_for(&(input_key.0, p, program_id, input_hash)) {
+                Some(w) => {
+                    rerun_wait = Some(rerun_wait.map_or(w, |r| r.min(w)));
+                    false
+                }
+                None => true,
+            },
+        )
+        .collect();
+    if missing.is_empty() {
+        let wait = rerun_wait.unwrap_or(MEASURE_RERUN_COOLDOWN);
+        tracing::debug!(
+            "measure {}: this input was measured a moment ago and its measurement is gone again — \
+             executing it again in {}s at the earliest",
+            short_id(program_id),
+            wait.as_secs()
+        );
+        if paces_claims {
+            note_job_retry_after(
+                job_id,
+                wait,
+                "measured a moment ago; waiting to measure it again",
+            );
+        }
+        return;
+    }
+
     // (The SP1 program-wide `elf_hash` requirement is enforced EARLIER — before the descriptor scan
     // above — via the self-healing SP1_ELF_HASH_MISSING cooldown, so a no-hash program is declined
     // without paying the scan. See that block near the top of this function.)
@@ -15073,8 +15109,8 @@ async fn measure_cycles(
     {
         Ok(Ok(e)) => e,
         Ok(Err(e))
-            if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>().is_some()
-                || e.downcast_ref::<RegistryUnavailable>().is_some() =>
+            if measure_fetch_failure(&e, registry_elf_hash_previous(program_id))
+                == MeasureFetchFailure::NoSource =>
         {
             // Not registered yet, or registered with no URIs yet: says nothing about the program's
             // future. A back-off, never a strike toward a permanent UNMEASURABLE verdict.
@@ -15089,6 +15125,24 @@ async fn measure_cycles(
             }
             tracing::debug!(
                 "measure {}: no ELF source now ({e:#}) — backing off",
+                short_id(program_id)
+            );
+            return;
+        }
+        Ok(Err(e))
+            if measure_fetch_failure(&e, registry_elf_hash_previous(program_id))
+                == MeasureFetchFailure::RolloutPending =>
+        {
+            // The registry names a new `elf_hash`, and its URIs still serve the bytes of the one
+            // before: the new ELF is not uploaded yet. Says nothing of this input, so no strike; the
+            // program waits, as one with no ELF source does, and its next read sees the new bytes.
+            if paces_claims {
+                note_transient_preclaim_failure(job_id);
+                mark_program_no_elf_source(program_id);
+            }
+            tracing::info!(
+                "measure {}: its URIs still serve the ELF of the registry's previous elf_hash — \
+                 backing off until the new one is uploaded",
                 short_id(program_id)
             );
             return;
@@ -15200,7 +15254,9 @@ async fn measure_cycles(
     let elf = std::sync::Arc::new(elf);
     // Another backend's bytes were checked against the registry `elf_hash` by the fetch above, so
     // their keccak is that hash. Stored with the measurement, so a claim can tell when the registry
-    // has since named other bytes (see [`ElfHashChanged`]).
+    // has since named other bytes (see [`ElfHashChanged`]). The fetch recorded that hash as the
+    // program's current one (see [`REGISTRY_ELF_HASH`]), so this measurement stands until a later
+    // read sees another.
     let registry_elf_hash = if capture_risc0_keccak {
         None
     } else {
@@ -15274,6 +15330,7 @@ async fn measure_cycles(
                 if paces_claims {
                     clear_preclaim_strikes(job_id);
                 }
+                note_measure_run((input_key.0, po2, program_id, input_hash));
                 // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
                 // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
                 // limit. Both the journal and the input are a deterministic function of (program, input)
@@ -15676,6 +15733,9 @@ async fn fetch_elf(
             .into());
         }
     };
+    // Every registry read of an SP1 program's `elf_hash` is recorded, so a measurement stored under
+    // the hash read here is judged against it, and a change back to an earlier hash counts.
+    record_registry_hash(honor_registry_hash, program_id, info.elf_hash);
     // The registry marks a program Active / Deprecated / Revoked. A non-Active status
     // (Active is the zero/default variant) means the program author pulled it; proving it wastes GPU
     // + gas. We WARN by default rather than hard-refuse because the exact enum ordering is not
@@ -16036,30 +16096,52 @@ fn schedule_elf_prefetch(
 /// `NO_ELF_SOURCE_TTL`: each change makes its jobs measured, and their ELF fetched, again.
 const MAX_ELF_HASH_CHANGES_PER_HOUR: usize = 2;
 
-/// Per program, the registry `elf_hash` the pre-claim step last saw, and when it saw it change within
-/// the last hour.
+/// What is known of one program's registry `elf_hash` (see [`REGISTRY_ELF_HASH`]).
+#[derive(Clone)]
+struct RegistryElfHash {
+    /// The hash the registry named at the last read.
+    current: B256,
+    /// The hash it named before `current`, when a change was seen.
+    previous: Option<B256>,
+    /// When it changed, within the last hour.
+    changes: Vec<std::time::Instant>,
+}
+
+/// Per program, the registry `elf_hash` at the last read of it on any path (measure, pre-claim,
+/// prove, recovery), the one before, and when it changed within the last hour. Every SP1 registry
+/// read updates it (see [`record_registry_hash`]), so a measurement stored under the hash just read
+/// is never taken as superseded by an older one, and a change back to an earlier hash counts.
 static REGISTRY_ELF_HASH: std::sync::Mutex<
-    Option<std::collections::HashMap<B256, (B256, Vec<std::time::Instant>)>>,
+    Option<std::collections::HashMap<B256, RegistryElfHash>>,
 > = std::sync::Mutex::new(None);
 
-/// Record that the registry names `now` for `program_id`, seen at a job measured under another hash.
-/// A change is counted once per new hash, not once per job. Returns the changes in the last hour;
-/// past [`MAX_ELF_HASH_CHANGES_PER_HOUR`] the program is marked as having no ELF source.
-fn note_registry_elf_hash(program_id: B256, now: B256) -> usize {
+/// Record that the registry names `now` for `program_id`. A change is counted once per new hash, not
+/// once per job. A program with no entry counts a change when `count_unknown`, and is otherwise
+/// seeded with `now`. Returns the changes in the last hour; past [`MAX_ELF_HASH_CHANGES_PER_HOUR`]
+/// the program is marked as having no ELF source.
+fn record_registry_elf_hash(program_id: B256, now: B256, count_unknown: bool) -> usize {
     let changes = {
         let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
         let m = g.get_or_insert_with(Default::default);
-        let (mut current, mut times) = m
-            .get(&program_id)
-            .cloned()
-            .unwrap_or((B256::ZERO, Vec::new()));
-        times.retain(|t| t.elapsed() < Duration::from_secs(3600));
-        if current != now {
-            current = now;
-            times.push(std::time::Instant::now());
+        let mut entry = match m.get(&program_id) {
+            Some(e) => e.clone(),
+            None => RegistryElfHash {
+                // A zero hash is never a registry `elf_hash`, so it differs from `now` and counts.
+                current: if count_unknown { B256::ZERO } else { now },
+                previous: None,
+                changes: Vec::new(),
+            },
+        };
+        entry
+            .changes
+            .retain(|t| t.elapsed() < Duration::from_secs(3600));
+        if entry.current != now {
+            entry.previous = (entry.current != B256::ZERO).then_some(entry.current);
+            entry.current = now;
+            entry.changes.push(std::time::Instant::now());
         }
-        let changes = times.len();
-        bounded_insert(m, program_id, (current, times), MEASURED_CYCLES_CAP);
+        let changes = entry.changes.len();
+        bounded_insert(m, program_id, entry, MEASURED_CYCLES_CAP);
         changes
     };
     if changes > MAX_ELF_HASH_CHANGES_PER_HOUR {
@@ -16068,13 +16150,126 @@ fn note_registry_elf_hash(program_id: B256, now: B256) -> usize {
     changes
 }
 
+/// Record that the pre-claim step found the registry naming `now` for `program_id`, at a job measured
+/// under another hash. The program has no entry here only when the map evicted it, so that still
+/// counts as a change (see [`record_registry_elf_hash`]).
+fn note_registry_elf_hash(program_id: B256, now: B256) -> usize {
+    record_registry_elf_hash(program_id, now, true)
+}
+
+/// Record a registry read naming `now` for `program_id`. The first read of a program seeds it and is
+/// not a change (see [`record_registry_elf_hash`]).
+fn observe_registry_elf_hash(program_id: B256, now: B256) -> usize {
+    record_registry_elf_hash(program_id, now, false)
+}
+
+/// Record a registry read in [`fetch_elf`]: only where the registry `elf_hash` binds the bytes
+/// (`honor`, not risc0) and the program has one. Returns the changes in the last hour, or `None` when
+/// nothing was recorded.
+fn record_registry_hash(honor: bool, program_id: B256, info_hash: Option<B256>) -> Option<usize> {
+    match (honor, info_hash) {
+        (true, Some(now)) => Some(observe_registry_elf_hash(program_id, now)),
+        _ => None,
+    }
+}
+
 /// Whether the registry is known to name another ELF for `program_id` than `measured_under` (see
-/// [`note_registry_elf_hash`]): a measurement made under it is not of the ELF a claim would prove.
+/// [`REGISTRY_ELF_HASH`]): a measurement made under it is not of the ELF a claim would prove.
 fn registry_elf_hash_superseded(program_id: B256, measured_under: B256) -> bool {
     let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
     g.as_ref()
         .and_then(|m| m.get(&program_id))
-        .is_some_and(|(current, _)| *current != measured_under)
+        .is_some_and(|e| e.current != measured_under)
+}
+
+/// The registry `elf_hash` `program_id` had before its current one, when a change was seen.
+fn registry_elf_hash_previous(program_id: B256) -> Option<B256> {
+    let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&program_id))
+        .and_then(|e| e.previous)
+}
+
+/// What the measure path does with a failed ELF fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasureFetchFailure {
+    /// No ELF source now: not registered, no URIs, or the registry unreadable. A back-off.
+    NoSource,
+    /// The URIs still serve the bytes of the registry's previous `elf_hash`: the new hash was set
+    /// before its bytes were uploaded. A back-off, never a strike: a strike-out here would retire
+    /// the input for good over a rollout.
+    RolloutPending,
+    /// Anything else: a strike toward a permanent UNMEASURABLE verdict.
+    Strike,
+}
+
+/// Classify a measure-path ELF fetch failure. `previous` is the registry `elf_hash` the program had
+/// before its current one (see [`registry_elf_hash_previous`]).
+fn measure_fetch_failure(e: &anyhow::Error, previous: Option<B256>) -> MeasureFetchFailure {
+    if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>()
+        .is_some()
+        || e.downcast_ref::<RegistryUnavailable>().is_some()
+    {
+        MeasureFetchFailure::NoSource
+    } else if e
+        .downcast_ref::<zkminer_chain::programs::ElfHashMismatch>()
+        .zip(previous)
+        .is_some_and(|(m, previous)| m.served.contains(&previous))
+    {
+        MeasureFetchFailure::RolloutPending
+    } else {
+        MeasureFetchFailure::Strike
+    }
+}
+
+/// How long after a (backend, size, program, input) was measured by execution before it may be
+/// executed again, doubling with each run within [`MEASURE_RERUN_WINDOW`] up to
+/// [`MEASURE_RERUN_COOLDOWN_MAX`]. A measurement dropped soon after it was stored (a registry hash
+/// that moved, an eviction) is then not executed again on every tick.
+const MEASURE_RERUN_COOLDOWN: Duration = Duration::from_secs(60);
+const MEASURE_RERUN_COOLDOWN_MAX: Duration = Duration::from_secs(30 * 60);
+/// Runs older than this are forgotten: the cooldown starts over at [`MEASURE_RERUN_COOLDOWN`].
+const MEASURE_RERUN_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Per (backend, size, program, input): its executions that stored a measurement within
+/// [`MEASURE_RERUN_WINDOW`] of each other, and when the last one did.
+static MEASURE_RUNS: std::sync::Mutex<
+    Option<std::collections::HashMap<MeasureKey, (u32, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// How much longer a key measured `runs` times, last `since_last` ago, waits before it is executed
+/// again; `None` when it may run now.
+fn measure_rerun_wait(runs: u32, since_last: Duration) -> Option<Duration> {
+    if runs == 0 || since_last >= MEASURE_RERUN_WINDOW {
+        return None;
+    }
+    let cooldown = MEASURE_RERUN_COOLDOWN
+        .saturating_mul(1u32 << (runs - 1).min(5))
+        .min(MEASURE_RERUN_COOLDOWN_MAX);
+    cooldown.checked_sub(since_last).filter(|w| !w.is_zero())
+}
+
+/// [`measure_rerun_wait`] for `key`, from its recorded runs.
+fn measure_rerun_wait_for(key: &MeasureKey) -> Option<Duration> {
+    let g = MEASURE_RUNS.lock().unwrap_or_else(|p| p.into_inner());
+    let (runs, last) = *g.as_ref()?.get(key)?;
+    measure_rerun_wait(runs, last.elapsed())
+}
+
+/// Record that `key` was measured by execution now.
+fn note_measure_run(key: MeasureKey) {
+    let mut g = MEASURE_RUNS.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    let runs = match m.get(&key) {
+        Some((runs, last)) if last.elapsed() < MEASURE_RERUN_WINDOW => runs.saturating_add(1),
+        _ => 1,
+    };
+    bounded_insert(
+        m,
+        key,
+        (runs, std::time::Instant::now()),
+        MEASURED_CYCLES_CAP,
+    );
 }
 
 /// What a read pinned at or after the block where we last saw our lock says about it.
@@ -19996,6 +20191,175 @@ mod r2_sizing_tests {
         assert_eq!((r.verified_elf_hash, r.registry_elf_hash), (Some(h1), None));
     }
 
+    /// A registry read seeds a program without counting a change, and only an SP1 read that carries
+    /// an `elf_hash` is recorded.
+    #[test]
+    fn a_first_registry_read_seeds_without_counting() {
+        let prog = keccak256(b"f1-seed");
+        let (h1, h2) = (keccak256(b"f1-seed-elf-1"), keccak256(b"f1-seed-elf-2"));
+        // risc0 (the registry hash does not bind its bytes) and a program with no hash: nothing.
+        assert_eq!(record_registry_hash(false, prog, Some(h1)), None);
+        assert_eq!(record_registry_hash(true, prog, None), None);
+        assert!(!registry_elf_hash_superseded(prog, h2));
+        // The first SP1 read seeds it: no change, and a measurement under it stands.
+        assert_eq!(record_registry_hash(true, prog, Some(h1)), Some(0));
+        assert!(!registry_elf_hash_superseded(prog, h1));
+        assert!(registry_elf_hash_superseded(prog, h2));
+        assert_eq!(registry_elf_hash_previous(prog), None);
+        // Read again: still no change.
+        assert_eq!(observe_registry_elf_hash(prog, h1), 0);
+        // The pre-claim step on a program it has no entry for (evicted) counts the change.
+        let evicted = keccak256(b"f1-seed-evicted");
+        assert_eq!(note_registry_elf_hash(evicted, h1), 1);
+        assert_eq!(registry_elf_hash_previous(evicted), None);
+    }
+
+    /// F1: an elfHash flip-back (H1 -> H2 -> H1) used to leave the map at H2, so every measurement
+    /// made under H1 was dropped at the next resolve and the input executed again on every tick.
+    /// Every read now records the hash it saw: the measurement under H1 stands, the flip-back counts,
+    /// and a registrant that keeps flipping has its program skipped.
+    #[test]
+    fn an_elf_hash_flip_back_counts_and_ends_in_a_skip_not_a_loop() {
+        let (measured, desc_input) = fresh();
+        let prog = keccak256(b"f1-flip");
+        let desc = keccak256(b"f1-flip-desc");
+        let ih = keccak256(b"f1-flip-input");
+        insert_desc_input(&desc_input, desc, ih);
+        let (h1, h2) = (keccak256(b"f1-flip-elf-1"), keccak256(b"f1-flip-elf-2"));
+        let measure_under = |h: B256| {
+            insert_measurement(
+                &measured,
+                "sp1",
+                NO_PO2,
+                prog,
+                ih,
+                5_000,
+                7,
+                Some(h),
+                None,
+                0,
+            )
+        };
+
+        // Measured under H1 (the measure fetch read H1).
+        assert_eq!(observe_registry_elf_hash(prog, h1), 0);
+        measure_under(h1);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            Some(5_000)
+        );
+        // The registry names H2: the pre-claim fetch reads it, and the pre-claim arm's own note is
+        // then not a second change. The H1 measurement is dropped.
+        assert_eq!(record_registry_hash(true, prog, Some(h2)), Some(1));
+        assert_eq!(note_registry_elf_hash(prog, h2), 1);
+        assert_eq!(registry_elf_hash_previous(prog), Some(h1));
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            None
+        );
+        // Back to H1: the measure fetch reads H1, which counts, and its measurement stands. Before
+        // the fix the map stayed at H2 and this resolve dropped it again.
+        assert_eq!(record_registry_hash(true, prog, Some(h1)), Some(2));
+        assert_eq!(registry_elf_hash_previous(prog), Some(h2));
+        measure_under(h1);
+        for _ in 0..3 {
+            assert_eq!(
+                resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+                Some(5_000),
+                "the measurement under the hash just read stands"
+            );
+        }
+        assert!(!program_has_no_elf_source(prog));
+        // Flipping once more is past two changes in the hour: the program is skipped.
+        assert_eq!(record_registry_hash(true, prog, Some(h2)), Some(3));
+        assert!(program_has_no_elf_source(prog));
+    }
+
+    /// The re-measure cooldown: none before a first run, then 60 s doubling with each run inside an
+    /// hour, capped at 30 min, and forgotten after an hour.
+    #[test]
+    fn a_measured_input_waits_out_a_cooldown_before_it_executes_again() {
+        let secs = Duration::from_secs;
+        assert_eq!(measure_rerun_wait(0, secs(0)), None);
+        assert_eq!(measure_rerun_wait(1, secs(0)), Some(secs(60)));
+        assert_eq!(measure_rerun_wait(1, secs(5)), Some(secs(55)));
+        assert_eq!(measure_rerun_wait(1, secs(60)), None);
+        assert_eq!(measure_rerun_wait(2, secs(60)), Some(secs(60)));
+        assert_eq!(measure_rerun_wait(3, secs(0)), Some(secs(240)));
+        assert_eq!(measure_rerun_wait(6, secs(0)), Some(secs(30 * 60)));
+        assert_eq!(measure_rerun_wait(u32::MAX, secs(0)), Some(secs(30 * 60)));
+        assert_eq!(measure_rerun_wait(u32::MAX, secs(30 * 60)), None);
+        assert_eq!(measure_rerun_wait(6, secs(3600)), None);
+
+        // Recorded per (backend, size, program, input).
+        let key = (
+            backend_tag("sp1"),
+            NO_PO2,
+            keccak256(b"f1-cool"),
+            keccak256(b"f1-cool-in"),
+        );
+        let other_size = (backend_tag("risc0"), 20, key.2, key.3);
+        assert_eq!(
+            measure_rerun_wait_for(&key),
+            None,
+            "a first measurement runs at once"
+        );
+        note_measure_run(key);
+        let w = measure_rerun_wait_for(&key).expect("a re-run waits");
+        assert!(w <= secs(60) && w > secs(50), "{w:?}");
+        note_measure_run(key);
+        let w = measure_rerun_wait_for(&key).expect("a second re-run waits longer");
+        assert!(w <= secs(120) && w > secs(110), "{w:?}");
+        assert_eq!(
+            measure_rerun_wait_for(&other_size),
+            None,
+            "another size is not held"
+        );
+    }
+
+    /// N1: a download whose bytes hash to the registry's previous `elf_hash` is a rollout in
+    /// progress (the new hash set before its bytes were uploaded): a back-off, not a strike.
+    #[test]
+    fn old_bytes_after_an_elf_hash_change_back_off_instead_of_striking() {
+        use zkminer_chain::programs::{ElfHashMismatch, NoStorageUris};
+        let (old, other) = (keccak256(b"n1-old"), keccak256(b"n1-other"));
+        let mismatch = |served: Vec<B256>| -> anyhow::Error {
+            anyhow::Error::from(ElfHashMismatch::new(served, "ELF hash mismatch"))
+                .context("ELF download failed")
+        };
+        use MeasureFetchFailure::*;
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![old]), Some(old)),
+            RolloutPending
+        );
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![other, old]), Some(old)),
+            RolloutPending
+        );
+        // Bytes of anything else, or no earlier hash known: a strike, as before.
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![other]), Some(old)),
+            Strike
+        );
+        assert_eq!(measure_fetch_failure(&mismatch(vec![old]), None), Strike);
+        assert_eq!(
+            measure_fetch_failure(&anyhow::anyhow!("HTTP 500"), Some(old)),
+            Strike
+        );
+        // No ELF source: a back-off, as before.
+        assert_eq!(
+            measure_fetch_failure(&anyhow::Error::from(NoStorageUris).context("x"), Some(old)),
+            NoSource
+        );
+        assert_eq!(
+            measure_fetch_failure(
+                &anyhow::Error::from(RegistryUnavailable("down".into())),
+                None
+            ),
+            NoSource
+        );
+    }
+
     // A later cycle-only write to the SAME (program, input) replaces the whole entry, so a stale hash
     // can never outlive the measurement it belonged to.
     #[test]
@@ -21099,7 +21463,8 @@ mod r2_sizing_tests {
     }
 
     /// A refusal before the proof started blames no one, and a refusal on learned rates is tried
-    /// once more on the benchmark's; a proof cut at its cutoff marks a measured job, as before.
+    /// once more on the benchmark's; a proof cut at its cutoff marks a measured job, as before,
+    /// unless it was that retry.
     #[test]
     fn a_refusal_before_the_proof_started_is_not_the_submitters() {
         use DeadlineRefusalAction::*;
@@ -21111,7 +21476,11 @@ mod r2_sizing_tests {
             ((true, false, false, true), ReleaseNoMark),
             ((true, true, false, false), ReleaseNoMark),
             ((false, false, true, true), ReleaseAndMark),
-            ((false, true, false, true), ReleaseAndMark),
+            ((false, false, false, true), ReleaseAndMark),
+            // An overrun on the benchmark's rates after the retry is not the submitter's.
+            ((false, true, false, true), ReleaseNoMark),
+            ((false, true, true, true), ReleaseNoMark),
+            ((false, true, false, false), ReleaseNoMark),
             ((false, false, true, false), ReleaseNoMark),
         ];
         for ((before_start, retried, used_observed, rode), want) in table {
