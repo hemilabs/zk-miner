@@ -12,6 +12,13 @@
 //! Each worker is also in a job of its own inside that one ([`new_worker_job`]), which keeps it
 //! from the desktop: the clipboard, other processes' windows, the global atom table, the display
 //! and system settings. Those limits are never put on the miner's job, which the miner is in.
+//!
+//! The miner's job also ends any process in it, the miner included, on an unhandled exception.
+//! The miner's process is locked down (`windows_sandbox::lock_down_this_process`), so Windows Error
+//! Reporting cannot open it: a crash left the faulting thread stuck forever and the miner alive
+//! (no exit for a service manager to restart, locks held to their deadlines). The miner joins the
+//! job first thing ([`join_early`]), and its own crash handler (`windows_crash`) records the crash
+//! and exits before this applies; the job is the backstop if a library replaced that handler.
 
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
@@ -81,7 +88,8 @@ fn job() -> Result<*mut c_void, String> {
                 return Err(std::io::Error::last_os_error().to_string());
             }
             let mut info = ExtendedLimitInformation::default();
-            info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            info.basic.limit_flags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
             if SetInformationJobObject(
                 job,
                 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -120,6 +128,12 @@ pub(crate) fn join() {
              closed, end them by hand before the next start"
         );
     }
+}
+
+/// [`join`] for the miner's `main`, before anything else runs: from then on an unhandled exception
+/// ends the process (see the module docs). What went wrong, if it could not join.
+pub(crate) fn join_early() -> Result<(), String> {
+    job().map(|_| ())
 }
 
 /// Make the process `process` (pid `pid`) end when this process ends. Never fails the spawn: without

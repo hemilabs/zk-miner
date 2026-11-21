@@ -676,6 +676,14 @@ pub(crate) fn low_il_setup_failed(key: &str, program: &Path, why: &str) {
     );
 }
 
+/// Make `dir` (created if missing, with its parents) a directory whose files, made in it from now
+/// on, Low processes cannot read: for what a crash leaves behind. `dir` must be a directory, not a
+/// link to one ([`set_dir_label`]).
+pub(crate) fn make_no_read_up_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    set_dir_label(dir, "S:(ML;OICI;NWNR;;;ME)")
+}
+
 /// Make `dir` (created if missing) and everything made in it writable by Low processes. `dir` must
 /// be a directory, not a link to one ([`set_dir_label`]).
 fn label_low_writable(dir: &Path) -> io::Result<()> {
@@ -908,7 +916,7 @@ fn open_for(path: &Path, access: u32) -> io::Result<OwnedHandle> {
 
 /// Whether `path` has a label at Medium or above with no-read-up, as [`label_no_read_up`] sets:
 /// read back, so that a label that did not take never passes for one that did.
-fn has_no_read_up_label(path: &Path) -> io::Result<bool> {
+pub(crate) fn has_no_read_up_label(path: &Path) -> io::Result<bool> {
     #[link(name = "advapi32")]
     extern "system" {
         fn GetNamedSecurityInfoW(
