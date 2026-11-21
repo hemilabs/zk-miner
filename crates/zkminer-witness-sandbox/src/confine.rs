@@ -20,8 +20,12 @@
 //!   `fd`) to, a process outside its Landlock domain (the miner, other workers); no abstract Unix
 //!   socket of another domain. The miner can still signal it;
 //! - **kernel surface**: no namespace and no mount, no `userfaultfd`, `perf_event_open` or file
-//!   handles, and no metadata writes (mode, owner, extended attributes, times; see
-//!   [`crate::netdeny`]).
+//!   handles, no metadata writes (mode, owner, extended attributes, times), and nothing that
+//!   controls the host (modules, `kexec`, `reboot`, the clock, swap, port I/O; see
+//!   [`crate::netdeny`]);
+//! - **capabilities**: none, on any thread. A worker drops them all first thing in `main`, while
+//!   it has one thread ([`crate::drop_all_capabilities`]: a miner run as root would otherwise hand
+//!   them to its guests); the confinement checks it and refuses otherwise.
 //!
 //! Since Landlock does not govern the path walk (a `stat` or a lookup reaches any directory), a
 //! process confines itself only where no filesystem it can reach is a network or FUSE filesystem or
@@ -327,7 +331,8 @@ impl std::fmt::Display for ConfinementReport {
 /// a path lookup gets to, or under a path `c` grants), before applying anything.
 ///
 /// After applying it checks the result rather than the calls: `PR_GET_SECCOMP == 2`,
-/// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode, sockets of every kind refused,
+/// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode and holding no capability
+/// (the caller drops them first: [`crate::drop_all_capabilities`]), sockets of every kind refused,
 /// `unshare` refused and `clone3` unimplemented (no namespace), the root directory unreadable
 /// (Landlock is on), the parent process unreachable by signal, and still no filesystem in reach
 /// that is not local. Then it fails if a socket the policy does not let the process keep is still
@@ -525,6 +530,13 @@ fn verify(c: &Confinement) -> Result<Vec<&'static str>, SandboxError> {
         return fail(format!("thread {tid} is not in seccomp filter mode"));
     }
     passed.push("every thread filtered");
+    if let Some(tid) = crate::caps::threads_holding_capabilities()?.first() {
+        return fail(format!(
+            "thread {tid} holds a capability: the worker must drop them all while it has one \
+             thread (drop_all_capabilities)"
+        ));
+    }
+    passed.push("no capabilities");
     for (name, domain, kind) in [
         ("AF_INET", libc::AF_INET, libc::SOCK_STREAM),
         ("AF_INET6", libc::AF_INET6, libc::SOCK_DGRAM),

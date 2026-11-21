@@ -433,6 +433,29 @@ executor:
   `clone3` fails as unimplemented (`ENOSYS`), since a filter cannot see its flags; libc then falls
   back to `clone`, so threads, `fork` and `posix_spawn` keep working. The worker and the
   supervised server check that `unshare` and `clone3` are refused before they run anything.
+  Nothing that controls the host either, as in the sandbox profiles: kernel modules
+  (`init_module`, `finit_module`, `delete_module`), `kexec_load`, `kexec_file_load`, `reboot`,
+  the clock (`clock_settime`, `clock_adjtime`, `settimeofday`, `adjtimex`), `swapon`, `swapoff`,
+  `acct`, `quotactl`, `quotactl_fd`, `syslog`, `sethostname`, `setdomainname` and, on x86_64,
+  `iopl`, `ioperm` and `uselib`; `personality` may only be queried or reset to `PER_LINUX`. No GPU
+  runtime makes these calls. A unit test holds the inline list against the profiles', so a call
+  the profiles start refusing has to be decided on for the workers too.
+- **Capabilities.** None, on any thread. Every worker drops them all first thing in `main`, while
+  it has one thread (the bounding set too, where it may, then the ambient, inheritable, permitted
+  and effective sets; a worker that held any, or runs as uid 0, also sets `NO_NEW_PRIVS`, so no
+  `exec` gives one back), so every thread and process it ever has, `sp1-gpu-server` included,
+  starts with none; the confinement checks every thread (`/proc/self/task/*/status`) and refuses
+  otherwise, and so does the supervised server. For a worker of an unprivileged uid this changes
+  nothing. A miner run as root still runs its workers as uid 0, without capabilities: Landlock's
+  grants do not look at the uid, so a guest that escaped its executor could read root's files
+  among those a worker may read (`/etc` is one: `/etc/shadow`, SSH host keys, a service's
+  `EnvironmentFile`). So `zkminer run` as root on a bare host logs `PAGE: RUNNING-AS-ROOT`, and
+  `zkminer doctor` warns of it; in a container it is a warning (Docker's default capability set
+  and seccomp profile already refuse what root would add, and the container's `/etc` is its own).
+  The miner is not refused as root: the dashboard's GPU tuning needs it. A worker that dropped
+  to another uid as well would need its GPU device nodes, its provers (under `/root`, mode 0700),
+  `~/.sp1`, its GPU caches and its temporary directories to be that uid's; run the miner as an
+  unprivileged user instead.
 - **`sp1-gpu-server`** runs every SP1 proof's guest, so it is confined from its first
   instruction. The SDK starts it as `~/.sp1/bin/zkminer-confined-<name>`, a link to the worker,
   which starts the real server under a supervisor: the server's `socket`, `bind`, `listen` and

@@ -265,6 +265,7 @@ fn kernel_surface_checks(exec: Option<&Path>, mut report: impl FnMut(&str, bool,
         let (ok, detail) = refused_with(r, e, libc::EPERM);
         report(name, ok, detail);
     }
+    host_control_checks(&mut report);
     for (name, flag) in crate::netdeny::CLONE_NEW_FLAGS {
         let flags = (flag | libc::SIGCHLD) as libc::c_ulong;
         // SAFETY: a fork-like clone (no CLONE_VM, no new stack); a child, if the filter let one
@@ -308,6 +309,147 @@ fn kernel_surface_checks(exec: Option<&Path>, mut report: impl FnMut(&str, bool,
             r.as_ref().is_ok_and(|s| s.success()),
             format!("{r:?}"),
         );
+    }
+}
+
+/// The host-control calls (`netdeny::host_control`), each with arguments that make it fail with
+/// another errno, or succeed harmlessly, without the filter, even as root: no module image, an
+/// invalid `kexec` or `reboot` request, a bad pointer for the clock, swap and accounting, invalid
+/// swap flags. For an unprivileged caller the kernel's own answer to several of them (`reboot`,
+/// `init_module`, `kexec_load`, `delete_module`, `swapoff`, `acct`, `sethostname`) is `EPERM`
+/// too, checked before their arguments; the rest tell the filter apart. Then that `personality`
+/// can still be queried and not changed.
+fn host_control_checks(report: &mut impl FnMut(&str, bool, String)) {
+    let m1 = -1 as libc::c_long;
+    let null = std::ptr::null::<libc::c_char>();
+    // An address no mapping holds (1): copying from it fails with EFAULT.
+    let bad = std::ptr::dangling::<libc::c_char>();
+    // SAFETY (every call below): the arguments are invalid (EINVAL, EFAULT, EBADF) or the call a
+    // harmless one (`iopl(0)` keeps the level the process has), so nothing changes even unfiltered.
+    let mut calls: Vec<(&str, libc::c_long, i32)> = vec![
+        {
+            let (r, e) =
+                sys(|| unsafe { libc::syscall(libc::SYS_init_module, null, 0usize, null) });
+            ("init_module", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_finit_module, m1, null, m1) });
+            ("finit_module", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_delete_module, null, 0) });
+            ("delete_module", r, e)
+        },
+        // A flag neither call knows (and not KEXEC_ON_CRASH): EINVAL once past the capability
+        // check.
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_kexec_load, 0, 0, null, 0x4000) });
+            ("kexec_load", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(libc::SYS_kexec_file_load, m1, m1, 0, null, 0x4000)
+            });
+            ("kexec_file_load", r, e)
+        },
+        {
+            // No magic numbers: EINVAL once past the capability check.
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_reboot, 0, 0, 0, null) });
+            ("reboot", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(libc::SYS_clock_settime, libc::CLOCK_REALTIME, bad)
+            });
+            ("clock_settime", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe {
+                libc::syscall(libc::SYS_clock_adjtime, libc::CLOCK_REALTIME, bad)
+            });
+            ("clock_adjtime", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_settimeofday, bad, null) });
+            ("settimeofday", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_adjtimex, bad) });
+            ("adjtimex", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_swapon, bad, m1) });
+            ("swapon", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_swapoff, bad) });
+            ("swapoff", r, e)
+        },
+        {
+            // Not NULL, which would turn accounting off.
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_acct, bad) });
+            ("acct", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_quotactl, 0, bad, 0, null) });
+            ("quotactl", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_quotactl_fd, m1, 0, 0, null) });
+            ("quotactl_fd", r, e)
+        },
+        {
+            // SYSLOG_ACTION_SIZE_BUFFER: the size of the kernel log, where dmesg is not
+            // restricted.
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_syslog, 10, null, 0) });
+            ("syslog", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_sethostname, bad, m1) });
+            ("sethostname", r, e)
+        },
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_setdomainname, bad, m1) });
+            ("setdomainname", r, e)
+        },
+    ];
+    #[cfg(target_arch = "x86_64")]
+    calls.extend([
+        {
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_iopl, 0) });
+            ("iopl", r, e)
+        },
+        {
+            // from + num overflows: EINVAL.
+            let (r, e) = sys(|| unsafe { libc::syscall(libc::SYS_ioperm, m1, m1, 0) });
+            ("ioperm", r, e)
+        },
+    ]);
+    for (name, r, e) in calls {
+        let (ok, detail) = refused_with(r, e, libc::EPERM);
+        report(name, ok, detail);
+    }
+    // SAFETY: a query changes nothing.
+    let (r, e) = sys(|| unsafe { libc::personality(0xffff_ffff) } as libc::c_long);
+    report(
+        "personality_query",
+        r >= 0,
+        if r >= 0 {
+            format!("{r:#x}")
+        } else {
+            format!("errno {e}")
+        },
+    );
+    if r >= 0 {
+        let current = r as libc::c_ulong;
+        let changed = current | libc::ADDR_NO_RANDOMIZE as libc::c_ulong;
+        // SAFETY: a personality change; were it let through, the old one is put back at once.
+        let (r2, e2) = sys(|| unsafe { libc::personality(changed) } as libc::c_long);
+        if r2 >= 0 {
+            unsafe { libc::personality(current) };
+        }
+        let (ok, detail) = refused_with(r2, e2, libc::EPERM);
+        report("personality_change", ok, detail);
     }
 }
 
@@ -839,6 +981,17 @@ pub fn run_confined(args: &[OsString]) -> i32 {
     };
     // SAFETY: installing a handler that only stores to an atomic.
     unsafe { libc::signal(libc::SIGUSR1, on_sigusr1 as *const () as usize) };
+
+    // First, while it has one thread, as a worker's `main` does (a no-op unless run as root).
+    if let Err(e) = crate::drop_all_capabilities() {
+        check("capabilities_dropped", false, e);
+        return 1;
+    }
+    check(
+        "capabilities_dropped",
+        crate::capabilities_cleared(),
+        "capget: none held",
+    );
 
     // A thread from before the confinement, which tries its way out when told to.
     let (go_tx, go_rx) = std::sync::mpsc::channel::<PathBuf>();

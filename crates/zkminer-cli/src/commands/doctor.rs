@@ -345,6 +345,11 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
         },
     );
     let running = running.unwrap_or(false);
+    #[cfg(target_os = "linux")]
+    {
+        let (level, detail) = root_verdict(super::run::privilege::root_run_here());
+        report.say(level, "user", detail);
+    }
     if super::run::stop_request_path().exists() {
         report.say(
             Level::Warn,
@@ -506,6 +511,31 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
              `zkminer benchmark --calibrate` beforehand; a plain `zkminer benchmark` saves \
              nothing)",
         );
+    }
+}
+
+/// Linux: what running as this user means for the workers (review r4 LD2). Root on a bare host is
+/// a warning: the workers drop every capability, but as uid 0 they can still read root's files
+/// (`run::privilege`).
+#[cfg(target_os = "linux")]
+fn root_verdict(run: super::run::privilege::RootRun) -> (Level, String) {
+    use super::run::privilege::RootRun;
+    match run {
+        RootRun::NotRoot => (Level::Pass, "not root".to_string()),
+        RootRun::Container => (
+            Level::Info,
+            "root in a container: the workers drop every capability; `--user` or `--cap-drop=ALL \
+             --security-opt no-new-privileges` narrows it further"
+                .to_string(),
+        ),
+        RootRun::BareHost => (
+            Level::Warn,
+            "root on this host: the workers drop every capability, but as uid 0 they could still \
+             read root's files (/etc/shadow, SSH host keys, a service's environment file) after an \
+             executor escape. Run the miner as an unprivileged user in the render and video groups \
+             (contrib/zkminer.service); only the dashboard's GPU tuning needs root"
+                .to_string(),
+        ),
     }
 }
 
@@ -707,6 +737,18 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn doctor_warns_of_root_on_a_bare_host_only() {
+        use super::super::run::privilege::RootRun;
+        assert_eq!(root_verdict(RootRun::NotRoot).0, Level::Pass);
+        assert_eq!(root_verdict(RootRun::Container).0, Level::Info);
+        let (level, detail) = root_verdict(RootRun::BareHost);
+        assert_eq!(level, Level::Warn);
+        assert!(detail.contains("unprivileged user"), "{detail}");
+        assert!(!detail.contains("  "), "{detail}");
+    }
 
     /// The RPC URL is shown by host only: providers put API keys in the path or query.
     #[test]

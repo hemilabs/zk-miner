@@ -35,6 +35,10 @@ mod collateral;
 /// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
 mod segment_disk;
 
+/// A miner run as root: a `PAGE:` on a bare host (review r4 LD2).
+#[cfg(target_os = "linux")]
+pub(crate) mod privilege;
+
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
 const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
@@ -3501,6 +3505,19 @@ pub async fn run(
                  stop as soon as it starts",
                 stop_request_path().display()
             ),
+        }
+        // Root: allowed (the dashboard's GPU tuning needs it), but said loudly on a bare host.
+        #[cfg(target_os = "linux")]
+        {
+            let root = privilege::root_run_here();
+            if let Some(msg) = privilege::startup_line(root) {
+                if root == privilege::RootRun::BareHost {
+                    tracing::error!("{msg}");
+                    note_page(msg);
+                } else {
+                    tracing::warn!("{msg}");
+                }
+            }
         }
     }
     // The lock journal, read before anything starts. One this build must not rewrite (a newer format)

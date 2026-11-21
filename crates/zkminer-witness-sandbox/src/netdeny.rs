@@ -40,6 +40,19 @@
 //! live in memory, out of a filter's sight, and libc then falls back to `clone`, whose flags the
 //! filter reads (threads, `fork`, `vfork` and `posix_spawn` keep working).
 //!
+//! Nor does any of them control the host ([`host_control`], as the sandbox profiles refuse it):
+//! kernel modules (`init_module`, `finit_module`, `delete_module`), `kexec_load`,
+//! `kexec_file_load`, `reboot`, the clock (`clock_settime`, `clock_adjtime`, `settimeofday`,
+//! `adjtimex`, reads through the last two included), swap (`swapon`, `swapoff`), process
+//! accounting (`acct`), quotas (`quotactl`, `quotactl_fd`), the kernel log (`syslog`), the host
+//! and domain names (`sethostname`, `setdomainname`) and, on x86_64, port I/O (`iopl`, `ioperm`)
+//! and `uselib`. A process of an unprivileged uid gets `EPERM` for most of these from the kernel
+//! anyway; one of a miner run as root would not, were it not for the filter and for the
+//! capabilities every worker drops first ([`crate::drop_all_capabilities`]). No GPU runtime
+//! (CUDA, ROCm, Level Zero) makes these calls. `personality` may only be queried
+//! (`personality(0xffffffff)`) or reset to `PER_LINUX`: a change (`ADDR_NO_RANDOMIZE`,
+//! `READ_IMPLIES_EXEC`) would weaken what the process starts.
+//!
 //! Landlock has no right for a file's metadata, and a confined process runs as the miner's uid,
 //! which owns most of what it can name by path (keys, configuration, the provers, git hooks). So
 //! every policy also refuses metadata writes, by path and through an fd alike: mode (`chmod`,
@@ -155,8 +168,47 @@ fn always_denied() -> Vec<(&'static str, i64)> {
     ];
     #[cfg(target_arch = "x86_64")]
     v.push(("mknod", SYS_mknod));
+    v.extend(host_control());
     v
 }
+
+/// The host-control syscalls every policy refuses (see the module docs): those the sandbox
+/// profiles refuse too (`crate::restrict`), and the host and domain names.
+pub(crate) fn host_control() -> Vec<(&'static str, i64)> {
+    use libc::*;
+    let mut v = vec![
+        ("init_module", SYS_init_module),
+        ("finit_module", SYS_finit_module),
+        ("delete_module", SYS_delete_module),
+        ("kexec_load", SYS_kexec_load),
+        ("kexec_file_load", SYS_kexec_file_load),
+        ("reboot", SYS_reboot),
+        ("clock_settime", SYS_clock_settime),
+        ("clock_adjtime", SYS_clock_adjtime),
+        ("settimeofday", SYS_settimeofday),
+        ("adjtimex", SYS_adjtimex),
+        ("swapon", SYS_swapon),
+        ("swapoff", SYS_swapoff),
+        ("acct", SYS_acct),
+        ("quotactl", SYS_quotactl),
+        ("quotactl_fd", SYS_quotactl_fd),
+        ("syslog", SYS_syslog),
+        ("sethostname", SYS_sethostname),
+        ("setdomainname", SYS_setdomainname),
+    ];
+    #[cfg(target_arch = "x86_64")]
+    v.extend([
+        ("iopl", SYS_iopl),
+        ("ioperm", SYS_ioperm),
+        ("uselib", SYS_uselib),
+    ]);
+    v
+}
+
+/// `personality(0xffffffff)`: a query, which changes nothing.
+pub(crate) const PERSONALITY_QUERY: u64 = 0xffff_ffff;
+/// `PER_LINUX`: the default personality, no flags (not in libc 0.2.191).
+pub(crate) const PER_LINUX: u64 = 0;
 
 /// Metadata writes that every policy refuses (see the module docs), by path and through an fd.
 fn metadata_writes() -> Vec<(&'static str, i64)> {
@@ -334,6 +386,15 @@ fn conditional_denials(sockets: Sockets) -> Result<Vec<(i64, Vec<SeccompRule>)>,
         (
             libc::SYS_prctl,
             vec![rule(vec![cond(0, Eq, PR_SET_PTRACER as u64)?])?],
+        ),
+        // A query, or a reset to PER_LINUX, and nothing else (see the module docs). The kernel
+        // reads an `unsigned int`, as these `Dword` comparisons do.
+        (
+            libc::SYS_personality,
+            vec![rule(vec![
+                cond(0, Ne, PERSONALITY_QUERY)?,
+                cond(0, Ne, PER_LINUX)?,
+            ])?],
         ),
         // Threads, `fork`, `vfork` and `posix_spawn`, never a new namespace. The kernel reads
         // only the low 32 bits of the flags, and so do these `Dword` comparisons.
@@ -1297,6 +1358,173 @@ pub(crate) mod tests {
                     RET_EPERM
                 );
             }
+        }
+    }
+
+    /// Review r4 LD2: the host-control calls, by their numbers on this architecture (so a wrong
+    /// constant fails here, not only a missing name), refused under every policy whatever their
+    /// arguments.
+    #[test]
+    fn host_control_calls_are_refused() {
+        #[cfg(target_arch = "x86_64")]
+        let expected: &[(&str, i64)] = &[
+            ("init_module", 175),
+            ("finit_module", 313),
+            ("delete_module", 176),
+            ("kexec_load", 246),
+            ("kexec_file_load", 320),
+            ("reboot", 169),
+            ("clock_settime", 227),
+            ("clock_adjtime", 305),
+            ("settimeofday", 164),
+            ("adjtimex", 159),
+            ("swapon", 167),
+            ("swapoff", 168),
+            ("acct", 163),
+            ("quotactl", 179),
+            ("quotactl_fd", 443),
+            ("syslog", 103),
+            ("sethostname", 170),
+            ("setdomainname", 171),
+            ("iopl", 172),
+            ("ioperm", 173),
+            ("uselib", 134),
+        ];
+        #[cfg(target_arch = "aarch64")]
+        let expected: &[(&str, i64)] = &[
+            ("init_module", 105),
+            ("finit_module", 273),
+            ("delete_module", 106),
+            ("kexec_load", 104),
+            ("kexec_file_load", 294),
+            ("reboot", 142),
+            ("clock_settime", 112),
+            ("clock_adjtime", 266),
+            ("settimeofday", 170),
+            ("adjtimex", 171),
+            ("swapon", 224),
+            ("swapoff", 225),
+            ("acct", 89),
+            ("quotactl", 60),
+            ("quotactl_fd", 443),
+            ("syslog", 116),
+            ("sethostname", 161),
+            ("setdomainname", 162),
+        ];
+        let listed = host_control();
+        assert_eq!(listed.len(), expected.len(), "{listed:?}");
+        let denied = always_denied();
+        for &(name, nr) in expected {
+            assert!(listed.contains(&(name, nr)), "{name} ({nr}) is not listed");
+            assert!(denied.contains(&(name, nr)), "{name} is not always denied");
+            for policy in POLICIES {
+                for args in [[0; 6], [u64::MAX; 6], [1, 2, 3, 4, 5, 6]] {
+                    assert_eq!(
+                        call(policy, nr, args),
+                        RET_EPERM,
+                        "{policy:?} {name} {args:x?}"
+                    );
+                }
+                // Its x32 alias too, on x86_64 (every x32 call is).
+                #[cfg(target_arch = "x86_64")]
+                assert_eq!(call(policy, 0x4000_0000 | nr, [0; 6]), RET_EPERM);
+            }
+        }
+    }
+
+    #[test]
+    fn personality_may_be_queried_or_reset_and_not_changed() {
+        use libc::*;
+        for policy in POLICIES {
+            let c = |persona: u64| call(policy, SYS_personality, [persona, 0, 0, 0, 0, 0]);
+            assert_eq!(c(PERSONALITY_QUERY), RET_ALLOW, "{policy:?} query");
+            assert_eq!(c(PER_LINUX), RET_ALLOW, "{policy:?} PER_LINUX");
+            // The kernel reads an unsigned int: the upper half changes nothing either way.
+            assert_eq!(c(0xffff_ffff_0000_0000 | PERSONALITY_QUERY), RET_ALLOW);
+            for persona in [
+                ADDR_NO_RANDOMIZE as u64,
+                READ_IMPLIES_EXEC as u64,
+                ADDR_COMPAT_LAYOUT as u64,
+                MMAP_PAGE_ZERO as u64,
+                // PER_LINUX32, PER_BSD
+                0x0008,
+                0x0006,
+                0xffff_fffe,
+                (1 << 32) | ADDR_NO_RANDOMIZE as u64,
+            ] {
+                assert_eq!(
+                    c(persona),
+                    RET_EPERM,
+                    "{policy:?} personality({persona:#x})"
+                );
+            }
+        }
+    }
+
+    /// The witness sandbox profiles (`crate::restrict`) refuse every syscall these policies do not
+    /// need. Each one they refuse is refused here too, unless it is listed below with why an inline
+    /// worker keeps it: a call added to their list must be decided on here, so the two lists cannot
+    /// drift apart unnoticed (review r4 LD2 found them apart).
+    #[test]
+    fn what_the_sandbox_profiles_refuse_is_refused_here_or_needed() {
+        let kept_inline = [
+            // The GPU stack starts helper processes, and the SP1 worker its server.
+            "execve",
+            "execveat",
+            "fork",
+            "vfork",
+            // NUMA placement (ROCm's runtime moves pages between nodes); another process's pages
+            // need ptrace access, which Landlock's domain and the uid's other processes deny.
+            "migrate_pages",
+            "move_pages",
+            "process_madvise",
+            // SysV IPC, file locks and watches on what Landlock grants: not host control, kept as
+            // they were, and not ruled out for the GPU runtimes.
+            "shmget",
+            "shmat",
+            "shmdt",
+            "shmctl",
+            "msgget",
+            "msgsnd",
+            "msgrcv",
+            "msgctl",
+            "semget",
+            "semop",
+            "semtimedop",
+            "semctl",
+            "flock",
+            "inotify_add_watch",
+            // Reads an inode's attributes; `file_setattr` is refused.
+            "file_getattr",
+            // Need CAP_SYS_ADMIN (fanotify for anything a worker could watch) or change only the
+            // process's own LSM label.
+            "fanotify_init",
+            "fanotify_mark",
+            "lsm_set_self_attr",
+        ];
+        let broker = crate::Profile::Broker {
+            readable: Vec::new(),
+            writable: Vec::new(),
+        };
+        // The broker's list is the one every profile refuses (`always_denied` in `restrict`).
+        let profile_denied = crate::restrict::denied_syscalls(&broker);
+        for d in &profile_denied {
+            if kept_inline.contains(&d.name) {
+                continue;
+            }
+            // Arguments that are neither a personality query nor PER_LINUX.
+            assert_eq!(
+                call(Sockets::None, d.nr, [1, 2, 3, 4, 5, 6]),
+                RET_EPERM,
+                "{} is refused by the sandbox profiles but not by Sockets::None",
+                d.name
+            );
+        }
+        for name in kept_inline {
+            assert!(
+                profile_denied.iter().any(|d| d.name == name),
+                "{name} is no longer refused by the sandbox profiles: remove it from this list"
+            );
         }
     }
 

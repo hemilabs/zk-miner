@@ -23,9 +23,10 @@
 //!   its runtime is up. Its network connections are made for it by the miner's connector.
 //!
 //! The miner's inline measuring and proving workers, which run requester guests outside these
-//! profiles (the GPU stack needs files, devices and threads a profile does not allow), confine
-//! themselves with [`confine`] before their first guest: Landlock and seccomp, no sockets. An SP1
-//! worker's `sp1-gpu-server` runs under [`supervise`].
+//! profiles (the GPU stack needs files, devices and threads a profile does not allow), drop every
+//! capability first thing in `main` ([`drop_all_capabilities`]) and confine themselves with
+//! [`confine`] before their first guest: Landlock and seccomp, no sockets. An SP1 worker's
+//! `sp1-gpu-server` runs under [`supervise`].
 //!
 //! Every one of them refuses to start while a network or FUSE filesystem, or an automount map, is
 //! within reach ([`localfs`]): Landlock does not restrict the path walk, and a lookup there would
@@ -47,6 +48,7 @@
 
 use std::path::PathBuf;
 
+mod caps;
 mod cgroup;
 pub mod confine;
 #[doc(hidden)]
@@ -60,6 +62,7 @@ mod selftest;
 mod spawn;
 pub mod supervise;
 
+pub use caps::{capabilities_cleared, drop_all_capabilities};
 pub use cgroup::{delegated_root, Cgroup};
 pub use restrict::{
     landlock_abi, restrict_self, seal_socket_creation, set_socket_option, SocketOption, BROKER_SOCKET_OPTION,
@@ -122,6 +125,8 @@ pub enum SandboxError {
     NotDelegated { cgroup: PathBuf, reason: String },
     #[error("cgroup: {0}")]
     Cgroup(String),
+    #[error("capabilities: {0}")]
+    Capabilities(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error(
