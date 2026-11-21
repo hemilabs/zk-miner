@@ -235,12 +235,14 @@ mod tests {
 
     /// In a process of its own: the test harness has threads, and capabilities are per thread.
     /// The child drops everything, then reports what it sees; as an unprivileged user (CI) this
-    /// checks that the drop is a harmless no-op, as root that it drops the lot.
+    /// checks that the drop is a harmless no-op, as root that it drops the lot. (That threads
+    /// started afterwards inherit the empty sets is checked live, by the confined probe of
+    /// `tests/confine.rs`: its confinement checks every thread.)
     #[test]
     fn dropping_every_capability_leaves_none_on_any_thread() {
-        // SAFETY: the child reads /proc, allocates and starts a thread, which glibc allows after
-        // `fork` (its malloc resets its locks in the child); it leaves through `_exit`, with the
-        // verdict as its exit code.
+        // SAFETY: the child only reads /proc and allocates, which glibc allows after `fork` (its
+        // malloc resets its locks in the child), and starts no thread; it leaves through `_exit`,
+        // with the verdict as its exit code.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
@@ -258,14 +260,6 @@ mod tests {
                 }
                 // A second call changes nothing and still succeeds.
                 Ok(()) if drop_all_capabilities().is_err() => 5,
-                // A thread started afterwards inherits the empty sets.
-                Ok(())
-                    if !std::thread::spawn(capabilities_cleared)
-                        .join()
-                        .unwrap_or(false) =>
-                {
-                    6
-                }
                 Ok(()) => 0,
             };
             // SAFETY: leaving the child without running the harness's exit handlers.
