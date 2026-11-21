@@ -462,8 +462,16 @@ Worth knowing:
   It refuses an administrator's account as a service too (UAC filters no service logon), and a
   start that cannot tell which account it runs as.
   `ZKMINER_DANGEROUSLY_ALLOW_PRIVILEGED_ACCOUNT=1` runs it anyway, paged at every start. An
-  elevated (administrator) console is paged, not refused, and an administrator's console that is
-  not elevated is warned of. From an administrator console:
+  elevated (administrator) console is paged (`PAGE: ELEVATED`), not refused, and so is an
+  administrator's OpenSSH, WinRM or PsExec logon or a "highest privileges" scheduled task (only a
+  token with the SERVICE group counts as a service); an administrator's console that is not
+  elevated is warned of. A refused start whose journal holds locks proves none of them: it holds
+  them, starting no worker, pages `PRIVILEGED-ACCOUNT` every 5 minutes, and releases each one only
+  as its cutoff comes near (the release penalty is the job's flat one, 5% by default, the same as
+  at once), so stopping it and starting the miner as the right account in the meantime still
+  proves them. `zkminer stop` stops it keeping what is left, `zkminer stop --abandon` releases
+  everything now, and `zkminer run --release-held` releases everything at once from the start.
+  From an administrator console:
 
   ```
   net user zkminer * /add
@@ -524,9 +532,9 @@ Worth knowing:
   (`psexec -s`; its home was `C:\Windows\System32\config\systemprofile\.zkminer`) so it finishes
   or releases its locks, then change the account. A miner started in the new account's home does
   not see the old journal, so locks kept there are never driven. A LocalSystem service upgraded
-  in place to this build while it holds locks does not prove them: it releases each one (at its
-  penalty, starting no worker), pages `PRIVILEGED-ACCOUNT`, and exits with the refusal and the
-  list of what it released; what it could not release is tried again at the next start. Consider
+  in place to this build while it holds locks does not prove them: it holds them and releases
+  each one near its cutoff (above), then exits with the refusal and the list of what it
+  released; what it could not release is tried again at the next start. Consider
   a key that was in
   `AppEnvironmentExtra` exposed. A service wrapper's stop (NSSM sends Ctrl+C, then kills the
   process after its timeout) starts a drain it then cuts off: run `zkminer stop --wait` (as the

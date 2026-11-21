@@ -50,6 +50,9 @@ pub(crate) mod privilege;
 /// Linux: the key's files readable by others, and who can replace the miner (review r6 LS1, LS3).
 #[cfg(target_os = "linux")]
 pub(crate) mod file_access;
+/// Windows: a refused account's held locks, each released at its keep horizon (review 6 CR6-1).
+#[cfg(windows)]
+mod refused;
 
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
@@ -3522,99 +3525,16 @@ pub(crate) fn refused_account_mode(
 
 /// Windows: `zkminer run` refused its account (`refusal`, see [`refused_account_mode`]) with locks
 /// in the journal. Proving them would run requesters' guests as that account, and refusing outright
-/// strands them until they are slashed; so each is released, at its penalty, nearest cutoff first,
-/// with no worker ever started and no claim taken: only the chain client runs here, and
-/// `release_and_clean` keeps a lock where the abandon path would (a pause, a state it cannot read).
-/// Then the refusal, with what was released and what was not. A service manager that restarts the
-/// miner gets the plain refusal once the journal is empty, and tries the rest again before that.
+/// strands them until they are slashed; so it holds them, starting no worker and taking no claim,
+/// pages, and releases each only as its cutoff comes within the keep horizon (`release_held`: all
+/// at once), answering `zkminer stop` meanwhile. See `refused`.
 #[cfg(windows)]
-pub async fn release_for_refused_account(config_path: Option<&Path>, refusal: &str) -> Result<()> {
-    let config = ZkMinerConfig::load(config_path)?;
-    config.validate_for_chain()?;
-    hold_instance_lock("miner")?;
-    // Nothing here claims, but every check of it says the same.
-    HELD_LOCKS_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
-    let path = JobJournal::default_path();
-    let journal = JobJournal::load_checked().map_err(|e| {
-        anyhow::anyhow!(
-            "{}",
-            refused_account_mode(refusal.to_string(), Some(Err(e))).unwrap_err()
-        )
-    })?;
-    let mut held: Vec<(u64, B256)> = journal
-        .iter()
-        .map(|e| (e.lock_deadline, e.job_id))
-        .collect();
-    // As the abandon path: an unknown cutoff (0) last.
-    held.sort_by_key(|(d, _)| if *d == 0 { u64::MAX } else { *d });
-    let earliest = held
-        .iter()
-        .map(|(d, _)| *d)
-        .filter(|d| *d > 0)
-        .min()
-        .map_or_else(|| "unknown".to_string(), zkminer_chain::exit::fmt_unix);
-    let msg = format!(
-        "PAGE: PRIVILEGED-ACCOUNT refused; releasing {} held lock(s) (earliest cutoff {earliest}) \
-         without proving them, then exiting. {refusal}",
-        held.len()
-    );
-    tracing::error!("{msg}");
-    let client = ChainClient::new(&config, load_signer(&config.wallet)?).await?;
-    let state = new_shared_state();
-    let journal: SharedJournal = Arc::new(Mutex::new(journal));
-    let now = zkminer_chain::client::chain_now_floor();
-    // Nonces in cutoff order (the nonce is a release's on-chain priority); those past their
-    // recorded cutoff after every live one, with none reserved (most send nothing).
-    let mut releasing = Vec::new();
-    let mut past = Vec::new();
-    for &(deadline, jid) in &held {
-        if deadline != 0 && deadline <= now {
-            past.push(jid);
-            continue;
-        }
-        tracing::info!(
-            "releasing job {} ({})",
-            short_id(jid),
-            if deadline == 0 {
-                "cutoff unknown".to_string()
-            } else {
-                format!("{}s of deadline left", deadline - now)
-            }
-        );
-        let pre_nonce = client.reserve_nonce().await.ok();
-        let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
-        releasing.push(tokio::spawn(async move {
-            release_and_clean_with_nonce(&c, &st, &jr, jid, pre_nonce).await;
-        }));
-    }
-    for jid in past {
-        let (c, st, jr) = (client.clone(), state.clone(), journal.clone());
-        releasing.push(tokio::spawn(async move {
-            release_and_clean_with_nonce(&c, &st, &jr, jid, None).await;
-        }));
-    }
-    for task in releasing {
-        let _ = task.await;
-    }
-    let lines: Vec<String> = {
-        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
-        held.iter()
-            .map(|&(_, jid)| match j.entries.contains_key(&jid) {
-                false => format!("  {jid}: released"),
-                true => format!(
-                    "  {jid}: NOT released ({}); the next start tries again",
-                    kept_reason_of(jid).unwrap_or_else(|| "the release did not confirm".into())
-                ),
-            })
-            .collect()
-    };
-    anyhow::bail!(
-        "{refusal}\n\n{} lock(s) were held in {}; released without proving them (no worker was \
-         started):\n{}",
-        held.len(),
-        path.display(),
-        lines.join("\n")
-    )
+pub async fn release_for_refused_account(
+    config_path: Option<&Path>,
+    refusal: &str,
+    release_held: bool,
+) -> Result<()> {
+    refused::hold_and_release(config_path, refusal, release_held).await
 }
 
 #[cfg(all(test, windows))]
