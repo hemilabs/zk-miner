@@ -501,6 +501,10 @@ Worth knowing:
 - **`PAGE:` lines need a human.** They say claiming has stopped (the deployment or proof
   system failed its check, the protocol is paused, the clock is off, funds are short) or a
   lock is at risk. The dashboard shows them; headless, they go to stderr.
+  `PAGE: ESTIMATE-OVERRUN <card>` says jobs claimed on that card's benchmark rate overran their
+  cutoff (a release penalty each) after its learned rate had refused them: the card is proving
+  slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
+  for it are sized on the learned rate; re-run `zkminer benchmark` once the cause is fixed.
 - **Drain before an upgrade that changes the `sys_rand` rule.** risc0 guests' randomness is a
   public function of the program and input (`crates/zkminer-prover-protocol/src/sys_rand.rs`), so
   a measurement and the proof after it agree on any host, and no key needs keeping (an old
