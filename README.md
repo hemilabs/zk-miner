@@ -799,17 +799,27 @@ Worth knowing:
   at once), so stopping it and starting the miner as the right account in the meantime still
   proves them. `zkminer stop` stops it keeping what is left, `zkminer stop --abandon` releases
   everything now, and `zkminer run --release-held` releases everything at once from the start.
-  From an administrator console:
+  From an administrator PowerShell:
 
   ```
   net user zkminer * /add
+  Set-LocalUser -Name zkminer -PasswordNeverExpires $true
   copy nssm.exe "C:\Program Files\zkminer\"
   cd "C:\Program Files\zkminer"
   .\nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
   .\nssm set zkminer ObjectName .\zkminer <password>
   .\nssm set zkminer AppStopMethodConsole 3900000
-  sc privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
+  sc.exe privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
   ```
+
+  A local account's password expires after 42 days by default, and a service whose password has
+  expired fails to log on at its next start: nothing runs, and every lock kept for that start is
+  slashed. `Set-LocalUser ... -PasswordNeverExpires $true` (or `wmic useraccount where
+  name='zkminer' set PasswordExpires=false`; not `net user /expires:never`, which is the
+  account's expiry, not its password's) prevents that. `zkminer doctor` fails while the service's
+  account has a password that can expire, has expired, or is disabled or locked out, and the
+  miner pages it at start-up (`PAGE: PASSWORD-EXPIRES`, again daily once it is two weeks away).
+  Log on as the account (`runas /user:zkminer cmd`) only after the flag is set.
 
   A service logon gives the account `SeImpersonatePrivilege` through the SERVICE group, and with
   it a guest that broke out of a worker could make itself SYSTEM. `sc privs` leaves the service

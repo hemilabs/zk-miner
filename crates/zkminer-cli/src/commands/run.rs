@@ -3685,6 +3685,11 @@ pub async fn run(
     // Windows: a service account `main` was told to let through, or an elevated token, paged.
     #[cfg(windows)]
     zkminer_prover::windows_sandbox::page_account_risk();
+    // Windows, as a service: a password that can expire fails a later start's logon (OJ-1).
+    #[cfg(windows)]
+    if zkminer_prover::windows_account::is_service_logon().unwrap_or(false) {
+        super::windows_service::watch_own_password();
+    }
     // Windows: the privileges `main` removed from this process (and so from its workers), or a
     // page if it could not and was told to start anyway.
     #[cfg(windows)]

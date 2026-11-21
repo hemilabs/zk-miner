@@ -19,7 +19,9 @@ pub mod simulate_witness;
 pub mod sp1_demo;
 pub mod stake;
 pub mod status;
-pub mod witness;
-pub mod witness_tools;
 pub mod stop;
 pub mod unstake;
+pub mod witness;
+pub mod witness_tools;
+#[cfg(windows)]
+pub mod windows_service;
