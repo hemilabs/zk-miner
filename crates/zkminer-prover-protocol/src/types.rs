@@ -1815,6 +1815,11 @@ impl std::error::Error for GpuMemoryShortage {}
 pub struct ProofDeadlineReached {
     /// Human-readable detail: which slot, how much budget was left, and at which stage.
     pub detail: String,
+    /// Whether no proof of the job started before the refusal: no card could finish it in time by
+    /// its estimate, or the time to start ran out while it waited. Such a refusal rests on this
+    /// host's estimates and queue, never on what the guest did, so the caller does not blame the
+    /// job's submitter for it.
+    pub before_start: bool,
 }
 
 impl std::fmt::Display for ProofDeadlineReached {

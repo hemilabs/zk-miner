@@ -6614,7 +6614,10 @@ impl WorkerPool {
             return Ok(());
         }
         let deadline = |detail: String| {
-            anyhow::Error::new(zkminer_prover_protocol::types::ProofDeadlineReached { detail })
+            anyhow::Error::new(zkminer_prover_protocol::types::ProofDeadlineReached {
+                detail,
+                before_start: true,
+            })
         };
         let give_up_at = abort_at.map(|at| at.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(at));
         let timeout = match give_up_at {
@@ -9843,6 +9846,7 @@ impl WorkerPool {
                         detail: "no card here can finish it before its deadline cutoff now \
                                  (releasing to recover collateral)"
                             .to_string(),
+                        before_start: true,
                     },
                 ));
             }
@@ -9856,6 +9860,7 @@ impl WorkerPool {
                             detail: "deadline cutoff reached while queued for a worker \
                                      (releasing to recover collateral)"
                                 .to_string(),
+                            before_start: true,
                         },
                     ));
                 }
@@ -12763,6 +12768,7 @@ impl WorkerPool {
                                      on that card is still using it and too little time is left to \
                                      start (releasing to recover collateral)"
                                 ),
+                                before_start: true,
                             },
                         ));
                     }
@@ -13008,6 +13014,7 @@ impl WorkerPool {
                                          measurement is holding it and too little time is left to \
                                          start (releasing to recover collateral)"
                                     ),
+                                    before_start: true,
                                 },
                             ));
                         }
@@ -13353,6 +13360,7 @@ impl WorkerPool {
                                      cutoff, and this card first needs another worker of ours \
                                      recycled to make room (releasing to recover collateral)"
                                 ),
+                                before_start: true,
                             },
                         ));
                     }
@@ -13633,6 +13641,7 @@ impl WorkerPool {
                                          measurement is holding it and too little time is left to \
                                          start (releasing to recover collateral)"
                                     ),
+                                    before_start: true,
                                 },
                             ));
                         }
@@ -13923,6 +13932,7 @@ impl WorkerPool {
                                  deadline cutoff after the GPU queue wait — not starting \
                                  (releasing to recover collateral)"
                             ),
+                            before_start: true,
                         },
                     ));
                 }
@@ -14228,6 +14238,7 @@ impl WorkerPool {
                                 "proof on {key} stopped: job deadline reached mid-proof \
                                  (releasing to recover collateral)"
                             ),
+                            before_start: false,
                         },
                     ));
                 }
@@ -21830,6 +21841,44 @@ mod learned_host_peak_tests {
             assert!(finishes_in_time("sp1:cuda:9", abort));
         });
         assert!(finishes_in_time("sp1:cuda:1", abort));
+    }
+
+    /// A job no card can finish by its estimate is refused before any proof starts, and the refusal
+    /// says so (`before_start`): it rests on this host's estimate, not on the job.
+    #[test]
+    fn a_refusal_on_the_estimate_is_marked_before_start() {
+        let pool = pool(&["sp1:cuda:0", "sp1:cuda:1"]);
+        let abort = Some(Instant::now() + Duration::from_secs(300));
+        let estimates = HashMap::from([
+            ("sp1:cuda:0".to_string(), Duration::from_secs(400)),
+            ("sp1:cuda:1".to_string(), Duration::from_secs(900)),
+        ]);
+        let mut used = None;
+        let err = with_slot_estimates(estimates, || {
+            pool.prove_min_vram(
+                "sp1",
+                &[],
+                &[],
+                None,
+                Some(Duration::from_secs(60)),
+                None,
+                None,
+                &[],
+                &[],
+                &mut used,
+                abort,
+                None,
+                None,
+                JobCards::default(),
+                0,
+            )
+        })
+        .unwrap_err();
+        let refusal = err
+            .downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
+            .expect("a deadline refusal");
+        assert!(refusal.before_start, "{err:#}");
+        assert_eq!(used, None, "no slot was picked");
     }
 
     /// A job leaves a free slow card for a busy fast one that frees soon enough to finish it well

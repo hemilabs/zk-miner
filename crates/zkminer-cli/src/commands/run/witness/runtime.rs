@@ -210,15 +210,28 @@ impl Phase {
 struct Task {
     token: AbortToken,
     phase: Phase,
+    /// The card (benchmark device id) [`take_card`] booked for its proof, while it holds one: no
+    /// other witness claim takes that card meanwhile. `None`: any card (the job fits every one).
+    card: Option<String>,
+}
+
+impl Task {
+    fn new(token: AbortToken, phase: Phase) -> Self {
+        Task { token, phase, card: None }
+    }
 }
 
 /// Takes a card for `jid`'s claim, in one step with the check that one is free: under the tasks
 /// lock, a task that is simulating becomes `Claiming` only while the inline jobs needing a card
-/// (`cards`, the brain's latest view) and every task already holding one leave room under the cap.
-/// Two simulations that finish together can then never both claim the host's last card. `true` also
+/// (`cards`, the brain's latest view) and every task already holding one leave room under the cap,
+/// and, when the job fits only some cards (`fits`, benchmark device ids, fastest first; empty: any
+/// card), one of those is neither proving an inline job (`busy`, the brain's view) nor booked by
+/// another witness claim. That card is booked for it. A count alone claimed a job that fits only
+/// the busy 5090 while the 4070 was free, and its proof waited there past its cutoff. Two
+/// simulations that finish together can then never both claim the host's last card. `true` also
 /// when the task already holds one; `false` when no card is free, the brain has not said yet, or
 /// `jid` has no task.
-fn take_card(tasks: &mut HashMap<B256, Task>, cards: Option<(usize, usize)>, jid: B256) -> bool {
+fn take_card(tasks: &mut HashMap<B256, Task>, cards: Option<(usize, usize)>, busy: &[String], jid: B256, fits: &[String]) -> bool {
     match tasks.get(&jid).map(|t| t.phase) {
         None => return false,
         Some(p) if p.holds_card() => return true,
@@ -228,8 +241,18 @@ fn take_card(tasks: &mut HashMap<B256, Task>, cards: Option<(usize, usize)>, jid
     if !cards.is_some_and(|(inline, max)| card_room(inline, held, max)) {
         return false;
     }
+    let card = if fits.is_empty() {
+        None
+    } else {
+        let booked: Vec<&String> = tasks.values().filter(|t| t.phase.holds_card()).filter_map(|t| t.card.as_ref()).collect();
+        match fits.iter().find(|d| !busy.contains(d) && !booked.contains(d)) {
+            Some(d) => Some(d.clone()),
+            None => return false,
+        }
+    };
     if let Some(t) = tasks.get_mut(&jid) {
         t.phase = Phase::Claiming;
+        t.card = card;
     }
     true
 }
@@ -240,6 +263,7 @@ fn give_back_card(tasks: &mut HashMap<B256, Task>, jid: B256) {
     if let Some(t) = tasks.get_mut(&jid) {
         if t.phase == Phase::Claiming {
             t.phase = Phase::Simulating;
+            t.card = None;
         }
     }
 }
@@ -415,6 +439,9 @@ struct GateOk {
     fulfil_gas: u64,
     /// What the claim may lock, and whose job it is, for the collateral cap (`run::collateral`).
     exposure: run::collateral::Exposure,
+    /// The cards (benchmark device ids) it fits, fastest first; empty: any card. Its claim needs one
+    /// of them free ([`take_card`]).
+    fits: Vec<String>,
 }
 
 /// A held witness lock, as the prove and fulfil steps need it.
@@ -524,6 +551,8 @@ pub(crate) struct WitnessRuntime {
     execute_build: Mutex<Option<String>>,
     /// The brain's view of the cards, each tick: inline jobs still needing a card, and the cap.
     cards: Mutex<Option<(usize, usize)>>,
+    /// The cards (benchmark device ids) inline jobs are proving on, each tick (the brain's view).
+    busy_cards: Mutex<Vec<String>>,
     /// A brain recovery pass with a complete chain scan has handed over every witness lock it decided.
     brain_recovered: AtomicBool,
     /// Witness locks recovery handed over whose bundle is not pinned yet: eviction waits for them.
@@ -684,6 +713,7 @@ impl WitnessRuntime {
             store_pass_running: AtomicBool::new(false),
             execute_build: Mutex::new(None),
             cards: Mutex::new(None),
+            busy_cards: Mutex::new(Vec::new()),
             brain_recovered: AtomicBool::new(false),
             unpinned_recoveries: Mutex::new(HashSet::new()),
             undecided: Mutex::new(HashSet::new()),
@@ -1075,10 +1105,11 @@ impl WitnessRuntime {
         lock(&self.tasks).contains_key(&jid)
     }
 
-    /// The brain's view of the cards this tick: inline jobs still needing a card, and the
-    /// concurrency cap. A witness lock is taken only while a card is free for it (see
-    /// [`card_room`]).
-    pub(crate) fn note_cards(&self, inline_needing: usize, max_concurrent: usize) {
+    /// The brain's view of the cards this tick: inline jobs still needing a card, the concurrency
+    /// cap, and the cards (benchmark device ids) inline jobs are proving on. A witness lock is taken
+    /// only while a card is free for it (see [`card_room`] and [`take_card`]).
+    pub(crate) fn note_cards(&self, inline_needing: usize, max_concurrent: usize, busy: Vec<String>) {
+        *lock(&self.busy_cards) = busy;
         *lock(&self.cards) = Some((inline_needing, max_concurrent));
     }
 
@@ -1094,10 +1125,12 @@ impl WitnessRuntime {
         lock(&self.cards).is_some_and(|(inline, max)| card_room(inline, witness_locks, max))
     }
 
-    /// [`take_card`] on this runtime's tasks and the brain's latest view of the cards.
-    fn take_card(&self, jid: B256) -> bool {
+    /// [`take_card`] on this runtime's tasks and the brain's latest view of the cards, for a job
+    /// that fits `fits`.
+    fn take_card(&self, jid: B256, fits: &[String]) -> bool {
         let cards = *lock(&self.cards);
-        take_card(&mut lock(&self.tasks), cards, jid)
+        let busy = lock(&self.busy_cards).clone();
+        take_card(&mut lock(&self.tasks), cards, &busy, jid, fits)
     }
 
     /// [`give_back_card`] on this runtime's tasks.
@@ -1146,7 +1179,7 @@ impl WitnessRuntime {
         if !witness {
             return ReleaseClaim::NotWitness;
         }
-        tasks.insert(jid, Task { token: AbortToken::new(), phase: Phase::Releasing });
+        tasks.insert(jid, Task::new(AbortToken::new(), Phase::Releasing));
         ReleaseClaim::Witness(WitnessRelease { rt: self.clone(), jid })
     }
 
@@ -1343,7 +1376,7 @@ impl WitnessRuntime {
             if t.contains_key(&jid) {
                 return Route::Witness;
             }
-            t.insert(jid, Task { token: token.clone(), phase: Phase::Simulating });
+            t.insert(jid, Task::new(token.clone(), Phase::Simulating));
         }
         let (rt, job) = (self.clone(), job.clone());
         tokio::spawn(async move {
@@ -2097,7 +2130,8 @@ impl WitnessRuntime {
                 plan.margin,
                 fits.iter().map(|c| c.device.as_str()).collect::<Vec<_>>().join(", ")
             );
-            Ok(GateOk { reservation, window: rec.fulfillment_timeout, fulfil_gas, exposure })
+            let fits = fits.into_iter().map(|c| c.device).collect();
+            Ok(GateOk { reservation, window: rec.fulfillment_timeout, fulfil_gas, exposure, fits })
         })
         .await
     }
@@ -2147,7 +2181,7 @@ impl WitnessRuntime {
     /// it bonds collateral (a pause, a jammed signer, funds, a card, serving switched off). The card
     /// is taken for `jid` here, in one step with its check ([`take_card`]); the caller gives it back
     /// when it does not claim.
-    async fn lock_held_back(&self, jid: B256, fulfil_gas: u64) -> Option<String> {
+    async fn lock_held_back(&self, jid: B256, fulfil_gas: u64, fits: &[String]) -> Option<String> {
         if let Some(why) = self.claims_held().await {
             return Some(why.to_string());
         }
@@ -2173,8 +2207,8 @@ impl WitnessRuntime {
             return Some("every risc0 card is quarantined for witness proofs (post-lock failures)".into());
         }
         // Last, with nothing awaited after it: the card, checked and taken at once.
-        if !self.take_card(jid) {
-            return Some("no card is free for its proof (inline work or witness locks fill them)".into());
+        if !self.take_card(jid, fits) {
+            return Some("no card it fits is free for its proof (inline work or witness locks fill them)".into());
         }
         None
     }
@@ -2228,7 +2262,7 @@ impl WitnessRuntime {
         // The card this claim takes (below) goes back however the claim is not sent; a lock held
         // keeps it (`Phase::Locked`).
         let _card = CardTaken { rt: &**self, jid };
-        if let Some(why) = self.lock_held_back(jid, gate.fulfil_gas).await {
+        if let Some(why) = self.lock_held_back(jid, gate.fulfil_gas, &gate.fits).await {
             // Not the job's doing: a short, deferred verdict, and the bundle stays for the next try.
             tracing::info!("witness job {}: not locked now — {}", short(jid), zkminer_chain::programs::sanitize_log(&why));
             self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
@@ -2311,7 +2345,7 @@ impl WitnessRuntime {
             self.abandon_intent(jid, c.bundle, prior).await;
             return None;
         }
-        if let Some(why) = self.lock_held_back(jid, gate.fulfil_gas).await {
+        if let Some(why) = self.lock_held_back(jid, gate.fulfil_gas, &gate.fits).await {
             self.abandon_intent(jid, c.bundle, prior).await;
             tracing::info!("witness job {}: not locked now — {}", short(jid), zkminer_chain::programs::sanitize_log(&why));
             self.record_verdict(jid, caller, SkipReason::NotAdmitted, &why).await;
@@ -3322,7 +3356,7 @@ impl WitnessRuntime {
             if t.contains_key(&jid) {
                 return false;
             }
-            t.insert(jid, Task { token: AbortToken::new(), phase: Phase::Locked });
+            t.insert(jid, Task::new(AbortToken::new(), Phase::Locked));
         }
         lock(&self.unpinned_recoveries).insert(jid);
         let rt = self.clone();
@@ -4145,9 +4179,9 @@ mod tests {
         *lock(&rt.serve) = Some(Arc::new(ZkMinerConfig::default()));
         rt.enabled.store(true, Ordering::SeqCst);
         let sim = AbortToken::new();
-        lock(&rt.tasks).insert(B256::repeat_byte(0x91), Task { token: sim.clone(), phase: Phase::Simulating });
+        lock(&rt.tasks).insert(B256::repeat_byte(0x91), Task::new(sim.clone(), Phase::Simulating));
         let held = AbortToken::new();
-        lock(&rt.tasks).insert(B256::repeat_byte(0x92), Task { token: held.clone(), phase: Phase::Locked });
+        lock(&rt.tasks).insert(B256::repeat_byte(0x92), Task::new(held.clone(), Phase::Locked));
 
         let dir = std::env::temp_dir().join(format!("zkminer-killswitch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4304,7 +4338,7 @@ mod tests {
     }
 
     fn task(phase: Phase) -> Task {
-        Task { token: AbortToken::new(), phase }
+        Task::new(AbortToken::new(), phase)
     }
 
     /// Two simulations finished at once on a one-card host: both passed the advisory card check,
@@ -4316,24 +4350,53 @@ mod tests {
         let (a, b) = (B256::repeat_byte(0xa), B256::repeat_byte(0xb));
         let one_card = Some((0, 1));
         let mut tasks: HashMap<B256, Task> = [(a, task(Phase::Simulating)), (b, task(Phase::Simulating))].into();
-        assert!(take_card(&mut tasks, one_card, a));
+        assert!(take_card(&mut tasks, one_card, &[], a, &[]));
         assert_eq!(tasks[&a].phase, Phase::Claiming);
-        assert!(!take_card(&mut tasks, one_card, b), "the card is taken");
-        assert!(take_card(&mut tasks, one_card, a), "the claim's second check keeps its own card");
+        assert!(!take_card(&mut tasks, one_card, &[], b, &[]), "the card is taken");
+        assert!(take_card(&mut tasks, one_card, &[], a, &[]), "the claim's second check keeps its own card");
         give_back_card(&mut tasks, a);
         assert_eq!(tasks[&a].phase, Phase::Simulating);
-        assert!(take_card(&mut tasks, one_card, b), "given back: the other claims");
+        assert!(take_card(&mut tasks, one_card, &[], b, &[]), "given back: the other claims");
         tasks.get_mut(&b).unwrap().phase = Phase::Locked;
         give_back_card(&mut tasks, b);
         assert_eq!(tasks[&b].phase, Phase::Locked, "a held lock keeps its card");
-        assert!(!take_card(&mut tasks, one_card, a));
+        assert!(!take_card(&mut tasks, one_card, &[], a, &[]));
         tasks.remove(&b);
-        assert!(take_card(&mut tasks, one_card, a), "the lock ended");
+        assert!(take_card(&mut tasks, one_card, &[], a, &[]), "the lock ended");
         // Inline work needing a card, and no word from the brain yet.
-        assert!(!take_card(&mut tasks, Some((1, 2)), b), "no task for it");
+        assert!(!take_card(&mut tasks, Some((1, 2)), &[], b, &[]), "no task for it");
         tasks.insert(b, task(Phase::Simulating));
-        assert!(!take_card(&mut tasks, Some((1, 2)), b), "a's claim and one inline job fill two cards");
-        assert!(!take_card(&mut tasks, None, b));
+        assert!(!take_card(&mut tasks, Some((1, 2)), &[], b, &[]), "a's claim and one inline job fill two cards");
+        assert!(!take_card(&mut tasks, None, &[], b, &[]));
+    }
+
+    /// A job that fits only some cards claims only while one of them is free: not proving an inline
+    /// job, and not booked by another witness claim. The count alone would let it claim.
+    #[test]
+    fn a_claim_needs_a_free_card_it_fits() {
+        let (a, b) = (B256::repeat_byte(0xa), B256::repeat_byte(0xb));
+        let two_cards = Some((0, 2));
+        let (fast, slow) = ("gpu0".to_string(), "gpu1".to_string());
+        let mut tasks: HashMap<B256, Task> = [(a, task(Phase::Simulating)), (b, task(Phase::Simulating))].into();
+        // The 5090 proves an inline job: a job fitting only it waits, though a card is free by count.
+        assert!(!take_card(&mut tasks, two_cards, std::slice::from_ref(&fast), a, std::slice::from_ref(&fast)));
+        assert_eq!(tasks[&a].phase, Phase::Simulating);
+        // One that fits both books the free 4070.
+        assert!(take_card(&mut tasks, two_cards, std::slice::from_ref(&fast), a, &[fast.clone(), slow.clone()]));
+        assert_eq!(tasks[&a].card.as_deref(), Some("gpu1"));
+        // The 4070 booked: the next job fitting only it waits; the 5090 once free takes the other.
+        assert!(!take_card(&mut tasks, two_cards, &[], b, std::slice::from_ref(&slow)));
+        assert!(take_card(&mut tasks, two_cards, &[], b, &[fast.clone(), slow.clone()]));
+        assert_eq!(tasks[&b].card.as_deref(), Some("gpu0"));
+        // Given back, the booking goes with it.
+        give_back_card(&mut tasks, a);
+        assert_eq!(tasks[&a].card, None);
+        assert!(take_card(&mut tasks, two_cards, &[], a, std::slice::from_ref(&slow)));
+        // A job that fits any card (none named) goes by the count alone.
+        tasks.insert(B256::repeat_byte(0xc), task(Phase::Simulating));
+        assert!(!take_card(&mut tasks, two_cards, &[], B256::repeat_byte(0xc), &[]), "two cards, two held");
+        assert!(take_card(&mut tasks, Some((0, 3)), &[], B256::repeat_byte(0xc), &[]));
+        assert_eq!(tasks[&B256::repeat_byte(0xc)].card, None);
     }
 
     /// The same race with real threads: of many simulations finishing together on a one-card host,
@@ -4349,7 +4412,7 @@ mod tests {
                 let (tasks, barrier, j) = (tasks.clone(), barrier.clone(), *j);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    take_card(&mut lock(&tasks), Some((0, 1)), j)
+                    take_card(&mut lock(&tasks), Some((0, 1)), &[], j, &[])
                 })
             })
             .collect::<Vec<_>>()
