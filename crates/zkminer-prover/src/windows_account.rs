@@ -1,5 +1,5 @@
-//! The account the miner runs as on Windows: the privileges its token carries, and whether it is an
-//! administrator.
+//! The account the miner runs as on Windows: the privileges its token carries, whether it is an
+//! administrator, and whether another user of this PC can replace what it runs.
 //!
 //! - A service logon's token holds the SERVICE group, and Windows grants that group
 //!   `SeImpersonatePrivilege`: from a worker a requester's guest broke out of, that is one
@@ -12,11 +12,15 @@
 //!   (an elevated console, or a service logon, which UAC never filters) or kept for deny only (an
 //!   administrator's console that is not elevated). `TokenElevation` is not used: a token holding
 //!   one of the privileges above counts as elevated without being an administrator's.
+//! - `zkminer doctor` reads who can write the miner's executable, its configuration, its workers,
+//!   and the service wrapper that starts it ([`writers_of`], [`services_running`]): on a PC with
+//!   other users, one who can replace any of them runs code as the miner's account, key and all.
 
-use std::ffi::c_void;
+use std::ffi::{c_void, OsStr, OsString};
 use std::io;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 type Handle = *mut c_void;
@@ -132,6 +136,43 @@ extern "system" {
         token_type: i32,
         new_token: *mut Handle,
     ) -> i32;
+    fn GetFileSecurityW(
+        name: *const u16,
+        information: u32,
+        descriptor: *mut c_void,
+        length: u32,
+        needed: *mut u32,
+    ) -> i32;
+    fn RegOpenKeyExW(
+        key: isize,
+        sub_key: *const u16,
+        options: u32,
+        access: u32,
+        result: *mut isize,
+    ) -> i32;
+    fn RegQueryValueExW(
+        key: isize,
+        name: *const u16,
+        reserved: *mut u32,
+        kind: *mut u32,
+        data: *mut u8,
+        size: *mut u32,
+    ) -> i32;
+    fn RegEnumKeyExW(
+        key: isize,
+        index: u32,
+        name: *mut u16,
+        name_len: *mut u32,
+        reserved: *mut u32,
+        class: *mut u16,
+        class_len: *mut u32,
+        written: *mut u64,
+    ) -> i32;
+    fn RegCloseKey(key: isize) -> i32;
+}
+
+fn wide(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain([0]).collect()
 }
 
 /// The name of the privilege with LUID `(low, high)`, or `LUID <high>:<low>` for one Windows does
@@ -520,6 +561,307 @@ pub fn sid_string(sid: &[u8]) -> Option<String> {
     Some(text)
 }
 
+/// The rights in a file or directory ACE that let its holder replace what is there, or put
+/// something new there: write or append (add a file or subdirectory), delete it or a child,
+/// change its DACL or owner, and the generic rights that include those.
+const REPLACE_RIGHTS: u32 =
+    0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x4000_0000 | 0x1000_0000;
+
+/// The SIDs that the DACL of the self-relative security descriptor `descriptor` grants any of
+/// [`REPLACE_RIGHTS`] on the object itself (an ACE only for what is made inside it does not
+/// count). Deny ACEs are not weighed: a SID listed here may in fact be denied. `Err` for a
+/// descriptor that cannot be read, `Ok(["S-1-1-0"])` (Everyone) for one with no DACL.
+pub fn dacl_writers(descriptor: &[u8]) -> Result<Vec<String>, &'static str> {
+    const SE_DACL_PRESENT: u16 = 0x4;
+    const SE_SELF_RELATIVE: u16 = 0x8000;
+    const ACCESS_ALLOWED_ACE: u8 = 0;
+    const ACCESS_ALLOWED_CALLBACK_ACE: u8 = 9;
+    const INHERIT_ONLY_ACE: u8 = 0x8;
+    let u16_at = |b: &[u8], at: usize| b.get(at..at + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let control = u16_at(descriptor, 2).ok_or("too short")?;
+    if control & SE_SELF_RELATIVE == 0 {
+        return Err("not self-relative");
+    }
+    let dacl_at = u32_at(descriptor, 16).ok_or("too short")? as usize;
+    if control & SE_DACL_PRESENT == 0 || dacl_at == 0 {
+        return Ok(vec!["S-1-1-0".to_string()]);
+    }
+    let acl = descriptor.get(dacl_at..).ok_or("DACL out of bounds")?;
+    let count = u16_at(acl, 4).ok_or("DACL too short")?;
+    let mut at = 8;
+    let mut writers: Vec<String> = Vec::new();
+    for _ in 0..count {
+        let kind = *acl.get(at).ok_or("ACE out of bounds")?;
+        let flags = *acl.get(at + 1).ok_or("ACE out of bounds")?;
+        let size = usize::from(u16_at(acl, at + 2).ok_or("ACE out of bounds")?);
+        if size < 8 || at + size > acl.len() {
+            return Err("ACE out of bounds");
+        }
+        if matches!(kind, ACCESS_ALLOWED_ACE | ACCESS_ALLOWED_CALLBACK_ACE)
+            && flags & INHERIT_ONLY_ACE == 0
+            && u32_at(acl, at + 4).ok_or("ACE out of bounds")? & REPLACE_RIGHTS != 0
+        {
+            let sid = sid_string(&acl[at + 8..at + size]).ok_or("an ACE with a bad SID")?;
+            if !writers.contains(&sid) {
+                writers.push(sid);
+            }
+        }
+        at += size;
+    }
+    Ok(writers)
+}
+
+/// SYSTEM, Administrators and TrustedInstaller: the principals that may write what the miner runs,
+/// with the miner's own account.
+pub const TRUSTED_WRITERS: [&str; 3] = [
+    "S-1-5-18",
+    "S-1-5-32-544",
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+];
+
+/// A name for a SID an operator knows, where there is a well-known one.
+pub fn principal_name(sid: &str) -> String {
+    let name = match sid {
+        "S-1-1-0" => "Everyone",
+        "S-1-5-11" => "Authenticated Users",
+        "S-1-5-32-545" => "Users",
+        "S-1-5-4" => "INTERACTIVE",
+        "S-1-5-32-546" => "Guests",
+        "S-1-3-0" => "CREATOR OWNER",
+        "S-1-3-4" => "OWNER RIGHTS",
+        "S-1-15-2-1" => "ALL APPLICATION PACKAGES",
+        _ => return sid.to_string(),
+    };
+    format!("{name} ({sid})")
+}
+
+/// The principals other than [`TRUSTED_WRITERS`] and `own` (the miner's account's SID) that can
+/// replace `path` or put something in it ([`dacl_writers`]).
+pub fn writers_of(path: &Path, own: &str) -> io::Result<Vec<String>> {
+    const DACL_SECURITY_INFORMATION: u32 = 0x4;
+    let name = wide(path.as_os_str());
+    let mut needed = 0u32;
+    // SAFETY: a NUL-terminated path; a size query.
+    unsafe {
+        GetFileSecurityW(
+            name.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: a buffer of at least `needed` bytes that outlives the call.
+    if unsafe {
+        GetFileSecurityW(
+            name.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: plain bytes of a buffer this function owns.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
+    let writers = dacl_writers(bytes).map_err(io::Error::other)?;
+    Ok(writers
+        .into_iter()
+        .filter(|sid| !TRUSTED_WRITERS.contains(&sid.as_str()) && !sid.eq_ignore_ascii_case(own))
+        .collect())
+}
+
+/// A service whose program, or whose NSSM `Application`, is a given executable.
+#[derive(Debug, Clone)]
+pub struct ServiceImage {
+    pub name: String,
+    /// What the service manager starts (`nssm.exe` for an NSSM service).
+    pub image: PathBuf,
+    /// The `ImagePath` names a program with a space in its path, unquoted: Windows tries each
+    /// prefix up to a space (`C:\Program.exe` first).
+    pub unquoted_with_spaces: bool,
+    /// The service's `RequiredPrivileges` (`sc privs`), when set.
+    pub required_privileges: Option<Vec<String>>,
+}
+
+/// The program an `ImagePath` (or NSSM `Application`) value names, and whether it is unquoted with
+/// a space in it. `%VAR%` is expanded from this process's environment, and `\??\` dropped.
+pub fn image_program(value: &str) -> (PathBuf, bool) {
+    let value = value.trim();
+    let (program, unquoted_with_spaces) = if let Some(rest) = value.strip_prefix('"') {
+        (rest.split('"').next().unwrap_or(rest).to_string(), false)
+    } else {
+        let lower = value.to_ascii_lowercase();
+        let program = match lower.find(".exe") {
+            Some(i) => &value[..i + 4],
+            None => value.split(' ').next().unwrap_or(value),
+        };
+        (program.to_string(), program.contains(' '))
+    };
+    let mut expanded = String::new();
+    let mut rest = program.as_str();
+    while let Some(start) = rest.find('%') {
+        let Some(len) = rest[start + 1..].find('%') else {
+            break;
+        };
+        let var = &rest[start + 1..start + 1 + len];
+        expanded.push_str(&rest[..start]);
+        match std::env::var(var) {
+            Ok(v) if !var.is_empty() => expanded.push_str(&v),
+            _ => expanded.push_str(&rest[start..start + len + 2]),
+        }
+        rest = &rest[start + len + 2..];
+    }
+    expanded.push_str(rest);
+    let expanded = expanded
+        .strip_prefix(r"\??\")
+        .map(str::to_string)
+        .unwrap_or(expanded);
+    (PathBuf::from(expanded), unquoted_with_spaces)
+}
+
+/// A registry key under HKLM, closed on drop.
+struct Key(isize);
+
+impl Key {
+    fn open(path: &str) -> Option<Self> {
+        const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+        const KEY_READ: u32 = 0x2_0019;
+        let path = wide(OsStr::new(path));
+        let mut key = 0isize;
+        // SAFETY: a NUL-terminated path and an out-pointer; the key is owned at once.
+        (unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key) } == 0)
+            .then_some(Self(key))
+    }
+
+    /// A string value (REG_SZ, REG_EXPAND_SZ or REG_MULTI_SZ), its strings in order.
+    fn strings(&self, name: &str) -> Option<Vec<String>> {
+        const REG_SZ: u32 = 1;
+        const REG_EXPAND_SZ: u32 = 2;
+        const REG_MULTI_SZ: u32 = 7;
+        let name = wide(OsStr::new(name));
+        let (mut kind, mut size) = (0u32, 0u32);
+        // SAFETY: a size query on an open key.
+        if unsafe {
+            RegQueryValueExW(
+                self.0,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        } != 0
+            || !matches!(kind, REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ)
+        {
+            return None;
+        }
+        let mut data = vec![0u16; (size as usize).div_ceil(2) + 1];
+        let mut size = (data.len() * 2) as u32;
+        // SAFETY: a buffer of `size` bytes that outlives the call.
+        if unsafe {
+            RegQueryValueExW(
+                self.0,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                data.as_mut_ptr().cast(),
+                &mut size,
+            )
+        } != 0
+        {
+            return None;
+        }
+        data.truncate(size as usize / 2);
+        Some(
+            data.split(|c| *c == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| OsString::from_wide(s).to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        // SAFETY: a key this value opened.
+        unsafe { RegCloseKey(self.0) };
+    }
+}
+
+/// Whether `a` and `b` name the same file (canonical paths, else the paths without case).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+    }
+}
+
+/// The services that run `exe`: as their program, or through NSSM (its `Parameters\Application`,
+/// the only value read there: `AppEnvironmentExtra` beside it may hold a key).
+pub fn services_running(exe: &Path) -> Vec<ServiceImage> {
+    const SERVICES: &str = r"SYSTEM\CurrentControlSet\Services";
+    let Some(services) = Key::open(SERVICES) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for index in 0.. {
+        let mut name = [0u16; 256];
+        let mut len = name.len() as u32;
+        // SAFETY: a buffer of `len` characters and out-pointers that outlive the call.
+        let status = unsafe {
+            RegEnumKeyExW(
+                services.0,
+                index,
+                name.as_mut_ptr(),
+                &mut len,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            break;
+        }
+        let name = String::from_utf16_lossy(&name[..len as usize]);
+        let Some(key) = Key::open(&format!(r"{SERVICES}\{name}")) else {
+            continue;
+        };
+        let Some(image_path) = key.strings("ImagePath").and_then(|v| v.into_iter().next()) else {
+            continue;
+        };
+        let (image, unquoted_with_spaces) = image_program(&image_path);
+        let runs_exe = same_file(&image, exe)
+            || Key::open(&format!(r"{SERVICES}\{name}\Parameters"))
+                .and_then(|p| p.strings("Application"))
+                .and_then(|v| v.into_iter().next())
+                .is_some_and(|app| same_file(&image_program(&app).0, exe));
+        if runs_exe {
+            found.push(ServiceImage {
+                name,
+                image,
+                unquoted_with_spaces,
+                required_privileges: key.strings("RequiredPrivileges"),
+            });
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +1054,111 @@ mod tests {
         worker.kill().unwrap();
         assert!(to_remove(&held).is_empty(), "{held:?}");
         assert!(dangerous(&held).is_empty(), "{held:?}");
+    }
+
+    /// A self-relative descriptor from SDDL, as `GetFileSecurityW` gives one.
+    fn descriptor(sddl: &str) -> Vec<u8> {
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl: *const u16,
+                revision: u32,
+                descriptor: *mut *mut c_void,
+                size: *mut u32,
+            ) -> i32;
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LocalFree(mem: *mut c_void) -> *mut c_void;
+        }
+        let text = wide(OsStr::new(sddl));
+        let (mut sd, mut size) = (std::ptr::null_mut(), 0u32);
+        // SAFETY: a NUL-terminated string and out-pointers; the descriptor is copied, then freed.
+        unsafe {
+            assert!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    text.as_ptr(),
+                    1,
+                    &mut sd,
+                    &mut size
+                ) != 0
+            );
+            let bytes = std::slice::from_raw_parts(sd.cast::<u8>(), size as usize).to_vec();
+            LocalFree(sd);
+            bytes
+        }
+    }
+
+    /// A folder under `C:\` (Authenticated Users may modify it) is found writable; Program Files'
+    /// ACL (inherit-only CREATOR OWNER, Users read) is not; no DACL is Everyone.
+    #[test]
+    fn writers_are_read_from_the_dacl() {
+        let program_files = descriptor(
+            "D:PAI(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)\
+             (A;OICIIO;GA;;;CO)(A;;FA;;;SY)(A;OICIIO;GA;;;SY)(A;;FA;;;BA)(A;OICIIO;GA;;;BA)\
+             (A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;AC)",
+        );
+        let writers = dacl_writers(&program_files).unwrap();
+        assert!(
+            writers
+                .iter()
+                .all(|s| TRUSTED_WRITERS.contains(&s.as_str())),
+            "{writers:?}"
+        );
+        let under_c = descriptor(
+            "D:AI(A;ID;FA;;;BA)(A;OICIIOID;GA;;;BA)(A;ID;FA;;;SY)(A;OICIIOID;GA;;;SY)\
+             (A;ID;0x1301bf;;;AU)(A;OICIIOID;SDGXGWGR;;;AU)(A;ID;0x1200a9;;;BU)",
+        );
+        assert_eq!(
+            dacl_writers(&under_c).unwrap(),
+            ["S-1-5-32-544", "S-1-5-18", "S-1-5-11"]
+        );
+        assert_eq!(
+            dacl_writers(&descriptor("D:NO_ACCESS_CONTROL")).unwrap(),
+            ["S-1-1-0"]
+        );
+        assert!(dacl_writers(&[1, 0]).is_err());
+        assert_eq!(principal_name("S-1-5-11"), "Authenticated Users (S-1-5-11)");
+    }
+
+    /// The test binary's own directory is under this user's profile or the build directory: its
+    /// ACL can be read, and the user's own SID never counts.
+    #[test]
+    fn a_file_acl_can_be_read() {
+        let own = zkminer_config::wallet::current_user_sid().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let writers = writers_of(&exe, &own).unwrap();
+        assert!(!writers.contains(&own));
+    }
+
+    #[test]
+    fn service_image_paths_are_parsed() {
+        assert_eq!(
+            image_program(r#""C:\Program Files\zkminer\nssm.exe""#),
+            (PathBuf::from(r"C:\Program Files\zkminer\nssm.exe"), false)
+        );
+        assert_eq!(
+            image_program(r"C:\Program Files\zkminer\nssm.exe run"),
+            (PathBuf::from(r"C:\Program Files\zkminer\nssm.exe"), true)
+        );
+        assert_eq!(
+            image_program(r"C:\tools\nssm.exe"),
+            (PathBuf::from(r"C:\tools\nssm.exe"), false)
+        );
+        assert_eq!(
+            image_program(r"\??\C:\drv\x.sys"),
+            (PathBuf::from(r"C:\drv\x.sys"), false)
+        );
+        let root = std::env::var("SystemRoot").unwrap();
+        assert_eq!(
+            image_program(r"%SystemRoot%\System32\svchost.exe -k netsvcs").0,
+            PathBuf::from(format!(r"{root}\System32\svchost.exe"))
+        );
+    }
+
+    /// No service runs the test binary; the enumeration itself works without rights.
+    #[test]
+    fn no_service_runs_the_test_binary() {
+        assert!(services_running(&std::env::current_exe().unwrap()).is_empty());
     }
 }

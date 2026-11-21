@@ -789,9 +789,11 @@ Worth knowing:
 
   ```
   net user zkminer * /add
-  nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
-  nssm set zkminer ObjectName .\zkminer <password>
-  nssm set zkminer AppStopMethodConsole 3900000
+  copy nssm.exe "C:\Program Files\zkminer\"
+  cd "C:\Program Files\zkminer"
+  .\nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
+  .\nssm set zkminer ObjectName .\zkminer <password>
+  .\nssm set zkminer AppStopMethodConsole 3900000
   sc privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
   ```
 
@@ -801,9 +803,12 @@ Worth knowing:
   removes every other privilege from itself at start-up and from each worker before it runs; a
   worker that still holds a dangerous one is not started (`PAGE: WORKER-PRIVILEGES`).
 
-  Install the miner and its workers in a directory only administrators can write
-  (`C:\Program Files\zkminer`), not in a new folder under `C:\`, which every local user can
-  write to. NSSM grants the account "Log on as a service". Its home is `C:\Users\zkminer`, so the
+  Install the miner, its workers and `nssm.exe` (the program the service actually starts) in a
+  directory only administrators can write (`C:\Program Files\zkminer`), not in a new folder under
+  `C:\`, which every local user can write to: a user who can replace any of them runs code as
+  the miner's account, key included. Keep a `--config` file there too, or in the account's own
+  `.zkminer`. `zkminer doctor` fails when any of these, or its directory, can be written by
+  anyone but SYSTEM, Administrators, TrustedInstaller and the miner's account. NSSM grants the account "Log on as a service". Its home is `C:\Users\zkminer`, so the
   miner keeps its `.zkminer` there; run `zkminer` commands for it as that account (`runas
   /user:zkminer cmd`, then `zkminer init`, `zkminer doctor`, `zkminer stop`). Give it its key in
   a key file (`key_source = "file"`), never in its environment: NSSM keeps `AppEnvironmentExtra`

@@ -501,6 +501,179 @@ fn low_il_findings(on: bool, misset: Option<&str>, tampered: &[String]) -> Vec<(
     findings
 }
 
+/// Windows: what to say of who can replace what the miner runs. `checked`: each file or directory
+/// (the miner's program, its configuration, its workers, a service wrapper, and their
+/// directories) with the principals other than SYSTEM, Administrators, TrustedInstaller and this
+/// account that can write it (`windows_account::writers_of`), or why its ACL could not be read.
+/// `service`: the miner runs as a service (one runs this program, or this is a service logon),
+/// where any of them fails; on a console they warn. `services`: each service that runs this
+/// program, with its wrapper's path, whether that `ImagePath` is unquoted with a space, and
+/// whether `sc privs` was set.
+#[cfg(windows)]
+fn replaceable_findings(
+    checked: &[(PathBuf, Result<Vec<String>, String>)],
+    service: bool,
+    services: &[(String, PathBuf, bool, bool)],
+) -> Vec<(Level, String)> {
+    use zkminer_prover::windows_account::{principal_name, KEPT_PRIVILEGES};
+    let mut findings = Vec::new();
+    let level = if service { Level::Fail } else { Level::Warn };
+    for (path, writers) in checked {
+        match writers {
+            Ok(writers) if !writers.is_empty() => {
+                findings.push((
+                    level,
+                    format!(
+                    "{} can be written by {}: another user of this PC could replace it and run \
+                     code as the miner's account, its key included. Keep the miner, its \
+                     workers{}, and its configuration in a directory only administrators can \
+                     write (C:\\Program Files\\zkminer, README: Windows service)",
+                    path.display(),
+                    writers
+                        .iter()
+                        .map(|s| principal_name(s))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if services.is_empty() { "" } else { ", nssm.exe" }
+                ),
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => findings.push((
+                Level::Info,
+                format!("{}: its ACL could not be read ({e})", path.display()),
+            )),
+        }
+    }
+    for (name, image, unquoted, privs) in services {
+        if *unquoted {
+            findings.push((
+                Level::Fail,
+                format!(
+                    "service {name} starts {} from an unquoted path with a space in it: Windows \
+                     tries each prefix up to a space first. Quote it (`sc config {name} binPath= \
+                     \"\\\"{}\\\"\"`)",
+                    image.display(),
+                    image.display()
+                ),
+            ));
+        }
+        if !privs {
+            findings.push((
+                Level::Warn,
+                format!(
+                    "service {name} has no required privileges set: its logon gets \
+                     SeImpersonatePrivilege (SERVICE group), which `zkminer run` removes from \
+                     itself and its workers but not from {}. `sc privs {name} {}`",
+                    image.display(),
+                    KEPT_PRIVILEGES.join("/")
+                ),
+            ));
+        }
+    }
+    if !findings.iter().any(|(level, _)| *level >= Level::Warn) {
+        findings.insert(
+            0,
+            (
+                Level::Pass,
+                format!(
+                    "only SYSTEM, Administrators, TrustedInstaller and this account can write the \
+                     miner, its workers and configuration{}",
+                    if services.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", and the service wrapper ({})",
+                            services
+                                .iter()
+                                .map(|(_, image, ..)| image.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                ),
+            ),
+        );
+    }
+    findings
+}
+
+/// Windows: who can replace what the miner runs ([`replaceable_findings`]): this program, the
+/// configuration file `config_file`, the worker binaries configured and those in the directories
+/// searched for them, the wrapper of any service that runs this program, and each one's directory.
+#[cfg(windows)]
+fn replaceable_checks(report: &mut Report, config: &ZkMinerConfig, config_file: &Path) {
+    use zkminer_prover::windows_account as account;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let own = match zkminer_config::wallet::current_user_sid() {
+        Ok(sid) => sid,
+        Err(e) => {
+            report.say(
+                Level::Info,
+                "who can replace the miner",
+                format!("this account could not be read ({e})"),
+            );
+            return;
+        }
+    };
+    let services = account::services_running(&exe);
+    let mut paths: Vec<PathBuf> = vec![exe.clone(), config_file.to_path_buf()];
+    paths.extend(services.iter().map(|s| s.image.clone()));
+    paths.extend(config.prover.worker_binaries.values().map(PathBuf::from));
+    let searched = zkminer_prover::discovery::worker_search_dirs(
+        &config
+            .prover
+            .worker_search_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+    );
+    for dir in &searched {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            paths.extend(entries.flatten().map(|e| e.path()).filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    let n = n.to_ascii_lowercase();
+                    n.starts_with("zkminer-prove") && n.ends_with(".exe")
+                })
+            }));
+        }
+    }
+    let mut all: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let parent = path.parent().map(Path::to_path_buf);
+        all.push(path);
+        all.extend(parent);
+    }
+    all.extend(searched);
+    // Once each, and only what is there: a missing file is said elsewhere.
+    let mut seen = std::collections::BTreeSet::new();
+    all.retain(|p| p.exists() && seen.insert(p.to_string_lossy().to_lowercase()));
+    let checked: Vec<(PathBuf, Result<Vec<String>, String>)> = all
+        .into_iter()
+        .map(|p| {
+            let writers = account::writers_of(&p, &own).map_err(|e| e.to_string());
+            (p, writers)
+        })
+        .collect();
+    let service = !services.is_empty() || account::is_service_logon().unwrap_or(false);
+    let services: Vec<(String, PathBuf, bool, bool)> = services
+        .into_iter()
+        .map(|s| {
+            (
+                s.name,
+                s.image,
+                s.unquoted_with_spaces,
+                s.required_privileges.is_some(),
+            )
+        })
+        .collect();
+    for (level, detail) in replaceable_findings(&checked, service, &services) {
+        report.say(level, "who can replace the miner", detail);
+    }
+}
+
 fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     report.section("This host");
     let home = super::run::zkminer_home();
@@ -1055,10 +1228,16 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
         }
     }
     let host_config = config.clone().unwrap_or_default();
+    #[cfg(windows)]
+    let config_file = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| ZkMinerConfig::default_dir().join("config.toml"));
     // Blocking probes (nvidia-smi, sysfs, the disk), off the runtime.
     let mut host_report = Report::default();
     let host_report = tokio::task::spawn_blocking(move || {
         host_checks(&mut host_report, &host_config);
+        #[cfg(windows)]
+        replaceable_checks(&mut host_report, &host_config, &config_file);
         host_report
     })
     .await?;
@@ -1310,6 +1489,74 @@ mod tests {
         let (level, text) = privilege_finding(&held[..1], Ok(Vec::new()));
         assert_eq!(level, Level::Pass);
         assert!(text.contains("SeChangeNotifyPrivilege"), "{text}");
+    }
+
+    /// Windows: a file another user can write fails under a service and warns on a console; a
+    /// service's unquoted path fails and a missing `sc privs` warns; nothing found passes.
+    #[cfg(windows)]
+    #[test]
+    fn doctor_reports_who_can_replace_the_miner() {
+        let nssm = PathBuf::from(r"C:\tools\nssm.exe");
+        let writable = vec![
+            (nssm.clone(), Ok(vec!["S-1-5-11".to_string()])),
+            (PathBuf::from(r"C:\Program Files\zkminer"), Ok(Vec::new())),
+            (PathBuf::from(r"C:\gone"), Err("denied".to_string())),
+        ];
+        let service = vec![("zkminer".to_string(), nssm.clone(), false, true)];
+        let found = replaceable_findings(&writable, true, &service);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].0, Level::Fail);
+        assert!(
+            found[0].1.contains(r"C:\tools\nssm.exe")
+                && found[0].1.contains("Authenticated Users")
+                && found[0].1.contains("nssm.exe, and its configuration"),
+            "{}",
+            found[0].1
+        );
+        assert_eq!(found[1].0, Level::Info);
+        // On a console, with no service, the same file only warns.
+        let found = replaceable_findings(&writable[..1], false, &[]);
+        assert_eq!(found[0].0, Level::Warn);
+        let clean = vec![(PathBuf::from(r"C:\Program Files\zkminer"), Ok(Vec::new()))];
+        let unquoted = vec![(
+            "zkminer".to_string(),
+            PathBuf::from(r"C:\Program Files\zkminer\nssm.exe"),
+            true,
+            false,
+        )];
+        let found = replaceable_findings(&clean, true, &unquoted);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].0, Level::Fail);
+        assert!(found[0].1.contains("unquoted"), "{}", found[0].1);
+        assert_eq!(found[1].0, Level::Warn);
+        assert!(found[1].1.contains("sc privs zkminer"), "{}", found[1].1);
+        let found = replaceable_findings(&clean, true, &service);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, Level::Pass);
+        assert!(found[0].1.contains("service wrapper"), "{}", found[0].1);
+    }
+
+    /// Windows, live: this test binary and its directory are read, no service runs it, and the
+    /// check says something.
+    #[cfg(windows)]
+    #[test]
+    fn doctor_reads_who_can_replace_this_binary() {
+        let mut report = Report::default();
+        let config_file = std::env::temp_dir().join("zkminer-doctor-no-config.toml");
+        replaceable_checks(&mut report, &ZkMinerConfig::default(), &config_file);
+        assert!(!report.lines.is_empty());
+        assert!(
+            report
+                .lines
+                .iter()
+                .all(|(_, what, _)| what == "who can replace the miner"),
+            "{:?}",
+            report.lines
+        );
+        // Not under a service (a CI runner may be one): a writable directory only warns.
+        if !zkminer_prover::windows_account::is_service_logon().unwrap_or(true) {
+            assert_eq!(report.failures, 0, "{:?}", report.lines);
+        }
     }
 
     /// Windows' Low-integrity workers as doctor reports them: on (failing closed), off, a flag
