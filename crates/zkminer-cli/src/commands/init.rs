@@ -108,6 +108,12 @@ pub fn run(
                 "     or set ZKMINER_PRIVATE_KEY in the miner's environment. Type the key at a"
             );
             println!("     prompt rather than on a command line your shell saves to its history.");
+            #[cfg(windows)]
+            {
+                println!("     Not with setx or in a service's environment (NSSM's");
+                println!("     AppEnvironmentExtra): other users or processes read it there.");
+                println!("     A service needs the key file.");
+            }
         }
     }
     let address_hint = key

@@ -449,7 +449,15 @@ Worth knowing:
   before systemd restarts it). On Windows, a miner run as a service keeps its `.zkminer` in
   the service account's profile (for LocalSystem,
   `C:\Windows\System32\config\systemprofile\.zkminer`), so run `zkminer stop` as that
-  account (`psexec -s` for LocalSystem). A service wrapper's stop (NSSM sends Ctrl+C, then
+  account (`psexec -s` for LocalSystem). Give a service its key in a key file
+  (`key_source = "file"`), never in its environment: NSSM keeps `AppEnvironmentExtra` in
+  `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters` and `setx /M` keeps a variable
+  in the machine's environment, and every user of the PC can read both. Create the key as the
+  service account: `zkminer init --generate-key` run as that account writes it to its
+  `.zkminer` with an ACL for that account and SYSTEM only. For a key file made another way,
+  `icacls <file> /inheritance:r /grant:r <account>:R` leaves only that account on it.
+  `zkminer doctor` and the miner's start-up say when the key's variable is kept in the
+  machine's, a service's or the user's environment. A service wrapper's stop (NSSM sends Ctrl+C, then
   kills the process after its timeout) starts a drain it then cuts off: run `zkminer stop
   --wait` (as the service account) before stopping the service, or give NSSM a timeout long
   enough for a drain (`nssm set <service> AppStopMethodConsole 3900000`).
