@@ -871,7 +871,9 @@ Worth knowing:
   (repeated every 5 minutes): fulfils and releases go through the same RPC, so the locks can be
   neither proven nor given back until it returns. `PAGE: LOCK-AT-RISK <job>` follows for each lock
   whose cutoff comes inside its release margin meanwhile. The dashboard's link badge shows the age
-  of the last chain read (`STALE`, then `DISCONNECTED` after 2 minutes).
+  of the last chain read (`STALE`, then `DISCONNECTED` after 2 minutes). On Windows, where a Low
+  worker has the network, an outage of 10 minutes with locks held also stops every worker once
+  (`PAGE: WORKERS-RECYCLED`; they start again on demand) in case one of them is holding the link.
   `PAGE: ESTIMATE-OVERRUN <card>` says jobs claimed on that card's benchmark rate overran their
   cutoff (a release penalty each) after its learned rate had refused them: the card is proving
   slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
