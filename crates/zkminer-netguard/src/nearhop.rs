@@ -48,7 +48,8 @@
 //! **The connection that follows** is pinned to the probe that produced the far evidence
 //! ([`FarEvidence::local`], carried by [`crate::Vetted`]): the same source address and local port
 //! (`EADDRINUSE` refuses), the same interface where the platform can bind one (macOS
-//! `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux `IP_UNICAST_IF` / `IPV6_UNICAST_IF`), and on Linux a
+//! `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` / `IPV6_UNICAST_IF`, which TCP does
+//! not follow there), and on Linux a
 //! fixed IPv6 flow label (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), so a
 //! per-connection balancer hashes it as it hashed the probe. A far verdict is not remembered for
 //! other connections: it belongs to that 4-tuple.
@@ -886,14 +887,19 @@ fn bind_interface(sock: &socket2::Socket, addr: SocketAddr, index: u32) -> io::R
     }
 }
 
-/// Binds the socket's traffic to interface `index` (`IP_UNICAST_IF` takes it in network byte
-/// order, `IPV6_UNICAST_IF` in host order).
+/// Linux: `IP_UNICAST_IF` / `IPV6_UNICAST_IF` to interface `index` (both take it in network byte
+/// order; the IPv6 one in host order was refused with `EADDRNOTAVAIL`, found on the Linux VM). It
+/// steers UDP and raw sockets; measured on kernel 7.0, a TCP connect is routed as without it
+/// (the unprivileged way to hold a TCP socket to an interface, `SO_BINDTODEVICE`, needs
+/// `CAP_NET_RAW`), so on Linux the path pin is the source address and the port, and the check
+/// once connected ([`crate::NetPolicy::recheck_connected`]).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn bind_interface(sock: &socket2::Socket, addr: SocketAddr, index: u32) -> io::Result<()> {
+    let index = index.to_be() as libc::c_int;
     if addr.is_ipv4() {
-        set_int(sock, libc::IPPROTO_IP, libc::IP_UNICAST_IF, index.to_be() as libc::c_int)
+        set_int(sock, libc::IPPROTO_IP, libc::IP_UNICAST_IF, index)
     } else {
-        set_int(sock, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF, index as libc::c_int)
+        set_int(sock, libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF, index)
     }
 }
 
@@ -1899,13 +1905,21 @@ mod tests {
         assert!(e.contains("could not be sent"), "{e}");
         assert_eq!(interface_of("192.0.2.200".parse().unwrap()).unwrap(), None);
         // The interface is bound: a probe of a public address held to loopback's interface does
-        // not leave by the default route (macOS: no route on lo0; Linux: IP_UNICAST_IF).
+        // not leave by the default route on macOS (no route on lo0); on Linux the option is set
+        // (an IPv6 one in the wrong byte order failed) but does not steer TCP.
         let public: SocketAddr = "192.0.2.1:443".parse().unwrap();
         let pin = Pin { source: None, interface };
         let r = TtlProbe.round(0, public, 64, 0, &pin, Duration::from_millis(300), Instant::now() + DECIDE_BUDGET);
         eprintln!("held to loopback's interface: {r:?}");
         #[cfg(target_os = "macos")]
         assert!(matches!(&r, Ok(o) if matches!(&o[0].outcome, ProbeOutcome::Failed(_))), "{r:?}");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(r.is_ok(), "{r:?}");
+        if let Some(i) = interface {
+            let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+            let sock = new_socket(v6).unwrap();
+            pin_socket(&sock, v6, &Pin { source: None, interface: Some(i) }, 0).expect("the IPv6 interface pin");
+        }
     }
 
     /// The real probe, on the real path: a probe of hop limit 1 (or 2: a VM's NAT sends none) to
