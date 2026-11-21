@@ -42,9 +42,9 @@ jobs:
     # zkminer-netguard's suite and clippy on Linux. ZKMINER_CI_STRICT=1 makes every test that
     # cannot check what it is for here fail instead of printing SKIPPED and passing; GitHub's
     # hosted runners have no IPv6, so skips naming it are allowed (docs/netguard-hardening.md,
-    # "CI"). The suite needs outbound DNS and HTTPS, and the near-hop probe's ICMP "time
-    # exceeded" from the runner's first two hops. ZKMINER_CI_ALLOW_SKIP names skip tokens exactly
-    # (a skip reason starting "[ipv6] "), not parts of a reason's text.
+    # "CI"). The suite needs outbound DNS and HTTPS, and the near-hop probes' ICMP "time
+    # exceeded" from the runner's hops N..N+2 (2 to 4 by default). ZKMINER_CI_ALLOW_SKIP names
+    # skip tokens exactly (a skip reason starting "[ipv6] "), not parts of a reason's text.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:

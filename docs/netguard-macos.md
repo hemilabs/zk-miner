@@ -15,9 +15,18 @@ decisions, what was measured, and what macOS cannot show.
 > refusal for a FIN no hop limit got acknowledged now reads `the peer acknowledged the check's
 > FIN neither within the hop limit nor at the default one (AWS S3 never does)`: the old text was
 > cut at 120 characters before it named a cause.
+>
+> **Since the S3 review** (2026-11-21; [netguard-hardening.md](netguard-hardening.md), "Near-hop
+> rule: positive evidence"), the near-hop check is a different one on every platform: there is
+> no check or control connection, no `confirm_once` and no `TCP_CONNECTION_INFO` reader, and a
+> destination is far only on a router's ICMP Time Exceeded matched to a probe. On macOS that is
+> read from an unprivileged ICMP socket, matched by the quoted 4-tuple and the probe's ISN from
+> the private `TCP_INFO` ("Near-hop probes", below). Every statement here about the check
+> connection, its positive control, its S3 refusal, its RTO margins and the far-verdict memory
+> describes the branch before that review.
 
 Code: `crates/zkminer-netguard/src/routes_macos.rs` (routes, the per-destination query,
-interfaces), `nearhop.rs` (the macOS probe and `confirm_once`), `facts.rs` (interface addresses
+interfaces), `nearhop.rs` (the macOS probe; `confirm_once` until the S3 review), `facts.rs` (interface addresses
 and netmasks read within `sa_len`, the DNS servers: `facts::macos_dns`), `macos_tests.rs`
 (refusals on this host). Linux code is unchanged: the netlink module, the Linux `confirm_once`,
 and the Linux bodies of `probe_once`, `sockaddr_ip`, `sockaddr_mask` and `system_resolvers` are
@@ -262,40 +271,43 @@ objects.
   `0xcb007135`, `10.1`), and the plain form with a zone dropped.
 - Point-to-point peers use `ifa_dstaddr`, as before.
 
-### Near-hop probe and check connection (`nearhop.rs`)
+### Near-hop probes (`nearhop.rs`)
 
-The probe is the Linux one, a TCP socket with `IP_TTL` / `IPV6_UNICAST_HOPS` set, connected for
-at most 1.5 s, with one difference: macOS runs `socket2::Socket::connect_timeout`'s steps itself
-so that an unreachable `connect` returns at once, before the connection is in progress (Local
-Network privacy, a Network Extension denial: no packet was sent, let alone answered), is a
-failure, refused, rather than far. An ICMP "time exceeded" can only arrive after `connect`
-returned `EINPROGRESS`. With `net.inet.tcp.icmp_may_rst=1` (the
-default) xnu drops a connection in `SYN_SENT` on an ICMP error that quotes its SYN, "time exceeded"
-included, with `EHOSTUNREACH`: the same outcome Linux gives. (The ON37 note's 2-hop timeout to
-1.1.1.1 was a router rate-limiting its ICMP: 2 of 20 probes to 9.9.9.9 time out, below.)
+*Rewritten for the S3 review's positive-evidence rule; what this section said before (the check
+connection read through `TCP_CONNECTION_INFO`, its positive control, the probe asked twice)
+is in the branch history and in the review records below.*
 
-The check connection now exists on macOS: the same steps as Linux (connect with the default hop
-limit, linger 0, lower the hop limit, `shutdown(SHUT_WR)`, wait `4 × RTT + 250 ms` clamped to
-0.3–1.5 s), reading the state from `TCP_CONNECTION_INFO` (<netinet/tcp.h>; `tcpi_srtt` /
-`tcpi_rttcur` in ms; states from <netinet/tcp_fsm.h>). Since round 2 (probe-1) only
-`FIN_WAIT_2` or `TIME_WAIT` (reached once the FIN is acknowledged) is an answer, near;
-`FIN_WAIT_1` and `CLOSING` (the peer's FIN crossed the check's) wait; still `FIN_WAIT_1` at the
-deadline is far, but since round 3 (probe-1) only after a positive control: the hop limit the
-connection was made with is restored, and the FIN's retransmission (due within `tcpi_rto`) is
-waited for, the RTO, two round trips and 250 ms (clamped to 0.5–4 s); acknowledged then (the peer
-answers a FIN that reaches it, and the hop-limited one did not reach it): far; not acknowledged,
-or closed or reset meanwhile: a failed check, refused (a reset does not count: an S3 front end
-resets an idle connection on a timer). And since round 3 the probe is asked twice within its
-1.5 s (1 s, then 0.5 s after a timeout), so that a router rate-limiting its ICMP sends the check
-connection fewer destinations. A peer that closed or reset the connection on its own (not `ESTABLISHED` before
-the FIN, or `CLOSE_WAIT`/`LAST_ACK`/`CLOSED` after it, or `CLOSING` at the deadline) is a failed
-check: refused, but not read as near, and never as far. Before, any state but `FIN_WAIT_1` was
-near, so a far server that closes at once (NIST's daytime server 129.6.15.28:13, two hops out)
-was refused as near (3 of 3, `fix-r2/repro-probe1-probe2-on-HEAD.log`); it is now refused as a
-failed check (a far server that always closes first stays refused, by the check's design: it
-never lets the FIN be tested). The probe and the check connection connect to an IPv4-mapped
-address as its IPv4 address (probe-2: an IPv6 socket's hop limit does not limit the IPv4 packets
-of a mapped connection, so the probe of `[::ffff:1.1.1.1]:443` connected).
+The rule is the shared one: probes at hop limits `N`, `N+1` and `N+2` at once, a second round
+1 s later only when the first decided nothing; near when the destination answers a probe of at
+most `N` hops; far only on an ICMP Time Exceeded code 0 matched to a probe of `t >= N` hops, sent
+by a unicast router that is not the destination, with no answer at `t` or below; everything else
+refused. What is macOS-specific is how the Time Exceeded is read:
+
+- **Connect steps.** macOS runs `socket2::Socket::connect_timeout`'s steps itself so that an
+  unreachable `connect` returns at once, before the connection is in progress (Local Network
+  privacy, a Network Extension denial: no packet was sent, let alone answered). That is a local
+  failure, never evidence. An ICMP error can only arrive after `connect` returned `EINPROGRESS`;
+  with `net.inet.tcp.icmp_may_rst=1` (the default) xnu then drops the connection in `SYN_SENT`
+  with `EHOSTUNREACH` / `ENETUNREACH`.
+- **The ICMP copy.** xnu gives an unprivileged process no per-socket ICMP type, code or sender,
+  so before the probes a `SOCK_DGRAM` `IPPROTO_ICMP` (`IPPROTO_ICMPV6`) socket is opened, which
+  receives a copy of the ICMP errors that reach this host. A copy counts for a probe only when
+  its quoted packet has the probe's destination address and port, source address and port and
+  sequence number, and the probe's own socket failed with `EHOSTUNREACH` / `ENETUNREACH`; copies
+  that come late are drained for 30 ms. (12 concurrent processes probing at once were never
+  misattributed in the S3 review's measurements.)
+- **The ISN.** The probe's initial sequence number comes from the **private**
+  `getsockopt(IPPROTO_TCP, TCP_INFO)` (option 0x200, not in the SDK headers): `tcpi_snd_nxt - 1`,
+  read only while the probe is in `SYN_SENT`, the length the kernel wrote checked; a zero ISN, or
+  two probes with the same one, refuses. This is an undocumented layout Apple may change: a Mac
+  where the ICMP socket cannot be opened or `TCP_INFO` cannot be read refuses every requester
+  connection, said once at startup.
+- **The pin.** The connection that follows is made from the far probe's source address and local
+  port, bound to its interface with `IP_BOUND_IF` / `IPV6_BOUND_IF`. (Linux's fixed IPv6 flow
+  label has no macOS counterpart.)
+
+The probes connect to an IPv4-mapped address as its IPv4 address (probe-2 of round 2: an IPv6
+socket's hop limit does not limit the IPv4 packets of a mapped connection).
 
 ## Empirical results (this Mac: macOS 27.2, `kern.osversion` 26B131, Wi-Fi behind a home router)
 
@@ -338,7 +350,7 @@ each, hop limit 2):
 | 2606:4700:4700::1111:443, 2001:4860:4860::8888:443 | 20/20 `EHOSTUNREACH` within 6 ms |
 | 1.1.1.1:443 at hop limit 64 | connected |
 | the ISP's second-hop router (global IPv6), port 179 | refused (RST) in 2.5 ms: near |
-| the same router, port 443 | no answer (filtered): the check connection then cannot connect, refused |
+| the same router, port 443 | no answer (filtered): then refused by the check connection; since the S3 review refused for want of evidence |
 | the home router (LAN and its global IPv6 in the `/64`) | `EHOSTUNREACH` **at once**, before any packet: Local Network privacy (now refused, see below) |
 
 Review round 1 measured it again with the probe's own steps (`fix-r1/h13-probe-timing.log`, 20
@@ -351,9 +363,11 @@ finds all nine public hosts far (`decide`: far, 3 of 3 each) and the LAN probes 
 `icmp_tcp.py` confirms the mechanism: an unprivileged `SOCK_DGRAM`/`IPPROTO_ICMP` socket receives
 the router's "time exceeded" quoting the probe's SYN at the same instant the TCP socket reports
 `EHOSTUNREACH`. (Unprivileged ICMP sockets work on macOS, as `ping -m 2` shows, but are not needed:
-the TCP socket reports the error itself.)
+the TCP socket reports the error itself.) Since the S3 review they are needed: the TCP socket's
+`EHOSTUNREACH` does not say whether a Time Exceeded or an unreachable caused it, nor who sent it,
+so the copy on the ICMP socket is the evidence.
 
-**Check connection** (`confirm.py`: `TCP_CONNECTION_INFO` polled every 5 ms, 1.5 s):
+**Check connection** (before the S3 review; `confirm.py`: `TCP_CONNECTION_INFO` polled every 5 ms, 1.5 s):
 
 | destination | state after `shutdown`, hop limit 2 |
 |---|---|
@@ -363,7 +377,8 @@ the TCP socket reports the error itself.)
 
 `net.inet.tcp.syncookie=1`: a full accept queue is answered with SYN cookies, so the Linux test's
 "listener that drops SYNs" cannot be staged on macOS without root (the probe would just connect);
-the macOS test stages the probe's silence and runs the real check connection.
+the macOS test staged the probe's silence and ran the real check connection (gone since the S3
+review: such a listener is now refused for want of evidence, never far).
 
 **End to end through the CLI** (`zkminer simulate`, public mode, the default `[egress]`, the mock
 worker standing in for risc0; logs `/Users/user/zkminer/scratch/w11/NETGUARD-MAC/e2e/sim-job.log` and `sim-many.log` there): the guard starts (facts
@@ -386,16 +401,18 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
    rule (ip rule)", the `PolicyRule` kind's Linux wording.
 2. **One `RTM_GET`, not two lookups.** macOS has no source rules, so there is no source-dependent
    second lookup to make; the UDP socket's source address check stands in for it (NECP).
-3. **Check connection: far only by the deadline.** macOS keeps an ICMP error for an established
-   connection's FIN as a soft error it never reports, so "far" is never answered early, as Linux
-   can from `SO_ERROR`. Same verdicts; an undecided destination costs up to 1.5 s more.
+3. **The Time Exceeded is read from an ICMP socket, matched by the private `TCP_INFO`'s ISN**
+   (since the S3 review; before it, item 3 was the check connection's far-only-by-the-deadline).
+   Linux reads it from the probe's own error queue (`IP_RECVERR`). Same rule; macOS rests on an
+   undocumented layout, and refuses everything where it cannot be read.
 4. **`ppp` uplinks always need `internal_ranges`** (no PPPoE session list). Stricter.
 5. **No `anycast` route type, no nexthop objects.** macOS's own anycast IPv6 addresses are interface
    addresses (`getifaddrs`), refused as own addresses.
 6. **Netmasks honour `sa_len`** (a macOS-only reader; what Linux's would read past it is not the
    mask's on macOS).
 7. **An unreachable `connect` reports at once is refused**, not far (Local Network privacy, a
-   Network Extension denial). Linux reads every unreachable as far. Stricter.
+   Network Extension denial). Before the S3 review Linux read every unreachable as far; now no
+   platform does (an unreachable is never evidence), so this is no longer a difference.
 8. **Ethernet-type interfaces are physical only by Apple's names.** Linux reads a device without
    a kind as physical; macOS has no kind to read, so an unknown name is not physical. Stricter.
 9. **DNS servers come from configd too**, and each `nameserver` word is read by every macOS
@@ -405,7 +422,8 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
     of grace; Linux keeps the last good facts for as long as the failure lasts (recommended for
     #37, below).
 11. **The check connection reads only an acknowledged FIN as near**; a peer that closed or reset
-    first is a failed check. Linux reads any state but `FIN_WAIT1` as near (recommended for #37).
+    first is a failed check. Linux reads any state but `FIN_WAIT1` as near (recommended for #37;
+    applied, then the check connection removed by the S3 review).
 12. **One facts re-read at a time, the configuration daemon bounded by 2 s.** Linux re-reads in
     every caller that finds the facts stale.
 13. **The uplink signature includes configd's network signatures.** Linux's has the routes only.
@@ -420,7 +438,8 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
     the first 8 sorted servers (recommended for #37).
 17. **The check connection's positive control and a second probe attempt** (round 3, probe-1): a
     peer that acknowledges a FIN at no hop limit is refused, not far. Linux reads it as far
-    (recommended for #37, with its cost).
+    (recommended for #37, with its cost; applied, then removed with the check connection by the
+    S3 review).
 18. **A caller waits for a re-read under way at most 500 ms** (round 3, 12(b)). Linux has no
     single flight (each stale caller re-reads).
 
@@ -460,8 +479,14 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
   connection into a directly attached network. The probe now refuses that (it no longer reads it
   as far); such destinations are on-link and refused by the address and route checks before any
   probe anyway.
-- **`net.inet.tcp.icmp_may_rst=0`** (not the default) makes every 2-hop probe time out; the check
-  connection then decides each connection (same verdicts, slower: up to 1.5 s + its connect).
+- **`net.inet.tcp.icmp_may_rst=0`** (not the default) keeps a probe in `SYN_SENT` after its Time
+  Exceeded, so the probe's socket never fails and no copy counts: every destination is refused
+  for want of evidence (fails closed). Before the S3 review the check connection decided instead.
+- **The private `TCP_INFO` layout** (option 0x200, `tcpi_snd_nxt` and `tcpi_state` at fixed
+  offsets) is not an API: a macOS release that changes it makes the probes' ISNs unreadable or
+  wrong. Unreadable, short or zero refuses (warned once at startup); a layout that changed but
+  still yields plausible numbers would match no ICMP copy, so it refuses too, unless the new
+  field at the old offset happened to equal the ISN.
 - **DNS servers that change between facts reads** (a VPN that comes up) are known from the next
   read, as on Linux. Resolvers configd keeps under other keys than `State:/Network/Service/*/DNS`,
   `State:/Network/Global/DNS` and `Setup:/Network/Service/*/DNS` are not read
@@ -517,7 +542,12 @@ admits; the download's own lines are `Downloading ELF from …` / `Downloaded EL
   `a_local_listener_is_near`, `outcomes_are_classified`. Round 2:
   `the_check_reads_only_an_acknowledged_fin_as_an_answer`,
   `a_peer_that_closes_first_is_never_far`,
-  `a_mapped_address_is_probed_as_its_ipv4_address`.
+  `a_mapped_address_is_probed_as_its_ipv4_address`. Since the S3 review the check-connection
+  tests are gone; the near-hop tests of the macOS mechanism are `the_isn_is_read_only_when_it_can_be` and
+  `an_icmp_copy_is_matched_by_what_it_quotes` (pure), `macos_a_probe_has_its_isn` (macOS only),
+  `an_unreachable_at_once_is_a_local_failure` (every Unix) and the live
+  `the_router_that_ran_a_probe_out_is_named` (Linux, Android and macOS), with the shared rule's
+  tests.
 - `macos_tests` (this host's real facts): `loopback_link_local_the_lan_and_the_router_are_refused`,
   `neighbours_own_addresses_site_resolvers_and_deny_cidrs_are_refused` (with the kernel's own
   on-link and local verdicts), `a_public_address_is_admitted_and_vetted`,
