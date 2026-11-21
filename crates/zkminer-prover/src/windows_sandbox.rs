@@ -1,0 +1,1456 @@
+//! Keeping a requester's guest away from the operator's key on Windows.
+//!
+//! A worker runs a requester's guest program. On Linux it confines itself before the first guest
+//! (`zkminer_witness_sandbox::confine`) and the miner is not dumpable; on Windows a worker is a
+//! process of the operator's, and one that a guest got code execution in could read the miner's
+//! memory (the signing key) or the key on disk. So, on Windows:
+//!
+//! - The miner's process, and each of its threads, grants this user only what a process manager
+//!   needs: query its name and times, wait for it, end it ([`lock_down_this_process`]). No other
+//!   process of the user's, a worker included, can read its memory, inject code, or change that
+//!   back; an elevated process with `SeDebugPrivilege` still can.
+//! - Every worker starts suspended in a job of its own (`windows_job::new_worker_job`: no desktop,
+//!   no clipboard, no breakaway) and is resumed once it is in it ([`spawn_worker`]).
+//! - With `ZKMINER_WINDOWS_LOW_IL_WORKERS=1`, every worker runs at Low integrity: it cannot open the
+//!   miner (or any process of the user's at Medium) at all, nor write a file or registry key at
+//!   Medium. Its temporary, cache and segment directories are made writable at Low before it starts,
+//!   and the key file, `~/.zkminer/.env` and the lock journal get a label Low processes cannot read
+//!   through ([`protect_secrets`], [`write_secret_file`]). Off by default until each GPU runtime is
+//!   known to work at Low; a worker that cannot even start its handshake at Low is restarted at
+//!   Medium, with a `PAGE:` ([`low_il_failed`]).
+//!
+//! Without the flag a worker can still read every file of the user's, the key file and `.env`
+//! included (`zkminer doctor` says so).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{c_void, OsStr, OsString};
+use std::io;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{ChildStderr, ChildStdin, ChildStdout, ExitStatus};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// Set to `1` to run every worker at Low integrity (see the module docs).
+pub const LOW_IL_WORKERS_ENV: &str = "ZKMINER_WINDOWS_LOW_IL_WORKERS";
+
+type Handle = *mut c_void;
+
+// Process and thread rights (winnt.h).
+const PROCESS_TERMINATE: u32 = 0x0001;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
+const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
+const SE_FILE_OBJECT: i32 = 1;
+const SDDL_REVISION_1: u32 = 1;
+
+/// What this user keeps on the miner's process: see it in a process list, wait for it, end it.
+const PROCESS_USER_RIGHTS: u32 =
+    PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE;
+/// And on each of its threads.
+const THREAD_USER_RIGHTS: u32 = THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+
+/// A directory, and everything made in it, that a Low process may write.
+const LOW_WRITABLE_DIR: &str = "S:(ML;OICI;NW;;;LW)";
+/// A file that Low processes can neither read nor write (Medium processes are not affected).
+const NO_READ_UP_FILE: &str = "S:(ML;;NWNR;;;ME)";
+
+#[repr(C)]
+struct SecurityAttributes {
+    length: u32,
+    descriptor: *mut c_void,
+    inherit_handle: i32,
+}
+
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    reserved: *mut u16,
+    desktop: *mut u16,
+    title: *mut u16,
+    x: u32,
+    y: u32,
+    x_size: u32,
+    y_size: u32,
+    x_count_chars: u32,
+    y_count_chars: u32,
+    fill_attribute: u32,
+    flags: u32,
+    show_window: u16,
+    reserved2_len: u16,
+    reserved2: *mut u8,
+    std_input: Handle,
+    std_output: Handle,
+    std_error: Handle,
+}
+
+#[repr(C)]
+struct StartupInfoExW {
+    startup_info: StartupInfoW,
+    attribute_list: *mut c_void,
+}
+
+#[repr(C)]
+struct ProcessInformation {
+    process: Handle,
+    thread: Handle,
+    process_id: u32,
+    thread_id: u32,
+}
+
+#[repr(C)]
+struct ThreadEntry32 {
+    size: u32,
+    usage: u32,
+    thread_id: u32,
+    owner_process_id: u32,
+    base_priority: i32,
+    delta_priority: i32,
+    flags: u32,
+}
+
+#[repr(C)]
+struct TokenMandatoryLabel {
+    sid: *mut c_void,
+    attributes: u32,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> Handle;
+    fn GetCurrentProcessId() -> u32;
+    fn GetCurrentThread() -> Handle;
+    fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    fn InitializeProcThreadAttributeList(
+        list: *mut c_void,
+        count: u32,
+        flags: u32,
+        size: *mut usize,
+    ) -> i32;
+    fn UpdateProcThreadAttribute(
+        list: *mut c_void,
+        flags: u32,
+        attribute: usize,
+        value: *const c_void,
+        size: usize,
+        previous: *mut c_void,
+        returned: *mut usize,
+    ) -> i32;
+    fn DeleteProcThreadAttributeList(list: *mut c_void);
+    fn CreateProcessW(
+        application: *const u16,
+        command_line: *mut u16,
+        process_attributes: *const SecurityAttributes,
+        thread_attributes: *const SecurityAttributes,
+        inherit_handles: i32,
+        flags: u32,
+        environment: *const c_void,
+        current_directory: *const u16,
+        startup_info: *const StartupInfoExW,
+        information: *mut ProcessInformation,
+    ) -> i32;
+    fn ResumeThread(thread: Handle) -> u32;
+    fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
+    fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+    fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> Handle;
+    fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        attributes: *const SecurityAttributes,
+        disposition: u32,
+        flags: u32,
+        template: Handle,
+    ) -> Handle;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl: *const u16,
+        revision: u32,
+        descriptor: *mut *mut c_void,
+        size: *mut u32,
+    ) -> i32;
+    fn GetSecurityDescriptorSacl(
+        descriptor: *mut c_void,
+        present: *mut i32,
+        sacl: *mut *mut c_void,
+        defaulted: *mut i32,
+    ) -> i32;
+    fn SetNamedSecurityInfoW(
+        name: *const u16,
+        object_type: i32,
+        information: u32,
+        owner: *mut c_void,
+        group: *mut c_void,
+        dacl: *mut c_void,
+        sacl: *mut c_void,
+    ) -> u32;
+    fn SetKernelObjectSecurity(handle: Handle, information: u32, descriptor: *mut c_void) -> i32;
+    fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+    fn DuplicateTokenEx(
+        token: Handle,
+        access: u32,
+        attributes: *const SecurityAttributes,
+        impersonation_level: i32,
+        token_type: i32,
+        new_token: *mut Handle,
+    ) -> i32;
+    fn SetTokenInformation(token: Handle, class: i32, info: *const c_void, length: u32) -> i32;
+    fn CreateProcessAsUserW(
+        token: Handle,
+        application: *const u16,
+        command_line: *mut u16,
+        process_attributes: *const SecurityAttributes,
+        thread_attributes: *const SecurityAttributes,
+        inherit_handles: i32,
+        flags: u32,
+        environment: *const c_void,
+        current_directory: *const u16,
+        startup_info: *const StartupInfoExW,
+        information: *mut ProcessInformation,
+    ) -> i32;
+}
+
+fn wide(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain([0]).collect()
+}
+
+/// A security descriptor made from SDDL, freed on drop.
+struct Descriptor(*mut c_void);
+
+impl Descriptor {
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
+        let text = wide(OsStr::new(sddl));
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated string and an out-pointer; the result is owned by `Self`.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(descriptor))
+    }
+
+    /// Its SACL (where a mandatory label lives).
+    fn sacl(&self) -> io::Result<*mut c_void> {
+        let (mut present, mut defaulted, mut sacl) = (0, 0, std::ptr::null_mut());
+        // SAFETY: a valid descriptor and out-pointers; the SACL points into the descriptor.
+        if unsafe { GetSecurityDescriptorSacl(self.0, &mut present, &mut sacl, &mut defaulted) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 0 || sacl.is_null() {
+            return Err(io::Error::other("the descriptor has no SACL"));
+        }
+        Ok(sacl)
+    }
+
+    /// Kept for the life of the process (the thread hook below reads it from any thread).
+    fn leak(self) -> *mut c_void {
+        let p = self.0;
+        std::mem::forget(self);
+        p
+    }
+}
+
+impl Drop for Descriptor {
+    fn drop(&mut self) {
+        // SAFETY: allocated by the SDDL conversion, used by nothing any more.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+fn set_dacl(handle: Handle, descriptor: *mut c_void) -> io::Result<()> {
+    // SAFETY: a handle with WRITE_DAC (or a pseudo-handle, which has every right) and a valid
+    // descriptor.
+    if unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The DACL for the miner's process or one of its threads: `user_rights` for this user, the same for
+/// whoever owns it (`OWNER RIGHTS`, so the owner's implicit `WRITE_DAC` cannot take the rest back),
+/// everything for SYSTEM. Protected, so nothing is inherited.
+fn locked_dacl(user: &str, user_rights: u32, all: u32) -> String {
+    format!("D:P(A;;{user_rights:#x};;;{user})(A;;{all:#x};;;SY)(A;;{user_rights:#x};;;OW)")
+}
+
+/// The descriptor every thread of the miner gets once [`lock_down_this_process`] ran.
+static THREAD_DESCRIPTOR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Run by the loader on every thread this process starts, on that thread, before its own code:
+/// a thread's object takes its DACL from the token, which grants this user everything, so each
+/// new thread locks itself as the ones running at [`lock_down_this_process`] were. (Without it a
+/// process of the user's could open one of the miner's threads and change its context.) Only
+/// `SetKernelObjectSecurity`, which loads nothing: it runs under the loader lock.
+unsafe extern "system" fn on_thread_attach(_module: *mut c_void, reason: u32, _: *mut c_void) {
+    const DLL_THREAD_ATTACH: u32 = 2;
+    if reason == DLL_THREAD_ATTACH {
+        let descriptor = THREAD_DESCRIPTOR.load(Ordering::Acquire);
+        if !descriptor.is_null() {
+            // SAFETY: the pseudo-handle of the calling thread and a descriptor that is never freed.
+            unsafe {
+                SetKernelObjectSecurity(GetCurrentThread(), DACL_SECURITY_INFORMATION, descriptor)
+            };
+        }
+    }
+}
+
+/// The TLS callback table entry for [`on_thread_attach`] (`.CRT$XL*`, between the CRT's own
+/// `XLA` and `XLZ`, as std's is).
+#[used]
+#[link_section = ".CRT$XLC"]
+static ON_THREAD_ATTACH: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) =
+    on_thread_attach;
+
+/// Lock this process and its threads to this user as the module docs say. For the miner's `main`,
+/// first thing: everything it does to itself goes through pseudo-handles, which this does not
+/// restrict, and it opens only its workers and their children by pid.
+///
+/// A thread started between its creation and its first instruction (when the loader runs the
+/// hook above) still has the token's DACL; a process of the user's that opened it in that window
+/// keeps its handle. Elevated processes with `SeDebugPrivilege` are not stopped.
+pub fn lock_down_this_process() -> io::Result<()> {
+    let user = zkminer_config::wallet::current_user_sid()?;
+    let process =
+        Descriptor::from_sddl(&locked_dacl(&user, PROCESS_USER_RIGHTS, PROCESS_ALL_ACCESS))?;
+    // SAFETY: the pseudo-handle of this process.
+    set_dacl(unsafe { GetCurrentProcess() }, process.0)?;
+    let thread = Descriptor::from_sddl(&locked_dacl(&user, THREAD_USER_RIGHTS, THREAD_ALL_ACCESS))?;
+    let thread = thread.leak();
+    // The threads started from now on lock themselves, then the ones running now are locked.
+    THREAD_DESCRIPTOR.store(thread, Ordering::Release);
+    // Referenced, so the linker keeps the TLS callback (as std does for its own).
+    // SAFETY: a plain read of a static.
+    let _ = unsafe { std::ptr::from_ref(&ON_THREAD_ATTACH).read_volatile() };
+    lock_running_threads(thread)
+}
+
+/// Locks every thread of this process running now. A thread that ended in the meantime is skipped.
+fn lock_running_threads(descriptor: *mut c_void) -> io::Result<()> {
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    // SAFETY: plain kernel32 calls on a snapshot this function owns; `entry` outlives each call.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = OwnedHandle::from_raw_handle(snapshot);
+        let me = GetCurrentProcessId();
+        let mut entry: ThreadEntry32 = std::mem::zeroed();
+        entry.size = std::mem::size_of::<ThreadEntry32>() as u32;
+        let mut more = Thread32First(snapshot.as_raw_handle(), &mut entry) != 0;
+        let mut failed = None;
+        while more {
+            if entry.owner_process_id == me {
+                let thread = OpenThread(WRITE_DAC, 0, entry.thread_id);
+                if !thread.is_null() {
+                    let thread = OwnedHandle::from_raw_handle(thread);
+                    if let Err(e) = set_dacl(thread.as_raw_handle(), descriptor) {
+                        failed = Some(e);
+                    }
+                }
+            }
+            more = Thread32Next(snapshot.as_raw_handle(), &mut entry) != 0;
+        }
+        failed.map_or(Ok(()), Err)
+    }
+}
+
+/// Whether workers are to run at Low integrity (`ZKMINER_WINDOWS_LOW_IL_WORKERS=1`), read once.
+pub fn low_il_workers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var(LOW_IL_WORKERS_ENV).is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Backends whose workers fell back to Medium, and whether all did (no Low directories).
+static LOW_IL_REFUSED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static LOW_IL_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether `backend`'s next worker starts at Low integrity.
+fn low_il_for(backend: &str) -> bool {
+    low_il_workers()
+        && !LOW_IL_OFF.load(Ordering::Relaxed)
+        && !LOW_IL_REFUSED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(backend)
+}
+
+/// A Low worker of `backend` failed to start (`why`): its workers run at Medium from now on, and the
+/// operator is paged, as the sandbox the flag asked for is gone for them.
+pub(crate) fn low_il_failed(backend: &str, why: &str) {
+    LOW_IL_REFUSED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(backend.to_string());
+    tracing::error!(
+        "PAGE: LOW-IL-WORKER-UNSUPPORTED ({backend}) — a worker at Low integrity failed to start \
+         ({why}); {backend} workers run at Medium integrity from now on, able to read this user's \
+         files and open this user's processes other than the miner"
+    );
+}
+
+/// Make `dir` (created if missing) and everything in it writable by Low processes.
+fn label_low_writable(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    set_label(dir, LOW_WRITABLE_DIR)
+}
+
+fn set_label(path: &Path, sddl: &str) -> io::Result<()> {
+    let descriptor = Descriptor::from_sddl(sddl)?;
+    let sacl = descriptor.sacl()?;
+    let name = wide(path.as_os_str());
+    // SAFETY: a NUL-terminated path and a SACL inside a live descriptor. Setting a label at or below
+    // this process's own level needs no privilege, only WRITE_OWNER, which the user's files grant.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            name.as_ptr(),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            sacl,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
+
+/// Label `path` so Low processes cannot read it. Labels, never reads, the file.
+fn label_no_read_up(path: &Path) -> io::Result<()> {
+    set_label(path, NO_READ_UP_FILE)
+}
+
+/// With Low workers, label the key file (if the key comes from one), `~/.zkminer/.env` and the lock
+/// journal so no Low process can read them; a file that does not exist is skipped. Labels, never
+/// reads, them. Does nothing without the flag.
+pub fn protect_secrets(key_file: Option<&Path>, journal: &Path) {
+    if !low_il_workers() {
+        return;
+    }
+    let env_file = dirs::home_dir().map(|h| h.join(".zkminer").join(".env"));
+    for path in key_file
+        .into_iter()
+        .chain(env_file.as_deref())
+        .chain([journal])
+    {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(e) = label_no_read_up(path) {
+            tracing::warn!(
+                "{} could not be labelled unreadable to the Low-integrity workers ({e}); they can \
+                 read it",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Write `contents` to a new `path` (an existing one is replaced), labelled from its creation so Low
+/// processes cannot read it when workers run at Low; a plain write otherwise.
+pub fn write_secret_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if !low_il_workers() {
+        return std::fs::write(path, contents);
+    }
+    write_labelled_file(path, contents)
+}
+
+fn write_labelled_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    // A new file: an existing one would keep its own descriptor.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    // Only a SACL: the DACL is inherited from the directory, as for any new file.
+    let descriptor = Descriptor::from_sddl(NO_READ_UP_FILE)?;
+    let attributes = SecurityAttributes {
+        length: std::mem::size_of::<SecurityAttributes>() as u32,
+        descriptor: descriptor.0,
+        inherit_handle: 0,
+    };
+    let name = wide(path.as_os_str());
+    // SAFETY: a NUL-terminated path and a SECURITY_ATTRIBUTES that outlives the call.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_ALL,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle as isize == -1 || handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a valid file handle this function owns, handed to `File` to close.
+    let mut file = unsafe { std::fs::File::from_raw_handle(handle) };
+    file.write_all(contents)
+}
+
+/// The directories a Low worker writes, made and labelled once: (variable, directory) for those it
+/// is pointed at, then `~/.zkminer/risc0-segments` and `~/.zkminer/locks`, which it finds itself.
+fn low_dirs() -> Result<&'static [(&'static str, PathBuf)], String> {
+    static DIRS: OnceLock<Result<Vec<(&'static str, PathBuf)>, String>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let local = dirs::data_local_dir().ok_or("no local application data directory")?;
+        let base = local.join("zkminer").join("worker");
+        let home = dirs::home_dir().ok_or("no home directory")?;
+        let mut dirs = Vec::new();
+        for (vars, name) in [
+            (&["TMP", "TEMP", "TMPDIR"][..], "tmp"),
+            (&["CUDA_CACHE_PATH"], "cuda-cache"),
+            (&["NEO_CACHE_DIR"], "neo"),
+            (&["SYCL_CACHE_DIR"], "sycl"),
+            (&["RISC0_G16_CACHE_DIR"], "risc0-groth16"),
+            (&["AMD_COMGR_CACHE_DIR"], "comgr"),
+        ] {
+            for var in vars {
+                dirs.push((*var, base.join(name)));
+            }
+        }
+        for (_, dir) in &dirs {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        label_low_writable(&base).map_err(|e| format!("{}: {e}", base.display()))?;
+        for dir in [
+            home.join(".zkminer").join("risc0-segments"),
+            zkminer_prover_protocol::types::sp1_groth16_queue_dir(&home),
+        ] {
+            label_low_writable(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        Ok(dirs)
+    })
+    .as_ref()
+    .map(Vec::as_slice)
+    .map_err(String::clone)
+}
+
+/// Directories a worker is pointed at by its environment that it writes (the witness proofs'
+/// segment directory, an operator's SP1 queue directory): labelled once each.
+fn label_env_dirs(env: &[(OsString, OsString)]) -> Result<(), String> {
+    static DONE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    let written = [
+        zkminer_prover_protocol::types::WITNESS_SEGMENT_DIR_ENV,
+        "SP1_GROTH16_QUEUE_DIR",
+    ];
+    for (k, v) in env {
+        if v.is_empty() || !written.iter().any(|w| OsStr::new(w) == k.as_os_str()) {
+            continue;
+        }
+        let dir = PathBuf::from(v);
+        let mut done = DONE.lock().unwrap_or_else(|p| p.into_inner());
+        if done.contains(&dir) {
+            continue;
+        }
+        label_low_writable(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        done.insert(dir);
+    }
+    Ok(())
+}
+
+/// A worker process started by [`spawn_worker`]: what the dispatcher uses of a
+/// `std::process::Child`, which cannot be made from a process started any other way.
+pub(crate) struct WorkerChild {
+    pub stdin: Option<ChildStdin>,
+    pub stdout: Option<ChildStdout>,
+    pub stderr: Option<ChildStderr>,
+    process: OwnedHandle,
+    pid: u32,
+    /// Its job (`windows_job::new_worker_job`), if it could be put in one. Closing it ends
+    /// whatever is still in it.
+    job: Option<OwnedHandle>,
+    low: bool,
+}
+
+impl WorkerChild {
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    /// Whether it runs at Low integrity.
+    pub fn is_low_integrity(&self) -> bool {
+        self.low
+    }
+
+    /// Ends the worker and everything it started (its job), as Unix ends its process group. Ok if it
+    /// had ended already.
+    pub fn kill(&mut self) -> io::Result<()> {
+        if let Some(job) = &self.job {
+            // SAFETY: a valid job handle.
+            if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } != 0 {
+                return Ok(());
+            }
+        }
+        // SAFETY: a valid process handle.
+        if unsafe { TerminateProcess(self.process.as_raw_handle(), 1) } == 0 {
+            let e = io::Error::last_os_error();
+            // An ended process refuses to be terminated.
+            if self.try_wait().is_ok_and(|s| s.is_some()) {
+                return Ok(());
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.wait_for(0)
+    }
+
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        // As std does: a worker reading its stdin must see it close.
+        drop(self.stdin.take());
+        self.wait_for(u32::MAX)?
+            .ok_or_else(|| io::Error::other("the wait ended without an exit"))
+    }
+
+    fn wait_for(&self, milliseconds: u32) -> io::Result<Option<ExitStatus>> {
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 0x102;
+        // SAFETY: a valid process handle; `code` outlives the call.
+        unsafe {
+            match WaitForSingleObject(self.process.as_raw_handle(), milliseconds) {
+                WAIT_OBJECT_0 => {
+                    let mut code = 0u32;
+                    if GetExitCodeProcess(self.process.as_raw_handle(), &mut code) == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(Some(ExitStatus::from_raw(code)))
+                }
+                WAIT_TIMEOUT => Ok(None),
+                _ => Err(io::Error::last_os_error()),
+            }
+        }
+    }
+}
+
+/// Start the worker `program` for `backend` with exactly `env`, its stdin, stdout and stderr piped
+/// to the miner, in a console of its own with no window (`CREATE_NO_WINDOW`: the miner's console
+/// events, Ctrl+C above all, must not reach it), in the miner's job and a job of its own, at Low
+/// integrity when that is on (see the module docs). Nothing else of the miner's is inherited.
+pub(crate) fn spawn_worker(
+    backend: &str,
+    program: &Path,
+    mut env: Vec<(OsString, OsString)>,
+) -> io::Result<WorkerChild> {
+    let low = low_il_for(backend)
+        && match low_dirs().and_then(|dirs| label_env_dirs(&env).map(|()| dirs)) {
+            Ok(dirs) => {
+                // Last, so they win over the miner's own: a Low process cannot write those.
+                env.extend(
+                    dirs.iter()
+                        .map(|(var, dir)| (OsString::from(var), dir.into())),
+                );
+                true
+            }
+            Err(e) => {
+                LOW_IL_OFF.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    "PAGE: LOW-IL-WORKER-UNSUPPORTED (all) — the directories a Low-integrity \
+                     worker writes could not be prepared ({e}); every worker runs at Medium \
+                     integrity"
+                );
+                false
+            }
+        };
+    spawn(program, &[], &env, low)
+}
+
+/// Quote `arg` for a command line as the C runtime parses it back.
+fn push_arg(line: &mut Vec<u16>, arg: &OsStr, always_quote: bool) {
+    let (quote, backslash) = (u16::from(b'"'), u16::from(b'\\'));
+    let arg: Vec<u16> = arg.encode_wide().collect();
+    let needs = always_quote
+        || arg.is_empty()
+        || arg
+            .iter()
+            .any(|&c| c == quote || c == u16::from(b' ') || c == u16::from(b'\t'));
+    if !needs {
+        line.extend(arg);
+        return;
+    }
+    line.push(quote);
+    let mut backslashes = 0;
+    for c in arg {
+        if c == backslash {
+            backslashes += 1;
+        } else {
+            if c == quote {
+                line.extend(std::iter::repeat_n(backslash, backslashes + 1));
+            }
+            backslashes = 0;
+        }
+        line.push(c);
+    }
+    line.extend(std::iter::repeat_n(backslash, backslashes));
+    line.push(quote);
+}
+
+fn command_line(program: &Path, args: &[&OsStr]) -> io::Result<Vec<u16>> {
+    if program
+        .as_os_str()
+        .encode_wide()
+        .any(|c| c == u16::from(b'"'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a program path with a quote",
+        ));
+    }
+    let mut line = Vec::new();
+    push_arg(&mut line, program.as_os_str(), true);
+    for arg in args {
+        line.push(u16::from(b' '));
+        push_arg(&mut line, arg, false);
+    }
+    line.push(0);
+    Ok(line)
+}
+
+/// A Unicode environment block: one `name=value` each, the last of a name (matched without case,
+/// as Windows does) winning, sorted by name, ending in an empty one.
+fn environment_block(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+    let mut vars: BTreeMap<String, (&OsString, &OsString)> = BTreeMap::new();
+    for (k, v) in env {
+        if k.is_empty() {
+            continue;
+        }
+        let key = k.to_string_lossy().to_uppercase();
+        vars.insert(key, (k, v));
+    }
+    let mut block = Vec::new();
+    for (k, v) in vars.into_values() {
+        let (k, v): (Vec<u16>, Vec<u16>) = (k.encode_wide().collect(), v.encode_wide().collect());
+        if k.contains(&0) || v.contains(&0) || k[1..].contains(&u16::from(b'=')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an environment variable with a NUL or a misplaced '='",
+            ));
+        }
+        block.extend(k);
+        block.push(u16::from(b'='));
+        block.extend(v);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
+/// A copy of this process's token at Low integrity, to start a process with.
+fn low_integrity_token() -> io::Result<OwnedHandle> {
+    const TOKEN_DUPLICATE: u32 = 0x0002;
+    const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ADJUST_DEFAULT: u32 = 0x0080;
+    const SECURITY_IMPERSONATION: i32 = 2;
+    const TOKEN_PRIMARY: i32 = 1;
+    const TOKEN_INTEGRITY_LEVEL: i32 = 25;
+    const SE_GROUP_INTEGRITY: u32 = 0x20;
+    // S-1-16-4096: revision 1, one sub-authority, the mandatory label authority (16), Low (0x1000).
+    let mut low_sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x10, 0x00, 0x00];
+    // SAFETY: plain advapi32 calls; every handle is owned as soon as it exists, and `label` and the
+    // SID it points to outlive the call that reads them.
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+            &mut token,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let token = OwnedHandle::from_raw_handle(token);
+        let mut low = std::ptr::null_mut();
+        if DuplicateTokenEx(
+            token.as_raw_handle(),
+            0,
+            std::ptr::null(),
+            SECURITY_IMPERSONATION,
+            TOKEN_PRIMARY,
+            &mut low,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let low = OwnedHandle::from_raw_handle(low);
+        let label = TokenMandatoryLabel {
+            sid: low_sid.as_mut_ptr().cast(),
+            attributes: SE_GROUP_INTEGRITY,
+        };
+        if SetTokenInformation(
+            low.as_raw_handle(),
+            TOKEN_INTEGRITY_LEVEL,
+            (&label as *const TokenMandatoryLabel).cast(),
+            (std::mem::size_of::<TokenMandatoryLabel>() + low_sid.len()) as u32,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(low)
+    }
+}
+
+/// A pipe: the end the child gets and the miner's. The miner's is opened for overlapped I/O, as
+/// std's own pipes are: `ChildStdin`/`ChildStdout` read and write with `ReadFileEx`/`WriteFileEx`,
+/// which wait forever on an anonymous pipe from `CreatePipe`. Neither end is inheritable yet: the
+/// child's is made so only for the `CreateProcess` call (see [`spawn`]), so a process another
+/// thread starts with std (which inherits every inheritable handle) does not get a copy.
+fn pipe(child_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    const PIPE_ACCESS_INBOUND: u32 = 0x1;
+    const PIPE_ACCESS_OUTBOUND: u32 = 0x2;
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x8;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const OPEN_EXISTING: u32 = 3;
+    const CAPACITY: u32 = 64 * 1024;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            max_instances: u32,
+            out_size: u32,
+            in_size: u32,
+            timeout: u32,
+            attributes: *const SecurityAttributes,
+        ) -> Handle;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    // One instance, the first of its name: a name taken already fails, and a process that connected
+    // before the miner makes the miner's own connection fail rather than share the pipe.
+    let name = wide(OsStr::new(&format!(
+        r"\\.\pipe\zkminer-worker-{}-{}-{nanos}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )));
+    let (ours_mode, theirs_access) = if child_reads {
+        (PIPE_ACCESS_OUTBOUND, GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+    } else {
+        (PIPE_ACCESS_INBOUND, GENERIC_WRITE)
+    };
+    // SAFETY: a NUL-terminated name; both handles are owned at once.
+    unsafe {
+        let ours = CreateNamedPipeW(
+            name.as_ptr(),
+            ours_mode | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+            PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            CAPACITY,
+            CAPACITY,
+            0,
+            std::ptr::null(),
+        );
+        if ours as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let ours = OwnedHandle::from_raw_handle(ours);
+        let theirs = CreateFileW(
+            name.as_ptr(),
+            theirs_access,
+            0,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if theirs as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((OwnedHandle::from_raw_handle(theirs), ours))
+    }
+}
+
+/// Make `handle` inheritable, or not.
+fn set_inheritable(handle: &OwnedHandle, inheritable: bool) -> io::Result<()> {
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
+    }
+    // SAFETY: a valid handle.
+    if unsafe {
+        SetHandleInformation(
+            handle.as_raw_handle(),
+            HANDLE_FLAG_INHERIT,
+            if inheritable { HANDLE_FLAG_INHERIT } else { 0 },
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// [`spawn_worker`] for any program: `args` after it, exactly `env`, at Low integrity if `low`.
+fn spawn(
+    program: &Path,
+    args: &[&OsStr],
+    env: &[(OsString, OsString)],
+    low: bool,
+) -> io::Result<WorkerChild> {
+    const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+
+    let application = wide(program.as_os_str());
+    let mut line = command_line(program, args)?;
+    let block = environment_block(env)?;
+    let token = if low {
+        Some(low_integrity_token()?)
+    } else {
+        None
+    };
+    let (stdin_child, stdin_ours) = pipe(true)?;
+    let (stdout_child, stdout_ours) = pipe(false)?;
+    let (stderr_child, stderr_ours) = pipe(false)?;
+    // The only handles it inherits.
+    let inherited: [Handle; 3] = [
+        stdin_child.as_raw_handle(),
+        stdout_child.as_raw_handle(),
+        stderr_child.as_raw_handle(),
+    ];
+
+    // SAFETY: the attribute list is sized by the first call, initialised once, deleted below, and
+    // `inherited` outlives every use of it; every structure passed to CreateProcess outlives the
+    // call; every handle it returns is owned at once.
+    let (process, job, pid) = unsafe {
+        let mut size = 0usize;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        let mut list = vec![0u64; size.div_ceil(8)];
+        let list = list.as_mut_ptr().cast::<c_void>();
+        if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        struct List(*mut c_void);
+        impl Drop for List {
+            fn drop(&mut self) {
+                // SAFETY: an initialised list.
+                unsafe { DeleteProcThreadAttributeList(self.0) };
+            }
+        }
+        let list = List(list);
+        if UpdateProcThreadAttribute(
+            list.0,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inherited.as_ptr().cast(),
+            std::mem::size_of_val(&inherited),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut startup: StartupInfoExW = std::mem::zeroed();
+        startup.startup_info.cb = std::mem::size_of::<StartupInfoExW>() as u32;
+        startup.startup_info.flags = STARTF_USESTDHANDLES;
+        startup.startup_info.std_input = inherited[0];
+        startup.startup_info.std_output = inherited[1];
+        startup.startup_info.std_error = inherited[2];
+        startup.attribute_list = list.0;
+        let flags = CREATE_SUSPENDED
+            | CREATE_UNICODE_ENVIRONMENT
+            | EXTENDED_STARTUPINFO_PRESENT
+            | CREATE_NO_WINDOW;
+        let mut info: ProcessInformation = std::mem::zeroed();
+        // Inheritable for this call only (the handle list keeps everything else out of it).
+        for handle in [&stdin_child, &stdout_child, &stderr_child] {
+            set_inheritable(handle, true)?;
+        }
+        let ok = match &token {
+            Some(token) => CreateProcessAsUserW(
+                token.as_raw_handle(),
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                block.as_ptr().cast(),
+                std::ptr::null(),
+                &startup,
+                &mut info,
+            ),
+            None => CreateProcessW(
+                application.as_ptr(),
+                line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                block.as_ptr().cast(),
+                std::ptr::null(),
+                &startup,
+                &mut info,
+            ),
+        };
+        let created = io::Error::last_os_error();
+        for handle in [&stdin_child, &stdout_child, &stderr_child] {
+            let _ = set_inheritable(handle, false);
+        }
+        if ok == 0 {
+            return Err(created);
+        }
+        let process = OwnedHandle::from_raw_handle(info.process);
+        let thread = OwnedHandle::from_raw_handle(info.thread);
+        // Into the jobs while it is suspended: once running, the SP1 worker puts itself in a job of
+        // its own, and could then no longer be put in this one.
+        crate::windows_job::end_with_this_process(process.as_raw_handle(), info.process_id);
+        let job = match crate::windows_job::new_worker_job()
+            .and_then(|job| crate::windows_job::assign(&job, process.as_raw_handle()).map(|()| job))
+        {
+            Ok(job) => Some(job),
+            Err(e) => {
+                tracing::warn!(
+                    "worker pid {} runs without its job ({e}): it is not kept from the desktop and \
+                     the clipboard",
+                    info.process_id
+                );
+                None
+            }
+        };
+        if ResumeThread(thread.as_raw_handle()) == u32::MAX {
+            let e = io::Error::last_os_error();
+            TerminateProcess(process.as_raw_handle(), 1);
+            return Err(e);
+        }
+        (process, job, info.process_id)
+    };
+    // The child's ends are the child's alone now: closed here, so the miner sees EOF when it exits.
+    drop((stdin_child, stdout_child, stderr_child));
+    Ok(WorkerChild {
+        stdin: Some(ChildStdin::from(stdin_ours)),
+        stdout: Some(ChildStdout::from(stdout_ours)),
+        stderr: Some(ChildStderr::from(stderr_ours)),
+        process,
+        pid,
+        job,
+        low,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, Read};
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetLastError() -> u32;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn GetCurrentThreadId() -> u32;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetTokenInformation(
+            token: Handle,
+            class: i32,
+            info: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const PROCESS_VM_WRITE: u32 = 0x0020;
+    const PROCESS_CREATE_THREAD: u32 = 0x0002;
+    const THREAD_GET_CONTEXT: u32 = 0x0008;
+    const THREAD_SET_CONTEXT: u32 = 0x0010;
+    const ERROR_ACCESS_DENIED: u32 = 5;
+    const HELPER: &str = "ZKMINER_TEST_SANDBOX_HELPER";
+
+    /// `OpenProcess(access, pid)`: Ok, or the error code.
+    fn open_process(pid: u32, access: u32) -> Result<(), u32> {
+        // SAFETY: plain kernel32 calls; a handle opened is closed at once.
+        unsafe {
+            let h = OpenProcess(access, 0, pid);
+            if h.is_null() {
+                return Err(GetLastError());
+            }
+            drop(OwnedHandle::from_raw_handle(h));
+            Ok(())
+        }
+    }
+
+    fn open_thread(tid: u32, access: u32) -> Result<(), u32> {
+        // SAFETY: as `open_process`.
+        unsafe {
+            let h = OpenThread(access, 0, tid);
+            if h.is_null() {
+                return Err(GetLastError());
+            }
+            drop(OwnedHandle::from_raw_handle(h));
+            Ok(())
+        }
+    }
+
+    /// This process's integrity level (the RID of its label).
+    fn integrity_level() -> u32 {
+        const TOKEN_QUERY: u32 = 0x0008;
+        const TOKEN_INTEGRITY_LEVEL: i32 = 25;
+        // SAFETY: plain advapi32 calls into a pointer-aligned buffer that outlives them.
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            assert!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0);
+            let token = OwnedHandle::from_raw_handle(token);
+            let mut buf = [0u64; 16];
+            let mut needed = 0;
+            assert!(
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TOKEN_INTEGRITY_LEVEL,
+                    buf.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buf) as u32,
+                    &mut needed,
+                ) != 0
+            );
+            let sid = *(buf.as_ptr() as *const *const u8);
+            // SID: revision, count, 6-byte authority, then the sub-authorities (the last is the RID).
+            let count = *sid.add(1) as usize;
+            std::ptr::read_unaligned(sid.add(8 + 4 * (count - 1)) as *const u32)
+        }
+    }
+
+    /// The test binary itself, running only `test` (an ignored helper) with `env` added.
+    fn helper(test: &str, env: &[(&str, String)]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--ignored",
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .envs(env.iter().map(|(k, v)| (*k, v)))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+        cmd
+    }
+
+    /// Locks itself down as the miner does, starts a thread, and says its pid and both thread ids,
+    /// then waits for its stdin to close. Checks on the way that what the miner does to itself and
+    /// its children still works.
+    #[test]
+    #[ignore = "run by a_locked_down_process_refuses_this_user"]
+    fn locked_down_helper() {
+        if std::env::var(HELPER).as_deref() != Ok("dacl") {
+            return;
+        }
+        // SAFETY: plain kernel32 call.
+        let main_tid = unsafe { GetCurrentThreadId() };
+        lock_down_this_process().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: plain kernel32 call.
+            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+        let new_tid = rx.recv().unwrap();
+        // The miner still starts and reads a child, and joins its own job.
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "echo child-ok"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("child-ok"));
+        crate::windows_job::join();
+        println!(
+            "READY pid={} main={main_tid} new={new_tid}",
+            std::process::id()
+        );
+        let _ = std::io::stdin().read(&mut [0u8; 1]);
+        drop(thread);
+    }
+
+    /// A process of this user, at the same integrity, can no longer read the locked-down miner's
+    /// memory, write it, start a thread in it, change its DACL back, or touch its threads' contexts
+    /// (one running at the lock-down and one started after); it can still see it and end it.
+    #[test]
+    fn a_locked_down_process_refuses_this_user() {
+        let mut child = helper(
+            "windows_sandbox::tests::locked_down_helper",
+            &[(HELPER, "dacl".into())],
+        )
+        .spawn()
+        .unwrap();
+        // The harness prints its own lines first, and the test's name on the same line.
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains("READY") {
+            line.clear();
+            assert!(
+                stdout.read_line(&mut line).unwrap() > 0,
+                "the helper ended early"
+            );
+        }
+        let field = |name: &str| -> u32 {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+                .parse()
+                .unwrap()
+        };
+        let (pid, main, new) = (field("pid"), field("main"), field("new"));
+        let denied = Err(ERROR_ACCESS_DENIED);
+        let checks = [
+            ("VM_READ", open_process(pid, PROCESS_VM_READ)),
+            ("VM_WRITE", open_process(pid, PROCESS_VM_WRITE)),
+            ("CREATE_THREAD", open_process(pid, PROCESS_CREATE_THREAD)),
+            ("WRITE_DAC", open_process(pid, WRITE_DAC)),
+            (
+                "main thread context",
+                open_thread(main, THREAD_SET_CONTEXT | THREAD_GET_CONTEXT),
+            ),
+            (
+                "new thread context",
+                open_thread(new, THREAD_SET_CONTEXT | THREAD_GET_CONTEXT),
+            ),
+            ("thread WRITE_DAC", open_thread(new, WRITE_DAC)),
+        ];
+        let still = [
+            open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE),
+            open_process(pid, PROCESS_TERMINATE),
+        ];
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+        // The control: an unlocked process of this user's is open to it.
+        assert_eq!(open_process(std::process::id(), PROCESS_VM_READ), Ok(()));
+        for (what, got) in checks {
+            assert_eq!(got, denied, "{what} was not refused");
+        }
+        assert_eq!(still, [Ok(()), Ok(())]);
+    }
+
+    /// At Low integrity: says its level, then whether it could open the parent for reading, read a
+    /// file labelled unreadable to it, write its own directory, and write a Medium one.
+    #[test]
+    #[ignore = "run by a_low_worker_is_kept_from_the_miner_and_its_secrets"]
+    fn low_helper() {
+        if std::env::var(HELPER).as_deref() != Ok("low") {
+            return;
+        }
+        let var = |k: &str| std::env::var(k).unwrap();
+        let parent: u32 = var("ZKMINER_TEST_PARENT").parse().unwrap();
+        println!("LEVEL {:#x}", integrity_level());
+        println!(
+            "OPEN_PARENT {:?}",
+            open_process(parent, PROCESS_VM_READ).map_err(|e| e == ERROR_ACCESS_DENIED)
+        );
+        let secret = std::fs::read(var("ZKMINER_TEST_SECRET"));
+        println!(
+            "READ_SECRET {:?}",
+            secret.map(|_| ()).map_err(|e| e.raw_os_error())
+        );
+        let journal = std::fs::read(var("ZKMINER_TEST_JOURNAL"));
+        println!(
+            "READ_JOURNAL {:?}",
+            journal.map(|_| ()).map_err(|e| e.raw_os_error())
+        );
+        let low = Path::new(&var("ZKMINER_TEST_LOW_DIR")).join("written");
+        println!(
+            "WRITE_LOW {:?}",
+            std::fs::write(&low, b"x").map_err(|e| e.raw_os_error())
+        );
+        let medium = Path::new(&var("ZKMINER_TEST_MEDIUM_DIR")).join("written");
+        println!(
+            "WRITE_MEDIUM {:?}",
+            std::fs::write(&medium, b"x").map_err(|e| e.raw_os_error())
+        );
+    }
+
+    #[test]
+    fn a_low_worker_is_kept_from_the_miner_and_its_secrets() {
+        let dir = std::env::temp_dir().join(format!("zkminer-low-il-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (low_dir, medium_dir) = (dir.join("low"), dir.join("medium"));
+        std::fs::create_dir_all(&medium_dir).unwrap();
+        label_low_writable(&low_dir).unwrap();
+        let secret = dir.join("secret.key");
+        std::fs::write(&secret, b"not a key").unwrap();
+        label_no_read_up(&secret).unwrap();
+        // Written labelled from its creation (as the journal is), and still readable here.
+        let journal = dir.join("journal.json");
+        write_labelled_file(&journal, b"old").unwrap();
+        write_labelled_file(&journal, b"{}").unwrap();
+        assert_eq!(std::fs::read(&journal).unwrap(), b"{}");
+
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        for (k, v) in [
+            (HELPER, "low".to_string()),
+            ("ZKMINER_TEST_PARENT", std::process::id().to_string()),
+            ("ZKMINER_TEST_SECRET", secret.display().to_string()),
+            ("ZKMINER_TEST_JOURNAL", journal.display().to_string()),
+            ("ZKMINER_TEST_LOW_DIR", low_dir.display().to_string()),
+            ("ZKMINER_TEST_MEDIUM_DIR", medium_dir.display().to_string()),
+        ] {
+            env.push((k.into(), v.into()));
+        }
+        let exe = std::env::current_exe().unwrap();
+        let args = [
+            "--ignored",
+            "--exact",
+            "windows_sandbox::tests::low_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .map(OsStr::new);
+        let mut child = spawn(&exe, &args, &env, true).unwrap();
+        assert!(child.is_low_integrity());
+        // In a job of its own.
+        let mut in_job = 0;
+        // SAFETY: valid process and job handles.
+        let ok = unsafe {
+            IsProcessInJob(
+                child.process.as_raw_handle(),
+                child.job.as_ref().unwrap().as_raw_handle(),
+                &mut in_job,
+            )
+        };
+        assert!(ok != 0 && in_job != 0, "the worker is not in its job");
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(status.success(), "{status:?}\n{out}");
+        assert!(out.contains("LEVEL 0x1000"), "not at Low:\n{out}");
+        assert!(out.contains("OPEN_PARENT Err(true)"), "{out}");
+        assert!(out.contains("READ_SECRET Err(Some(5))"), "{out}");
+        assert!(out.contains("READ_JOURNAL Err(Some(5))"), "{out}");
+        assert!(out.contains("WRITE_LOW Ok(())"), "{out}");
+        assert!(out.contains("WRITE_MEDIUM Err(Some(5))"), "{out}");
+    }
+
+    /// The same process at Medium: its environment and pipes work, it gets no handle it was not
+    /// given, and it ends with its job.
+    #[test]
+    fn a_worker_gets_its_environment_and_pipes() {
+        let env = vec![
+            ("SystemRoot".into(), std::env::var_os("SystemRoot").unwrap()),
+            ("ZKMINER_A".into(), "first".into()),
+            ("zkminer_a".into(), "last wins".into()),
+        ];
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        let args = [
+            "/v:on",
+            "/c",
+            "set ZKMINER_A & echo err 1>&2 & set /p X= & echo got !X!",
+        ]
+        .map(OsStr::new);
+        let mut child = spawn(&cmd, &args, &env, false).unwrap();
+        assert!(!child.is_low_integrity());
+        {
+            use std::io::Write;
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"hello\r\n").unwrap();
+        }
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let mut err = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(out.to_uppercase().contains("ZKMINER_A=LAST WINS"), "{out}");
+        assert!(!out.contains("first"), "{out}");
+        assert!(out.contains("got hello"), "{out}");
+        assert!(err.contains("err"), "{err}");
+        // A second one, waiting on its stdin, killed.
+        let mut child = spawn(&cmd, &["/c", "set /p X="].map(OsStr::new), &env, false).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn command_lines_and_environment_blocks() {
+        let line = |args: &[&str]| {
+            let l = command_line(
+                Path::new(r"C:\a b\w.exe"),
+                &args.iter().map(OsStr::new).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            String::from_utf16(&l[..l.len() - 1]).unwrap()
+        };
+        assert_eq!(line(&[]), r#""C:\a b\w.exe""#);
+        assert_eq!(
+            line(&["plain", "two words", "", r#"q"uote"#, r"tail\"]),
+            r#""C:\a b\w.exe" plain "two words" "" "q\"uote" tail\"#
+        );
+        assert_eq!(line(&[r"a b\"]), r#""C:\a b\w.exe" "a b\\""#);
+        assert!(command_line(Path::new("a\"b"), &[]).is_err());
+        let block = environment_block(&[
+            ("b".into(), "2".into()),
+            ("A".into(), "1".into()),
+            ("B".into(), "3".into()),
+        ])
+        .unwrap();
+        assert_eq!(String::from_utf16(&block).unwrap(), "A=1\0B=3\0\0");
+        assert_eq!(environment_block(&[]).unwrap(), vec![0, 0]);
+        assert!(environment_block(&[("A=B".into(), "1".into())]).is_err());
+    }
+}

@@ -2,10 +2,14 @@
 //!
 //! Manages the lifecycle of a subprocess worker: spawn, handshake, IPC, shutdown.
 
+#[cfg(windows)]
+use crate::windows_sandbox::WorkerChild as Child;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -752,8 +756,9 @@ impl WorkerHandle {
         // wallet). We rebuild the child env from ours MINUS secret-bearing names, rather than
         // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
         // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
+        let env = worker_env(backend, std::env::vars_os(), env_overrides);
         cmd.env_clear();
-        cmd.envs(worker_env(backend, std::env::vars_os(), env_overrides));
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
 
         // The worker's memory ceiling, and (Linux) what ends everything it starts: a cgroup of its
         // own below a delegated root, the reaper, the mount watch. See `containment`.
@@ -770,12 +775,10 @@ impl WorkerHandle {
         // the operator's first Ctrl+C — the very key that starts a DRAIN, which then had no
         // proofs left to finish. Its own hidden console keeps the miner's console events away
         // from it (and from the sp1-gpu-server it starts, which inherits it); the miner still
-        // stops it, through its pipes and the reap.
+        // stops it, through its pipes and the reap. `windows_sandbox::spawn_worker` starts it so,
+        // in the miner's job (joined here, so it is in it from its creation) and a job of its own.
         #[cfg(windows)]
-        {
-            isolate_from_console(&mut cmd);
-            crate::windows_job::join();
-        }
+        crate::windows_job::join();
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
@@ -827,13 +830,16 @@ impl WorkerHandle {
             });
         }
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
-        // It runs in a console of its own, so the miner's console no longer takes it down with
-        // the miner: a job does, however the miner ends (see `windows_job`).
+        #[cfg(not(windows))]
+        let child = cmd.spawn();
+        // `std::process::Command` can start neither suspended in a job nor at Low integrity.
         #[cfg(windows)]
-        crate::windows_job::end_with_this_process(&child);
+        let child = {
+            drop(cmd);
+            crate::windows_sandbox::spawn_worker(backend, path, env)
+        };
+        let child = child
+            .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
 
         // From here until the `WorkerHandle` owns it, the child is held by a plain local and
         // `std::process::Child::drop` neither kills nor reaps. Everything between this point and the
@@ -1104,6 +1110,17 @@ impl WorkerHandle {
         };
 
         // Perform Hello handshake
+        #[cfg(windows)]
+        if handle.child.is_low_integrity() {
+            // A worker that cannot even answer at Low integrity (a library that will not load
+            // there) is started again at Medium, paged: see `windows_sandbox`.
+            if let Err(e) = handle.handshake() {
+                drop(handle);
+                crate::windows_sandbox::low_il_failed(backend, &format!("{e:#}"));
+                return Self::spawn_on_this_thread(backend, path, env_overrides);
+            }
+            return Ok(handle);
+        }
         handle.handshake()?;
 
         Ok(handle)
@@ -2852,8 +2869,9 @@ mod console_isolation_tests {
 }
 
 /// Start `cmd` with a console of its own that has no window (`CREATE_NO_WINDOW`), so the console
-/// events of the one the miner runs in (Ctrl+C, Ctrl+Break, closing it) never reach it.
-#[cfg(windows)]
+/// events of the one the miner runs in (Ctrl+C, Ctrl+Break, closing it) never reach it: as
+/// `windows_sandbox::spawn_worker` starts every worker.
+#[cfg(all(test, windows))]
 pub(crate) fn isolate_from_console(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
