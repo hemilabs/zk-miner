@@ -1228,7 +1228,7 @@ pub(crate) fn instance_lock_holder() -> Option<String> {
 
 /// Whether new claims on a job of `proof_system_id` from `submitter` for `program_id` are held right
 /// now: the deployment or (risc0) the proof system failed verification, the post-claim divergence
-/// breaker holds them, or the slash latch is tripped.
+/// breaker holds them, or the slash latch is tripped (or a stake fall is being checked).
 fn claims_held_for(
     proof_system_id: B256,
     submitter: alloy::primitives::Address,
@@ -1239,7 +1239,7 @@ fn claims_held_for(
         || (backend == Some("risc0") && !risc0_claimable())
         || (backend == Some("sp1") && !sp1_claimable())
         || backend.is_some_and(|b| divergence_blocks_claim(submitter, program_id, b))
-        || slash_latch::tripped().is_some()
+        || slash_latch::hold_short().is_some()
 }
 
 /// Whether the deployment itself last passed `verify_deployment` (this chain's live stack, wired to
@@ -2586,8 +2586,9 @@ fn job_tag(job_id: B256) -> u64 {
 /// How a lock of ours that is gone ended, for the history (`MinerState::record_finished`), judged
 /// from its record before that is dropped and from the job's view (`status`, `prover`) when read:
 /// fulfilled by us; else gone after its recorded deadline (`EndedPastDeadline`: a keeper's slash,
-/// or a release of ours that landed after a forced exit, which the view does not tell apart); else
-/// released. `None` for a claim never confirmed ours (it may never have landed).
+/// or a release of ours that landed after a forced exit, which the view does not tell apart:
+/// `past_deadline_end` asks the chain's events); else released. `None` for a claim never confirmed
+/// ours (it may never have landed).
 fn lock_end(
     journal: &SharedJournal,
     job_id: B256,
@@ -2612,33 +2613,79 @@ fn lock_end(
     }
 }
 
+/// The block our lock on `job_id` was read locked at (`JournalEntry::lock_block`, 0 when not
+/// recorded or no entry), for [`past_deadline_end`]. Read before the entry is dropped.
+fn lock_block_of(journal: &SharedJournal, job_id: B256) -> u64 {
+    let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    j.entries.get(&job_id).map_or(0, |e| e.lock_block)
+}
+
+/// Review 7 LD-3 / VLA-1: a lock of ours that `lock_end` found gone past its recorded deadline,
+/// classified from the router's events (`slash_latch::classify_past_deadline`). A release of ours
+/// that landed late is a release (no trip); a slash, or events that cannot be read or name neither,
+/// trips the slash latch (fail closed). Every `EndedPastDeadline` site goes through here.
+async fn past_deadline_end(
+    client: &ChainClient,
+    job_id: B256,
+    lock_block: u64,
+    why: &str,
+) -> zkminer_tui::state::MinerJobStatus {
+    use zkminer_tui::state::MinerJobStatus;
+    match slash_latch::classify_past_deadline(client, job_id, lock_block).await {
+        slash_latch::PastEnd::Released { penalty } => {
+            tracing::info!(
+                "{}: ended after its recorded deadline, but the chain shows a release of ours \
+                 landed (penalty {} HEMI): not a slash",
+                short_id(job_id),
+                fmt_hemi(penalty)
+            );
+            MinerJobStatus::Released { penalty }
+        }
+        slash_latch::PastEnd::Slashed | slash_latch::PastEnd::Unknown => {
+            slash_latch::note_lock_lost(job_id, why);
+            MinerJobStatus::EndedPastDeadline
+        }
+    }
+}
+
 /// Put locks a recovery pass found gone (`RecoveryPass::ended`) in the history, and say so in the
 /// activity log: a slash loses the collateral, and nothing else would tell the operator.
 async fn record_lock_ends(
+    client: &ChainClient,
     state: &zkminer_tui::state::SharedState,
-    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus)>,
+    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus, u64)>,
 ) {
     use zkminer_tui::state::MinerJobStatus;
     if ended.is_empty() {
         return;
     }
+    // Classified before the state lock: it reads the chain.
+    let mut classified = Vec::with_capacity(ended.len());
+    for (job_id, end, lock_block) in ended {
+        let end = if matches!(end, MinerJobStatus::EndedPastDeadline) {
+            past_deadline_end(
+                client,
+                job_id,
+                lock_block,
+                "ended past its deadline (slashed, or its end could not be read)",
+            )
+            .await
+        } else {
+            end
+        };
+        classified.push((job_id, end));
+    }
     let mut s = state.write().await;
-    for (job_id, end) in ended {
+    for (job_id, end) in classified {
         let (level, what) = match end {
             MinerJobStatus::EndedPastDeadline => (
                 LogLevel::Warn,
-                "ended after its deadline: slashed (its collateral lost), or released by a send \
-                 that landed late",
+                "ended after its deadline: slashed (its collateral lost), or its end could not be \
+                 read from the chain",
             ),
             MinerJobStatus::Fulfilled { .. } => (LogLevel::Info, "was fulfilled"),
             _ => (LogLevel::Info, "is no longer locked to this miner"),
         };
-        if matches!(end, MinerJobStatus::EndedPastDeadline) {
-            slash_latch::note_lock_lost(
-                job_id,
-                "ended past its deadline (slashed, or a late release)",
-            );
-        }
         s.record_finished(job_id, end);
         s.add_log(level, format!("Job {} {what}", short_id(job_id)));
     }
@@ -4563,6 +4610,9 @@ pub async fn run(
             match refresh_client.get_refresh_batch().await {
                 Ok(data) => {
                     slash_latch::observe(data.stats.as_ref(), data.stake.as_ref());
+                    // A fall held for the chain's events (also one carried over a restart): one
+                    // small eth_getLogs, outside every lock; nothing when none is pending.
+                    slash_latch::explain_pending(&refresh_client).await;
                     let mut s = state_refresh.write().await;
                     // Apply each field only if its sub-call succeeded; a single
                     // failed read never wipes the others (they share one snapshot).
@@ -7761,7 +7811,7 @@ async fn miner_brain(
     };
     let mut recovery_deferred = startup_pass.deferred;
     let mut recovery_scan = startup_pass.scan;
-    record_lock_ends(&state, startup_pass.ended).await;
+    record_lock_ends(&client, &state, startup_pass.ended).await;
     spawn_recovery_actions(
         startup_pass.actions,
         (startup_pass.scan_ok, startup_pass.undecided),
@@ -8392,10 +8442,10 @@ async fn miner_brain(
                     recovery_deferred = pass.deferred;
                     recovery_scan = pass.scan;
                     // A lock found ended no longer counts against the collateral caps.
-                    for (jid, _) in &pass.ended {
+                    for (jid, _, _) in &pass.ended {
                         collateral::forget(*jid);
                     }
-                    record_lock_ends(&state, pass.ended).await;
+                    record_lock_ends(&client, &state, pass.ended).await;
                     // Reap tasks that finished DURING the pass first, so a lock whose task just
                     // ended can be picked up again.
                     let mut rearm = false;
@@ -14622,9 +14672,23 @@ async fn process_job_lifecycle(
                     .ok()
                     .map(|v| (v.status, v.prover));
                 let ended = lock_end(journal, job_id, view, client.address);
+                let lock_block = lock_block_of(journal, job_id);
                 journal_update(journal, |j| j.remove(job_id));
                 // No release will ever run for this job, and release is the stash's only consumer.
                 client.settle_abandoned_nonce(job_id).await;
+                // Past its deadline: the one classifier decides slash or late release (VLA-1).
+                let ended = match ended {
+                    Some(MinerJobStatus::EndedPastDeadline) => Some(
+                        past_deadline_end(
+                            client,
+                            job_id,
+                            lock_block,
+                            "lost past its deadline (slashed, or its end could not be read)",
+                        )
+                        .await,
+                    ),
+                    other => other,
+                };
                 let mut s = state.write().await;
                 if let Some(ended) = ended {
                     s.record_finished(job_id, ended);
@@ -17222,9 +17286,9 @@ async fn release_and_clean_with_nonce(
                 Some((view.status, view.prover)),
                 client.address,
             );
-            let why = match &ended {
+            let mut why = match &ended {
                 Some(MinerJobStatus::EndedPastDeadline) => {
-                    "ended after its deadline (slashed, or a late release)"
+                    "ended after its deadline (slashed, or its end could not be read)"
                 }
                 Some(MinerJobStatus::Fulfilled { .. }) => "fulfilled",
                 _ if not_ours => {
@@ -17236,6 +17300,7 @@ async fn release_and_clean_with_nonce(
                 }
                 _ => "no longer locked (fulfilled or released)",
             };
+            let lock_block = lock_block_of(journal, job_id);
             journal_update(journal, |j| j.remove(job_id));
             // This path SKIPS release_job (the only stash consumer). If a fulfill
             // stashed its nonce for this job, drain it here or it becomes a permanent gap
@@ -17245,11 +17310,20 @@ async fn release_and_clean_with_nonce(
             if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
+            // Past its deadline: the one classifier decides slash (it trips the latch) or late
+            // release (LD-3).
+            let ended = match ended {
+                Some(MinerJobStatus::EndedPastDeadline) => {
+                    let end = past_deadline_end(client, job_id, lock_block, why).await;
+                    if !matches!(end, MinerJobStatus::EndedPastDeadline) {
+                        why = "ended after its deadline, released by a late send of ours";
+                    }
+                    Some(end)
+                }
+                other => other,
+            };
             let mut s = state.write().await;
             let slashed = matches!(ended, Some(MinerJobStatus::EndedPastDeadline));
-            if slashed {
-                slash_latch::note_lock_lost(job_id, why);
-            }
             if let Some(ended) = ended {
                 s.record_finished(job_id, ended);
             }
@@ -17389,8 +17463,17 @@ async fn release_and_clean_with_nonce(
     }
 
     let seen = lock_seen(journal, job_id);
-    // Its penalty, read beside the release (no delay to it) while the lock is still on record.
-    let penalty_read = tokio::spawn(slash_latch::release_penalty(client.clone(), job_id));
+    // Its penalty, read while the lock is still on record. Noted with the slash latch BEFORE the send
+    // when it reads within 2 s (review 7 LD-1: a refresh can see the fall before the receipt); else
+    // read on beside the release, never delaying it more than that.
+    let mut penalty_read = tokio::spawn(slash_latch::release_penalty(client.clone(), job_id));
+    let penalty_early = tokio::time::timeout(Duration::from_secs(2), &mut penalty_read)
+        .await
+        .ok()
+        .map(|r| r.ok().flatten());
+    if let Some(Some(p)) = penalty_early {
+        slash_latch::note_release_sending(job_id, p);
+    }
     let mut release = client.release_job_with_nonce(job_id, pre_nonce, seen).await;
     // Inside the release margin there may be no time for a recovery pass: retry in place while the
     // window is open. A ladder can burn out in seconds on a burst of refused sends. A typed revert is
@@ -17441,10 +17524,16 @@ async fn release_and_clean_with_nonce(
         && client.get_job_status_view(job_id).await.is_ok_and(|v| {
             v.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED && v.prover == client.address
         });
-    let penalty = penalty_read.await.ok().flatten();
+    let penalty = match penalty_early {
+        Some(p) => p,
+        None => penalty_read.await.ok().flatten(),
+    };
     if release_ok && !fulfilled {
         // So the slash latch reads the stake it takes as ours, not as a slash.
         slash_latch::note_own_release(job_id, penalty);
+    } else if fulfilled {
+        // The fulfil landed first: the release took nothing.
+        slash_latch::withdraw_own_release(job_id);
     }
     let mut s = state.write().await;
     if release_ok {
@@ -17838,8 +17927,9 @@ struct RecoveryPass {
     actions: Vec<(B256, RecoveryAction)>,
     /// The incremental locked-job scan state to hand to the next pass.
     scan: Option<RecoveryScan>,
-    /// Locks of ours this pass found gone, and how each ended (`lock_end`), for the history.
-    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus)>,
+    /// Locks of ours this pass found gone, how each ended (`lock_end`) and its lock block, for the
+    /// history (`record_lock_ends`).
+    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus, u64)>,
 }
 
 /// Incremental discovery of locks we hold. Only the startup pass scans the whole lookback window;
@@ -17973,7 +18063,7 @@ async fn recover_claimed_jobs(
     // Ids found settled / not ours this pass: dropped from `known` at the end.
     let mut settled: Vec<B256> = Vec::new();
     // And how each lock of ours among them ended (`lock_end`).
-    let mut ended: Vec<(B256, zkminer_tui::state::MinerJobStatus)> = Vec::new();
+    let mut ended: Vec<(B256, zkminer_tui::state::MinerJobStatus, u64)> = Vec::new();
     // A live lifecycle task owns these: it is the only writer of their breadcrumbs.
     job_ids.retain(|jid| !skip.contains(jid));
     // Every id this pass is about: whatever it neither settles nor acts on is left undecided.
@@ -18118,7 +18208,7 @@ async fn recover_claimed_jobs(
             }
             settled.push(*jid);
             if let Some(end) = lock_end(journal, *jid, Some((v.status, v.prover)), client.address) {
-                ended.push((*jid, end));
+                ended.push((*jid, end, lock_block_of(journal, *jid)));
             }
             journal_update(journal, |j| j.remove(*jid));
             take_pause_kept(*jid);
@@ -18236,7 +18326,7 @@ async fn recover_claimed_jobs(
                 Some((view.status, view.prover)),
                 client.address,
             ) {
-                ended.push((jid, end));
+                ended.push((jid, end, lock_block_of(journal, jid)));
             }
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
@@ -18258,7 +18348,7 @@ async fn recover_claimed_jobs(
                 Some((view.status, view.prover)),
                 client.address,
             ) {
-                ended.push((jid, end));
+                ended.push((jid, end, lock_block_of(journal, jid)));
             }
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
@@ -19567,7 +19657,7 @@ async fn miner_brain(",
 async fn release_and_clean_with_nonce(",
         );
         let not_ours = f
-            .find("let why = match &ended {")
+            .find("let mut why = match &ended {")
             .expect("the not-ours drop");
         let cutoff = f
             .find("if lock_deadline != 0 && now >= lock_deadline {")

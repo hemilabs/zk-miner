@@ -111,6 +111,19 @@ pub fn event_id(code: &str) -> u32 {
         "JOURNAL-DIVERGED" => 132,
         "JOURNAL-ENTRY-UNREADABLE" => 133,
         "KEY-CHANGED" => 134,
+        "JOURNAL-UNWRITABLE" => 135,
+        // The slash latch's stake check, and the refused-account hold.
+        "STAKE-DROP" => 140,
+        "SLEPT-WHILE-HOLDING" => 141,
+        // Chain watch, workers and the host.
+        "LOCK-AT-RISK" => 150,
+        "WORKERS-RECYCLED" => 151,
+        "DISK-LOW" => 152,
+        "MINER-CRASHED" => 153,
+        // Key copies.
+        "KEY-FILE-READABLE" => 160,
+        "SECRETS-IN-SNAPSHOT" => 161,
+        "SNAPSHOT-UNCHECKED" => 162,
         _ => 199,
     }
 }
@@ -453,6 +466,9 @@ mod tests {
         assert_eq!(event_id("LOCK-LATE"), 101);
         assert_eq!(event_id("SECRETS-UNLABELLED"), 110);
         assert_eq!(event_id("PASSWORD-EXPIRES"), 117);
+        assert_eq!(event_id("STAKE-DROP"), 140);
+        assert_eq!(event_id("WORKERS-RECYCLED"), 151);
+        assert_eq!(event_id("SECRETS-IN-SNAPSHOT"), 161);
         assert_eq!(event_id("PAGE"), 199);
         assert_eq!(event_id("SOMETHING-NEW"), 199);
     }
