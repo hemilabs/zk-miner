@@ -2160,10 +2160,11 @@ impl WitnessRuntime {
         Ok(run::claim_exposure(info, price, terms))
     }
 
-    /// The collateral caps at the stake last read (each `None`: off, or the stake not known yet).
+    /// The collateral caps at the stake last read (each `None`: off, or the stake not known yet), with
+    /// that read's locked figure while it is fresh, as the brain's claims are held to.
     async fn collateral_cap(&self) -> run::collateral::Caps {
-        let total = self.state.read().await.stake_info.as_ref().map_or(0, |s| s.total_staked);
-        run::collateral::caps(total)
+        let s = self.state.read().await;
+        run::collateral::caps_at(s.stake_info.as_ref(), run::collateral::fresh_reading(s.last_refresh))
     }
 
     // ── the lock (§5.2 step 9) ────────────────────────────────────────────────
@@ -2510,6 +2511,11 @@ impl WitnessRuntime {
                 collateral: l.locked_collateral.max(run::collateral::floor().unwrap_or(0)),
             },
         );
+        // Where its lock is known (a recovered one's too), so a stake read at or after it is not
+        // counted as missing it.
+        if l.lock_block != 0 {
+            run::collateral::note_lock_block(jid, l.lock_block);
+        }
         let link = lock(&self.brain).clone();
         let _slot = link.map(|b| {
             let _ = b.held.send((jid, l.locked_collateral, l.cycles));

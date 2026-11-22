@@ -1045,10 +1045,12 @@ Worth knowing:
 - **Every lock held at once comes to at most half the stake.** Programs and submitters cost
   nothing to make, so the per-program and per-submitter caps alone let a few of them lock nearly
   the whole stake together. `[prover] max_locked_stake_fraction` (default `0.5`, more than 0 and
-  at most 1; `1` lets the whole stake be locked) bounds the collateral of every lock this miner
-  holds and has not settled, across programs and submitters, with the same per-job floor. A lock
-  counts until it settles, not until its proof is done, and the locks found at a restart count
-  again. A job that would take them over the cap waits. `zkminer status` and the startup log show
+  at most 1; `1` lets the whole stake be locked) bounds the collateral of every lock this prover
+  holds on chain, and of its claims in flight, across programs and submitters, with the same
+  per-job floor. A lock counts until it settles, not until its proof is done or its task hands it
+  back to recovery, and the miner counts the larger of the locks it knows of and the stake's own
+  locked figure (while that read is fresh) plus the claims that figure does not show yet, so locks
+  not yet found again after a restart count too. A job that would take them over the cap waits. `zkminer status` and the startup log show
   the cap in HEMI.
 - **A miner cut off from the chain is slashed for every lock it holds.** A lock that is neither
   fulfilled nor released by its deadline (plus grace) is slashed in full, and the miner reaches the
