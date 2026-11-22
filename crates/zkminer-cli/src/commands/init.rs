@@ -95,7 +95,9 @@ fn key_plan_on(
              `zkminer init --import-env-key{var_flag}` copies it into a key file only you can read. \
              To make a new key and leave that address behind: `zkminer init --generate-key` \
              (what is staked or paid to it stays with it). To keep using the variable: \
-             `zkminer init --key-source env`"
+             `zkminer init --key-source env` (only for a variable set in the miner's own \
+             process, such as a service's environment: a copy kept in your user environment \
+             stops Low workers from starting)"
         );
     }
     Ok(KeyPlan::Generate)
