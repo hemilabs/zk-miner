@@ -31,6 +31,10 @@ permissions:
 
 jobs:
   build:
+    # TEMPORARY: no automatic CI on PRs from the beta branches (metal-3.1, metal-3.1-v2,
+    # netguard-mac-v2) while they are tested by hand; run it with workflow_dispatch instead.
+    # To re-enable, drop the !contains(fromJSON(...), github.head_ref) condition.
+    if: ${{ github.event_name != 'pull_request' || !contains(fromJSON('["metal-3.1","metal-3.1-v2","netguard-mac-v2"]'), github.head_ref) }}
     # One job per shippable artifact, each on its own runner, all at once: the
     # build takes as long as its slowest target, not the sum of them.
     # release.yml collects the artifacts and assembles the release from them.
