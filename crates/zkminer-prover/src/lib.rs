@@ -23,6 +23,8 @@ mod windows_job;
 #[cfg(windows)]
 pub mod windows_sandbox;
 #[cfg(windows)]
+pub mod windows_snapshots;
+#[cfg(windows)]
 #[cfg(windows)]
 pub mod windows_telemetry;
 pub mod worker;

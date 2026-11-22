@@ -955,7 +955,7 @@ pub(crate) fn has_no_read_up_label(path: &Path) -> io::Result<bool> {
 
 /// Whether the label in `sddl` (`S:(ML;<flags>;<policy>;;;<level>)`) has no-read-up at Medium or
 /// above.
-fn label_keeps_low_from_reading(sddl: &str) -> bool {
+pub(crate) fn label_keeps_low_from_reading(sddl: &str) -> bool {
     sddl.split('(').skip(1).any(|ace| {
         let fields: Vec<&str> = ace.trim_end_matches(')').split(';').collect();
         matches!(fields.as_slice(), ["ML", _, policy, _, _, level]
@@ -1111,7 +1111,8 @@ static SECRETS: Mutex<Option<Result<(), String>>> = Mutex::new(None);
 ///
 /// PowerShell's command histories are labelled too, and with an `env` key (its variable
 /// `key_env_var`) a copy of the variable in this user's registry environment refuses Low workers
-/// the same way ([`other_key_copies`]).
+/// the same way ([`other_key_copies`]), and so does an unlabelled copy of the key kept in a Volume
+/// Shadow Copy (`SECRETS-IN-SNAPSHOT`, [`crate::windows_snapshots`]).
 pub fn protect_secrets(key_file: Option<&Path>, key_env_var: Option<&str>, journal: &Path) {
     if !low_il_workers() {
         page_medium_workers();
@@ -1128,6 +1129,11 @@ pub fn protect_secrets(key_file: Option<&Path>, key_env_var: Option<&str>, journ
     if let Err(why) = &labelled {
         tracing::error!("PAGE: SECRETS-UNLABELLED — {why}");
     }
+    // Old unlabelled copies in restore points refuse Low workers too (pages its own).
+    let labelled = both(
+        labelled,
+        crate::windows_snapshots::protect(key_file, key_env_var),
+    );
     *SECRETS.lock().unwrap_or_else(|p| p.into_inner()) = Some(labelled);
 }
 
@@ -1150,6 +1156,7 @@ fn secrets_labelled() -> Result<(), String> {
         if let Err(why) = &labelled {
             tracing::error!("PAGE: SECRETS-UNLABELLED — {why}");
         }
+        let labelled = both(labelled, crate::windows_snapshots::protect(None, None));
         *state = Some(labelled);
     }
     state.clone().unwrap_or(Ok(()))
