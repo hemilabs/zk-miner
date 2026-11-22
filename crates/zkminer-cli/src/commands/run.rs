@@ -2444,6 +2444,45 @@ fn job_collateral_terms(job_id: B256) -> Option<(u128, u128)> {
         .and_then(|m| m.get(&job_id).copied())
 }
 
+/// The settled price of each lock a recovery pass found ours (its view's `settledPrice`), so the
+/// lock it releases counts against the stake-wide cap at what it locked, not the floor.
+static RECOVERED_SETTLED_PRICE: std::sync::Mutex<Option<HashMap<B256, u128>>> =
+    std::sync::Mutex::new(None);
+
+fn note_recovered_settled_price(job_id: B256, settled_price: u128) {
+    let mut g = RECOVERED_SETTLED_PRICE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= MEASURED_CYCLES_CAP {
+        m.clear();
+    }
+    m.insert(job_id, settled_price);
+}
+
+fn recovered_settled_price(job_id: B256) -> Option<u128> {
+    RECOVERED_SETTLED_PRICE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&job_id).copied())
+}
+
+/// What a recovered lock locked, for the collateral caps: its settled price under its own terms
+/// when both are known, and at least the deployment's floor, which every lock locks.
+fn recovered_lock_collateral(job_id: B256, settled_price: Option<u128>) -> u128 {
+    let floor = collateral::floor().unwrap_or(0);
+    let locked = match (settled_price, job_collateral_terms(job_id)) {
+        (Some(price), Some((min, bps))) => zkminer_chain::auction::compute_collateral(
+            price,
+            u64::try_from(bps).unwrap_or(u64::MAX),
+            min,
+        ),
+        _ => floor,
+    };
+    locked.max(floor)
+}
+
 /// What a claim of `info`'s job may lock at most, and whose job it is, for the collateral cap: its
 /// collateral at its maximum price (or `price`, if higher: the price ramps up until the claim mines)
 /// under its own snapshotted `terms`, `(minCollateral, collateralBps)`, as the claim computes it.
@@ -6163,6 +6202,9 @@ fn note_lock_block(job_id: B256, block: u64) {
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(job_id, block);
+    // The stake-wide cap tells the same way whether the chain's locked figure counts it yet, for as
+    // long as the lock counts there (past its task, while handed back).
+    collateral::note_lock_block(job_id, block);
 }
 
 fn lock_blocks() -> HashMap<B256, u64> {
@@ -7992,10 +8034,16 @@ async fn miner_brain(
             witness_held.insert(jid);
         }
         witness_held.retain(|j| in_flight.contains_key(j));
+        // Locks the journal still holds (a task that handed its lock back to recovery, a kept lock):
+        // still on chain, so still counted against the collateral caps.
+        let journalled = collateral::journalled_locks(
+            &journal.lock().unwrap_or_else(|p| p.into_inner()),
+            zkminer_chain::client::chain_now(),
+        );
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
-            collateral::forget(jid);
+            collateral::forget_unless_journalled(jid, &journalled);
             segment_disk::release(jid);
             proved.remove(&jid);
             inflight_work.remove(&jid);
@@ -8016,11 +8064,14 @@ async fn miner_brain(
         // recovery pass's own reap, and the planner's model then never matched again.
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
-        // Held (proven or not: until its lock settles), or a witness task's (claiming, or holding a
-        // lock the brain has not been told of yet): anything else left the count (a claim that did
-        // not land, a task that ended).
+        // Held (proven or not: until its lock settles), a witness task's (claiming, or holding a
+        // lock the brain has not been told of yet), or still in the journal (handed back, kept, not
+        // yet found again by recovery): anything else left the count (a claim that did not land, a
+        // lock fulfilled, released or found ended).
         collateral::retain(|j| {
-            in_flight.contains_key(j) || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
+            in_flight.contains_key(j)
+                || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
+                || journalled.contains(j)
         });
         prune_lock_blocks(&in_flight);
         refresh_kept_locks(&state, &journal, &in_flight, &mut kept_rows).await;
@@ -8320,6 +8371,10 @@ async fn miner_brain(
                     .await;
                     recovery_deferred = pass.deferred;
                     recovery_scan = pass.scan;
+                    // A lock found ended no longer counts against the collateral caps.
+                    for (jid, _) in &pass.ended {
+                        collateral::forget(*jid);
+                    }
                     record_lock_ends(&state, pass.ended).await;
                     // Reap tasks that finished DURING the pass first, so a lock whose task just
                     // ended can be picked up again.
@@ -8335,6 +8390,12 @@ async fn miner_brain(
                     if rearm {
                         request_recovery();
                     }
+                    let releases: Vec<B256> = pass
+                        .actions
+                        .iter()
+                        .filter(|(_, a)| matches!(a, RecoveryAction::Release(_)))
+                        .map(|(j, _)| *j)
+                        .collect();
                     spawn_recovery_actions(
                         pass.actions,
                         (pass.scan_ok, pass.undecided),
@@ -8346,6 +8407,22 @@ async fn miner_brain(
                         proving_timeout,
                         witness_rt.as_ref(),
                     );
+                    // The releases are on their way: now read the terms of locks released at the
+                    // floor for want of them (after a restart), so each counts against the
+                    // stake-wide cap at what it locked. One batched read, only when there are some.
+                    let unread: Vec<B256> = releases
+                        .into_iter()
+                        .filter(|j| job_collateral_terms(*j).is_none())
+                        .collect();
+                    if !unread.is_empty() {
+                        prefetch_job_collateral_terms(&client, &unread).await;
+                        for jid in unread {
+                            collateral::raise(
+                                jid,
+                                recovered_lock_collateral(jid, recovered_settled_price(jid)),
+                            );
+                        }
+                    }
                 }
                 // Escalate the back-off on repeated deferrals; reset once a pass completes.
                 consecutive_defers = if recovery_deferred {
@@ -9238,7 +9315,12 @@ async fn miner_brain(
         }
         let total_staked = stake_info.as_ref().map_or(0, |si| si.total_staked);
         collateral::note_stake(total_staked);
-        let collateral_caps = collateral::caps(total_staked);
+        // The stake-wide cap also counts the chain's own locked figure while it is fresh: locks this
+        // process holds no entry for (handed back, not yet found again after a restart) count too.
+        let collateral_caps = collateral::caps_at(
+            stake_info.as_ref(),
+            collateral::fresh_reading(state.read().await.last_refresh),
+        );
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
@@ -18140,6 +18222,8 @@ async fn recover_claimed_jobs(
             continue;
         }
         let lock_deadline = effective_cutoff(&view);
+        // What it locked, should this pass release it (`recovered_lock_collateral`).
+        note_recovered_settled_price(jid, view.settledPrice.to::<u128>());
         // Ownership is PROVEN by the read above. An id that reached the loop via the `None => true`
         // arm may have NO journal entry: write one so the shutdown paths can see the lock.
         if !journal_has(journal, jid) {
@@ -18412,10 +18496,14 @@ fn spawn_recovery_actions(
             _ => None,
         };
         in_flight.insert(jid, 0);
-        // A lock released here counts toward every lock held together until its release settles, at
-        // the deployment's floor (its program and price are not read for a release).
+        // A lock released here counts toward every lock held together until its release settles (its
+        // program is not read for a release): at what it locked when its settled price and terms are
+        // known, else the deployment's floor.
         if let RecoveryAction::Release(_) = &action {
-            collateral::record_settling(jid, collateral::floor().unwrap_or(0));
+            collateral::record_settling(
+                jid,
+                recovered_lock_collateral(jid, recovered_settled_price(jid)),
+            );
         }
         if let RecoveryAction::Drive {
             job, descriptor, ..
@@ -18424,20 +18512,13 @@ fn spawn_recovery_actions(
             // A lock held and not settled yet counts against its program's and submitter's share of
             // the stake, and the stake's: at what its settled price locks under its terms when they
             // are known, and at least the deployment's floor, which every lock locks.
-            let floor = collateral::floor().unwrap_or(0);
-            let locked = job_collateral_terms(jid).map_or(floor, |(min, bps)| {
-                zkminer_chain::auction::compute_collateral(
-                    job.info.settled_price,
-                    u64::try_from(bps).unwrap_or(u64::MAX),
-                    min,
-                )
-            });
+            let locked = recovered_lock_collateral(jid, Some(job.info.settled_price));
             collateral::record(
                 jid,
                 collateral::Exposure {
                     program: descriptor.programId,
                     submitter: job.info.caller,
-                    collateral: locked.max(job.info.locked_collateral).max(floor),
+                    collateral: locked.max(job.info.locked_collateral),
                 },
             );
         }
