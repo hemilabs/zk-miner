@@ -980,50 +980,28 @@ impl ChainClient {
     /// first block), and the block the scan covered up to — the cursor for the next incremental scan.
     pub async fn find_locked_jobs_in(&self, from: u64, to: u64) -> Result<(Vec<B256>, u64)> {
         use alloy::rpc::types::Filter;
-        const CHUNK: u64 = 9000;
-        const CHUNK_TRIES: u32 = 3;
         let head = to;
         let from = from.max(self.scan_from_block.min(head));
         let topic = alloy::primitives::keccak256(
             "JobClaimed(bytes32,address,address,uint96,uint96,uint40)",
         );
         let prover_topic = self.address.into_word();
-
+        let filter = Filter::new()
+            .address(self.hemi_prove)
+            .event_signature(topic)
+            .topic2(prover_topic);
+        let logs = self
+            .get_logs_chunked(&filter, from, head, "JobClaimed scan")
+            .await
+            .map_err(|e| anyhow::anyhow!("LOOKBACK-FAILED: {e:#}"))?;
         let mut job_ids: Vec<B256> = Vec::new();
-        let mut start = from;
-        while start <= head {
-            let end = (start + CHUNK).min(head);
-            let filter = Filter::new()
-                .address(self.hemi_prove)
-                .event_signature(topic)
-                .topic2(prover_topic)
-                .from_block(start)
-                .to_block(end);
-            let mut tries = 0;
-            let logs = loop {
-                tries += 1;
-                match self.provider.get_logs(&filter).await {
-                    Ok(l) => break l,
-                    Err(e) if tries < CHUNK_TRIES => {
-                        tracing::warn!(
-                            "find_locked_jobs: get_logs {start}..={end} failed (try {tries}/{CHUNK_TRIES}): {e:#}"
-                        );
-                        tokio::time::sleep(Duration::from_secs(2 * tries as u64)).await;
-                    }
-                    Err(e) => {
-                        bail!("LOOKBACK-FAILED: JobClaimed scan {start}..={end} failed {CHUNK_TRIES}x: {e:#}")
-                    }
-                }
-            };
-            for log in logs {
-                // topics: [sig, jobId, prover, operator]
-                if let Some(jid) = log.topics().get(1).copied() {
-                    if !job_ids.contains(&jid) {
-                        job_ids.push(jid);
-                    }
+        for log in logs {
+            // topics: [sig, jobId, prover, operator]
+            if let Some(jid) = log.topics().get(1).copied() {
+                if !job_ids.contains(&jid) {
+                    job_ids.push(jid);
                 }
             }
-            start = end.saturating_add(1);
         }
         Ok((job_ids, head))
     }
