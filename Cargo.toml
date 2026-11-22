@@ -192,7 +192,7 @@ hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 # build work, #27's memory fixes for small Intel cards, and #28's AMD RDNA3/RDNA4 speedups, which
 # rewrite most of the ROCm proving path (validated upstream on ROCm 7.2; prove on an AMD card before
 # trusting a new ROCm toolchain with it).
-# The pin is 81ee699e3, the macOS/Metal fork branch rebased onto hemilabs/risc0 `release-3.1` @ eb847a1af
+# The pin is 81ee699e3 (hemilabs/risc0 branch `zkminer/metal-3.1-v2`), the macOS/Metal fork branch rebased onto hemilabs/risc0 `release-3.1` @ eb847a1af
 # (W12-REBASE; it must be pushed to hemilabs/risc0 before this rev resolves): `release-3.1` (upstream
 # v3.1.0, with the GHSA-g6qg-9j8p-7j87 Groth16 fix whose receipts the risc0-ethereum v3.1.0 verifier
 # accepts: SELECTOR 0xe71e6620, control root e6feef13..., with the fork's work above, #39's zkr decode

@@ -786,7 +786,14 @@ mod tests {
     }
 
     /// The image is the one the pinned `risc0-groth16` runs, by digest.
+    ///
+    /// Not on macOS: it reads the Linux dependency graph with `cargo metadata --offline`, which a
+    /// macOS host (or the macOS CI runner) has not downloaded, and the image only runs on Linux.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "needs the Linux dependency graph offline; the image only runs on Linux"
+    )]
     fn the_image_is_risc0_groth16s_pinned_by_digest() {
         // The source cargo built it from (this host's platform only: others' dependencies are not
         // downloaded).

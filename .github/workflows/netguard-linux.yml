@@ -45,6 +45,10 @@ jobs:
     # "CI"). The suite needs outbound DNS and HTTPS, and the near-hop probes' ICMP "time
     # exceeded" from the runner's hops N..N+2 (2 to 4 by default). ZKMINER_CI_ALLOW_SKIP names
     # skip tokens exactly (a skip reason starting "[ipv6] "), not parts of a reason's text.
+    # TEMPORARY: no automatic CI on PRs from the beta branches (metal-3.1, metal-3.1-v2,
+    # netguard-mac-v2) while they are tested by hand; run it with workflow_dispatch instead.
+    # To re-enable, drop the !contains(fromJSON(...), github.head_ref) condition.
+    if: ${{ !contains(fromJSON('["metal-3.1","metal-3.1-v2","netguard-mac-v2"]'), github.head_ref) }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -77,6 +81,10 @@ jobs:
     # and the connector's checks before and after connecting. The broker's integration tests need
     # anvil and run its sandboxed binary; they are not run here. Strict like the netguard job
     # (review round 5, cross-4): a test that needs a public peer it cannot reach fails.
+    # TEMPORARY: no automatic CI on PRs from the beta branches (metal-3.1, metal-3.1-v2,
+    # netguard-mac-v2) while they are tested by hand; run it with workflow_dispatch instead.
+    # To re-enable, drop the !contains(fromJSON(...), github.head_ref) condition.
+    if: ${{ !contains(fromJSON('["metal-3.1","metal-3.1-v2","netguard-mac-v2"]'), github.head_ref) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:

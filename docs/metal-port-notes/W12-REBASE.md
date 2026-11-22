@@ -141,3 +141,13 @@ commits. The tip tree equals the clean `git merge-tree` of this branch and `reba
    `item/W11-NETGUARD-MAC`, which would need force-pushes if they are reused.
 3. Before merging to main: revert the TEMPORARY CI skip (`86f48b0`) once manual platform testing is
    done.
+
+## Pushed (2026-11-21)
+
+- risc0 `rebase/metal-3.1` @ `81ee699e3` is on hemilabs/risc0 as the new branch **`zkminer/metal-3.1-v2`**
+  (no force-push; `zkminer/metal-3.1` @ `37b434755` is unchanged). The zk-miner pin now resolves.
+- The temporary PR-CI skip covers every pushed beta branch: `metal-3.1`, `metal-3.1-v2` and
+  `netguard-mac-v2` (build-docker, e2e, build-macos build/cpu-tests and thus metal-probe, and
+  netguard-linux). risc0's workflows run only on pull requests, so a push runs nothing there.
+- `the_image_is_risc0_groth16s_pinned_by_digest` is ignored on macOS (it needs the Linux dependency
+  graph offline; it failed the macOS cpu-tests job, pre-existing since #37).
