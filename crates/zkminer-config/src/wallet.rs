@@ -817,8 +817,8 @@ mod tests {
         dir
     }
 
-    /// A made-up key (never funded), with and without `0x`.
-    const TEST_KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+    /// The well-known first Anvil/Hardhat dev key (public, never funded on a real chain).
+    const TEST_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     #[test]
     fn an_imported_key_loads_back_and_never_replaces_another() {
