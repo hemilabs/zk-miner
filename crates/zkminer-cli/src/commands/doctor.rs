@@ -270,6 +270,24 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
         for (level, finding) in secret_label_findings(&unlabelled) {
             report.say(level, "key", finding);
         }
+        // Old unlabelled copies in Volume Shadow Copies: the miner refuses Low workers on an
+        // exposure (SECRETS-IN-SNAPSHOT), and only warns of what it could not check.
+        let snapshots = zkminer_prover::windows_snapshots::inspect(
+            key_file,
+            (config.wallet.key_source == "env").then_some(config.wallet.key_env_var.as_str()),
+            Some(&home),
+            dirs::config_dir().as_deref(),
+        );
+        if let Some(refusal) = snapshots.refusal() {
+            report.say(
+                Level::Fail,
+                "key",
+                format!("{refusal} (PAGE: SECRETS-IN-SNAPSHOT)"),
+            );
+        }
+        if let Some(warning) = snapshots.warning() {
+            report.say(Level::Warn, "key", warning);
+        }
     }
     let host = rpc_host(&config.chain.rpc_url);
     let client = match tokio::time::timeout(
