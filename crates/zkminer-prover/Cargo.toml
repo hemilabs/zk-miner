@@ -19,6 +19,8 @@ methods = [
     "guests/risc0/segment-boundary",
     "guests/risc0/babybear-stress",
     "guests/risc0/minimal-proof",
+    "guests/risc0/sys-rand-echo",
+    "guests/risc0/segment-size-steer",
 ]
 
 [[bin]]
