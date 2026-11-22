@@ -336,6 +336,7 @@ chain_id` set to the test network's chain id.
 ```bash
 zkminer init --generate-key   # a key file only you can read (or: read -rs ZKMINER_PRIVATE_KEY; export ZKMINER_PRIVATE_KEY)
                               # on Windows the key file is the default; --key-source env keeps the variable
+zkminer init --import-env-key # copy a key you already give as ZKMINER_PRIVATE_KEY into that key file
 
 zkminer status                # balance, stake, collateral, job stats
 zkminer benchmark             # measure real per-GPU proving throughput
@@ -535,7 +536,15 @@ Worth knowing:
   in `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters` and `setx /M` keeps a
   variable in the machine's environment, and every user of the PC can read both. `zkminer init
   --generate-key --network <network>` run as the account writes the key to its `.zkminer` with
-  an ACL for that account and SYSTEM only; for a key file made another way, `icacls <file>
+  an ACL for that account and SYSTEM only, labelled unreadable to Low-integrity processes from
+  its creation. A key you already give as the variable is kept with `zkminer init
+  --import-env-key` (it reads the variable from its own environment or the registry, writes the
+  key file, prints its address, and deletes nothing); a plain `zkminer init` refuses while such a
+  variable is set, rather than make a new key, and `--generate-key` makes one only when asked.
+  Delete the variable only after `zkminer status` shows the same address, and consider the key
+  exposed (plan to rotate it). `init` keeps an existing key file only if it is owned by the
+  account (or Administrators) and its ACL grants no one but the account, SYSTEM and
+  Administrators. For a key file made another way, `icacls <file>
   /inheritance:r /grant:r zkminer:(R,WO)` leaves only the account on it. Keep `WO`: the miner
   labels the key file so that its Low-integrity workers cannot read it, which needs the right to
   change the file's owner (the account's own files have it). A key file it can neither label nor,
@@ -596,7 +605,17 @@ Worth knowing:
   3. Check that the old journal holds nothing: `psexec -s "C:\Program Files\zkminer\zkminer.exe"
      status` says "Held locks: none". If some are left (a release that did not confirm), start
      the service again and repeat step 2, or end them with `stop --abandon --wait`.
-  4. Only then change the account (`nssm set zkminer ObjectName .\zkminer <password>`) and
+  4. Move the key, or leave it behind; never delete the old copy before one of these is done:
+     - **Keep the address.** As an administrator, copy
+       `C:\Windows\System32\config\systemprofile\.zkminer\key` to `C:\Users\zkminer\.zkminer\key`
+       and run `icacls C:\Users\zkminer\.zkminer\key /inheritance:r /grant:r zkminer:(R,WO)
+       SYSTEM:F`. For a key in `AppEnvironmentExtra`, run `zkminer init --import-env-key` as the
+       account instead (it reads the service's environment). Then `zkminer doctor` as the account
+       must show the same address as before; only then delete the old copy.
+     - **Rotate.** While still LocalSystem, `psexec -s ... unstake --all`, `withdraw` 7 days on,
+       move the HEMI, and only then delete the old copy; give the new account a new key
+       (`zkminer init --generate-key` as the account).
+  5. Only then change the account (`nssm set zkminer ObjectName .\zkminer <password>`) and
      `nssm start zkminer`.
 
   A LocalSystem service upgraded in place to this build while it holds locks does not prove
@@ -610,6 +629,19 @@ Worth knowing:
   a drain: keep NSSM's timeout long enough for one (`AppStopMethodConsole` above), or run
   `zkminer stop --wait` (as the service account) first. To upgrade: `nssm stop zkminer` (it
   waits for the drain), replace the files, `nssm start zkminer`.
+- **Back the key up, but not as a plain file in a synced folder.** The key file is the only
+  copy: stake and payouts belong to it. Put the key in a password manager, or copy the file to a
+  removable drive you keep offline, and label that copy (a bare key file says nothing of what it
+  is for). Not to Documents, Desktop, OneDrive, Dropbox or Google Drive: a sync client uploads it
+  and keeps old versions and deleted files for weeks, and on Windows a plain copy there has no
+  label keeping the Low-integrity workers from reading it. `zkminer init` refuses to make a key
+  file inside OneDrive (`%OneDrive%`, `%OneDriveCommercial%`), Dropbox, Google Drive, iCloud
+  Drive or Nextcloud folders, and `zkminer doctor` fails one that is there.
+- **The journal belongs to one key.** `~/.zkminer/job_journal.json` records the address whose
+  locks it holds. A miner started with another key while it holds locks refuses to start
+  (`PAGE: KEY-CHANGED`): start it with the old key to drive them, or pass `zkminer run
+  --forget-foreign-locks` to give them up (each is slashed at its deadline unless that key
+  drives it). `zkminer init --force` keeps the config's key settings unless given a key option.
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in

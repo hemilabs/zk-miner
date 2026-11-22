@@ -180,6 +180,11 @@ enum Commands {
         /// account and prove them)
         #[arg(long, conflicts_with_all = ["mock", "watch_only"])]
         release_held: bool,
+        /// Start although the job journal's locks belong to another address than the configured
+        /// key's (the key changed), giving them up: each is slashed at its deadline unless a miner
+        /// with that key drives it. Without it such a start is refused (PAGE: KEY-CHANGED)
+        #[arg(long, conflicts_with_all = ["mock", "watch_only"])]
+        forget_foreign_locks: bool,
     },
     /// Measure jobs as the miner sizes them before a claim, whatever their state, and print one JSON
     /// line per job: cycles, or why not. Signs and sends nothing; starts measure workers only.
@@ -336,9 +341,20 @@ enum Commands {
         #[arg(long)]
         generate_key: bool,
         /// Where the miner takes its key from: "file" (a key file, as --generate-key; the default
-        /// on Windows) or "env" (the ZKMINER_PRIVATE_KEY variable; the default elsewhere)
+        /// on Windows) or "env" (the ZKMINER_PRIVATE_KEY variable; the default elsewhere). With
+        /// --force and none of these options, the config's key settings are kept
         #[arg(long, value_parser = ["file", "env"])]
         key_source: Option<String>,
+        /// Copy the key given as the variable (ZKMINER_PRIVATE_KEY, or --key-env-var) into a key
+        /// file readable by you only, beside the config, and point the config at it. Reads it from
+        /// this process's environment, else from the registry (Windows: the user's, the machine's
+        /// or a service's environment); never deletes it. Over an existing config, changes only its
+        /// key settings
+        #[arg(long, conflicts_with_all = ["generate_key", "key_source"])]
+        import_env_key: bool,
+        /// The variable the key is given as (default: the config's, else ZKMINER_PRIVATE_KEY)
+        #[arg(long, value_name = "NAME")]
+        key_env_var: Option<String>,
     },
 }
 
@@ -884,8 +900,11 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             headless,
             watch_only,
             address,
+            forget_foreign_locks,
             ..
         } => {
+            commands::run::FORGET_FOREIGN_LOCKS
+                .store(forget_foreign_locks, std::sync::atomic::Ordering::SeqCst);
             let watch = watch_only.then_some(commands::run::WatchOnly { address });
             commands::run::run(config_path, headless || watch_only || no_terminal, watch).await
         }
@@ -1046,11 +1065,18 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             network,
             generate_key,
             key_source,
+            import_env_key,
+            key_env_var,
         } => commands::init::run(
             config_path,
             force,
             &network,
-            commands::init::key_file_wanted(generate_key, key_source.as_deref())?,
+            commands::init::KeyRequest {
+                generate_key,
+                import_env_key,
+                key_source: key_source.as_deref(),
+                key_env_var: key_env_var.as_deref(),
+            },
         ),
         Commands::Witness { command } => match command {
             WitnessCommand::InitStore {

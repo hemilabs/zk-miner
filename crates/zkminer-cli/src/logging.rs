@@ -110,6 +110,7 @@ pub fn event_id(code: &str) -> u32 {
         "JOURNAL-UNUSABLE" => 131,
         "JOURNAL-DIVERGED" => 132,
         "JOURNAL-ENTRY-UNREADABLE" => 133,
+        "KEY-CHANGED" => 134,
         _ => 199,
     }
 }

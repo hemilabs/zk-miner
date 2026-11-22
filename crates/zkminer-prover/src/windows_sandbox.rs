@@ -1072,11 +1072,9 @@ fn other_key_copies(
         for copy in copies(var).into_iter().filter(|c| !c.machine_wide) {
             wrong.push(format!(
                 "{} holds a copy of the key's variable, which every process of this user can \
-                 read, Low-integrity workers included: delete it (in PowerShell: \
-                 [Environment]::SetEnvironmentVariable('{var}', $null, 'User')), move the key to \
-                 a key file (`zkminer init --force --generate-key`, or key_source = \"file\"), \
-                 and consider the key exposed",
-                copy.location
+                 read, Low-integrity workers included. Move the key, in this order: {}",
+                copy.location,
+                zkminer_config::wallet::key_env_move_steps(var, &copy.location)
             ));
         }
     }
@@ -2489,6 +2487,14 @@ mod tests {
                 && !refused.contains("HKLM"),
             "{refused}"
         );
+        // Review 7 WR-1/VWI-2: the key is copied into a key file and its address checked before
+        // the copy is deleted; a new key is never the remedy.
+        let import = refused.find("--import-env-key").expect("names the import");
+        let delete = refused
+            .find("SetEnvironmentVariable")
+            .expect("names the delete");
+        assert!(import < delete, "{refused}");
+        assert!(!refused.contains("--generate-key"), "{refused}");
         assert_eq!(machine_only, Ok(()));
         assert_eq!(file_key, Ok(()));
         assert!(both(Err("a".into()), Err("b".into())).unwrap_err() == "a; b");
