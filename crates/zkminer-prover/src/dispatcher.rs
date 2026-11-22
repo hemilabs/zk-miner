@@ -2934,6 +2934,26 @@ fn sp1_queue_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| zkminer_prover_protocol::types::sp1_groth16_queue_dir(&home))
 }
 
+/// A proof stopped because the chain watch's outage recycle stopped its worker
+/// ([`WorkerPool::stop_slots`]): neither the job's failure nor the card's. The caller retries it
+/// without counting an attempt. Typed, so no worker's or guest's text can produce it.
+#[derive(Debug)]
+pub struct WorkerRecycled {
+    pub slot_key: String,
+}
+
+impl std::fmt::Display for WorkerRecycled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the worker on {} was stopped by the outage recycle (it held network sockets)",
+            self.slot_key
+        )
+    }
+}
+
+impl std::error::Error for WorkerRecycled {}
+
 /// Pool of worker processes, keyed by compound slot key.
 pub struct WorkerPool {
     /// What a proof on each backend is expected to peak at in host memory, in bytes.
@@ -3046,6 +3066,9 @@ pub struct WorkerPool {
     /// making room and recycling both wait for VRAM to come back with the slot's pid already cleared.
     /// That respawned worker's `sp1-gpu-server` then outlives the miner, holding its VRAM.
     closing: AtomicBool,
+    /// Slot key -> the pid of the worker the outage recycle stopped there (`stop_slots`), until its
+    /// proof's death is reported as [`WorkerRecycled`] (`take_recycled`).
+    recycled: Mutex<HashMap<String, u32>>,
     /// Last time `make_measure_room` recycled an idle same-backend prove worker to fit a measurement.
     /// The standalone global cooldown behind L5: consumed AT KILL TIME so concurrent measurements do
     /// not each evict, and a measurement flood cannot thrash the warm prover with re-warm churn. See
@@ -3517,6 +3540,7 @@ impl WorkerPool {
             #[cfg(any(test, feature = "testing"))]
             test_cards: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
+            recycled: Mutex::new(HashMap::new()),
             last_measure_eviction: Mutex::new(None),
             inflight_measures: Mutex::new(HashMap::new()),
             only_backends: None,
@@ -12377,6 +12401,8 @@ impl WorkerPool {
             entry.pid.load(Ordering::Acquire),
             entry.pid_starttime.load(Ordering::Acquire),
         )));
+        // Whose death a recycle reports (`take_recycled`): read before a death clears it.
+        let proof_pid = entry.pid.load(Ordering::SeqCst);
         let proof_response = handle.recv_proof(request_id, &on_progress);
 
         // How a worker that died mid-proof ended and what it said last, added to the error (below).
@@ -12557,6 +12583,14 @@ impl WorkerPool {
                         },
                     ));
                 }
+            }
+
+            // Stopped by the outage recycle (`stop_slots`): reported as such, so the caller retries
+            // it without counting an attempt against the job or the card.
+            if self.take_recycled(key, proof_pid) {
+                return Err(anyhow::Error::new(WorkerRecycled {
+                    slot_key: key.to_string(),
+                }));
             }
         }
 
@@ -13255,6 +13289,133 @@ impl WorkerPool {
     /// because its worker was stopped, not because of the job or the card.
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Every slot, prove and measure, with its key (`{backend}:measure:{i}` for a measure slot).
+    fn all_slots(&self) -> impl Iterator<Item = (String, &WorkerEntry)> {
+        let prove = self.workers.iter().map(|(k, e)| (k.clone(), e));
+        let measure = self.measure_workers.iter().flat_map(|(backend, pool)| {
+            pool.iter()
+                .enumerate()
+                .map(move |(i, e)| (format!("{backend}:measure:{i}"), e))
+        });
+        prove.chain(measure)
+    }
+
+    /// End worker `pid` (started at `start`) and everything it started: its job on Windows, its
+    /// process group on Unix. Identity-checked, as everywhere a pid is signalled.
+    fn kill_worker_tree(pid: u32, start: Option<u64>) {
+        if !crate::memory::pid_is_our_worker(pid, start) {
+            return;
+        }
+        #[cfg(windows)]
+        if !crate::netwatch::terminate_job_of(pid) {
+            crate::memory::terminate_if_our_worker(pid, start);
+        }
+        #[cfg(unix)]
+        // SAFETY: pid is non-zero, so neither call degenerates to kill(0)/kill(-1).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+
+    /// The sockets each running worker's processes hold (`netwatch`), for the chain watch's outage
+    /// recycle. Windows only: elsewhere a confined worker has no socket, and this is empty.
+    pub fn worker_sockets(&self) -> std::io::Result<Vec<crate::netwatch::SlotSockets>> {
+        #[cfg(windows)]
+        {
+            let table = crate::netwatch::socket_table()?;
+            let now = crate::netwatch::filetime_now();
+            let mut out = Vec::new();
+            for (key, entry) in self.all_slots() {
+                let Some((pid, start)) = entry.signal_target() else {
+                    continue;
+                };
+                // Still that worker: a pid freed since may name a stranger.
+                if !crate::memory::pid_is_our_worker(pid, start) {
+                    continue;
+                }
+                let busy = entry.slot.try_lock().is_err();
+                let (pids, sockets) = crate::netwatch::sockets_of_worker(pid, &table);
+                // FILETIMEs, in 100 ns.
+                let age =
+                    start.map(|s| Duration::from_nanos(now.saturating_sub(s).saturating_mul(100)));
+                out.push(crate::netwatch::SlotSockets {
+                    slot: key,
+                    pids,
+                    age,
+                    sockets,
+                    busy,
+                });
+            }
+            Ok(out)
+        }
+        #[cfg(not(windows))]
+        Ok(Vec::new())
+    }
+
+    /// Stop the workers of `keys`, busy or not, for the chain watch's outage recycle: each
+    /// worker's process tree is ended at once. An idle slot is cleared here; a busy one by its
+    /// dispatch, whose proof then fails as [`WorkerRecycled`] (not counted against the slot, the
+    /// job or the card). Each starts again when next dispatched. The keys stopped, with the pid of
+    /// the worker that was there.
+    pub fn stop_slots(&self, keys: &[String]) -> Vec<(String, u32)> {
+        let mut stopped = Vec::new();
+        for (key, entry) in self.all_slots() {
+            if !keys.contains(&key) {
+                continue;
+            }
+            let Some((pid, start)) = entry.signal_target() else {
+                continue;
+            };
+            self.recycled
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key.clone(), pid);
+            // Not a failure of the slot: its death is not counted (see `intentional_kill`).
+            entry.intentional_kill.store(true, Ordering::Release);
+            Self::kill_worker_tree(pid, start);
+            if let Ok(mut slot) = entry.slot.try_lock() {
+                // Idle: no proof will report the death.
+                self.take_recycled(&key, pid);
+                Self::mark_slot_dead(&mut slot, entry);
+            }
+            stopped.push((key, pid));
+        }
+        stopped
+    }
+
+    /// Stop every idle worker (prove and measure), for the outage recycle when no worker holds
+    /// sockets: no proof or measurement is lost, and each starts again when next dispatched. The
+    /// keys stopped.
+    pub fn stop_idle_slots(&self) -> Vec<String> {
+        let mut stopped = Vec::new();
+        for (key, entry) in self.all_slots() {
+            let Ok(mut slot) = entry.slot.try_lock() else {
+                continue;
+            };
+            if slot.handle.is_none() {
+                continue;
+            }
+            if let Some((pid, start)) = entry.signal_target() {
+                Self::kill_worker_tree(pid, start);
+            }
+            Self::mark_slot_dead(&mut slot, entry);
+            stopped.push(key);
+        }
+        stopped
+    }
+
+    /// Whether `key`'s worker `pid` was stopped by `stop_slots`, forgetting it.
+    fn take_recycled(&self, key: &str, pid: u32) -> bool {
+        let mut recycled = self.recycled.lock().unwrap_or_else(|p| p.into_inner());
+        if pid != 0 && recycled.get(key) == Some(&pid) {
+            recycled.remove(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Shutdown all workers.
@@ -19166,5 +19327,109 @@ mod learned_host_peak_tests {
             .lock()
             .unwrap()
             .contains_key("risc0:cuda:1"));
+    }
+}
+
+#[cfg(test)]
+mod recycle_tests {
+    use super::*;
+
+    /// A pool with one slot per key, each with a worker pid that is not a process of ours (so
+    /// nothing is signalled), and no handle.
+    fn pool_with(keys: &[(&str, u32)]) -> WorkerPool {
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+        for (key, pid) in keys {
+            pool.workers.insert(
+                key.to_string(),
+                WorkerEntry {
+                    slot: Mutex::new(WorkerSlot {
+                        handle: None,
+                        path: PathBuf::from("/nonexistent"),
+                        backend: "risc0".to_string(),
+                        gpu_tag: "cuda".to_string(),
+                        device_index: Some(0),
+                        pci_bus_id: None,
+                        gpu_name: None,
+                        spawn_env: HashMap::new(),
+                        consecutive_failures: 0,
+                        last_failure: None,
+                        declined: None,
+                        decline_retry: DeclineRetry::default(),
+                        proofs_since_spawn: 0,
+                    }),
+                    vram_bytes: None,
+                    pci_bus_id: None,
+                    pid: Arc::new(AtomicU32::new(*pid)),
+                    // A start time no live process has: the identity check refuses every signal.
+                    pid_starttime: Arc::new(AtomicU64::new(1)),
+                    intentional_kill: Arc::new(AtomicBool::new(false)),
+                    build: WorkerBuild::default(),
+                },
+            );
+        }
+        pool
+    }
+
+    /// The outage recycle stops only the slots it names. A busy slot's death is reported as
+    /// `WorkerRecycled` once, for that worker only (`take_recycled`), and is not a failure of the
+    /// slot; an idle one is cleared at once.
+    #[test]
+    fn stop_slots_stops_only_the_named_slots_and_marks_the_busy_ones_recycled() {
+        let pool = pool_with(&[
+            ("risc0:cuda:0", 4_000_000_001),
+            ("risc0:cuda:1", 4_000_000_002),
+        ]);
+        let busy = pool.workers["risc0:cuda:0"].slot.lock().unwrap();
+        let stopped = pool.stop_slots(&["risc0:cuda:0".to_string()]);
+        assert_eq!(stopped, vec![("risc0:cuda:0".to_string(), 4_000_000_001)]);
+        assert_eq!(pool.test_intentional_kill("risc0:cuda:0"), Some(true));
+        // The other slot is untouched.
+        assert_eq!(pool.test_intentional_kill("risc0:cuda:1"), Some(false));
+        assert_eq!(pool.test_pid("risc0:cuda:1"), Some(4_000_000_002));
+        // Busy: the dispatch clears it when it sees the death, and reports it once, for that pid.
+        assert_eq!(pool.test_pid("risc0:cuda:0"), Some(4_000_000_001));
+        assert!(!pool.take_recycled("risc0:cuda:0", 4_000_000_009));
+        assert!(!pool.take_recycled("risc0:cuda:1", 4_000_000_002));
+        assert!(pool.take_recycled("risc0:cuda:0", 4_000_000_001));
+        assert!(!pool.take_recycled("risc0:cuda:0", 4_000_000_001));
+        drop(busy);
+        // Idle: cleared now, and nothing is left to report.
+        let stopped = pool.stop_slots(&["risc0:cuda:1".to_string()]);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(pool.test_pid("risc0:cuda:1"), Some(0));
+        assert!(!pool.take_recycled("risc0:cuda:1", 4_000_000_002));
+        // A slot with no worker is not stopped.
+        assert!(pool.stop_slots(&["risc0:cuda:1".to_string()]).is_empty());
+    }
+
+    /// A proof whose worker `stop_slots` stopped fails as `WorkerRecycled`, matched by the pid of
+    /// the worker that ran it (read before its death clears the slot's).
+    #[test]
+    fn a_proof_whose_worker_was_recycled_fails_as_worker_recycled() {
+        let src = include_str!("dispatcher.rs");
+        let prove = src.split_once("    fn prove_on_slot(").unwrap().1;
+        let prove = &prove[..prove.find("
+    }
+").unwrap()];
+        let pid = prove
+            .find("let proof_pid = entry.pid.load(Ordering::SeqCst);")
+            .unwrap();
+        assert!(pid < prove.find("handle.recv_proof(").unwrap());
+        assert!(prove.contains("if self.take_recycled(key, proof_pid) {"));
+        assert!(prove.contains("return Err(anyhow::Error::new(WorkerRecycled {"));
+    }
+
+    /// With no worker holding sockets, only idle workers are stopped: a busy slot keeps its proof.
+    #[test]
+    fn stop_idle_slots_spares_busy_slots() {
+        let pool = pool_with(&[("risc0:cuda:0", 4_000_000_001)]);
+        let busy = pool.workers["risc0:cuda:0"].slot.lock().unwrap();
+        assert!(pool.stop_idle_slots().is_empty());
+        drop(busy);
+        // Idle but without a handle: nothing running to stop.
+        assert!(pool.stop_idle_slots().is_empty());
+        assert_eq!(pool.test_intentional_kill("risc0:cuda:0"), Some(false));
+        // A worker that is not ours (by start time) is never counted.
+        assert!(pool.worker_sockets().unwrap().is_empty());
     }
 }

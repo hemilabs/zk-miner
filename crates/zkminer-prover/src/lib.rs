@@ -9,6 +9,7 @@ mod env;
 pub mod gpu_code;
 pub mod host_peaks;
 pub mod memory;
+pub mod netwatch;
 pub mod registry;
 pub mod sp1_shard_caps;
 #[cfg(windows)]

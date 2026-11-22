@@ -1365,8 +1365,9 @@ pub(crate) struct WorkerChild {
     process: OwnedHandle,
     pid: u32,
     /// Its job (`windows_job::new_worker_job`), if it could be put in one. Closing it ends
-    /// whatever is still in it.
-    job: Option<OwnedHandle>,
+    /// whatever is still in it. Shared only weakly, with the outage recycle's socket check
+    /// (`netwatch::register_job`), so this is still its only owner.
+    job: Option<std::sync::Arc<OwnedHandle>>,
     low: bool,
 }
 
@@ -1964,7 +1965,11 @@ fn spawn(
         let job = match crate::windows_job::new_worker_job()
             .and_then(|job| crate::windows_job::assign(&job, process.as_raw_handle()).map(|()| job))
         {
-            Ok(job) => Some(job),
+            Ok(job) => {
+                let job = std::sync::Arc::new(job);
+                crate::netwatch::register_job(info.process_id, &job);
+                Some(job)
+            }
             Err(e) => {
                 tracing::warn!(
                     "worker pid {} runs without its job ({e}): it is not kept from the desktop and \
