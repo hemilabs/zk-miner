@@ -10,7 +10,9 @@
 //!   exit unless told otherwise, so `zkminer stop` (exit 0) only restarted the miner; and its
 //!   default 1.5 s console stop timeout cuts a drain off.
 //! - Where the service's output goes (review 6 D1): NSSM drops stdout and stderr unless
-//!   `AppStdout`/`AppStderr` name a file, and the `zkminer` event source is registered once.
+//!   `AppStdout`/`AppStderr` name a file, and the `zkminer` event source is registered once; and
+//!   whether NSSM rotates that file while the miner runs (`AppRotateOnline`, review 7 LD-2), whose
+//!   rotated copies a headless start prunes to the newest ten (NSSM deletes none).
 //!
 //! Only the service's own key and its NSSM `Parameters` values named here are read, never
 //! `AppEnvironmentExtra`, which may hold a key.
@@ -469,6 +471,10 @@ pub(crate) struct Nssm {
     /// `AppStdout` and `AppStderr`: the files NSSM keeps the miner's output in (none: dropped).
     pub app_stdout: Option<String>,
     pub app_stderr: Option<String>,
+    /// `AppRotateFiles` and `AppRotateOnline`: whether NSSM rotates those files, and also while the
+    /// miner runs (without `AppRotateOnline 1` it rotates only when the service starts).
+    pub rotate_files: Option<u32>,
+    pub rotate_online: Option<u32>,
 }
 
 /// The [`Nssm`] settings of service `name`, or `None` when it is not run by NSSM (no
@@ -486,6 +492,8 @@ pub(crate) fn nssm_of(name: &str) -> Option<Nssm> {
         stop_console_ms: reg_dword(&params, "AppStopMethodConsole"),
         app_stdout: reg_string(&params, Some("AppStdout")).filter(|v| !v.trim().is_empty()),
         app_stderr: reg_string(&params, Some("AppStderr")).filter(|v| !v.trim().is_empty()),
+        rotate_files: reg_dword(&params, "AppRotateFiles"),
+        rotate_online: reg_dword(&params, "AppRotateOnline"),
     })
 }
 
@@ -572,6 +580,7 @@ pub(crate) fn service_nssm_findings() -> Vec<(Finding, String, String)> {
             restart_warning(&name, &nssm),
             stop_timeout_warning(&name, &nssm),
             output_warning(&name, &nssm),
+            rotation_warning(&name, &nssm),
         ]
         .into_iter()
         .flatten()
@@ -583,7 +592,8 @@ pub(crate) fn service_nssm_findings() -> Vec<(Finding, String, String)> {
             out.push((
                 Finding::Pass,
                 what,
-                "stops when the miner stops, waits for a drain, and keeps its output".to_string(),
+                "stops when the miner stops, waits for a drain, and keeps and rotates its output"
+                    .to_string(),
             ));
         }
     }
@@ -602,6 +612,16 @@ pub(crate) fn service_nssm_findings() -> Vec<(Finding, String, String)> {
 
 // ---- Where a service's output goes (D1) ----
 
+/// The NSSM settings that keep service `name`'s stdout and stderr in the account's
+/// `.zkminer\logs\service.log`, rotated at 10 MB while the miner runs too.
+pub(crate) fn output_advice(name: &str) -> String {
+    format!(
+        "`nssm set {name} AppStdout <home>\\.zkminer\\logs\\service.log`, the same for AppStderr, \
+         `nssm set {name} AppRotateFiles 1`, `nssm set {name} AppRotateOnline 1` and `nssm set \
+         {name} AppRotateBytes 10485760`"
+    )
+}
+
 /// For `doctor`: the warning that service `name` keeps none of the miner's output, or `None`.
 /// NSSM drops stdout and stderr unless `AppStdout` or `AppStderr` names a file; the miner's own
 /// log file and `pages.log` (`~/.zkminer/logs`) are kept either way, but a panic, a start-up
@@ -610,11 +630,195 @@ pub(crate) fn output_warning(name: &str, nssm: &Nssm) -> Option<String> {
     (nssm.app_stdout.is_none() && nssm.app_stderr.is_none()).then(|| {
         format!(
             "service {name} (NSSM) keeps none of the miner's output: a start-up error, a refusal \
-             or a crash is lost. `nssm set {name} AppStdout <home>\\zkminer-service.log`, \
-             the same for AppStderr, `nssm set {name} AppRotateFiles 1` and `nssm set {name} \
-             AppRotateBytes 10485760`"
+             or a crash is lost. {}",
+            output_advice(name)
         )
     })
+}
+
+/// For `doctor`: the warning that service `name` keeps the miner's output in a file it rotates
+/// only when the service starts (no `AppRotateOnline 1`), or never (no `AppRotateFiles 1`), or
+/// `None` (review 7 LD-2). That file then grows for as long as the miner runs, and a full disk stops
+/// claims (`PAGE: DISK-LOW`) and fails the proofs of held locks.
+pub(crate) fn rotation_warning(name: &str, nssm: &Nssm) -> Option<String> {
+    let kept = nssm.app_stdout.is_some() || nssm.app_stderr.is_some();
+    let rotated = nssm.rotate_files == Some(1) && nssm.rotate_online == Some(1);
+    (kept && !rotated).then(|| {
+        format!(
+            "service {name} (NSSM) keeps the miner's output in a file it does not rotate while the \
+             miner runs (AppRotateFiles {}, AppRotateOnline {}): it grows until the service \
+             restarts, and a full disk stops claims and fails held proofs. {}",
+            nssm.rotate_files.map_or("unset".to_string(), |v| v.to_string()),
+            nssm.rotate_online.map_or("unset".to_string(), |v| v.to_string()),
+            output_advice(name)
+        )
+    })
+}
+
+// ---- NSSM's rotated files (review 7 LD-2) ----
+
+/// How many of NSSM's rotated files of the service's output the miner keeps (NSSM deletes none).
+pub(crate) const KEEP_ROTATED: usize = 10;
+
+/// Whether `candidate` is the name NSSM gives a rotated copy of the file named `log_name`:
+/// `<stem>-YYYYMMDDTHHMMSS.mmm<ext>`, where `<ext>` is `log_name`'s extension (its last `.` on),
+/// possibly none. Stem and extension compare case-insensitively (NTFS names do); the timestamp must
+/// be exactly that many digits. Nothing else matches, the live file included.
+pub(crate) fn is_nssm_rotated(log_name: &str, candidate: &str) -> bool {
+    let (stem, ext) = match log_name.rfind('.') {
+        Some(dot) if dot > 0 => log_name.split_at(dot),
+        _ => (log_name, ""),
+    };
+    if stem.is_empty() || candidate.len() != stem.len() + "-YYYYMMDDTHHMMSS.mmm".len() + ext.len() {
+        return false;
+    }
+    let (Some(head), Some(tail)) = (
+        candidate.get(..stem.len()),
+        candidate.get(candidate.len() - ext.len()..),
+    ) else {
+        return false;
+    };
+    let Some(stamp) = candidate.get(stem.len()..candidate.len() - ext.len()) else {
+        return false;
+    };
+    let digits = |s: &[u8]| !s.is_empty() && s.iter().all(u8::is_ascii_digit);
+    let b = stamp.as_bytes();
+    head.eq_ignore_ascii_case(stem)
+        && tail.eq_ignore_ascii_case(ext)
+        && b.len() == 20
+        && b[0] == b'-'
+        && digits(&b[1..9])
+        && b[9] == b'T'
+        && digits(&b[10..16])
+        && b[16] == b'.'
+        && digits(&b[17..20])
+}
+
+/// Of `names` (a directory's), NSSM's rotated copies of `log_name` beyond the newest `keep`, oldest
+/// first. Their names sort by their time.
+pub(crate) fn rotated_to_prune(log_name: &str, names: &[String], keep: usize) -> Vec<String> {
+    let mut rotated: Vec<&String> = names
+        .iter()
+        .filter(|n| is_nssm_rotated(log_name, n))
+        .collect();
+    rotated.sort_by_key(|n| n.to_ascii_lowercase());
+    let excess = rotated.len().saturating_sub(keep);
+    rotated.into_iter().take(excess).cloned().collect()
+}
+
+/// The owner SID (`S-1-…`) of the self-relative security descriptor `descriptor`.
+pub(crate) fn descriptor_owner(descriptor: &[u8]) -> Option<String> {
+    const SE_SELF_RELATIVE: u16 = 0x8000;
+    let control = u16::from_le_bytes(descriptor.get(2..4)?.try_into().ok()?);
+    if control & SE_SELF_RELATIVE == 0 {
+        return None;
+    }
+    let at = u32::from_le_bytes(descriptor.get(4..8)?.try_into().ok()?) as usize;
+    if at == 0 {
+        return None;
+    }
+    zkminer_prover::windows_account::sid_string(descriptor.get(at..)?)
+}
+
+/// The owner SID of `path`.
+fn owner_of(path: &std::path::Path) -> std::io::Result<String> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn GetFileSecurityW(
+            name: *const u16,
+            information: u32,
+            descriptor: *mut c_void,
+            length: u32,
+            needed: *mut u32,
+        ) -> i32;
+    }
+    const OWNER_SECURITY_INFORMATION: u32 = 0x1;
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut needed = 0u32;
+    // SAFETY: a NUL-terminated path; a size query.
+    unsafe {
+        GetFileSecurityW(
+            name.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: a buffer of at least `needed` bytes that outlives the call.
+    if unsafe {
+        GetFileSecurityW(
+            name.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * 8) as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: plain bytes of a buffer this function owns.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
+    descriptor_owner(bytes).ok_or_else(|| std::io::Error::other("no owner in the descriptor"))
+}
+
+/// At a headless start: for each NSSM service that runs this miner, delete NSSM's rotated copies of
+/// its `AppStdout` file beyond the newest [`KEEP_ROTATED`]. Only in that file's own directory, only
+/// when this account owns that directory (and it is not a link), only regular files whose names
+/// [`is_nssm_rotated`] matches. An `AppStdout` with a variable in it, or not absolute, is left alone.
+pub(crate) fn prune_rotated_service_logs() {
+    let Ok(me) = zkminer_config::wallet::current_user_sid() else {
+        return;
+    };
+    for name in services_of_this_exe() {
+        let Some(stdout) = nssm_of(&name).and_then(|n| n.app_stdout) else {
+            continue;
+        };
+        let path = std::path::PathBuf::from(stdout.trim());
+        if stdout.contains('%') || !path.is_absolute() {
+            continue;
+        }
+        let (Some(dir), Some(log_name)) = (path.parent(), path.file_name()) else {
+            continue;
+        };
+        let Some(log_name) = log_name.to_str() else {
+            continue;
+        };
+        let is_plain_dir =
+            std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+        if !is_plain_dir || !owner_of(dir).is_ok_and(|owner| owner.eq_ignore_ascii_case(&me)) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let names: Vec<String> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        let mut removed = 0usize;
+        for old in rotated_to_prune(log_name, &names, KEEP_ROTATED) {
+            let file = dir.join(&old);
+            if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file())
+                && std::fs::remove_file(&file).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                "removed {removed} old rotated output file(s) of service {name} in {} (the newest \
+                 {KEEP_ROTATED} are kept)",
+                dir.display()
+            );
+        }
+    }
 }
 
 /// Whether the event source `zkminer` is registered (`New-EventLog -Source zkminer`).
@@ -643,6 +847,153 @@ mod tests {
             ..Nssm::default()
         };
         assert_eq!(output_warning("zkminer", &kept), None);
+    }
+
+    /// Review 7 LD-2: the advice rotates while the miner runs and keeps the file in the account's
+    /// logs; a kept output that NSSM does not rotate online is warned of, and the recipe is not.
+    #[test]
+    fn a_service_output_not_rotated_online_is_warned_of() {
+        let advice = output_advice("zkminer");
+        assert!(
+            advice.contains("AppRotateOnline 1")
+                && advice.contains("AppRotateFiles 1")
+                && advice.contains(r"\.zkminer\logs\service.log"),
+            "{advice}"
+        );
+        let text = output_warning("zkminer", &Nssm::default()).unwrap();
+        assert!(text.contains("AppRotateOnline 1"), "{text}");
+        // Nothing kept: the output warning says it all.
+        assert_eq!(rotation_warning("zkminer", &Nssm::default()), None);
+        let recipe = Nssm {
+            app_stdout: Some(r"C:\Users\zkminer\.zkminer\logs\service.log".into()),
+            app_stderr: Some(r"C:\Users\zkminer\.zkminer\logs\service.log".into()),
+            rotate_files: Some(1),
+            rotate_online: Some(1),
+            ..Nssm::default()
+        };
+        assert_eq!(rotation_warning("zkminer", &recipe), None);
+        for (files, online) in [
+            (Some(1), None),
+            (Some(1), Some(0)),
+            (None, Some(1)),
+            (None, None),
+        ] {
+            let nssm = Nssm {
+                rotate_files: files,
+                rotate_online: online,
+                ..recipe.clone()
+            };
+            let text = rotation_warning("zkminer", &nssm).unwrap();
+            assert!(text.contains("AppRotateOnline 1"), "{text}");
+        }
+    }
+
+    /// NSSM's rotated names, and nothing else: not the live file, not another file's copies, not a
+    /// near miss in the timestamp, not a longer or shorter name.
+    #[test]
+    fn only_nssm_rotated_names_are_matched() {
+        let log = "service.log";
+        for name in [
+            "service-20261121T093015.123.log",
+            "SERVICE-20261121T093015.123.LOG",
+            "service-19991231T235959.999.log",
+        ] {
+            assert!(is_nssm_rotated(log, name), "{name}");
+        }
+        for name in [
+            "service.log",
+            "service.log.1",
+            "zkminer.log.2026-11-21",
+            "pages.log",
+            "pages.log.1",
+            "job_journal.json",
+            "key",
+            "service-20261121T093015.123.txt",
+            "service-20261121T093015.123.log.bak",
+            "service-20261121T093015.123",
+            "service-20261121T093015.12.log",
+            "service-20261121T0930151.123.log",
+            "service-2026112T093015.1234.log",
+            "service-20261121t093015.123.log",
+            "service_20261121T093015.123.log",
+            "service-20261121T093015-123.log",
+            "service-2026112aT093015.123.log",
+            "xservice-20261121T093015.123.log",
+            "other-20261121T093015.123.log",
+            "service-20261121T093015.123-1.log",
+            "service-２0261121T093015.123.log",
+            "",
+        ] {
+            assert!(!is_nssm_rotated(log, name), "{name}");
+        }
+        // A file with no extension, and one whose only dot leads.
+        assert!(is_nssm_rotated("out", "out-20261121T093015.123"));
+        assert!(!is_nssm_rotated("out", "out-20261121T093015.123.log"));
+        assert!(is_nssm_rotated(".log", ".log-20261121T093015.123"));
+    }
+
+    /// Beyond the newest ten rotated copies, oldest first; other files are never listed.
+    #[test]
+    fn rotated_copies_beyond_the_newest_ten_are_pruned() {
+        let mut names: Vec<String> = (0..13)
+            .map(|i| format!("service-202611{:02}T000000.000.log", i + 1))
+            .collect();
+        names.extend(
+            [
+                "service.log",
+                "zkminer.log.2026-11-01",
+                "key",
+                "service-1.log",
+            ]
+            .map(String::from),
+        );
+        names.reverse();
+        let pruned = rotated_to_prune("service.log", &names, KEEP_ROTATED);
+        assert_eq!(
+            pruned,
+            vec![
+                "service-20261101T000000.000.log",
+                "service-20261102T000000.000.log",
+                "service-20261103T000000.000.log"
+            ]
+        );
+        assert!(rotated_to_prune("service.log", &names[..5], KEEP_ROTATED).is_empty());
+    }
+
+    /// The owner of a self-relative descriptor, as `GetFileSecurityW` returns it.
+    #[test]
+    fn a_descriptors_owner_is_read() {
+        // Revision 1, control SE_SELF_RELATIVE | SE_OWNER_DEFAULTED=0, owner at 20.
+        let mut sd = vec![1u8, 0, 0x00, 0x80];
+        sd.extend(20u32.to_le_bytes());
+        sd.extend([0u8; 12]);
+        // S-1-5-18
+        sd.extend([1u8, 1, 0, 0, 0, 0, 0, 5]);
+        sd.extend(18u32.to_le_bytes());
+        assert_eq!(descriptor_owner(&sd).as_deref(), Some("S-1-5-18"));
+        let mut absolute = sd.clone();
+        absolute[3] = 0;
+        assert_eq!(descriptor_owner(&absolute), None);
+        let mut no_owner = sd.clone();
+        no_owner[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(descriptor_owner(&no_owner), None);
+        assert_eq!(descriptor_owner(&sd[..10]), None);
+    }
+
+    /// The miner's own account owns a directory it made (the prune's precondition).
+    #[test]
+    fn this_account_owns_a_directory_it_made() {
+        let dir = std::env::temp_dir().join(format!("zkminer-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let owner = owner_of(&dir).unwrap();
+        let me = zkminer_config::wallet::current_user_sid().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // An administrator's files may be owned by Administrators instead.
+        assert!(
+            owner.eq_ignore_ascii_case(&me) || owner == "S-1-5-32-544",
+            "{owner} vs {me}"
+        );
     }
 
     /// Review 6 OJ-2: NSSM's exit actions as the README recipe sets them stop on every deliberate

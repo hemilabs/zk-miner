@@ -696,7 +696,11 @@ come a tick or two later than a real miner's would, and the per-job reports can 
 behind the market.
 
 Verbosity is `-v`/`-vv`, before or after the subcommand (`RUST_LOG` is ignored). Logs go to
-stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
+stderr, so `zkminer benchmark --json` on stdout stays machine-readable. A worker's own output
+(what a guest prints) is not shown: one line per worker per minute says how many lines and bytes
+it printed. To debug a guest, `ZKMINER_WORKER_OUTPUT=stderr` shows its lines on stderr (rate-capped;
+not in the dashboard). Don't leave it set with guests you don't trust: what they print then reaches
+stderr, and a service's log file.
 
 Worth knowing:
 
@@ -814,9 +818,10 @@ Worth knowing:
   .\nssm set zkminer AppExit 0 Exit
   .\nssm set zkminer AppExit 130 Exit
   .\nssm set zkminer AppRestartDelay 30000
-  .\nssm set zkminer AppStdout C:\Users\zkminer\zkminer-service.log
-  .\nssm set zkminer AppStderr C:\Users\zkminer\zkminer-service.log
+  .\nssm set zkminer AppStdout C:\Users\zkminer\.zkminer\logs\service.log
+  .\nssm set zkminer AppStderr C:\Users\zkminer\.zkminer\logs\service.log
   .\nssm set zkminer AppRotateFiles 1
+  .\nssm set zkminer AppRotateOnline 1
   .\nssm set zkminer AppRotateBytes 10485760
   New-EventLog -LogName Application -Source zkminer
   sc.exe privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
@@ -935,8 +940,13 @@ Worth knowing:
   pages and exits 2 while one is unacknowledged or locks are held with no miner running to drive
   them (0 otherwise, 1 when it cannot run); `zkminer status --ack` acknowledges the pages shown.
   The NSSM recipe above keeps the service's own stdout and stderr in the account's
-  `zkminer-service.log` (a start-up error or a refusal is said there only); `zkminer doctor`
-  warns of a service that keeps neither, and of an unregistered event source.
+  `.zkminer\logs\service.log` (a start-up error or a refusal is said there only), rotated at 10
+  MB while the miner runs too (without `AppRotateOnline 1` NSSM rotates only when the service
+  starts, and the file grows until then). NSSM deletes none of its rotated copies; each headless
+  start keeps the newest ten in that folder, if the account owns it. Make the folder as the
+  account before the first start (`runas /user:zkminer cmd`, then `mkdir
+  %USERPROFILE%\.zkminer\logs`), so that NSSM can open the file there and the account owns it. `zkminer doctor` warns of a service that keeps neither stream,
+  that does not rotate them while it runs, and of an unregistered event source.
   `PAGE: CHAIN-UNREACHABLE` says no chain read has succeeded for a minute while locks are held
   (repeated every 5 minutes): fulfils and releases go through the same RPC, so the locks can be
   neither proven nor given back until it returns. `PAGE: LOCK-AT-RISK <job>` follows for each lock

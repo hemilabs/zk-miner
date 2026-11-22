@@ -350,13 +350,32 @@ pub fn rolling_file(dir: &Path) -> tracing_appender::rolling::RollingFileAppende
         .unwrap_or_else(|_| tracing_appender::rolling::daily(dir, "zkminer.log"))
 }
 
+/// The variable that forwards worker (guest) output to stderr line by line: `stderr`. Unset, a
+/// worker's output is only counted (`zkminer_prover::worker::WorkerOutput::Tally`). A debugging
+/// aid, unsafe with a hostile guest: what it prints then reaches stderr, and a service wrapper's
+/// file of it.
+pub const WORKER_OUTPUT_ENV: &str = "ZKMINER_WORKER_OUTPUT";
+
+/// Whether [`WORKER_OUTPUT_ENV`] is `stderr` (case ignored, surrounding blanks trimmed).
+pub fn worker_output_opt_in(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("stderr"))
+}
+
+/// [`worker_output_opt_in`] from this process's environment.
+pub fn worker_output_to_stderr() -> bool {
+    worker_output_opt_in(std::env::var(WORKER_OUTPUT_ENV).ok().as_deref())
+}
+
 /// The subscriber of a headless `zkminer run`: `stderr` as before (colour when `ansi`), the
 /// rolling `file`, and [`PageSink`] in `dir`, everything at `filter`; URLs cut to their host in both
-/// writers, and worker output kept out of the file.
+/// writers. Worker output (target `worker`) is kept out of the file always, and out of stderr unless
+/// `worker_to_stderr` ([`WORKER_OUTPUT_ENV`]): a service wrapper keeps stderr in a file it does not
+/// bound (review 7 LD-2).
 fn headless_subscriber<E, F>(
     filter: &str,
     stderr: E,
     ansi: bool,
+    worker_to_stderr: bool,
     file: F,
     sink: PageSink,
 ) -> impl tracing::Subscriber + Send + Sync + 'static
@@ -372,7 +391,10 @@ where
             tracing_subscriber::fmt::layer()
                 .with_writer(RedactingMake(stderr))
                 .with_target(false)
-                .with_ansi(ansi),
+                .with_ansi(ansi)
+                .with_filter(tracing_subscriber::filter::filter_fn(move |m| {
+                    worker_to_stderr || m.target() != "worker"
+                })),
         )
         .with(
             tracing_subscriber::fmt::layer()
@@ -396,6 +418,7 @@ pub fn init_headless_run(filter: &str, dir: &Path) -> tracing_appender::non_bloc
         filter,
         std::io::stderr,
         ansi,
+        worker_output_to_stderr(),
         file,
         PageSink::new(dir.to_path_buf()),
     )
@@ -535,34 +558,62 @@ mod tests {
     }
 
     /// The headless subscriber: a PAGE reaches stderr, the file and `pages.log`; worker output
-    /// reaches stderr only; a URL's path reaches none of them.
+    /// reaches neither stderr (review 7 LD-2) nor the file, unless `ZKMINER_WORKER_OUTPUT=stderr`
+    /// lets it reach stderr; the worker output tally reaches both; a URL's path reaches none of
+    /// them.
     #[test]
     fn a_headless_run_keeps_pages_and_logs_but_not_worker_output() {
-        let dir = temp_dir("headless");
-        let (stderr, file) = (Shared::default(), Shared::default());
-        let subscriber = headless_subscriber(
-            "warn,zkminer=info",
-            stderr.clone(),
-            false,
-            file.clone(),
-            PageSink::files_only(dir.clone()),
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::error!(target: "zkminer::run", "PAGE: LOCK-LATE — https://rpc.example.org/KEY");
-            tracing::warn!(target: "worker", "[worker:risc0] a guest's line");
-        });
-        let (stderr, file) = (stderr.text(), file.text());
-        assert!(
-            stderr.contains("PAGE: LOCK-LATE") && stderr.contains("a guest's line"),
-            "{stderr}"
-        );
-        assert!(
-            file.contains("PAGE: LOCK-LATE") && !file.contains("a guest's line"),
-            "{file}"
-        );
-        assert!(!stderr.contains("KEY") && !file.contains("KEY"));
-        let pages = read_pages(&dir);
-        assert_eq!(pages.len(), 1, "{pages:?}");
-        let _ = std::fs::remove_dir_all(&dir);
+        for worker_to_stderr in [false, true] {
+            let dir = temp_dir(&format!("headless-{worker_to_stderr}"));
+            let (stderr, file) = (Shared::default(), Shared::default());
+            let subscriber = headless_subscriber(
+                "warn,zkminer=info",
+                stderr.clone(),
+                false,
+                worker_to_stderr,
+                file.clone(),
+                PageSink::files_only(dir.clone()),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(target: "zkminer::run", "PAGE: LOCK-LATE — https://rpc.example.org/KEY");
+                tracing::warn!(target: "worker", "[worker:risc0] a guest's line");
+                tracing::info!(
+                    target: "zkminer::worker_output",
+                    "worker risc0 (PID 7) printed 3 line(s) (40 bytes)"
+                );
+            });
+            let (stderr, file) = (stderr.text(), file.text());
+            assert!(stderr.contains("PAGE: LOCK-LATE"), "{stderr}");
+            assert_eq!(
+                stderr.contains("a guest's line"),
+                worker_to_stderr,
+                "{stderr}"
+            );
+            assert!(
+                file.contains("PAGE: LOCK-LATE") && !file.contains("a guest's line"),
+                "{file}"
+            );
+            assert!(
+                stderr.contains("printed 3 line(s) (40 bytes)")
+                    && file.contains("printed 3 line(s) (40 bytes)"),
+                "{stderr}\n{file}"
+            );
+            assert!(!stderr.contains("KEY") && !file.contains("KEY"));
+            let pages = read_pages(&dir);
+            assert_eq!(pages.len(), 1, "{pages:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Only `stderr` opts in to forwarding worker output.
+    #[test]
+    fn worker_output_is_forwarded_only_on_request() {
+        assert!(!worker_output_opt_in(None));
+        for value in ["", "1", "true", "file", "stdout", "stderr2"] {
+            assert!(!worker_output_opt_in(Some(value)), "{value}");
+        }
+        for value in ["stderr", "STDERR", " stderr "] {
+            assert!(worker_output_opt_in(Some(value)), "{value}");
+        }
     }
 }

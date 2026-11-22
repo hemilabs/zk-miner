@@ -728,8 +728,8 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
         // to the daily-rotated, size-uncapped log it fills the operator's disk, and its ungated
         // "[WITSUM]" eprintln path would corrupt the alternate screen. The drainer still READS the pipe
         // (so the worker never blocks on a full pipe) — it just does not forward while suppressed.
-        // (Headless keeps forwarding, rate-capped in the drainer, to operator-controlled stderr.)
-        zkminer_prover::worker::suppress_worker_stderr(true);
+        // (Headless counts it instead, and forwards it only on ZKMINER_WORKER_OUTPUT=stderr.)
+        zkminer_prover::worker::set_worker_output(zkminer_prover::worker::WorkerOutput::Suppress);
         // TUI mode: log to file instead of stderr (stderr output corrupts the alternate screen).
         let log_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -778,6 +778,13 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             )
             .init();
     } else {
+        // Worker (guest) output is counted, not shown, unless ZKMINER_WORKER_OUTPUT=stderr: a
+        // service wrapper keeps stderr in a file nothing bounds while the miner runs (review 7 LD-2).
+        zkminer_prover::worker::set_worker_output(if logging::worker_output_to_stderr() {
+            zkminer_prover::worker::WorkerOutput::Forward
+        } else {
+            zkminer_prover::worker::WorkerOutput::Tally
+        });
         let filter = match cli.verbose {
             // `doctor` prints its own report; the probes' INFO lines would only interleave with it.
             0 if matches!(cli.command, Commands::Doctor) => "error",
@@ -793,6 +800,9 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             // A headless run (a service's included) also keeps the rolling file and its pages,
             // which a service wrapper may otherwise drop with stderr (review 6 D1).
             _log_guard = Some(logging::init_headless_run(filter, &logging::logs_dir()));
+            // NSSM keeps every file it rotates: keep the newest few of the service's.
+            #[cfg(windows)]
+            commands::windows_service::prune_rotated_service_logs();
         } else {
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::new(filter))

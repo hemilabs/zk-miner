@@ -270,29 +270,131 @@ pub(crate) fn install_artifacts_at_medium(
     }
 }
 
-/// A worker's last lines of output, kept whether or not they are forwarded: the dashboard suppresses
-/// forwarding, and a worker that crashed otherwise said only "process died (EOF)".
-type RecentOutput = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+/// A worker's last lines of output, kept whether or not they are forwarded: forwarding is off by
+/// default, and a worker that crashed otherwise said only "process died (EOF)". Kept as the raw
+/// bytes (each capped), sanitized only when read, so that a drainer that forwards nothing does no
+/// per-line formatting.
+type RecentOutput = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>;
 
 /// How many of a worker's last lines are kept, and how much of each: bounded, as a guest's own output
-/// reaches the worker's stderr.
+/// reaches the worker's stderr. The raw cap leaves room for multi-byte characters.
 const RECENT_OUTPUT_LINES: usize = 12;
 const RECENT_OUTPUT_LINE_CHARS: usize = 240;
+const RECENT_OUTPUT_LINE_BYTES: usize = 4 * RECENT_OUTPUT_LINE_CHARS;
 
-fn remember_output(recent: &RecentOutput, line: &str) {
+fn remember_output(recent: &RecentOutput, raw: &[u8]) {
     let mut lines = recent.lock().unwrap_or_else(|p| p.into_inner());
     if lines.len() == RECENT_OUTPUT_LINES {
         lines.pop_front();
     }
-    lines.push_back(line.chars().take(RECENT_OUTPUT_LINE_CHARS).collect());
+    lines.push_back(raw[..raw.len().min(RECENT_OUTPUT_LINE_BYTES)].to_vec());
 }
 
-/// When true, worker stderr forwarding is suppressed (TUI mode).
-static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
+/// [`RecentOutput`] as text: each line sanitized and capped at `RECENT_OUTPUT_LINE_CHARS`, empty
+/// ones left out.
+fn recent_lines(recent: &RecentOutput) -> Vec<String> {
+    recent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|raw| {
+            sanitize_worker_line(&String::from_utf8_lossy(raw))
+                .chars()
+                .take(RECENT_OUTPUT_LINE_CHARS)
+                .collect::<String>()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
 
-/// Suppress worker stderr forwarding to prevent TUI corruption.
-pub fn suppress_worker_stderr(suppress: bool) {
-    SUPPRESS_WORKER_STDERR.store(suppress, Ordering::Relaxed);
+/// What happens to a worker's output (its stderr, onto which the worker puts each guest's stdout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOutput {
+    /// Neither forwarded nor counted in the log (the dashboard: the log file is all there is, and
+    /// stderr would corrupt the screen).
+    Suppress,
+    /// Not forwarded; one line per worker per minute in which it printed says how many lines and
+    /// bytes, not what (the default: a guest's output must not reach a log no one rotates).
+    Tally,
+    /// Forwarded line by line to tracing target `worker` (rate-capped), for debugging a guest
+    /// (`ZKMINER_WORKER_OUTPUT=stderr`; unsafe with a hostile guest, whose output it is).
+    Forward,
+}
+
+/// The current [`WorkerOutput`], as its index.
+static WORKER_OUTPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Set what happens to the output of every worker from now on (see [`WorkerOutput`]).
+pub fn set_worker_output(mode: WorkerOutput) {
+    let index = match mode {
+        WorkerOutput::Suppress => 0,
+        WorkerOutput::Tally => 1,
+        WorkerOutput::Forward => 2,
+    };
+    WORKER_OUTPUT.store(index, Ordering::Relaxed);
+}
+
+fn worker_output() -> WorkerOutput {
+    match WORKER_OUTPUT.load(Ordering::Relaxed) {
+        0 => WorkerOutput::Suppress,
+        2 => WorkerOutput::Forward,
+        _ => WorkerOutput::Tally,
+    }
+}
+
+/// How often [`WorkerOutput::Tally`] reports a worker that printed.
+const OUTPUT_TALLY_PERIOD: Duration = Duration::from_secs(60);
+
+/// A worker's output counted since the last report: lines and bytes, never content.
+#[derive(Debug)]
+struct OutputTally {
+    lines: u64,
+    bytes: u64,
+    since: Instant,
+}
+
+impl OutputTally {
+    fn new(now: Instant) -> Self {
+        Self {
+            lines: 0,
+            bytes: 0,
+            since: now,
+        }
+    }
+
+    fn add(&mut self, lines: u64, bytes: u64) {
+        self.lines = self.lines.saturating_add(lines);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// The counts of the period that ended, once `OUTPUT_TALLY_PERIOD` has passed since it began,
+    /// starting a new one; `None` before that, or when the worker printed nothing in it.
+    fn due(&mut self, now: Instant) -> Option<(u64, u64)> {
+        if now.saturating_duration_since(self.since) < OUTPUT_TALLY_PERIOD {
+            return None;
+        }
+        self.since = now;
+        self.take()
+    }
+
+    /// What is counted so far (at the worker's end), or `None` for nothing; resets the counts.
+    fn take(&mut self) -> Option<(u64, u64)> {
+        let counts = (
+            std::mem::take(&mut self.lines),
+            std::mem::take(&mut self.bytes),
+        );
+        (counts != (0, 0)).then_some(counts)
+    }
+}
+
+/// Log a tally of `(lines, bytes)` for worker `backend` (PID `pid`), at most once a minute.
+fn report_output_tally(backend: &str, pid: u32, (lines, bytes): (u64, u64)) {
+    tracing::info!(
+        target: "zkminer::worker_output",
+        "worker {backend} (PID {pid}) printed {lines} line(s) ({bytes} bytes) in the last minute \
+         (not shown: guest output; ZKMINER_WORKER_OUTPUT=stderr forwards it, unsafe with a hostile \
+         guest)"
+    );
 }
 
 use anyhow::{bail, Context, Result};
@@ -1153,12 +1255,14 @@ impl WorkerHandle {
         let reader = BufReader::new(child_stdout);
         let writer = BufWriter::new(child_stdin);
 
-        // Spawn stderr reader thread that forwards to tracing
+        // Spawn stderr reader thread: it drains the pipe, keeps the last lines, and forwards or
+        // counts them (`WorkerOutput`).
         let backend_name = backend.to_string();
         let last_stderr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_stderr_w = last_stderr.clone();
         let recent_output = RecentOutput::default();
         let recent_for_drain = recent_output.clone();
+        let drain_pid = spawn_guard.get().id();
         let stderr_task = child_stderr.map(|stderr| {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
@@ -1174,17 +1278,18 @@ impl WorkerHandle {
                     let mut buf: Vec<u8> = Vec::with_capacity(256);
                     let mut discarding = false;
                     let mut byte = [0u8; 1];
-                    // Aggregate flood cap on forwarding. A guest's stdout is dup2'd onto this
-                    // worker-stderr pipe, so a malicious guest can emit unbounded lines; the
-                    // per-line BYTE cap above bounds each line but not their NUMBER. Unbounded, a guest
-                    // in a tight print loop (free, on the pre-claim EXECUTE measurement path — no claim,
-                    // no collateral) floods the daily-rotated, size-uncapped log and fills the
-                    // operator's disk. Token-bucket it: a burst, then a steady trickle, with the excess
-                    // folded into one periodic "(N dropped)" summary so a genuine late diagnostic still
-                    // gets through while a flood cannot. Per drainer thread = per worker lifetime; a
-                    // respawn resets it. In TUI mode forwarding is gated off ENTIRELY below
-                    // (SUPPRESS_WORKER_STDERR), which closes the rolling-file disk-fill outright; the
-                    // bucket is the headless (operator-redirected stderr) defence-in-depth.
+                    // Forwarding is opt-in (`WorkerOutput::Forward`): a guest's stdout is dup2'd onto
+                    // this pipe, and a service wrapper keeps stderr in a file nothing rotates while
+                    // the miner runs, so a guest in a print loop (free, on the pre-claim EXECUTE
+                    // measurement path) would fill the operator's disk. By default only a count of
+                    // lines and bytes is logged, at most once a minute (`OutputTally`); the dashboard
+                    // logs not even that. Either way the pipe is drained (every byte is read), so
+                    // the worker never blocks on a full pipe.
+                    //
+                    // When forwarding, a flood cap still applies: token-bucket it, a burst, then a
+                    // steady trickle, with the excess folded into one periodic "(N dropped)" summary
+                    // so a genuine late diagnostic still gets through while a flood cannot. Per
+                    // drainer thread = per worker lifetime; a respawn resets it.
                     const BUCKET_CAP: u32 = 2048; // lines forwardable back-to-back
                     const REFILL_PER_SEC: u32 = 32; // steady trickle once the burst is spent
                     let mut tokens: u32 = BUCKET_CAP;
@@ -1194,6 +1299,9 @@ impl WorkerHandle {
                         if raw.is_empty() {
                             return;
                         }
+                        // Kept even when not forwarded, for a failed proof to report (sanitized
+                        // when read).
+                        remember_output(&recent_for_drain, raw);
                         // Sanitize (strip control/escape bytes, cap length) before it can reach the
                         // operator's console or log file.
                         let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
@@ -1207,13 +1315,7 @@ impl WorkerHandle {
                             *last_stderr_w.lock().unwrap_or_else(|e| e.into_inner()) =
                                 Some(line.clone());
                         }
-                        // TUI mode suppresses forwarding to BOTH sinks: the eprintln would corrupt the
-                        // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
-                        // tracing::warn would flood the rolling log file. The pipe is still drained (we
-                        // read every byte), so the worker never blocks on a full pipe regardless.
-                        // Kept even when not forwarded, for a failed proof to report.
-                        remember_output(&recent_for_drain, &line);
-                        if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
+                        if worker_output() != WorkerOutput::Forward {
                             return;
                         }
                         // Refill the bucket for the time since the last forward, then spend one token.
@@ -1244,31 +1346,51 @@ impl WorkerHandle {
                         }
                         tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
                     };
+                    let mut tally = OutputTally::new(Instant::now());
+                    let mut read_total: u64 = 0;
                     loop {
+                        let mut line_ended = false;
                         match reader.read(&mut byte) {
-                            Ok(0) => {
+                            Ok(0) | Err(_) => {
+                                tally.add(u64::from(!buf.is_empty()), 0);
                                 emit(&buf);
                                 break;
                             }
                             Ok(_) => {
+                                tally.add(0, 1);
+                                read_total = read_total.wrapping_add(1);
                                 if byte[0] == b'\n' {
+                                    tally.add(u64::from(!buf.is_empty()), 0);
                                     emit(&buf);
                                     buf.clear();
                                     discarding = false;
+                                    line_ended = true;
                                 } else if !discarding {
                                     buf.push(byte[0]);
                                     if buf.len() >= MAX_LINE_BYTES {
                                         // Line too long: emit what we have, then skip to the newline.
+                                        tally.add(1, 0);
                                         emit(&buf);
                                         buf.clear();
                                         discarding = true;
+                                        line_ended = true;
                                     }
                                 }
                             }
-                            Err(_) => {
-                                emit(&buf);
-                                break;
+                        }
+                        // Looked at on each line's end, and every 64 KiB of one that never ends.
+                        if line_ended || read_total.is_multiple_of(65_536) {
+                            if let Some(counts) = tally.due(Instant::now()) {
+                                if worker_output() == WorkerOutput::Tally {
+                                    report_output_tally(&backend_name, drain_pid, counts);
+                                }
                             }
+                        }
+                    }
+                    // What it printed since the last report, once, at its end.
+                    if let Some(counts) = tally.take() {
+                        if worker_output() == WorkerOutput::Tally {
+                            report_output_tally(&backend_name, drain_pid, counts);
                         }
                     }
                 })
@@ -1388,7 +1510,7 @@ impl WorkerHandle {
             may_lack_network: false,
         };
 
-        // Perform Hello handshake
+        // Perform Hello handshake.
         #[cfg(windows)]
         if handle.child.is_low_integrity() {
             // A worker that does not answer at Low integrity (a library that will not load there,
@@ -1408,6 +1530,9 @@ impl WorkerHandle {
             }
             return Ok(handle);
         }
+        // A worker that fails it (died at exec, a missing dylib, a crash before the handshake) has
+        // usually said why on stderr: carry its last line in the error, or the operator sees only
+        // "process died (EOF)" (W10-BFIX).
         if let Err(e) = handle.handshake() {
             let quoted = format!("{e:#}").contains(LAST_OUTPUT); // a `WorkerDied` already has it
             return Err(match handle.last_stderr_line(STDERR_DRAIN_WAIT) {
@@ -1869,12 +1994,7 @@ impl WorkerHandle {
 
     /// The worker's last lines of output, oldest first (at most `RECENT_OUTPUT_LINES`).
     pub fn recent_output(&self) -> Vec<String> {
-        self.recent_output
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .cloned()
-            .collect()
+        recent_lines(&self.recent_output)
     }
 
     /// How a worker whose output pipe closed ended, and what it said last, in one line for a failed
@@ -2511,6 +2631,68 @@ mod exit_classification_tests {
 }
 
 // Unix-only, as the `/proc` helpers it tests are.
+/// Review 7 LD-2: what a worker prints is counted, not shown, by default.
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    /// The tally reports lines and bytes once a minute has passed, then starts again from zero; a
+    /// minute with no output reports nothing; what is left is reported at the end.
+    #[test]
+    fn the_output_tally_counts_lines_and_bytes_per_minute() {
+        let t0 = Instant::now();
+        let mut tally = OutputTally::new(t0);
+        tally.add(1, 10);
+        tally.add(2, 5);
+        assert_eq!(tally.due(t0 + Duration::from_secs(59)), None);
+        assert_eq!(tally.due(t0 + Duration::from_secs(60)), Some((3, 15)));
+        // Reset: the next minute starts from zero, and an empty one says nothing.
+        assert_eq!(tally.due(t0 + Duration::from_secs(121)), None);
+        tally.add(1, 7);
+        assert_eq!(tally.due(t0 + Duration::from_secs(150)), None);
+        assert_eq!(tally.take(), Some((1, 7)));
+        assert_eq!(tally.take(), None);
+    }
+
+    /// The default is the tally; the mode is read back as set.
+    #[test]
+    fn worker_output_is_not_forwarded_by_default() {
+        assert_eq!(worker_output(), WorkerOutput::Tally);
+        for mode in [
+            WorkerOutput::Suppress,
+            WorkerOutput::Forward,
+            WorkerOutput::Tally,
+        ] {
+            set_worker_output(mode);
+            assert_eq!(worker_output(), mode);
+        }
+    }
+
+    /// The last lines are kept raw and capped, and sanitized and capped again when read: a death
+    /// note never carries a control character or more than its cap.
+    #[test]
+    fn recent_output_is_capped_and_sanitized_when_read() {
+        let recent = RecentOutput::default();
+        for i in 0..20 {
+            remember_output(&recent, format!("line {i}\u{1b}[31m").as_bytes());
+        }
+        remember_output(&recent, &[b'x'; 100_000]);
+        remember_output(&recent, b"\x07\x1b");
+        assert!(recent
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|raw| raw.len() <= RECENT_OUTPUT_LINE_BYTES));
+        let lines = recent_lines(&recent);
+        // 12 kept, the control-only one left out when read.
+        assert_eq!(lines.len(), RECENT_OUTPUT_LINES - 1, "{lines:?}");
+        assert_eq!(lines[0], "line 10[31m");
+        assert!(lines
+            .iter()
+            .all(|l| l.chars().count() <= RECENT_OUTPUT_LINE_CHARS && !l.contains('\u{1b}')));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     #[test]
