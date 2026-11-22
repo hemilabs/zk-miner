@@ -289,7 +289,10 @@ pub fn inspect(
     }
     // Each snapshot's volume serial, read once: a snapshot is a block copy of its volume, serial
     // included.
-    let serials: Vec<Option<u32>> = devices
+    // A snapshot device that no longer answers (deleted, or its storage gone while the name
+    // lingers) holds no copy anyone can open, a Low worker included: it is skipped rather than
+    // called unchecked.
+    let serials: Vec<io::Result<u32>> = devices
         .iter()
         .map(|device| volume_serial(Path::new(&format!(r"\\?\GLOBALROOT\Device\{device}\"))))
         .collect();
@@ -306,10 +309,13 @@ pub fn inspect(
                 .push(format!("{}: its volume could not be told", live.display()));
             continue;
         };
-        let serial = volume_serial(&mount);
+        let serial = volume_serial(&mount).ok();
         for (device, snapshot_serial) in devices.iter().zip(&serials) {
+            if snapshot_serial.as_ref().is_err_and(device_gone) {
+                continue;
+            }
             // Another volume's snapshot (when both serials are known).
-            if matches!((serial, snapshot_serial), (Some(a), Some(b)) if a != *b) {
+            if matches!((serial, snapshot_serial), (Some(a), Ok(b)) if a != *b) {
                 continue;
             }
             let Some(copy) = snapshot_path(device, &mount, live) else {
@@ -720,8 +726,25 @@ fn mount_point(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Whether `e`, from opening a snapshot device's root, says the device is not there at all.
+fn device_gone(e: &io::Error) -> bool {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+    const ERROR_DEV_NOT_EXIST: i32 = 55;
+    const ERROR_NO_SUCH_DEVICE: i32 = 433;
+    matches!(
+        e.raw_os_error(),
+        Some(
+            ERROR_FILE_NOT_FOUND
+                | ERROR_PATH_NOT_FOUND
+                | ERROR_DEV_NOT_EXIST
+                | ERROR_NO_SUCH_DEVICE
+        )
+    )
+}
+
 /// The serial number of the volume whose root is `root`.
-fn volume_serial(root: &Path) -> Option<u32> {
+fn volume_serial(root: &Path) -> io::Result<u32> {
     let mut root = root.as_os_str().to_os_string();
     if !root.to_string_lossy().ends_with('\\') {
         root.push("\\");
@@ -741,7 +764,10 @@ fn volume_serial(root: &Path) -> Option<u32> {
             0,
         )
     };
-    (ok != 0).then_some(serial)
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(serial)
 }
 
 /// `path`'s parts: the drive (`C:`) and each name; `None` for a path that is not on a drive or
@@ -921,6 +947,17 @@ fn parse_directory_buffer(buffer: &[u8]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_device_that_is_gone_is_skipped_not_unchecked() {
+        for code in [2, 3, 55, 433] {
+            assert!(device_gone(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+        // Access denied or a busy device is not "gone": that stays unchecked.
+        for code in [5, 21, 32] {
+            assert!(!device_gone(&io::Error::from_raw_os_error(code)), "{code}");
+        }
+    }
 
     #[test]
     fn a_path_maps_into_the_snapshot_of_its_volume() {
