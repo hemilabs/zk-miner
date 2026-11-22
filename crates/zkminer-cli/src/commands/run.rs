@@ -141,6 +141,27 @@ const GPU_MEMORY_BACKOFF_SECS: u64 = 5;
 /// be able to hold a claim until its deadline.
 const MAX_GPU_MEMORY_WAITS: u32 = 24;
 
+/// How many times one job's proof may be retried free after the outage recycle stopped its worker
+/// (`WorkerRecycled`). A recycle is not the job's failure, but a guest that holds the network on
+/// purpose is stopped this way each time it runs: past this, each such stop costs an attempt, so
+/// the job still ends.
+const MAX_RECYCLED_RETRIES: u32 = 2;
+
+/// Whether a failed proof attempt is retried free because the outage recycle stopped its worker
+/// (`chain_watch`, `WorkerPool::stop_slots`): no attempt counted, no card excluded, nothing marked
+/// against the program or submitter. Up to [`MAX_RECYCLED_RETRIES`] per job (`recycled_retries`,
+/// counted here); after that it is an ordinary worker death. Typed: no text can produce it.
+fn free_retry_after_recycle(e: &anyhow::Error, recycled_retries: &mut u32) -> bool {
+    if e.downcast_ref::<zkminer_prover::dispatcher::WorkerRecycled>()
+        .is_none()
+        || *recycled_retries >= MAX_RECYCLED_RETRIES
+    {
+        return false;
+    }
+    *recycled_retries += 1;
+    true
+}
+
 /// How long a claimed risc0 job waits between looks for a card that can prove it, when none enabled
 /// here has a job size. Unbounded in count: the job's deadline budget ends the wait in time to release.
 const NO_RISC0_CARD_WAIT: Duration = Duration::from_secs(60);
@@ -4783,8 +4804,7 @@ pub async fn run(
         .await;
     });
     // Chain-loss pages and the outage worker recycle; nothing to watch in a watch-only run.
-    let watch_handle = (!watch_only())
-        .then(|| chain_watch::spawn(state.clone(), journal.clone(), client.rpc_meter()));
+    let watch_handle = (!watch_only()).then(|| chain_watch::spawn(state.clone(), journal.clone()));
 
     // Escalating shutdown. Each signal advances one stage:
     //   1st -> DRAIN   : stop claiming, let in-flight proofs FINISH and fulfil.
@@ -13412,6 +13432,8 @@ async fn process_job_lifecycle(
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
+        // Free retries after the outage recycle stopped the worker (`free_retry_after_recycle`).
+        let mut recycled_retries = 0u32;
         // Set once a proof of this job has started on a worker (its `Started` event), by any
         // attempt: a deadline refusal after that is not one the guest had no part in.
         let proof_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -14199,6 +14221,28 @@ async fn process_job_lifecycle(
                             "proving stopped for {}: the miner is shutting its workers down",
                             short_id(job_id)
                         ));
+                    }
+                    // The outage recycle stopped the worker for holding network sockets: like the
+                    // shutdown above, not the job's failure or the card's. Retried (the slot's worker
+                    // starts again) without counting the attempt, excluding the card or marking a
+                    // divergence; a few times per job at most, then it counts as a death.
+                    if free_retry_after_recycle(&e, &mut recycled_retries) {
+                        attempt = attempt.saturating_sub(1);
+                        tracing::warn!(
+                            "{}: {msg}; retrying, not counted as an attempt (recycled retry {}/{})",
+                            short_id(job_id),
+                            recycled_retries,
+                            MAX_RECYCLED_RETRIES,
+                        );
+                        end_attempt_display(state, job_id).await;
+                        state.write().await.set_job_note(
+                            job_id,
+                            zkminer_tui::state::JobNoteKind::Wait,
+                            "retrying: its worker was stopped by the chain-outage recycle"
+                                .to_string(),
+                        );
+                        wait_note_up = true;
+                        continue;
                     }
                     let worker_err =
                         e.downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>();
@@ -19696,6 +19740,44 @@ async fn release_and_clean_with_nonce(",
         assert!(job.contains("None => !died && is_invalid_proof(&msg),"));
         assert!(job.contains("None => !died && zkminer_prover_protocol::types::is_gpu_oom(&msg),"));
         assert!(job.contains(".downcast_ref::<zkminer_prover::worker::WorkerDied>()"));
+    }
+
+    /// A worker the outage recycle stopped (review r7 EC-2/VEC-1) is retried free: no attempt, no
+    /// card excluded, no divergence. Twice per job at most; then it is an ordinary death, so a guest
+    /// that holds the network on purpose each time it runs still ends its job.
+    #[test]
+    fn a_recycled_worker_is_retried_free_twice_then_counts() {
+        let recycled = || {
+            anyhow::Error::new(zkminer_prover::dispatcher::WorkerRecycled {
+                slot_key: "risc0:cuda:0".to_string(),
+            })
+        };
+        let mut n = 0;
+        assert!(free_retry_after_recycle(&recycled(), &mut n));
+        assert!(free_retry_after_recycle(&recycled(), &mut n));
+        assert!(!free_retry_after_recycle(&recycled(), &mut n));
+        assert_eq!(n, MAX_RECYCLED_RETRIES);
+        // An ordinary death, or one whose text says "recycle", is not it.
+        let mut n = 0;
+        let died = anyhow::Error::new(zkminer_prover::worker::WorkerDied {
+            backend: "risc0".to_string(),
+        })
+        .context("stopped by the outage recycle (it held network sockets)");
+        assert!(!free_retry_after_recycle(&died, &mut n));
+        assert_eq!(n, 0);
+        // In the loop: before the card is steered off or anything is marked, and it continues
+        // without counting the attempt.
+        let job = body(include_str!("run.rs"), "\nasync fn process_job_lifecycle(");
+        let arm = job
+            .find("if free_retry_after_recycle(&e, &mut recycled_retries) {")
+            .expect("the recycle arm is in the prove loop");
+        let steer = job.find("steer_after_failure(").unwrap();
+        assert!(arm < steer);
+        let arm_body = &job[arm..];
+        let arm_body = &arm_body[..arm_body.find("continue;").unwrap()];
+        assert!(arm_body.contains("attempt = attempt.saturating_sub(1);"));
+        assert!(!arm_body.contains("note_post_claim_divergence"));
+        assert!(!arm_body.contains("excluded"));
     }
 
     /// The same property for the GPU-memory class. This arm refunds its attempt AND excludes a slot,

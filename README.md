@@ -1000,8 +1000,15 @@ Worth knowing:
   neither proven nor given back until it returns. `PAGE: LOCK-AT-RISK <job>` follows for each lock
   whose cutoff comes inside its release margin meanwhile. The dashboard's link badge shows the age
   of the last chain read (`STALE`, then `DISCONNECTED` after 2 minutes). On Windows, where a Low
-  worker has the network, an outage of 10 minutes with locks held also stops every worker once
-  (`PAGE: WORKERS-RECYCLED`; they start again on demand) in case one of them is holding the link.
+  worker has the network, an outage of 10 minutes with locks held also checks the sockets each
+  worker holds (its job's processes included). Only a worker holding more than 8 TCP or 4 UDP
+  sockets after its first 2 minutes is stopped, busy or not: `PAGE: WORKERS-RECYCLED` names the
+  slot, its pids and its sockets. It starts again on demand, and a proof stopped this way is
+  retried without counting against its job or card (twice per job at most). When no worker holds
+  sockets, no proof is stopped (only idle workers), and `PAGE: CHAIN-UNREACHABLE` says the link
+  or the RPC is down. Checks repeat at least 30 minutes apart, the gap doubling with each recycle
+  in the last 24 hours up to 4 hours. `ZKMINER_RECYCLE_TCP_MAX`, `ZKMINER_RECYCLE_UDP_MAX` and
+  `ZKMINER_RECYCLE_GRACE_SECS` change the limits.
   `PAGE: ESTIMATE-OVERRUN <card>` says jobs claimed on that card's benchmark rate overran their
   cutoff (a release penalty each) after its learned rate had refused them: the card is proving
   slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
