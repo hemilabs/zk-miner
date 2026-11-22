@@ -1070,6 +1070,12 @@ fn held_locks_only() -> bool {
     HELD_LOCKS_ONLY.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// `zkminer run --forget-foreign-locks`: start although the job journal's locks belong to another
+/// address than this config's key (`JobJournal::key_changed_refusal`), accepting that they will be
+/// slashed unless that key drives them. Set once by `main`, before `run`.
+pub static FORGET_FOREIGN_LOCKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The options of `zkminer run --watch-only`.
 pub struct WatchOnly {
     /// The prover address to watch as; the configured key's address when `None`.
@@ -3727,19 +3733,21 @@ pub async fn run(
         for copy in
             zkminer_config::wallet_win::persisted_key_env_copies(&config.wallet.key_env_var)
         {
+            let steps = zkminer_config::wallet::key_env_move_steps(
+                &config.wallet.key_env_var,
+                &copy.location,
+            );
             if copy.machine_wide {
                 tracing::error!(
                     "PAGE: KEY-IN-MACHINE-ENVIRONMENT — {} holds the signing key's variable, \
                      which every user of this PC can read; move the key to a key file only the \
-                     miner's account can read (key_source = \"file\", README: Windows service), \
-                     delete that value, and consider the key exposed",
+                     miner's account can read: {steps}",
                     copy.location
                 );
             } else {
                 tracing::warn!(
                     "{} holds the signing key's variable, which every process of this user can \
-                     read, Low-integrity workers included; move the key to a key file \
-                     (key_source = \"file\") and delete that value",
+                     read, Low-integrity workers included; move the key to a key file: {steps}",
                     copy.location
                 );
             }
@@ -3865,6 +3873,31 @@ pub async fn run(
         }
         None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
     };
+    // Review 7 WR-1: a journal whose locks belong to another address (the key changed: a new key
+    // file, a config rewritten) is not taken over: recovery would drop each of those locks as
+    // "held by another prover", to be slashed. Refused unless the operator says so.
+    if !watch_only() {
+        if let Some(why) = loaded_journal.key_changed_refusal(client.address) {
+            let forget = FORGET_FOREIGN_LOCKS.load(std::sync::atomic::Ordering::SeqCst);
+            let msg = if forget {
+                format!(
+                    "PAGE: KEY-CHANGED — {why}. --forget-foreign-locks was given: starting, and \
+                     those locks are dropped as another prover's"
+                )
+            } else {
+                format!("PAGE: KEY-CHANGED — refusing to start: {why}")
+            };
+            tracing::error!("{msg}");
+            note_page(msg.clone());
+            if !forget {
+                anyhow::bail!("{msg}");
+            }
+            if let Some(previous) = loaded_journal.prover {
+                crate::journal::set_previous_owner(previous);
+            }
+        }
+        crate::journal::set_owner(client.address);
+    }
     // Before the first state read, which it watches; a watch-only run never writes it.
     slash_latch::init(client.chain_id, client.address, !watch_only());
 
@@ -18070,6 +18103,21 @@ async fn recover_claimed_jobs(
         }
         // Present but settled / held by another prover → drop the stale breadcrumb.
         Some(v) => {
+            // Held by the address this journal belonged to before a key change the operator
+            // accepted (`--forget-foreign-locks`): said, as it will be slashed.
+            if v.status == JOB_STATUS_LOCKED
+                && v.prover != alloy::primitives::Address::ZERO
+                && Some(v.prover) == crate::journal::previous_owner()
+            {
+                let msg = format!(
+                    "PAGE: KEY-CHANGED — {jid} is still locked by {}, this journal's previous \
+                     address; this miner signs as {} and drops it: it is slashed at its deadline \
+                     unless a miner with that key drives it",
+                    v.prover, client.address
+                );
+                tracing::error!("{msg}");
+                note_page(msg);
+            }
             settled.push(*jid);
             if let Some(end) = lock_end(journal, *jid, Some((v.status, v.prover)), client.address) {
                 ended.push((*jid, end));

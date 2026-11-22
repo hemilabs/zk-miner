@@ -182,36 +182,44 @@ fn secret_label_findings(unlabelled: &[(PathBuf, bool)]) -> Vec<(Level, String)>
         .collect()
 }
 
-/// Windows, an `env` key source: what to say of each copy of the key's variable kept in the
+/// Windows, an `env` key source: what to say of each copy of the key's variable `var` kept in the
 /// registry (`zkminer_config::wallet_win`), given as (where, readable by every user of this PC).
+/// Both fail: a machine-wide copy is readable by every user, and with a copy in the user's own
+/// environment no Low worker starts (`windows_sandbox::other_key_copies`). Each gives the steps
+/// that keep the key: import, check the address, then delete (`wallet::key_env_move_steps`).
 #[cfg(any(windows, test))]
-fn key_env_copy_findings(copies: &[(String, bool)]) -> Vec<(Level, String)> {
+fn key_env_copy_findings(var: &str, copies: &[(String, bool)]) -> Vec<(Level, String)> {
     copies
         .iter()
         .map(|(place, machine_wide)| {
-            if *machine_wide {
-                (
-                    Level::Fail,
-                    format!(
-                        "{place} holds the key's variable: every user of this PC can read it \
-                         there, and so can any process of theirs, Low-integrity ones included. \
-                         Move the key to a key file only the miner's account can read \
-                         (key_source = \"file\"; README: Windows service), then delete that value"
-                    ),
-                )
+            let steps = zkminer_config::wallet::key_env_move_steps(var, place);
+            let what = if *machine_wide {
+                "every user of this PC can read it there, and so can any process of theirs, \
+                 Low-integrity ones included"
             } else {
-                (
-                    Level::Warn,
-                    format!(
-                        "{place} holds the key's variable (setx or System Properties): every \
-                         process of this user can read it there, Low-integrity workers included. \
-                         Move the key to a key file (key_source = \"file\"), then delete that \
-                         value"
-                    ),
-                )
-            }
+                "every process of this user can read it there, Low-integrity workers included, so \
+                 no Low worker starts while it exists (PAGE: SECRETS-UNLABELLED)"
+            };
+            (
+                Level::Fail,
+                format!("{place} holds the key's variable: {what}. Move the key: {steps}"),
+            )
         })
         .collect()
+}
+
+/// A key file inside a folder a sync client uploads (review 7 HT-1): it has left this PC, and old
+/// versions stay in the service's history and recycle bin.
+fn cloud_key_file_finding(key_file: &str, folder: Option<String>) -> Option<String> {
+    folder.map(|folder| {
+        format!(
+            "the key file {key_file} is inside {folder}, which a sync client uploads: the key is \
+             in that cloud account and its version history, reachable from any device of whoever \
+             holds the account. Consider it exposed: rotate it (`zkminer init --generate-key` with \
+             a config outside that folder, then unstake, withdraw and move the funds from the old \
+             address), and delete the copy and its old versions from the service"
+        )
+    })
 }
 
 async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
@@ -225,8 +233,16 @@ async fn chain_checks(report: &mut Report, config: &ZkMinerConfig) {
                 .into_iter()
                 .map(|c| (c.location, c.machine_wide))
                 .collect();
-        for (level, finding) in key_env_copy_findings(&copies) {
+        for (level, finding) in key_env_copy_findings(&config.wallet.key_env_var, &copies) {
             report.say(level, "key", finding);
+        }
+    }
+    if config.wallet.key_source == "file" {
+        if let Some(key_file) = config.wallet.key_file_path.as_deref() {
+            let folder = zkminer_config::wallet::cloud_synced_folder(Path::new(key_file));
+            if let Some(finding) = cloud_key_file_finding(key_file, folder) {
+                report.say(Level::Fail, "key", finding);
+            }
         }
     }
     // Linux: the key's files that other users can read or change (review r6 LS1). Before the key
@@ -1586,19 +1602,23 @@ mod tests {
     }
 
     /// Windows, an `env` key: a copy in the machine's or a service's environment fails (every user
-    /// reads it), one in the user's own environment warns, and each names where it is and what to
-    /// do instead.
+    /// reads it), and so does one in the user's own environment (no Low worker starts beside it,
+    /// review 7 VWI-1); each names where it is and gives the steps that keep the key, import
+    /// before delete.
     #[test]
     fn doctor_flags_a_key_kept_in_a_readable_environment() {
-        assert!(key_env_copy_findings(&[]).is_empty());
-        let found = key_env_copy_findings(&[
-            (
-                r"HKLM\SYSTEM\CurrentControlSet\Services\zkminer\Parameters (AppEnvironmentExtra)"
-                    .into(),
-                true,
-            ),
-            (r"HKCU\Environment (ZKMINER_PRIVATE_KEY)".into(), false),
-        ]);
+        assert!(key_env_copy_findings("ZKMINER_PRIVATE_KEY", &[]).is_empty());
+        let found = key_env_copy_findings(
+            "ZKMINER_PRIVATE_KEY",
+            &[
+                (
+                    r"HKLM\SYSTEM\CurrentControlSet\Services\zkminer\Parameters (AppEnvironmentExtra)"
+                        .into(),
+                    true,
+                ),
+                (r"HKCU\Environment (ZKMINER_PRIVATE_KEY)".into(), false),
+            ],
+        );
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].0, Level::Fail);
         assert!(
@@ -1608,12 +1628,34 @@ mod tests {
             "{}",
             found[0].1
         );
-        assert_eq!(found[1].0, Level::Warn);
+        assert_eq!(found[1].0, Level::Fail);
         assert!(
-            found[1].1.contains(r"HKCU\Environment") && found[1].1.contains("Low-integrity"),
+            found[1].1.contains(r"HKCU\Environment")
+                && found[1].1.contains("Low-integrity")
+                && found[1]
+                    .1
+                    .contains("SetEnvironmentVariable('ZKMINER_PRIVATE_KEY', $null, 'User')"),
             "{}",
             found[1].1
         );
+        for (_, text) in &found {
+            let import = text.find("--import-env-key").expect("names the import");
+            let delete = text.find("only then delete").expect("names the delete");
+            assert!(import < delete, "{text}");
+            assert!(!text.contains("--generate-key"), "{text}");
+        }
+    }
+
+    /// HT-1: a key file in a cloud-synced folder fails, naming the folder; elsewhere nothing.
+    #[test]
+    fn doctor_fails_a_key_file_in_a_cloud_synced_folder() {
+        assert!(cloud_key_file_finding("/k", None).is_none());
+        let f = cloud_key_file_finding(
+            r"C:\Users\me\OneDrive\key",
+            Some(r"OneDrive (C:\Users\me\OneDrive)".into()),
+        )
+        .unwrap();
+        assert!(f.contains("OneDrive (") && f.contains("exposed"), "{f}");
     }
 
     /// Windows: a service account fails (refused, or run paged with the override), an elevated

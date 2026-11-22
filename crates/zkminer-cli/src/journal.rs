@@ -162,6 +162,35 @@ pub struct JobJournal {
     /// build ignores it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub crash_looped: BTreeMap<B256, CrashLoopMark>,
+    /// The address whose locks these are: the signer of the miner that last saved it
+    /// ([`set_owner`]). `None` in a journal written before it was recorded (stamped at its next
+    /// save). A miner started with another key refuses to take the journal over while it holds
+    /// entries ([`JobJournal::key_changed_refusal`]). An older build ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prover: Option<Address>,
+}
+
+/// The signer of this process's miner, stamped into every journal it saves ([`JobJournal::prover`]).
+static OWNER: std::sync::OnceLock<Address> = std::sync::OnceLock::new();
+
+/// The address this journal's locks belonged to before a key change the operator accepted
+/// (`run --forget-foreign-locks`): recovery pages each lock still held by it.
+static PREVIOUS_OWNER: std::sync::OnceLock<Address> = std::sync::OnceLock::new();
+
+/// Record `address` as the owner of every journal this process saves from now on (once per
+/// process: a later call is ignored).
+pub fn set_owner(address: Address) {
+    let _ = OWNER.set(address);
+}
+
+/// Record that the journal's locks belonged to `address` before a key change that was accepted.
+pub fn set_previous_owner(address: Address) {
+    let _ = PREVIOUS_OWNER.set(address);
+}
+
+/// See [`set_previous_owner`].
+pub fn previous_owner() -> Option<Address> {
+    PREVIOUS_OWNER.get().copied()
 }
 
 /// A job released as a crash loop ([`JobJournal::crash_looped`]).
@@ -189,6 +218,7 @@ impl Default for JobJournal {
             entries: HashMap::new(),
             unparsed: BTreeMap::new(),
             crash_looped: BTreeMap::new(),
+            prover: None,
         }
     }
 }
@@ -290,6 +320,10 @@ fn parse_journal(content: &str) -> std::result::Result<(JobJournal, Vec<String>)
             }
         }
     }
+    // An owner that does not parse is as none: the journal is stamped again at its next save.
+    j.prover = obj
+        .get("prover")
+        .and_then(|p| serde_json::from_value::<Address>(p.clone()).ok());
     let unparsed = j.unparsed.keys().cloned().collect();
     Ok((j, unparsed))
 }
@@ -420,6 +454,24 @@ impl JobJournal {
             .clone()
     }
 
+    /// Review 7 WR-1: why a miner signing as `signer` must not take this journal over: it holds
+    /// entries (parsed or not), and they belong to another address. Its recovery would see each of
+    /// those locks held by "another prover" and drop it, leaving it to be slashed. `None` for an
+    /// empty journal, one of `signer`'s, or one written before the owner was recorded.
+    pub fn key_changed_refusal(&self, signer: Address) -> Option<String> {
+        let owner = self.prover.filter(|&p| p != signer)?;
+        let held = self.entries.len() + self.unparsed.len();
+        if held == 0 {
+            return None;
+        }
+        Some(format!(
+            "the job journal holds {held} job(s) claimed by {owner:?}, but this config signs as \
+             {signer:?}: the key changed. Start with the key of {owner:?} to drive them (put its \
+             key file back, or `zkminer init --import-env-key`), or, to give them up and accept \
+             they will be slashed, `zkminer run --forget-foreign-locks`"
+        ))
+    }
+
     /// Job ids of the entries that did not parse but whose key is a job id: an authoritative read
     /// of each can show it terminal ([`Self::drop_unparsed`]).
     pub fn unparsed_job_ids(&self) -> Vec<B256> {
@@ -434,14 +486,24 @@ impl JobJournal {
         before - self.unparsed.len()
     }
 
+    /// This journal as it is written: in this build's format, owned by `owner` when known (else
+    /// by whoever it was read as owned by).
+    fn stamped(&self, owner: Option<Address>) -> Self {
+        let mut out = self.clone();
+        out.format_version = JOURNAL_FORMAT_VERSION;
+        if owner.is_some() {
+            out.prover = owner;
+        }
+        out
+    }
+
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create journal dir {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        let mut out = self.clone();
-        out.format_version = JOURNAL_FORMAT_VERSION;
+        let out = self.stamped(OWNER.get().copied());
         let content = serde_json::to_string_pretty(&out).context("Failed to serialize journal")?;
         // Windows, with Low-integrity workers: unreadable to them from its creation.
         #[cfg(windows)]
@@ -1104,5 +1166,50 @@ mod tests {
         // A breadcrumb written before cycles were recorded loads with none.
         let old: JournalEntry = serde_json::from_str(r#"{"job_id":"0x0505050505050505050505050505050505050505050505050505050505050505","claimed_at":1,"lock_deadline":9,"state":"Claimed"}"#).unwrap();
         assert_eq!(old.measured_cycles, None);
+    }
+
+    /// Review 7 WR-1: the journal records whose locks it holds. A miner with another key refuses
+    /// to take over one with entries; an empty one, its own, or one written before the owner was
+    /// recorded (then stamped at its next save) is taken over.
+    #[test]
+    fn a_journal_of_another_address_is_not_taken_over() {
+        let a: Address = "0x00000000000000000000000000000000000000aa".parse().unwrap();
+        let b: Address = "0x00000000000000000000000000000000000000bb".parse().unwrap();
+        let mut j = JobJournal::default();
+        j.record_claim_intent(B256::repeat_byte(1), 1, None);
+        // Written before the owner was recorded: accepted, and stamped with the new owner.
+        assert_eq!(j.prover, None);
+        assert_eq!(j.key_changed_refusal(b), None);
+        assert_eq!(j.stamped(Some(b)).prover, Some(b));
+        assert_eq!(j.stamped(None).prover, None);
+        // Owned by `a`: round-trips through the file, and `b` is refused.
+        j.prover = Some(a);
+        let path = tmp_path("owner");
+        j.save_to(&path).unwrap();
+        let loaded = JobJournal::load_checked_from(&path).unwrap();
+        assert_eq!(loaded.prover, Some(a));
+        let why = loaded.key_changed_refusal(b).expect("another key is refused");
+        assert!(
+            why.contains(&format!("{a:?}"))
+                && why.contains(&format!("{b:?}"))
+                && why.contains("--forget-foreign-locks"),
+            "{why}"
+        );
+        assert_eq!(loaded.key_changed_refusal(a), None);
+        // Empty: nothing to lose.
+        let mut empty = loaded.clone();
+        empty.entries.clear();
+        assert_eq!(empty.key_changed_refusal(b), None);
+        // An entry that did not parse counts.
+        empty.unparsed.insert("x".into(), serde_json::Value::Null);
+        assert!(empty.key_changed_refusal(b).is_some());
+        // An old journal without the field, or an owner that does not parse, loads as unowned.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replace(&format!("{a:?}"), "not-an-address");
+        std::fs::write(&path, text).unwrap();
+        let loaded = JobJournal::load_checked_from(&path).unwrap();
+        assert_eq!(loaded.prover, None);
+        assert_eq!(loaded.entries.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }
