@@ -214,8 +214,11 @@ Check that a file is clear with `xattr -l <file>`: no `com.apple.quarantine` lin
 ## Uninstall
 
 `./install.sh --uninstall` removes the CLI, the prover and any archives it installed. Your config,
-keys, the Groth16 component (`~/.risc0`) and the compiled-pipeline cache
-(`~/Library/Caches/com.risczero.RISC-Zero.risc0`) stay. Delete those by hand if you want them gone.
+keys, the Groth16 component (`~/.risc0`), the compiled-pipeline cache
+(`~/Library/Caches/com.risczero.RISC-Zero.risc0`) and the prover's segment folder
+(`~/.zkminer/risc0-segments`) stay. The segment folder holds temporary proof files while a proof
+runs; it is normally empty, but a prover that was killed can leave files there. Delete any of these
+by hand if you want them gone (the segment folder only while the miner is not running).
 
 ## Files
 

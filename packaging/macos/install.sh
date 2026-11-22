@@ -14,8 +14,8 @@
 #   --warm           afterwards prove one small program with the worker (builds its GPU pipelines;
 #                    needs the risc0-groth16 component, so it implies --with-groth16)
 #   --force          install on a Mac the worker will refuse (less than 12 GiB of RAM)
-#   --uninstall      remove what this script installs (not ~/.zkminer/config.toml, keys, caches or
-#                    the risc0-groth16 component)
+#   --uninstall      remove what this script installs (not ~/.zkminer/config.toml, keys, caches,
+#                    ~/.zkminer/risc0-segments or the risc0-groth16 component)
 #
 # What it installs:
 #   <prefix>/zkminer                              the CLI
@@ -58,7 +58,8 @@ if [ $uninstall = 1 ]; then
     [ -e "$f" ] && rm -rf "$f" && say "removed $f"
   done
   say "Left in place: ~/.zkminer/config.toml and keys, ~/.risc0 (the risc0-groth16 component, 5.8 GB),"
-  say "~/Library/Caches/com.risczero.RISC-Zero.risc0 (compiled GPU pipelines). Remove them by hand if wanted."
+  say "~/Library/Caches/com.risczero.RISC-Zero.risc0 (compiled GPU pipelines) and ~/.zkminer/risc0-segments"
+  say "(temporary proof files; normally empty). Remove them by hand if wanted (the segments only while the miner is stopped)."
   exit 0
 fi
 
