@@ -546,11 +546,16 @@ escape its executor:
   Medium worker or the miner later runs. With the network it can also cut the miner off its RPC
   without ending it (the host's ephemeral ports held open, or the uplink flooded), so nothing
   crashes and every held lock runs to a slash. The miner pages that (`PAGE: CHAIN-UNREACHABLE`),
-  and once no chain read has succeeded for 10 minutes with locks held and workers running it stops
-  every worker (`PAGE: WORKERS-RECYCLED`; each starts again when next needed), once per outage and
-  at least 30 minutes apart, the gap doubling up to 4 hours while recycles do not bring the chain
-  back. That ends a worker's hold on the network; it does not stop the same job's guest escaping
-  again when it is proven again.
+  and once no chain read has succeeded for 10 minutes with locks held and workers running it counts
+  the sockets each worker's processes hold (its job's, so a child is counted too). A worker past
+  the limits (more than 8 TCP or 4 UDP after its first 2 minutes; an honest one holds none while it
+  proves) is stopped, busy or not (`PAGE: WORKERS-RECYCLED`, with its slot, pids and sockets), and
+  its proof is retried without counting an attempt, twice per job at most. With no worker past
+  them, no proof is stopped. A stop of a suspect waits 30 minutes after the last; otherwise the gap
+  doubles with each recycle in the last 24 hours, up to 4 hours. Rate limits do not hold it back.
+  That ends a worker's hold on the network; it does not stop the same job's guest escaping again
+  when it is proven again, and a guest that floods the link through a socket or two stays under
+  the limits.
 
 Each GPU runtime must work at Low: a worker that fails there is paged with its binary's name and
 its last output (`PAGE: LOW-IL-WORKER-FAILED`, `PAGE: LOW-IL-WARMUP-FAILED`) and never falls back
