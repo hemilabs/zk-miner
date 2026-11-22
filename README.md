@@ -897,6 +897,22 @@ Worth knowing:
   Medium, where a guest that breaks out can read the key: it is paged at every start (`PAGE:
   MEDIUM-WORKERS`) and `zkminer doctor` warns.
 
+  Restore points (Volume Shadow Copies, made by System Protection and some backup tools) keep
+  old copies of files with the label each had when the snapshot was taken, and a Low-integrity
+  worker can read an unlabelled copy through the snapshot: the key file as it was between `zkminer
+  init` and the first run, an old `.env`, a PowerShell history from before the miner labelled it,
+  or `NTUSER.DAT` from while a `setx` copy of the key's variable existed. At start (and in
+  `zkminer doctor`) the miner looks at the snapshots of those files' drive: an unlabelled copy of
+  the key file, or an unlabelled `.env` or history copy, or a snapshot hive's `Environment`, that
+  names the key's variable (it looks for the name only) keeps the workers from starting (`PAGE:
+  SECRETS-IN-SNAPSHOT`); a copy it cannot check is only paged (`PAGE: SNAPSHOT-UNCHECKED`) and
+  warned of. To remove them, as an administrator: `vssadmin list shadows` shows each snapshot's
+  id and its "Shadow Copy Volume" (the `HarddiskVolumeShadowCopy<N>` device the page names), and
+  `vssadmin delete shadows /shadow={id}` deletes one (or System Protection > Configure > Delete,
+  which deletes every restore point of the drive). Those restore points are then gone. A key that
+  was ever kept in a snapshot without a label should be treated as exposed: rotate it (unstake,
+  withdraw, and move the HEMI to a new key).
+
   Moving from LocalSystem: a miner started in the new account's home does not see the old
   journal (`C:\Windows\System32\config\systemprofile\.zkminer\job_journal.json`), so locks still
   held there are never driven. Drain them first, from an administrator console:
