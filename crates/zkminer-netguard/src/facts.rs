@@ -3568,13 +3568,21 @@ mod tests {
     /// at once, never make the count of abandoned calls wrap below zero (round 2 counted a call
     /// after marking it abandoned, so its thread could uncount it first), and never refuse a call
     /// while fewer than the cap are outstanding.
+    ///
+    /// A caller moves on as soon as its call times out, while the abandoned call's thread may still
+    /// be sleeping, so one caller can leave several abandoned calls behind: under load (a busy
+    /// machine stretches each 300 µs sleep) the count legitimately passes the number of callers.
+    /// It cannot pass the cap by more than the callers that checked it at once, and a refusal is
+    /// only right once the cap was reached.
     #[cfg(target_os = "macos")]
     #[test]
     fn abandoned_calls_are_counted_before_they_can_return() {
         use super::macos_dns::Bounded;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
-        static B: Bounded = Bounded::new("the test daemon", 64);
+        const CAP: usize = 64;
+        const CALLERS: usize = 16;
+        static B: Bounded = Bounded::new("the test daemon", CAP);
         static STOP: AtomicBool = AtomicBool::new(false);
         static HIGHEST: AtomicUsize = AtomicUsize::new(0);
         static REFUSED: AtomicUsize = AtomicUsize::new(0);
@@ -3583,7 +3591,7 @@ mod tests {
                 HIGHEST.fetch_max(B.abandoned_now(), Ordering::Relaxed);
             }
         });
-        let racers: Vec<_> = (0..16)
+        let racers: Vec<_> = (0..CALLERS)
             .map(|_| {
                 std::thread::spawn(|| {
                     let mut timed_out = 0usize;
@@ -3614,10 +3622,14 @@ mod tests {
             REFUSED.load(Ordering::Relaxed)
         );
         assert!(timed_out > 100, "the race was not run: {timed_out}");
-        // Sixteen callers can have at most sixteen calls abandoned at once (plus one counted while
-        // it returns); a wrapped count is near usize::MAX.
-        assert!(highest <= 32, "the count wrapped: {highest}");
-        assert_eq!(REFUSED.load(Ordering::Relaxed), 0);
+        // The cap is checked before a call is counted, so callers that checked it at the same
+        // moment can each add one past it; a wrapped count is near usize::MAX.
+        assert!(highest <= CAP + CALLERS, "the count wrapped: {highest}");
+        // Refused only once the cap was reached (with fewer outstanding, a refusal means the count
+        // went wrong).
+        if highest < CAP {
+            assert_eq!(REFUSED.load(Ordering::Relaxed), 0, "refused below the cap");
+        }
     }
 
     /// Review round 3, bypass-1 (every platform since the Linux application): the facts of a host with IPv6 and no IPv4 route that has
