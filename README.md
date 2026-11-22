@@ -803,8 +803,12 @@ Worth knowing:
   them, starting no worker, pages `PRIVILEGED-ACCOUNT` every 5 minutes, and releases each one only
   as its cutoff comes near (the release penalty is the job's flat one, 5% by default, the same as
   at once), so stopping it and starting the miner as the right account in the meantime still
-  proves them. `zkminer stop` stops it keeping what is left, `zkminer stop --abandon` releases
-  everything now, and `zkminer run --release-held` releases everything at once from the start.
+  proves them. While it holds locks it keeps the PC awake, as the miner does (`PAGE:
+  SLEPT-WHILE-HOLDING` if it did not run for minutes anyway), and it keeps the slash latch (below)
+  current. `zkminer stop --keep-locks` stops it keeping what is left, `zkminer stop` (a drain)
+  lets it go on releasing each lock near its cutoff and exit once none is left, `zkminer stop
+  --abandon` releases everything now, and `zkminer run --release-held` releases everything at once
+  from the start.
   From an administrator PowerShell:
 
   ```
@@ -929,7 +933,9 @@ Worth knowing:
   1. `nssm set zkminer AppExit 0 Exit` and `nssm set zkminer AppExit 130 Exit`, so that the
      miner's stop stops the service instead of restarting it.
   2. `psexec -s "C:\Program Files\zkminer\zkminer.exe" stop --wait`: it proves what it holds,
-     or releases it, and exits; the service stays stopped.
+     or releases it, and exits; the service stays stopped. (A service already running this build
+     as LocalSystem is refused and proves nothing: its drain releases each lock near its cutoff
+     and exits once none is left; see the next paragraph.)
   3. Check that the old journal holds nothing: `psexec -s "C:\Program Files\zkminer\zkminer.exe"
      status` says "Held locks: none". If some are left (a release that did not confirm), start
      the service again and repeat step 2, or end them with `stop --abandon --wait`.
@@ -982,7 +988,8 @@ Worth knowing:
   cut to their host in both (an RPC URL's key never reaches a file). On Windows each page also
   goes to the Application event log, source `zkminer`, at most once per code every 5 minutes,
   with a fixed event id per code (`SLASHED` 100, `LOCK-LATE` 101, `JOB-CRASH-LOOP` 106,
-  `SECRETS-UNLABELLED` 110, `PRIVILEGED-ACCOUNT` 111, `PASSWORD-EXPIRES` 117, others 199; see
+  `SECRETS-UNLABELLED` 110, `PRIVILEGED-ACCOUNT` 111, `PASSWORD-EXPIRES` 117, `STAKE-DROP` 140,
+  `SLEPT-WHILE-HOLDING` 141, others 199; see
   `crates/zkminer-cli/src/logging.rs`): a Task Scheduler task "On an event" (log Application,
   source zkminer) or a monitoring agent can alert on them. `zkminer status` prints the last ten
   pages and exits 2 while one is unacknowledged or locks are held with no miner running to drive
@@ -1014,9 +1021,15 @@ Worth knowing:
   slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
   for it are sized on the learned rate; re-run `zkminer benchmark` once the cause is fixed.
 - **After a slash the miner stops claiming until you say so.** `PAGE: SLASHED` says a lock of
-  this prover was slashed (the on-chain `jobsSlashed` rose, a lock ended past its deadline, or the
-  miner slashed its own expired lock); `PAGE: STAKE-DROP` says the stake fell by more than a
-  withdrawal and the miner's own release penalties explain. Either trips the slash latch,
+  this prover was slashed (the on-chain `jobsSlashed` rose, the staking contract's `StakeReduced`
+  event marked a reduction as a slash, a lock ended past its deadline with no release of ours on
+  chain, or the miner slashed its own expired lock); a release of ours that landed after the
+  cutoff is not read as a slash when the router's `JobReleased` says it was one. `PAGE:
+  STAKE-DROP` says the stake fell by more than the chain's own events explain (`StakeReduced` for
+  release penalties, `Withdrawn` for withdrawals). A fall is checked against those events on the
+  next refresh; meanwhile new claims wait (no page, it clears itself), and if the events cannot
+  be read for 10 minutes, the release penalties the miner noted itself decide. Either trips the
+  slash latch,
   `~/.zkminer/slash_latch.json`: no new claims, across restarts, until `zkminer resume-claims`
   (it prints what tripped it, then clears it; `--yes` skips the prompt). Locks already held are
   still fulfilled or released. The page repeats every 30 minutes while it holds; `zkminer status`

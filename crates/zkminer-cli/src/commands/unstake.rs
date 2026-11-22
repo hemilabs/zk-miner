@@ -39,6 +39,25 @@ async fn connect(config_path: Option<&Path>) -> Result<ChainClient> {
     Ok(client)
 }
 
+/// The stake after this command's own confirmed transaction(s), and the slash latch's baseline moved
+/// to it from `before` (review 7 LD-1: a stake or unstake made while the miner is stopped is not an
+/// unexplained fall at its next start). The head is read first, so the latch's next event range
+/// starts after the transaction.
+async fn state_after_own_tx(client: &ChainClient, before: &ExitState) -> Result<ExitState> {
+    let block = client.get_block_number().await.ok();
+    let after = client.get_exit_state(client.address).await;
+    if let Ok(a) = &after {
+        super::run::slash_latch::rebaseline_after_own_tx(
+            client.chain_id,
+            client.address,
+            (before.total_staked, before.pending_unstake),
+            (a.total_staked, a.pending_unstake),
+            block,
+        );
+    }
+    after
+}
+
 /// A wei amount in HEMI, exact: at least 3 decimals, more only when the amount has them (so an
 /// `--all` of 12.3456 HEMI is shown as that, not rounded up to 12.346).
 pub(crate) fn fmt_hemi_exact(wei: u128) -> String {
@@ -217,7 +236,7 @@ pub async fn run_unstake(
 
     let hash = client.send_exit(tx).await.map_err(refused)?;
     println!("\n{} confirmed: {hash:?}", tx.name());
-    let after = client.get_exit_state(client.address).await;
+    let after = state_after_own_tx(&client, &before).await;
     // A cancel counts back only what the staking cap has room for (`UnstakeCancelled`).
     if let (ExitTx::CancelUnstake, Ok(a)) = (tx, &after) {
         if a.pending_unstake > 0 {
@@ -324,7 +343,7 @@ pub async fn run_withdraw(
         println!("\nWithdrew {w}: {hash:?}");
         done.push(w);
     }
-    print_after(client.get_exit_state(client.address).await);
+    print_after(state_after_own_tx(&client, &before).await);
     Ok(())
 }
 

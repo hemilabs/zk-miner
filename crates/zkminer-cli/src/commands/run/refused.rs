@@ -9,8 +9,15 @@
 //! margin a keep-locks stop releases at, `keep_horizon`). The release penalty is the job's flat
 //! snapshot (5% by default), so a release at the horizon costs what one at once does, and every
 //! minute before it is a minute to restart the miner correctly. `zkminer stop` is answered: a drain
-//! or keep-locks stop exits keeping what is held, an abandon releases everything now, and
+//! goes on releasing each lock at its horizon and exits once none is left (review 7 WR-5: exiting
+//! at once left the locks to a full slash under a service set to stay stopped on 0), a keep-locks
+//! stop exits keeping what is held, an abandon releases everything now, and
 //! `zkminer run --release-held` releases everything at once from the start.
+//!
+//! Like the main run, it keeps Windows awake while it holds locks (`keep_awake`, review 7 DI-1): a
+//! PC that idles into sleep turns each horizon release (5%) into a full slash. And it keeps the
+//! slash latch (review 7 LD-1): its own releases are noted, and the stake baseline stays current,
+//! so the next correct start does not read them as an unexplained fall.
 
 use super::*;
 
@@ -19,6 +26,13 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the hold loop pages.
 const PAGE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often the hold loop reads the stake for the slash latch.
+const LATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A gap of chain time between two ticks longer than this means the loop was not running (the PC
+/// slept): `PAGE: SLEPT-WHILE-HOLDING`. Above the longest a tick's own chain reads can take.
+const SLEPT_AFTER_SECS: u64 = 180;
 
 /// How long after a release that left its lock held (a pause, a state it could not read) the lock is
 /// tried again.
@@ -118,12 +132,33 @@ impl Schedule {
     }
 }
 
+/// Whether the hold loop keeps Windows awake: while it holds a lock, or a release is in flight.
+pub(super) fn awake_wanted(held: &[Held], in_flight: bool) -> bool {
+    !held.is_empty() || in_flight
+}
+
+/// The locks of `held` whose cutoff passed between two ticks at `before` and `now` (chain time),
+/// when that gap is too long for the process to have been running: it slept.
+pub(super) fn slept_past(held: &[Held], before: u64, now: u64) -> Option<Vec<B256>> {
+    if now.saturating_sub(before) <= SLEPT_AFTER_SECS {
+        return None;
+    }
+    Some(
+        held.iter()
+            .filter(|h| h.lock_deadline > before && h.lock_deadline <= now)
+            .map(|h| h.job_id)
+            .collect(),
+    )
+}
+
 /// What the hold loop does with a `zkminer stop` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OnStop {
-    /// Exit at once, keeping every lock not yet released, with this exit code: 0 for a drain (a
-    /// service set to exit on 0 stays stopped), 75 for a keep-locks stop (one set to restart on it
-    /// starts the miner again, which holds them again).
+    /// Go on holding and releasing each lock at its horizon, and exit 0 once none is left (a
+    /// drain: nothing is proving, and exiting would leave every lock to its slash).
+    Drain,
+    /// Exit at once, keeping every lock not yet released, with this exit code: 75 for a keep-locks
+    /// stop (a service set to restart on it starts the miner again, which holds them again).
     Keep(i32),
     /// Release every lock now, then exit 0.
     ReleaseAll,
@@ -136,9 +171,11 @@ pub(super) fn on_stop(mode: zkminer_tui::state::StopMode) -> (OnStop, &'static s
     use zkminer_tui::state::StopMode;
     match mode {
         StopMode::Drain => (
-            OnStop::Keep(0),
-            "refused account: nothing is proving, so it exits now and keeps the locks it holds; \
-             start the miner as the right account to prove them",
+            OnStop::Drain,
+            "refused account: nothing is proving, so it goes on releasing each lock it holds as \
+             its cutoff comes near and exits once none is left; `zkminer stop --keep-locks` exits \
+             now keeping them (to prove them as the right account), `zkminer stop --abandon` \
+             releases them now",
         ),
         StopMode::KeepLocks => (
             OnStop::Keep(75),
@@ -183,10 +220,12 @@ fn hold_page(refusal: &str, held: &[Held], next: Option<u64>, release_all: bool)
     };
     format!(
         "PAGE: PRIVILEGED-ACCOUNT refused; holding {} lock(s) without proving them (earliest \
-         cutoff {earliest}), {when}. To prove them instead, stop this process (`zkminer stop`, \
-         or stop the service) and start the miner as a dedicated standard user, or from a \
-         console that is not elevated; to release them all now, `zkminer stop --abandon` or \
-         `zkminer run --release-held`. {refusal}",
+         cutoff {earliest}), {when}. This process keeps Windows awake while it holds them; a \
+         sleep or shutdown asked for still happens and turns each release into a slash. To prove \
+         them instead, stop this process (`zkminer stop --keep-locks`, or stop the service) and \
+         start the miner as a dedicated standard user, or from a console that is not elevated; \
+         to release them all now, `zkminer stop --abandon` or `zkminer run --release-held`. \
+         {refusal}",
         held.len()
     )
 }
@@ -232,6 +271,8 @@ pub(super) async fn hold_and_release(
     })?;
     let ids: Vec<B256> = journal.iter().map(|e| e.job_id).collect();
     let client = ChainClient::new(&config, load_signer(&config.wallet)?).await?;
+    // Its releases are noted and the stake baseline kept, as in the main run (review 7 LD-1).
+    slash_latch::init(client.chain_id, client.address, true);
     let state = new_shared_state();
     let journal: SharedJournal = Arc::new(Mutex::new(journal));
     let mut schedule = Schedule {
@@ -240,10 +281,15 @@ pub(super) async fn hold_and_release(
     };
     let (ended_tx, mut ended_rx) = tokio::sync::mpsc::unbounded_channel::<B256>();
     let mut last_page: Option<std::time::Instant> = None;
+    let mut last_latch: Option<std::time::Instant> = None;
+    let mut last_now: Option<u64> = None;
     let mut exit_code = None;
+    // A keep-locks stop: exit once the releases already sent end.
+    let mut keep_stop = false;
     loop {
         let now = zkminer_chain::client::chain_now_floor();
         let horizon = keep_horizon();
+        let mut release_ended = false;
         while let Ok(jid) = ended_rx.try_recv() {
             let still = journal
                 .lock()
@@ -251,6 +297,16 @@ pub(super) async fn hold_and_release(
                 .entries
                 .contains_key(&jid);
             schedule.ended(jid, still, now);
+            release_ended = true;
+        }
+        // The stake for the slash latch: every LATCH_EVERY, and after each release that ended.
+        if release_ended || last_latch.is_none_or(|t| t.elapsed() >= LATCH_EVERY) {
+            last_latch = Some(std::time::Instant::now());
+            if let Ok(data) = client.get_refresh_batch().await {
+                slash_latch::observe(data.stats.as_ref(), data.stake.as_ref());
+                slash_latch::explain_pending(&client).await;
+            }
+            slash_latch::page_again_if_due();
         }
         if let Some(request) = take_stop_request_file() {
             let word = request.as_ref().map_or("unknown", |m| stop_mode_word(*m));
@@ -262,12 +318,18 @@ pub(super) async fn hold_and_release(
                     tracing::warn!("stop requested: {answer}");
                     match action {
                         OnStop::Force => force_exit(),
+                        OnStop::Drain => {
+                            exit_code = Some(0);
+                            keep_stop = false;
+                        }
                         OnStop::Keep(code) => {
                             exit_code = Some(code);
+                            keep_stop = true;
                             schedule.release_all = false;
                         }
                         OnStop::ReleaseAll => {
                             schedule.release_all = true;
+                            keep_stop = false;
                             exit_code = Some(0);
                         }
                     }
@@ -275,8 +337,28 @@ pub(super) async fn hold_and_release(
             }
         }
         let held = held_of(&journal, &client);
+        // Asleep it releases nothing, and a lock whose cutoff passes meanwhile is slashed in full.
+        keep_awake(awake_wanted(&held, !schedule.in_flight.is_empty()));
+        if let Some(missed) = last_now.and_then(|before| slept_past(&held, before, now)) {
+            let ids: Vec<String> = missed.iter().map(|j| short_id(*j)).collect();
+            tracing::error!(
+                "PAGE: SLEPT-WHILE-HOLDING — this loop did not run for {} s while holding {} \
+                 lock(s) (the PC slept, the process was suspended, or its chain reads hung); {} \
+                 passed {} cutoff meanwhile and cannot be released any more{}",
+                now.saturating_sub(last_now.unwrap_or(now)),
+                held.len(),
+                missed.len(),
+                if missed.len() == 1 { "its" } else { "their" },
+                if ids.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", ids.join(", "))
+                }
+            );
+        }
+        last_now = Some(now);
         // A keep stop waits only for the releases already sent.
-        if exit_code.is_some() && !schedule.release_all {
+        if keep_stop && !schedule.release_all {
             if schedule.in_flight.is_empty() {
                 break;
             }
@@ -313,6 +395,7 @@ pub(super) async fn hold_and_release(
         }
         tokio::time::sleep(TICK).await;
     }
+    keep_awake(false);
     let text = report(refusal, &journal, &ids);
     match exit_code {
         Some(0) => {
@@ -419,12 +502,18 @@ mod tests {
         assert_eq!(s.due(&[stuck, locks[0]], t0, t0 + 100), vec![stuck.job_id]);
     }
 
-    /// A stop request: a drain exits 0 and a keep-locks stop 75, both keeping the rest; an abandon
-    /// releases everything; a force exit is a force exit.
+    /// A stop request: a drain goes on holding and releasing (review 7 WR-5: exiting 0 at once left
+    /// the locks to a full slash under a service set to stay stopped on 0); a keep-locks stop exits
+    /// 75 keeping the rest; an abandon releases everything; a force exit is a force exit.
     #[test]
     fn stop_requests_keep_or_release_what_a_refused_account_holds() {
         use zkminer_tui::state::StopMode;
-        assert_eq!(on_stop(StopMode::Drain).0, OnStop::Keep(0));
+        let (drain, answer) = on_stop(StopMode::Drain);
+        assert_eq!(drain, OnStop::Drain);
+        assert!(
+            answer.contains("--keep-locks") && answer.contains("--abandon"),
+            "{answer}"
+        );
         assert_eq!(on_stop(StopMode::KeepLocks).0, OnStop::Keep(75));
         assert_eq!(on_stop(StopMode::Abandon).0, OnStop::ReleaseAll);
         assert_eq!(on_stop(StopMode::Force).0, OnStop::Force);
@@ -434,5 +523,49 @@ mod tests {
             page.contains("--release-held") && page.contains("not elevated"),
             "{page}"
         );
+        assert!(page.contains("keeps Windows awake"), "{page}");
+    }
+
+    /// Review 7 DI-1: awake while anything is held or being released, and the loop asks for it on
+    /// every tick and lets go on its way out.
+    #[test]
+    fn the_hold_loop_keeps_windows_awake_while_it_holds_locks() {
+        assert!(awake_wanted(&[held(1, 0)], false));
+        assert!(awake_wanted(&[], true));
+        assert!(!awake_wanted(&[], false));
+        let src = include_str!("refused.rs");
+        let hold = &src[src.find("pub(super) async fn hold_and_release(").unwrap()..];
+        let hold = &hold[..hold.find("\n}\n").unwrap()];
+        let ask = hold
+            .find("keep_awake(awake_wanted(&held, !schedule.in_flight.is_empty()));")
+            .expect("asked on every tick");
+        assert!(hold.find("let held = held_of(").unwrap() < ask);
+        let release = hold
+            .find("keep_awake(false);")
+            .expect("let go on the way out");
+        assert!(release > hold.rfind("tokio::time::sleep(TICK).await;").unwrap());
+        // The main run's two holders ask too.
+        let run = include_str!("../run.rs");
+        assert!(
+            run.matches("keep_awake(").count() >= 3,
+            "fn + the run's two calls"
+        );
+        // And the latch is kept here as in the main run (review 7 LD-1 path 3).
+        assert!(hold.contains("slash_latch::init(client.chain_id, client.address, true);"));
+    }
+
+    /// A gap of chain time between ticks longer than the loop can take is a sleep; the locks whose
+    /// cutoff passed in it are named.
+    #[test]
+    fn a_long_gap_between_ticks_names_the_cutoffs_slept_through() {
+        let t0 = 1_900_000_000;
+        let locks = [held(1, t0 + 100), held(2, t0 + 5_000), held(3, 0)];
+        assert_eq!(slept_past(&locks, t0, t0 + 10), None);
+        assert_eq!(slept_past(&locks, t0, t0 + SLEPT_AFTER_SECS), None);
+        assert_eq!(
+            slept_past(&locks, t0, t0 + 3_600),
+            Some(vec![locks[0].job_id])
+        );
+        assert_eq!(slept_past(&locks[1..], t0, t0 + 3_600), Some(vec![]));
     }
 }

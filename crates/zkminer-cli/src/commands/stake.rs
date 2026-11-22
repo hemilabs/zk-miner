@@ -162,8 +162,19 @@ pub async fn run(
         .await
         .context("stake did not complete")?;
 
+    // Read before the stake below, so the slash latch's next range starts after this transaction.
+    let block = client.get_block_number().await.ok();
     match client.get_stake_info(client.address).await {
         Ok(after) => {
+            if let Some(b) = &before {
+                super::run::slash_latch::rebaseline_after_own_tx(
+                    client.chain_id,
+                    client.address,
+                    (b.total_staked, b.unstake_amount),
+                    (after.total_staked, after.unstake_amount),
+                    block,
+                );
+            }
             println!();
             println!("Staked:         {} HEMI", fmt_hemi(after.total_staked));
             println!(
