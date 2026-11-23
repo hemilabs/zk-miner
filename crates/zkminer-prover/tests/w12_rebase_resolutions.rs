@@ -160,9 +160,7 @@ fn the_mock_sleeps_then_answers_its_forced_benchmark_failure() {
     let started = Instant::now();
     let run = pool.benchmark_all_streaming(&|_| {});
     let took = started.elapsed();
-    // The warm-up step's failure is only a warning; the suite's request fails: >= 2 delayed answers.
-    assert!(took >= Duration::from_secs(2), "{took:?}");
-    assert!(took < Duration::from_secs(10), "{took:?}");
+    // The answer first: the forced failure, not a watchdog's timeout or kill (the pool's is 10 s).
     assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
     assert!(
         run.failures[0].error.contains("w12 forced failure"),
@@ -171,6 +169,11 @@ fn the_mock_sleeps_then_answers_its_forced_benchmark_failure() {
     );
     let e = run.failures[0].error.to_lowercase();
     assert!(!e.contains("timed out") && !e.contains("killed"), "{e}");
+    // The warm-up step's failure is only a warning; the suite's request fails: >= 2 delayed answers.
+    // The run also respawns the slot (the suite's GPU recycle), ~7 s in all on an idle host and
+    // over 20 s on a loaded one, so the upper bound is only a sanity limit.
+    assert!(took >= Duration::from_secs(2), "{took:?}");
+    assert!(took < Duration::from_secs(60), "{took:?}");
     // An answered failure is not a crash: the slot is up again after the suite's GPU recycle.
     assert_eq!(pool.test_has_handle("risc0:metal:0"), Some(true));
     assert_ne!(pool.test_pid("risc0:metal:0"), Some(0));
