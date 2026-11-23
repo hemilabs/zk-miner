@@ -205,23 +205,29 @@ pub(crate) fn ensure_installed(
     }
 
     // With the lock held nothing else is installing, so whatever is here is debris: a torn
-    // install at `dir`, and staging directories of an installer that died.
+    // install at `dir`, and staging directories of an installer that died, with their SDK locks.
     if dir.exists() {
         tracing::warn!("{} is an incomplete install; replacing it", dir.display());
         fs::remove_dir_all(dir).with_context(|| format!("cannot remove {}", dir.display()))?;
     }
     let staging_prefix = format!(".{name}.staging.");
+    // The SDK's installer locks `.<name of the directory it installs>.lock` beside that directory
+    // and keeps the file, so every installer locks one inode. Here that directory is a staging
+    // directory named for one process: its lock file is never taken again.
+    let sdk_lock_prefix = format!(".{staging_prefix}");
     for entry in fs::read_dir(parent)?.flatten() {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(&staging_prefix)
-        {
+        let entry_name = entry.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        if entry_name.starts_with(&staging_prefix) {
             let _ = fs::remove_dir_all(entry.path());
+        } else if entry_name.starts_with(&sdk_lock_prefix) {
+            let _ = fs::remove_file(entry.path());
         }
     }
 
-    let staging = parent.join(format!("{staging_prefix}{}", std::process::id()));
+    let staging_name = format!("{staging_prefix}{}", std::process::id());
+    let staging = parent.join(&staging_name);
+    let sdk_lock = parent.join(format!(".{staging_name}.lock"));
     fs::create_dir(&staging).with_context(|| format!("cannot create {}", staging.display()))?;
     let installed = install(&staging).and_then(|()| {
         if is_complete(&staging) {
@@ -235,9 +241,12 @@ pub(crate) fn ensure_installed(
     });
     if let Err(e) = installed {
         let _ = fs::remove_dir_all(&staging);
+        let _ = fs::remove_file(&sdk_lock);
         return Err(e);
     }
-    if let Err(e) = fs::rename(&staging, dir) {
+    let renamed = fs::rename(&staging, dir);
+    let _ = fs::remove_file(&sdk_lock);
+    if let Err(e) = renamed {
         let _ = fs::remove_dir_all(&staging);
         // Something that does not take this lock (an SDK installing during a proof) got there
         // first. Fine if what it left is complete.
@@ -494,6 +503,40 @@ mod tests {
         Ok(())
     }
 
+    /// The lock file the SDK's installer keeps beside the directory it installs into.
+    fn sdk_lock_beside(dir: &Path) -> Result<()> {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        Ok(fs::write(
+            dir.parent().unwrap().join(format!(".{name}.lock")),
+            b"",
+        )?)
+    }
+
+    fn staging_leftovers(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("staging"))
+            .collect()
+    }
+
+    /// The SDK keeps its install lock beside the staging directory it was given: a successful
+    /// install takes it away with the staging directory.
+    #[test]
+    fn a_successful_install_leaves_no_staging_lock() {
+        let root = TestDir::new();
+        let dir = root.path().join("v6.0.0");
+        let outcome = ensure_installed(&dir, |staging| {
+            sdk_lock_beside(staging)?;
+            fill(staging)
+        });
+        assert_eq!(outcome.unwrap(), Installed::Downloaded);
+        assert!(is_complete(&dir));
+        let leftovers = staging_leftovers(root.path());
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     /// Every file but the SDK's marker: the SDK would download the artifacts again, inside a proof,
     /// so the warm-up replaces them now.
     #[test]
@@ -551,7 +594,9 @@ mod tests {
         let dir = root.path().join("v6.0.0");
         let stale = root.path().join(".v6.0.0.staging.999999");
         fs::create_dir(&stale).unwrap();
+        fs::write(root.path().join("..v6.0.0.staging.999999.lock"), b"").unwrap();
         let failed = ensure_installed(&dir, |staging| {
+            sdk_lock_beside(staging)?;
             fs::write(staging.join("groth16_pk.bin"), b"half")?;
             Err(anyhow!("connection reset"))
         });
