@@ -1099,6 +1099,7 @@ impl NetPolicy {
     /// The host facts in force, as they are: never re-read (a snapshot for a caller that must
     /// not block, an async runtime's worker: review round 4, parse-3). Whatever it decides with
     /// them is admitted later on facts that are re-read.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn facts_in_force(&self) -> Arc<HostFacts> {
         self.facts
             .current
