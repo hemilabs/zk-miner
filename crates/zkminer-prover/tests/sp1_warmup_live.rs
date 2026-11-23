@@ -48,7 +48,20 @@ fn a_download_cut_short_is_redone_and_never_trusted() {
     ));
     std::fs::create_dir_all(&root).unwrap();
     let circuits = root.join("groth16");
-    let version_dir = circuits.join("v6.0.0");
+    // The installs published under `circuits`: one `v<version>` directory per SP1 circuit version
+    // (the pinned SDK's; staging directories start with a dot). Not named here, so a pin that moves
+    // the version does not leave this test looking in the wrong place.
+    let installed = || -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&circuits) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('v'))
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.path())
+            .collect()
+    };
     let mut env = HashMap::new();
     env.insert(
         "SP1_GROTH16_CIRCUIT_PATH".to_string(),
@@ -66,9 +79,9 @@ fn a_download_cut_short_is_redone_and_never_trusted() {
     assert!(cut.is_err(), "the download should not finish in 20 s");
     assert!(!pool.backend_warmed("sp1"));
     assert!(
-        !version_dir.exists(),
-        "a download cut short must publish nothing at {}",
-        version_dir.display()
+        installed().is_empty(),
+        "a download cut short must publish nothing: {:?}",
+        installed()
     );
 
     // The next warm-up (on a respawned worker) sweeps the debris and completes the install.
@@ -78,6 +91,9 @@ fn a_download_cut_short_is_redone_and_never_trusted() {
     eprintln!("warm-up: {summary}");
     assert!(summary.contains("downloaded"), "{summary}");
     assert!(pool.backend_warmed("sp1"));
+    let installs = installed();
+    assert_eq!(installs.len(), 1, "one version installed: {installs:?}");
+    let version_dir = &installs[0];
     for name in [
         "groth16_circuit.bin",
         "groth16_pk.bin",
