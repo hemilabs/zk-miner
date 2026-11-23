@@ -190,7 +190,9 @@ fn main() {
                  (a test aid; unset it)"
             );
         }
-        // The benchmark proves on the GPU, so it is confined like any proof (confinement.rs).
+        // The benchmark proves on the GPU, so it is confined like any proof (confinement.rs), with
+        // write access to its receipt directory when one is asked for.
+        confinement::allow_benchmark_receipt_dir();
         if let Err(e) = confinement::confine() {
             eprintln!("cannot confine this worker, so it proves nothing: {e}");
             std::process::exit(1);
@@ -2510,7 +2512,9 @@ fn benchmark_stages(
 /// Test aid (P31-19): with `ZKMINER_BENCH_RECEIPT_DIR` set, write each verified benchmark Groth16
 /// receipt there as `<name>.groth16.receipt` (bincode 1.3 `risc0_zkvm::Receipt`, the encoding an
 /// independent verifier such as risc0's `tools/stock_verify31` reads) with `<name>.image_id` (hex).
-/// Unset (the default): nothing is written. A failed write is logged, never fatal.
+/// Unset (the default): nothing is written. A failed write is logged, never fatal. On Linux the
+/// confinement lets only `--benchmark` write there (`confinement::allow_benchmark_receipt_dir`); a
+/// benchmark the miner drives logs a refused write.
 fn dump_benchmark_receipt(name: &str, receipt: &risc0_zkvm::Receipt, image_id: risc0_zkvm::Digest) {
     let Some(dir) = std::env::var_os("ZKMINER_BENCH_RECEIPT_DIR") else {
         return;
