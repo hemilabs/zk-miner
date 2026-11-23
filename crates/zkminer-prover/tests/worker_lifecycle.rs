@@ -559,34 +559,25 @@ fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
     );
 }
 
-/// The same preemption with a real SP1 worker and guest, for what they really leave in `/dev/shm`.
+/// The same preemption with a real SP1 worker and guest, for what they really stage. SP1's executor
+/// shares the guest's memory and trace ring with its runner through memfds, not `/dev/shm` files
+/// (see `zkminer-prove-sp1`'s confinement), so what it stages is read from the host's shared memory
+/// (`Shmem` in `/proc/meminfo`, which counts memfd pages) and must come back once it is preempted.
 ///
 ///   ZKMINER_TEST_SP1_WORKER=<zkminer-prove-sp1> cargo test -p zkminer-prover --features testing \\
 ///     --test worker_lifecycle -- --ignored --test-threads=1 preempting_a_real_sp1_measurement
 #[test]
 #[ignore = "needs a real zkminer-prove-sp1, and no other SP1 execution on this host"]
-fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
-    /// What the tmpfs really has in use, which unlinked but still mapped pages count towards.
-    fn tmpfs_used() -> u64 {
-        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) };
-        assert_eq!(rc, 0);
-        (fs.f_blocks - fs.f_bfree) as u64 * fs.f_frsize as u64
-    }
-    fn staged() -> u64 {
-        std::fs::read_dir("/dev/shm")
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("sp1_") || name.starts_with("sem.sp1_")
-            })
-            .map(|e| {
-                use std::os::unix::fs::MetadataExt;
-                e.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
-            })
-            .sum()
+fn preempting_a_real_sp1_measurement_frees_what_it_staged() {
+    /// The host's shared memory in use: tmpfs, SysV and memfd pages.
+    fn shmem() -> u64 {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let kib: u64 = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("Shmem:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("Shmem in /proc/meminfo");
+        kib * 1024
     }
     let worker =
         PathBuf::from(std::env::var("ZKMINER_TEST_SP1_WORKER").expect("the worker to run"));
@@ -602,8 +593,8 @@ fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
         .unwrap();
     assert!(exported.success());
     let elf = std::fs::read(&elf_path).unwrap();
-    assert_eq!(staged(), 0, "another SP1 execution is using /dev/shm");
-    let used_before = tmpfs_used();
+    let before_staging = shmem();
+    let staged = || shmem().saturating_sub(before_staging);
 
     let mut env = HashMap::new();
     env.insert(
@@ -632,11 +623,12 @@ fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
     while staged() < 500 * 1024 * 1024 {
         assert!(
             started.elapsed() < Duration::from_secs(120),
-            "it never staged"
+            "it never staged ({} bytes of shared memory)",
+            staged()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let before = staged();
+    let peak = staged();
     pool.test_preempt_all_inflight_measures();
     let err = measurer.join().unwrap().expect_err("it was preempted");
     assert!(
@@ -644,16 +636,14 @@ fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
             .is_some(),
         "{err:#}"
     );
-    let after = staged();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(after, 0, "{before} bytes staged, {after} left behind");
-    // Not just the names: the pages themselves came back.
+    // The pages themselves come back, not just the names: the runner that mapped them is gone.
     let started = Instant::now();
-    while tmpfs_used() > used_before + 4 * 1024 * 1024 {
+    while staged() > 64 * 1024 * 1024 {
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "{} bytes still in use in /dev/shm, {used_before} before it staged",
-            tmpfs_used()
+            "{peak} bytes staged, {} still in use after the preemption",
+            staged()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
