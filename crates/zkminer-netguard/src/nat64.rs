@@ -371,6 +371,25 @@ pub fn set_configured(prefixes: &[Prefix]) -> Result<(), String> {
     Ok(())
 }
 
+/// Set by [`without_listener`].
+static NO_LISTENER: AtomicBool = AtomicBool::new(false);
+
+/// For a process that reads the host's facts once and then confines itself to a single thread
+/// (the witness broker: its sandbox refuses a process that already has a second thread, and
+/// denies the netlink socket the listener reads): from this call on, no facts read starts the
+/// Linux PREF64 listener (`pref64`), whose thread would outlive the read. Nothing is lost there:
+/// the listener learns from router advertisements that arrive after it starts, so a first read
+/// learns nothing from it, and the broker gets the miner's refusals later as prefixes. The first
+/// NAT64 round and public-address discovery already run on the calling thread.
+pub fn without_listener() {
+    NO_LISTENER.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`without_listener`] was called.
+pub fn listener_refused() -> bool {
+    NO_LISTENER.load(Ordering::SeqCst)
+}
+
 /// Notes that the host's facts are read on uplink `signature`, whose IPv6 default gateways are
 /// `gateways` (address, interface): learned prefixes are synthesized with on that uplink only,
 /// and PREF64 is heard from those routers only.
@@ -1509,8 +1528,12 @@ pub(crate) mod pref64 {
     static STATE: Mutex<(bool, Heard)> = Mutex::new((false, Heard::new()));
 
     /// Starts the listener once per process, on a thread of its own; a listener that cannot
-    /// start (no netlink, a kernel without the group) is logged once and not tried again.
+    /// start (no netlink, a kernel without the group) is logged once and not tried again. None
+    /// starts in a process that called [`super::without_listener`].
     pub(crate) fn start() {
+        if super::listener_refused() {
+            return;
+        }
         let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
         if s.0 {
             return;

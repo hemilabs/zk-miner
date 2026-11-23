@@ -98,6 +98,11 @@ unprivileged process can read without those APIs; neither is read. A network who
 signal is a PREF64 on such a host needs `[egress] nat64_prefixes` (or a DNS64, which RFC 7050
 finds).
 
+The witness broker starts no listener (`nat64::without_listener`): it reads the facts once, before
+its sandbox, which refuses a process that already has a second thread (and denies the netlink
+socket a listener reads). A listener started there would have heard nothing yet; the broker gets
+the miner's refusals, PREF64-learned prefixes included, as `RefreshPrefixes`.
+
 ### The macOS CI change (ready to apply on `item/W11-ON37`)
 
 `scripts/ci/macos-cpu-tests.sh` lives on `item/W11-ON37`, so nothing is committed there. Against
