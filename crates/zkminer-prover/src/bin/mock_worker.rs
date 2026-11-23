@@ -36,6 +36,15 @@
 //!   is held.
 //! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
 //!   `unknown` for `None`. Default: 0.
+//! - `MOCK_PROTOCOL_VERSION`: the protocol version HelloAck reports. Default: this build's.
+//! - `MOCK_PROVE_ERROR_KIND`: answer every Prove with a `WorkerResponse::Error` of this kind
+//!   (`resource_exhausted`, `proof_failed` or `invalid_input`), and `MOCK_PROVE_ERROR_MESSAGE` as
+//!   its message.
+//! - `MOCK_OOM_UNLESS_CAP_AT_MOST`: answer a Prove, and a Benchmark, with a `ResourceExhausted`
+//!   error unless `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` (the SP1 shard-size cap the dispatcher spawns
+//!   a worker with) is set to at most this: a program, or a card, that fits only at the smaller size.
+//! - `MOCK_RECORD_TO`: a file each Benchmark and Prove appends a line to, saying what it was sent
+//!   (`benchmark po2=<po2>`) or what it ran with (`prove cap=<ZKMINER_SP1_ELEMENT_THRESHOLD_CAP>`).
 //! - `MOCK_WITNESS_DIVERGE`: set to anything to answer a witness Prove with `JournalDiverged`: the
 //!   journal is the bundle's `input_path`, the hash the complement of the expected one, and the cycles
 //!   its `w_len`. Unset = a witness Prove is answered as an inline one.
@@ -49,14 +58,6 @@
 //!   (the warm-up, the suite), so a test can make the whole run outlast a per-step deadline.
 //! - `MOCK_PROTOCOL_VERSION`: the protocol version the HelloAck reports, as a worker built for
 //!   another version would. Default: this build's.
-//! - `MOCK_PROVE_ERROR_KIND`: answer every Prove with a `WorkerResponse::Error` of this kind
-//!   (`resource_exhausted`, `proof_failed` or `invalid_input`), and `MOCK_PROVE_ERROR_MESSAGE` as
-//!   its message.
-//! - `MOCK_OOM_UNLESS_CAP_AT_MOST`: answer a Prove, and a Benchmark, with a `ResourceExhausted`
-//!   error unless `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` (the SP1 shard-size cap the dispatcher spawns
-//!   a worker with) is set to at most this: a program, or a card, that fits only at the smaller size.
-//! - `MOCK_RECORD_TO`: a file each Benchmark and Prove appends a line to, saying what it was sent
-//!   (`benchmark po2=<po2>`) or what it ran with (`prove cap=<ZKMINER_SP1_ELEMENT_THRESHOLD_CAP>`).
 
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;

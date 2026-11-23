@@ -698,7 +698,7 @@ pub(crate) fn force_exit() -> ! {
     // The operator's force exit is not a crash either (`ProveStart`).
     end_counted_prove_starts();
     let now = zkminer_chain::client::chain_now_floor();
-    let journal = crate::journal::JobJournal::load();
+    let journal = crate::journal::JobJournal::peek();
     let live: Vec<u64> = journal
         .iter()
         .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
@@ -3044,20 +3044,6 @@ fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
     );
 }
 
-/// What the candidate loop does with a job's witness route: `true` skips it this tick. A witness job
-/// the witness path serves is its; one this host does not serve is set aside for as long as that
-/// lasts, so it ranks last in the Open set (see [`open_rank`]) and stays out of the per-tick cut, as
-/// any job the inline path finds it cannot claim on a lasting verdict.
-fn witness_route_skips(job_id: B256, route: witness::Route) -> bool {
-    match route {
-        witness::Route::Inline => false,
-        witness::Route::Witness => true,
-        witness::Route::WitnessUnserved { wait } => {
-            set_job_aside(job_id, wait);
-            true
-        }
-    }
-}
 /// The reason given for a job the miner executed and could not measure: never claimed.
 const COULD_NOT_BE_MEASURED: &str =
     "could not be measured (over the execute cycle cap, out of time, or a different journal at each size)";
@@ -3090,6 +3076,21 @@ fn release_set_aside_for(why: &'static str) -> usize {
         }
     }
     released.len()
+}
+
+/// What the candidate loop does with a job's witness route: `true` skips it this tick. A witness job
+/// the witness path serves is its; one this host does not serve is set aside for as long as that
+/// lasts, so it ranks last in the Open set (see [`open_rank`]) and stays out of the per-tick cut, as
+/// any job the inline path finds it cannot claim on a lasting verdict.
+fn witness_route_skips(job_id: B256, route: witness::Route) -> bool {
+    match route {
+        witness::Route::Inline => false,
+        witness::Route::Witness => true,
+        witness::Route::WitnessUnserved { wait } => {
+            set_job_aside(job_id, wait, "a witness job this host does not serve");
+            true
+        }
+    }
 }
 
 fn job_set_aside(job_id: B256) -> bool {
@@ -10686,7 +10687,7 @@ async fn miner_brain(
             if let Some(why) = cap_verdict.describe() {
                 if cap_verdict.is_final() {
                     tracing::warn!("job {}: {why} — setting it aside", short_id(jid));
-                    set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                    set_job_aside(jid, DETERMINISTIC_SKIP_TTL, "over the collateral cap");
                 } else {
                     tracing::debug!("job {}: {why} — not now", short_id(jid));
                 }
@@ -18920,49 +18921,6 @@ mod tests {
         assert_eq!(&seal[4..], &proof[..]);
     }
 
-    #[test]
-    fn a_job_tries_its_planned_card_then_the_fastest_and_a_refusing_card_last() {
-        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
-        let eligible = ids(&["gpu0", "gpu-rocm1", "gpu-rocm0", "gpu-intel0"]);
-        let planned = "gpu-rocm1".to_string();
-        assert_eq!(
-            job_card_order(Some(&planned), &eligible, &[]),
-            ids(&["gpu-rocm1", "gpu0", "gpu-rocm0", "gpu-intel0"])
-        );
-        // The 7900 XTX refused admission (host RAM): the 4090, then the 9070 XT, before the A770.
-        assert_eq!(
-            job_card_order(Some(&planned), &eligible, &ids(&["gpu-rocm1"])),
-            ids(&["gpu0", "gpu-rocm0", "gpu-intel0"])
-        );
-        // No plan: only the preference, which a refusal removes.
-        let any = "gpu0".to_string();
-        assert_eq!(job_card_order(Some(&any), &[], &[]), ids(&["gpu0"]));
-        assert!(job_card_order(Some(&any), &[], &ids(&["gpu0"])).is_empty());
-        assert!(job_card_order(None, &[], &[]).is_empty());
-    }
-
-    /// The cards a measured job is admitted on: those that finish it inside the watchdog and the
-    /// window, at the claim gate's margin. Measured on this host: an RX 7900 XTX proves risc0 at ~2.2M
-    /// c/s, an Arc A770 at ~116K.
-    #[test]
-    fn a_card_is_eligible_only_if_it_finishes_the_job_in_time() {
-        // A 1.5 margin, 2 s of allowances, a 600 s watchdog and a window of `window` s.
-        let fits =
-            |cycles, rate, window| card_finishes_in_time(cycles, rate, 1.5, 2.0, 600.0, window);
-        let (xtx, a770) = (2.2e6, 116e3);
-        // A 41M-cycle job: both cards (the A770's ~535 s, at the margin, fits the 600 s watchdog).
-        assert!(fits(41_418_752, xtx, 3000));
-        assert!(fits(41_418_752, a770, 3000));
-        // A 100M-cycle job: the XTX only; the A770 would need ~1300 s.
-        assert!(fits(100_000_000, xtx, 3000));
-        assert!(!fits(100_000_000, a770, 3000));
-        // The window binds too: 41M cycles on the A770 do not fit a 400 s window.
-        assert!(!fits(41_418_752, a770, 400));
-        // No rate, no card.
-        assert!(!fits(1, 0.0, 3000));
-        assert!(!fits(1, f64::NAN, 3000));
-    }
-
     /// A volume under the floor holds claims and proofs, naming it; one whose free space cannot be
     /// read does not.
     #[test]
@@ -19523,6 +19481,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_job_tries_its_planned_card_then_the_fastest_and_a_refusing_card_last() {
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let eligible = ids(&["gpu0", "gpu-rocm1", "gpu-rocm0", "gpu-intel0"]);
+        let planned = "gpu-rocm1".to_string();
+        assert_eq!(
+            job_card_order(Some(&planned), &eligible, &[]),
+            ids(&["gpu-rocm1", "gpu0", "gpu-rocm0", "gpu-intel0"])
+        );
+        // The 7900 XTX refused admission (host RAM): the 4090, then the 9070 XT, before the A770.
+        assert_eq!(
+            job_card_order(Some(&planned), &eligible, &ids(&["gpu-rocm1"])),
+            ids(&["gpu0", "gpu-rocm0", "gpu-intel0"])
+        );
+        // No plan: only the preference, which a refusal removes.
+        let any = "gpu0".to_string();
+        assert_eq!(job_card_order(Some(&any), &[], &[]), ids(&["gpu0"]));
+        assert!(job_card_order(Some(&any), &[], &ids(&["gpu0"])).is_empty());
+        assert!(job_card_order(None, &[], &[]).is_empty());
+    }
+
+    /// The cards a measured job is admitted on: those that finish it inside the watchdog and the
+    /// window, at the claim gate's margin. Measured on this host: an RX 7900 XTX proves risc0 at ~2.2M
+    /// c/s, an Arc A770 at ~116K.
+    #[test]
+    fn a_card_is_eligible_only_if_it_finishes_the_job_in_time() {
+        // A 1.5 margin, 2 s of allowances, a 600 s watchdog and a window of `window` s.
+        let fits =
+            |cycles, rate, window| card_finishes_in_time(cycles, rate, 1.5, 2.0, 600.0, window);
+        let (xtx, a770) = (2.2e6, 116e3);
+        // A 41M-cycle job: both cards (the A770's ~535 s, at the margin, fits the 600 s watchdog).
+        assert!(fits(41_418_752, xtx, 3000));
+        assert!(fits(41_418_752, a770, 3000));
+        // A 100M-cycle job: the XTX only; the A770 would need ~1300 s.
+        assert!(fits(100_000_000, xtx, 3000));
+        assert!(!fits(100_000_000, a770, 3000));
+        // The window binds too: 41M cycles on the A770 do not fit a 400 s window.
+        assert!(!fits(41_418_752, a770, 400));
+        // No rate, no card.
+        assert!(!fits(1, 0.0, 3000));
+        assert!(!fits(1, f64::NAN, 3000));
+    }
+
     /// The terminal-vs-retryable classification is by TYPE, and guest text cannot forge it.
     ///
     /// This replaced a `msg.contains("deadline cutoff") || msg.contains("job deadline reached")`
@@ -19821,6 +19822,7 @@ async fn release_and_clean_with_nonce(",
         assert!(zkminer_prover_protocol::types::is_gpu_oom(note) && is_invalid_proof(note));
         let died = anyhow::Error::new(zkminer_prover::worker::WorkerDied {
             backend: "risc0".to_string(),
+            last_output: None,
         })
         .context(note);
         assert!(died
@@ -19851,6 +19853,7 @@ async fn release_and_clean_with_nonce(",
         let mut n = 0;
         let died = anyhow::Error::new(zkminer_prover::worker::WorkerDied {
             backend: "risc0".to_string(),
+            last_output: None,
         })
         .context("stopped by the outage recycle (it held network sockets)");
         assert!(!free_retry_after_recycle(&died, &mut n));
@@ -22790,6 +22793,7 @@ mod r2_sizing_tests {
                 cycles: 2_000_000_000,
                 stark_secs: 1000.0,
                 wrap_secs: Some(5.0),
+                power_reduced: None,
             }],
             device_id: "gpu0".to_string(),
             device_label: String::new(),

@@ -68,6 +68,7 @@ fn card_label(gpu_tag: &str, index: Option<u32>, name: Option<&str>, vram: Optio
         "cuda" => "GPU",
         "rocm" => "AMD GPU",
         "intel" => "Intel GPU",
+        "metal" => "Apple GPU",
         other => other,
     };
     let mut label = format!("{vendor} {}", index.unwrap_or(0));
@@ -111,11 +112,13 @@ fn running_verdict(
                     .find(|d| d.device_id == device && d.prover_backend == BACKEND_RISC0)
             });
             let over = risc0_sizes.get(&device).copied();
-            match zkminer_prover::benchmark::risc0_job_po2(
+            // `risc0_slot_job_po2`: an Apple GPU is sized from the Metal table, as `run` sizes it.
+            match zkminer_prover::benchmark::risc0_slot_job_po2(
+                &device,
+                &slot.gpu_tag,
                 over,
                 row,
                 slot.vram_bytes,
-                &slot.gpu_tag,
             ) {
                 Some(po2) => Verdict::Ready(format!(
                     "segment size 2^{po2}{}",

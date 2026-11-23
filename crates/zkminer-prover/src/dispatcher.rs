@@ -433,9 +433,6 @@ pub enum WitnessProveOutcome {
     JournalDiverged(JournalDivergence),
 }
 
-/// A proof's progress callback: the fraction done and the slot proving it.
-pub type ProveProgress = Box<dyn Fn(f64, &str) + Send>;
-
 /// The input a proof is dispatched with.
 #[derive(Debug, Clone, Copy)]
 enum ProveInput<'a> {
@@ -1528,28 +1525,6 @@ impl WorkerEntry {
     }
 }
 
-/// A watchdog's clock: its deadline is the last `touch` plus its timeout. A benchmark touches it as each
-/// step completes (the warm-up, each program, each scoring proof), so `benchmark_timeout` bounds a step
-/// rather than the whole run, which a slow card cannot finish in it (an Arc A770's risc0 suite and
-/// score take over 30 minutes, no step more than about 10), while a wedged step is still caught as
-/// soon.
-#[derive(Clone)]
-struct WatchdogClock(Arc<Mutex<Instant>>);
-
-impl WatchdogClock {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(Instant::now())))
-    }
-
-    fn touch(&self) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-    }
-
-    fn last(&self) -> Instant {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 /// A proof's memory Windows has moved off its card, in MiB, past which a sample counts toward a
 /// spill. A proof with the card to itself reads 0 (an SP1 proof at 2^28 on an RTX 4070, every sample
 /// of a whole suite, allocations included); one paged against another program's memory read ~9.8 GB.
@@ -1917,6 +1892,28 @@ impl Drop for SpillWatch {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.slot_key);
+    }
+}
+
+/// A watchdog's clock: its deadline is the last `touch` plus its timeout. A benchmark touches it as each
+/// step completes (the warm-up, each program, each scoring proof), so `benchmark_timeout` bounds a step
+/// rather than the whole run, which a slow card cannot finish in it (an Arc A770's risc0 suite and
+/// score take over 30 minutes, no step more than about 10), while a wedged step is still caught as
+/// soon.
+#[derive(Clone)]
+struct WatchdogClock(Arc<Mutex<Instant>>);
+
+impl WatchdogClock {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn touch(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -9362,7 +9359,7 @@ impl WorkerPool {
         &self,
         key: &str,
         elf: &[u8],
-        input_data: &[u8],
+        input: ProveInput<'_>,
         po2: Option<u8>,
         timeout: Option<Duration>,
         on_progress: &mut Option<SlotProgress>,
@@ -9370,11 +9367,11 @@ impl WorkerPool {
         job_po2: Option<SlotPo2<'_>>,
         program_id: Option<[u8; 32]>,
         execute_peak_bytes: u64,
-    ) -> Result<ProofOutput> {
+    ) -> Result<SlotProof> {
         let result = self.prove_on_slot(
             key,
             elf,
-            input_data,
+            input,
             po2,
             timeout,
             on_progress,
@@ -9425,7 +9422,7 @@ impl WorkerPool {
         input_data: &[u8],
         po2: Option<u8>,
         timeout: Option<Duration>,
-        mut on_progress: Option<SlotProgress>,
+        on_progress: Option<SlotProgress>,
         min_vram_bytes: Option<u64>,
         exclude: &[String],
         // Slots the OPERATOR switched off. A HARD filter, unlike `exclude`.
@@ -9500,7 +9497,7 @@ impl WorkerPool {
         witness: &zkminer_prover_protocol::WitnessProve,
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<ProveProgress>,
+        on_progress: Option<SlotProgress>,
         min_vram_bytes: Option<u64>,
         exclude: &[String],
         disabled: &[String],
@@ -9545,7 +9542,7 @@ impl WorkerPool {
         input: ProveInput<'_>,
         po2: Option<u8>,
         timeout: Option<Duration>,
-        on_progress: Option<ProveProgress>,
+        mut on_progress: Option<SlotProgress>,
         min_vram_bytes: Option<u64>,
         exclude: &[String],
         disabled: &[String],
@@ -14331,9 +14328,6 @@ impl WorkerPool {
         if proof_response.is_ok() {
             slot.proofs_since_spawn = slot.proofs_since_spawn.saturating_add(1);
         }
-        if matches!(proof_response, Ok(WorkerResponse::ProofResult { .. })) {
-            Self::note_guest_ran(&mut slot, key);
-        }
         // How long its stage after the STARK took, for the next proof's expected end here.
         if let Ok(WorkerResponse::ProofResult { .. }) = &proof_response {
             let began = eta_track
@@ -14346,6 +14340,9 @@ impl WorkerPool {
                     .unwrap_or_else(|p| p.into_inner())
                     .insert(key.to_string(), began.elapsed());
             }
+        }
+        if matches!(proof_response, Ok(WorkerResponse::ProofResult { .. })) {
+            Self::note_guest_ran(&mut slot, key);
         }
 
         match proof_response? {
@@ -16771,6 +16768,7 @@ mod tests {
         // An operator's own threshold is theirs: no cap over it.
         let mut operator = WorkerSlot {
             handle: None,
+            decline_retry: DeclineRetry::default(),
             path: PathBuf::from("/dev/null"),
             backend: "sp1".into(),
             gpu_tag: "cuda".into(),
@@ -16782,6 +16780,8 @@ mod tests {
             last_failure: None,
             declined: None,
             proofs_since_spawn: 0,
+            last_spawn_error: None,
+            last_use: None,
         };
         assert!(!pool.lower_sp1_shard_cap(key, &mut operator, Some(total), heavy, true));
         assert!(!operator
@@ -17706,6 +17706,7 @@ mod tests {
             tried += 1;
             Err(anyhow::Error::new(
                 zkminer_prover_protocol::types::HostMemoryShortage {
+                    kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
                     attempted: false,
                     slot_key: k.to_string(),
                     needed: 1,
@@ -18273,14 +18274,15 @@ mod tests {
         assert!(!shrank(roomy, Some(8 * GIB), 24 * GIB, rtx4090));
         // Nothing fits now and the floor is about to refuse: a recycle buys nothing.
         assert!(!shrank(roomy, Some(24 * GIB), 8 * GIB, rtx4090));
-        // But with the floor LOWERED or DISABLED the proof will run, and a live 268M worker must come
-        // down to the 134M tier it now fits, not stay at 268M on 11,000 MiB (in the 134M band).
-        let lowered = Some(9_000 * MIB);
+        // But with the floor LOWERED or DISABLED the proof will run, and a fresh worker below every
+        // tier takes the smallest: a live 268M worker must come down to it, not run at 268M on
+        // 15,178 MiB — which is what `room_needed` already assumed it would.
+        let lowered = Some(15_000 * MIB);
         assert!(vram_tier_shrank(
             roomy,
             "sp1",
             Some(24 * GIB),
-            11_000 * MIB,
+            15_178 * MIB,
             rtx4090,
             lowered
         ));
@@ -18288,7 +18290,7 @@ mod tests {
             roomy,
             "sp1",
             Some(24 * GIB),
-            11_000 * MIB,
+            15_178 * MIB,
             rtx4090,
             None
         ));
@@ -18675,8 +18677,8 @@ mod tests {
             room(roomy, 24_107, Some(Some(SMALL)), floor, rtx4090),
             Bytes(17_553 * MIB)
         );
-        // A live 268M worker on a 4090 whose ceiling is 15,878: 268M now fits (12,512), so it stays —
-        // no resize down, and the room is 268M's.
+        // A live worker bigger than the card now allows is resized down after this, so the room to
+        // make is the smaller tier's.
         assert_eq!(
             room(roomy, 20_000, Some(Some(LARGE)), floor, rtx4090),
             Bytes(17_553 * MIB)
@@ -18688,8 +18690,8 @@ mod tests {
             room(host_134, 24_107, None, floor, rtx4090),
             Bytes(17_553 * MIB)
         );
-        // A 12,288 MiB ceiling now fits 134M (10,012) on v6.1.0, where on v6.0.0 nothing fit.
-        assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Bytes(10_012 * MIB));
+        // Nothing fits even emptied: making room cannot help.
+        assert_eq!(room(roomy, 12 * 1024, None, floor, rtx4090), Hopeless);
 
         // The SERVER's own tier: an operator's 402M on a 5080 runs at 268M, so 11,889 is the room,
         // not the unknown requirement of a configuration the card never runs.
@@ -18716,9 +18718,7 @@ mod tests {
             room(SizingCap::Operator(None), 24_107, None, floor, rtx4090),
             Unknown
         );
-        // 402M is unmeasured, so with a 12,288 ceiling above the 10,012 floor it is Unknown, not
-        // Hopeless (nothing to aim at, but the floor is reachable).
-        assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Unknown);
+        assert_eq!(room(op_402, 12 * 1024, None, floor, rtx4090), Hopeless);
 
         // The OPERATOR's floor, on a 5080 with a 700 MiB display (15,178 emptied).
         // Raised: room up to it, or the gate refuses what recycling allows.
@@ -20906,178 +20906,6 @@ mod preemption_tests {
     }
 }
 
-/// W10-BENCH round 2: the bookkeeping of `BenchmarkRun` on its own, without workers.
-#[cfg(test)]
-mod benchmark_run_tests {
-    use super::*;
-
-    fn row(program: &str, prover_backend: &str) -> BenchmarkEntry {
-        BenchmarkEntry {
-            program_name: program.to_string(),
-            prover_backend: prover_backend.to_string(),
-            cycles: 1_000,
-            duration_secs: 1.0,
-            throughput: 1_000.0,
-            weight: 0.2,
-            precompile: false,
-            wrap_secs: None,
-            power_state: None,
-        }
-    }
-
-    fn full_suite(backend: &str) -> Vec<BenchmarkEntry> {
-        zkminer_prover_protocol::benchmark_suite(backend)
-            .into_iter()
-            .map(|p| p.name)
-            .chain([zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string()])
-            .map(|name| row(&name, backend))
-            .collect()
-    }
-
-    fn measured(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
-        run.record(
-            key,
-            backend,
-            false,
-            Ok(full_suite(backend)),
-            |entries| SlotBenchmarkResult {
-                slot_key: key.to_string(),
-                gpu_name: None,
-                device_index: None,
-                pci_bus_id: None,
-                gpu_tag: tag.to_string(),
-                entries,
-                vram_bytes: None,
-                host_peak_bytes: None,
-            },
-            None,
-            tag,
-        );
-    }
-
-    fn down(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
-        run.record(
-            key,
-            backend,
-            true,
-            Err(anyhow::anyhow!("Backoff: waiting before respawning")),
-            |_| unreachable!(),
-            None,
-            tag,
-        );
-    }
-
-    fn keys(slots: &[SlotBenchmarkFailure]) -> Vec<&str> {
-        slots.iter().map(|f| f.slot_key.as_str()).collect()
-    }
-
-    #[test]
-    fn only_a_same_backend_gpu_covers_for_a_down_slot() {
-        // A CPU worker of the same backend: failure.
-        let mut run = BenchmarkRun::default();
-        measured(&mut run, "risc0:generic", "risc0", "generic");
-        down(&mut run, "risc0:metal:0", "risc0", "metal");
-        let run = run.finish();
-        assert_eq!(keys(&run.failures), ["risc0:metal:0"]);
-        assert!(run.not_benchmarked.is_empty());
-
-        // A GPU of another backend: failure.
-        let mut run = BenchmarkRun::default();
-        measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
-        down(&mut run, "sp1:cuda:0", "sp1", "cuda");
-        let run = run.finish();
-        assert_eq!(keys(&run.failures), ["sp1:cuda:0"]);
-
-        // A GPU of the same backend, whichever order the slots ran in: not benchmarked.
-        for down_first in [true, false] {
-            let mut run = BenchmarkRun::default();
-            if down_first {
-                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
-            }
-            measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
-            if !down_first {
-                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
-            }
-            let run = run.finish();
-            assert!(run.failures.is_empty(), "{:?}", run.failures);
-            assert_eq!(keys(&run.not_benchmarked), ["risc0:cuda:1"]);
-        }
-
-        // A same-backend GPU whose suite came back short does not cover for it either.
-        let mut run = BenchmarkRun::default();
-        let mut short = full_suite("risc0");
-        short.pop();
-        run.record(
-            "risc0:cuda:0",
-            "risc0",
-            false,
-            Ok(short),
-            |entries| SlotBenchmarkResult {
-                slot_key: "risc0:cuda:0".to_string(),
-                gpu_name: None,
-                device_index: None,
-                pci_bus_id: None,
-                gpu_tag: "cuda".to_string(),
-                entries,
-                vram_bytes: None,
-                host_peak_bytes: None,
-            },
-            None,
-            "cuda",
-        );
-        down(&mut run, "risc0:cuda:1", "risc0", "cuda");
-        let mut failed = keys(&run.clone().finish().failures)
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        failed.sort();
-        assert_eq!(failed, ["risc0:cuda:0", "risc0:cuda:1"]);
-    }
-
-    #[test]
-    fn simulated_rows_are_never_results() {
-        assert!(simulated_benchmark_reason("openvm", &[]).is_some());
-        assert!(simulated_benchmark_reason("risc0", &full_suite("risc0")).is_none());
-        let mut rows = full_suite("risc0");
-        rows[0].prover_backend = "simulated".to_string();
-        let reason = simulated_benchmark_reason("risc0", &rows).unwrap();
-        assert!(reason.starts_with(SIMULATED_BENCHMARK), "{reason}");
-
-        // A worker that labels a row simulated: not a result, and alone, the run's failure.
-        let mut run = BenchmarkRun::default();
-        run.record(
-            "risc0:cuda:0",
-            "risc0",
-            false,
-            Ok(rows.clone()),
-            |_| panic!("simulated rows must not become a result"),
-            None,
-            "cuda",
-        );
-        let run = run.finish();
-        assert!(run.results.is_empty());
-        assert_eq!(keys(&run.failures), ["risc0:cuda:0"]);
-
-        // Beside a measured card: reported, and the card's run is clean; it covers for nothing.
-        let mut run = BenchmarkRun::default();
-        measured(&mut run, "risc0:metal:0", "risc0", "metal");
-        run.record(
-            "openvm:cuda:0",
-            "openvm",
-            false,
-            Ok(full_suite("openvm")),
-            |_| panic!("simulated rows must not become a result"),
-            None,
-            "cuda",
-        );
-        down(&mut run, "openvm:cuda:1", "openvm", "cuda");
-        let run = run.finish();
-        assert_eq!(keys(&run.not_benchmarked), ["openvm:cuda:0"]);
-        assert_eq!(keys(&run.failures), ["openvm:cuda:1"]);
-        assert_eq!(run.results.len(), 1);
-    }
-}
-
 /// The 12 GB support, SP1 shard-size cap and VRAM-spill wiring, driven through card readings given
 /// in place of `nvidia-smi` (`WorkerPool::test_set_cards`) and a hermetic environment
 /// (`crate::env::Hermetic`): nothing here reads a card or the shell's variables.
@@ -21098,8 +20926,10 @@ mod spill_and_cap_tests {
             pool.workers.insert(
                 key.to_string(),
                 WorkerEntry {
+                    build: WorkerBuild::default(),
                     slot: Mutex::new(WorkerSlot {
                         handle: None,
+                        decline_retry: DeclineRetry::default(),
                         path: PathBuf::from("/dev/null"),
                         backend: key.split(':').next().unwrap_or(key).to_string(),
                         gpu_tag: key.split(':').nth(1).unwrap_or("generic").to_string(),
@@ -21111,6 +20941,8 @@ mod spill_and_cap_tests {
                         last_failure: None,
                         declined: None,
                         proofs_since_spawn: 0,
+                        last_spawn_error: None,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -21684,8 +21516,10 @@ mod learned_host_peak_tests {
 
     fn entry(backend: &str, pid: u32, started: u64) -> WorkerEntry {
         WorkerEntry {
+            build: WorkerBuild::default(),
             slot: Mutex::new(WorkerSlot {
                 handle: None,
+                decline_retry: DeclineRetry::default(),
                 path: PathBuf::from("/nonexistent"),
                 backend: backend.to_string(),
                 gpu_tag: "cuda".to_string(),
@@ -21697,6 +21531,8 @@ mod learned_host_peak_tests {
                 last_failure: None,
                 declined: None,
                 proofs_since_spawn: 0,
+                last_spawn_error: None,
+                last_use: None,
             }),
             vram_bytes: None,
             pci_bus_id: None,
@@ -21971,7 +21807,7 @@ mod learned_host_peak_tests {
                 "self.learn_host_peak(key, po2, low_water.tree_ram_peak(), low_water.tree_peak());",
             )
             .expect("a success is learned from");
-        assert!(learned < prove.find("Ok(ProofOutput {").unwrap());
+        assert!(learned < prove.find("Ok(SlotProof::Proved(ProofOutput {").unwrap());
         // And each slot is charged its own figure.
         let want = src.split_once("    fn host_want(").unwrap().1;
         assert!(want[..want.find("\n    }\n").unwrap()].contains("self.slot_host_peak(key, po2)"));
@@ -22483,6 +22319,8 @@ mod recycle_tests {
                         declined: None,
                         decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
+                        last_spawn_error: None,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -22558,5 +22396,179 @@ mod recycle_tests {
         assert_eq!(pool.test_intentional_kill("risc0:cuda:0"), Some(false));
         // A worker that is not ours (by start time) is never counted.
         assert!(pool.worker_sockets().unwrap().is_empty());
+    }
+}
+
+/// W10-BENCH round 2: the bookkeeping of `BenchmarkRun` on its own, without workers.
+#[cfg(test)]
+mod benchmark_run_tests {
+    use super::*;
+
+    fn row(program: &str, prover_backend: &str) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: program.to_string(),
+            prover_backend: prover_backend.to_string(),
+            cycles: 1_000,
+            duration_secs: 1.0,
+            throughput: 1_000.0,
+            weight: 0.2,
+            precompile: false,
+            wrap_secs: None,
+            power_state: None,
+        }
+    }
+
+    fn full_suite(backend: &str) -> Vec<BenchmarkEntry> {
+        zkminer_prover_protocol::benchmark_suite(backend)
+            .into_iter()
+            .map(|p| p.name)
+            .chain([zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string()])
+            .map(|name| row(&name, backend))
+            .collect()
+    }
+
+    fn measured(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
+        run.record(
+            key,
+            backend,
+            false,
+            Ok(full_suite(backend)),
+            |entries| SlotBenchmarkResult {
+                slot_key: key.to_string(),
+                gpu_name: None,
+                device_index: None,
+                pci_bus_id: None,
+                gpu_tag: tag.to_string(),
+                entries,
+                vram_bytes: None,
+                host_peak_bytes: None,
+                benchmark_po2: None,
+            },
+            None,
+            tag,
+        );
+    }
+
+    fn down(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
+        run.record(
+            key,
+            backend,
+            true,
+            Err(anyhow::anyhow!("Backoff: waiting before respawning")),
+            |_| unreachable!(),
+            None,
+            tag,
+        );
+    }
+
+    fn keys(slots: &[SlotBenchmarkFailure]) -> Vec<&str> {
+        slots.iter().map(|f| f.slot_key.as_str()).collect()
+    }
+
+    #[test]
+    fn only_a_same_backend_gpu_covers_for_a_down_slot() {
+        // A CPU worker of the same backend: failure.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:generic", "risc0", "generic");
+        down(&mut run, "risc0:metal:0", "risc0", "metal");
+        let run = run.finish();
+        assert_eq!(keys(&run.failures), ["risc0:metal:0"]);
+        assert!(run.not_benchmarked.is_empty());
+
+        // A GPU of another backend: failure.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
+        down(&mut run, "sp1:cuda:0", "sp1", "cuda");
+        let run = run.finish();
+        assert_eq!(keys(&run.failures), ["sp1:cuda:0"]);
+
+        // A GPU of the same backend, whichever order the slots ran in: not benchmarked.
+        for down_first in [true, false] {
+            let mut run = BenchmarkRun::default();
+            if down_first {
+                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+            }
+            measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
+            if !down_first {
+                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+            }
+            let run = run.finish();
+            assert!(run.failures.is_empty(), "{:?}", run.failures);
+            assert_eq!(keys(&run.not_benchmarked), ["risc0:cuda:1"]);
+        }
+
+        // A same-backend GPU whose suite came back short does not cover for it either.
+        let mut run = BenchmarkRun::default();
+        let mut short = full_suite("risc0");
+        short.pop();
+        run.record(
+            "risc0:cuda:0",
+            "risc0",
+            false,
+            Ok(short),
+            |entries| SlotBenchmarkResult {
+                slot_key: "risc0:cuda:0".to_string(),
+                gpu_name: None,
+                device_index: None,
+                pci_bus_id: None,
+                gpu_tag: "cuda".to_string(),
+                entries,
+                vram_bytes: None,
+                host_peak_bytes: None,
+                benchmark_po2: None,
+            },
+            None,
+            "cuda",
+        );
+        down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+        let mut failed = keys(&run.clone().finish().failures)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        failed.sort();
+        assert_eq!(failed, ["risc0:cuda:0", "risc0:cuda:1"]);
+    }
+
+    #[test]
+    fn simulated_rows_are_never_results() {
+        assert!(simulated_benchmark_reason("openvm", &[]).is_some());
+        assert!(simulated_benchmark_reason("risc0", &full_suite("risc0")).is_none());
+        let mut rows = full_suite("risc0");
+        rows[0].prover_backend = "simulated".to_string();
+        let reason = simulated_benchmark_reason("risc0", &rows).unwrap();
+        assert!(reason.starts_with(SIMULATED_BENCHMARK), "{reason}");
+
+        // A worker that labels a row simulated: not a result, and alone, the run's failure.
+        let mut run = BenchmarkRun::default();
+        run.record(
+            "risc0:cuda:0",
+            "risc0",
+            false,
+            Ok(rows.clone()),
+            |_| panic!("simulated rows must not become a result"),
+            None,
+            "cuda",
+        );
+        let run = run.finish();
+        assert!(run.results.is_empty());
+        assert_eq!(keys(&run.failures), ["risc0:cuda:0"]);
+
+        // Beside a measured card: reported, and the card's run is clean; it covers for nothing.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:metal:0", "risc0", "metal");
+        run.record(
+            "openvm:cuda:0",
+            "openvm",
+            false,
+            Ok(full_suite("openvm")),
+            |_| panic!("simulated rows must not become a result"),
+            None,
+            "cuda",
+        );
+        down(&mut run, "openvm:cuda:1", "openvm", "cuda");
+        let run = run.finish();
+        assert_eq!(keys(&run.not_benchmarked), ["openvm:cuda:0"]);
+        assert_eq!(keys(&run.failures), ["openvm:cuda:1"]);
+        assert_eq!(run.results.len(), 1);
     }
 }

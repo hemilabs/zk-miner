@@ -3481,7 +3481,7 @@ struct BenchmarkRun {
     /// A [`ServerLost`], which ended the run where it happened. `results` still holds what came
     /// before, and a row whose wrap alone was lost.
     server_lost: Option<anyhow::Error>,
-    /// A program ran out of GPU memory (`classify_prove_error`), which also ended the run: the
+    /// A program ran out of GPU memory (`prove_error_kind`), which also ended the run: the
     /// card cannot hold this shard size, the programs after it would fail the same way, and rows
     /// measured at a size that does not fit are no measurement of the card. Answered as an
     /// out-of-memory, for the host to measure again one shard size smaller.
@@ -3596,7 +3596,7 @@ fn run_benchmarks(
                 tracing::error!("{name}: {e:#}");
                 let message = format!("{name}: {e:#}");
                 run.out_of_memory |=
-                    matches!(classify_prove_error(&message), ErrorKind::ResourceExhausted);
+                    matches!(prove_error_kind(&message), ErrorKind::ResourceExhausted);
                 run.failed.push(message);
                 if e.is::<ServerLost>() {
                     run.server_lost = Some(e);
@@ -4697,8 +4697,7 @@ mod threshold_tests {
     /// for — a roomy host attached to an occupied card.
     #[test]
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
-        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind. On v6.1.0
-        // 11 GiB is in the 134M band [10,012, 12,512) — a 16 GiB card now fits 268M.
+        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
         assert_eq!(from_vram(18 * GIB, RTX4090), Some(SMALL));
         // Through the function the worker actually calls, not a re-implementation of it.

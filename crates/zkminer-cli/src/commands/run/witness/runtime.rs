@@ -2990,23 +2990,29 @@ impl WitnessRuntime {
     }
 
     /// The job's row on the dashboard follows its proof (Queued → Proving, and the card).
-    fn progress_callback(&self, jid: B256) -> zkminer_prover::dispatcher::ProveProgress {
+    fn progress_callback(&self, jid: B256) -> zkminer_prover::dispatcher::SlotProgress {
         let state = self.state.clone();
         let runtime = tokio::runtime::Handle::current();
-        Box::new(move |_p: f64, slot_key: &str| {
-            let bus = zkminer_prover::engine::worker_pool().and_then(|p| p.bus_id_for_slot(slot_key));
-            let (state, slot_key) = (state.clone(), slot_key.to_string());
-            runtime.spawn(async move {
-                let mut st = state.write().await;
-                if let Some(j) = st.active_jobs.iter_mut().find(|j| j.info.job_id == jid) {
-                    if matches!(j.status, MinerJobStatus::Queued) {
-                        j.status = MinerJobStatus::Proving { progress: 0.0, elapsed_secs: 0 };
+        Box::new(
+            move |_event: zkminer_prover_protocol::ProveEvent, slot_key: &str| {
+                let bus =
+                    zkminer_prover::engine::worker_pool().and_then(|p| p.bus_id_for_slot(slot_key));
+                let (state, slot_key) = (state.clone(), slot_key.to_string());
+                runtime.spawn(async move {
+                    let mut st = state.write().await;
+                    if let Some(j) = st.active_jobs.iter_mut().find(|j| j.info.job_id == jid) {
+                        if matches!(j.status, MinerJobStatus::Queued) {
+                            j.status = MinerJobStatus::Proving {
+                                progress: 0.0,
+                                elapsed_secs: 0,
+                            };
+                        }
+                        j.gpu_bus_id = bus;
+                        j.prover_backend = slot_key;
                     }
-                    j.gpu_bus_id = bus;
-                    j.prover_backend = slot_key;
-                }
-            });
-        })
+                });
+            },
+        )
     }
 
     /// A journal divergence (§15.3): the new journal is checked against the binding and the

@@ -236,6 +236,7 @@ mod tests {
                 cycles: stark_cycles,
                 stark_secs,
                 wrap_secs,
+                power_reduced: None,
             }],
             device_id: "gpu1".to_string(),
             device_label: "GPU1".to_string(),

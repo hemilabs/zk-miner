@@ -1381,7 +1381,7 @@ pub struct HostMemoryShortage {
     /// Bytes already reserved by proofs in flight.
     pub reserved: u64,
     /// What was free of that memory at the moment of the refusal: free RAM (`MemAvailable`), what
-    /// may still be committed (free commit plus page-file growth), or the `/dev/shm` capacity.
+    /// may still be committed (free commit plus page-file growth).
     pub available: u64,
 }
 
@@ -1394,8 +1394,6 @@ pub enum HostMemoryKind {
     /// a CUDA proof's is VRAM that is never in RAM). A larger page file adds it; RAM alone does not
     /// show it.
     Commit,
-    /// The `/dev/shm` tmpfs SP1's native executor stages in (x86-64 Linux).
-    SharedMemory,
 }
 
 impl HostMemoryKind {
@@ -1404,7 +1402,6 @@ impl HostMemoryKind {
         match self {
             Self::Ram => "host RAM",
             Self::Commit => "commit (RAM plus page file)",
-            Self::SharedMemory => "/dev/shm",
         }
     }
 
@@ -1440,11 +1437,6 @@ impl std::fmt::Display for HostMemoryShortage {
                 "Windows commit (RAM plus page file) is short for {slot}: needs ~{needed:.1} GiB, \
                  {reserved:.1} GiB already reserved by proofs in flight, {available:.1} GiB can \
                  still be committed. RAM may be free: a larger page file adds commit"
-            ),
-            HostMemoryKind::SharedMemory => write!(
-                f,
-                "/dev/shm is short for {slot}: needs ~{needed:.1} GiB, {reserved:.1} GiB already \
-                 staged by others, {available:.1} GiB in the tmpfs"
             ),
         }
     }
@@ -2524,9 +2516,7 @@ mod tests {
             commit.contains("a larger page file adds commit"),
             "{commit}"
         );
-        let shm = host(super::HostMemoryKind::SharedMemory);
-        assert!(shm.starts_with("/dev/shm is short for sp1:cuda:0"), "{shm}");
-        for m in [&ram, &commit, &shm] {
+        for m in [&ram, &commit] {
             assert!(!m.contains("  "), "{m}");
         }
         // A proof stopped part-way because Windows was paging it off the card: said as such, with

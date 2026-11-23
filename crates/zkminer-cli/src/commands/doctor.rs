@@ -917,7 +917,7 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             ),
         );
     }
-    let journal = crate::journal::JobJournal::load();
+    let journal = crate::journal::JobJournal::peek();
     // Only locks a start can still finish or release: a breadcrumb past its cutoff is kept until a
     // keeper slashes it, and nothing the operator does changes it.
     let now = std::time::SystemTime::now()
