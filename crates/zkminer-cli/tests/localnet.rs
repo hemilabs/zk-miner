@@ -374,8 +374,13 @@ impl Case {
             Case::FullExclusiveForAnother => {
                 format!("assigned to prover {ANOTHER_PROVER}, and its exclusivity has not lapsed")
             }
-            // Staked or not, the quote's simulated claim reverts: the lock overruns the free stake
-            // (the staking contract's assert, Panic(0x01)) or there is no stake at all.
+            // Staked, the collateral cap sets it aside before any claim is simulated: its lock is
+            // over the share of the stake one job may lock (half, by default). With no stake the
+            // cap is not reached and the quote's simulated claim reverts.
+            Case::HighCollateral if staked => format!(
+                "binding satisfied; it would lock up to {} HEMI of collateral",
+                hemi(HIGH_COLLATERAL_PRICE * MAX_COLLATERAL_BPS as u128 / 10_000)
+            ),
             Case::HighCollateral => {
                 "binding satisfied; the claim would be refused (StakeShort)".into()
             }
