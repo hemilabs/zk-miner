@@ -679,6 +679,7 @@ fn recycle_after_proofs_for(gpu_tag: &str) -> u32 {
 /// The baseline is the maximum SETTLED level over the first [`METAL_IDLE_BASELINE_PROOFS`] proofs
 /// (settled by time, or by a wait whenever a reading could raise it by more than the tolerance), so
 /// ten back-to-back proofs no longer put the transient into it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 const METAL_IDLE_BASELINE_PROOFS: u32 = 10;
 /// The margin is a quarter of the worker's working-set limit, between these bounds, and at most
 /// half the room between that limit and M6's footprint ceiling (see [`metal_growth_margin`]).
@@ -692,6 +693,7 @@ const METAL_IDLE_GROWTH_FLOOR: u64 = 512 << 20;
 const METAL_IDLE_RECLAIM: Duration = Duration::from_secs(2);
 /// A reading this soon after a proof still carries the whole transient: the first reclaim step
 /// came 90 ms after the proof at the earliest (8 traces).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 const METAL_IDLE_FRESH: Duration = Duration::from_millis(50);
 /// The longest one settle wait may take (it runs under the slot lock, before a proof): it waits
 /// until [`METAL_IDLE_RECLAIM`] after the last use, then until two readings agree.
@@ -699,6 +701,7 @@ const METAL_IDLE_SETTLE: Duration = Duration::from_secs(3);
 const METAL_IDLE_SETTLE_POLL: Duration = Duration::from_millis(250);
 /// Two settled readings agree when this close (consecutive settled readings in the traces differed
 /// by 0-1 MiB).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 const METAL_IDLE_AGREE: u64 = 64 << 20;
 /// How far an estimate may rise above the baseline during the baseline proofs before a settle
 /// re-measures it, and how far a fresh reading may drop below the allowance's anchor (the fresh
@@ -708,6 +711,7 @@ const METAL_IDLE_AGREE: u64 = 64 << 20;
 /// anchor (see [`IdleTrack::measured`]) that costs one re-measure, after which the anchor sits at
 /// a trimmed level (the trims stay within ~120 MiB of each other), where the previous per-proof
 /// comparison paid one every trim.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 const METAL_IDLE_TOLERANCE: u64 = 256 << 20;
 /// After this many fresh readings judged with the allowance, the next one over the line is
 /// checked against the line itself (a pass/fail settle: under the line as soon as any reading is,
@@ -716,6 +720,7 @@ const METAL_IDLE_TOLERANCE: u64 = 256 << 20;
 /// level rising) can hide to this many proofs' growth, and at most one allowance. 50 keeps a
 /// back-to-back 4 GiB worker's checks at 1.5 s per 50 proofs, 0.75 % of the shortest (4 s) Metal
 /// proofs; any settled-by-time reading after a proof re-measures the allowance for free.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 const METAL_IDLE_VERIFY_EVERY: u32 = 50;
 /// The allowance's cap, in quarters of the working-set limit: 3/4 of it, which clears the measured
 /// 2644 MiB transient (65 % of a 4 GiB limit) at every tier PLAN 9.1 names.
@@ -764,16 +769,19 @@ enum UseKind {
 /// When a worker slot's last exchange ended, and what it was.
 #[derive(Debug, Clone, Copy)]
 struct LastUse {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     at: Instant,
     kind: UseKind,
     /// A Metal worker's footprint read right as its proof ended (a fresh reading, with the whole
     /// transient), so a later mid-reclaim reading can be judged on it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     footprint: Option<u64>,
 }
 
 /// How settled a reading is, from the time since the worker's last use (see
 /// [`METAL_IDLE_BASELINE_PROOFS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 enum ReadingAge {
     /// At least [`METAL_IDLE_RECLAIM`] after the last use: settled.
     Settled,
@@ -783,6 +791,7 @@ enum ReadingAge {
     Partial,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 fn reading_age(since_last_use: Option<Duration>, kind: UseKind) -> ReadingAge {
     match since_last_use {
         Some(d) if d >= METAL_IDLE_RECLAIM => ReadingAge::Settled,
@@ -802,6 +811,7 @@ struct NetConfig {
 
 /// A Metal worker's idle-footprint history (see [`METAL_IDLE_BASELINE_PROOFS`]), per slot key.
 #[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 struct IdleTrack {
     pid: u32,
     /// Maximum settled level over the first [`METAL_IDLE_BASELINE_PROOFS`] proofs.
@@ -821,6 +831,7 @@ impl IdleTrack {
     /// lower anchor, so the healthy cache trims (the settled level falling 240-400 MiB about every
     /// sixth proof and growing back) cost one re-measure per worker rather than one per trim; a
     /// different transient moves the anchor to its own reading.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn measured(&mut self, proofs: u32, fresh: u64, settled: u64, cap: u64) {
         let a = fresh.saturating_sub(settled).min(cap);
         let agrees = proofs > METAL_IDLE_BASELINE_PROOFS
@@ -839,6 +850,7 @@ impl IdleTrack {
 
 /// Why the net waited for a reading to settle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 enum SettleWhy {
     /// A baseline proof's reading could raise the baseline.
     Baseline,
@@ -856,6 +868,7 @@ enum SettleWhy {
 /// a reading is at most `pass_below` (a pass/fail question) or must return the settled level (to
 /// measure a baseline or an allowance).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 struct SettleAsk {
     why: SettleWhy,
     pass_below: Option<u64>,
@@ -863,6 +876,7 @@ struct SettleAsk {
 
 /// Why [`metal_idle_growth`] recycles: the baseline and the settled footprint over it.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 struct Outgrown {
     baseline: u64,
     settled: u64,
@@ -878,6 +892,7 @@ struct Outgrown {
 /// one estimate (fresh readings minus the allowance) is described on
 /// [`METAL_IDLE_BASELINE_PROOFS`].
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 fn metal_idle_growth(
     track: &mut IdleTrack,
     pid: u32,
@@ -1030,6 +1045,7 @@ fn metal_idle_growth(
 /// `elapsed` is the time since the worker's last use (`None`: unknown, then the reclaim time counts
 /// from the start of this wait). Returns the settled reading; `None` when the footprint cannot be
 /// read or the budget ran out before the reclaim time (an unsettled reading must not judge).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
 fn settle_footprint(
     mut read: impl FnMut() -> Option<u64>,
     mut elapsed: impl FnMut() -> Option<Duration>,
