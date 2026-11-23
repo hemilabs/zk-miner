@@ -9,12 +9,14 @@
 //! side effect of a broader `cargo test`, so it must be asked for by name.
 //!
 //! ```text
-//! ZKMINER_SP1_INPUT=4000000 ZKMINER_TEST_SP1_SLOT=sp1:cuda:0 \
+//! ZKMINER_SP1_INPUT=400000 ZKMINER_TEST_SP1_SLOT=sp1:cuda:0 \
 //!   cargo test --release -p zkminer-prover --test sp1_large_proof -- --ignored --nocapture
 //! ```
 //!
 //! * `ZKMINER_SP1_GUEST`     guest name under `guests/sp1/` (default `sha256-chain`)
-//! * `ZKMINER_SP1_INPUT`     the guest's `u32` input — iterations for `sha256-chain` (default 1_000_000)
+//! * `ZKMINER_SP1_INPUT`     the guest's `u32` input — iterations for `sha256-chain` (default 400_000:
+//!   ~1.7e9 cycles at ~4,260 a round, under the 2e9 cap the worker's execute before every proof
+//!   enforces; `ZKMINER_SP1_EXECUTE_MAX_CYCLES` moves it)
 //! * `ZKMINER_TEST_SP1_SLOT` which slot to prove on, e.g. `sp1:cuda:1`
 //! * `ZKMINER_SP1_TIMEOUT_S` proof timeout in seconds (default 2400)
 
@@ -50,7 +52,7 @@ fn sp1_large_groth16_proof() {
     let input_n: u32 = std::env::var("ZKMINER_SP1_INPUT")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1_000_000);
+        .unwrap_or(400_000);
     let timeout_s: u64 = std::env::var("ZKMINER_SP1_TIMEOUT_S")
         .ok()
         .and_then(|v| v.trim().parse().ok())
