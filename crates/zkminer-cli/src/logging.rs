@@ -356,6 +356,9 @@ impl<'a, M: tracing_subscriber::fmt::MakeWriter<'a>> tracing_subscriber::fmt::Ma
 
 /// The daily rolling `zkminer.log` in `dir`, two weeks of it (the dashboard's and a headless run's).
 pub fn rolling_file(dir: &Path) -> tracing_appender::rolling::RollingFileAppender {
+    // The directory first, as the dashboard's path does (W10-DOC): the builder prunes old files
+    // before it creates it, and on a fresh install its read_dir failure reached stderr.
+    let _ = std::fs::create_dir_all(dir);
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("zkminer.log")
