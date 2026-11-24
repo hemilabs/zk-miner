@@ -50,6 +50,11 @@ fn a_calibration_size_that_does_not_fit_replaces_the_worker_and_charges_no_failu
         .calibrate_slot_po2(KEY, 22)
         .expect_err("22 does not fit");
     assert!(format!("{e:#}").contains("allocation failed"), "{e:#}");
+    // Typed, so the calibration sweep knows the size does not fit and does not retry it.
+    let typed = e
+        .downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>()
+        .expect("a typed answer");
+    assert!(typed.is_gpu_oom(), "{typed}");
     assert_eq!(
         pool.test_consecutive_failures(KEY),
         Some(0),

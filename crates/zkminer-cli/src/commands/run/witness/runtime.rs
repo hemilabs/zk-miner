@@ -2885,7 +2885,7 @@ impl WitnessRuntime {
             let progress = self.progress_callback(jid);
             let (res, used) = tokio::task::spawn_blocking(move || {
                 let mut used = None;
-                let size_on = |slot: &str| sizes2.get(slot).copied();
+                let size_on = |slot: &str| sizes2.get(slot).map(|p| vec![*p]).unwrap_or_default();
                 let r = pool.prove_witness_min_vram(
                     zkminer_prover_protocol::BACKEND_RISC0,
                     &elf,

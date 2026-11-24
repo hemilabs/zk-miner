@@ -387,9 +387,15 @@ pub struct ProgramIdDerivation {
     pub duration_secs: f64,
 }
 
-/// A job's segment size (po2) on each slot, by slot key, or `None` for a slot that must not prove it
-/// (see `WorkerPool::prove_min_vram`).
-pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Option<u8>;
+/// The segment sizes (po2) a job may be proven at on each slot, by slot key, largest first: the card's
+/// own size (or the largest the job was measured at below it), then smaller sizes the job was also
+/// measured at, which `prove_on_slot` falls back to when the card has less room than the larger needs
+/// (`risc0_size_that_fits`). Empty for a slot that must not prove it (see
+/// `WorkerPool::prove_min_vram`).
+pub type SlotPo2<'a> = &'a dyn Fn(&str) -> Vec<u8>;
+
+/// How often a calibration proof reads the card for its worker's peak (`Po2Sample::vram_peak_bytes`).
+const CALIBRATION_VRAM_SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
 /// The cards a job may run on and the order to try them in, as the claim gate planned it (see
 /// `WorkerPool::prove_min_vram`). Both lists hold benchmark device ids (e.g. `gpu0`, `gpu-rocm1`).
@@ -3502,6 +3508,33 @@ enum RoomNeeded {
     Hopeless,
 }
 
+/// The largest of `sizes` (largest first) whose need is at most `available`: its calibrated need among
+/// `samples`, or else `estimate`'s (`discovery::risc0_proof_vram_bytes`, measured peaks of a few
+/// sizes on CUDA cards), or that has neither; the smallest when none fits. See
+/// `WorkerPool::risc0_size_that_fits`.
+fn size_that_fits(
+    sizes: &[u8],
+    samples: &[crate::benchmark::Po2Sample],
+    available: u64,
+    estimate: impl Fn(u8) -> Option<u64>,
+) -> u8 {
+    let need = |p: u8| {
+        samples
+            .iter()
+            .find(|s| s.po2 == p)
+            .and_then(crate::benchmark::Po2Sample::vram_needed)
+            .or_else(|| estimate(p))
+    };
+    sizes
+        .iter()
+        .copied()
+        .find(|&p| need(p).is_none_or(|n| n <= available))
+        .or_else(|| sizes.last().copied())
+        .unwrap_or_default()
+}
+
+const GIB_F: f64 = 1024.0 * 1024.0 * 1024.0;
+
 /// How much room a slot needs on a card of `total` bytes where it could have `ceiling` bytes with every
 /// sibling gone. See `RoomNeeded`.
 ///
@@ -3945,6 +3978,10 @@ pub struct WorkerPool {
     /// Commit in-flight proofs have laid claim to (Windows; `reserve_commit`), beside the RAM ones in
     /// `memory_ledger`.
     commit_ledger: crate::memory::MemoryLedger,
+    /// Each risc0 card's calibration samples, by benchmark device id: what each segment size took of
+    /// the card (`Po2Sample::vram_needed`), for `risc0_size_that_fits`. Published with the host-memory
+    /// figures (`set_risc0_po2_samples`); a card missing from here proves at its own size, as before.
+    risc0_po2_samples: Mutex<HashMap<String, Vec<crate::benchmark::Po2Sample>>>,
     /// Host memory in-flight proofs have laid claim to. See `memory::MemoryLedger`.
     memory_ledger: crate::memory::MemoryLedger,
     /// Backends whose one-time setup has completed on this host; see `warm_up`.
@@ -3990,6 +4027,10 @@ pub struct WorkerPool {
     /// risc0 slots whose card had too little VRAM free for a proof (`risc0_card_short`): the claim
     /// side claims no risc0 job for them until a check finds the room.
     risc0_short: Mutex<HashMap<String, Risc0Short>>,
+    /// The segment size a risc0 proof ran out of GPU memory at, by slot key, for the retry's step down
+    /// (`take_risc0_oom_po2`): the size that ran, which may be one below the job's size for the card
+    /// (`risc0_size_that_fits`).
+    risc0_oom_po2: Mutex<HashMap<String, u8>>,
     /// Each SP1 slot's shard-size cap, for the planner (`sp1_rate_factor`): a copy of what its
     /// spawn environment carries, kept here because a proof holds the slot for its whole length.
     sp1_slot_caps: Mutex<HashMap<String, SlotSp1Cap>>,
@@ -4483,6 +4524,7 @@ impl WorkerPool {
             memory_waiters: Mutex::new(Vec::new()),
             proof_tails: Arc::new(Mutex::new(HashMap::new())),
             commit_ledger: crate::memory::MemoryLedger::default(),
+            risc0_po2_samples: Mutex::new(HashMap::new()),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
             measure_warm_pids: Mutex::new(HashMap::new()),
@@ -4497,6 +4539,7 @@ impl WorkerPool {
             sp1_shard_caps: Mutex::new(None),
             sp1_caps_pending: Mutex::new(HashMap::new()),
             risc0_short: Mutex::new(HashMap::new()),
+            risc0_oom_po2: Mutex::new(HashMap::new()),
             sp1_slot_caps: Mutex::new(HashMap::new()),
             sp1_prove_errors: Mutex::new(HashMap::new()),
             gpu_spills: Arc::new(Mutex::new(HashMap::new())),
@@ -4877,6 +4920,16 @@ impl WorkerPool {
              {outcome}",
             pending.cap
         );
+    }
+
+    /// The segment size the last risc0 proof on `key` ran at, if it ran out of GPU memory there,
+    /// once: the size to step down from, which the caller cannot know (the proof may have run a size
+    /// below the job's size for the card, `risc0_size_that_fits`).
+    pub fn take_risc0_oom_po2(&self, key: &str) -> Option<u8> {
+        self.risc0_oom_po2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key)
     }
 
     /// The benchmark device id of an SP1 slot lowered a tier for a job that just ran out of GPU
@@ -6373,7 +6426,9 @@ impl WorkerPool {
         // Only ever downward. A sweep is calibration: raising po2 above what the caller asked for
         // would invent a sample it never requested, and `calibrate_po2_for_suite` reads the returned
         // `po2` to decide what succeeded.
-        let po2 = match self.check_vram_budget(key, None, None)? {
+        let budget = self.check_vram_budget(key, None, None)?;
+        let available_at_start = budget.as_ref().map(|b| b.available);
+        let po2 = match budget {
             Some(budget) => {
                 let backend = key.split(':').next().unwrap_or(key);
                 let gpu_tag = key.split(':').nth(1).unwrap_or("");
@@ -6499,7 +6554,24 @@ impl WorkerPool {
             self.gpu_spills.clone(),
         );
 
-        let resp = handle.recv();
+        // What the worker holds on the card while it proves, read as admission reads it, so the
+        // sample says how much of the card this size took (`Po2Sample::vram_needed`).
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let peak = std::sync::atomic::AtomicU64::new(0);
+        let resp = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Acquire) {
+                    if let Some(card) = self.read_card(key) {
+                        peak.fetch_max(card.held_by(key), Ordering::Relaxed);
+                    }
+                    std::thread::sleep(CALIBRATION_VRAM_SAMPLE_EVERY);
+                }
+            });
+            let resp = handle.recv();
+            stop.store(true, Ordering::Release);
+            resp
+        });
+        let peak = peak.into_inner();
         if let Some(evicted_mib) = spill_watch.stopped() {
             Self::mark_slot_dead(&mut slot, entry);
             return Err(self.spill_shortage(key, evicted_mib));
@@ -6529,6 +6601,9 @@ impl WorkerPool {
                     segment_count,
                     duration_secs: prove_duration_secs,
                     throughput: total_cycles as f64 / prove_duration_secs.max(1e-9),
+                    vram_peak_bytes: (peak > 0).then_some(peak),
+                    vram_available_bytes: available_at_start,
+                    steady: false,
                 })
             }
             Ok(WorkerResponse::Error { kind, message, .. }) => {
@@ -6545,7 +6620,15 @@ impl WorkerPool {
                     }
                     Self::mark_slot_dead(&mut slot, entry);
                 }
-                Err(anyhow::anyhow!("{key} rejected calibration: {message}"))
+                // Typed, so the sweep can tell a size that does not fit (no retry) from a
+                // refusal or a fault.
+                Err(anyhow::Error::new(
+                    zkminer_prover_protocol::types::WorkerProofError {
+                        kind,
+                        slot_key: key.to_string(),
+                        message: format!("{key} rejected calibration: {message}"),
+                    },
+                ))
             }
             Ok(other) => Err(anyhow::anyhow!(
                 "{key} sent an unexpected response to calibration: {other:?}"
@@ -9437,7 +9520,9 @@ impl WorkerPool {
                 .is_some_and(|s| !s.attempted)
         });
         if refused {
-            let po2 = job_po2.and_then(|size_of| size_of(key)).or(po2);
+            let po2 = job_po2
+                .and_then(|size_of| size_of(key).first().copied())
+                .or(po2);
             self.note_memory_waiter(key, po2, abort_at, execute_peak_bytes);
         }
         result
@@ -9621,7 +9706,7 @@ impl WorkerPool {
         }
         // The other hard filter: only cards at a size this job was measured at. See `job_po2`.
         if let Some(size_of) = job_po2 {
-            all_keys.retain(|k| size_of(k).is_some());
+            all_keys.retain(|k| !size_of(k).is_empty());
             if all_keys.is_empty() {
                 bail!(
                     "no {backend} card proves at a segment size this job was measured at, so it \
@@ -10039,6 +10124,62 @@ impl WorkerPool {
             (Some(gpu_tag), Some(idx)) => Self::gpu_device_id(gpu_tag, idx),
             (Some(gpu_tag), None) => Self::gpu_device_id(gpu_tag, "0"),
         }
+    }
+
+    /// Publish each risc0 card's calibration samples from a suite (see `risc0_size_that_fits`). Call it
+    /// with `set_expected_host_peaks`, whenever a suite is loaded or re-benchmarked.
+    pub fn set_risc0_po2_samples(&self, suite: &crate::benchmark::BenchmarkSuite) {
+        let map: HashMap<String, Vec<crate::benchmark::Po2Sample>> = suite
+            .device_benchmarks
+            .iter()
+            .filter(|d| d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0)
+            .filter(|d| !d.po2_samples.is_empty())
+            .map(|d| (d.device_id.clone(), d.po2_samples.clone()))
+            .collect();
+        *self
+            .risc0_po2_samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = map;
+    }
+
+    /// The largest of a job's `sizes` (largest first) that `key`'s card has room for now, with the room
+    /// ours to make already made (`budget`): the first whose calibrated need (`Po2Sample::vram_needed`)
+    /// is free, or that has no calibrated need (then it is as today: the card proves at its own size,
+    /// and a smaller one needs less). When none fits, the smallest: a calibrated need is a peak plus a
+    /// margin, an upper bound, so the proof is tried rather than refused, and its out-of-memory retry
+    /// (the miner's) steps down further.
+    fn risc0_size_that_fits(&self, key: &str, sizes: &[u8], budget: &VramBudget) -> u8 {
+        let device = Self::benchmark_device_id(key);
+        let samples = self
+            .risc0_po2_samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&device)
+            .cloned()
+            .unwrap_or_default();
+        let gpu_tag = key.split(':').nth(1).unwrap_or("");
+        let estimate = |p| crate::discovery::risc0_proof_vram_bytes(p, gpu_tag, Some(budget.total));
+        let chosen = size_that_fits(sizes, &samples, budget.available, estimate);
+        if Some(&chosen) != sizes.first() {
+            let need = |p: u8| {
+                samples
+                    .iter()
+                    .find(|s| s.po2 == p)
+                    .and_then(crate::benchmark::Po2Sample::vram_needed)
+                    .or_else(|| estimate(p))
+                    .map_or("?".to_string(), |b| format!("{:.1}", b as f64 / GIB_F))
+            };
+            tracing::info!(
+                "{key}: proving at po2 {chosen} rather than {}: {:.1} GiB of the card is free to it \
+                 ({:.1} GiB held elsewhere), and po2 {} needs {} GiB",
+                sizes[0],
+                budget.available as f64 / GIB_F,
+                budget.held_elsewhere as f64 / GIB_F,
+                sizes[0],
+                need(sizes[0]),
+            );
+        }
+        chosen
     }
 
     /// Publish the per-backend host-memory expectations from a measured suite.
@@ -13632,7 +13773,15 @@ impl WorkerPool {
             // Room was made and it still does not fit: claim no more risc0 jobs for this card a
             // while (`risc0_card_short`), as each would wait here and be released.
             if risc0_proof && !card.apps_unread {
-                self.note_risc0_card_short(key, needed, risc0_po2.unwrap_or_default());
+                // Marked at the card's own size, which the claim side asks about
+                // (`risc0_card_short`), when the proof's floor was at or below it: a job's floor is
+                // its smallest size for the card, a fallback below the card's size.
+                let po2 = risc0_po2.unwrap_or_default();
+                let mark = self
+                    .card_po2(key)
+                    .filter(|&card| po2 <= card)
+                    .unwrap_or(po2);
+                self.note_risc0_card_short(key, needed, mark);
             }
             return Err(anyhow::Error::new(shortage));
         }
@@ -13676,14 +13825,19 @@ impl WorkerPool {
     ) -> Result<SlotProof> {
         // Resolve the segment size now that the card is known: a job's size on THIS slot, else the
         // caller's `po2`. A job never reaches a slot it has no size for (`prove_min_vram` filters
-        // those out); refused here too, for a caller that names the slot itself.
-        let po2 = match job_po2 {
-            Some(size_of) => match size_of(key) {
-                Some(p) => Some(p),
-                None => bail!("{key} does not prove at a segment size this job was measured at"),
-            },
-            None => po2,
+        // those out); refused here too, for a caller that names the slot itself. A smaller size the
+        // job was also measured at may replace it once the card's free memory is known (below).
+        let sizes: Vec<u8> = match job_po2 {
+            Some(size_of) => {
+                let sizes = size_of(key);
+                if sizes.is_empty() {
+                    bail!("{key} does not prove at a segment size this job was measured at");
+                }
+                sizes
+            }
+            None => po2.into_iter().collect(),
         };
+        let mut po2 = sizes.first().copied();
 
         // A card whose kernels are compiled on first use (Intel) is warmed up before its first proof,
         // outside this proof's watchdog but inside its deadline; a no-op for every other slot and for
@@ -13738,11 +13892,30 @@ impl WorkerPool {
 
         // Is enough of this card's VRAM free for this backend? See `check_vram_budget`, which also
         // explains why this must come after the guard and before the slot mutex.
-        // A risc0 proof's floor is its segment size's measured peak: the worker proves at `po2`, or
-        // at its default when none is named.
+        // A risc0 proof's floor is the measured peak of the smallest size it may run at here: the
+        // smallest of the job's sizes for this card (`sizes`), or the size named, or the default.
         let risc0_po2 = (key.split(':').next() == Some(zkminer_prover_protocol::BACKEND_RISC0))
-            .then(|| po2.unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2));
-        let _vram_budget = self.check_vram_budget(key, abort_at, risc0_po2)?;
+            .then(|| {
+                sizes
+                    .last()
+                    .copied()
+                    .or(po2)
+                    .unwrap_or(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2)
+            });
+        if risc0_po2.is_some() {
+            // A record from an earlier proof here is not this one's (`take_risc0_oom_po2`).
+            self.risc0_oom_po2
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key);
+        }
+        let vram_budget = self.check_vram_budget(key, abort_at, risc0_po2)?;
+        // With the room ours to make made, the largest of the job's sizes the card has room for now:
+        // another program on the card (a desktop, a game) can have taken what a size was calibrated
+        // with since.
+        if let (Some(budget), [_, _, ..]) = (&vram_budget, sizes.as_slice()) {
+            po2 = Some(self.risc0_size_that_fits(key, &sizes, budget));
+        }
 
         let entry = self
             .workers
@@ -14562,6 +14735,15 @@ impl WorkerPool {
                 }
                 if matches!(kind, ErrorKind::ResourceExhausted) {
                     tracing::warn!("Worker {key} OOM — killing for respawn with clean GPU state");
+                    // risc0: the size that ran out, for the retry's step down (`take_risc0_oom_po2`).
+                    if let (zkminer_prover_protocol::BACKEND_RISC0, Some(ran)) =
+                        (slot.backend.as_str(), po2)
+                    {
+                        self.risc0_oom_po2
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(key.to_string(), ran);
+                    }
                     // SP1: respawn one shard size smaller for the retry (and, once it proves
                     // there, in every later run, unless another program's memory grew meanwhile).
                     let lowered = slot.backend == zkminer_prover_protocol::BACKEND_SP1 && {
@@ -14895,16 +15077,30 @@ impl WorkerPool {
     ///
     /// Mirrors `respawn`'s own arithmetic so the two cannot disagree.
     fn in_respawn_backoff(slot: &WorkerSlot) -> bool {
+        Self::respawn_backoff_left(slot).is_some()
+    }
+
+    /// What is left of `slot`'s respawn backoff window, `None` outside one (see
+    /// `in_respawn_backoff`, which this is the arithmetic of).
+    fn respawn_backoff_left(slot: &WorkerSlot) -> Option<Duration> {
         if slot.handle.is_some() {
-            return false; // alive: nothing to respawn, no window
+            return None; // alive: nothing to respawn, no window
         }
-        match slot.last_failure {
-            Some(last) => {
-                let idx = (slot.consecutive_failures as usize).min(RESPAWN_BACKOFF.len() - 1);
-                last.elapsed() < RESPAWN_BACKOFF[idx]
-            }
-            None => false,
-        }
+        let last = slot.last_failure?;
+        let idx = (slot.consecutive_failures as usize).min(RESPAWN_BACKOFF.len() - 1);
+        RESPAWN_BACKOFF[idx]
+            .checked_sub(last.elapsed())
+            .filter(|left| !left.is_zero())
+    }
+
+    /// How long `key`'s dead worker must still wait before `respawn` starts it again, if it is
+    /// inside that window: for a caller that runs on the slot itself rather than through the
+    /// dispatch loop, which waits the window out (a calibration comparing two sizes right after a
+    /// larger one killed the worker twice, 30 s). `None` when it is alive, busy, or free to respawn.
+    pub fn respawn_backoff_remaining(&self, key: &str) -> Option<Duration> {
+        let entry = self.workers.get(key)?;
+        let slot = entry.slot.try_lock().ok()?;
+        Self::respawn_backoff_left(&slot)
     }
 
     /// `slot_eligible` AND not inside its respawn backoff window.
@@ -17716,10 +17912,69 @@ mod tests {
         );
     }
 
+    /// A job falls back to a smaller size it was measured at only when the card has less room than the
+    /// larger took when calibrated, and is never refused on that estimate.
+    #[test]
+    fn a_job_steps_down_a_size_when_the_card_has_less_room_than_its_size_took() {
+        use crate::benchmark::{Po2Sample, RISC0_VRAM_MARGIN_BYTES};
+        const GIB: u64 = 1 << 30;
+        let calibrated = |po2: u8, peak: u64, free: u64| Po2Sample {
+            po2,
+            vram_peak_bytes: Some(peak),
+            vram_available_bytes: Some(free),
+            ..Po2Sample::default()
+        };
+        // An RTX 4090: po2 21 took the whole of the 23.6 GiB free to it, po2 20 took 17 GiB.
+        let samples = vec![
+            calibrated(21, 23_600 << 20, 23_600 << 20),
+            calibrated(20, 17 * GIB, 23_600 << 20),
+        ];
+        assert_eq!(
+            size_that_fits(&[21, 20], &samples, 23_600 << 20, |_| None),
+            21
+        );
+        // A desktop took 2 GiB since: 21 would not fit as calibrated, 20 still does.
+        assert_eq!(
+            size_that_fits(&[21, 20], &samples, 21_600 << 20, |_| None),
+            20
+        );
+        // 20 needs its 17 GiB peak and the margin.
+        assert_eq!(
+            size_that_fits(
+                &[21, 20],
+                &samples,
+                17 * GIB + RISC0_VRAM_MARGIN_BYTES,
+                |_| None
+            ),
+            20
+        );
+        // Not even that: the smallest, tried rather than refused.
+        assert_eq!(size_that_fits(&[21, 20], &samples, 10 * GIB, |_| None), 20);
+        // A size with no calibrated need is taken as today; one job size, always that.
+        assert_eq!(size_that_fits(&[21, 20], &[], 1, |_| None), 21);
+        assert_eq!(size_that_fits(&[20], &samples, 1, |_| None), 20);
+        assert_eq!(
+            size_that_fits(&[22, 21, 20], &samples, 21_600 << 20, |_| None),
+            22,
+            "22 was never calibrated here: no estimate to step down on"
+        );
+        // An uncalibrated card steps down on the measured peaks it has an estimate for
+        // (`discovery::risc0_proof_vram_bytes`): 20 needs 16 GiB, 19 fits in 12.
+        let estimate = |p: u8| match p {
+            20 => Some(16 * GIB),
+            19 => Some(11 * GIB),
+            _ => None,
+        };
+        assert_eq!(size_that_fits(&[20, 19], &[], 13 * GIB, estimate), 19);
+        assert_eq!(size_that_fits(&[20, 19], &[], 17 * GIB, estimate), 20);
+        // A calibrated need wins over the estimate.
+        assert_eq!(size_that_fits(&[21, 20], &samples, 18 * GIB, estimate), 20);
+    }
+
     #[test]
     fn a_job_is_never_dispatched_to_a_slot_without_a_size_it_was_measured_at() {
         let pool = pool_with_keys(&["risc0:cuda:0", "risc0:cuda:1"]);
-        let none = |_: &str| -> Option<u8> { None };
+        let none = |_: &str| -> Vec<u8> { Vec::new() };
         let mut used = None;
         let err = pool
             .prove_min_vram(
@@ -17767,7 +18022,13 @@ mod tests {
         // With one slot sized for it, the job goes there and nowhere else, however often it is tried
         // (the round-robin would otherwise alternate). Its worker here is /dev/null, so it fails there,
         // and later tries find it backing off and wait it out rather than take the other slot.
-        let only_one = |k: &str| (k == "risc0:cuda:1").then_some(19);
+        let only_one = |k: &str| {
+            if k == "risc0:cuda:1" {
+                vec![19]
+            } else {
+                Vec::new()
+            }
+        };
         for attempt in 0..3 {
             let mut used = None;
             let _ = pool.prove_min_vram(
@@ -19933,6 +20194,27 @@ mod tests {
         );
     }
 
+    /// What is left of a window, for a caller that waits it out itself: after two failures, the
+    /// 30 s step less what has passed; nothing once it has run out or for a live worker.
+    #[test]
+    fn the_backoff_left_is_the_window_less_what_has_passed() {
+        let left =
+            WorkerPool::respawn_backoff_left(&slot_with(2, Some(Duration::from_secs(10)), false))
+                .expect("10 s into a 30 s window");
+        assert!(
+            left <= Duration::from_secs(20) && left > Duration::from_secs(19),
+            "{left:?}"
+        );
+        assert_eq!(
+            WorkerPool::respawn_backoff_left(&slot_with(1, Some(Duration::from_secs(6)), false)),
+            None
+        );
+        assert_eq!(
+            WorkerPool::respawn_backoff_left(&slot_with(0, None, false)),
+            None
+        );
+    }
+
     /// Once the window has elapsed the slot is dispatchable again.
     #[test]
     fn a_cooled_backoff_window_is_dispatchable_again() {
@@ -21277,6 +21559,44 @@ mod spill_and_cap_tests {
         pool.test_set_cards(key, vec![Some(card(fits + 1_000, 1024))]);
         assert!(pool.check_vram_budget(key, None, None).unwrap().is_some());
         assert!(!pool.risc0_card_short(key, 19));
+    }
+
+    /// A job's floor is its smallest size for the card, its fallback one below the card's own size;
+    /// the card is marked short at its own size, which is what the claim side asks about
+    /// (`risc0_card_short` drops a mark for another size), or it would go on claiming risc0 jobs it
+    /// has no room for. A proof at a larger size than the card's (a benchmark) keeps its own.
+    #[test]
+    fn a_short_card_is_marked_at_its_own_size_when_the_floor_was_its_fallback() {
+        let _env = Hermetic::new(&[]);
+        let key = "risc0:cuda:3";
+        let pool = pool(&[key]);
+        pool.set_risc0_card_sizes([(key.to_string(), 20)]);
+        let fits = TOTAL_MIB - RESERVED_MIB - 8_179; // po2 19's measured peak on CUDA
+        pool.test_set_cards(key, vec![Some(card(fits + 1, 1024))]);
+        assert!(pool.check_vram_budget(key, None, Some(19)).is_err());
+        assert!(
+            pool.risc0_card_short(key, 20),
+            "kept for the claim side's size"
+        );
+        assert!(
+            pool.risc0_card_short(key, 20),
+            "and still there on the next tick"
+        );
+
+        pool.test_set_cards(key, vec![Some(card(fits, 1024))]);
+        assert!(pool
+            .check_vram_budget(key, None, Some(19))
+            .unwrap()
+            .is_some());
+        assert!(!pool.risc0_card_short(key, 20), "an admission clears it");
+
+        pool.set_risc0_card_sizes([(key.to_string(), 18)]);
+        pool.test_set_cards(key, vec![Some(card(fits + 1, 1024))]);
+        assert!(pool.check_vram_budget(key, None, Some(19)).is_err());
+        assert!(
+            pool.risc0_card_short(key, 19),
+            "a larger size keeps its own mark"
+        );
     }
 
     /// A refusal on a reading whose process list could not be read is still a refusal, but it is

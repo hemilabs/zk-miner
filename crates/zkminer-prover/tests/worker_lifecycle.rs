@@ -1158,7 +1158,13 @@ fn the_segment_size_reaches_the_worker() {
         .expect("measurement should succeed");
     assert_eq!(m.cycles, 1018);
     // A job's size on its slot wins over the caller's `po2`.
-    let size_on = |k: &str| (k == "mock:generic").then_some(19);
+    let size_on = |k: &str| {
+        if k == "mock:generic" {
+            vec![19]
+        } else {
+            Vec::new()
+        }
+    };
     let mut used = None;
     let out = pool
         .prove_min_vram(
