@@ -5306,6 +5306,16 @@ impl WorkerPool {
                 if std::env::var_os("HSA_NO_SCRATCH_RECLAIM").is_none() {
                     env.insert("HSA_NO_SCRATCH_RECLAIM".into(), "0".into());
                 }
+                // The card's capacity, as for CUDA above: the risc0 worker keeps its Groth16 proving
+                // key cached between proofs only on a card it knows has room beside its next STARK
+                // (`release_groth16_cache_if_tight`). Without it a 24 GB RX 7900 XTX rebuilt the key
+                // for every proof: 2.7-2.8 s wraps against 2.55 s with it kept (2026-11-24).
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
+                }
             }
             "intel" => {
                 // Use a SINGLE device selection mechanism. ZE_AFFINITY_MASK filters at the
@@ -5333,10 +5343,10 @@ impl WorkerPool {
                     backend,
                     pci_bus_id.is_some_and(crate::discovery::intel_is_alchemist),
                 );
-                // On Windows, the card's capacity, as for CUDA above: the risc0 worker keeps its
-                // Groth16 proving key cached on the GPU between proofs only on a card it knows has
-                // room (`release_groth16_cache_if_tight`).
-                #[cfg(windows)]
+                // The card's capacity, as for CUDA above: the risc0 worker keeps its Groth16 proving
+                // key cached on the GPU between proofs only on a card it knows has room
+                // (`release_groth16_cache_if_tight`). On Linux it comes from xe or i915; a 32 GB Arc
+                // Pro B70 rebuilt the key for every proof without it (8.5-9.0 s wraps against 8.3 s).
                 if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
                     env.insert(
                         zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
