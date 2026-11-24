@@ -1811,83 +1811,129 @@ fn sp1_element_threshold_for(scale: f64) -> Option<u64> {
     zkminer_prover_protocol::types::sp1_element_threshold_for_host_scale(scale)
 }
 
-/// Settle `SP1_GPU_ELEMENT_THRESHOLD`, the one knob measured to decide whether a proof completes
-/// at all rather than merely slower.
+/// Settle `SP1_GPU_ELEMENT_THRESHOLD` and SP1's two VRAM savers (`SP1_GPU_DROP_LDES`,
+/// `SP1_GPU_RECOMPUTE_FIRST_LAYER`), the knobs measured to decide whether a proof completes at all
+/// rather than merely slower.
 ///
-/// TWO independent bounds, and the smaller wins:
+/// Independent bounds, and the smallest wins:
 ///
 /// * the HOST's memory, via `scale` — measured on this box, the wrap stage died at 18.0 GiB of
 ///   heap plus 7.0 GiB of shared memory against a 25.1 GiB per-worker ceiling;
+/// * the card's record: a card whose SP1 proof once ran out of GPU memory carries a cap from the
+///   dispatcher (`ZKMINER_SP1_ELEMENT_THRESHOLD_CAP`, `sp1_card_cap`);
 /// * the CARD's FREE memory. SP1's own `local_gpu_opts` sizes from `cuda_memory_info().1`, the
-///   card's TOTAL, discarding the free figure returned beside it. On a card with a display
-///   attached that commits to a tier larger than what is actually free and fails part-way
-///   through — after the job is claimed and the collateral bonded. The dispatcher measures what
-///   is free and passes it in `CUDA_VRAM_AVAILABLE_BYTES_ENV`; this turns it into the tier that
-///   fits.
+///   card's TOTAL, discarding the free figure returned beside it, and runs a 24 GB-class card
+///   without its savers. On a card it shares — a display, an idle risc0 worker's Groth16 cache —
+///   that commits to a configuration larger than what is actually free and fails part-way
+///   through, after the job is claimed and the collateral bonded. The dispatcher measures what is
+///   free and passes it in `CUDA_VRAM_AVAILABLE_BYTES_ENV`; this turns it into the configuration
+///   that fits on this vendor's server (`SP1_GPU_SERVER_NAME`), by the tables the dispatcher
+///   predicts it with (`sp1_worker_sizing`).
 ///
-/// The fork treats the variable as a CAP on its own tier choice, never a raise, so the worst this
+/// The fork treats the threshold as a CAP on its own tier choice, never a raise, so the worst it
 /// can do is leave performance on the table. That direction also matters for soundness: the shape
 /// allow-list is enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a value below
-/// the constant yields shapes the circuit already accepts while one above it does not.
-/// The element threshold `apply_sp1_element_threshold` sets when the operator has not: the smallest
-/// of the host's tier, the free-VRAM tier (`sp1_element_threshold_cap`) and the card's recorded cap
-/// (`card_cap_raw`, as `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` reads, see `sp1_card_cap`). `None`:
-/// nothing bounds it.
+/// the constant yields shapes the circuit already accepts while one above it does not. The savers
+/// change only how a shard is held on the card, not what is proved.
+///
+/// What `apply_sp1_element_threshold` sets when the operator has not: the threshold, and the savers
+/// when the worker sets them (`None`: the server's own), or `None` when nothing bounds it.
 fn element_threshold_to_apply(
     scale: f64,
     available_vram: Option<u64>,
     total_vram: Option<u64>,
     card_cap_raw: Option<&str>,
-) -> Option<u64> {
+    gpu: zkminer_prover_protocol::types::Sp1Gpu,
+    operator_lean: Option<bool>,
+) -> Option<(u64, Option<bool>)> {
     let card_cap = zkminer_prover_protocol::types::sp1_card_cap(card_cap_raw);
-    let computed = zkminer_prover_protocol::types::sp1_element_threshold_cap(
-        scale,
-        available_vram,
+    let cap = [sp1_element_threshold_for(scale), card_cap]
+        .into_iter()
+        .flatten()
+        .min();
+    zkminer_prover_protocol::types::sp1_worker_sizing(
+        gpu,
         total_vram,
-    );
-    [computed, card_cap].into_iter().flatten().min()
+        cap,
+        available_vram,
+        operator_lean,
+    )
 }
 
 fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
-    // Never override what the operator set by hand.
+    use zkminer_prover_protocol::types as t;
+    // Never override what the operator set by hand: a threshold leaves everything to them, savers
+    // only themselves.
     if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok() {
         return;
     }
-    // For the log line only. The threshold itself comes from `sp1_element_threshold_cap`, the shared
-    // function whose inputs the dispatcher reads too when it predicts this worker's tier.
+    let gpu = t::Sp1Gpu::from_server_name(std::env::var("SP1_GPU_SERVER_NAME").ok().as_deref());
+    let operator_lean = t::sp1_operator_lean(|name| std::env::var(name).ok(), gpu, total_vram);
+    // A card whose SP1 proof once ran out of GPU memory carries a cap from the dispatcher
+    // (`sp1_shard_caps`), which it also applies when it predicts this worker's configuration
+    // (`SizingCap`).
+    let card_cap_raw =
+        std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV).ok();
+    let card_cap = t::sp1_card_cap(card_cap_raw.as_deref());
+    // For the log line only. The configuration itself comes from `sp1_worker_sizing`, the shared
+    // function whose inputs the dispatcher reads too when it predicts this worker's configuration.
     let from_host = sp1_element_threshold_for(scale);
     let from_vram = available_vram.map(|a| {
-        match zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
-            a, total_vram,
-        ) {
-            Some(t) => t.to_string(),
+        let cap = [
+            from_host,
+            card_cap,
+            total_vram.map(t::sp1_fork_threshold_for_total_vram),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        match t::sp1_config_for_available_vram(gpu, total_vram, a, cap, operator_lean) {
+            Some(c) => c.to_string(),
             None => format!(
-                "{} ({} MiB free is below every measured tier; using the smallest)",
-                zkminer_prover_protocol::types::sp1_smallest_measured_threshold(),
+                "{} ({} MiB free is below every measured configuration; using the smallest)",
+                t::sp1_smallest_measured_config(gpu, total_vram, cap, operator_lean),
                 a / (1024 * 1024)
             ),
         }
     });
-    // A card whose SP1 proof once ran out of GPU memory carries a cap from the dispatcher
-    // (`sp1_shard_caps`), which it also applies when it predicts this worker's tier (`SizingCap`).
-    let card_cap_raw =
-        std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV).ok();
-    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(card_cap_raw.as_deref());
-    let Some(threshold) =
-        element_threshold_to_apply(scale, available_vram, total_vram, card_cap_raw.as_deref())
-    else {
+    let Some((threshold, lean)) = element_threshold_to_apply(
+        scale,
+        available_vram,
+        total_vram,
+        card_cap_raw.as_deref(),
+        gpu,
+        operator_lean,
+    ) else {
         return;
     };
-    // Only say so when it lowers the fork's own default. With today's tables every computed value
-    // does (the largest measured tier is 268M), so this is a guard for a future table that measures
-    // the default itself, not a branch that fires now.
+    // Only lower the fork's own default. With today's tables every computed value does (the largest
+    // measured threshold is 268M), so this is a guard for a future table that measures the default
+    // itself, not a branch that fires now.
     const DEFAULT_THRESHOLD: u64 = 402_653_184;
-    if threshold >= DEFAULT_THRESHOLD {
-        return;
+    if threshold < DEFAULT_THRESHOLD {
+        // SAFETY: single-threaded startup, before any prover, server or thread exists.
+        unsafe { std::env::set_var(t::SP1_ELEMENT_THRESHOLD_ENV, threshold.to_string()) };
     }
+    let savers = match (lean, operator_lean) {
+        (Some(lean), None) => {
+            let value = if lean { "1" } else { "0" };
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(t::SP1_DROP_LDES_ENV, value);
+                std::env::set_var(t::SP1_RECOMPUTE_FIRST_LAYER_ENV, value);
+            }
+            if lean {
+                "on"
+            } else {
+                "off"
+            }
+        }
+        (_, Some(_)) => "as the operator set them",
+        (None, None) => "the server's own choice",
+    };
     tracing::info!(
-        "SP1 tuning: SP1_GPU_ELEMENT_THRESHOLD={threshold} (default {DEFAULT_THRESHOLD}) — \
-         host budget allows {}, free VRAM allows {}{}",
+        "SP1 tuning on the {gpu:?} server: SP1_GPU_ELEMENT_THRESHOLD={threshold} (default \
+         {DEFAULT_THRESHOLD}), VRAM savers {savers} — host budget allows {}, free VRAM allows {}{}",
         from_host
             .map(|t| t.to_string())
             .unwrap_or_else(|| "no limit".into()),
@@ -1898,13 +1944,6 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
             ))
             .unwrap_or_default(),
     );
-    // SAFETY: single-threaded startup, before any prover, server or thread exists.
-    unsafe {
-        std::env::set_var(
-            zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV,
-            threshold.to_string(),
-        )
-    };
 }
 
 /// The environment variable sp1-gpu-server reads for its progress file (`sp1_prover::worker`'s
@@ -2143,16 +2182,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
             .map(|b| format!("{:.1} GB", b as f64 / 1e9))
             .unwrap_or_else(|| "unknown".into()),
     );
-    // The measured tables are CUDA measurements, taken with the server's small-card memory savers
-    // on, so another vendor's server, or one with a saver switched off, is sized by the larger
-    // card's table, as the dispatcher sizes it (`sizing_total`).
-    let savers_off =
-        zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
-    apply_sp1_worker_tuning(
-        sp1_scale,
-        available_vram,
-        vram_bytes.filter(|_| warmup::drives_cuda() && !savers_off),
-    );
+    // Each vendor's server has its own measured tables, and the operator's savers pick among them
+    // (`sp1_measured_configs`), as the dispatcher sizes it (`SizingCap`).
+    apply_sp1_worker_tuning(sp1_scale, available_vram, vram_bytes);
     #[cfg(windows)]
     windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
     #[cfg(windows)]
@@ -4731,21 +4763,43 @@ mod ipc_fd_tests {
 /// `zkminer_prover_protocol::proc`, which owns it; these are the SP1-specific obligations.
 #[cfg(test)]
 mod threshold_tests {
-    use zkminer_prover_protocol::types::{
-        sp1_element_threshold_cap as cap, sp1_element_threshold_for_available_vram as from_vram,
-    };
+    use zkminer_prover_protocol::types::{sp1_worker_sizing as sizing, Sp1Gpu};
 
     const GIB: u64 = 1024 * 1024 * 1024;
-    /// The card these were written against: an RTX 4090's `memory.total`.
+    /// The cards these were written against: `memory.total` (or amdgpu's, or xe's) for each.
     const RTX4090: Option<u64> = Some(24_564 * 1024 * 1024);
+    const RX7900XTX: Option<u64> = Some(24_560 * 1024 * 1024);
+    const ARC_B70: Option<u64> = Some(32_620 * 1024 * 1024);
     const SMALL: u64 = 134_217_728;
-    /// The largest MEASURED configuration. The fork's own default is 402,653,184 and is deliberately
-    /// absent from the measured table, so nothing here may select it.
+    /// The largest MEASURED configuration on a CUDA card. The fork's own defaults (285,212,672 on a
+    /// 24 GB card, 402,653,184 above) are in no table but the XTX's 285M, measured on that card.
     const LARGEST_MEASURED: u64 = 268_435_456;
     /// What the fork would choose for itself, and the ceiling we may only cap.
     const FORK_DEFAULT: u64 = 402_653_184;
+    const CARDS: [(Sp1Gpu, Option<u64>); 4] = [
+        (Sp1Gpu::Cuda, RTX4090),
+        (Sp1Gpu::Rocm, RX7900XTX),
+        (Sp1Gpu::Intel, ARC_B70),
+        (Sp1Gpu::Cuda, None),
+    ];
 
-    /// The two bounds are independent and the SMALLER must win.
+    fn threshold(
+        gpu: Sp1Gpu,
+        total: Option<u64>,
+        scale: f64,
+        available: Option<u64>,
+    ) -> Option<u64> {
+        sizing(
+            gpu,
+            total,
+            super::sp1_element_threshold_for(scale),
+            available,
+            None,
+        )
+        .map(|(t, _)| t)
+    }
+
+    /// The bounds are independent and the SMALLER must win.
     ///
     /// `apply_sp1_element_threshold` writes to the process environment, so the arithmetic is asserted
     /// here rather than the side effect. The combination is the easy case to get wrong: returning
@@ -4753,26 +4807,54 @@ mod threshold_tests {
     /// for — a roomy host attached to an occupied card.
     #[test]
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
-        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind.
+        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind: with just
+        // what each measured configuration needs free, that configuration's threshold, not a larger.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
-        assert_eq!(from_vram(18 * GIB, RTX4090), Some(SMALL));
-        // Through the function the worker actually calls, not a re-implementation of it.
-        let combined = cap(1.0, Some(18 * GIB), RTX4090);
-        assert_eq!(
-            combined,
-            Some(SMALL),
-            "a host with plenty of RAM must not let an occupied card size itself for a tier that \
-             does not fit"
-        );
+        for (gpu, total) in CARDS {
+            let table = zkminer_prover_protocol::types::sp1_measured_configs(gpu, total, None);
+            for (config, _) in table.configs {
+                let need =
+                    zkminer_prover_protocol::types::sp1_vram_required(gpu, total, *config, None);
+                assert_eq!(
+                    threshold(gpu, total, 1.0, need),
+                    Some(config.threshold),
+                    "{gpu:?}: a host with plenty of RAM must not let an occupied card size itself \
+                     for more than {config}, which is what fits"
+                );
+            }
+        }
 
         // And the converse: a roomy CARD must not let a constrained host off.
-        assert_eq!(from_vram(24 * GIB, RTX4090), Some(LARGEST_MEASURED));
         let host_bound = super::sp1_element_threshold_for(0.3);
         assert!(
             host_bound.is_some_and(|t| t < LARGEST_MEASURED),
             "a tight host budget must still produce a limit: {host_bound:?}"
         );
-        assert_eq!(cap(0.3, Some(24 * GIB), RTX4090), host_bound);
+        for (gpu, total) in CARDS {
+            assert_eq!(threshold(gpu, total, 0.3, Some(24 * GIB)), host_bound);
+        }
+        assert_eq!(
+            threshold(Sp1Gpu::Cuda, RTX4090, 1.0, Some(24 * GIB)),
+            Some(LARGEST_MEASURED)
+        );
+    }
+
+    /// The savers follow the room: off where the card has room for the full configuration, on where
+    /// only the lean one fits, and left alone where the operator set them or the card's figures are
+    /// not this vendor's own.
+    #[test]
+    fn the_savers_follow_the_room() {
+        let cuda = |available, lean| sizing(Sp1Gpu::Cuda, RTX4090, None, Some(available), lean);
+        assert_eq!(cuda(24 * GIB, None), Some((LARGEST_MEASURED, Some(false))));
+        // An RTX 4090 with an idle risc0 worker's 7.4 GiB beside it.
+        assert_eq!(cuda(17 * GIB, None), Some((LARGEST_MEASURED, Some(true))));
+        // The operator's savers: the configuration is of their kind, and they are not touched.
+        assert_eq!(cuda(24 * GIB, Some(true)), Some((LARGEST_MEASURED, None)));
+        // A card nothing has measured (no total): the threshold only.
+        assert_eq!(
+            sizing(Sp1Gpu::Rocm, None, None, Some(24 * GIB), None),
+            Some((LARGEST_MEASURED, None))
+        );
     }
 
     /// Only ever a CAP. The fork treats `SP1_GPU_ELEMENT_THRESHOLD` as a bound on its own tier, and the
@@ -4781,22 +4863,26 @@ mod threshold_tests {
     #[test]
     fn no_computed_threshold_ever_exceeds_what_is_allowed() {
         // The VRAM path may only ever select a MEASURED configuration, which is stricter than the
-        // fork's default: an unmeasured tier is one whose peak VRAM we cannot vouch for.
-        for (gib, total) in (0..=64u64).flat_map(|g| {
-            [
-                RTX4090,
-                Some(12_282 * 1024 * 1024),
-                Some(16_303 * 1024 * 1024),
-                None,
-            ]
-            .map(|t| (g, t))
-        }) {
-            if let Some(t) = from_vram(gib * GIB, total) {
-                assert!(
-                    t <= LARGEST_MEASURED,
-                    "{gib} GiB free produced {t}, above the largest measured configuration \
-                     {LARGEST_MEASURED}"
-                );
+        // fork's default: an unmeasured one is one whose VRAM we cannot vouch for.
+        for (gpu, total) in CARDS.into_iter().chain([
+            (Sp1Gpu::Cuda, Some(12_282 * 1024 * 1024)),
+            (Sp1Gpu::Cuda, Some(16_303 * 1024 * 1024)),
+        ]) {
+            let largest = zkminer_prover_protocol::types::sp1_measured_configs(gpu, total, None)
+                .configs
+                .iter()
+                .map(|(c, _)| c.threshold)
+                .max()
+                .unwrap_or(SMALL);
+            assert!(largest <= FORK_DEFAULT);
+            for gib in 0..=64u64 {
+                if let Some(t) = threshold(gpu, total, 1.0, Some(gib * GIB)) {
+                    assert!(
+                        t <= largest,
+                        "{gpu:?}: {gib} GiB free produced {t}, above the largest measured \
+                         configuration {largest}"
+                    );
+                }
             }
         }
         // The host path snaps to its own measured steps, bounded by what the fork would do anyway.
@@ -4849,29 +4935,29 @@ mod threshold_tests {
     /// ignored.
     #[test]
     fn the_cards_recorded_cap_bounds_the_worker_with_the_others() {
-        use super::element_threshold_to_apply as apply;
         const RTX4070: Option<u64> = Some(12_282 * 1024 * 1024);
+        let apply = |available, total, cap| {
+            super::element_threshold_to_apply(1.0, available, total, cap, Sp1Gpu::Cuda, None)
+                .map(|(t, _)| t)
+        };
         let idle_4070 = Some(12_010 * 1024 * 1024);
-        assert_eq!(apply(1.0, idle_4070, RTX4070, None), Some(LARGEST_MEASURED));
-        assert_eq!(
-            apply(1.0, idle_4070, RTX4070, Some("134217728")),
-            Some(SMALL)
-        );
+        assert_eq!(apply(idle_4070, RTX4070, None), Some(LARGEST_MEASURED));
+        assert_eq!(apply(idle_4070, RTX4070, Some("134217728")), Some(SMALL));
         // The cap only lowers.
         assert_eq!(
-            apply(1.0, Some(9 * GIB), RTX4070, Some("268435456")),
-            cap(1.0, Some(9 * GIB), RTX4070)
+            apply(Some(9 * GIB), RTX4070, Some("268435456")),
+            threshold(Sp1Gpu::Cuda, RTX4070, 1.0, Some(9 * GIB))
         );
         // Below every measured size: held at the smallest, never a size nothing measured.
-        assert_eq!(apply(1.0, idle_4070, RTX4070, Some("1000")), Some(SMALL));
+        assert_eq!(apply(idle_4070, RTX4070, Some("1000")), Some(SMALL));
         // Not a number: no cap.
         assert_eq!(
-            apply(1.0, idle_4070, RTX4070, Some("lots")),
+            apply(idle_4070, RTX4070, Some("lots")),
             Some(LARGEST_MEASURED)
         );
         // Nothing else bounds it: the cap alone does.
-        assert_eq!(apply(1.0, None, None, Some("134217728")), Some(SMALL));
-        assert_eq!(apply(1.0, None, None, None), None);
+        assert_eq!(apply(None, None, Some("134217728")), Some(SMALL));
+        assert_eq!(apply(None, None, None), None);
         // The worker applies it as computed here, after the operator's own value.
         let src = include_str!("main.rs");
         let body = src
@@ -4886,7 +4972,7 @@ mod threshold_tests {
             .find("std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)")
             .expect("the card's cap is no longer read");
         let applied = body
-            .find("element_threshold_to_apply(scale, available_vram, total_vram, card_cap_raw.as_deref())")
+            .find("element_threshold_to_apply(\n        scale,\n        available_vram,\n        total_vram,\n        card_cap_raw.as_deref(),")
             .expect("the threshold is no longer computed with the card's cap");
         assert!(operator < cap_env && cap_env < applied);
     }

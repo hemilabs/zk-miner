@@ -910,58 +910,120 @@ pub const CUDA_VRAM_AVAILABLE_BYTES_ENV: &str = "ZKMINER_CUDA_VRAM_AVAILABLE_BYT
 /// MiB, as `nvidia-smi` reports it.
 const MIB: u64 = 1024 * 1024;
 
-/// Measured `(element threshold, peak VRAM)` for SP1 on a CUDA card of MORE than 16 GiB, largest
-/// first. A card whose total is not given has its own table, [`SP1_OTHER_SERVER_TIERS`].
-///
-/// Measured 2026-11-17 on a 32,607 MiB RTX 5090 under Windows with the pinned server (circuit
-/// v6.1.0) and the SP1 benchmark suite through to Groth16 seals, every program verified:
-/// 22,944 MiB at 268M and 17,041 MiB at 134M (`nvidia-smi`'s figure less the 1.7 GiB the card
-/// held before the worker started). The server reaches that level on the first large proof and
-/// holds it in its memory pool for the rest of the process, so it is also what nothing else on the
-/// card can use.
-///
-/// The figures this replaced (17,766 MiB at 268M on a 4090, 15,092 at 134M on a 5080, now
-/// [`SP1_OTHER_SERVER_TIERS`]) were taken under the v6.0.0 server, which dropped the LDEs and
-/// recomputed the first GKR layer on 24 GB cards too. The pinned server does both only on a CUDA
-/// card of 16 GiB or less (ceil(GiB) + 4 <= 20), so above that they were ~5 GiB short at 268M.
-///
-/// A card above 16 GiB but under 24 GiB (a 24,564 MiB RTX 4090 among them) needs less than the
-/// 5090 did: its server keeps no wrap or shrink proving key between proofs, and runs its Groth16
-/// on the GPU only when its own check finds the memory free. The table is an upper bound there,
-/// which errs toward the smaller tier, never toward a spill. An emptied 4090 still clears 268M.
-///
-/// `402_653_184` — the fork's own default — is deliberately ABSENT. Nothing here has measured its peak
-/// VRAM, and this table is used to decide what will fit. Its omission makes a roomy card slightly
-/// conservative (it is capped to 268M rather than left at 402M) and never unsafe, which is the same
-/// trade `sp1_element_threshold_for_host_scale` already makes for host memory: only ever a value
-/// measured to complete a proof.
-const SP1_MEASURED_TIERS: &[(u64, u64)] =
-    &[(268_435_456, 22_944 * MIB), (134_217_728, 17_041 * MIB)];
+/// Which vendor's build of `sp1-gpu-server` proves for an SP1 worker: CUDA's (`sp1-gpu-server`, the
+/// SDK's default), ROCm's (`sp1-gpu-server-hip`) or Intel's (`sp1-gpu-server-sycl`). The same
+/// configuration asks different amounts of their cards — ROCm's device-memory arena takes the card's
+/// free memory less 2 GiB up front and grows from there, Intel's caching allocator holds what it has
+/// touched, CUDA's allocates as it goes — so each has its own measured tables
+/// ([`sp1_measured_configs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sp1Gpu {
+    Cuda,
+    Rocm,
+    Intel,
+}
 
-/// `(element threshold, peak VRAM)` for an SP1 card whose total is not given: an AMD or Intel card,
-/// a CUDA card of 16 GiB or less with its server's memory savers switched off
-/// ([`sp1_small_card_savers_off`]), or one whose total could not be read.
-///
-/// These are the CUDA figures of the v6.0.0 server (17,766 MiB of a 4090 at 268M, 15,092 MiB of a
-/// 5080 at 134M), kept as they were. Nothing has measured the pinned server on these cards, and the
-/// CUDA card's table above does not describe them: a HIP server picks a smaller tier on a 16 GB
-/// card when Windows grants it too little, and a SYCL server's caching allocator fills the card
-/// whatever the tier, so neither peaks where a CUDA one does. Held to [`SP1_MEASURED_TIERS`] they
-/// would lose SP1 on every 16 GB card (an RX 9070 XT, an Arc A770), which prove it here. A 12-16
-/// GiB CUDA card with its savers off still needs less than these at 134M (11,023 MiB measured on
-/// an RTX 4070 under the pinned server, 2026-11-17).
-const SP1_OTHER_SERVER_TIERS: &[(u64, u64)] =
-    &[(268_435_456, 17_766 * MIB), (134_217_728, 15_092 * MIB)];
+impl Sp1Gpu {
+    /// From a slot's GPU tag (`"cuda"`, `"rocm"`, `"intel"`); anything else runs CUDA's server.
+    pub fn from_gpu_tag(tag: &str) -> Self {
+        match tag {
+            "rocm" => Self::Rocm,
+            "intel" => Self::Intel,
+            _ => Self::Cuda,
+        }
+    }
 
-/// Measured `(element threshold, peak VRAM)` for SP1 on a CUDA card of 16 GiB or less, largest
-/// first. Callers give an AMD or Intel card no total, so it is sized by [`SP1_OTHER_SERVER_TIERS`]: a
-/// SYCL server keeps its LDEs on a 13-16 GiB card (an A770 peaks around 14 GB at 134M), and nothing
-/// has measured a HIP one.
+    /// From `SP1_GPU_SERVER_NAME` as a worker inherits it: the dispatcher names the AMD and Intel
+    /// builds, and CUDA's is the SDK's default, with the variable unset.
+    pub fn from_server_name(name: Option<&str>) -> Self {
+        match name {
+            Some(n) if n.ends_with("-hip") => Self::Rocm,
+            Some(n) if n.ends_with("-sycl") => Self::Intel,
+            _ => Self::Cuda,
+        }
+    }
+}
+
+/// SP1's two device-memory savers, both read by `sp1-gpu-server` (`local_gpu_opts`): drop each
+/// shard's LDEs after the trace commit and re-encode them later (~6 GiB at a full shard), and recompute
+/// the first GKR layer rather than keep it (~2.8 GiB). `1`/`true` on, `0`/`false` off; unset, the
+/// server decides from the card's total ([`sp1_fork_lean_for_total_vram`]).
+pub const SP1_DROP_LDES_ENV: &str = "SP1_GPU_DROP_LDES";
+/// See [`SP1_DROP_LDES_ENV`].
+pub const SP1_RECOMPUTE_FIRST_LAYER_ENV: &str = "SP1_GPU_RECOMPUTE_FIRST_LAYER";
+
+/// One configuration of SP1's GPU prover, as far as its device memory goes: the shard element
+/// threshold (`SP1_GPU_ELEMENT_THRESHOLD`), and whether the server runs LEAN — both savers of
+/// [`SP1_DROP_LDES_ENV`] on.
 ///
-/// The server sizes itself from the card's total (`local_gpu_opts`, `ceil(total GiB) + 4 <= 20`) and
-/// on these cards drops its LDE codewords after committing, recomputes the first GKR layer, keeps no
-/// wrap or shrink key between proofs, and caches no preprocessed data — so the same threshold needs
-/// far less than on a 24 GB card, and the larger tables above would refuse a 12 GB card outright.
+/// The server turns the savers on by itself only on cards of 16 GiB or less, so a 24 GB-class card
+/// runs without them, and needs far more than the same threshold does on a 16 GB card: at 268M on an
+/// RTX 4090, 12.6 GiB free proved lean and 17.6 did not prove full (2026-11-24). Lean costs time — a
+/// little on CUDA, a third or more on ROCm (see the tables) — so a worker runs full where the card
+/// has room and steps down where it has not, rather than running lean always.
+///
+/// Ordered by what it asks of the card: a larger threshold above a smaller one, and at one threshold
+/// full above lean. A configuration that orders below another needs less VRAM in every measured table
+/// (`sp1_measured_configs`), and is slower or no faster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sp1Config {
+    pub threshold: u64,
+    pub lean: bool,
+}
+
+impl Sp1Config {
+    pub const fn full(threshold: u64) -> Self {
+        Self {
+            threshold,
+            lean: false,
+        }
+    }
+
+    pub const fn lean(threshold: u64) -> Self {
+        Self {
+            threshold,
+            lean: true,
+        }
+    }
+}
+
+impl Ord for Sp1Config {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.threshold, !self.lean).cmp(&(other.threshold, !other.lean))
+    }
+}
+
+impl PartialOrd for Sp1Config {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for Sp1Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.lean {
+            write!(f, "{} lean", self.threshold)
+        } else {
+            write!(f, "{}", self.threshold)
+        }
+    }
+}
+
+const SP1_285M: u64 = 285_212_672;
+const SP1_268M: u64 = 268_435_456;
+const SP1_134M: u64 = 134_217_728;
+
+/// One card class's measured configurations, largest first, each with the VRAM it needs free (less
+/// [`SP1_VRAM_MARGIN`]), and whether the worker sets the savers for the configuration it picks
+/// (`sets_savers`). Where it does not, the server runs them as it decides from the card's total, and
+/// the figures are bounds for either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sp1Table {
+    pub configs: &'static [(Sp1Config, u64)],
+    pub sets_savers: bool,
+}
+
+/// A CUDA card of 16 GiB or less, where the server runs lean by itself.
 ///
 /// Measured 2026-11-16 on a 12,282 MiB RTX 4070 under Windows, driving no display, with the SP1
 /// benchmark suite through to Groth16 seals (`nvidia-smi`'s figure, every program verified):
@@ -970,79 +1032,279 @@ const SP1_OTHER_SERVER_TIERS: &[(u64, u64)] =
 /// CUDA card runs it on the GPU only when its own check finds the memory free beside the prover.
 ///
 /// 268M fills a 12 GB card, and it needs to: with 1.5 GiB of the card taken by a test allocation
-/// first (standing in for a display), the same suite spilled into system memory and `sha256-chain` took 101 s instead
-/// of 33. So the figure is what the configuration needs, not what an allocator took because it was
-/// there.
-const SP1_MEASURED_TIERS_16GB: &[(u64, u64)] =
-    &[(268_435_456, 11_377 * MIB), (134_217_728, 8_655 * MIB)];
+/// first (standing in for a display), the same suite spilled into system memory and `sha256-chain`
+/// took 101 s instead of 33. So the figure is what the configuration needs, not what an allocator
+/// took because it was there.
+const SP1_CUDA_16GB: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::lean(SP1_268M), 11_377 * MIB),
+        (Sp1Config::lean(SP1_134M), 8_655 * MIB),
+    ],
+    sets_savers: true,
+};
 
-/// The largest card total that `sp1-gpu-server` treats as a 16 GB card (see
-/// [`SP1_MEASURED_TIERS_16GB`]): `ceil(total GiB) + 4 <= 20`.
-const SP1_16GB_CARD_MAX_TOTAL: u64 = 16 * 1024 * MIB;
+/// A CUDA card of 17-26 GiB (`ceil(GiB) + 4 <= 30`: the 24 GB class), where the server runs without
+/// the savers by itself, and keeps no wrap or shrink proving key between proofs.
+///
+/// "Needed free" is what the card had free to the worker when the proof started, at the lowest figure
+/// a proof was seen to complete (the next step down, 1 GiB lower, failed where one is given), on
+/// hemilabs/sp1 d20bbb6 (v6.8.1, circuit v6.1.0) under Linux with a VRAM ballast beside it
+/// (2026-11-24). The proof is fibonacci(4,000,000), 13.4M cycles: it asked more of the card than a
+/// 1.7e9-cycle `sha256-chain` did, so the working set is the shard's, not the job's. `free` and not a
+/// peak, because a server's allocator takes what is free (ROCm's arena, Intel's cache) and a sampled
+/// peak then measures the card, not the need.
+///
+/// RTX 4090: 268M full proved at 19,048 MiB free (twice; and the 1.7e9-cycle proof at 20,072) and not
+/// at 18,024; 268M lean at 12,904 and not at 11,880; 134M full at 11,880; 134M lean at 9,832. In that
+/// order each needs less and is slower: a 425M-cycle proof took 76.1-85.1 s full at 268M, 82.8-84.1
+/// lean, 91.5 at 134M full.
+const SP1_CUDA_24GB: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::full(SP1_268M), 19_048 * MIB),
+        (Sp1Config::lean(SP1_268M), 12_904 * MIB),
+        (Sp1Config::full(SP1_134M), 11_880 * MIB),
+        (Sp1Config::lean(SP1_134M), 9_832 * MIB),
+    ],
+    sets_savers: true,
+};
+
+/// A CUDA card of 27 GiB or more (`ceil(GiB) + 4 > 30`), whose server also keeps a separate recursion
+/// stream, and the wrap and shrink keys between proofs.
+///
+/// Measured 2026-11-17 on a 32,607 MiB RTX 5090 under Windows with the pinned server (circuit
+/// v6.1.0) and the SP1 benchmark suite through to Groth16 seals, every program verified:
+/// 22,944 MiB at 268M and 17,041 MiB at 134M (`nvidia-smi`'s figure less the 1.7 GiB the card
+/// held before the worker started). The server reaches that level on the first large proof and
+/// holds it in its memory pool for the rest of the process, so it is also what nothing else on the
+/// card can use. Nothing has measured such a card lean.
+const SP1_CUDA_32GB: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::full(SP1_268M), 22_944 * MIB),
+        (Sp1Config::full(SP1_134M), 17_041 * MIB),
+    ],
+    sets_savers: true,
+};
+
+/// As [`SP1_CUDA_24GB`], on an RX 7900 XTX (ROCm 7.1, the arena on): 285M full (the server's own tier
+/// for the class) proved at 19,185 MiB free and not at 18,673; 268M full at 18,161 and not at 17,137
+/// (the arena, 15,136 MiB plus what it could grow, full); 134M full at 12,017 (growing its arena three
+/// times); 134M lean at 9,969. 285M is the faster on this card: a 1.7e9-cycle sha256-chain proof took
+/// 246 and 260 s there against 257 and 264 s at 268M, and the SP1 benchmark ran 4.7% faster at it. (On
+/// the 4090 285M was the slower, 186-192 s against 181-182, needing as much as 268M: not in its table.)
+///
+/// 268M lean is left out: there it proved at 14,065 and not at 13,041 — MORE than 134M full needs — and
+/// slower too. The savers cost ROCm far more than CUDA: the 425M-cycle proof took 110-121 s at 268M
+/// full, 136 s at 134M full and 160-173 s at 268M lean.
+const SP1_ROCM_24GB: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::full(SP1_285M), 19_185 * MIB),
+        (Sp1Config::full(SP1_268M), 18_161 * MIB),
+        (Sp1Config::full(SP1_134M), 12_017 * MIB),
+        (Sp1Config::lean(SP1_134M), 9_969 * MIB),
+    ],
+    sets_savers: true,
+};
+
+/// As [`SP1_CUDA_24GB`], on a 32 GB Arc Pro B70 (Level Zero; an Intel server keeps no separate
+/// recursion stream): 268M full proved at 9,880 MiB free, the lowest tried with it; 134M lean at 7,832.
+/// (134M full proved at 9,880 too, needing no less than 268M full, and is left out.)
+const SP1_INTEL_32GB: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::full(SP1_268M), 9_880 * MIB),
+        (Sp1Config::lean(SP1_134M), 7_832 * MIB),
+    ],
+    sets_savers: true,
+};
+
+/// Any other card — an AMD card outside the 24 GB class, an Intel one under 27 GiB, a card whose total
+/// is not given — and a CUDA card whose savers the operator set where its own table has none of their
+/// kind. The worker leaves the savers to the server there, and these bounds hold for either.
+///
+/// These are the CUDA figures of the v6.0.0 server (17,766 MiB of a 4090 at 268M, 15,092 MiB of a
+/// 5080 at 134M), kept as they were: nothing has measured the pinned server on these cards. A HIP
+/// server picks a smaller tier on a 16 GB card when Windows grants it too little, and a SYCL server's
+/// caching allocator fills the card whatever the tier, so neither peaks where a CUDA one does. Held to
+/// a 24 GB card's figures they would lose SP1 on every 16 GB card (an RX 9070 XT, an Arc A770), which
+/// prove it here.
+const SP1_OTHER_SERVER: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::full(SP1_268M), 17_766 * MIB),
+        (Sp1Config::full(SP1_134M), 15_092 * MIB),
+    ],
+    sets_savers: false,
+};
 
 /// The largest card total `sp1-gpu-server` refuses: it panics at start-up ("Unsupported GPU memory")
 /// when `ceil(total GiB) + 4 < 16`, so on any card of 11 GiB or less.
 const SP1_UNSUPPORTED_CARD_MAX_TOTAL: u64 = 11 * 1024 * MIB;
 
-/// Whether the environment `get` reads switches off a memory saver `sp1-gpu-server` runs on a CUDA
-/// card of 16 GiB or less: dropping the LDEs (`SP1_GPU_DROP_LDES`, ~6 GiB at a 100K shard) or
-/// recomputing the first GKR layer (`SP1_GPU_RECOMPUTE_FIRST_LAYER`, ~2.8 GiB). The server reads
-/// both from the environment it inherits, and turns a saver off on "0" or "false".
-/// [`SP1_MEASURED_TIERS_16GB`] was measured with both on, so a card with either off is sized as a
-/// larger card (no total): its room is never under what its server takes.
+/// `gpu`'s measured configurations on a card of `total` bytes, largest first: none for a card the
+/// server refuses, [`SP1_OTHER_SERVER`] for a class nothing has measured or a card whose total is not
+/// given, and that too when the operator set the savers (`lean`) and the class's table has none of
+/// that kind. Card classes are the server's own (`local_gpu_opts`, `ceil(total GiB) + 4`): 20 or less,
+/// 30 or less, above.
+pub fn sp1_measured_configs(gpu: Sp1Gpu, total: Option<u64>, lean: Option<bool>) -> Sp1Table {
+    let Some(total) = total else {
+        return SP1_OTHER_SERVER;
+    };
+    if total <= SP1_UNSUPPORTED_CARD_MAX_TOTAL {
+        return Sp1Table {
+            configs: &[],
+            sets_savers: false,
+        };
+    }
+    let table = match (gpu, sp1_fork_gpu_memory_gb(total)) {
+        (Sp1Gpu::Cuda, ..=20) => SP1_CUDA_16GB,
+        (Sp1Gpu::Cuda, ..=30) => SP1_CUDA_24GB,
+        (Sp1Gpu::Cuda, _) => SP1_CUDA_32GB,
+        (Sp1Gpu::Rocm, 21..=30) => SP1_ROCM_24GB,
+        (Sp1Gpu::Intel, 31..) => SP1_INTEL_32GB,
+        _ => SP1_OTHER_SERVER,
+    };
+    match lean {
+        Some(l) if !table.configs.iter().any(|(c, _)| c.lean == l) => SP1_OTHER_SERVER,
+        _ => table,
+    }
+}
+
+/// Whether the environment `get` reads switches off a memory saver `sp1-gpu-server` runs on a card
+/// of 16 GiB or less: dropping the LDEs (`SP1_GPU_DROP_LDES`, ~6 GiB at a 100K shard) or recomputing
+/// the first GKR layer (`SP1_GPU_RECOMPUTE_FIRST_LAYER`, ~2.8 GiB). The server reads both from the
+/// environment it inherits, and turns a saver off on "0" or "false".
 pub fn sp1_small_card_savers_off(get: impl Fn(&str) -> Option<String>) -> bool {
-    ["SP1_GPU_DROP_LDES", "SP1_GPU_RECOMPUTE_FIRST_LAYER"]
+    [SP1_DROP_LDES_ENV, SP1_RECOMPUTE_FIRST_LAYER_ENV]
         .iter()
         .any(|var| matches!(get(var).as_deref(), Some("0" | "false")))
 }
 
-/// Whether `sp1-gpu-server` runs its small-card memory savers by default on a CUDA card of `total`
-/// bytes: on one it accepts of 16 GiB or less (`ceil(GiB) + 4 <= 20`). Larger cards run without
-/// them, which [`SP1_MEASURED_TIERS`] measures.
+/// Whether `sp1-gpu-server` runs its small-card memory savers by default on a card of `total` bytes:
+/// on one it accepts of 16 GiB or less (`ceil(GiB) + 4 <= 20`). Larger cards run without them.
 pub fn sp1_savers_are_the_default(total: u64) -> bool {
-    total > SP1_UNSUPPORTED_CARD_MAX_TOTAL && total <= SP1_16GB_CARD_MAX_TOTAL
+    total > SP1_UNSUPPORTED_CARD_MAX_TOTAL && sp1_fork_gpu_memory_gb(total) <= 20
 }
 
-/// The measured tiers for a card of `total` bytes, largest first: none for a card the server refuses,
-/// and [`SP1_OTHER_SERVER_TIERS`] when no total is given.
-fn sp1_measured_tiers(total: Option<u64>) -> &'static [(u64, u64)] {
-    match total {
-        None => SP1_OTHER_SERVER_TIERS,
-        Some(t) if t <= SP1_UNSUPPORTED_CARD_MAX_TOTAL => &[],
-        Some(t) if t <= SP1_16GB_CARD_MAX_TOTAL => SP1_MEASURED_TIERS_16GB,
-        Some(_) => SP1_MEASURED_TIERS,
+/// The operator's own setting of SP1's savers, from the environment a worker gets (`var` reads it),
+/// for `gpu`'s server on a card of `total` bytes: `None` when neither is set and the worker chooses;
+/// otherwise whether the server then runs lean, both savers on. Read as `local_gpu_opts` reads them:
+/// "1"/"true" on, "0"/"false" off, any other value as unset; a saver left unset runs as the server's
+/// default for the card (on a card of 16 GiB or less; Intel drops its LDEs only at 12 GiB or less),
+/// so `SP1_GPU_DROP_LDES=1` alone leaves a 16 GB card fully lean. Half lean, which no table measures,
+/// counts as full: the larger need. An unknown `total` takes an unset saver as off, for the same
+/// reason.
+pub fn sp1_operator_lean(
+    var: impl Fn(&str) -> Option<String>,
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+) -> Option<bool> {
+    let set = |name: &str| match var(name)?.as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    };
+    let (drop_ldes, recompute) = (set(SP1_DROP_LDES_ENV), set(SP1_RECOMPUTE_FIRST_LAYER_ENV));
+    if drop_ldes.is_none() && recompute.is_none() {
+        return None;
+    }
+    let gpu_memory_gb = total.map(sp1_fork_gpu_memory_gb);
+    let drop_by_default = gpu_memory_gb.is_some_and(|gb| match gpu {
+        Sp1Gpu::Cuda | Sp1Gpu::Rocm => gb <= 20,
+        Sp1Gpu::Intel => gb <= 16,
+    });
+    let recompute_by_default = gpu_memory_gb.is_some_and(|gb| gb <= 20);
+    Some(drop_ldes.unwrap_or(drop_by_default) && recompute.unwrap_or(recompute_by_default))
+}
+
+/// Whether `sp1-gpu-server` runs lean (both savers on) by itself on a card of `total` bytes, as
+/// `local_gpu_opts` decides when neither saver is set: on CUDA and ROCm cards of 16 GiB or less; on
+/// Intel, where it keeps the LDEs of a 16 GB card, only on cards of 12 GiB or less.
+pub fn sp1_fork_lean_for_total_vram(gpu: Sp1Gpu, total: u64) -> bool {
+    let gpu_memory_gb = sp1_fork_gpu_memory_gb(total);
+    match gpu {
+        Sp1Gpu::Cuda | Sp1Gpu::Rocm => gpu_memory_gb <= 20,
+        Sp1Gpu::Intel => gpu_memory_gb <= 16,
     }
 }
 
-/// Headroom required on top of a measured peak before that configuration is considered to fit.
+fn sp1_fork_gpu_memory_gb(total: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    total.div_ceil(GIB) + 4
+}
+
+/// Headroom required on top of a measured figure before that configuration is considered to fit.
 ///
 /// A CUDA context alone costs ~400 MiB here (measured: a process allocating 2,048 MiB showed as 2,444
-/// MiB), and the peaks above come from one program — another workload of the same shard shape can sit
-/// a little above them.
+/// MiB), and the figures above come from one program on one card each — another workload of the same
+/// shard shape can sit a little above them.
 const SP1_VRAM_MARGIN: u64 = 512 * MIB;
 
-/// The SP1 shard element threshold for a card of `total` bytes with `available` bytes of VRAM free to
-/// us, or `None` when that is below what even the smallest measured configuration needs there (or the
-/// server refuses the card). `total` picks the table (see [`sp1_measured_tiers`]).
+/// The configuration an SP1 worker on `gpu`'s server runs with `available` bytes of VRAM free to it on
+/// a card of `total` bytes, or `None` when that is below what even the smallest measured
+/// configuration needs there (or the server refuses the card): the largest measured one that fits
+/// with margin, among those at or below `threshold_cap` (the host's own cap,
+/// `sp1_element_threshold_for_host_scale`, the card's recorded cap and the server's own tier, the
+/// smallest: see [`sp1_worker_sizing`]) and, when the operator fixed the savers (`lean`), of that
+/// kind. Where the worker leaves the savers to the server (`Sp1Table::sets_savers`), as the server
+/// decides them.
 ///
 /// Why not SP1's own tier arithmetic, which is what this first did: `local_gpu_opts` computes
-/// `gpu_memory_gb = ceil(total / 1 GiB) + 4` and takes the larger tier above 20. That formula carries
-/// 4 GiB of implicit slack that only holds for a card whose capacity it is given. Fed an AVAILABLE
-/// figure it selects the large tier from 16.4 GiB upward, while 268M's measured peak on such a card
-/// is 22.4 GiB — so between roughly 16.4 and 22.9 GiB free it would choose a configuration that does
-/// not fit and fail (or spill) part-way through a claimed job. The same latent gap exists in the fork for a real 17 GiB card;
-/// it has never shown because the cards that exist are 16 and 24.
-///
-/// So: pick the largest configuration whose MEASURED peak fits, with margin. The result is only ever
-/// used to LOWER the threshold, via `SP1_GPU_ELEMENT_THRESHOLD`, which the fork treats as a cap on its
-/// own tier choice. That direction matters for soundness as well as memory: the shape allow-list is
-/// enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a threshold below the constant
-/// yields shapes the circuit already accepts while one above it does not.
-pub fn sp1_element_threshold_for_available_vram(available: u64, total: Option<u64>) -> Option<u64> {
-    sp1_measured_tiers(total)
+/// `gpu_memory_gb = ceil(total / 1 GiB) + 4` from the card's TOTAL, and a card it shares with a
+/// display or another prover then commits to a tier that does not fit and fails (or spills) part-way
+/// through a claimed job. So: pick the largest configuration MEASURED to fit what is free. The
+/// threshold is only ever used to LOWER the server's, via `SP1_GPU_ELEMENT_THRESHOLD`, which the fork
+/// treats as a cap on its own tier choice. That direction matters for soundness as well as memory: the
+/// shape allow-list is enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a threshold
+/// below the constant yields shapes the circuit already accepts while one above it does not.
+pub fn sp1_config_for_available_vram(
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+    available: u64,
+    threshold_cap: Option<u64>,
+    lean: Option<bool>,
+) -> Option<Sp1Config> {
+    sp1_candidate_configs(gpu, total, threshold_cap, lean)
+        .find(|(_, need)| need.saturating_add(SP1_VRAM_MARGIN) <= available)
+        .map(|(config, _)| config)
+}
+
+/// The configurations a worker may choose on `gpu`'s card of `total` bytes under `threshold_cap` and
+/// `lean` (see [`sp1_config_for_available_vram`]), largest first, as its server will run them. All of
+/// them when the cap is below every measured threshold: the smallest then still stands, as it does
+/// for host memory.
+fn sp1_candidate_configs(
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+    threshold_cap: Option<u64>,
+    lean: Option<bool>,
+) -> impl Iterator<Item = (Sp1Config, u64)> {
+    let table = sp1_measured_configs(gpu, total, lean);
+    let of_kind = move |c: &Sp1Config| !table.sets_savers || lean.is_none_or(|l| c.lean == l);
+    let under_cap = move |c: &Sp1Config| threshold_cap.is_none_or(|h| c.threshold <= h);
+    let any_under_cap = table
+        .configs
         .iter()
-        .find(|(_, peak)| peak.saturating_add(SP1_VRAM_MARGIN) <= available)
-        .map(|(threshold, _)| *threshold)
+        .any(|(c, _)| of_kind(c) && under_cap(c));
+    // The savers as the server runs them where the worker leaves them: the operator's, or its own.
+    let servers_own =
+        lean.unwrap_or_else(|| total.is_some_and(|t| sp1_fork_lean_for_total_vram(gpu, t)));
+    table
+        .configs
+        .iter()
+        .copied()
+        .filter(move |(c, _)| of_kind(c) && (!any_under_cap || under_cap(c)))
+        .map(move |(c, need)| {
+            let lean = if table.sets_savers {
+                c.lean
+            } else {
+                servers_own
+            };
+            (
+                Sp1Config {
+                    threshold: c.threshold,
+                    lean,
+                },
+                need,
+            )
+        })
 }
 
 /// The variable through which SP1's element threshold is set. An operator who sets it by hand
@@ -1057,15 +1319,17 @@ pub const SP1_ELEMENT_THRESHOLD_ENV: &str = "SP1_GPU_ELEMENT_THRESHOLD";
 /// wins.
 pub const SP1_ELEMENT_THRESHOLD_CAP_ENV: &str = "ZKMINER_SP1_ELEMENT_THRESHOLD_CAP";
 
-/// The measured tier one below `ran_at` (`None`: nothing bounded it, so the server's own) on a card
-/// of `total` bytes (`None` when its server tier is not modelled): what an SP1 worker that ran out
-/// of GPU memory at `ran_at` is lowered to. `None` when it already ran at the smallest measured
-/// tier.
-pub fn sp1_tier_below(ran_at: Option<u64>, total: Option<u64>) -> Option<u64> {
+/// The measured threshold one below `ran_at` (`None`: nothing bounded it, so the server's own) on
+/// `gpu`'s card of `total` bytes: what an SP1 worker that ran out of GPU memory at `ran_at` is lowered
+/// to. `None` when it already ran at the smallest measured threshold. A threshold, not a configuration:
+/// the card's cap bounds the threshold, and the worker then picks the savers for what is free beside
+/// it (`sp1_config_for_available_vram`).
+pub fn sp1_tier_below(ran_at: Option<u64>, gpu: Sp1Gpu, total: Option<u64>) -> Option<u64> {
     let ran_at = ran_at.unwrap_or(u64::MAX);
-    sp1_measured_tiers(total)
+    sp1_measured_configs(gpu, total, None)
+        .configs
         .iter()
-        .map(|(threshold, _)| *threshold)
+        .map(|(c, _)| c.threshold)
         .find(|threshold| *threshold < ran_at)
 }
 
@@ -1082,22 +1346,37 @@ pub fn sp1_card_cap(raw: Option<&str>) -> Option<u64> {
 pub const SP1_TIER_STEP_RATE_FACTOR: f64 = 0.79;
 
 /// The factor to plan an SP1 card capped at `cap` with, when its benchmark ran before the cap: one
-/// [`SP1_TIER_STEP_RATE_FACTOR`] per tier above `cap` that the uncapped worker could have run at,
-/// up to the server's own tier for a card of `total` bytes (`None`: the fork's default).
-pub fn sp1_rate_factor_for_cap(cap: u64, total: Option<u64>) -> f64 {
+/// [`SP1_TIER_STEP_RATE_FACTOR`] per halving between the largest measured threshold the uncapped worker
+/// could have run at on `gpu`'s card of `total` bytes (up to the server's own tier; `None`: the fork's
+/// default) and the largest it runs at under `cap`. So one per tier lost where the tiers halve, and a
+/// share of one for a smaller step: 285M to 268M on the XTX, about 3% measured, is planned 2%.
+pub fn sp1_rate_factor_for_cap(cap: u64, gpu: Sp1Gpu, total: Option<u64>) -> f64 {
     // The worker is sized from its free VRAM (every GPU slot is told it), so it never ran above the
-    // largest measured tier, nor above the server's own.
+    // largest measured threshold, nor above the server's own.
     let server = total.map_or(
         SP1_FORK_DEFAULT_THRESHOLD,
         sp1_fork_threshold_for_total_vram,
     );
-    let tiers = sp1_measured_tiers(total);
-    let ceiling = tiers.first().map_or(server, |(t, _)| (*t).min(server));
-    let above = tiers
+    let mut thresholds: Vec<u64> = sp1_measured_configs(gpu, total, None)
+        .configs
         .iter()
-        .filter(|(t, _)| *t > cap && *t <= ceiling)
-        .count();
-    SP1_TIER_STEP_RATE_FACTOR.powi(above as i32)
+        .map(|(c, _)| c.threshold)
+        .collect();
+    thresholds.dedup();
+    let Some(ceiling) = thresholds.first().map(|t| (*t).min(server)) else {
+        return 1.0;
+    };
+    let at = thresholds
+        .iter()
+        .copied()
+        .filter(|t| *t <= cap)
+        .max()
+        .unwrap_or(cap)
+        .min(ceiling);
+    if at >= ceiling {
+        return 1.0;
+    }
+    SP1_TIER_STEP_RATE_FACTOR.powf((ceiling as f64 / at as f64).log2())
 }
 
 /// Set to disable the SP1 worker's host-memory tuning, for bisecting a proving failure against stock
@@ -1224,38 +1503,62 @@ pub fn sp1_element_threshold_for_host_scale(scale: f64) -> Option<u64> {
         .or_else(|| SP1_HOST_MEASURED_THRESHOLDS.last().copied())
 }
 
-/// The element threshold an SP1 worker caps itself to, from the two independent bounds — the HOST's
-/// budget via `scale`, and the CARD's free VRAM — the smaller winning. `None` when neither bounds it.
+/// The configuration an SP1 worker sets for itself (`SP1_GPU_ELEMENT_THRESHOLD`, and the savers of
+/// [`SP1_DROP_LDES_ENV`] unless the operator set them), from the independent bounds — the HOST's
+/// budget, and the card's recorded cap, as the threshold they allow (`threshold_cap`:
+/// [`sp1_element_threshold_for_host_scale`], [`sp1_card_cap`]), and the CARD's free VRAM — or `None`
+/// when none bounds it. `lean` is the operator's own setting of the savers ([`sp1_operator_lean`]).
+/// The result is the threshold, and the savers when the worker sets them (`None`: the server's).
 ///
-/// A free-VRAM figure below every measured tier still bounds it, to the SMALLEST tier. It used to
-/// bound nothing, which handed the choice back to the fork's own rule — the LARGEST configuration on a
-/// 24 GB card, 402,653,184, for exactly the card with the least room. Nothing measured fits there, but
-/// the smallest configuration is the one most likely to; and the dispatcher — which refuses such a card
-/// unless the operator lowered or disabled its floor — then predicts the same tier it would run at.
+/// Only among configurations the server will run as set: none above its own tier from the card's
+/// `total` ([`sp1_fork_threshold_for_total_vram`]).
 ///
-/// This is only the worker's half. The server takes the minimum of this and its own tier from the
-/// card's TOTAL (`sp1_fork_threshold_for_total_vram`), so the threshold actually used is that minimum.
-/// Ignores the operator's `SP1_ELEMENT_THRESHOLD_ENV`, which callers check first: when it is set the
-/// worker applies none of this.
-pub fn sp1_element_threshold_cap(
-    scale: f64,
+/// Without a VRAM figure only the caps bound it, and the savers are left to the server. A free-VRAM
+/// figure below every measured configuration still bounds it, to the SMALLEST. It used to bound
+/// nothing, which handed the choice back to the fork's own rule — the LARGEST configuration on a 24 GB
+/// card, for exactly the card with the least room. Nothing measured fits there, but the smallest
+/// configuration is the one most likely to; and the dispatcher — which refuses such a card unless
+/// the operator lowered or disabled its floor — then predicts the same configuration it would run at.
+///
+/// This is only the worker's half; see [`sp1_server_config`] for what the server then runs. Ignores
+/// the operator's `SP1_ELEMENT_THRESHOLD_ENV`, which callers check first: when it is set the worker
+/// applies none of this.
+pub fn sp1_worker_sizing(
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+    threshold_cap: Option<u64>,
     available_vram: Option<u64>,
-    total_vram: Option<u64>,
-) -> Option<u64> {
-    let from_host = sp1_element_threshold_for_host_scale(scale);
-    let from_vram = available_vram.map(|a| {
-        sp1_element_threshold_for_available_vram(a, total_vram)
-            .unwrap_or_else(sp1_smallest_measured_threshold)
-    });
-    [from_host, from_vram].into_iter().flatten().min()
+    lean: Option<bool>,
+) -> Option<(u64, Option<bool>)> {
+    let Some(available) = available_vram else {
+        return threshold_cap.map(|t| (t, None));
+    };
+    let own = total.map(sp1_fork_threshold_for_total_vram);
+    let cap = [threshold_cap, own].into_iter().flatten().min();
+    let config = sp1_config_for_available_vram(gpu, total, available, cap, lean)
+        .unwrap_or_else(|| sp1_smallest_measured_config(gpu, total, cap, lean));
+    let threshold = threshold_cap.map_or(config.threshold, |h| h.min(config.threshold));
+    let sets = sp1_measured_configs(gpu, total, lean).sets_savers && lean.is_none();
+    Some((threshold, sets.then_some(config.lean)))
 }
 
-/// The smallest SP1 element threshold with a measured VRAM peak. The same in every table.
-pub fn sp1_smallest_measured_threshold() -> u64 {
-    SP1_MEASURED_TIERS
+/// The smallest of the configurations a worker may choose on `gpu`'s card of `total` bytes under
+/// `threshold_cap` and `lean` (see [`sp1_config_for_available_vram`]).
+pub fn sp1_smallest_measured_config(
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+    threshold_cap: Option<u64>,
+    lean: Option<bool>,
+) -> Sp1Config {
+    sp1_candidate_configs(gpu, total, threshold_cap, lean)
         .last()
-        .map(|(t, _)| *t)
-        .unwrap_or(SP1_FORK_DEFAULT_THRESHOLD)
+        .map(|(c, _)| c)
+        .unwrap_or(Sp1Config::lean(SP1_134M))
+}
+
+/// The smallest SP1 element threshold with a measured VRAM figure. The same in every table.
+pub fn sp1_smallest_measured_threshold() -> u64 {
+    SP1_134M
 }
 
 /// The element threshold `sp1-gpu-server` picks for itself from the card's TOTAL VRAM, before any cap.
@@ -1285,34 +1588,62 @@ pub fn sp1_fork_threshold_for_total_vram(total: u64) -> u64 {
     }
 }
 
-/// How much VRAM an SP1 worker sized at `threshold` needs free on its card of `total` bytes: that
-/// configuration's measured peak plus [`SP1_VRAM_MARGIN`]. `None` for a threshold that card's table
-/// has not measured.
-///
-/// The inverse of [`sp1_element_threshold_for_available_vram`], from the same table, so the two cannot
-/// disagree: `sp1_element_threshold_for_available_vram(sp1_vram_required_for_threshold(t, c), c)` is
-/// `t`. The dispatcher uses it to decide how much room an SP1 proof needs made for it on a card our
-/// other workers share.
-pub fn sp1_vram_required_for_threshold(threshold: u64, total: Option<u64>) -> Option<u64> {
-    sp1_measured_tiers(total)
-        .iter()
-        .find(|(t, _)| *t == threshold)
-        .map(|(_, peak)| peak.saturating_add(SP1_VRAM_MARGIN))
+/// The configuration `sp1-gpu-server` actually runs on `gpu`'s card of `total` bytes, given the
+/// `threshold` and savers (`lean`) set for it — by its worker ([`sp1_worker_sizing`]) or the operator:
+/// the smaller of that threshold and the server's own tier, and the savers as set, or as the server
+/// decides from the total. `None` when neither a threshold nor the total is known; the savers count
+/// as off where nothing says, the larger need.
+pub fn sp1_server_config(
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+    threshold: Option<u64>,
+    lean: Option<bool>,
+) -> Option<Sp1Config> {
+    let own = total.map(sp1_fork_threshold_for_total_vram);
+    let threshold = [threshold, own].into_iter().flatten().min()?;
+    let lean = lean
+        .or_else(|| total.map(|t| sp1_fork_lean_for_total_vram(gpu, t)))
+        .unwrap_or(false);
+    Some(Sp1Config { threshold, lean })
 }
 
-/// How much VRAM must be free on a card of `total` bytes before SP1 can be given work there at all:
-/// what its smallest measured configuration needs, plus margin. `u64::MAX` for a card the server
-/// refuses.
+/// How much VRAM an SP1 worker running `config` on `gpu`'s card of `total` bytes needs free: that
+/// configuration's measured figure plus [`SP1_VRAM_MARGIN`]. `None` for a configuration that card's
+/// table has not measured. Where the worker leaves the savers to the server (`sets_savers`), a
+/// threshold's figure holds for either, and `lean` (the operator's savers) picks the table as it does
+/// for the worker.
+///
+/// The inverse of [`sp1_config_for_available_vram`], from the same table, so the two cannot disagree:
+/// the requirement of a measured configuration buys exactly that configuration. The dispatcher uses it
+/// to decide how much room an SP1 proof needs made for it on a card our other workers share.
+pub fn sp1_vram_required(
+    gpu: Sp1Gpu,
+    total: Option<u64>,
+    config: Sp1Config,
+    lean: Option<bool>,
+) -> Option<u64> {
+    let table = sp1_measured_configs(gpu, total, lean);
+    table
+        .configs
+        .iter()
+        .find(|(c, _)| {
+            c.threshold == config.threshold && (!table.sets_savers || c.lean == config.lean)
+        })
+        .map(|(_, need)| need.saturating_add(SP1_VRAM_MARGIN))
+}
+
+/// How much VRAM must be free on `gpu`'s card of `total` bytes before SP1 can be given work there at
+/// all: what its smallest measured configuration needs, plus margin; of the operator's kind when they
+/// set the savers (`lean`), as the worker can run no other. `u64::MAX` for a card the server refuses.
 ///
 /// Derived from the measured tables rather than written down separately, so this and
-/// [`sp1_element_threshold_for_available_vram`] cannot disagree about whether a card is usable. Two
-/// independent constants could disagree — a floor that admitted a card by ~350 MiB the tier function
-/// then had no configuration for would refuse the work one layer later, after the worker was already
-/// spawned.
-pub fn sp1_min_available_vram_bytes(total: Option<u64>) -> u64 {
-    sp1_measured_tiers(total)
+/// [`sp1_config_for_available_vram`] cannot disagree about whether a card is usable. Two independent
+/// constants could disagree — a floor that admitted a card by ~350 MiB the tier function then had no
+/// configuration for would refuse the work one layer later, after the worker was already spawned.
+pub fn sp1_min_available_vram_bytes(gpu: Sp1Gpu, total: Option<u64>, lean: Option<bool>) -> u64 {
+    sp1_candidate_configs(gpu, total, None, lean)
         .last()
-        .map(|(_, peak)| peak.saturating_add(SP1_VRAM_MARGIN))
+        .map(|(_, need)| need.saturating_add(SP1_VRAM_MARGIN))
         .unwrap_or(u64::MAX)
 }
 
@@ -2173,6 +2504,32 @@ mod zkop_mix_tests {
 #[cfg(test)]
 mod tests {
 
+    /// The cards the tests size: `memory.total` (or amdgpu's, or xe's) for each.
+    const RTX4090: Option<u64> = Some(24_564 * super::MIB);
+    const RTX5080: Option<u64> = Some(16_303 * super::MIB);
+    const RTX4070: Option<u64> = Some(12_282 * super::MIB);
+    const RTX5090: Option<u64> = Some(32_607 * super::MIB);
+    const RX7900XTX: Option<u64> = Some(24_560 * super::MIB);
+    const ARC_B70: Option<u64> = Some(32_620 * super::MIB);
+    const ARC_B580: Option<u64> = Some(12_216 * super::MIB);
+    const RX9070XT: Option<u64> = Some(16_304 * super::MIB);
+
+    use super::Sp1Gpu::{Cuda, Intel, Rocm};
+
+    /// Every card class the tables distinguish, and a card whose total is not given.
+    const CARDS: [(super::Sp1Gpu, Option<u64>); 10] = [
+        (Cuda, RTX4090),
+        (Cuda, RTX5080),
+        (Cuda, RTX4070),
+        (Cuda, RTX5090),
+        (Rocm, RX7900XTX),
+        (Rocm, RX9070XT),
+        (Intel, ARC_B70),
+        (Intel, ARC_B580),
+        (Cuda, None),
+        (Rocm, None),
+    ];
+
     #[test]
     fn the_server_runs_its_savers_on_cards_it_accepts_up_to_16_gib() {
         const MIB: u64 = 1 << 20;
@@ -2183,21 +2540,54 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_card_is_planned_a_tier_step_slower_per_tier_lost() {
+    fn the_server_runs_its_savers_by_itself_on_small_cards() {
+        use super::sp1_fork_lean_for_total_vram as lean;
         const MIB: u64 = 1 << 20;
-        let rtx4070 = Some(12_282 * MIB);
+        assert!(lean(Cuda, 12_282 * MIB));
+        assert!(lean(Cuda, 16 * 1024 * MIB));
+        assert!(!lean(Cuda, 24_564 * MIB));
+        assert!(lean(Rocm, 16 * 1024 * MIB));
+        assert!(!lean(Rocm, 24 * 1024 * MIB));
+        // Intel keeps a 16 GB card's LDEs, and drops them on a 12 GB one.
+        assert!(!lean(Intel, 16 * 1024 * MIB));
+        assert!(lean(Intel, 12 * 1024 * MIB));
+    }
+
+    #[test]
+    fn a_capped_card_is_planned_a_tier_step_slower_per_tier_lost() {
         let f = super::SP1_TIER_STEP_RATE_FACTOR;
         // A 12 GB card ran at 268M, the server's own tier: one step.
-        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4070), f);
-        assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4070), 1.0);
-        // A 24 GB card's worker runs at most the largest measured tier, 268M (its server would run
-        // 402M, but the worker is sized from its free VRAM): capped at 134M is one step, at 268M
+        assert_eq!(
+            super::sp1_rate_factor_for_cap(134_217_728, Cuda, RTX4070),
+            f
+        );
+        assert_eq!(
+            super::sp1_rate_factor_for_cap(268_435_456, Cuda, RTX4070),
+            1.0
+        );
+        // A 24 GB card's worker runs at most the largest measured threshold, 268M (its server would
+        // run 285M, but the worker is sized from its free VRAM): capped at 134M is one step, at 268M
         // none.
-        let rtx4090 = Some(24_564 * MIB);
-        assert_eq!(super::sp1_rate_factor_for_cap(268_435_456, rtx4090), 1.0);
-        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, rtx4090), f);
-        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, None), f);
-        // A recorded cap is never below the smallest measured tier, and garbage is no cap.
+        assert_eq!(
+            super::sp1_rate_factor_for_cap(268_435_456, Cuda, RTX4090),
+            1.0
+        );
+        assert_eq!(
+            super::sp1_rate_factor_for_cap(134_217_728, Cuda, RTX4090),
+            f
+        );
+        // The XTX's runs at its server's 285M: 268M is a sixteenth smaller, a share of a step (2%),
+        // and 134M a little more than one.
+        let xtx = |cap| super::sp1_rate_factor_for_cap(cap, Rocm, RX7900XTX);
+        assert_eq!(xtx(285_212_672), 1.0);
+        assert!(
+            (xtx(268_435_456) - 0.98).abs() < 0.005,
+            "{}",
+            xtx(268_435_456)
+        );
+        assert!(xtx(134_217_728) < f && xtx(134_217_728) > f * 0.97);
+        assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, Cuda, None), f);
+        // A recorded cap is never below the smallest measured threshold, and garbage is no cap.
         assert_eq!(super::sp1_card_cap(Some("0")), Some(134_217_728));
         assert_eq!(super::sp1_card_cap(Some("268435456")), Some(268_435_456));
         assert_eq!(super::sp1_card_cap(Some("x")), None);
@@ -2206,21 +2596,16 @@ mod tests {
 
     #[test]
     fn an_sp1_worker_that_ran_out_is_lowered_one_measured_tier() {
-        const MIB: u64 = 1 << 20;
-        let rtx4070 = Some(12_282 * MIB);
-        assert_eq!(
-            super::sp1_tier_below(Some(268_435_456), rtx4070),
-            Some(134_217_728)
-        );
+        let below = super::sp1_tier_below;
+        assert_eq!(below(Some(268_435_456), Cuda, RTX4070), Some(134_217_728));
+        // Lean or full, 268M is one threshold: the 4090 is lowered to 134M.
+        assert_eq!(below(Some(268_435_456), Cuda, RTX4090), Some(134_217_728));
         // Already at the smallest: nothing lower has been measured.
-        assert_eq!(super::sp1_tier_below(Some(134_217_728), rtx4070), None);
+        assert_eq!(below(Some(134_217_728), Cuda, RTX4070), None);
         // Unbounded (the server's own tier): the largest measured.
-        assert_eq!(super::sp1_tier_below(None, None), Some(268_435_456));
+        assert_eq!(below(None, Cuda, None), Some(268_435_456));
         // Between tiers (an operator-shaped or host-bounded value): the next measured below it.
-        assert_eq!(
-            super::sp1_tier_below(Some(200_000_000), rtx4070),
-            Some(134_217_728)
-        );
+        assert_eq!(below(Some(200_000_000), Cuda, RTX4070), Some(134_217_728));
     }
 
     #[test]
@@ -2251,168 +2636,345 @@ mod tests {
             "SP1_GPU_RECOMPUTE_FIRST_LAYER",
             "false"
         )])));
+        // The operator's savers, as the worker leaves them and the tables read them: lean when the
+        // server then runs both, a saver left unset running as its default for the card; half lean
+        // is sized full, the larger need.
+        let lean = |pairs, gpu, total| super::sp1_operator_lean(env(pairs), gpu, total);
+        let both: &'static [(&'static str, &'static str)] = &[
+            ("SP1_GPU_DROP_LDES", "1"),
+            ("SP1_GPU_RECOMPUTE_FIRST_LAYER", "true"),
+        ];
+        let drop_on: &'static [(&'static str, &'static str)] = &[("SP1_GPU_DROP_LDES", "1")];
+        let drop_off: &'static [(&'static str, &'static str)] = &[("SP1_GPU_DROP_LDES", "0")];
+        let recompute_on: &'static [(&'static str, &'static str)] =
+            &[("SP1_GPU_RECOMPUTE_FIRST_LAYER", "1")];
+        for (gpu, total) in CARDS {
+            assert_eq!(lean(&[], gpu, total), None, "{gpu:?} {total:?}");
+            assert_eq!(lean(both, gpu, total), Some(true), "{gpu:?} {total:?}");
+            assert_eq!(lean(drop_off, gpu, total), Some(false), "{gpu:?} {total:?}");
+        }
+        // One saver on, the other at the server's default: on for a 12-16 GB card, so lean there,
+        // as the server runs it (and as main accepted a 4070 with it); off above, so half, full.
+        assert_eq!(lean(drop_on, Cuda, RTX4070), Some(true));
+        assert_eq!(lean(drop_on, Cuda, RTX5080), Some(true));
+        assert_eq!(lean(drop_on, Cuda, RTX4090), Some(false));
+        assert_eq!(lean(drop_on, Rocm, RX7900XTX), Some(false));
+        // Intel keeps the LDEs of a 16 GB card (A770) by default, drops them on a 12 GB one (B580).
+        assert_eq!(
+            lean(recompute_on, Intel, Some(16_288 * super::MIB)),
+            Some(false)
+        );
+        assert_eq!(lean(recompute_on, Intel, ARC_B580), Some(true));
+        // A card of unknown size: an unset saver counts as off.
+        assert_eq!(lean(drop_on, Cuda, None), Some(false));
+        // A value the server does not read leaves that saver unset.
+        assert_eq!(lean(&[("SP1_GPU_DROP_LDES", "yes")], Cuda, RTX4070), None);
+        assert_eq!(
+            lean(
+                &[
+                    ("SP1_GPU_DROP_LDES", "yes"),
+                    ("SP1_GPU_RECOMPUTE_FIRST_LAYER", "0")
+                ],
+                Cuda,
+                RTX4070
+            ),
+            Some(false)
+        );
     }
-    /// The cards the tier tests size: `nvidia-smi`'s `memory.total` for each.
-    const RTX4090: Option<u64> = Some(24_564 * super::MIB);
-    const RTX5080: Option<u64> = Some(16_303 * super::MIB);
-    const RTX4070: Option<u64> = Some(12_282 * super::MIB);
 
-    /// The tier must never select a configuration whose MEASURED peak does not fit, and never exceed
-    /// the fork's default, which it is only allowed to cap.
+    /// Each table is in [`super::Sp1Config`]'s order, largest first, and every entry needs strictly
+    /// less than the one above it. The dispatcher compares configurations by that order (`then > now`
+    /// is a worker sized for more than the card now has), so an entry below another that needed MORE
+    /// would be one the worker could never pick, and would invert that comparison.
     #[test]
-    fn the_sp1_tier_only_picks_a_configuration_that_fits() {
-        use super::{sp1_element_threshold_for_available_vram as tier, MIB};
-        const GIB: u64 = 1024 * 1024 * 1024;
-        const FULL_DEFAULT: u64 = 402_653_184;
-
-        // An empty 4090 has room for the 268M configuration (22,944 MiB + margin).
-        assert_eq!(tier(24 * GIB, RTX4090), Some(268_435_456));
-        // 18 GiB free steps down to 134M, whose 17,041 MiB peak fits; 17 GiB fits neither.
-        assert_eq!(tier(18 * GIB, RTX4090), Some(134_217_728));
-        assert_eq!(tier(17 * GIB, RTX4090), None);
-        assert_eq!(tier(17_552 * MIB, RTX4090), None);
-        assert_eq!(tier(17_553 * MIB, RTX4090), Some(134_217_728));
-
-        // THE REGRESSION THIS GUARDS. SP1's own rule — `ceil(gib) + 4 > 20` — takes the large tier
-        // from 16.4 GiB upward, but 268M peaks at 22,944 MiB. Everything in that band must step
-        // down, or we commit to a configuration that cannot fit and fail (or, on Windows, spill)
-        // part-way through a claimed job.
-        for mib in [17_553u64, 18_000, 20_000, 22_000, 23_000, 23_455] {
+    fn each_sp1_table_is_largest_first_and_needs_fall_down_it() {
+        for (gpu, total) in CARDS {
+            let table = super::sp1_measured_configs(gpu, total, None);
+            assert!(
+                !table.configs.is_empty(),
+                "{gpu:?} {total:?} has no measured configuration"
+            );
+            for pair in table.configs.windows(2) {
+                assert!(
+                    pair[0].0 > pair[1].0,
+                    "{gpu:?}: {} above {}",
+                    pair[0].0,
+                    pair[1].0
+                );
+                assert!(
+                    pair[0].1 > pair[1].1,
+                    "{gpu:?}: {} needs no more than {}",
+                    pair[0].0,
+                    pair[1].0
+                );
+            }
+            // Nothing above 268M but the XTX's server's own 285M, measured on it.
+            for (c, _) in table.configs {
+                assert!(
+                    c.threshold <= 268_435_456 || (gpu == Rocm && c.threshold == 285_212_672),
+                    "{gpu:?}: {c} is above any threshold measured"
+                );
+            }
+            // The smallest is one threshold whatever the card: a recorded cap may only floor at it.
             assert_eq!(
-                tier(mib * MIB, RTX4090),
-                Some(134_217_728),
-                "{mib} MiB free must take the 134M tier: 268M peaks at 22,944 MiB and will not fit"
+                table.configs.last().unwrap().0.threshold,
+                super::sp1_smallest_measured_threshold()
             );
         }
-        // Just above the 268M peak plus margin, it may step back up.
-        assert_eq!(tier(23_456 * MIB, RTX4090), Some(268_435_456));
+    }
 
-        // Below the smallest measured configuration there is nothing to offer.
-        assert_eq!(tier(8 * GIB, RTX4090), None);
-        assert_eq!(tier(0, RTX4090), None);
-        // A card with no total (AMD, Intel) keeps the v6.0.0 figures: 16 GiB takes 134M.
-        assert_eq!(tier(16 * GIB, None), Some(134_217_728));
-        assert_eq!(tier(12 * GIB, None), None);
-
-        // Monotonic, and never above the default it may only cap.
-        for total in [RTX4090, RTX5080, RTX4070, None] {
-            let mut prev = 0u64;
-            for mib in (0..=49_152u64).step_by(128) {
-                if let Some(t) = tier(mib * MIB, total) {
+    /// The configuration must never be one whose MEASURED need does not fit, and must grow with the
+    /// room, never shrink.
+    #[test]
+    fn the_sp1_configuration_only_picks_one_that_fits() {
+        use super::{sp1_config_for_available_vram as config, Sp1Config, MIB};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for (gpu, total) in CARDS {
+            let mut prev: Option<Sp1Config> = None;
+            for mib in (0..=49_152u64).step_by(64) {
+                let got = config(gpu, total, mib * MIB, None, None);
+                if let Some(c) = got {
+                    let need = super::sp1_vram_required(gpu, total, c, None).expect("measured");
                     assert!(
-                        t >= prev,
-                        "tier fell as free VRAM grew, at {mib} MiB of {total:?}"
+                        need <= mib * MIB,
+                        "{gpu:?}: {c} needs {need} with {mib} MiB free"
                     );
-                    assert!(t <= FULL_DEFAULT, "{t} exceeds the default {FULL_DEFAULT}");
-                    prev = t;
+                    assert!(c.threshold <= 402_653_184);
                 }
+                assert!(
+                    got >= prev,
+                    "{gpu:?}: the configuration fell as free VRAM grew, at {mib} MiB"
+                );
+                prev = got;
             }
+        }
+        // Empty 24 GB-class cards and the B70 run the largest measured configuration, full: the XTX
+        // its server's own 285M, the faster there, until less than it needs is free.
+        for (gpu, total) in [(Cuda, RTX4090), (Intel, ARC_B70)] {
+            assert_eq!(
+                config(gpu, total, 23 * GIB, None, None),
+                Some(Sp1Config::full(268_435_456))
+            );
+        }
+        assert_eq!(
+            config(Rocm, RX7900XTX, 23 * GIB, None, None),
+            Some(Sp1Config::full(285_212_672))
+        );
+        assert_eq!(
+            config(Rocm, RX7900XTX, (19_185 + 512) * MIB, None, None),
+            Some(Sp1Config::full(285_212_672))
+        );
+        assert_eq!(
+            config(Rocm, RX7900XTX, (19_185 + 511) * MIB, None, None),
+            Some(Sp1Config::full(268_435_456))
+        );
+        // One that ran out at 285M is lowered to 268M, which proved with less free.
+        assert_eq!(
+            super::sp1_tier_below(Some(285_212_672), Rocm, RX7900XTX),
+            Some(268_435_456)
+        );
+        // THE REGRESSION THIS GUARDS (2026-11-24): a 24 GB card with an idle risc0 worker's 7.4 GiB
+        // Groth16 cache beside it. The XTX's SP1 worker ran 268M full in the 17.1 GiB left and ran out
+        // of memory in every proof; the 4090's did the same at 18,024 MiB free. There 268M runs lean.
+        assert_ne!(
+            config(Rocm, RX7900XTX, 17_137 * MIB, None, None),
+            Some(Sp1Config::full(268_435_456))
+        );
+        assert_eq!(
+            config(Cuda, RTX4090, 18_024 * MIB, None, None),
+            Some(Sp1Config::lean(268_435_456))
+        );
+        // Below the smallest measured configuration there is nothing to offer.
+        for (gpu, total) in CARDS {
+            assert_eq!(config(gpu, total, 7 * GIB, None, None), None);
         }
     }
 
-    /// A card of 16 GiB or less has its own table: the server runs differently there, and the larger
-    /// card's figures would refuse a 12 GB card that proves at 268M (measured on an RTX 4070).
+    /// A CUDA card of 16 GiB or less has its own table: the server runs lean there by itself, and a
+    /// larger card's figures would refuse a 12 GB card that proves at 268M (measured on an RTX 4070).
     #[test]
     fn a_16gb_or_smaller_card_is_sized_by_its_own_measurements() {
-        use super::{sp1_element_threshold_for_available_vram as tier, MIB};
+        use super::{sp1_config_for_available_vram as config, Sp1Config, MIB};
+        let tier = |available, total| config(Cuda, total, available, None, None);
         // An idle 4070: its total less the driver's 272 MiB reservation. 268M peaked at 11,377 MiB.
-        assert_eq!(tier(12_010 * MIB, RTX4070), Some(268_435_456));
-        // 1.5 GiB of it taken (a test allocation standing in for a display): 268M spilled into system memory there, so 134M, whose
-        // peak (the wrap's) was 8,655 MiB.
-        assert_eq!(tier(10_337 * MIB, RTX4070), Some(134_217_728));
-        assert_eq!(tier((8_655 + 512) * MIB, RTX4070), Some(134_217_728));
+        assert_eq!(
+            tier(12_010 * MIB, RTX4070),
+            Some(Sp1Config::lean(268_435_456))
+        );
+        // 1.5 GiB of it taken (a test allocation standing in for a display): 268M spilled into
+        // system memory there, so 134M, whose peak (the wrap's) was 8,655 MiB.
+        assert_eq!(
+            tier(10_337 * MIB, RTX4070),
+            Some(Sp1Config::lean(134_217_728))
+        );
+        assert_eq!(
+            tier((8_655 + 512) * MIB, RTX4070),
+            Some(Sp1Config::lean(134_217_728))
+        );
         assert_eq!(tier((8_655 + 512) * MIB - 1, RTX4070), None);
         // A 5080 is a 16 GB card to the server too: an idle one (less its 423 MiB) takes 268M.
-        assert_eq!(tier(15_880 * MIB, RTX5080), Some(268_435_456));
-        // Exactly 16 GiB is still a 16 GB card; a byte more is not.
+        assert_eq!(
+            tier(15_880 * MIB, RTX5080),
+            Some(Sp1Config::lean(268_435_456))
+        );
+        // Exactly 16 GiB is still a 16 GB card; a byte more is a 24 GB-class one, which needs more:
+        // 12 GiB free there is a little short of 134M full (11,880 MiB and the margin).
         assert_eq!(
             tier(12 * 1024 * MIB, Some(16 * 1024 * MIB)),
-            Some(268_435_456)
+            Some(Sp1Config::lean(268_435_456))
         );
-        assert_eq!(tier(12 * 1024 * MIB, Some(16 * 1024 * MIB + 1)), None);
+        assert_eq!(
+            tier(12 * 1024 * MIB, Some(16 * 1024 * MIB + 1)),
+            Some(Sp1Config::lean(134_217_728))
+        );
+        // A 5090 (32 GB class, measured under Windows): 268M full needs 22,944 MiB.
+        assert_eq!(
+            tier(23_456 * MIB, RTX5090),
+            Some(Sp1Config::full(268_435_456))
+        );
+        assert_eq!(
+            tier(23_455 * MIB, RTX5090),
+            Some(Sp1Config::full(134_217_728))
+        );
+    }
+
+    /// A card nothing has measured — a 16 GB AMD card, a 12 GB Intel one, one whose total is not given
+    /// — keeps the v6.0.0 figures, and its savers are its server's.
+    #[test]
+    fn an_unmeasured_card_keeps_the_other_servers_figures_and_its_own_savers() {
+        use super::{sp1_config_for_available_vram as config, sp1_worker_sizing as sizing, MIB};
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            config(Rocm, RX9070XT, 16 * GIB, None, None).map(|c| c.threshold),
+            Some(134_217_728)
+        );
+        assert_eq!(config(Cuda, None, 12 * GIB, None, None), None);
+        assert_eq!(config(Intel, ARC_B580, 12 * GIB, None, None), None);
+        // Its server's savers, as predicted: on for a 16 GB AMD card.
+        assert_eq!(
+            config(Rocm, RX9070XT, 16 * GIB, None, None).map(|c| c.lean),
+            Some(true)
+        );
+        // And the worker sets the threshold only.
+        assert_eq!(
+            sizing(Rocm, RX9070XT, None, Some(16 * GIB), None),
+            Some((134_217_728, None))
+        );
+        // A CUDA card of 16 GiB or less with the operator's savers off is sized by these figures too:
+        // its own table measured them on.
+        assert_eq!(
+            config(Cuda, RTX4070, 12_010 * MIB, None, Some(false)),
+            None,
+            "15,604 MiB for 134M with its savers off, more than the card"
+        );
     }
 
     /// The server panics at start-up on a card of 11 GiB or less (`ceil(total GiB) + 4 < 16`), so no
-    /// amount of free memory there buys a tier, and the floor is out of reach.
+    /// amount of free memory there buys a configuration, and the floor is out of reach.
     #[test]
     fn a_card_the_server_refuses_has_no_tier() {
-        use super::{sp1_element_threshold_for_available_vram as tier, MIB};
+        use super::{sp1_config_for_available_vram as config, Sp1Config, MIB};
         let eleven = Some(11 * 1024 * MIB);
-        assert_eq!(tier(11 * 1024 * MIB, eleven), None);
-        assert_eq!(super::sp1_min_available_vram_bytes(eleven), u64::MAX);
+        assert_eq!(config(Cuda, eleven, 11 * 1024 * MIB, None, None), None);
         assert_eq!(
-            super::sp1_vram_required_for_threshold(134_217_728, eleven),
+            super::sp1_min_available_vram_bytes(Cuda, eleven, None),
+            u64::MAX
+        );
+        assert_eq!(
+            super::sp1_vram_required(Cuda, eleven, Sp1Config::lean(134_217_728), None),
             None
         );
         // A byte over 11 GiB is a 12 GB card to the server.
         let twelve = Some(11 * 1024 * MIB + 1);
-        assert_eq!(tier(11 * 1024 * MIB, twelve), Some(134_217_728));
+        assert_eq!(
+            config(Cuda, twelve, 11 * 1024 * MIB, None, None),
+            Some(Sp1Config::lean(134_217_728))
+        );
     }
 
-    /// The floor and the tier table must agree about whether a card is usable at all. Two independent
+    /// The floor and the table must agree about whether a card is usable at all. Two independent
     /// constants did not: the floor admitted a card by ~350 MiB that the tier function had no
     /// configuration for, so the work would have been refused a layer later, after a worker spawn.
     #[test]
     fn the_floor_is_exactly_what_the_smallest_configuration_needs() {
-        for total in [RTX4090, RTX5080, RTX4070, None] {
-            let floor = super::sp1_min_available_vram_bytes(total);
-            assert!(
-                super::sp1_element_threshold_for_available_vram(floor, total).is_some(),
-                "a card that exactly clears the floor must have a configuration available"
-            );
-            assert!(
-                super::sp1_element_threshold_for_available_vram(floor - 1, total).is_none(),
-                "one byte below the floor there must be nothing on offer, or the two disagree"
-            );
-        }
-    }
-
-    /// What a tier needs and what tier a figure buys must be exact inverses, at every tier. The
-    /// dispatcher evicts our other workers from a card until an SP1 proof has `required(t)` free; if
-    /// that figure bought a SMALLER tier than `t`, the worker would be recycled down a tier on a card
-    /// we had just emptied for it, and if it bought a larger one the worker would be sized past what
-    /// the dispatcher made room for.
-    #[test]
-    fn the_requirement_buys_exactly_its_own_tier() {
-        use super::{
-            sp1_element_threshold_for_available_vram as tier, sp1_measured_tiers,
-            sp1_smallest_measured_threshold, sp1_vram_required_for_threshold as required,
-        };
-        for total in [RTX4090, RTX5080, RTX4070, None] {
-            for (t, _) in sp1_measured_tiers(total) {
-                let need = required(*t, total).expect("every measured tier has a requirement");
-                assert_eq!(
-                    tier(need, total),
-                    Some(*t),
-                    "{need} bytes must buy exactly tier {t}"
+        // With the operator's savers too: the floor of a kind is that kind's smallest configuration,
+        // not the table's (a lean 134M floor admitted a card with the savers off that the worker,
+        // left only full configurations, then ran out of memory on).
+        for (gpu, total) in CARDS {
+            for lean in [None, Some(true), Some(false)] {
+                let floor = super::sp1_min_available_vram_bytes(gpu, total, lean);
+                assert!(
+                    super::sp1_config_for_available_vram(gpu, total, floor, None, lean).is_some(),
+                    "{gpu:?} {total:?} {lean:?}: a card that exactly clears the floor must have a \
+                     configuration"
                 );
-                assert_ne!(
-                    tier(need - 1, total),
-                    Some(*t),
-                    "one byte short of {need} must not buy tier {t}"
+                assert!(
+                    super::sp1_config_for_available_vram(gpu, total, floor - 1, None, lean)
+                        .is_none(),
+                    "{gpu:?} {total:?} {lean:?}: one byte below the floor there must be nothing on \
+                     offer"
                 );
             }
-            // The smallest tier's requirement IS the floor: the two are one rule, not two constants.
-            // And both tables share it, so "the smallest" means one threshold whatever the card.
-            let smallest = sp1_measured_tiers(total).last().unwrap().0;
-            assert_eq!(smallest, sp1_smallest_measured_threshold());
+        }
+        // The 4090 with the savers off: its smallest full configuration, 134M, not the lean one.
+        let (full, any) = (
+            super::sp1_min_available_vram_bytes(Cuda, RTX4090, Some(false)),
+            super::sp1_min_available_vram_bytes(Cuda, RTX4090, None),
+        );
+        assert!(full > any, "{full} vs {any}");
+        assert_eq!(
+            Some(full),
+            super::sp1_vram_required(Cuda, RTX4090, Sp1Config::full(134_217_728), Some(false))
+        );
+    }
+
+    /// What a configuration needs and what a figure buys must be exact inverses, at every measured
+    /// configuration. The dispatcher evicts our other workers from a card until an SP1 proof has
+    /// `required(c)` free; if that figure bought a SMALLER configuration the worker would be recycled
+    /// down on a card we had just emptied for it, and if a larger one it would be sized past the room
+    /// made for it.
+    #[test]
+    fn the_requirement_buys_exactly_its_own_configuration() {
+        use super::{sp1_config_for_available_vram as config, sp1_vram_required as required};
+        for (gpu, total) in CARDS {
+            let table = super::sp1_measured_configs(gpu, total, None);
+            for (c, _) in table.configs {
+                let need = required(gpu, total, *c, None).expect("every measured one has a need");
+                let got = config(gpu, total, need, None, None).expect("its need buys it");
+                assert_eq!(
+                    got.threshold, c.threshold,
+                    "{gpu:?} {total:?}: {need} bytes must buy {c}"
+                );
+                if table.sets_savers {
+                    assert_eq!(got, *c, "{gpu:?} {total:?}: {need} bytes must buy {c}");
+                }
+                assert_ne!(
+                    config(gpu, total, need - 1, None, None),
+                    Some(got),
+                    "{gpu:?} {total:?}: {need} - 1 must not buy {c}"
+                );
+            }
+            let smallest = table.configs.last().unwrap().0;
             assert_eq!(
-                required(smallest, total),
-                Some(super::sp1_min_available_vram_bytes(total))
+                required(gpu, total, smallest, None),
+                Some(super::sp1_min_available_vram_bytes(gpu, total, None))
             );
             // An unmeasured configuration has no requirement — never a guess.
-            assert_eq!(required(402_653_184, total), None);
-            assert_eq!(required(0, total), None);
+            assert_eq!(
+                required(gpu, total, super::Sp1Config::full(402_653_184), None),
+                None
+            );
+            assert_eq!(required(gpu, total, super::Sp1Config::full(0), None), None);
         }
     }
 
     /// The host-memory half of SP1's sizing, which the worker applies to itself and the dispatcher
-    /// predicts with these same functions.
+    /// predicts with these same functions, and how it combines with the card's.
     #[test]
     fn the_host_scale_only_ever_lowers_and_snaps_to_measured_steps() {
         use super::{
-            sp1_element_threshold_cap as cap, sp1_element_threshold_for_host_scale as host,
-            sp1_memory_scale as scale,
+            sp1_element_threshold_for_host_scale as host, sp1_memory_scale as scale,
+            sp1_worker_sizing as sizing,
         };
         const GIB: u64 = 1024 * 1024 * 1024;
         // Unknown budget, or tuning off: change nothing.
@@ -2427,23 +2989,80 @@ mod tests {
         assert_eq!(host(scale(Some(20 * GIB), false)), Some(134_217_728));
         assert_eq!(host(super::SP1_MIN_SCALE), Some(134_217_728));
         assert_eq!(host(1.0), None);
-        // The two bounds combine as the smaller; neither present means the fork decides.
-        assert_eq!(cap(1.0, Some(24 * GIB), RTX4090), Some(268_435_456));
-        assert_eq!(cap(0.6, Some(24 * GIB), RTX4090), Some(134_217_728));
-        assert_eq!(cap(0.8, Some(16 * GIB), RTX4090), Some(134_217_728));
-        // Too little free for any measured tier still bounds it — to the smallest, never to nothing,
-        // which would hand a 24 GB card back to the fork's 402M.
-        assert_eq!(cap(1.0, Some(8 * GIB), RTX4090), Some(134_217_728));
-        assert_eq!(cap(1.0, None, RTX4090), None);
-        // A 12 GB card is sized by its own table: free, 268M; the host can still lower it.
+        // The bounds combine as the smaller; none present means the fork decides.
         assert_eq!(
-            cap(1.0, Some(12_010 * super::MIB), RTX4070),
-            Some(268_435_456)
+            sizing(Cuda, RTX4090, None, Some(24 * GIB), None),
+            Some((268_435_456, Some(false)))
+        );
+        let held = host(0.6);
+        assert_eq!(held, Some(134_217_728));
+        assert_eq!(
+            sizing(Cuda, RTX4090, held, Some(24 * GIB), None),
+            Some((134_217_728, Some(false)))
+        );
+        // An RTX 4090 with an idle risc0 worker's 7.4 GiB beside it: 268M lean.
+        assert_eq!(
+            sizing(Cuda, RTX4090, None, Some(17 * GIB), None),
+            Some((268_435_456, Some(true)))
+        );
+        // Too little free for any measured configuration still bounds it — to the smallest, never to
+        // nothing, which would hand a 24 GB card back to the fork's 285M without its savers.
+        for (gpu, total) in CARDS {
+            let table = super::sp1_measured_configs(gpu, total, None);
+            let smallest = table.configs.last().unwrap().0;
+            let set = table.sets_savers.then_some(smallest.lean);
+            assert_eq!(
+                sizing(gpu, total, None, Some(GIB), None),
+                Some((smallest.threshold, set))
+            );
+        }
+        // No VRAM figure: only the caps bound it, and the savers are the server's.
+        assert_eq!(
+            sizing(Cuda, RTX4090, held, None, None),
+            Some((134_217_728, None))
+        );
+        assert_eq!(sizing(Cuda, RTX4090, None, None, None), None);
+        // The operator's savers: the configuration is of their kind, and the worker leaves them.
+        assert_eq!(
+            sizing(Cuda, RTX4090, None, Some(24 * GIB), Some(true)),
+            Some((268_435_456, None))
+        );
+    }
+
+    /// What the server runs: the smaller of the threshold it was given and its own tier, and the
+    /// savers as given or as it decides from the card's total.
+    #[test]
+    fn the_server_config_mirrors_the_forks_own_choice() {
+        use super::{sp1_server_config as server, Sp1Config};
+        // Nothing set: a 4090 runs the fork's tier (402M, an upper bound for its 285M) full, a 16 GB
+        // CUDA card 268M lean, a 12 GB Intel card lean.
+        assert_eq!(
+            server(Cuda, RTX4090, None, None),
+            Some(Sp1Config::full(402_653_184))
         );
         assert_eq!(
-            cap(0.6, Some(12_010 * super::MIB), RTX4070),
-            Some(134_217_728)
+            server(Cuda, RTX5080, None, None),
+            Some(Sp1Config::lean(268_435_456))
         );
+        assert_eq!(
+            server(Intel, ARC_B580, None, None).map(|c| c.lean),
+            Some(true)
+        );
+        // A threshold set caps the server's own; the savers set are what runs, alone or with one.
+        assert_eq!(
+            server(Cuda, RTX4090, Some(268_435_456), Some(true)),
+            Some(Sp1Config::lean(268_435_456))
+        );
+        assert_eq!(
+            server(Cuda, RTX4090, None, Some(true)),
+            Some(Sp1Config::lean(402_653_184))
+        );
+        // Savers unknown and no total: off, the larger need. Nothing at all: nothing to predict.
+        assert_eq!(
+            server(Cuda, None, Some(268_435_456), None),
+            Some(Sp1Config::full(268_435_456))
+        );
+        assert_eq!(server(Cuda, None, None, None), None);
     }
 
     /// These messages are operator-facing and go to a one-line log sink, so a wrapped literal must be

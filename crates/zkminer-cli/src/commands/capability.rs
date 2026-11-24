@@ -159,21 +159,22 @@ fn running_verdict(
             }
         }
         BACKEND_SP1 => {
-            // The tables are CUDA measurements; another vendor's card, or a 12-16 GB NVIDIA one with
-            // the server's memory savers off, is held to `SP1_OTHER_SERVER_TIERS` (no total). The
-            // dispatcher's `sizing_total` decides the same.
-            let savers_off = zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| {
-                std::env::var(v).ok()
-            });
-            let total = slot.vram_bytes.filter(|&v| {
-                slot.gpu_tag == "cuda"
-                    && !(savers_off
-                        && zkminer_prover_protocol::types::sp1_savers_are_the_default(v))
-            });
-            let floor =
-                zkminer_prover::discovery::min_available_vram_bytes_for_backend(BACKEND_SP1, total);
+            // Each vendor's card class has its own measured table, and the operator's savers pick
+            // among them (`sp1_measured_configs`), as the dispatcher's gate decides.
+            use zkminer_prover_protocol::types as t;
+            let total = slot.vram_bytes;
+            let floor = zkminer_prover::discovery::min_available_vram_bytes_for_backend(
+                BACKEND_SP1,
+                &slot.gpu_tag,
+                total,
+            );
             // What SP1's smallest measured configuration needs free, whatever the override.
-            let measured = zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total);
+            let gpu = t::Sp1Gpu::from_gpu_tag(&slot.gpu_tag);
+            let measured = t::sp1_min_available_vram_bytes(
+                gpu,
+                total,
+                t::sp1_operator_lean(|v| std::env::var(v).ok(), gpu, total),
+            );
             if measured == u64::MAX {
                 return Verdict::Idle(
                     "SP1's GPU server refuses cards of 11 GiB or less, so it gets no SP1 work"
