@@ -85,10 +85,18 @@ fn risc0_and_sp1_alternate_on_one_card() {
     let floor_mib = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1", total)
         .expect("sp1 must require free VRAM for this test to mean anything")
         >> 20;
+    // risc0 is gated too: it is not started on a card with less free than its job size's measured
+    // peak (12,436 MiB at po2 20 on a 16 GB card), which is above SP1's floor there. A ballast
+    // sized for SP1 alone left the 5080 ~10.7 GB, so the FIRST risc0 proof was refused and the
+    // test failed before it exercised any recycling.
+    let risc0_need_mib = total.map_or(0, |t| {
+        let po2 = zkminer_prover::benchmark::risc0_benchmark_po2(Some(t), "cuda");
+        zkminer_prover::benchmark::estimate_gpu_po2_memory(po2, "risc0", "cuda") >> 20
+    });
     let target_mib = std::env::var("ZKMINER_TEST_VRAM_TARGET_MIB")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(floor_mib + 1536);
+        .unwrap_or(floor_mib.max(risc0_need_mib) + 1536);
     let _ballast = match allocatable_mib(&card) {
         Some(allocatable) if allocatable >= target_mib + 1024 => {
             let ballast = Ballast::start(&card, allocatable - target_mib);

@@ -21449,7 +21449,7 @@ mod spill_and_cap_tests {
         let production = dispatcher.split_once("\n#[cfg(test)]").unwrap().0;
         assert_eq!(
             production
-                .matches(".map(|p| crate::memory::peak_at_baseline(p, benchmark_po2)),")
+                .matches(".map(|p| crate::memory::peak_at_baseline(p, benchmark_po2));")
                 .count(),
             2
         );

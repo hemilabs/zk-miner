@@ -95,6 +95,18 @@ fn start_lurker() {
 fn start_lurker() {}
 
 fn main() {
+    // The Windows miner's Medium-integrity install step before a Low worker's warm-up: nothing to
+    // install, answered as a real worker answers it.
+    if std::env::args().any(|a| a == zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG) {
+        let mut out = io::stdout().lock();
+        let resp = WorkerResponse::WarmupDone {
+            request_id: 0,
+            summary: "mock: nothing to install".to_string(),
+            groth16_helper: false,
+        };
+        write_message(&mut out, &resp).unwrap();
+        std::process::exit(0);
+    }
     if std::env::var_os("MOCK_BE_MEMORY_HOG").is_some() {
         let mut held: Vec<Vec<u8>> = Vec::new();
         loop {
