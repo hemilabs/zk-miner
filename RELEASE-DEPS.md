@@ -7,8 +7,8 @@ into the macOS beta (W10-INT, `docs/metal-port-notes/W10-INT.md`), then to `37b4
 fork's non-Metal changes to Metal builds (W10-GATE; W10-PIN, `docs/metal-port-notes/W10-PIN.md`), then
 to `81ee699e3`, the same branch rebased onto hemilabs/risc0 `release-3.1` @ `eb847a1af` (W12-REBASE,
 `docs/metal-port-notes/W12-REBASE.md`), then to `a424eda4b` (hemilabs/risc0 branch
-`zkminer/metal-3.1-v2-titanv`): `81ee699e3` plus three CUDA-only commits that a Metal build does not
-compile (the rv32im `eval_check_ef` compare-and-subtract on sm_70, the CUDA wrap releasing its stack
+`zkminer/metal-3.1-v2-titanv`): `81ee699e3` plus three CUDA-only commits, which change nothing a
+Metal build runs (the rv32im `eval_check_ef` compare-and-subtract on sm_70, the CUDA wrap releasing its stack
 reservation and preloading the SRS after the pool, and an opt-in pinned copy of the Groth16 key,
 `RISC0_GROTH16_PINNED_KEY`). For a Mac, `a424eda4b` builds what `81ee699e3` built.
 
@@ -41,10 +41,9 @@ hemilabs `release-3.1` @ `5beab26b5`, which GitHub main pinned until W10-INT
 beta pin lacked are the ROCm evalfast `eval_check` regeneration for the 3.1 circuit (4 files, ROCm only).
 W10-GATE (`404ae8dcf`, merged as `37b434755`) adds no Metal behaviour change: the five metallibs are
 byte-identical and its interleaved worker A/B is inside A-vs-A at the default and 4 GiB budgets.
-**The branch has to be pushed to hemilabs/risc0 unchanged as `zkminer/metal-3.1`** before anyone outside
-this Mac can build: until then `https://github.com/hemilabs/risc0` has no commit `37b434755`. If the
-branch is rebased or amended before the push, the rev in `Cargo.toml` and the 18 `source = "git+…"`
-lines in `Cargo.lock` must be updated to the pushed sha.
+That branch is on hemilabs/risc0 as `zkminer/metal-3.1` (it holds `37b434755`). A pin always names a
+pushed commit: if a pinned branch is rebased or amended, the rev in `Cargo.toml` and the 18
+`source = "git+…"` lines in `Cargo.lock` must be updated to the pushed sha.
 
 **What the Metal fork changes on the other platforms: nothing by default.** W10-R0's audit (the fork
 note `docs/metal-port/notes/W10-R0.md` in the risc0 repository) found six fork changes active off Metal.

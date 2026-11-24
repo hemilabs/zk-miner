@@ -3104,6 +3104,7 @@ fn job_set_aside(job_id: B256) -> bool {
         })
 }
 
+#[cfg(test)]
 fn claim_backing_off(job_id: alloy::primitives::B256) -> bool {
     claim_backoff_reason(job_id).is_some()
 }

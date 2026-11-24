@@ -3810,7 +3810,13 @@ mod storage_tests {
     /// host's failure, not a failed proof of the job; a guest that only says so is still the job's.
     #[test]
     fn a_full_segment_disk_is_the_hosts_failure() {
-        for code in [libc::ENOSPC, libc::EDQUOT] {
+        // The OS's own codes: errno on Unix, Win32 errors (ERROR_DISK_FULL,
+        // ERROR_HANDLE_DISK_FULL) on Windows.
+        #[cfg(unix)]
+        let codes = [libc::ENOSPC, libc::EDQUOT];
+        #[cfg(windows)]
+        let codes = [112, 39];
+        for code in codes {
             let e = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
                 .context("writing segment 4095");
             let (k, message) = kind(e);

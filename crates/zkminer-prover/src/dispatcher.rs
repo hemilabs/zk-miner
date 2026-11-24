@@ -1531,7 +1531,7 @@ impl WorkerEntry {
 #[cfg(any(windows, test))]
 const SPILL_EVICTED_MIB: u64 = 256;
 /// How often a running proof's evicted memory is read (`SpillWatch`).
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const SPILL_SAMPLE_EVERY: Duration = Duration::from_secs(2);
 /// Samples a spill is judged over: the last 30 s.
 #[cfg(any(windows, test))]
@@ -6822,10 +6822,11 @@ impl WorkerPool {
         #[cfg(windows)]
         if low {
             let why = match &response {
-                Err(e) => Some(format!(
-                    "{e:#}; {}",
-                    handle.death_note(Duration::from_millis(500))
-                )),
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    let note = handle.death_note_after(&error, Duration::from_millis(500));
+                    Some(format!("{error}; {note}"))
+                }
                 Ok(WorkerResponse::Error { message, .. }) => Some(message.clone()),
                 Ok(_) => None,
             };
@@ -14203,10 +14204,11 @@ impl WorkerPool {
             // Before the slot is cleared: the handle holds the exit and the output. A crash otherwise
             // reads only "process died (EOF)", and the dashboard does not forward worker output.
             if is_eof && !entry.intentional_kill.load(Ordering::Acquire) {
+                let error = format!("{e:#}");
                 death_note = slot
                     .handle
                     .as_mut()
-                    .map(|h| h.death_note(Duration::from_secs(1)));
+                    .map(|h| h.death_note_after(&error, Duration::from_secs(1)));
             }
 
             if !is_eof {

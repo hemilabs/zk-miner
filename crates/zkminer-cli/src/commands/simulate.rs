@@ -451,13 +451,27 @@ pub fn redact_urls(text: &str) -> String {
             .find(|&(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
             .map_or(0, |(p, c)| p + c.len_utf8());
         let after = &rest[i + 3..];
+        // The URL ends at white space, a quote or backtick, or a closing bracket that is not an
+        // IPv6 host's (`[::1]`): the text's own `)`, `>` or `]` stays in the output.
+        let mut bracket = false;
         let end = after
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | '<'))
-            .unwrap_or(after.len());
-        let authority_end = after[..end].find(['/', '?', '#']).unwrap_or(end);
-        let authority = &after[..authority_end];
-        // Drop userinfo (`user:pass@host`).
-        let host = authority.rsplit('@').next().unwrap_or(authority);
+            .char_indices()
+            .find(|&(_, c)| {
+                if c == '[' {
+                    bracket = true;
+                }
+                c.is_whitespace()
+                    || matches!(c, '"' | '\'' | '`' | ')' | '>' | '<')
+                    || (c == ']' && !std::mem::take(&mut bracket))
+            })
+            .map_or(after.len(), |(p, _)| p);
+        let span = &after[..end];
+        // Drop userinfo (`user:pass@host`) up to the LAST `@`: a password may hold an unencoded
+        // `/`, `?` or `#`, which would otherwise end the authority inside it and show the rest.
+        let host_start = span.rfind('@').map_or(0, |p| p + 1);
+        let tail = &span[host_start..];
+        let authority_end = host_start + tail.find(['/', '?', '#']).unwrap_or(tail.len());
+        let host = &span[host_start..authority_end];
         out.push_str(&rest[..scheme_start]);
         if scheme_start == i {
             // No scheme letters: not a URL, keep the text as it is.
@@ -468,7 +482,7 @@ pub fn redact_urls(text: &str) -> String {
         out.push_str(&head[scheme_start..]);
         out.push_str("://");
         out.push_str(host);
-        if end > authority_end || authority.contains('@') {
+        if end > authority_end || host_start > 0 {
             out.push_str("/…");
         }
         rest = &after[end..];
@@ -2605,6 +2619,29 @@ mod tests {
             "at (https://host:8545/…) down"
         );
         assert_eq!(redact_urls("https://host#SECRET"), "https://host/…");
+        // A password with an unencoded `/`, `?` or `#`: nothing of the userinfo is shown.
+        for url in [
+            "https://alice:pa/ss@rpc.example/v1",
+            "https://alice:pa?ss@rpc.example",
+            "https://alice:pa#ss@rpc.example:8545/x",
+        ] {
+            let out = redact_urls(&format!("at {url} down"));
+            assert!(!out.contains("alice") && !out.contains("pa"), "{out}");
+            assert!(
+                out.starts_with("at https://rpc.example") && out.ends_with("/… down"),
+                "{out}"
+            );
+        }
+        // The text's own closing bracket or backtick stays; an IPv6 host keeps its brackets.
+        assert_eq!(
+            redact_urls("[https://rpc.example/KEY] and `https://b/KEY`"),
+            "[https://rpc.example/…] and `https://b/…`"
+        );
+        assert_eq!(
+            redact_urls("at http://[::1]:8545/KEY down"),
+            "at http://[::1]:8545/… down"
+        );
+        assert_eq!(redact_urls("(http://[::1]:8545)"), "(http://[::1]:8545)");
         let r = Report::new(id(1)).end(
             Outcome::Unavailable,
             "status view unreadable: https://rpc.example.com/KEY123",

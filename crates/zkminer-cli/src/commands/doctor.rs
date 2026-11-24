@@ -107,8 +107,21 @@ fn free_bytes(path: &Path) -> Option<u64> {
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// The prover's first run downloads RISC Zero's Groth16 artifacts into `~/.risc0` and SP1's circuit
-/// artifacts into `~/.sp1`: about 16-20 GB unpacked between them.
-const FIRST_RUN_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// artifacts into `~/.sp1`: about 16-20 GB unpacked between them. A Mac proves risc0 only: its
+/// Groth16 component's 2.4 GB archive and the 5.8 GB it unpacks to are on disk together, about 8.3 GB
+/// (packaging/macos/README.md).
+const FIRST_RUN_DOWNLOAD_BYTES: u64 = if cfg!(target_os = "macos") {
+    8_300_000_000
+} else {
+    20 * 1024 * 1024 * 1024
+};
+
+/// [`FIRST_RUN_DOWNLOAD_BYTES`] as the operator reads it.
+const FIRST_RUN_DOWNLOAD_TEXT: &str = if cfg!(target_os = "macos") {
+    "about 8.3 GB"
+} else {
+    "about 16-20 GB"
+};
 
 fn fmt_eth(wei: u128) -> String {
     format!("{:.5} ETH", wei as f64 / 1e18)
@@ -965,7 +978,7 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
             Level::Warn,
             "disk",
             format!(
-                "{:.1} GiB free in {}; the first run downloads about 16-20 GB into {}",
+                "{:.1} GiB free in {}; the first run downloads {FIRST_RUN_DOWNLOAD_TEXT} into {}",
                 free as f64 / GIB,
                 user_home.display(),
                 missing.join(" and ")
@@ -982,7 +995,7 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
                     String::new()
                 } else {
                     format!(
-                        " (the first run downloads about 16-20 GB into {})",
+                        " (the first run downloads {FIRST_RUN_DOWNLOAD_TEXT} into {})",
                         missing.join(" and ")
                     )
                 }

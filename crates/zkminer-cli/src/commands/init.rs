@@ -96,8 +96,9 @@ fn key_plan_on(
              To make a new key and leave that address behind: `zkminer init --generate-key` \
              (what is staked or paid to it stays with it). To keep using the variable: \
              `zkminer init --key-source env` (only for a variable set in the miner's own \
-             process, such as a service's environment: a copy kept in your user environment \
-             stops Low workers from starting)"
+             process, such as the shell that starts it: a copy kept with setx stops Low workers \
+             from starting, and other users or processes read one kept there or in a service's \
+             environment; a service needs the key file)"
         );
     }
     Ok(KeyPlan::Generate)

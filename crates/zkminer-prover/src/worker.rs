@@ -1519,12 +1519,13 @@ impl WorkerHandle {
             // dispatcher starts the next one at Low after its back-off. See `windows_sandbox`.
             if let Err(e) = handle.handshake() {
                 // Its last words name what failed (a GPU runtime's call, a DLL that did not load).
-                let note = handle.death_note(Duration::from_millis(500));
+                let error = format!("{e:#}");
+                let note = handle.death_note_after(&error, Duration::from_millis(500));
                 drop(handle);
                 crate::windows_sandbox::low_il_worker_failed(
                     backend,
                     path,
-                    &format!("{e:#}; {note}"),
+                    &format!("{error}; {note}"),
                 );
                 return Err(e);
             }
@@ -2016,6 +2017,21 @@ impl WorkerHandle {
             format!("worker {reason}, with no output")
         } else {
             format!("worker {reason}; its last output: {}", lines.join(" | "))
+        }
+    }
+
+    /// [`death_note`](Self::death_note) for `error`, the failure it follows: only how the worker
+    /// ended when `error` already quotes its last output (a [`WorkerDied`]), which would otherwise
+    /// be said twice.
+    pub fn death_note_after(&mut self, error: &str, budget: Duration) -> String {
+        let note = self.death_note(budget);
+        if error.contains(LAST_OUTPUT) {
+            match note.split_once("; its last output: ") {
+                Some((ended, _)) => ended.to_string(),
+                None => note,
+            }
+        } else {
+            note
         }
     }
 

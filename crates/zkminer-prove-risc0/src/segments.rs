@@ -204,31 +204,27 @@ pub fn storage_exhausted(e: &anyhow::Error) -> bool {
         c.downcast_ref::<NoRoom>().is_some()
             || c.downcast_ref::<std::io::Error>().is_some_and(|io| {
                 io.get_ref().is_some_and(|inner| inner.is::<NoRoom>())
-                    || io
-                        .raw_os_error()
-                        .is_some_and(|n| n == enospc() || Some(n) == edquot())
+                    || io.raw_os_error().is_some_and(storage_full_code)
             })
     })
 }
 
+/// Whether an OS error code says a filesystem is full or a quota used up.
 #[cfg(unix)]
-fn enospc() -> i32 {
-    libc::ENOSPC
+fn storage_full_code(n: i32) -> bool {
+    n == libc::ENOSPC || n == libc::EDQUOT
 }
 
-#[cfg(not(unix))]
-fn enospc() -> i32 {
-    28
+/// Windows: an `io::Error`'s code is a Win32 error, never an errno. `ERROR_DISK_FULL` (112) and
+/// `ERROR_HANDLE_DISK_FULL` (39) are its full disk (a quota used up reports `ERROR_DISK_FULL` too).
+#[cfg(windows)]
+fn storage_full_code(n: i32) -> bool {
+    n == 112 || n == 39
 }
 
-#[cfg(unix)]
-fn edquot() -> Option<i32> {
-    Some(libc::EDQUOT)
-}
-
-#[cfg(not(unix))]
-fn edquot() -> Option<i32> {
-    None
+#[cfg(not(any(unix, windows)))]
+fn storage_full_code(n: i32) -> bool {
+    n == 28
 }
 
 /// Bytes available to this user on the filesystem holding `dir`, where they can be read.
@@ -451,6 +447,21 @@ mod windows_tests {
 
     /// A pid no process has: not a multiple of 4.
     const GONE: u32 = 4_000_000_001;
+
+    /// A full disk is told by its Win32 code (an errno never reaches an `io::Error` here).
+    #[test]
+    fn a_full_disk_is_known_by_its_win32_code() {
+        for code in [112, 39] {
+            let full = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
+                .context("write segment");
+            assert!(storage_exhausted(&full), "{code}");
+        }
+        // ENOSPC's number (28) is ERROR_OUT_OF_PAPER on Windows; 5 is ERROR_ACCESS_DENIED.
+        for code in [28, 5] {
+            let other = anyhow::Error::from(std::io::Error::from_raw_os_error(code));
+            assert!(!storage_exhausted(&other), "{code}");
+        }
+    }
 
     fn me() -> (u32, u64) {
         let pid = std::process::id();
