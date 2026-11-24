@@ -330,10 +330,15 @@ pub fn risc0_default_job_po2_for_vram(vram: u64) -> Option<u8> {
 /// (`risc0_default_job_po2_for_vram`) or, on a card too small for any, the smallest measured one:
 /// its rate still says what the card would do. Anywhere else [`RISC0_DEFAULT_JOB_PO2`], which every
 /// card was benchmarked at before: no AMD or Intel card has been measured per size, and a 12 GB Arc
-/// B580 proves 20.
+/// B580 proves 20. An Apple GPU: the Metal table's size for its idle budget ([`metal_job_po2`]),
+/// which is what its worker proves jobs at by default (the CUDA rule says 20 on every Mac, beyond
+/// the working set of a 16 or 18 GB one).
 ///
 /// [`RISC0_DEFAULT_JOB_PO2`]: zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
 pub fn risc0_benchmark_po2(vram_bytes: Option<u64>, gpu_tag: &str) -> u8 {
+    if gpu_tag == "metal" {
+        return metal_job_po2(vram_bytes);
+    }
     match vram_bytes {
         Some(v) if gpu_tag == "cuda" => {
             risc0_default_job_po2_for_vram(v).unwrap_or(RISC0_GPU_MEASURED_PEAK_MIB[0].0)
@@ -5491,6 +5496,53 @@ mod tests {
             if let Some(job) = risc0_job_po2(None, None, v, "cuda") {
                 assert_eq!(risc0_benchmark_po2(v, "cuda"), job, "{gib} GiB");
             }
+        }
+    }
+
+    /// An Apple GPU is benchmarked at the Metal table's size for its idle budget (`hw.memsize` less
+    /// the 8 GiB host reserve), the size its jobs prove at, never the CUDA rule's 20 (a rebase
+    /// regression once benchmarked every Mac at 20).
+    #[test]
+    fn a_mac_is_benchmarked_at_the_metal_tables_size() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for vram in [Some(4 * GIB), Some(8 * GIB), Some(10 * GIB), Some(16 * GIB), None] {
+            assert_eq!(
+                risc0_benchmark_po2(vram, "metal"),
+                metal_job_po2(vram),
+                "{vram:?}"
+            );
+            assert_eq!(
+                Some(risc0_benchmark_po2(vram, "metal")),
+                risc0_slot_job_po2("gpu-metal0", "metal", None, None, vram),
+                "the size its jobs prove at, {vram:?}"
+            );
+        }
+        // Without a budget: what the Metal table says for the idle budget, which keeps a 16 or
+        // 18 GB Mac (8 or 10 GiB idle) at 19 and a 12 GB one (4 GiB) at 18 (M8's rows, which W7
+        // and R2 only ever lower), and a 24 GB one (16 GiB) at 20.
+        if std::env::var_os(crate::metal_sizing::MAX_WORKING_SET_ENV).is_none() {
+            use crate::metal_sizing::{job_po2_for_limit, job_po2_for_limit_in, Po2Table::M8};
+            for gib in [4, 8, 10, 16] {
+                assert_eq!(
+                    risc0_benchmark_po2(Some(gib * GIB), "metal"),
+                    job_po2_for_limit(gib * GIB),
+                    "{gib} GiB"
+                );
+            }
+            assert_eq!(job_po2_for_limit_in(8 * GIB, M8), 19);
+            assert_eq!(job_po2_for_limit_in(10 * GIB, M8), 19);
+            assert_eq!(job_po2_for_limit_in(4 * GIB, M8), 18);
+            assert_eq!(job_po2_for_limit_in(16 * GIB, M8), 20);
+            assert!(risc0_benchmark_po2(Some(8 * GIB), "metal") <= 19);
+            assert!(risc0_benchmark_po2(Some(10 * GIB), "metal") <= 19);
+            assert!(risc0_benchmark_po2(Some(4 * GIB), "metal") <= 18);
+        }
+        // Unknown budget: the protocol default, as the worker then sizes itself.
+        if std::env::var_os(crate::metal_sizing::MAX_WORKING_SET_ENV).is_none() {
+            assert_eq!(
+                risc0_benchmark_po2(None, "metal"),
+                zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+            );
         }
     }
 
