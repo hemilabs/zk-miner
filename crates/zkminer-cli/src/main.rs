@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 mod commands;
 mod journal;
+mod logging;
 
 /// Forwards each WARN/ERROR event whose message starts with `PAGE` to the dashboard's log (see
 /// `commands::run::note_page`).
@@ -33,15 +34,16 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageToDashboard {
 #[derive(Parser)]
 #[command(
     name = "zkminer",
+    version,
     about = "ZK Miner — HemiProve proving marketplace client"
 )]
 struct Cli {
     /// Path to config file (default: ~/.zkminer/config.toml)
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     config: Option<String>,
 
-    /// Verbosity level
-    #[arg(long, short, action = clap::ArgAction::Count)]
+    /// Verbosity level (-v debug, -vv more, -vvv trace)
+    #[arg(long, short, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
     #[command(subcommand)]
@@ -50,8 +52,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show prover status (balance, stake, stats)
-    Status,
+    /// Show prover status (held locks, recent pages, balance, stake, stats). Exits 2 while a page
+    /// is unacknowledged, locks are held with no miner running to drive them, or the slash latch is
+    /// tripped (no new claims until it is cleared).
+    Status {
+        /// Acknowledge the pages shown (`~/.zkminer/logs/pages.log`): they no longer make the
+        /// exit code 2
+        #[arg(long)]
+        ack: bool,
+    },
     /// Add collateral so more GPU slots can be funded (approve + stake, in HEMI)
     Stake {
         /// Amount in HEMI (e.g. `500`, or `4.25`). NOT wei.
@@ -63,6 +72,77 @@ enum Commands {
         /// running). Risks displacing a pending fulfillJob and getting it slashed.
         #[arg(long)]
         force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Request stake back out (it can be withdrawn 7 days later with `zkminer withdraw`), or
+    /// cancel a pending request
+    #[command(group(clap::ArgGroup::new("what").required(true).args(["amount", "all", "cancel"])))]
+    Unstake {
+        /// Amount in HEMI (e.g. `100`, or `4.25`). NOT wei.
+        amount: Option<String>,
+        /// Request all free stake (stake locked in jobs stays until they settle)
+        #[arg(long)]
+        all: bool,
+        /// Cancel the pending request, counting it back as stake
+        #[arg(long)]
+        cancel: bool,
+        /// Check it against the contract and send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Send even though the miner may be running with this key. Risks displacing a pending
+        /// fulfillJob and getting it slashed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Withdraw a matured unstake and any payouts the router holds for this account
+    Withdraw {
+        /// Check it against the contract and send nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Send even though the miner may be running with this key. Risks displacing a pending
+        /// fulfillJob and getting it slashed.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Check whether this miner will claim and prove jobs, and if not, why not: config, key, chain,
+    /// gas, stake, and card by card what this host can prove. Sends nothing, starts no worker.
+    Doctor,
+    /// Stop the miner running under this home directory (from another terminal, a script or a
+    /// service manager). By default it drains: no new claims, and it exits once the proofs in
+    /// flight are fulfilled.
+    #[command(group(clap::ArgGroup::new("mode").args(["keep_locks", "abandon", "force_exit"])))]
+    Stop {
+        /// Exit within minutes without releasing (exit code 75, so `Restart=on-failure` starts
+        /// it again); the next start finishes the jobs held. A lock too close to its deadline
+        /// for a restart to save it is released first. For restarts and upgrades.
+        #[arg(long)]
+        keep_locks: bool,
+        /// Release every job held now (each pays a 5-30% release penalty), then exit
+        #[arg(long)]
+        abandon: bool,
+        /// Exit at once, releasing nothing (exit code 130: a service is not restarted; start
+        /// it again by the time it prints, ~15 min before the earliest lock's cutoff)
+        #[arg(long)]
+        force_exit: bool,
+        /// Wait until the miner has exited, then say what it left held
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up waiting after this many seconds (the miner keeps stopping)
+        #[arg(long, requires = "wait", value_name = "SECS")]
+        timeout: Option<u64>,
+    },
+    /// Allow new claims again after the slash latch stopped them. After a slash (or a stake fall
+    /// nothing of this miner's explains) the miner takes no new work, across restarts, until this
+    /// is run; held locks are driven throughout. Prints what tripped it first.
+    ResumeClaims {
         /// Skip the confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
@@ -81,7 +161,8 @@ enum Commands {
     },
     /// Start the miner
     Run {
-        /// Run in headless mode (no TUI, log to console)
+        /// Run in headless mode (no TUI, log to console). Chosen automatically when stdout is not a
+        /// terminal (a service, `nohup`, or a container started without `-t`).
         #[arg(long)]
         headless: bool,
         /// Run in mock mode (simulated marketplace, no chain/wallet needed)
@@ -95,6 +176,16 @@ enum Commands {
         /// is never used)
         #[arg(long, requires = "watch_only")]
         address: Option<alloy::primitives::Address>,
+        /// Windows, when `run` refuses its account with locks held: release them all at once,
+        /// rather than each near its cutoff (which leaves time to restart the miner as the right
+        /// account and prove them)
+        #[arg(long, conflicts_with_all = ["mock", "watch_only"])]
+        release_held: bool,
+        /// Start although the job journal's locks belong to another address than the configured
+        /// key's (the key changed), giving them up: each is slashed at its deadline unless a miner
+        /// with that key drives it. Without it such a start is refused (PAGE: KEY-CHANGED)
+        #[arg(long, conflicts_with_all = ["mock", "watch_only"])]
+        forget_foreign_locks: bool,
     },
     /// Measure jobs as the miner sizes them before a claim, whatever their state, and print one JSON
     /// line per job: cycles, or why not. Signs and sends nothing; starts measure workers only.
@@ -246,9 +337,25 @@ enum Commands {
         /// Target network: "testnet" (default) or "mainnet"
         #[arg(long, default_value = "testnet")]
         network: String,
-        /// Generate a fresh private key and save to ~/.zkminer/key
+        /// Generate a private key into ~/.zkminer/key (readable by you only; an existing key there
+        /// is kept, never overwritten) and point the config at it
         #[arg(long)]
         generate_key: bool,
+        /// Where the miner takes its key from: "file" (a key file, as --generate-key; the default
+        /// on Windows) or "env" (the ZKMINER_PRIVATE_KEY variable; the default elsewhere). With
+        /// --force and none of these options, the config's key settings are kept
+        #[arg(long, value_parser = ["file", "env"])]
+        key_source: Option<String>,
+        /// Copy the key given as the variable (ZKMINER_PRIVATE_KEY, or --key-env-var) into a key
+        /// file readable by you only, beside the config, and point the config at it. Reads it from
+        /// this process's environment, else from the registry (Windows: the user's, the machine's
+        /// or a service's environment); never deletes it. Over an existing config, changes only its
+        /// key settings
+        #[arg(long, conflicts_with_all = ["generate_key", "key_source"])]
+        import_env_key: bool,
+        /// The variable the key is given as (default: the config's, else ZKMINER_PRIVATE_KEY)
+        #[arg(long, value_name = "NAME")]
+        key_env_var: Option<String>,
     },
 }
 
@@ -479,9 +586,42 @@ struct Early {
     /// `artifact publish --password-fd N`, checked and owned.
     #[cfg(target_os = "linux")]
     password_fd: Option<std::os::fd::OwnedFd>,
+    /// Windows: `run` refused its account with locks in the journal (the refusal): it holds them,
+    /// starting no worker, releases each near its cutoff, then exits with it
+    /// (`commands::run::release_for_refused_account`).
+    #[cfg(windows)]
+    refused_account: Option<String>,
 }
 
-fn main() -> Result<()> {
+impl Early {
+    /// Whether this run only releases what a refused account holds.
+    fn refused_account(&self) -> bool {
+        #[cfg(windows)]
+        return self.refused_account.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+}
+
+/// Runs the command; an error it returns is printed as `main -> Result` would print it, but with
+/// every URL cut to its scheme and host: an RPC client's error embeds the request URL, and an
+/// operator's RPC URL carries its API key in the path, the query or the userinfo.
+fn main() -> std::process::ExitCode {
+    match run_cli() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", main_error_text(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// What [`main`] prints for an error: its chain (`{:?}`), URLs redacted.
+fn main_error_text(e: &anyhow::Error) -> String {
+    commands::simulate::redact_urls(&format!("{e:?}"))
+}
+
+fn run_cli() -> Result<()> {
     // The miner holds the operator's signing key. Non-dumpable, its `/proc/<pid>` entries belong to
     // root, so no other process of this uid can read its memory or environment (`mem`, `environ`,
     // `maps`, `fd`), whatever the host's `ptrace_scope`, and it leaves no core dump. Its own reads of
@@ -492,12 +632,99 @@ fn main() -> Result<()> {
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
+    // Windows: libraries loaded by name come from beside the program or System32 only.
+    #[cfg(windows)]
+    zkminer_prover::windows_sandbox::restrict_library_search();
+    // Windows has no dumpable flag: the miner's process and threads refuse every other process of
+    // this user (a prover worker that a guest took over included) all but seeing and ending it, so
+    // none can read its memory or run code in it. See `windows_sandbox`.
+    #[cfg(windows)]
+    if let Err(e) = zkminer_prover::windows_sandbox::lock_down_this_process() {
+        eprintln!(
+            "warning: the miner's process could not be locked to this user ({e}): other processes \
+             of this user can read its memory"
+        );
+    }
+    // Windows Error Reporting cannot open the locked-down process, so a crash would hang it: record
+    // the crash in ~/.zkminer/crashes and exit with its code instead. See `windows_crash`.
+    #[cfg(windows)]
+    zkminer_prover::windows_crash::install();
     let cli = Cli::parse();
+    // Windows: no mining as LocalSystem, LocalService or NetworkService, or as an administrator
+    // under a service logon (every worker, and so every requester's guest, would run as it too),
+    // nor when the account cannot be told, unless the operator says so. See `windows_sandbox`.
+    #[cfg(windows)]
+    let mut refused_account = None;
+    #[cfg(windows)]
+    if matches!(cli.command, Commands::Run { .. }) {
+        use zkminer_prover::windows_sandbox as sandbox;
+        if let Some(refusal) = sandbox::account_refusal(
+            &sandbox::account_risk(),
+            sandbox::privileged_account_allowed(),
+        ) {
+            // Locks in the journal (a LocalSystem service upgraded in place to this build): released
+            // first, with no worker started, rather than stranded until slashed. A run that holds
+            // none (watch-only, mock) is refused at once.
+            let holds = matches!(
+                cli.command,
+                Commands::Run {
+                    watch_only: false,
+                    mock: false,
+                    ..
+                }
+            );
+            refused_account = Some(
+                commands::run::refused_account_mode(
+                    refusal,
+                    holds.then(journal::JobJournal::load_checked),
+                )
+                .map_err(|refusal| anyhow::anyhow!("{refusal}"))?,
+            );
+        }
+        // Every privilege but traverse checking and two GPU runtimes may use, removed for good
+        // before any thread or child starts: a service logon's SeImpersonatePrivilege (the SERVICE
+        // group's) would let a requester's guest that broke out of a worker reach SYSTEM. Each
+        // worker's token is a copy of this one, and is checked again before it runs. (A refused
+        // account's release starts none.)
+        if let Err(e) = zkminer_prover::windows_account::strip_this_process() {
+            if !sandbox::privileged_account_allowed() && refused_account.is_none() {
+                let refusal = format!(
+                    "refusing to run: this process's privileges could not be removed ({e}), and \
+                     its prover workers would hold them too (with SeImpersonatePrivilege, a \
+                     requester's guest that broke out of one could reach SYSTEM). Run the miner \
+                     as a dedicated standard user (README: Windows service). To run anyway, \
+                     accepting that, set {}=1",
+                    sandbox::ALLOW_PRIVILEGED_ACCOUNT_ENV
+                );
+                // Review 6 M6-3: locks in the journal are held and released as a refused
+                // account's are, rather than stranded.
+                let holds = matches!(
+                    cli.command,
+                    Commands::Run {
+                        watch_only: false,
+                        mock: false,
+                        ..
+                    }
+                );
+                refused_account = Some(
+                    commands::run::refused_account_mode(
+                        refusal,
+                        holds.then(journal::JobJournal::load_checked),
+                    )
+                    .map_err(|refusal| anyhow::anyhow!("{refusal}"))?,
+                );
+            }
+        }
+    }
     // `--password-fd N` is taken now, while every open descriptor above 2 is one the caller passed:
     // once the runtime, the network guard or a connection has opened its own, a number the caller
     // did not open could name one of them (and reading it to the end would close it).
     #[allow(unused_mut)]
     let mut early = Early::default();
+    #[cfg(windows)]
+    {
+        early.refused_account = refused_account;
+    }
     #[cfg(target_os = "linux")]
     if let Commands::Artifact {
         command:
@@ -520,9 +747,14 @@ fn main() -> Result<()> {
 async fn run(cli: Cli, early: Early) -> Result<()> {
     // Only setup stderr tracing for headless/CLI modes.
     // In TUI mode, any stderr output (from any thread) corrupts the alternate screen.
-    let is_tui = matches!(&cli.command,
+    let tui_requested = matches!(&cli.command,
         Commands::Run { headless, watch_only, .. } if !headless && !watch_only
-    );
+    ) && !early.refused_account();
+    // The TUI draws on stdout. Without a terminal there (a systemd unit, `nohup`, `docker run`
+    // without `-t`) it cannot start, and the miner used to come up, fail to enter raw mode, log that
+    // to a file and shut down. Run headless instead, and say so.
+    let no_terminal = tui_requested && !stdout_is_terminal();
+    let is_tui = tui_requested && !no_terminal;
     // Hold the log guard until main() returns so the non-blocking writer flushes on shutdown.
     let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
 
@@ -532,8 +764,8 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
         // to the daily-rotated, size-uncapped log it fills the operator's disk, and its ungated
         // "[WITSUM]" eprintln path would corrupt the alternate screen. The drainer still READS the pipe
         // (so the worker never blocks on a full pipe) — it just does not forward while suppressed.
-        // (Headless keeps forwarding, rate-capped in the drainer, to operator-controlled stderr.)
-        zkminer_prover::worker::suppress_worker_stderr(true);
+        // (Headless counts it instead, and forwards it only on ZKMINER_WORKER_OUTPUT=stderr.)
+        zkminer_prover::worker::set_worker_output(zkminer_prover::worker::WorkerOutput::Suppress);
         // TUI mode: log to file instead of stderr (stderr output corrupts the alternate screen).
         let log_dir = dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -568,16 +800,30 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             .with(EnvFilter::new(filter))
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_writer(non_blocking)
+                    .with_writer(logging::RedactingMake(non_blocking))
                     .with_target(false)
                     .with_ansi(false),
             )
             // PAGE lines (claims stopped, a lock at risk) also reach the dashboard: in this mode the
             // log file is all the operator would otherwise see of them.
             .with(PageToDashboard)
+            // And to `pages.log` and the event log (review 6 D1), except a mock run's.
+            .with(
+                matches!(cli.command, Commands::Run { mock: false, .. })
+                    .then(|| logging::PageSink::new(log_dir.clone())),
+            )
             .init();
     } else {
+        // Worker (guest) output is counted, not shown, unless ZKMINER_WORKER_OUTPUT=stderr: a
+        // service wrapper keeps stderr in a file nothing bounds while the miner runs (review 7 LD-2).
+        zkminer_prover::worker::set_worker_output(if logging::worker_output_to_stderr() {
+            zkminer_prover::worker::WorkerOutput::Forward
+        } else {
+            zkminer_prover::worker::WorkerOutput::Tally
+        });
         let filter = match cli.verbose {
+            // `doctor` prints its own report; the probes' INFO lines would only interleave with it.
+            0 if matches!(cli.command, Commands::Doctor) => "error",
             0 => "warn,zkminer=info",
             1 => "info,zkminer=debug",
             2 => "debug",
@@ -586,35 +832,112 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
         // Logs go to STDERR so stdout carries only command output. Without this
         // `zkminer benchmark --json` interleaves INFO lines with the JSON document
         // and emits unparseable output (the default `fmt()` writer is stdout).
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .init();
+        if matches!(cli.command, Commands::Run { mock: false, .. }) {
+            // A headless run (a service's included) also keeps the rolling file and its pages,
+            // which a service wrapper may otherwise drop with stderr (review 6 D1).
+            _log_guard = Some(logging::init_headless_run(filter, &logging::logs_dir()));
+            // NSSM keeps every file it rotates: keep the newest few of the service's.
+            #[cfg(windows)]
+            commands::windows_service::prune_rotated_service_logs();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new(filter))
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                // Colour codes only for a terminal: journald and `docker logs` show them as text.
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+                .init();
+        }
+    }
+    if no_terminal {
+        tracing::warn!(
+            "stdout is not a terminal, so the dashboard cannot start: running headless (logs on \
+             stderr and in {}). Pass --headless to make this explicit.",
+            logging::logs_dir().display()
+        );
     }
 
     let config_path = cli.config.as_deref().map(std::path::Path::new);
 
+    // Windows: a refused account's held locks, each released near its cutoff (no worker, no
+    // claim), then the refusal.
+    #[cfg(windows)]
+    if let Some(refusal) = &early.refused_account {
+        let release_held = matches!(
+            cli.command,
+            Commands::Run {
+                release_held: true,
+                ..
+            }
+        );
+        return commands::run::release_for_refused_account(config_path, refusal, release_held)
+            .await;
+    }
+
     match cli.command {
-        Commands::Status => commands::status::run(config_path).await,
+        Commands::Status { ack } => commands::status::run(config_path, ack).await,
         Commands::Stake {
             amount,
             dry_run,
             force,
             yes,
         } => commands::stake::run(config_path, amount, dry_run, force, yes).await,
+        Commands::Unstake {
+            amount,
+            all,
+            cancel,
+            dry_run,
+            force,
+            yes,
+        } => {
+            let action = match (amount, all, cancel) {
+                (_, _, true) => commands::unstake::UnstakeAction::Cancel,
+                (_, true, _) => commands::unstake::UnstakeAction::All,
+                (Some(a), _, _) => commands::unstake::UnstakeAction::Amount(a),
+                (None, false, false) => unreachable!("clap requires one of them"),
+            };
+            commands::unstake::run_unstake(config_path, action, dry_run, force, yes).await
+        }
+        Commands::Withdraw {
+            dry_run,
+            force,
+            yes,
+        } => commands::unstake::run_withdraw(config_path, dry_run, force, yes).await,
+        Commands::Doctor => commands::doctor::run(config_path).await,
+        Commands::ResumeClaims { yes } => commands::run::slash_latch::resume(yes),
+        Commands::Stop {
+            keep_locks,
+            abandon,
+            force_exit,
+            wait,
+            timeout,
+        } => {
+            use zkminer_tui::state::StopMode;
+            let mode = match (keep_locks, abandon, force_exit) {
+                (true, _, _) => StopMode::KeepLocks,
+                (_, true, _) => StopMode::Abandon,
+                (_, _, true) => StopMode::Force,
+                _ => StopMode::Drain,
+            };
+            commands::stop::run(mode, wait, timeout)
+        }
         Commands::Benchmark { json, calibrate } => {
             commands::benchmark::run(config_path, json, calibrate).await
         }
-        Commands::Run { headless, mock, .. } if mock => commands::mock::run(headless).await,
+        Commands::Run { headless, mock, .. } if mock => {
+            commands::mock::run(headless || no_terminal).await
+        }
         Commands::Run {
             headless,
             watch_only,
             address,
+            forget_foreign_locks,
             ..
         } => {
+            commands::run::FORGET_FOREIGN_LOCKS
+                .store(forget_foreign_locks, std::sync::atomic::Ordering::SeqCst);
             let watch = watch_only.then_some(commands::run::WatchOnly { address });
-            commands::run::run(config_path, headless || watch_only, watch).await
+            commands::run::run(config_path, headless || watch_only || no_terminal, watch).await
         }
         Commands::Simulate {
             descriptor: Some(descriptor),
@@ -772,7 +1095,20 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
             force,
             network,
             generate_key,
-        } => commands::init::run(config_path, force, &network, generate_key),
+            key_source,
+            import_env_key,
+            key_env_var,
+        } => commands::init::run(
+            config_path,
+            force,
+            &network,
+            commands::init::KeyRequest {
+                generate_key,
+                import_env_key,
+                key_source: key_source.as_deref(),
+                key_env_var: key_env_var.as_deref(),
+            },
+        ),
         Commands::Witness { command } => match command {
             WitnessCommand::InitStore {
                 dir,
@@ -850,6 +1186,11 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
     }
 }
 
+/// Whether the TUI can draw: it renders on stdout.
+fn stdout_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
 /// A `simulate` bound in seconds, clamped to `MIN_BOUND_SECS..=86400`: below the minimum a request's
 /// own overhead would fail every request; far above it, the watchdog's deadline arithmetic overflows.
 /// `--header-bytes`: a length of 0 would declare that the binding has no header to pin, which passes
@@ -875,6 +1216,21 @@ fn simulate_bound(flag: &str, secs: u64) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start-up error that embeds the RPC URL (the API key in its path, query or userinfo) is
+    /// printed with the URL cut to its scheme and host, its context chain kept.
+    #[test]
+    fn a_startup_error_never_prints_the_rpc_urls_key() {
+        let e = anyhow::anyhow!(
+            "error sending request for url (https://user:pw@rpc.example.com/v2/SECRETKEY?key=SECRET2)"
+        )
+        .context("reading the chain ID");
+        let text = main_error_text(&e);
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(!text.contains("pw"), "{text}");
+        assert!(text.contains("https://rpc.example.com/…"), "{text}");
+        assert!(text.contains("reading the chain ID"), "{text}");
+    }
 
     #[test]
     fn simulate_bounds_are_clamped_to_their_minimum() {
@@ -974,6 +1330,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["zkminer", "run", "--watch-only", "--address", "0x12"]).is_err()
         );
+    }
+
+    #[test]
+    fn unstake_takes_exactly_one_of_an_amount_all_or_cancel() {
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "100"]).is_ok());
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "--all", "--dry-run"]).is_ok());
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "--cancel", "-y"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["zkminer", "unstake"]).is_err(),
+            "nothing to do"
+        );
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "100", "--all"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "unstake", "--all", "--cancel"]).is_err());
+        assert!(Cli::try_parse_from(["zkminer", "withdraw", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn global_flags_work_after_the_subcommand() {
+        let cli = Cli::try_parse_from(["zkminer", "run", "-v", "-v", "--headless", "-c", "x.toml"])
+            .unwrap();
+        assert_eq!(cli.verbose, 2);
+        assert_eq!(cli.config.as_deref(), Some("x.toml"));
+        let cli = Cli::try_parse_from(["zkminer", "-v", "status"]).unwrap();
+        assert_eq!(cli.verbose, 1);
+        let e = Cli::try_parse_from(["zkminer", "--version"]).err().unwrap();
+        assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]

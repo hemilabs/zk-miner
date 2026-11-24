@@ -1777,6 +1777,60 @@ pub fn discover_workers_reporting(
     search_dirs: &[PathBuf],
     report: &dyn Fn(&str),
 ) -> Vec<DiscoveredWorker> {
+    survey_workers(explicit_binaries, search_dirs, report).workers
+}
+
+/// What worker discovery found: the GPUs, a worker for each card a binary was found for, and the
+/// directories it searched.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverySurvey {
+    pub gpus: Vec<DetectedGpu>,
+    pub workers: Vec<DiscoveredWorker>,
+    /// Searched in this order, then `PATH`.
+    pub searched: Vec<PathBuf>,
+}
+
+/// The directories searched for worker binaries, in order (then `PATH`): the configured ones,
+/// `~/.zkminer/provers`, and the directory of the running executable.
+pub fn worker_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
+    if let Some(home_dir) = dirs::home_dir() {
+        all_dirs.push(home_dir.join(".zkminer").join("provers"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            all_dirs.push(parent.to_path_buf());
+        }
+    }
+    all_dirs
+}
+
+/// The file names a `backend` worker for `gpu_tag` cards is looked for under: the vendor's own,
+/// then the generic one.
+pub fn worker_file_names(backend: &str, gpu_tag: &str) -> Vec<String> {
+    let mut names = vec![worker_file_name(&worker_binary_name(backend, gpu_tag))];
+    if gpu_tag != "generic" {
+        names.push(worker_file_name(&worker_binary_name(backend, "generic")));
+    }
+    names
+}
+
+/// Files in `dirs` named like a `backend` worker for `gpu_tag` cards that discovery skips because
+/// they are not executable (on unix; elsewhere, none).
+pub fn non_executable_workers(backend: &str, gpu_tag: &str, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    worker_file_names(backend, gpu_tag)
+        .iter()
+        .flat_map(|name| dirs.iter().map(move |d| d.join(name)))
+        .filter(|p| p.is_file() && !is_executable(p))
+        .collect()
+}
+
+/// [`discover_workers_reporting`], keeping the GPUs it detected and where it looked.
+pub fn survey_workers(
+    explicit_binaries: &HashMap<String, PathBuf>,
+    search_dirs: &[PathBuf],
+    report: &dyn Fn(&str),
+) -> DiscoverySurvey {
     let gpus = detect_all_gpus_with(explicit_binaries, search_dirs, report);
     let mut found: Vec<DiscoveredWorker> = Vec::new();
 
@@ -1835,15 +1889,7 @@ pub fn discover_workers_reporting(
         }
 
         // Build search directories list: configured -> ~/.zkminer/provers/ -> sibling of exe
-        let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
-        if let Some(home_dir) = dirs::home_dir() {
-            all_dirs.push(home_dir.join(".zkminer").join("provers"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                all_dirs.push(parent.to_path_buf());
-            }
-        }
+        let all_dirs = worker_search_dirs(search_dirs);
 
         // Search for each GPU variant
         for gpu_tag in GPU_TAGS {
@@ -1924,7 +1970,11 @@ pub fn discover_workers_reporting(
         }
     }
 
-    found
+    DiscoverySurvey {
+        gpus,
+        workers: found,
+        searched: worker_search_dirs(search_dirs),
+    }
 }
 
 /// Check the one assumption every device pin in this program rests on.
@@ -2166,13 +2216,13 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 ///
 /// **hemilabs/sp1 #19 (6.8.1):** its server, on every backend, refuses only below
 /// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
-/// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore 11 GB, the
-/// server's own. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
-/// measured question; with circuit v6.1.0's peaks that floor (10,012 MiB) is below this one, so a
-/// card this admits can clear it once its VRAM is free.
+/// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore the server's
+/// own: more than 11 GiB (an 11,264 MiB card is `11 + 4 = 15` and refused), in bytes as the card
+/// totals are read. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
+/// measured question, answered for 12-16 GB CUDA cards from an RTX 4070's peaks (2026-11-16).
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
-        "sp1" => Some(11_000_000_000),
+        "sp1" => Some(11 * 1024 * 1024 * 1024 + 1),
         _ => None,
     }
 }
@@ -2196,30 +2246,38 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// inside SP1 can notice, because the sizing happens before its first allocation.
 ///
 /// Why this, rather than a flat allowance for foreign VRAM, which is what this replaced: a flat
-/// allowance refuses work the card could actually do. With circuit v6.1.0, SP1 peaks at about
-/// 9,000 MiB on the 134M-element tier and 11,500 MiB on the 268M tier (recorded as 9,500 and 12,000;
-/// see `SP1_MEASURED_TIERS`). A 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free —
-/// plenty — and a 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead
-/// admits that card and leaves the sizing to [`sp1_element_threshold_for_available_vram`], which
-/// steps the tier down to match. The floor itself is the smaller tier's recorded peak plus margin —
-/// 10,012 MiB — so a card that clears the floor has room for the configuration it will actually be
-/// given.
+/// allowance refuses work the card could actually do. Measured under the pinned server on a CUDA card
+/// above 16 GiB, SP1 peaks at 17,041 MiB on the 134M-element tier and 22,944 MiB on the 268M tier. A
+/// 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free — enough for the lower tier —
+/// and a 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead admits that
+/// card and leaves the sizing to [`sp1_element_threshold_for_available_vram`], which steps the tier
+/// down to match. The floor itself is the smaller tier's measured peak plus margin — 17,553 MiB on a
+/// CUDA card above 16 GiB, 9,167 MiB on one of 16 GiB or less, whose server runs leaner, 15,604 MiB
+/// on an AMD or Intel card — so a card that clears the floor has room for the configuration it will
+/// actually be given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
-/// (`benchmark::risc0_job_po2`), and one too small for any proves none.
-pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
+/// (`benchmark::risc0_job_po2`), and one too small for any proves none. A risc0 PROOF has one of
+/// its own, by its segment size: [`risc0_proof_vram_bytes`].
+///
+/// `total` is the card's capacity, which picks SP1's measured table (a 16 GB card's server runs
+/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown.
+pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -> Option<u64> {
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and
         // the tier the worker will actually be given cannot disagree about whether a card is usable.
         // They did in the first draft: a 16e9 floor admitted cards the tier function had no
         // configuration for.
-        "sp1" => zkminer_prover_protocol::types::sp1_min_available_vram_bytes(),
+        "sp1" => zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total),
         _ => return None,
     };
-    match std::env::var(MIN_AVAILABLE_VRAM_MB_ENV) {
+    if free_vram_checks_off() {
+        return None;
+    }
+    match crate::env::var(MIN_AVAILABLE_VRAM_MB_ENV) {
         // 0 is an explicit opt-out, for an operator who knows the other occupant of their card is
         // harmless and would rather risk the work than have it refused.
-        Ok(v) => match v.trim().parse::<u64>() {
+        Some(v) => match v.trim().parse::<u64>() {
             Ok(0) => None,
             Ok(mb) => Some(mb * 1024 * 1024),
             Err(_) => {
@@ -2231,9 +2289,52 @@ pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
                 Some(default)
             }
         },
-        Err(_) => Some(default),
+        None => Some(default),
     }
 }
+
+/// Whether the operator turned the free-VRAM checks off: [`MIN_AVAILABLE_VRAM_MB_ENV`] set to 0.
+pub fn free_vram_checks_off() -> bool {
+    crate::env::var(MIN_AVAILABLE_VRAM_MB_ENV).is_some_and(|v| v.trim().parse::<u64>() == Ok(0))
+}
+
+/// What a risc0 proof at segment size `po2` takes on a CUDA card of `total` bytes, as measured
+/// (`benchmark::RISC0_GPU_MEASURED_PEAK_MIB`), plus the Groth16 prover and SRS a worker keeps on a
+/// card of 20 GiB or more ([`RISC0_RESIDENT_GROTH16_BYTES`]): the room a proof must have before it
+/// starts, or it spills into system memory (Windows) or runs out (Linux). Not a margin: a proof
+/// that fits is never refused.
+///
+/// `None`, no requirement, for a size nothing measured (16 and 17, whose peaks are only bounded by
+/// 18's; 21 and up, which are extrapolated), another vendor's card, a card of unknown size or one
+/// that could never hold it (a refusal there would release every job such a card claims, where
+/// today it proves them slowly; the planner prices that, see
+/// `benchmark::risc0_largest_fitting_po2`), and with the checks off (`free_vram_checks_off`).
+pub fn risc0_proof_vram_bytes(po2: u8, gpu_tag: &str, total: Option<u64>) -> Option<u64> {
+    const MIB: u64 = 1024 * 1024;
+    if gpu_tag != "cuda" || free_vram_checks_off() {
+        return None;
+    }
+    let total = total?;
+    let peak = crate::benchmark::RISC0_GPU_MEASURED_PEAK_MIB
+        .iter()
+        .find(|(p, _)| *p == po2)
+        .map(|(_, mib)| mib * MIB)?;
+    let resident = if total >= RISC0_KEEPS_GROTH16_FROM_BYTES {
+        RISC0_RESIDENT_GROTH16_BYTES
+    } else {
+        0
+    };
+    let need = peak.saturating_add(resident);
+    (need <= total).then_some(need)
+}
+
+/// The card size from which a CUDA risc0 worker keeps its Groth16 prover and SRS on the card
+/// between proofs (`RELEASE_GROTH16_CACHE_BELOW_BYTES` in `zkminer-prove-risc0`).
+pub const RISC0_KEEPS_GROTH16_FROM_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// What the kept Groth16 cache adds to a risc0 proof's peak: 15,834 MiB at po2 20 with it kept,
+/// against 12,436 with it released (both on a 16 GB RTX 5080).
+pub const RISC0_RESIDENT_GROTH16_BYTES: u64 = (15_834 - 12_436) * 1024 * 1024;
 
 /// The sizing knob this backend should use on a card with `available` bytes of VRAM free, or `None`
 /// for a backend that has no such knob.
@@ -2241,11 +2342,11 @@ pub fn min_available_vram_bytes_for_backend(backend: &str) -> Option<u64> {
 /// Delegates to the shared arithmetic in `zkminer-prover-protocol` so the dispatcher and the worker
 /// that actually applies it cannot drift apart: the dispatcher uses this to notice that a live worker
 /// is sized for more VRAM than is now free, and the worker uses the same function to size itself.
-pub fn vram_sizing_tier(backend: &str, available: u64) -> Option<u64> {
+pub fn vram_sizing_tier(backend: &str, available: u64, total: Option<u64>) -> Option<u64> {
     match backend {
-        "sp1" => {
-            zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(available)
-        }
+        "sp1" => zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+            available, total,
+        ),
         // risc0 and openvm size per segment from `po2`, which the dispatcher clamps per run in
         // `calibrate_slot_po2`; there is no spawn-time tier to go stale.
         _ => None,
@@ -2262,9 +2363,9 @@ pub fn vram_sizing_tier(backend: &str, available: u64) -> Option<u64> {
 /// beside one that leaves too little kills the worker part-way through a claimed job — unless the
 /// backend's floor cannot be reached even then, in which case nothing is recycled and the floor
 /// refuses (see `room_needed`).
-pub fn vram_required_for_tier(backend: &str, tier: u64) -> Option<u64> {
+pub fn vram_required_for_tier(backend: &str, tier: u64, total: Option<u64>) -> Option<u64> {
     match backend {
-        "sp1" => zkminer_prover_protocol::types::sp1_vram_required_for_threshold(tier),
+        "sp1" => zkminer_prover_protocol::types::sp1_vram_required_for_threshold(tier, total),
         // No spawn-time tier, so no figure: risc0's need depends on the segment size of the job in
         // hand, and nothing here has measured it per po2 yet. Unknown, so all the room is made.
         _ => None,
@@ -2297,22 +2398,6 @@ fn infer_gpu_tag(path: &Path) -> String {
 /// executable suffix (`.exe` on Windows, nothing elsewhere).
 fn worker_file_name(bin_name: &str) -> String {
     format!("{bin_name}{}", std::env::consts::EXE_SUFFIX)
-}
-
-/// Where worker binaries are searched for: the configured directories, then ~/.zkminer/provers/,
-/// then the directory of this executable (as in `discover_workers`).
-#[cfg(windows)]
-fn worker_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
-    if let Some(home_dir) = dirs::home_dir() {
-        all_dirs.push(home_dir.join(".zkminer").join("provers"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            all_dirs.push(parent.to_path_buf());
-        }
-    }
-    all_dirs
 }
 
 fn search_in_dirs(bin_name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -2669,7 +2754,8 @@ mod tests {
     /// SP1's VRAM floor is a hard capability check, not a tunable risk — and the figure tracks which
     /// `sp1-gpu-server` is installed.
     ///
-    /// With the fork's server (built and installed 2026-10-05) the floor is 16 GB and BOTH cards here
+    /// With the fork's server as first built (2026-10-05) the floor was 16 GB (it is now more than
+    /// 11 GiB, see `min_vram_bytes_for_backend`) and BOTH cards here
     /// qualify. With the upstream binary the SDK downloads by default it is 24 GB and the 5080 is
     /// refused outright. The constant must match the installed server; see the doc on
     /// `min_vram_bytes_for_backend` for how to tell which one is in place.

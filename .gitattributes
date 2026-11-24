@@ -1,0 +1,4 @@
+# Rust sources stay LF on every checkout, Windows included: tests read them with
+# include_str! and match multi-line text, which a CRLF checkout (core.autocrlf=true, the
+# default on Windows and on GitHub's Windows runners) would never match.
+*.rs text eol=lf

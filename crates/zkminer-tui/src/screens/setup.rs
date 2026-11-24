@@ -393,6 +393,8 @@ pub enum SetupAction {
 
 /// Handle a key press on the setup screen.
 pub fn handle_setup_key(state: &mut MinerState, key: crossterm::event::KeyCode) -> SetupAction {
+    // Staking takes two presses of `s`: any other key in between disarms it.
+    let armed = std::mem::take(&mut state.setup_status.stake_armed);
     match key {
         crossterm::event::KeyCode::Esc => {
             state.setup_status.dismissed = true;
@@ -420,6 +422,18 @@ pub fn handle_setup_key(state: &mut MinerState, key: crossterm::event::KeyCode) 
         }
         crossterm::event::KeyCode::Char('s') | crossterm::event::KeyCode::Char('S') => {
             if state.setup_status.has_hemi
+                && !state.setup_status.has_stake
+                && state.setup_status.pending_action.is_none()
+                && !armed
+            {
+                state.setup_status.stake_armed = true;
+                state.setup_status.last_error = Some(
+                    "Press s again to approve and stake 100 HEMI. Staked HEMI comes back only 7 \
+                     days after an unstake (`zkminer unstake`)."
+                        .to_string(),
+                );
+                SetupAction::None
+            } else if state.setup_status.has_hemi
                 && !state.setup_status.has_stake
                 && state.setup_status.pending_action.is_none()
             {

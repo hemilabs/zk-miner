@@ -33,7 +33,10 @@ pub(crate) const GRAPH_SHA256_PREFIX: &str = "887aa345d6adc257";
 /// (`rzup/components/risc0-groth16/distribution_manifest.json`).
 /// (rzup's signed manifest, 2026-11-15: 0.2.0 = this blob, 2,406,044,780 bytes; 0.1.0 was 4b4f2b2f...).
 const ARCHIVE_SHA256: &str = "173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
-const ARCHIVE_URL: &str = "https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/\
+/// Served from `artifacts.risczero.net`, rzup's current download host: the old S3 bucket
+/// (risc0-artifacts.s3.us-west-2.amazonaws.com) now refuses anonymous reads (403). It is the same
+/// blob (checked against ARCHIVE_SHA256 on 2026-11-24), and the hash is checked after every download.
+const ARCHIVE_URL: &str = "https://artifacts.risczero.net/rzup/components/\
                            risc0-groth16/sha256/173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
 /// The files a complete install holds.
 const FILES: [&str; 4] = [
@@ -66,6 +69,19 @@ pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) 
     if complete(&dir) {
         return Ok(format!("risc0-groth16 component in {}", dir.display()));
     }
+    // A Low-integrity worker (Windows) cannot write rzup's home: the miner installs the component at
+    // its own integrity first (`--install-artifacts`). Say so rather than fail inside the install.
+    ensure!(
+        !zkminer_prover_protocol::types::is_low_integrity_worker(),
+        "the risc0-groth16 component is not installed in {}, and this worker runs at Low integrity, \
+         which cannot install it: the miner installs it at Medium integrity before a Low worker's \
+         warm-up (`{} {}`); its log says why that did not",
+        dir.display(),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "zkminer-prove-risc0".into()),
+        zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG,
+    );
     // A worker that has run a requester's guest is confined, with no network and no write access
     // to rzup's home (`confine` in main.rs): say so rather than fail inside the install.
     ensure!(

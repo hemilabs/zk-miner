@@ -91,6 +91,13 @@ pub struct ElfFetcher {
     client: GuardedClient,
 }
 
+/// Whether the network guard's near-hop check can work on this host, or why not (Windows: its TCP
+/// never reports a router's time exceeded). Where it cannot, public mode refuses every requester
+/// connection; `zkminer doctor` says so without connecting to a chain.
+pub fn near_hop_supported() -> Result<(), String> {
+    zkminer_netguard::nearhop::supported()
+}
+
 impl ElfFetcher {
     /// A fetcher under `config`'s network mode, deny CIDRs and `[egress]` facts options, over this
     /// host's facts (own and public addresses, connected and site prefixes, DNS servers, routing
@@ -131,35 +138,44 @@ impl ElfFetcher {
     }
 
     /// What the network guard refuses for want of configuration, as lines to show the operator:
-    /// that every requester connection is refused because the host's network facts could not be
-    /// read again (`HostFacts::unreadable_reason`, every platform), each path whose public address is not
-    /// known (every requester connection over it is refused), and, when the host now needs
-    /// `[egress] internal_ranges` the config does not state, that every requester connection is
-    /// refused; with what to set. Empty when there is none (and in developer mode).
+    /// that public mode cannot work on this platform at all
+    /// ([`zkminer_netguard::public_mode_unsupported`]), that every requester connection is refused
+    /// because the host's network facts could not be read again (`HostFacts::unreadable_reason`,
+    /// every platform), each path whose public address is not known (every requester connection
+    /// over it is refused), and, when the host now needs `[egress] internal_ranges` the config does
+    /// not state, that every requester connection is refused; with what to set. Empty when there is
+    /// none (and in developer mode).
     pub fn guard_warnings(&self) -> Vec<String> {
         if self.mode() != NetMode::Public {
             return Vec::new();
         }
         let facts = self.client.policy().facts();
-        let mut lines: Vec<String> = facts
-            .unknown_paths()
+        let mut lines: Vec<String> = zkminer_netguard::public_mode_unsupported()
+            .map(|why| format!("network guard: {why}"))
             .into_iter()
-            .map(|path| {
-                if facts.relearning(path) {
-                    format!(
-                        "network guard: this host moved to another network; its public {path} \
-                         address there is being learned again, and requester connections over \
-                         {path} are refused until it is"
-                    )
-                } else {
-                    format!(
-                        "network guard: this host's public {path} address is not known, so \
-                         requester connections over {path} are refused. To fix: {}",
-                        path.advice()
-                    )
-                }
-            })
             .collect();
+        // The near-hop check cannot find anything far here (Windows; a Mac without its ICMP
+        // socket): every requester connection is refused.
+        if lines.is_empty() {
+            if let Err(why) = zkminer_netguard::nearhop::supported() {
+                lines.push(format!("network guard: {why}"));
+            }
+        }
+        lines.extend(facts.unknown_paths().into_iter().map(|path| {
+            if facts.relearning(path) {
+                format!(
+                    "network guard: this host moved to another network; its public {path} \
+                     address there is being learned again, and requester connections over \
+                     {path} are refused until it is"
+                )
+            } else {
+                format!(
+                    "network guard: this host's public {path} address is not known, so \
+                     requester connections over {path} are refused. To fix: {}",
+                    path.advice()
+                )
+            }
+        }));
         if let Some(why) = facts.unreadable_reason() {
             lines.insert(
                 0,
@@ -446,6 +462,23 @@ impl ElfCache {
     /// is a verifying key rather than the ELF hash, and the registry URI was
     /// not consulted yet).
     pub fn get(&self, program_id: &B256, expected_content_hash: Option<B256>) -> Option<Vec<u8>> {
+        self.read(program_id, expected_content_hash, true)
+    }
+
+    /// [`Self::get`], except that bytes not matching `expected_content_hash` are a miss and stay
+    /// cached: for a hash someone else can change at will (a registry `elf_hash`), where the bytes
+    /// on disk were verified under the hash before and may be named again. A download that matches
+    /// the new hash replaces them ([`Self::put`] writes atomically).
+    pub fn get_keeping(&self, program_id: &B256, expected_content_hash: B256) -> Option<Vec<u8>> {
+        self.read(program_id, Some(expected_content_hash), false)
+    }
+
+    fn read(
+        &self,
+        program_id: &B256,
+        expected_content_hash: Option<B256>,
+        purge_mismatch: bool,
+    ) -> Option<Vec<u8>> {
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         let bytes = std::fs::read(&path).ok()?;
         // Nothing caches an empty ELF: an empty entry is a torn write (a crash before writes were
@@ -456,6 +489,15 @@ impl ElfCache {
         }
         if let Some(expected) = expected_content_hash {
             let actual_hash = alloy::primitives::keccak256(&bytes);
+            if actual_hash != expected && !purge_mismatch {
+                tracing::debug!(
+                    "ELF cache miss for {}: cached {} is not the expected {} — kept",
+                    program_id,
+                    actual_hash,
+                    expected,
+                );
+                return None;
+            }
             if actual_hash != expected {
                 tracing::warn!(
                     "ELF cache miss for {}: hash mismatch (got {}, expected {}) — deleting corrupt entry",
@@ -480,6 +522,7 @@ impl ElfCache {
         use std::io::Write;
         use std::sync::atomic::{AtomicU64, Ordering};
         std::fs::create_dir_all(&self.cache_dir).context("Failed to create ELF cache directory")?;
+        self.sweep_stale_temp(std::time::Duration::from_secs(3600));
         let path = self.cache_dir.join(format!("{}.elf", program_id));
         static TMP: AtomicU64 = AtomicU64::new(0);
         let tmp = self.cache_dir.join(format!(
@@ -504,6 +547,33 @@ impl ElfCache {
         // and this cache is written even on the PRE-CLAIM measurement path, for jobs never claimed.
         self.prune_to_budget();
         Ok(())
+    }
+
+    /// Remove the temporary files of [`Self::put`]s that never finished (a process killed while
+    /// writing one, which can be up to 256 MiB): `.<id>.<pid>.<n>.tmp` files untouched for `age`.
+    /// Nothing else counts them, so they would stay for good. A put still writing one touches it
+    /// far more often than `age`.
+    fn sweep_stale_temp(&self, age: std::time::Duration) {
+        let Ok(read) = std::fs::read_dir(&self.cache_dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !(name.starts_with('.') && name.ends_with(".tmp")) {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= age);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Maximum total bytes kept in the on-disk ELF cache. Override with
@@ -591,6 +661,34 @@ impl std::fmt::Display for NoStorageUris {
 }
 impl std::error::Error for NoStorageUris {}
 
+/// No URI served bytes that hash to the expected `elf_hash`, and at least one served bytes that hash
+/// to something else. `served` holds those other hashes, so a caller can tell a registry `elf_hash`
+/// that changed before its new bytes were uploaded (the URIs still serve the old ones) from a URI
+/// that serves anything.
+#[derive(Debug, Clone)]
+pub struct ElfHashMismatch {
+    /// The whole-ELF keccak of each mismatching download, at most one per URI tried.
+    pub served: Vec<B256>,
+    message: String,
+}
+
+impl std::fmt::Display for ElfHashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for ElfHashMismatch {}
+
+impl ElfHashMismatch {
+    /// The error for downloads that served the bytes hashing to `served`, described by `message`.
+    pub fn new(served: Vec<B256>, message: impl Into<String>) -> Self {
+        Self {
+            served,
+            message: message.into(),
+        }
+    }
+}
+
 /// Download an ELF binary from a list of storage URIs, through `fetcher`'s network guard.
 /// Tries each URI in order until one succeeds.
 pub async fn download_elf(
@@ -617,6 +715,8 @@ pub async fn download_elf(
 
     // Why the last URI tried failed, for the final error (the per-URI warnings say more).
     let mut last_failure: Option<String> = None;
+    // The hashes of the bytes served that were not `expected_hash` (see [`ElfHashMismatch`]).
+    let mut served_mismatch: Vec<B256> = Vec::new();
     for uri_info in uris.iter().take(MAX_ELF_URIS) {
         let url = match storage_url(uri_info) {
             Ok(Some(url)) => url,
@@ -728,6 +828,7 @@ pub async fn download_elf(
                                 actual
                             );
                             last_failure = Some("ELF hash mismatch".into());
+                            served_mismatch.push(actual);
                             continue;
                         }
                     }
@@ -755,13 +856,17 @@ pub async fn download_elf(
         }
     }
 
-    match last_failure {
-        Some(why) => bail!(
+    let message = match last_failure {
+        Some(why) => format!(
             "Failed to download ELF from any of {} URIs (last: {why})",
             uris.len()
         ),
-        None => bail!("Failed to download ELF from any of {} URIs", uris.len()),
+        None => format!("Failed to download ELF from any of {} URIs", uris.len()),
+    };
+    if served_mismatch.is_empty() {
+        bail!(message)
     }
+    Err(ElfHashMismatch::new(served_mismatch, message).into())
 }
 
 #[cfg(test)]
@@ -794,6 +899,36 @@ mod security_tests {
         assert!(dir.join(format!("{}.elf", ids[1])).exists(), "pinned ELF #2 must survive");
         assert!(!dir.join(format!("{}.elf", ids[2])).exists(), "unpinned ELF must be evicted");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A put's temporary file left by a killed process is removed once stale; a fresh one (a put
+    /// in progress) and the cached ELFs are kept.
+    #[test]
+    fn stale_put_temp_files_are_swept() {
+        let dir = std::env::temp_dir().join(format!("zkminer-elf-tmp-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+        let id = B256::repeat_byte(0x44);
+        let old = dir.join(format!(".{id}.1234.0.tmp"));
+        let fresh = dir.join(format!(".{id}.1234.1.tmp"));
+        let elf = dir.join(format!("{id}.elf"));
+        for p in [&old, &fresh, &elf] {
+            std::fs::write(p, b"\x7fELF").unwrap();
+        }
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        cache.sweep_stale_temp(std::time::Duration::from_secs(3600));
+        assert!(!old.exists(), "a stale temp file was kept");
+        assert!(fresh.exists() && elf.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -872,6 +1007,36 @@ mod security_tests {
         );
         assert_eq!(cache.get(&id, None), None, "entry is gone after the purge");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RP1: a read against a registry `elf_hash` that moved is a miss, but the bytes verified under
+    /// the earlier hash stay, so a change back to it does not download them again.
+    #[test]
+    fn cache_get_keeping_misses_on_a_mismatch_without_purging() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-elf-keep-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ElfCache {
+            cache_dir: dir.clone(),
+        };
+        let id = B256::repeat_byte(0x7f);
+        let bytes = b"the-sp1-elf-under-h1".to_vec();
+        let h1 = alloy::primitives::keccak256(&bytes);
+        let h2 = B256::repeat_byte(0xee);
+        cache.put(&id, &bytes).unwrap();
+        assert_eq!(cache.get_keeping(&id, h2), None, "a mismatch is a miss");
+        assert!(
+            dir.join(format!("{id}.elf")).exists(),
+            "and the entry stays"
+        );
+        assert_eq!(
+            cache.get_keeping(&id, h1).as_deref(),
+            Some(bytes.as_slice())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1007,6 +1172,28 @@ mod fetch_tests {
     /// This host's real policy and the system resolver, as the miner runs.
     fn real(mode: NetMode) -> ElfFetcher {
         ElfFetcher::new(&NetPolicy::new(mode, Vec::new()).unwrap()).unwrap()
+    }
+
+    /// Whether a public-mode failure is the guard refusing for want of a router's time exceeded
+    /// (a host whose network drops them, e.g. a hosted CI runner): the test cannot check what it
+    /// is for there. It says so and passes; under `ZKMINER_CI_STRICT=1` it fails unless
+    /// `ZKMINER_CI_ALLOW_SKIP` names `time-exceeded` (the netguard crate's rule).
+    fn no_time_exceeded_here(err: &str) -> bool {
+        if !err.contains("no router past") || !err.contains("silence is not taken as far") {
+            return false;
+        }
+        let strict = std::env::var("ZKMINER_CI_STRICT").ok().as_deref() == Some("1");
+        let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .any(|t| t.trim() == "time-exceeded");
+        if strict && !allowed {
+            panic!(
+                "SKIPPED under ZKMINER_CI_STRICT=1 (not in ZKMINER_CI_ALLOW_SKIP): [time-exceeded] no router's time exceeded reaches this host: {err}"
+            );
+        }
+        eprintln!("SKIPPED: [time-exceeded] no router's time exceeded reaches this host: {err}");
+        true
     }
 
     /// A lookup that answers from a table.
@@ -1152,12 +1339,19 @@ mod fetch_tests {
         .await
         .unwrap_err();
         assert!(format!("{e:#}").contains("ELF hash mismatch"), "{e:#}");
+        // The hash of what was served instead is carried, for a caller to recognise old bytes.
+        assert_eq!(
+            e.downcast_ref::<ElfHashMismatch>()
+                .map(|m| m.served.clone()),
+            Some(vec![good])
+        );
         let mut wrong_content = uri.clone();
         wrong_content.content_hash = B256::repeat_byte(2);
         let e = download_elf(&fetcher, &[wrong_content], None)
             .await
             .unwrap_err();
         assert!(format!("{e:#}").contains("content hash mismatch"), "{e:#}");
+        assert!(e.downcast_ref::<ElfHashMismatch>().is_none());
         assert_eq!(hits(&server), 3);
     }
 
@@ -1271,7 +1465,7 @@ mod fetch_tests {
     #[ignore = "needs the network"]
     async fn a_real_elf_downloads_in_public_mode() {
         let fetcher = real(NetMode::Public);
-        let elf = download_elf(
+        let elf = match download_elf(
             &fetcher,
             &[http(
                 "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox".into(),
@@ -1279,7 +1473,11 @@ mod fetch_tests {
             None,
         )
         .await
-        .expect("a public ELF downloads");
+        {
+            Ok(elf) => elf,
+            Err(e) if no_time_exceeded_here(&format!("{e:#}")) => return,
+            Err(e) => panic!("a public ELF downloads: {e:#}"),
+        };
         assert_eq!(&elf[..4], b"\x7fELF");
         eprintln!("downloaded {} bytes of ELF in public mode", elf.len());
     }
@@ -1294,11 +1492,15 @@ mod fetch_tests {
             "https://arweave.net/bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U",
             "https://github.com/risc0/risc0/releases/download/v1.0.0/cargo-risczero-x86_64-unknown-linux-gnu.tgz",
         ] {
-            let response = fetcher
+            let response = match fetcher
                 .client
                 .get_following_redirects(url, MAX_ELF_REDIRECTS, Duration::from_secs(60))
                 .await
-                .unwrap_or_else(|e| panic!("{url}: {e}"));
+            {
+                Ok(response) => response,
+                Err(e) if no_time_exceeded_here(&e.to_string()) => return,
+                Err(e) => panic!("{url}: {e}"),
+            };
             assert!(response.status().is_success(), "{url}: {}", response.status());
             assert_ne!(
                 response.url().host_str(),

@@ -980,50 +980,28 @@ impl ChainClient {
     /// first block), and the block the scan covered up to — the cursor for the next incremental scan.
     pub async fn find_locked_jobs_in(&self, from: u64, to: u64) -> Result<(Vec<B256>, u64)> {
         use alloy::rpc::types::Filter;
-        const CHUNK: u64 = 9000;
-        const CHUNK_TRIES: u32 = 3;
         let head = to;
         let from = from.max(self.scan_from_block.min(head));
         let topic = alloy::primitives::keccak256(
             "JobClaimed(bytes32,address,address,uint96,uint96,uint40)",
         );
         let prover_topic = self.address.into_word();
-
+        let filter = Filter::new()
+            .address(self.hemi_prove)
+            .event_signature(topic)
+            .topic2(prover_topic);
+        let logs = self
+            .get_logs_chunked(&filter, from, head, "JobClaimed scan")
+            .await
+            .map_err(|e| anyhow::anyhow!("LOOKBACK-FAILED: {e:#}"))?;
         let mut job_ids: Vec<B256> = Vec::new();
-        let mut start = from;
-        while start <= head {
-            let end = (start + CHUNK).min(head);
-            let filter = Filter::new()
-                .address(self.hemi_prove)
-                .event_signature(topic)
-                .topic2(prover_topic)
-                .from_block(start)
-                .to_block(end);
-            let mut tries = 0;
-            let logs = loop {
-                tries += 1;
-                match self.provider.get_logs(&filter).await {
-                    Ok(l) => break l,
-                    Err(e) if tries < CHUNK_TRIES => {
-                        tracing::warn!(
-                            "find_locked_jobs: get_logs {start}..={end} failed (try {tries}/{CHUNK_TRIES}): {e:#}"
-                        );
-                        tokio::time::sleep(Duration::from_secs(2 * tries as u64)).await;
-                    }
-                    Err(e) => {
-                        bail!("LOOKBACK-FAILED: JobClaimed scan {start}..={end} failed {CHUNK_TRIES}x: {e:#}")
-                    }
-                }
-            };
-            for log in logs {
-                // topics: [sig, jobId, prover, operator]
-                if let Some(jid) = log.topics().get(1).copied() {
-                    if !job_ids.contains(&jid) {
-                        job_ids.push(jid);
-                    }
+        for log in logs {
+            // topics: [sig, jobId, prover, operator]
+            if let Some(jid) = log.topics().get(1).copied() {
+                if !job_ids.contains(&jid) {
+                    job_ids.push(jid);
                 }
             }
-            start = end.saturating_add(1);
         }
         Ok((job_ids, head))
     }
@@ -1261,6 +1239,105 @@ impl ChainClient {
                 }
                 self.abort_nonce(nonce);
                 bail!("graceRelease {tx_hash:?} not confirmed")
+            }
+        }
+    }
+
+    /// `slashAndReopen(jobId)` on a lock of OUR OWN that can no longer be fulfilled or released: past
+    /// the effective deadline plus the 30-min grace, from `getJobStatusView(jobId).slashOpensAt`.
+    ///
+    /// The slash takes 100% of the lock's collateral whoever sends it, and pays the sender, a keeper
+    /// other than the job's caller, the keeper share: max(2%, 0.5 HEMI), the rest burned. Sent by the
+    /// defaulting prover itself, that share comes back to it rather than to a stranger, and the lock is
+    /// cleared now rather than whenever a keeper gets to it (INTERACTION_GUIDE §6: "a third-party
+    /// keeper, including ... the defaulting prover itself, keeps the keeper share").
+    ///
+    /// `Ok(true)`: the lock is gone (slashed by this call, or no longer ours). `Ok(false)`: the chain
+    /// refused it (not slashable yet, "Not expired yet", while a pause clock runs; not locked; a
+    /// disable or blacklist window that wants a grace release), so the caller tries again later.
+    /// `Err`: not sent or not confirmed.
+    pub async fn slash_own_expired_lock(&self, job_id: B256) -> Result<bool> {
+        let fulfill = IHemiProveFulfill::new(self.hemi_prove, &*self.provider);
+        let nonce = self.reserve_nonce().await?;
+        let (tip, max_fee) = self.base_fees().await;
+        // Lift over anything already at this (possibly recycled) nonce.
+        let (tip, max_fee) = match job_path_bid(
+            self.nonce_fee_floor_state(nonce),
+            tip,
+            max_fee,
+            self.fee_ceiling,
+            0,
+            u128::MAX,
+        ) {
+            JobBid::Send(t, m) | JobBid::Hold(t, m) => (t, m),
+            JobBid::Exhausted => (tip, max_fee),
+        };
+        let sent = {
+            let _guard = self.tx_lock.lock().await;
+            let mut tx = fulfill.slashAndReopen(job_id).nonce(nonce);
+            if max_fee > 0 {
+                tx = tx.max_priority_fee_per_gas(tip).max_fee_per_gas(max_fee);
+            }
+            tx.send().await
+        };
+        let pending = match sent {
+            Ok(p) => {
+                self.note_broadcast_fee(nonce, tip, max_fee, max_fee);
+                p
+            }
+            Err(e) => {
+                self.abort_nonce(nonce);
+                // No explicit gas: a revert surfaces here, from gas estimation. A refusal from the
+                // contract is an answer for now, not a failure to retry at once.
+                if let Some(data) = crate::revert::revert_data_of(&e) {
+                    use zkminer_contracts::bindings::IHemiProveErrors::IHemiProveErrorsErrors as E;
+                    match crate::revert::decode(&data) {
+                        crate::revert::Decoded::Hemi(
+                            E::JobNotLocked(_)
+                            | E::UseGraceRelease(_)
+                            | E::UseGraceReleaseWithDescriptor(_)
+                            | E::RegistryPausedUseGracePauseRelease(_)
+                            | E::EnforcedPause(_),
+                        ) => return Ok(false),
+                        crate::revert::Decoded::Message(m) if m == "Not expired yet" => {
+                            return Ok(false)
+                        }
+                        _ => {}
+                    }
+                }
+                let msg = format!("{e:#}");
+                if is_funds_refusal(&msg) {
+                    self.note_funds_short();
+                }
+                bail!(
+                    "slashAndReopen send failed: {}",
+                    crate::programs::sanitize_log(&msg)
+                );
+            }
+        };
+        let tx_hash = *pending.tx_hash();
+        match crate::tx::await_receipt(&*self.provider, tx_hash, RELEASE_RECEIPT_WAIT).await {
+            Some(r) if r.status() => {
+                self.commit_nonce(nonce);
+                tracing::info!("Job {job_id}: slashed our own expired lock: {tx_hash:?}");
+                Ok(true)
+            }
+            Some(_) => {
+                self.commit_nonce(nonce);
+                tracing::warn!(
+                    "slashAndReopen {tx_hash:?} for {job_id} reverted; trying again later"
+                );
+                Ok(false)
+            }
+            None => {
+                if let Ok((rec, _)) = self.read_job_record(job_id, None).await {
+                    if rec.prover != self.address {
+                        self.abort_nonce(nonce);
+                        return Ok(true);
+                    }
+                }
+                self.abort_nonce(nonce);
+                bail!("slashAndReopen {tx_hash:?} not confirmed")
             }
         }
     }
@@ -1538,6 +1615,15 @@ impl ChainClient {
                             "claimJob replacement at nonce {nonce} (attempt {attempt}/{MAX_ATTEMPTS}): {} — bumping fee, keeping nonce",
                             crate::programs::sanitize_log(&msg)
                         );
+                        crate::tx_events::emit(
+                            job_id,
+                            crate::tx_events::TxKind::Claim,
+                            crate::tx_events::TxEvent::SendFailed {
+                                attempt,
+                                of: MAX_ATTEMPTS,
+                                rate_limited: false,
+                            },
+                        );
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(nonce_retry_backoff(
                                 attempt,
@@ -1553,6 +1639,15 @@ impl ChainClient {
                         tracing::warn!(
                             "claimJob nonce error (attempt {attempt}/{MAX_ATTEMPTS}): {} — re-syncing nonce",
                             crate::programs::sanitize_log(&msg)
+                        );
+                        crate::tx_events::emit(
+                            job_id,
+                            crate::tx_events::TxKind::Claim,
+                            crate::tx_events::TxEvent::SendFailed {
+                                attempt,
+                                of: MAX_ATTEMPTS,
+                                rate_limited: false,
+                            },
                         );
                         // "nonce too low" at a nonce WE broadcast a claim at means that claim MINED.
                         // Read the job where it is included before re-sending at a fresh nonce: if it
@@ -1634,6 +1729,14 @@ impl ChainClient {
             let tx_hash = *pending.tx_hash();
             tracing::info!(
                 "claimJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
+            );
+            crate::tx_events::emit(
+                job_id,
+                crate::tx_events::TxKind::Claim,
+                crate::tx_events::TxEvent::Sent {
+                    attempt,
+                    of: MAX_ATTEMPTS,
+                },
             );
 
             match crate::tx::await_receipt(&*self.provider, tx_hash, CLAIM_RECEIPT_WAIT).await {
@@ -1727,6 +1830,14 @@ impl ChainClient {
                     tracing::warn!(
                         "claimJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling state before re-broadcast"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Claim,
+                        crate::tx_events::TxEvent::Unconfirmed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                        },
                     );
                     let deadline = std::time::Instant::now() + CLAIM_STATE_POLL;
                     while std::time::Instant::now() < deadline {
@@ -2542,6 +2653,15 @@ impl ChainClient {
                         self.note_funds_short();
                     }
                     tracing::warn!("{what} send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}");
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Fulfil,
+                        crate::tx_events::TxEvent::SendFailed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                            rate_limited: is_rate_limit_error(&msg),
+                        },
+                    );
                     if attempt < MAX_ATTEMPTS {
                         tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                     }
@@ -2551,6 +2671,14 @@ impl ChainClient {
             let tx_hash = *pending.tx_hash();
             tracing::info!(
                 "{what} tx sent (attempt {attempt}/{MAX_ATTEMPTS}, gas {gas}): {tx_hash:?}, waiting for receipt..."
+            );
+            crate::tx_events::emit(
+                job_id,
+                crate::tx_events::TxKind::Fulfil,
+                crate::tx_events::TxEvent::Sent {
+                    attempt,
+                    of: MAX_ATTEMPTS,
+                },
             );
 
             // Short per-attempt wait (FULFIL_RECEIPT_WAIT, ~3 blocks), not the generic 120 s: an
@@ -2624,6 +2752,14 @@ impl ChainClient {
                     tracing::warn!(
                         "{what} receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Fulfil,
+                        crate::tx_events::TxEvent::Unconfirmed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                        },
                     );
                     let mut poll_end = std::time::Instant::now() + FULFIL_STATE_POLL;
                     if let Some(b) = budget {
@@ -3108,6 +3244,15 @@ impl ChainClient {
                         tracing::warn!(
                             "releaseJob send failed (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
                         );
+                        crate::tx_events::emit(
+                            job_id,
+                            crate::tx_events::TxKind::Release,
+                            crate::tx_events::TxEvent::SendFailed {
+                                attempt,
+                                of: MAX_ATTEMPTS,
+                                rate_limited: is_rate_limit_error(&msg),
+                            },
+                        );
                         if attempt < MAX_ATTEMPTS {
                             tokio::time::sleep(SEND_FAILURE_RETRY_WAIT).await;
                         }
@@ -3118,6 +3263,14 @@ impl ChainClient {
             let tx_hash = *pending.tx_hash();
             tracing::info!(
                 "releaseJob tx sent (attempt {attempt}/{MAX_ATTEMPTS}): {tx_hash:?}, waiting for receipt..."
+            );
+            crate::tx_events::emit(
+                job_id,
+                crate::tx_events::TxKind::Release,
+                crate::tx_events::TxEvent::Sent {
+                    attempt,
+                    of: MAX_ATTEMPTS,
+                },
             );
 
             // Poll for the receipt (no heartbeat watcher). None folds the old
@@ -3172,6 +3325,14 @@ impl ChainClient {
                     tracing::warn!(
                         "releaseJob receipt not confirmed (attempt {attempt}/{MAX_ATTEMPTS}, tx {tx_hash:?}); \
                          polling on-chain state before re-broadcast"
+                    );
+                    crate::tx_events::emit(
+                        job_id,
+                        crate::tx_events::TxKind::Release,
+                        crate::tx_events::TxEvent::Unconfirmed {
+                            attempt,
+                            of: MAX_ATTEMPTS,
+                        },
                     );
                     let deadline = std::time::Instant::now() + RELEASE_STATE_POLL;
                     while std::time::Instant::now() < deadline {

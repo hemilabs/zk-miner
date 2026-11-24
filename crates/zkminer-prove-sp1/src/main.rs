@@ -339,8 +339,23 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // First, while the process has one thread: no capability on any thread it will ever have, nor
+    // on anything it starts (a no-op unless the miner runs as root). The confinement checks this
+    // before the first guest and refuses otherwise.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
+        eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
+    }
+    // Windows: its threads, those running and those to come, closed to every other process of the
+    // user, another worker included (`zkminer_prover_protocol::threads`).
+    #[cfg(windows)]
+    if let Err(e) = zkminer_prover_protocol::threads::lock_threads() {
+        eprintln!("zkminer: this worker could not close its threads to other processes ({e})");
+    }
+
     // Started by the SDK as `~/.sp1/bin/zkminer-confined-<server>`: the shim that runs the real
-    // `sp1-gpu-server` confined (confinement.rs). Before anything else; it does not return.
+    // `sp1-gpu-server` confined (confinement.rs). Before anything else but the above; it does not
+    // return.
     #[cfg(target_os = "linux")]
     confinement::run_if_shim();
 
@@ -379,12 +394,31 @@ fn main() {
         return;
     }
 
+    // `--install-bundled-server`: install the server shipped beside this worker and exit. For the
+    // Windows miner, before this worker's first start at Low integrity, which cannot write
+    // `~/.sp1/bin` (`windows_sandbox::install_sp1_server`). No IPC, GPU, network or guest.
+    if args
+        .iter()
+        .any(|a| a == zkminer_prover_protocol::types::INSTALL_BUNDLED_SERVER_ARG)
+    {
+        tracing_subscriber::fmt()
+            .with_writer(io::stderr)
+            .with_env_filter("info")
+            .init();
+        bundled_server::install_bundled_server();
+        if let Some(failure) = bundled_server::install_failure() {
+            eprintln!("{failure}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // CRITICAL: Save the real stdout FD for IPC before anything can pollute it.
     // The SP1 SDK's gnark CGO library (Go code) may print to stdout (FD 1),
     // which would corrupt the bincode IPC stream. We dup stdout for IPC,
     // then redirect FD 1 to stderr so any stray prints go to the log.
     #[cfg(unix)]
-    let mut ipc_stdout = {
+    let ipc_stdout = {
         use std::os::unix::io::{AsRawFd, FromRawFd};
         let stdout_fd = io::stdout().as_raw_fd(); // FD 1
         let ipc_fd = dup_cloexec(stdout_fd).expect("dup(stdout) failed");
@@ -393,7 +427,7 @@ fn main() {
         unsafe { std::fs::File::from_raw_fd(ipc_fd) }
     };
     #[cfg(windows)]
-    let mut ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
+    let ipc_stdout = zkminer_prover_protocol::ipc::take_ipc_stdout();
 
     tracing_subscriber::fmt()
         .with_writer(io::stderr)
@@ -401,6 +435,12 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Where sp1-gpu-server writes a proof's task counts, for `ProgressPoller`. Set before any server
+    // is started: it inherits this process's environment. A server without the feature ignores it.
+    if std::env::var_os(SP1_PROGRESS_FILE_ENV).is_none() {
+        std::env::set_var(SP1_PROGRESS_FILE_ENV, progress_file_path());
+    }
 
     // Which card this worker drives, set by the dispatcher. Read here as well as in the worker loop
     // because the orphan reaping below must be scoped to it: there is one SP1 worker per card now,
@@ -465,6 +505,16 @@ fn main() {
         }
     }
 
+    // `--install-artifacts`: what a `Warmup` installs in the user's profile (the server above, the
+    // Groth16 circuit artifacts, the stripped circuit), answered as a `Warmup` is, then exit. For the
+    // Windows miner, at its own integrity, before a Low-integrity worker's warm-up. No GPU, no guest.
+    if args
+        .iter()
+        .any(|a| a == zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG)
+    {
+        std::process::exit(install_artifacts(ipc_stdout));
+    }
+
     // Workers that run requester guests are confined, and so is their server (confinement.rs): a
     // private temporary directory, named by TMPDIR from here on, and for a worker that proves, the
     // SDK's server started through the confining shim. While the process has one thread.
@@ -490,10 +540,11 @@ fn main() {
         std::process::exit(run_benchmarks_by_hand(our_cuda_device));
     }
 
-    // By reference, so the descriptor closes with the process and not before. The host reads the EOF
-    // as this worker having died and asks at once how it died (`died_of_host_oom`), so a descriptor
-    // closed while it is still exiting gets the answer "still running".
-    if let Err(e) = run_worker_loop(&mut ipc_stdout) {
+    // The descriptor must close with the process and not before: the host reads the EOF as this
+    // worker having died and asks at once how it died (`died_of_host_oom`), so a descriptor closed
+    // while it is still exiting gets the answer "still running". The loop keeps it in `IPC_OUT`, a
+    // static, which is never dropped.
+    if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
         std::process::exit(if e.is::<ServerLost>() {
             zkminer_prover_protocol::types::WORKER_EXIT_SERVER_LOST
@@ -1778,7 +1829,26 @@ fn sp1_element_threshold_for(scale: f64) -> Option<u64> {
 /// can do is leave performance on the table. That direction also matters for soundness: the shape
 /// allow-list is enumerated against the compile-time `PADDED_ELEMENT_THRESHOLD`, so a value below
 /// the constant yields shapes the circuit already accepts while one above it does not.
-fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
+/// The element threshold `apply_sp1_element_threshold` sets when the operator has not: the smallest
+/// of the host's tier, the free-VRAM tier (`sp1_element_threshold_cap`) and the card's recorded cap
+/// (`card_cap_raw`, as `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` reads, see `sp1_card_cap`). `None`:
+/// nothing bounds it.
+fn element_threshold_to_apply(
+    scale: f64,
+    available_vram: Option<u64>,
+    total_vram: Option<u64>,
+    card_cap_raw: Option<&str>,
+) -> Option<u64> {
+    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(card_cap_raw);
+    let computed = zkminer_prover_protocol::types::sp1_element_threshold_cap(
+        scale,
+        available_vram,
+        total_vram,
+    );
+    [computed, card_cap].into_iter().flatten().min()
+}
+
+fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
     // Never override what the operator set by hand.
     if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok() {
         return;
@@ -1787,7 +1857,9 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
     // function whose inputs the dispatcher reads too when it predicts this worker's tier.
     let from_host = sp1_element_threshold_for(scale);
     let from_vram = available_vram.map(|a| {
-        match zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(a) {
+        match zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+            a, total_vram,
+        ) {
             Some(t) => t.to_string(),
             None => format!(
                 "{} ({} MiB free is below every measured tier; using the smallest)",
@@ -1796,8 +1868,13 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
             ),
         }
     });
+    // A card whose SP1 proof once ran out of GPU memory carries a cap from the dispatcher
+    // (`sp1_shard_caps`), which it also applies when it predicts this worker's tier (`SizingCap`).
+    let card_cap_raw =
+        std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV).ok();
+    let card_cap = zkminer_prover_protocol::types::sp1_card_cap(card_cap_raw.as_deref());
     let Some(threshold) =
-        zkminer_prover_protocol::types::sp1_element_threshold_cap(scale, available_vram)
+        element_threshold_to_apply(scale, available_vram, total_vram, card_cap_raw.as_deref())
     else {
         return;
     };
@@ -1810,11 +1887,16 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
     }
     tracing::info!(
         "SP1 tuning: SP1_GPU_ELEMENT_THRESHOLD={threshold} (default {DEFAULT_THRESHOLD}) — \
-         host budget allows {}, free VRAM allows {}",
+         host budget allows {}, free VRAM allows {}{}",
         from_host
             .map(|t| t.to_string())
             .unwrap_or_else(|| "no limit".into()),
         from_vram.unwrap_or_else(|| "unknown".into()),
+        card_cap
+            .map(|c| format!(
+                ", this card's record allows {c} (a proof here ran out of GPU memory)"
+            ))
+            .unwrap_or_default(),
     );
     // SAFETY: single-threaded startup, before any prover, server or thread exists.
     unsafe {
@@ -1825,9 +1907,186 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>) {
     };
 }
 
-fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
+/// The environment variable sp1-gpu-server reads for its progress file (`sp1_prover::worker`'s
+/// `PROGRESS_FILE_ENV`). A string here: the server is a separate binary of the fork, which may not
+/// have it, and then nothing is written.
+const SP1_PROGRESS_FILE_ENV: &str = "SP1_PROGRESS_FILE";
+
+/// This worker's progress file: one per worker process, so two cards' servers never share one.
+/// `--install-artifacts` (`zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG`): the warm-up's
+/// installs (`warmup::warm_up`, which uses no GPU), its progress and outcome written to `out` as a
+/// `Warmup`'s are. The exit status: 0 once installed.
+fn install_artifacts(mut out: impl io::Write) -> i32 {
+    if let Some(failure) = bundled_server::install_failure() {
+        tracing::warn!("{failure}");
+    }
+    let resp = match warmup::warm_up(&mut |status, done_bytes, total_bytes| {
+        // A closed pipe is reported by the final answer's write below.
+        let _ = write_message(
+            &mut out,
+            &WorkerResponse::SetupProgress {
+                request_id: 0,
+                status: status.to_string(),
+                done_bytes,
+                total_bytes,
+            },
+        );
+    }) {
+        Ok(report) => WorkerResponse::WarmupDone {
+            request_id: 0,
+            summary: report.summary,
+            groth16_helper: report.groth16_helper,
+        },
+        Err(e) => WorkerResponse::Error {
+            request_id: 0,
+            kind: ErrorKind::Internal,
+            message: format!("installing the SP1 Groth16 artifacts failed: {e:#}"),
+        },
+    };
+    let installed = matches!(resp, WorkerResponse::WarmupDone { .. });
+    match write_message(&mut out, &resp) {
+        Ok(()) if installed => 0,
+        _ => 1,
+    }
+}
+
+fn progress_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("zkminer-sp1-progress-{}.txt", std::process::id()))
+}
+
+/// The IPC writer, shared between the worker loop and the progress poller.
+type IpcOut = std::sync::Arc<std::sync::Mutex<Box<dyn io::Write + Send>>>;
+
+static IPC_OUT: std::sync::OnceLock<IpcOut> = std::sync::OnceLock::new();
+
+/// A handle on the shared IPC writer. Each message is written under its own lock: the poller holds
+/// it for a whole message (`write_message` through `report`), and the loop writes nothing while a
+/// poller runs.
+struct SharedOut(IpcOut);
+
+impl io::Write for SharedOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).flush()
+    }
+}
+
+/// One kind's task counts in the server's progress file: (done, submitted).
+type KindCounts = HashMap<String, (u32, u32)>;
+
+/// Parses the server's progress line (`proof=<id> KIND=done/submitted ...`). `None` for a line it
+/// cannot read, e.g. one caught half written.
+fn parse_progress_line(line: &str) -> Option<KindCounts> {
+    let mut words = line.split_whitespace();
+    words.next()?.strip_prefix("proof=")?;
+    let mut counts = HashMap::new();
+    for word in words {
+        let (kind, ratio) = word.split_once('=')?;
+        let (done, submitted) = ratio.split_once('/')?;
+        counts.insert(kind.to_string(), (done.parse().ok()?, submitted.parse().ok()?));
+    }
+    Some(counts)
+}
+
+/// Where a proof is, from the server's task counts (protocol 16): `Prove` with the shards proven
+/// and submitted (the total final once execution is done) until the wrap starts, then `Finish`,
+/// from the shrink's submission (the benchmark's wrap time covers the shrink and the Groth16 or
+/// PLONK wrap). The host weighs the stages by the job and the card; the worker only says where it
+/// is.
+fn stage_report(counts: &KindCounts) -> zkminer_prover_protocol::StageReport {
+    use zkminer_prover_protocol::{ProveStage, StageReport};
+    let get = |k: &str| counts.get(k).copied().unwrap_or((0, 0));
+    let wrapping = ["SHRINK_WRAP", "GROTH16_WRAP", "PLONK_WRAP"]
+        .iter()
+        .any(|k| get(k).1 > 0);
+    if wrapping {
+        return StageReport {
+            stage: ProveStage::Finish,
+            done: 0,
+            total: 0,
+            total_final: true,
+        };
+    }
+    let (done, submitted) = get("PROVE_SHARD");
+    StageReport {
+        stage: ProveStage::Prove,
+        done: done.min(submitted),
+        total: submitted,
+        total_final: get("CORE_EXECUTE").0 > 0,
+    }
+}
+
+/// Reads the server's progress file while a proof runs and sends the host a `Progress` when it
+/// moves. Stopped and joined on drop.
+struct ProgressPoller {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressPoller {
+    fn start(request_id: u64) -> Self {
+        let path = std::env::var_os(SP1_PROGRESS_FILE_ENV).map(std::path::PathBuf::from);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (Some(path), Some(out)) = (path, IPC_OUT.get().cloned()) else {
+            return Self { stop, thread: None };
+        };
+        // A previous proof's counts must not read as this one's.
+        let _ = std::fs::remove_file(&path);
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("sp1-progress".into())
+            .spawn(move || {
+                let send = |report: zkminer_prover_protocol::StageReport| {
+                    let msg = WorkerResponse::ProveStage { request_id, report };
+                    let _ = write_message(&mut SharedOut(out.clone()), &msg);
+                };
+                // Until the server writes its first counts: the proving key, the first tasks.
+                let mut last = zkminer_prover_protocol::StageReport {
+                    stage: zkminer_prover_protocol::ProveStage::Setup,
+                    done: 0,
+                    total: 0,
+                    total_final: true,
+                };
+                send(last);
+                while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let Some(counts) = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|line| parse_progress_line(&line))
+                    else {
+                        continue;
+                    };
+                    let report = stage_report(&counts);
+                    if report == last || flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    last = report;
+                    send(report);
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for ProgressPoller {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(ipc_stdout);
+    // Shared, so the progress poller can report while a proof runs (see `ProgressPoller`).
+    let shared: IpcOut =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(BufWriter::new(ipc_stdout))));
+    let _ = IPC_OUT.set(shared.clone());
+    let mut stdout = SharedOut(shared);
 
     // Lazy-init the CUDA prover on first Prove/Benchmark command, not at startup.
     // CudaProver initialization is expensive (spawns sp1-gpu-server, CUDA context)
@@ -1884,7 +2143,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             .map(|b| format!("{:.1} GB", b as f64 / 1e9))
             .unwrap_or_else(|| "unknown".into()),
     );
-    apply_sp1_worker_tuning(sp1_scale, available_vram);
+    // The measured tables are CUDA measurements, taken with the server's small-card memory savers
+    // on, so another vendor's server, or one with a saver switched off, is sized by the larger
+    // card's table, as the dispatcher sizes it (`sizing_total`).
+    let savers_off =
+        zkminer_prover_protocol::types::sp1_small_card_savers_off(|v| std::env::var(v).ok());
+    apply_sp1_worker_tuning(
+        sp1_scale,
+        available_vram,
+        vram_bytes.filter(|_| warmup::drives_cuda() && !savers_off),
+    );
     #[cfg(windows)]
     windows_tuning::apply_sycl_wrap_persistent_pk(vram_bytes);
     #[cfg(windows)]
@@ -1899,8 +2167,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     }
     // Scale SP1's memory appetite to the machine it is actually on.
     //
-    // WHAT THIS DOES AND DOES NOT FIX. It does NOT lower `sp1-gpu-server`'s hard VRAM floor (16 GB in
-    // the fork this repo pins, 24 GB upstream — see `min_vram_bytes_for_backend` in the dispatcher):
+    // WHAT THIS DOES AND DOES NOT FIX. It does NOT lower `sp1-gpu-server`'s hard VRAM floor (more than
+    // 11 GiB in the fork this repo pins, 24 GB upstream — see `min_vram_bytes_for_backend`):
     // that is a tier check on the device, made before any proving option exists, and
     // `SP1CoreOpts` never even crosses into the server crate. A card below the floor is refused
     // whatever we set, which is why the dispatcher declines to create a slot there at all.
@@ -1956,12 +2224,12 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     ///
     /// `set_var` is sound here: this runs once, before any prover or server exists, on the single
     /// thread that has not yet spawned anything.
-    fn apply_sp1_worker_tuning(scale: f64, available_vram: Option<u64>) {
+    fn apply_sp1_worker_tuning(scale: f64, available_vram: Option<u64>, total_vram: Option<u64>) {
         // The element threshold is settled FIRST and unconditionally, because the two inputs are
         // independent: a host with plenty of RAM gives `scale >= 1.0` and no host-derived threshold,
         // while the card it is attached to may still be half full. Returning early on `scale` alone —
         // which is what this did — skipped the VRAM cap in exactly the case it exists for.
-        apply_sp1_element_threshold(scale, available_vram);
+        apply_sp1_element_threshold(scale, available_vram, total_vram);
         if scale >= 1.0 {
             return;
         }
@@ -2113,7 +2381,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
+            WorkerCommand::Benchmark { programs, .. } => {
                 tracing::info!("Running benchmarks...");
                 if sp1_measure_only() {
                     // Benchmarking builds the CudaProver (forks sp1-gpu-server) — exactly what a
@@ -2157,7 +2425,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         //
                         // Zero rows is a failure, and an answer of zero rows hides it: the host
                         // skips an empty result without a word.
-                        let resp = if run.results.is_empty() {
+                        let resp = if run.out_of_memory {
+                            let message = format!(
+                                "an SP1 benchmark ran out of GPU memory at this shard size: {}",
+                                run.failed.join("; ")
+                            );
+                            tracing::error!("{message}");
+                            WorkerResponse::Error {
+                                request_id: 0,
+                                kind: ErrorKind::ResourceExhausted,
+                                message,
+                            }
+                        } else if run.results.is_empty() {
                             let message =
                                 format!("no SP1 benchmark completed: {}", run.failed.join("; "));
                             tracing::error!("{message}");
@@ -2258,6 +2537,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // SDK calls in catch_unwind for exactly this reason; the Prove arm must too, or the
                 // worker dies on a CLAIMED job, the dispatcher charges a healthy slot, the retry loop
                 // crashes every GPU, and the program is never classed bad. A caught panic is a bad job.
+                // Reports the server's task counts while the proof runs; stopped (and joined) before
+                // the answer is written.
+                let poller = ProgressPoller::start(request_id);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_proof(
                         prover_for_proof,
@@ -2267,6 +2549,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                         program_id,
                     )
                 }));
+                drop(poller);
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         let resp = WorkerResponse::ProofResult {
@@ -2310,7 +2593,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     }
                     Ok(Err(e)) => {
                         let msg = format!("{e:#}");
-                        // The vkey-binding bails below are THIS binary's own host-authored strings, not
+                        // The vkey-binding bails are THIS binary's own host-authored strings, not
                         // guest text (the executor's errors are a typed enum with no free-form guest
                         // field), so matching them is safe — unlike matching the guest-controlled
                         // `message` body, which nothing here does. Check them BEFORE is_gpu_oom so a
@@ -3001,9 +3284,10 @@ fn prove_error_kind(msg: &str) -> ErrorKind {
         || msg.starts_with(NOT_SHA256_DIGEST)
     {
         ErrorKind::InvalidInput
-    } else if is_gpu_oom(msg) {
+    } else if is_gpu_oom(msg) || msg.contains("allocation failed") {
         // GPU OOM: tag as ResourceExhausted so the dispatcher kills + respawns this worker (and its
-        // gpu-server) with clean VRAM.
+        // gpu-server) with clean VRAM, and retries one shard size smaller. "allocation failed" is
+        // slop's panic when the server's device allocator gives up.
         ErrorKind::ResourceExhausted
     } else if msg.contains("serialize") || msg.contains("bincode") {
         ErrorKind::Internal
@@ -3199,6 +3483,11 @@ struct BenchmarkRun {
     /// A [`ServerLost`], which ended the run where it happened. `results` still holds what came
     /// before, and a row whose wrap alone was lost.
     server_lost: Option<anyhow::Error>,
+    /// A program ran out of GPU memory (`prove_error_kind`), which also ended the run: the
+    /// card cannot hold this shard size, the programs after it would fail the same way, and rows
+    /// measured at a size that does not fit are no measurement of the card. Answered as an
+    /// out-of-memory, for the host to measure again one shard size smaller.
+    out_of_memory: bool,
 }
 
 /// Run the zkOP/s scoring proofs, adding their row to `run`. For `--benchmark`: under a host, the
@@ -3281,6 +3570,7 @@ fn run_benchmarks(
         results: Vec::new(),
         failed: Vec::new(),
         server_lost: None,
+        out_of_memory: false,
     };
     let total = programs.len() as u32;
     for (idx, spec) in programs.iter().enumerate() {
@@ -3306,13 +3596,16 @@ fn run_benchmarks(
             }
             Err(e) => {
                 tracing::error!("{name}: {e:#}");
-                run.failed.push(format!("{name}: {e:#}"));
+                let message = format!("{name}: {e:#}");
+                run.out_of_memory |=
+                    matches!(prove_error_kind(&message), ErrorKind::ResourceExhausted);
+                run.failed.push(message);
                 if e.is::<ServerLost>() {
                     run.server_lost = Some(e);
                 }
             }
         }
-        if run.server_lost.is_some() {
+        if run.server_lost.is_some() || run.out_of_memory {
             break;
         }
     }
@@ -4389,6 +4682,8 @@ mod threshold_tests {
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
+    /// The card these were written against: an RTX 4090's `memory.total`.
+    const RTX4090: Option<u64> = Some(24_564 * 1024 * 1024);
     const SMALL: u64 = 134_217_728;
     /// The largest MEASURED configuration. The fork's own default is 402,653,184 and is deliberately
     /// absent from the measured table, so nothing here may select it.
@@ -4404,12 +4699,11 @@ mod threshold_tests {
     /// for — a roomy host attached to an occupied card.
     #[test]
     fn the_smaller_of_the_host_and_vram_bounds_wins() {
-        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind. On v6.1.0
-        // 11 GiB is in the 134M band [10,012, 12,512) — a 16 GiB card now fits 268M.
+        // A roomy HOST gives no host-derived limit, so a constrained CARD must still bind.
         assert_eq!(super::sp1_element_threshold_for(1.0), None);
-        assert_eq!(from_vram(11 * GIB), Some(SMALL));
+        assert_eq!(from_vram(18 * GIB, RTX4090), Some(SMALL));
         // Through the function the worker actually calls, not a re-implementation of it.
-        let combined = cap(1.0, Some(11 * GIB));
+        let combined = cap(1.0, Some(18 * GIB), RTX4090);
         assert_eq!(
             combined,
             Some(SMALL),
@@ -4418,13 +4712,13 @@ mod threshold_tests {
         );
 
         // And the converse: a roomy CARD must not let a constrained host off.
-        assert_eq!(from_vram(24 * GIB), Some(LARGEST_MEASURED));
+        assert_eq!(from_vram(24 * GIB, RTX4090), Some(LARGEST_MEASURED));
         let host_bound = super::sp1_element_threshold_for(0.3);
         assert!(
             host_bound.is_some_and(|t| t < LARGEST_MEASURED),
             "a tight host budget must still produce a limit: {host_bound:?}"
         );
-        assert_eq!(cap(0.3, Some(24 * GIB)), host_bound);
+        assert_eq!(cap(0.3, Some(24 * GIB), RTX4090), host_bound);
     }
 
     /// Only ever a CAP. The fork treats `SP1_GPU_ELEMENT_THRESHOLD` as a bound on its own tier, and the
@@ -4434,8 +4728,16 @@ mod threshold_tests {
     fn no_computed_threshold_ever_exceeds_what_is_allowed() {
         // The VRAM path may only ever select a MEASURED configuration, which is stricter than the
         // fork's default: an unmeasured tier is one whose peak VRAM we cannot vouch for.
-        for gib in 0..=64u64 {
-            if let Some(t) = from_vram(gib * GIB) {
+        for (gib, total) in (0..=64u64).flat_map(|g| {
+            [
+                RTX4090,
+                Some(12_282 * 1024 * 1024),
+                Some(16_303 * 1024 * 1024),
+                None,
+            ]
+            .map(|t| (g, t))
+        }) {
+            if let Some(t) = from_vram(gib * GIB, total) {
                 assert!(
                     t <= LARGEST_MEASURED,
                     "{gib} GiB free produced {t}, above the largest measured configuration \
@@ -4486,17 +4788,116 @@ mod threshold_tests {
              tier that does not fit"
         );
     }
+
+    /// The card's recorded cap (`ZKMINER_SP1_ELEMENT_THRESHOLD_CAP`, from the dispatcher's
+    /// `sp1_shard_caps`) bounds the worker as the host's and the free VRAM's tiers do: the smallest
+    /// wins; one below every measured tier is held at the smallest, and one that does not parse is
+    /// ignored.
+    #[test]
+    fn the_cards_recorded_cap_bounds_the_worker_with_the_others() {
+        use super::element_threshold_to_apply as apply;
+        const RTX4070: Option<u64> = Some(12_282 * 1024 * 1024);
+        let idle_4070 = Some(12_010 * 1024 * 1024);
+        assert_eq!(apply(1.0, idle_4070, RTX4070, None), Some(LARGEST_MEASURED));
+        assert_eq!(
+            apply(1.0, idle_4070, RTX4070, Some("134217728")),
+            Some(SMALL)
+        );
+        // The cap only lowers.
+        assert_eq!(
+            apply(1.0, Some(9 * GIB), RTX4070, Some("268435456")),
+            cap(1.0, Some(9 * GIB), RTX4070)
+        );
+        // Below every measured size: held at the smallest, never a size nothing measured.
+        assert_eq!(apply(1.0, idle_4070, RTX4070, Some("1000")), Some(SMALL));
+        // Not a number: no cap.
+        assert_eq!(
+            apply(1.0, idle_4070, RTX4070, Some("lots")),
+            Some(LARGEST_MEASURED)
+        );
+        // Nothing else bounds it: the cap alone does.
+        assert_eq!(apply(1.0, None, None, Some("134217728")), Some(SMALL));
+        assert_eq!(apply(1.0, None, None, None), None);
+        // The worker applies it as computed here, after the operator's own value.
+        let src = include_str!("main.rs");
+        let body = src
+            .split_once("\nfn apply_sp1_element_threshold(")
+            .expect("apply_sp1_element_threshold moved")
+            .1;
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        let operator = body
+            .find("if std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_ENV).is_ok()")
+            .expect("the operator's threshold is no longer left alone");
+        let cap_env = body
+            .find("std::env::var(zkminer_prover_protocol::types::SP1_ELEMENT_THRESHOLD_CAP_ENV)")
+            .expect("the card's cap is no longer read");
+        let applied = body
+            .find("element_threshold_to_apply(scale, available_vram, total_vram, card_cap_raw.as_deref())")
+            .expect("the threshold is no longer computed with the card's cap");
+        assert!(operator < cap_env && cap_env < applied);
+    }
+
+    /// A failed prove's kind, which decides what the dispatcher does: sp1-gpu's own out-of-memory
+    /// wordings (slop's "allocation failed", the server's "out of GPU memory") are an out-of-memory,
+    /// which lowers the card one shard size; a vkey mismatch is permanent for the program, even when
+    /// its text also says "out of memory".
+    #[test]
+    fn a_prove_error_is_classified_by_this_binarys_and_the_provers_wordings() {
+        use super::prove_error_kind as kind;
+        use zkminer_prover_protocol::ErrorKind;
+        for oom in [
+            "allocation failed on evaluated: 1728053248 bytes",
+            "Proving failed: out of GPU memory",
+            "cudaMallocAsync failed: out of memory",
+            // The server's own report of a proof whose device allocation failed (hemilabs/sp1
+            // zkminer/sp1-oom-cause), as the SDK hands it on.
+            "CudaClientError: The server returned an internal error \n controller task failed: \
+             out of GPU memory (a device allocation failed)",
+        ] {
+            assert!(matches!(kind(oom), ErrorKind::ResourceExhausted), "{oom}");
+        }
+        // Without it, a failed proof says nothing of why: not an out-of-memory.
+        assert!(matches!(
+            kind(
+                "CudaClientError: The server returned an internal error \n controller task failed"
+            ),
+            ErrorKind::ProofFailed
+        ));
+        assert!(matches!(
+            kind("vkey hash does not match job programId (out of memory)"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("could not parse SP1 vkey hash"),
+            ErrorKind::ProgramMismatch
+        ));
+        assert!(matches!(
+            kind("bincode: unexpected end"),
+            ErrorKind::Internal
+        ));
+        assert!(matches!(kind("guest panicked"), ErrorKind::ProofFailed));
+        // The prove arm reports it as classified here.
+        let production = include_str!("main.rs")
+            .split_once("\n#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert_eq!(
+            production
+                .matches("let kind = prove_error_kind(&msg);")
+                .count(),
+            1
+        );
+    }
 }
 
 #[cfg(test)]
 mod pin_tests {
-    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the fork's shard tiers and its
-    /// 402,653,184-element default) was re-measured against the pinned hemilabs `sp1`, whose circuit
-    /// is v6.1.0: 134M peaks at ~9 GiB and 268M at ~11.5 GiB, both far below the v6.0.0 figures (v6.1.0
-    /// is much more memory-efficient). Moving the pin again must revisit it: re-measure the tiers and
-    /// update SP1_MEASURED_TIERS, then update this version. (v6.1.0's own default for a 24 GB card is
-    /// 285,212,672 elements rather than 402,653,184, but neither binds here — the measured tiers cap
-    /// SP1_GPU_ELEMENT_THRESHOLD at 268M, below both.)
+    /// The SP1 sizing mirror in `zkminer_prover_protocol::types` (the server's shard tiers, the
+    /// cards it refuses, where it runs its memory savers, and the measured VRAM tables) was checked
+    /// against the pinned hemilabs `sp1` 6.8.1, whose circuit is v6.1.0, and both tables measured
+    /// under its server (2026-11-16 on an RTX 4070, 2026-11-17 on an RTX 5090). Moving the pin must
+    /// revisit them: the v6.0.0 server ran its savers on 24 GB cards too, and the larger card's
+    /// table it left was ~5 GiB short at 268M under this one.
     #[test]
     fn the_sizing_mirror_was_measured_for_the_pinned_sp1() {
         assert_eq!(
@@ -4941,5 +5342,48 @@ mod shm_reaper_tests {
         assert!(!is_sp1_executor_runner_comm("sp1-gpu-server"));
         assert!(!is_sp1_executor_runner_comm("zkminer-prove-s"));
         assert!(!is_sp1_executor_runner_comm(""));
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_servers_progress_line() {
+        let counts = parse_progress_line(
+            "proof=abc CORE_EXECUTE=1/1 PROVE_SHARD=12/40 RECURSION_REDUCE=3/9",
+        )
+        .unwrap();
+        assert_eq!(counts["PROVE_SHARD"], (12, 40));
+        assert_eq!(counts["CORE_EXECUTE"], (1, 1));
+        assert!(
+            parse_progress_line("proof=abc PROVE_SHARD=12/").is_none(),
+            "half written"
+        );
+        assert!(parse_progress_line("").is_none());
+    }
+
+    /// Shards while the STARK runs (the total final once execution is done), then the wrap from
+    /// the shrink's submission.
+    #[test]
+    fn stage_reports_follow_the_servers_counts() {
+        use zkminer_prover_protocol::ProveStage;
+        let at = |line: &str| stage_report(&parse_progress_line(line).unwrap());
+        let executing = at("proof=a CORE_EXECUTE=0/1 PROVE_SHARD=5/10");
+        assert_eq!(executing.stage, ProveStage::Prove);
+        assert_eq!((executing.done, executing.total), (5, 10));
+        assert!(!executing.total_final);
+        let executed = at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=10/40 RECURSION_REDUCE=3/9");
+        assert_eq!((executed.done, executed.total), (10, 40));
+        assert!(executed.total_final);
+        assert_eq!(
+            at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=40/40 SHRINK_WRAP=0/1").stage,
+            ProveStage::Finish
+        );
+        assert_eq!(
+            at("proof=a CORE_EXECUTE=1/1 PROVE_SHARD=40/40 SHRINK_WRAP=1/1 GROTH16_WRAP=0/1").stage,
+            ProveStage::Finish
+        );
     }
 }

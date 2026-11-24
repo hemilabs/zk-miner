@@ -1,5 +1,7 @@
 pub mod config;
 pub mod wallet;
+#[cfg(windows)]
+pub mod wallet_win;
 pub mod witness;
 
 pub use config::{

@@ -1981,6 +1981,8 @@ mod gpu_identity_tests {
             po2_samples: Vec::new(),
             pci_bus_id: bus.to_string(),
             host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 

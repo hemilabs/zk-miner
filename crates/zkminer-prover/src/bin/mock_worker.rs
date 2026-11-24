@@ -36,6 +36,15 @@
 //!   is held.
 //! - `MOCK_HOST_ENTROPY_READS`: what an Execute reports as `host_entropy_reads`: a number, or
 //!   `unknown` for `None`. Default: 0.
+//! - `MOCK_PROTOCOL_VERSION`: the protocol version HelloAck reports. Default: this build's.
+//! - `MOCK_PROVE_ERROR_KIND`: answer every Prove with a `WorkerResponse::Error` of this kind
+//!   (`resource_exhausted`, `proof_failed` or `invalid_input`), and `MOCK_PROVE_ERROR_MESSAGE` as
+//!   its message.
+//! - `MOCK_OOM_UNLESS_CAP_AT_MOST`: answer a Prove, and a Benchmark, with a `ResourceExhausted`
+//!   error unless `ZKMINER_SP1_ELEMENT_THRESHOLD_CAP` (the SP1 shard-size cap the dispatcher spawns
+//!   a worker with) is set to at most this: a program, or a card, that fits only at the smaller size.
+//! - `MOCK_RECORD_TO`: a file each Benchmark and Prove appends a line to, saying what it was sent
+//!   (`benchmark po2=<po2>`) or what it ran with (`prove cap=<ZKMINER_SP1_ELEMENT_THRESHOLD_CAP>`).
 //! - `MOCK_WITNESS_DIVERGE`: set to anything to answer a witness Prove with `JournalDiverged`: the
 //!   journal is the bundle's `input_path`, the hash the complement of the expected one, and the cycles
 //!   its `w_len`. Unset = a witness Prove is answered as an inline one.
@@ -53,6 +62,7 @@
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
 
+use zkminer_prover_protocol::types::ErrorKind;
 use zkminer_prover_protocol::{
     read_message, write_message, FrameError, WorkerCommand, WorkerResponse, PROTOCOL_VERSION,
 };
@@ -85,6 +95,18 @@ fn start_lurker() {
 fn start_lurker() {}
 
 fn main() {
+    // The Windows miner's Medium-integrity install step before a Low worker's warm-up: nothing to
+    // install, answered as a real worker answers it.
+    if std::env::args().any(|a| a == zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG) {
+        let mut out = io::stdout().lock();
+        let resp = WorkerResponse::WarmupDone {
+            request_id: 0,
+            summary: "mock: nothing to install".to_string(),
+            groth16_helper: false,
+        };
+        write_message(&mut out, &resp).unwrap();
+        std::process::exit(0);
+    }
     if std::env::var_os("MOCK_BE_MEMORY_HOG").is_some() {
         let mut held: Vec<Vec<u8>> = Vec::new();
         loop {
@@ -103,6 +125,31 @@ fn main() {
     let backend = std::env::var("MOCK_BACKEND").unwrap_or_else(|_| "mock".to_string());
     let journal = hex_env("MOCK_JOURNAL_HEX");
     let seal = hex_env("MOCK_SEAL_HEX");
+    let record = |line: String| {
+        if let Some(path) = std::env::var_os("MOCK_RECORD_TO") {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("MOCK_RECORD_TO");
+            writeln!(file, "{line}").expect("MOCK_RECORD_TO");
+        }
+    };
+    let cap = std::env::var("ZKMINER_SP1_ELEMENT_THRESHOLD_CAP").ok();
+    // `MOCK_OOM_UNLESS_CAP_AT_MOST`: runs out of memory at this worker's cap.
+    let oom_at_cap = std::env::var("MOCK_OOM_UNLESS_CAP_AT_MOST")
+        .ok()
+        .map(|most| {
+            most.trim()
+                .parse::<u64>()
+                .expect("MOCK_OOM_UNLESS_CAP_AT_MOST")
+        })
+        .is_some_and(|most| {
+            cap.as_deref()
+                .and_then(|c| c.trim().parse::<u64>().ok())
+                .is_none_or(|c| c > most)
+        });
     let prove_delay = Duration::from_secs(
         std::env::var("MOCK_PROVE_DELAY_SECS")
             .ok()
@@ -149,7 +196,7 @@ fn main() {
                 let resp = WorkerResponse::HelloAck {
                     protocol_version: std::env::var("MOCK_PROTOCOL_VERSION")
                         .ok()
-                        .and_then(|v| v.parse().ok())
+                        .map(|v| v.trim().parse().expect("MOCK_PROTOCOL_VERSION"))
                         .unwrap_or(PROTOCOL_VERSION),
                     backend: backend.clone(),
                     sdk_version: std::env::var("MOCK_SDK_VERSION")
@@ -170,7 +217,8 @@ fn main() {
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            WorkerCommand::Benchmark { programs } => {
+            WorkerCommand::Benchmark { programs, po2 } => {
+                record(format!("benchmark po2={po2:?}"));
                 if crash_on == "benchmark" || crash_on == "both" {
                     std::process::exit(crash_code);
                 }
@@ -186,6 +234,13 @@ fn main() {
                         request_id: 0,
                         kind: zkminer_prover_protocol::types::ErrorKind::ProofFailed,
                         message: fail_message.clone(),
+                    }
+                } else if oom_at_cap {
+                    WorkerResponse::Error {
+                        request_id: 0,
+                        kind: ErrorKind::ResourceExhausted,
+                        message: "mock: an SP1 benchmark ran out of GPU memory at this shard size"
+                            .to_string(),
                     }
                 } else {
                     WorkerResponse::BenchmarkResult {
@@ -221,6 +276,25 @@ fn main() {
                     }
                 }
                 std::thread::sleep(prove_delay);
+                record(format!("prove cap={}", cap.as_deref().unwrap_or("none")));
+                let oom = oom_at_cap;
+                let error_kind = match std::env::var("MOCK_PROVE_ERROR_KIND").as_deref() {
+                    Ok("resource_exhausted") => Some(ErrorKind::ResourceExhausted),
+                    Ok("proof_failed") => Some(ErrorKind::ProofFailed),
+                    Ok("invalid_input") => Some(ErrorKind::InvalidInput),
+                    Ok(other) => panic!("MOCK_PROVE_ERROR_KIND={other}"),
+                    Err(_) => oom.then_some(ErrorKind::ResourceExhausted),
+                };
+                if let Some(kind) = error_kind {
+                    let resp = WorkerResponse::Error {
+                        request_id,
+                        kind,
+                        message: std::env::var("MOCK_PROVE_ERROR_MESSAGE")
+                            .unwrap_or_else(|_| "mock: out of GPU memory".to_string()),
+                    };
+                    write_message(&mut stdout, &resp).unwrap();
+                    continue;
+                }
                 // A witness proof whose run did not reproduce its bundle: what the run committed is the
                 // input path's bytes, so a test sees the bundle reached the worker.
                 if let Some(w) = witness

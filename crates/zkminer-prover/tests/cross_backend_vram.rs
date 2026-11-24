@@ -17,16 +17,14 @@
 //! still held at least 1 GiB of its own — so a run where nothing needed recycling cannot pass
 //! vacuously.
 //!
-//! A card with more room than that is first made to look like a 16 GB one: a separate process, not
+//! A card with more room than that is first held to SP1's floor plus 1.5 GiB: a separate process, not
 //! ours, holds device memory until what is allocatable is SP1's floor plus 1.5 GiB (or
 //! `ZKMINER_TEST_VRAM_TARGET_MIB`), whatever else the card already carries. To the miner it is
 //! foreign, like a display or another program, so nothing can reclaim it; on a 32 GB card the idle risc0
-//! worker would otherwise never stand in SP1's way and the run could not exercise the fix. A card
-//! already that tight is used as it is: on the 5080 SP1's smallest tier leaves only 276 MiB to spare
-//! (15,880 MiB allocatable against 15,604), so there a desktop session fails the SP1 step for reasons
-//! that have nothing to do with this fix. The 4090 step assumes a host budget that allows the 268M
-//! tier (at least 21⅓ GiB, two thirds of the 32 GiB reference), which is what makes its idle risc0
-//! worker stand in the way.
+//! worker would otherwise never stand in SP1's way and the run could not exercise the fix. The floor
+//! is the one for the card's own total (a 16 GB CUDA card's server runs leaner, see
+//! `sp1_min_available_vram_bytes`), and 1.5 GiB of slack is less than the idle risc0 worker holds, so
+//! SP1's smallest tier then needs it gone. A card already that tight is used as it is.
 //!
 //! `#[ignore]`d — real GPU proofs. `ZKMINER_TEST_CARD` picks the card (default 0); both backends must
 //! have a slot on it. Run with:
@@ -83,13 +81,22 @@ fn risc0_and_sp1_alternate_on_one_card() {
     let (risc0, sp1) = (format!("risc0:cuda:{card}"), format!("sp1:cuda:{card}"));
 
     // Before any worker exists, so each is sized for the card as it will be.
-    let floor_mib = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1")
+    let total = card_total_mib(&card).map(|mib| mib << 20);
+    let floor_mib = zkminer_prover::discovery::min_available_vram_bytes_for_backend("sp1", total)
         .expect("sp1 must require free VRAM for this test to mean anything")
         >> 20;
+    // risc0 is gated too: it is not started on a card with less free than its job size's measured
+    // peak (12,436 MiB at po2 20 on a 16 GB card), which is above SP1's floor there. A ballast
+    // sized for SP1 alone left the 5080 ~10.7 GB, so the FIRST risc0 proof was refused and the
+    // test failed before it exercised any recycling.
+    let risc0_need_mib = total.map_or(0, |t| {
+        let po2 = zkminer_prover::benchmark::risc0_benchmark_po2(Some(t), "cuda");
+        zkminer_prover::benchmark::estimate_gpu_po2_memory(po2, "risc0", "cuda") >> 20
+    });
     let target_mib = std::env::var("ZKMINER_TEST_VRAM_TARGET_MIB")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(floor_mib + 1536);
+        .unwrap_or(floor_mib.max(risc0_need_mib) + 1536);
     let _ballast = match allocatable_mib(&card) {
         Some(allocatable) if allocatable >= target_mib + 1024 => {
             let ballast = Ballast::start(&card, allocatable - target_mib);
@@ -197,9 +204,9 @@ fn risc0_and_sp1_alternate_on_one_card() {
         )
     });
     assert!(!proof.seal.is_empty());
-    // Non-vacuity. On both cards here the idle risc0 worker leaves less than SP1's tier needs
-    // (5080: 14,072 MiB against 15,604; 4090: 16,973 against 18,278 — see the header for what that
-    // assumes), so a pass without a recycle means this run did not exercise the fix.
+    // Non-vacuity. With the card held to SP1's floor plus 1.5 GiB, the idle risc0 worker (1.8 GiB or
+    // more) leaves less than SP1's tier needs, so a pass without a recycle means this run did not
+    // exercise the fix.
     assert_ne!(
         risc0_after, risc0_pid,
         "SP1 proved but the idle risc0 worker was never recycled: this run did not exercise making \
@@ -219,6 +226,20 @@ fn risc0_and_sp1_alternate_on_one_card() {
             held_by_sp1 >> 20
         );
     }
+}
+
+/// The card's `memory.total`, in MiB.
+fn card_total_mib(card: &str) -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "-i",
+            card,
+            "--query-gpu=memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// What the card has free to allocate, in MiB: its capacity less the driver's reservation and

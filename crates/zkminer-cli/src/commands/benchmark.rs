@@ -9,7 +9,7 @@ use zkminer_prover::engine::{init_worker_pool, worker_pool};
 pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Result<()> {
     // Not beside a miner from this home: both would drive every GPU, and a live miner's proofs
     // would run out of memory under the benchmark's (and the miner can't start during one).
-    super::run::hold_instance_lock()?;
+    super::run::hold_instance_lock("benchmark")?;
     // Spawn the prover workers BEFORE benchmarking. `benchmark::run_benchmark`
     // sources every per-device (GPU) result from `engine::worker_pool()`; when the
     // pool is uninitialized it silently degrades to simulated CPU numbers with an
@@ -24,6 +24,9 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // config degrades to the default worker search paths rather than failing.
     let config = ZkMinerConfig::load(config_path)?;
     let benchmark_timeout = config.prover.benchmark_timeout();
+    // Windows, with Low-integrity workers: the key file, `.env` and the journal unreadable to them.
+    #[cfg(windows)]
+    super::run::protect_secrets(&config);
     let mut pool = WorkerPool::new(
         config
             .prover
@@ -39,6 +42,10 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
             .collect(),
         benchmark_timeout,
     );
+    // Each card's SP1 shard-size cap, recorded when a job that ran out of GPU memory there proved
+    // at a smaller size, so a
+    // benchmark measures the size jobs run at.
+    pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
     let connected = pool.discover_and_spawn();
     // Found but not started (died at startup, declined): named in the header, never "none" (W10-BFIX).
     let not_started = pool.not_started().to_vec();

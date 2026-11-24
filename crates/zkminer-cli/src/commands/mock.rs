@@ -49,7 +49,7 @@ fn random_b256(rng: &mut impl Rng) -> B256 {
 
 fn seed_state(state: &mut zkminer_tui::state::MinerState) {
     state.address = format!("{}", mock_address());
-    state.connected = true;
+    state.last_refresh = Some(chrono::Utc::now());
     state.block_number = START_BLOCK;
     state.eth_balance = INITIAL_ETH;
     state.hemi_balance = INITIAL_HEMI.saturating_sub(INITIAL_STAKE);
@@ -90,6 +90,12 @@ pub async fn run(headless: bool) -> Result<()> {
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Looking for GPUs and prover workers");
     let state = new_shared_state();
+    // Windows, with Low-integrity workers: the key file of the default config, `.env` and the
+    // journal unreadable to them.
+    #[cfg(windows)]
+    if let Ok(config) = zkminer_config::ZkMinerConfig::load(None) {
+        super::run::protect_secrets(&config);
+    }
 
     // Spawn worker pool so GPU provers are available for real benchmarks.
     // This discovers binaries in ~/.zkminer/provers/, $PATH, etc.
@@ -99,6 +105,8 @@ pub async fn run(headless: bool) -> Result<()> {
             Vec::new(),     // default search paths
             zkminer_config::config::ProverConfig::default().benchmark_timeout(),
         );
+        // Real SP1 workers, benchmarked into the miner's own benchmarks.json: the same caps.
+        pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
         let status = splash.status_line();
         pool.set_progress(move |text| status.set(text));
         let connected = pool.discover_and_spawn();

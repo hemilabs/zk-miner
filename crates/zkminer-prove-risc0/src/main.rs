@@ -109,6 +109,20 @@ mod test_leak {
 }
 
 fn main() {
+    // First, while the process has one thread: no capability on any thread it will ever have, nor
+    // on anything it starts (a no-op unless the miner runs as root). The confinement checks this
+    // before the first guest and refuses otherwise.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
+        eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
+    }
+    // Windows: its threads, those running and those to come, closed to every other process of the
+    // user, another worker included (`zkminer_prover_protocol::threads`).
+    #[cfg(windows)]
+    if let Err(e) = zkminer_prover_protocol::threads::lock_threads() {
+        eprintln!("zkminer: this worker could not close its threads to other processes ({e})");
+    }
+
     // `--groth16-docker-helper`: the Docker Groth16 wrap's helper process (groth16_wrap.rs), which
     // never runs a guest. It does not return.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(groth16_wrap::HELPER_ARG))
@@ -360,6 +374,12 @@ fn main() {
     // Said on stderr before logging was up; again through it.
     segments::log_fallback();
 
+    // `--install-artifacts`: the Groth16 component only, answered as a `Warmup` is, then exit. For the
+    // Windows miner, at its own integrity, before a Low-integrity worker's warm-up. No GPU, no guest.
+    if std::env::args().any(|a| a == zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG) {
+        std::process::exit(install_artifacts(ipc_stdout));
+    }
+
     // W7-M10: with `ZKMINER_METAL_ENFORCE_BUDGET=1` the HAL enforces the limit this worker plans
     // with (the dispatcher's figure for this job tier); set before the first request, so before
     // any proof or HAL runtime reads it. rayon's (idle) pool and the Metal device `gpu_refusal`
@@ -401,6 +421,40 @@ fn main() {
     }
 }
 
+/// `--install-artifacts` (`zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG`): what a `Warmup`
+/// installs in the user's profile, its progress and outcome written to `out` as a `Warmup`'s are.
+/// The exit status: 0 once installed.
+fn install_artifacts(mut out: impl io::Write) -> i32 {
+    let resp = match groth16_component::ensure_installed(&mut |status, done_bytes, total_bytes| {
+        // A closed pipe is reported by the final answer's write below.
+        let _ = write_message(
+            &mut out,
+            &WorkerResponse::SetupProgress {
+                request_id: 0,
+                status: status.to_string(),
+                done_bytes,
+                total_bytes,
+            },
+        );
+    }) {
+        Ok(summary) => WorkerResponse::WarmupDone {
+            request_id: 0,
+            summary,
+            groth16_helper: false,
+        },
+        Err(e) => WorkerResponse::Error {
+            request_id: 0,
+            kind: ErrorKind::Internal,
+            message: format!("installing the risc0-groth16 component failed: {e:#}"),
+        },
+    };
+    let installed = matches!(resp, WorkerResponse::WarmupDone { .. });
+    match write_message(&mut out, &resp) {
+        Ok(()) if installed => 0,
+        _ => 1,
+    }
+}
+
 /// Workers that run requester guests are confined: the first command that runs a guest or uses the
 /// GPU (`Execute`, `Prove`, `ProgramId`, `Benchmark`, `CalibrateSegmentLimit`, the Intel warm-up's
 /// proof) first confines this process, its threads and everything it starts, for the rest of its
@@ -433,9 +487,13 @@ fn guest_may_run(request_id: u64) -> std::result::Result<(), WorkerResponse> {
     })
 }
 
-fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
+fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
     let mut stdin = BufReader::new(io::stdin().lock());
-    let mut stdout = BufWriter::new(ipc_stdout);
+    // Shared, so a proof's progress hook can report from inside the proof (see `report_stage`).
+    let shared: IpcOut =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(BufWriter::new(ipc_stdout))));
+    let _ = IPC_OUT.set(shared.clone());
+    let mut stdout = SharedOut(shared);
 
     loop {
         let cmd: WorkerCommand = match read_message(&mut stdin) {
@@ -481,26 +539,49 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
-                tracing::info!("Running benchmarks...");
-                if let Err(refused) = guest_may_run(0) {
-                    write_message(&mut stdout, &refused)?;
-                    continue;
-                }
-                let results = if let Some(refusal) = gpu_refusal() {
-                    tracing::error!("not benchmarking: {refusal}");
-                    Vec::new()
-                } else {
-                    #[cfg(feature = "metal")]
-                    {
-                        metal_start::log_power_state("benchmark");
-                        metal_start::prewarm_before_benchmark(default_job_po2());
+            WorkerCommand::Benchmark { programs, po2 } => match job_segment_po2(po2) {
+                Ok(po2) => {
+                    tracing::info!("Running benchmarks at po2 {po2}...");
+                    if let Err(refused) = guest_may_run(0) {
+                        write_message(&mut stdout, &refused)?;
+                        continue;
                     }
-                    run_benchmarks_streaming(&mut stdout, &programs)?
-                };
-                let resp = WorkerResponse::BenchmarkResult { results };
-                write_message(&mut stdout, &resp)?;
-            }
+                    // The job path's ceiling (`po2_refusal`): on a Mac a size whose STARK does not
+                    // fit the working set thrashes swap instead of failing, whoever chose it (an
+                    // explicitly configured worker has no budget on the host, which then sends 20).
+                    if let Some(refusal) = po2_refusal(po2) {
+                        tracing::error!("not benchmarking: {refusal}");
+                        let resp = WorkerResponse::Error {
+                            request_id: 0,
+                            message: refusal,
+                            kind: ErrorKind::ResourceExhausted,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                        continue;
+                    }
+                    let results = if let Some(refusal) = gpu_refusal() {
+                        tracing::error!("not benchmarking: {refusal}");
+                        Vec::new()
+                    } else {
+                        #[cfg(feature = "metal")]
+                        {
+                            metal_start::log_power_state("benchmark");
+                            metal_start::prewarm_before_benchmark(po2);
+                        }
+                        run_benchmarks_streaming(&mut stdout, &programs, po2)?
+                    };
+                    let resp = WorkerResponse::BenchmarkResult { results };
+                    write_message(&mut stdout, &resp)?;
+                }
+                Err(e) => {
+                    let resp = WorkerResponse::Error {
+                        request_id: 0,
+                        message: format!("{e:#}"),
+                        kind: ErrorKind::InvalidInput,
+                    };
+                    write_message(&mut stdout, &resp)?;
+                }
+            },
 
             // A witness-construction job (plan §15.3): its input read from the bundle and checked,
             // executed once, and proven only if it reproduces the bundle's journal.
@@ -621,12 +702,16 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // to every GPU crashing each, and the program is never classed bad — so it is cheaply
                 // repeatable and drives a release-penalty/slash. Contain it here and answer with an
                 // error (typed by what panicked, below) instead of dying.
+                // The proof's progress reports carry this request (see `report_stage`).
+                *PROVING.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some((request_id, Instant::now()));
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if let Some(refusal) = gpu_refusal() {
                         anyhow::bail!("this worker cannot prove here: {refusal}");
                     }
                     run_proof(&elf, &input_data, po2, program_id)
                 }));
+                *PROVING.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
                         #[cfg(feature = "testing")]
@@ -1858,6 +1943,93 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+/// The IPC writer, shared between the worker loop and a proof's progress hook.
+type IpcOut = std::sync::Arc<std::sync::Mutex<Box<dyn io::Write + Send>>>;
+
+static IPC_OUT: std::sync::OnceLock<IpcOut> = std::sync::OnceLock::new();
+
+/// The job proof in flight: its request id and when it started, for its progress reports.
+static PROVING: std::sync::Mutex<Option<(u64, Instant)>> = std::sync::Mutex::new(None);
+
+/// A handle on the shared IPC writer. A message is written under one lock per write call, but only
+/// one thread writes at a time: the loop is inside the proof while the hook reports.
+struct SharedOut(IpcOut);
+
+impl io::Write for SharedOut {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).flush()
+    }
+}
+
+/// Sends the host a message about the job proof in flight, if any. Best effort: a failed write
+/// shows up as the next message's failure, not here.
+fn send_to_host(msg: impl FnOnce(u64) -> WorkerResponse) {
+    let Some((request_id, _)) = *PROVING.lock().unwrap_or_else(|p| p.into_inner()) else {
+        return;
+    };
+    let Some(out) = IPC_OUT.get() else {
+        return;
+    };
+    let _ = write_message(&mut SharedOut(out.clone()), &msg(request_id));
+}
+
+/// Tells the host which stage the job proof is in (protocol 16). The host weighs the stages by the
+/// job's measured cycles and the card's benchmark; the worker only says where it is.
+fn report_stage(stage: zkminer_prover_protocol::ProveStage, done: u32, total: u32) {
+    send_to_host(|request_id| WorkerResponse::ProveStage {
+        request_id,
+        report: zkminer_prover_protocol::StageReport {
+            stage,
+            done,
+            total,
+            total_final: true,
+        },
+    });
+}
+
+/// Reports each proven segment of the session it is hooked onto.
+struct SegmentProgress {
+    total: u32,
+}
+
+impl risc0_zkvm::SessionEvents for SegmentProgress {
+    fn on_post_prove_segment(&self, segment: &risc0_zkvm::Segment) {
+        let done = (segment.index + 1).min(self.total);
+        report_stage(zkminer_prover_protocol::ProveStage::Prove, done, self.total);
+        // After the last segment: the lift/join and keccak tail, then the Groth16 wrap.
+        if done == self.total {
+            report_stage(zkminer_prover_protocol::ProveStage::Finish, 0, 0);
+        }
+    }
+}
+
+/// `groth16_wrap::prove` for a job, reporting each proven segment to the host: the execution, then
+/// `groth16_wrap::prove_session`, taken one level down from `prove_with_opts` so the session can
+/// carry a hook. The segment size is always set here, so the server's own choice of one, the only
+/// other thing `prove_with_ctx` does, never applies.
+fn prove_reporting_segments(
+    env: risc0_zkvm::ExecutorEnv<'_>,
+    elf: &[u8],
+) -> Result<risc0_zkvm::ProveInfo> {
+    // A start, also on a retry inside this worker (`run_proof`): the host starts its progress over.
+    send_to_host(|request_id| WorkerResponse::Progress {
+        request_id,
+        fraction: 0.0,
+        elapsed_secs: 0.0,
+        segments: None,
+    });
+    report_stage(zkminer_prover_protocol::ProveStage::Execute, 0, 0);
+    let mut session = risc0_zkvm::ExecutorImpl::from_elf(env, elf)?.run()?;
+    let total = u32::try_from(session.segments.len()).unwrap_or(u32::MAX);
+    report_stage(zkminer_prover_protocol::ProveStage::Prove, 0, total);
+    session.add_hook(SegmentProgress { total });
+    // In-process, or to a succinct receipt the Groth16 helper wraps (`groth16_wrap`).
+    groth16_wrap::prove_session(&session)
+}
+
 fn run_proof(
     elf: &[u8],
     input_data: &[u8],
@@ -2030,7 +2202,6 @@ fn run_proof_once(
     // This performs STARK proving followed by Groth16 SNARK compression,
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
-    let prover = local_prover();
     #[cfg(feature = "metal")]
     if let Some(limit) = metal_host::working_set_limit() {
         // Above the default but under the hard ceiling `run_proof` enforces (`po2_refusal`).
@@ -2051,7 +2222,7 @@ fn run_proof_once(
         // Releases on unwind too: a prove-path panic (a Metal budget panic mid-STARK) must not skip
         // returning the recursion provers' memory. The normal path releases when this scope ends.
         let _release = ReleaseOnDrop;
-        groth16_wrap::prove(&prover, env, elf)
+        prove_reporting_segments(env, elf)
     };
     #[cfg(feature = "metal")]
     sampler.phase("proof");
@@ -2151,16 +2322,17 @@ fn benchmark_guest(name: &str) -> Option<&'static [u8]> {
     (!elf.is_empty()).then_some(elf)
 }
 
-/// Prove each of `programs`, sending a `BenchmarkProgress` after each one that proved. The suite is
-/// the host's; see `zkminer_prover_protocol::suite`.
+/// Prove each of `programs` at segment size `po2`, sending a `BenchmarkProgress` after each one
+/// that proved. The suite is the host's; see `zkminer_prover_protocol::suite`.
 fn run_benchmarks_streaming<W: std::io::Write>(
     stdout: &mut W,
     programs: &[BenchmarkProgramSpec],
+    po2: u8,
 ) -> anyhow::Result<Vec<BenchmarkEntry>> {
     let mut results = Vec::new();
     let total = programs.len() as u32;
     for (idx, spec) in programs.iter().enumerate() {
-        if let Some(entry) = benchmark_spec(spec) {
+        if let Some(entry) = benchmark_spec(spec, po2) {
             let progress = WorkerResponse::BenchmarkProgress {
                 entry: entry.clone(),
                 program_index: idx as u32 + 1,
@@ -2193,13 +2365,17 @@ fn forced_failure_in(knob: Option<&str>, what: &str) -> Option<String> {
         .then(|| format!("forced failure (ZKMINER_TEST_FORCE_FAIL={what})"))
 }
 
-/// Prove one requested program, if this build has its guest.
-fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
-    benchmark_spec_with(spec, force_fail_knob().as_deref())
+/// Prove one requested program at segment size `po2`, if this build has its guest.
+fn benchmark_spec(spec: &BenchmarkProgramSpec, po2: u8) -> Option<BenchmarkEntry> {
+    benchmark_spec_with(spec, po2, force_fail_knob().as_deref())
 }
 
 /// `benchmark_spec` with the `ZKMINER_TEST_FORCE_FAIL` value passed in.
-fn benchmark_spec_with(spec: &BenchmarkProgramSpec, knob: Option<&str>) -> Option<BenchmarkEntry> {
+fn benchmark_spec_with(
+    spec: &BenchmarkProgramSpec,
+    po2: u8,
+    knob: Option<&str>,
+) -> Option<BenchmarkEntry> {
     if let Some(forced) = forced_failure_in(knob, &spec.name) {
         tracing::error!("{}: {forced}", spec.name);
         return None;
@@ -2215,6 +2391,7 @@ fn benchmark_spec_with(spec: &BenchmarkProgramSpec, knob: Option<&str>) -> Optio
         spec.weight,
         spec.precompile,
         spec.measure_wrap,
+        po2,
     )
 }
 
@@ -2254,6 +2431,8 @@ fn run_benchmarks_with(
     use zkminer_prover_protocol::{
         benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
     };
+    // At the size a host sends a card it knows nothing about (on a Mac, the Metal table's).
+    let po2 = default_job_po2();
     let mut failed = Vec::new();
     // Discarded, as under a host: see `warmup_spec`. Its failure still fails the run.
     let warmup = warmup_spec(BACKEND_RISC0);
@@ -2262,7 +2441,7 @@ fn run_benchmarks_with(
             tracing::error!("warm-up: {forced}");
             false
         }
-        None => benchmark_spec_with(&warmup, knob).is_some(),
+        None => benchmark_spec_with(&warmup, po2, knob).is_some(),
     };
     if !warmed {
         failed.push(format!("{} (warm-up)", warmup.name));
@@ -2273,13 +2452,15 @@ fn run_benchmarks_with(
         .iter()
         .filter(|spec| wanted(&spec.name))
     {
-        match benchmark_spec_with(spec, knob) {
+        match benchmark_spec_with(spec, po2, knob) {
             Some(entry) => results.push(entry),
             None => failed.push(spec.name.clone()),
         }
     }
     if wanted(BENCH_ZKOP_MIX) {
-        match measure_zkop_mix(|iterations| benchmark_spec_with(&zkop_mix_spec(iterations), knob)) {
+        match measure_zkop_mix(|iterations| {
+            benchmark_spec_with(&zkop_mix_spec(iterations), po2, knob)
+        }) {
             Some(entry) => results.push(entry),
             None => {
                 tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score");
@@ -2299,13 +2480,13 @@ fn benchmark_stages(
     weight: f64,
     precompile: bool,
     measure_wrap: bool,
+    po2: u8,
 ) -> Option<BenchmarkEntry> {
-    // At the size an uncalibrated card proves jobs at, so its throughput and host peak describe them.
-    // (Its first stage is a composite proof, for which the SDK never picks a size of its own, so this
-    // only says what the executor default already was.)
+    // At the size the host names: the one this card proves jobs at before any calibration, so its
+    // throughput and host peak describe them. On a 12 GB card that is 19; at 20 its proofs spill
+    // into shared memory and run several times slower than any job it proves.
     let mut env = risc0_zkvm::ExecutorEnv::builder();
-    env.write_slice(input)
-        .segment_limit_po2(default_job_po2() as u32);
+    env.write_slice(input).segment_limit_po2(po2 as u32);
     let _segments = segments::spill_here(&mut env);
     let env = env.build().ok()?;
 
@@ -2320,7 +2501,7 @@ fn benchmark_stages(
     // P31-M9b: wait for the in-flight specialized eval pipeline when this program's segments are
     // its size, outside the stopwatch.
     #[cfg(feature = "metal")]
-    metal_start::before_benchmark_program(name, default_job_po2(), elf, input);
+    metal_start::before_benchmark_program(name, po2, elf, input);
     let prover = local_prover();
     // W7-M11: the power state the program is measured under, read before and after it.
     let power_before = bench_power_state();
@@ -2381,7 +2562,7 @@ fn benchmark_stages(
             sampler.held("held after release");
             tracing::info!(
                 "{name}: Metal peak GPU memory at po2 {}: {}",
-                default_job_po2(),
+                po2,
                 sampler.summary()
             );
         }
@@ -2390,7 +2571,7 @@ fn benchmark_stages(
             footprint.phase("held after release");
             tracing::info!(
                 "{name}: peak process footprint (host + GPU) at po2 {}: {}",
-                default_job_po2(),
+                po2,
                 footprint.summary()
             );
         }
@@ -2439,7 +2620,7 @@ fn benchmark_stages(
         sampler.held("held after release");
         tracing::info!(
             "{name}: Metal peak GPU memory at po2 {}: {}",
-            default_job_po2(),
+            po2,
             sampler.summary()
         );
     }
@@ -2448,7 +2629,7 @@ fn benchmark_stages(
         footprint.phase("held after release");
         tracing::info!(
             "{name}: peak process footprint (host + GPU) at po2 {}: {}",
-            default_job_po2(),
+            po2,
             footprint.summary()
         );
     }
@@ -3629,7 +3810,13 @@ mod storage_tests {
     /// host's failure, not a failed proof of the job; a guest that only says so is still the job's.
     #[test]
     fn a_full_segment_disk_is_the_hosts_failure() {
-        for code in [libc::ENOSPC, libc::EDQUOT] {
+        // The OS's own codes: errno on Unix, Win32 errors (ERROR_DISK_FULL,
+        // ERROR_HANDLE_DISK_FULL) on Windows.
+        #[cfg(unix)]
+        let codes = [libc::ENOSPC, libc::EDQUOT];
+        #[cfg(windows)]
+        let codes = [112, 39];
+        for code in codes {
             let e = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
                 .context("writing segment 4095");
             let (k, message) = kind(e);

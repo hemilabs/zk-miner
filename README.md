@@ -8,7 +8,10 @@ worth taking, claims the ones that are, generates the proof on a local GPU, and 
 it on-chain. Proving runs in separate worker processes — one per GPU — so a wedged or
 OOM-killed prover can't take the miner down with it.
 
-Backends: **RISC Zero** (CUDA, ROCm, Intel, and Metal on Apple Silicon Macs), **SP1**, **OpenVM**.
+Backends: **RISC Zero** (CUDA, ROCm, Intel, and Metal on Apple Silicon Macs) and **SP1**.
+**OpenVM** is experimental: its worker builds and starts, but the miner claims no OpenVM job
+unless `ZKMINER_ENABLE_OPENVM=1` is set, so leave `zkminer-prove-openvm` out of an install.
+`zkminer doctor` shows, card by card, what this host can prove, and why not.
 
 ## Requirements
 
@@ -149,7 +152,7 @@ no error.**
 ├── sp1-gpu-server-sycl-lib -> zkminer-intel/lib
 ├── libcudart.so.12
 ├── libcudart.so.12.LICENSE.txt
-└── zkminer-prove-openvm
+└── zkminer-prove-openvm          (experimental, not mined: leave it out)
 ```
 
 **From a release**, put the single-file provers there and unpack the AMD or Intel tarball into the
@@ -163,7 +166,10 @@ RTX cards, and for AMD (Radeon RX 7000 and 9000) and Intel (Arc A and B) cards j
 driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
 oneAPI install, and a ROCm the distribution has is not used. A miner run outside a desktop session
 (a systemd unit, SSH) needs its user in the `render` group for AMD and Intel cards
-(`sudo usermod -aG render $USER`). The release workflow checks all of this on real GPUs before it
+(`sudo usermod -aG render $USER`). Run it as such a user, not as root: its workers drop every
+capability, but as uid 0 they could still read root's files after an executor escape, so a run as
+root on a bare host logs `PAGE: RUNNING-AS-ROOT` and `zkminer doctor` warns of it (only the
+dashboard's GPU tuning needs root). The release workflow checks all of this on real GPUs before it
 publishes (`.github/workflows/release.yml`).
 
 **SP1** needs three more things, all handled for you:
@@ -479,6 +485,7 @@ key_env_var = "ZKMINER_PRIVATE_KEY"
 [prover]
 max_concurrent_proofs = 0           # 0 = one proof per detected GPU
 skip_benchmark_gate   = true
+max_locked_stake_fraction = 0.5     # every held lock together: at most this share of the stake
 
 [egress]                            # optional
 deny_cidrs = ["203.0.113.0/24"]     # the rest of your fleet, your VPC's ranges
@@ -544,8 +551,9 @@ policy-routing rules; its interface-scoped routes (netstat's `I` flag, such as t
 routes nor uplinks, and a connection whose socket would leave by another interface than its
 route names (a Network Extension VPN) is refused. A `utun` or `ppp` default route needs
 `[egress] internal_ranges`, as a tunnel does on Linux. Details and residual differences:
-[docs/netguard-macos.md](docs/netguard-macos.md). Windows still refuses every requester
-connection in public mode (no route oracle there).
+[docs/netguard-macos.md](docs/netguard-macos.md). Public mode is not supported on Windows: its TCP
+never reports a router's "time exceeded", so every requester connection is refused there (said
+at start and in `zkminer status`); run public mode on Linux or macOS.
 
 *Troubleshooting (macOS):* if every requester connection is refused with `this host's network
 facts ... could not be read again`, the message names what failed. A file in `/etc/resolver`
@@ -635,9 +643,13 @@ rclone, ...) are not, whatever they call themselves. Unmount them, or run the mi
 user (another user's FUSE mount without `allow_other` is closed to it) or in a container or mount
 namespace that leaves them out. Confined workers also
 change no file's mode, owner, attributes or times. Nothing a worker starts outlives it: each worker
-runs in a cgroup of its own, killed with `cgroup.kill` when the worker ends (below the miner's when
-the miner runs in a cgroup delegated to it, such as under `systemd-run --user --scope -p
-Delegate=yes zkminer run`, else in a scope of your systemd user manager); a small reaper process
+runs in a cgroup of its own, with its memory ceiling, killed with `cgroup.kill` when the worker
+ends (below the miner's when the miner runs in a cgroup delegated to it, such as under
+`systemd-run --user --scope -p Delegate=yes zkminer run` or
+[`contrib/zkminer.service`](contrib/zkminer.service), which has `Delegate=cpu memory pids`, else
+in a scope of your systemd user manager; a system unit has no user manager, so one without
+`Delegate=` leaves every worker with no memory ceiling, which the miner reports at start-up as
+`PAGE: WORKERS-UNCAPPED` and `zkminer doctor` as a warning); a small reaper process
 (`zkminer-worker-reaper`) kills every worker if the miner dies abruptly; and the miner kills every
 worker the moment a filesystem that is not local is mounted. The CPU risc0 worker's Docker Groth16 wrap runs in
 a helper process that accepts only a strictly checked prover input, with the image pinned by digest
@@ -651,7 +663,9 @@ chain_id` set to the test network's chain id.
 ## Run
 
 ```bash
-export ZKMINER_PRIVATE_KEY=0x...
+zkminer init --generate-key   # a key file only you can read (or: read -rs ZKMINER_PRIVATE_KEY; export ZKMINER_PRIVATE_KEY)
+                              # on Windows the key file is the default; --key-source env keeps the variable
+zkminer init --import-env-key # copy a key you already give as ZKMINER_PRIVATE_KEY into that key file
 
 zkminer status                # balance, stake, collateral, job stats
 zkminer benchmark             # measure real per-GPU proving throughput
@@ -659,6 +673,8 @@ zkminer benchmark --calibrate # also time each segment size (po2); saves benchma
 zkminer run                   # interactive TUI
 zkminer -v run --headless     # headless; -v shows per-job claim/skip reasoning
 zkminer run --watch-only      # watch the market; claim, sign and send nothing
+zkminer stop                  # stop the running miner (drain); --keep-locks, --abandon
+zkminer doctor                # what this host can prove, and why not
 ```
 
 `run --watch-only` runs every check up to the claim against the live market and logs each
@@ -681,8 +697,12 @@ measure workers and RPC budget the WOULD CLAIM decisions use, so on a busy marke
 come a tick or two later than a real miner's would, and the per-job reports can lag well
 behind the market.
 
-Verbosity is `-v`/`-vv` **before** the subcommand (`RUST_LOG` is ignored). Logs go to
-stderr, so `zkminer benchmark --json` on stdout stays machine-readable.
+Verbosity is `-v`/`-vv`, before or after the subcommand (`RUST_LOG` is ignored). Logs go to
+stderr, so `zkminer benchmark --json` on stdout stays machine-readable. A worker's own output
+(what a guest prints) is not shown: one line per worker per minute says how many lines and bytes
+it printed. To debug a guest, `ZKMINER_WORKER_OUTPUT=stderr` shows its lines on stderr (rate-capped;
+not in the dashboard). Don't leave it set with guests you don't trust: what they print then reaches
+stderr, and a service's log file.
 
 Worth knowing:
 
@@ -694,23 +714,328 @@ Worth knowing:
 - **If the miner sits idle with jobs available, suspect collateral.** Available
   collateral is `staked − locked`, and a claimed job that passes its deadline locks
   collateral permanently. This surfaces as a throttled warning at default verbosity.
-- **Stopping costs locks.** Ctrl-C (SIGINT) stops claiming and lets the jobs in flight
-  finish, for up to 50 minutes; a second signal stops waiting, and every lock still held is
-  then released. SIGTERM (a supervisor's stop: `systemctl stop` or `restart`, `docker stop`,
-  a Kubernetes rollout) releases every held lock at once. Each release costs 5% of that
-  lock's collateral. A miner that dies without releasing (SIGKILL) picks its locks up again
-  when it restarts, and drives each one that still has time; its workers die with it.
-  So to restart without paying for the locks — to upgrade the binary, say — send SIGINT
-  (it stops claiming), then SIGKILL (`systemctl kill -s KILL`, `docker kill`), and start
-  it again promptly. Exit status 75 means it stopped with locks still held: start it again
-  before their deadlines.
+- **Stopping can cost locks, so choose how.** Releasing a lock costs 5% of its collateral
+  at its deadline and up to 30% with the whole fulfilment window left. There are three ways
+  to stop:
+  - **Drain** (the default): stop claiming, let the jobs in flight finish and be paid, then
+    exit. That can take up to 50 minutes, after which whatever is still held is released.
+  - **Keep locks**: stop claiming and exit without releasing (exit status 75), after any proof
+    already being submitted lands; a lock too close to its deadline for a restart to release
+    it in time is released first. That takes seconds to several minutes. The next start picks
+    the locks up from `~/.zkminer/job_journal.json`, re-proves each one that still has time,
+    and releases the rest. Use it for restarts and upgrades, and start again by the time it
+    prints (the earliest kept lock's cutoff less ~15 minutes for the restart and a release): a
+    lock left past its deadline is slashed.
+  - **Abandon**: release everything now, then exit.
+
+  In the dashboard, `q` or Ctrl+C asks which one when jobs are held: `d` drain, `k` keep
+  locks, `a` abandon, `Esc` to keep mining. The dashboard stays open while the miner stops,
+  and `a`, `k` and `x` (force exit) still change course; a second Ctrl+C does nothing.
+
+  From another terminal or a script, `zkminer stop` drains, `zkminer stop --keep-locks` keeps
+  the locks, `zkminer stop --abandon` releases everything and `zkminer stop --force-exit`
+  exits at once; `--wait` waits for the miner to exit. It works on Windows too. It talks to
+  the miner running under the same home directory, so run it as the same user.
+
+  Signals, for headless and supervised runs: SIGINT (Ctrl+C) drains, a second one abandons,
+  a third exits at once. A signal during a drain already under way counts as the second: a
+  Ctrl+C after `zkminer stop` abandons (the contrib unit's `systemctl stop` does not: it asks
+  for a drain and waits). A signal never force-exits an abandon it did not start; the one after
+  does. During a keep-locks stop, signals
+  never abandon (only `zkminer stop --abandon` or `a` does); the third still exits at once.
+  Closing the dashboard's terminal (SIGHUP) starts a drain if no stop was chosen, and
+  otherwise changes nothing. SIGTERM, the default stop signal of systemd, `docker stop` and
+  Kubernetes, releases every held lock at once, because a supervisor kills the process
+  before any drain could finish. [`contrib/zkminer.service`](contrib/zkminer.service) sets
+  `KillSignal=SIGINT`, `KillMode=mixed` and a long `TimeoutStopSec`, so `systemctl stop`
+  drains, and `Restart=on-failure`, so `zkminer stop --keep-locks` restarts it in place. It
+  also sets `Delegate=cpu memory pids`, which gives every worker a memory ceiling, and
+  `OOMPolicy=continue`, without which systemd stops the whole unit (a drain, then a restart)
+  when the kernel kills one worker for memory; a unit installed from an older copy has neither:
+  copy the new one over it, `systemctl daemon-reload`, and restart the miner when its locks
+  allow (`zkminer doctor` says whether the installed unit has both). A key in the unit's
+  `/etc/zkminer/env` must be readable by root only: create the file with `sudo install -m 600
+  -o root -g root /dev/null /etc/zkminer/env` before the key goes in (an editor or `tee`
+  alone makes it readable by every user), or pass the key as a systemd credential (the unit
+  shows how). The miner pages `KEY-FILE-READABLE`, and `zkminer doctor` fails, when other
+  users can read or change the key's file; doctor also checks that only root and the miner's
+  user can replace the miner, its workers, its configuration and `~/.sp1/bin`. To
+  upgrade, `install -m755` the new miner and every worker over the old ones (all of them: a
+  worker from another build is refused), then `zkminer stop --keep-locks`. For Docker, run
+  with `--stop-signal SIGINT --stop-timeout 4200 --restart on-failure` and keep `~/.zkminer`
+  on a volume (`-v zkminer-home:/root/.zkminer`): the kept locks are found through the job
+  journal there, and a new container without it never finds them. The miner runs as root in
+  that container, and its workers drop every capability; `--cap-drop=ALL --security-opt
+  no-new-privileges`, or `--user` with a uid that owns the volume (mounted at that user's
+  `~/.zkminer`), narrows the container further. Restart in place with
+  `docker exec <container> zkminer stop --keep-locks` (not `--wait`, which ends with the
+  container); for a new image, start the new container on the same volume promptly. On
+  Windows, the workers have consoles of their own, so Ctrl+C reaches only the miner.
+  Closing the console window or shutting Windows down gives the miner only seconds, so it
+  stops as keep-locks: the locks stay held for the next start (if Windows delivers the event,
+  a lock too close to its deadline is released), and its workers end with it. Start it again
+  soon, or stop it with `zkminer stop` first.
+
+  Exit status 75 means it stopped with locks still held (or by keep-locks): start it again
+  well before their deadlines. A miner killed outright (SIGKILL) picks its locks up the same way.
+  Under `Restart=on-failure` (or Docker's `--restart on-failure`) that exit restarts it, and the
+  restarted miner mines again; to stop it for good, use `systemctl disable --now` (a plain
+  `systemctl stop` starts again at the next boot) / `docker stop`, which the supervisor never
+  restarts. After installing new workers, restart only with `zkminer stop --keep-locks`, not
+  `systemctl restart`: the old miner would drain for up to 50 min while any worker it respawns
+  is the new build, which it refuses. A reboot or poweroff under the systemd unit drains like
+  `systemctl stop` and can hold the shutdown for up to 70 minutes; a hypervisor or cloud stop
+  rarely waits that long, and whatever it cuts off keeps its locks. So stop the miner first
+  and let it finish, or `zkminer stop --abandon`, or, for maintenance you'll be back from
+  soon, `zkminer stop --keep-locks --wait && sudo systemctl stop zkminer` (within the 10 s
+  before systemd restarts it). For a Windows service, see the next point.
+- **A Windows service runs as a dedicated standard user, with its key in a file.** The miner's
+  workers run requesters' guest programs as the account the miner runs as, so give the miner an
+  account of its own with no other rights. `zkminer run` refuses LocalSystem, LocalService and
+  NetworkService (NSSM's default is LocalSystem): a guest that broke out of a worker would have
+  that account's rights, and under LocalSystem the miner could not keep any worker from its key.
+  It refuses an administrator's account as a service too (UAC filters no service logon), and a
+  start that cannot tell which account it runs as.
+  `ZKMINER_DANGEROUSLY_ALLOW_PRIVILEGED_ACCOUNT=1` runs it anyway, paged at every start. An
+  elevated (administrator) console is paged (`PAGE: ELEVATED`), not refused, and so is an
+  administrator's OpenSSH, WinRM or PsExec logon or a "highest privileges" scheduled task (only a
+  token with the SERVICE group counts as a service); an administrator's console that is not
+  elevated is warned of. A refused start whose journal holds locks proves none of them: it holds
+  them, starting no worker, pages `PRIVILEGED-ACCOUNT` every 5 minutes, and releases each one only
+  as its cutoff comes near (the release penalty is the job's flat one, 5% by default, the same as
+  at once), so stopping it and starting the miner as the right account in the meantime still
+  proves them. While it holds locks it keeps the PC awake, as the miner does (`PAGE:
+  SLEPT-WHILE-HOLDING` if it did not run for minutes anyway), and it keeps the slash latch (below)
+  current. `zkminer stop --keep-locks` stops it keeping what is left, `zkminer stop` (a drain)
+  lets it go on releasing each lock near its cutoff and exit once none is left, `zkminer stop
+  --abandon` releases everything now, and `zkminer run --release-held` releases everything at once
+  from the start.
+  From an administrator PowerShell:
+
+  ```
+  net user zkminer * /add
+  Set-LocalUser -Name zkminer -PasswordNeverExpires $true
+  copy nssm.exe "C:\Program Files\zkminer\"
+  cd "C:\Program Files\zkminer"
+  .\nssm install zkminer "C:\Program Files\zkminer\zkminer.exe" run --headless
+  .\nssm set zkminer ObjectName .\zkminer <password>
+  .\nssm set zkminer AppStopMethodConsole 3900000
+  .\nssm set zkminer AppExit Default Restart
+  .\nssm set zkminer AppExit 0 Exit
+  .\nssm set zkminer AppExit 130 Exit
+  .\nssm set zkminer AppRestartDelay 30000
+  .\nssm set zkminer AppStdout C:\Users\zkminer\.zkminer\logs\service.log
+  .\nssm set zkminer AppStderr C:\Users\zkminer\.zkminer\logs\service.log
+  .\nssm set zkminer AppRotateFiles 1
+  .\nssm set zkminer AppRotateOnline 1
+  .\nssm set zkminer AppRotateBytes 10485760
+  New-EventLog -LogName Application -Source zkminer
+  sc.exe privs zkminer SeChangeNotifyPrivilege/SeCreateGlobalPrivilege/SeIncreaseWorkingSetPrivilege
+  ```
+
+  A local account's password expires after 42 days by default, and a service whose password has
+  expired fails to log on at its next start: nothing runs, and every lock kept for that start is
+  slashed. `Set-LocalUser ... -PasswordNeverExpires $true` (or `wmic useraccount where
+  name='zkminer' set PasswordExpires=false`; not `net user /expires:never`, which is the
+  account's expiry, not its password's) prevents that. `zkminer doctor` fails while the service's
+  account has a password that can expire, has expired, or is disabled or locked out, and the
+  miner pages it at start-up (`PAGE: PASSWORD-EXPIRES`, again daily once it is two weeks away).
+  Log on as the account (`runas /user:zkminer cmd`) only after the flag is set.
+
+  NSSM restarts its program after every exit unless told otherwise. The `AppExit` lines make it
+  stop the service when the miner stops on purpose (exit 0: a drain or an abandon; 130: a force
+  exit) and start it again otherwise (75, a keep-locks stop or locks left for the next start; a
+  crash), 30 s later. Without them `zkminer stop` only restarts the miner, which claims again.
+  `AppStopMethodConsole` is how long NSSM waits after its Ctrl+C (which starts a drain) before it
+  kills the miner: 65 minutes covers a drain and its releases, where NSSM's default 1.5 s cuts it
+  off. `zkminer doctor` and `zkminer stop` warn of a service that restarts on 0 or 130, and
+  doctor of a shorter stop timeout.
+
+  A service logon gives the account `SeImpersonatePrivilege` through the SERVICE group, and with
+  it a guest that broke out of a worker could make itself SYSTEM. `sc privs` leaves the service
+  (NSSM included) only the three privileges named. Whatever the service is given, `zkminer run`
+  removes every other privilege from itself at start-up and from each worker before it runs; a
+  worker that still holds a dangerous one is not started (`PAGE: WORKER-PRIVILEGES`).
+
+  Install the miner, its workers and `nssm.exe` (the program the service actually starts) in a
+  directory only administrators can write (`C:\Program Files\zkminer`), not in a new folder under
+  `C:\`, which every local user can write to: a user who can replace any of them runs code as
+  the miner's account, key included. Keep a `--config` file there too, or in the account's own
+  `.zkminer`. `zkminer doctor` fails when any of these, or its directory, can be written by
+  anyone but SYSTEM, Administrators, TrustedInstaller and the miner's account. NSSM grants the account "Log on as a service". Its home is `C:\Users\zkminer`, so the
+  miner keeps its `.zkminer` there; run `zkminer` commands for it as that account (`runas
+  /user:zkminer cmd`, then `zkminer init`, `zkminer doctor`, `zkminer stop`). Give it its key in
+  a key file (`key_source = "file"`), never in its environment: NSSM keeps `AppEnvironmentExtra`
+  in `HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters` and `setx /M` keeps a
+  variable in the machine's environment, and every user of the PC can read both. `zkminer init
+  --generate-key --network <network>` run as the account writes the key to its `.zkminer` with
+  an ACL for that account and SYSTEM only, labelled unreadable to Low-integrity processes from
+  its creation. A key you already give as the variable is kept with `zkminer init
+  --import-env-key` (it reads the variable from its own environment or the registry, writes the
+  key file, prints its address, and deletes nothing); a plain `zkminer init` refuses while such a
+  variable is set, rather than make a new key, and `--generate-key` makes one only when asked.
+  Delete the variable only after `zkminer status` shows the same address, and consider the key
+  exposed (plan to rotate it). `init` keeps an existing key file only if it is owned by the
+  account (or Administrators) and its ACL grants no one but the account, SYSTEM and
+  Administrators. For a key file made another way, `icacls <file>
+  /inheritance:r /grant:r zkminer:(R,WO)` leaves only the account on it. Keep `WO`: the miner
+  labels the key file so that its Low-integrity workers cannot read it, which needs the right to
+  change the file's owner (the account's own files have it). A key file it can neither label nor,
+  as its owner, open to labelling is paged (`PAGE: SECRETS-UNLABELLED`) and no worker starts
+  until it is fixed. `zkminer doctor` says when the miner's account is refused or elevated,
+  which dangerous privileges it holds, when the key file cannot be labelled, and when the key's
+  variable is kept in the machine's, a service's or the user's environment; the miner's start-up
+  pages each.
+
+  On Windows the workers run at Low integrity. They read neither the key file, `.env`, the job
+  journal nor PowerShell's command histories (which the miner labels too: a key typed at a
+  prompt stays in them); an `env` key's variable kept in your registry environment (`setx`),
+  which they could read, keeps them from starting (`PAGE: SECRETS-UNLABELLED`, with the command
+  that deletes it). They cannot open or end the miner, nor open each other or the threads each starts; and
+  they write only where Low processes may (their temporary, cache and segment directories, which
+  the miner repairs before each Low worker it starts). What their first warm-up downloads or builds
+  in your profile (the SP1 server in `~/.sp1/bin`, the Groth16 artifacts in `~/.risc0` and
+  `~/.sp1/circuits`) the miner installs itself, at Medium, before it. What they still can do: use
+  the network, see and end the processes a sibling starts (SP1's `sp1-gpu-server`) and use the
+  temporary and cache directories every Low worker shares. It fails closed: a worker that cannot
+  start at Low is never started at Medium instead; its slot proves nothing, with `PAGE:
+  LOW-IL-WORKER-FAILED` naming the worker binary and its last words (`PAGE: LOW-IL-WARMUP-FAILED`
+  for one whose warm-up fails), and the miner tries it again at Low with back-off. A job whose
+  proof (once a worker accepted it) the miner has died in the middle of three runs in a row (a
+  crash, or a guest that broke out and ended it) is released, with `PAGE: JOB-CRASH-LOOP`, rather
+  than proven again, and is not claimed again for a week (nor its submitter's jobs of the same
+  program for a day). No job is claimed and no proof started while the journal cannot be saved or
+  `~/.zkminer`'s disk has less than 2 GiB free (`PAGE: JOURNAL-UNWRITABLE`, `PAGE: DISK-LOW`):
+  a proof whose start is not recorded would never reach that limit. If a zkVM
+  works on your card only at Medium, `ZKMINER_WINDOWS_LOW_IL_WORKERS=0` runs every worker at
+  Medium, where a guest that breaks out can read the key: it is paged at every start (`PAGE:
+  MEDIUM-WORKERS`) and `zkminer doctor` warns.
+
+  Restore points (Volume Shadow Copies, made by System Protection and some backup tools) keep
+  old copies of files with the label each had when the snapshot was taken, and a Low-integrity
+  worker can read an unlabelled copy through the snapshot: the key file as it was between `zkminer
+  init` and the first run, an old `.env`, a PowerShell history from before the miner labelled it,
+  or `NTUSER.DAT` from while a `setx` copy of the key's variable existed. At start (and in
+  `zkminer doctor`) the miner looks at the snapshots of those files' drive: an unlabelled copy of
+  the key file, or an unlabelled `.env` or history copy, or a snapshot hive's `Environment`, that
+  names the key's variable (it looks for the name only) keeps the workers from starting (`PAGE:
+  SECRETS-IN-SNAPSHOT`); a copy it cannot check is only paged (`PAGE: SNAPSHOT-UNCHECKED`) and
+  warned of. To remove them, as an administrator: `vssadmin list shadows` shows each snapshot's
+  id and its "Shadow Copy Volume" (the `HarddiskVolumeShadowCopy<N>` device the page names), and
+  `vssadmin delete shadows /shadow={id}` deletes one (or System Protection > Configure > Delete,
+  which deletes every restore point of the drive). Those restore points are then gone. A key that
+  was ever kept in a snapshot without a label should be treated as exposed: rotate it (unstake,
+  withdraw, and move the HEMI to a new key).
+
+  Moving from LocalSystem: a miner started in the new account's home does not see the old
+  journal (`C:\Windows\System32\config\systemprofile\.zkminer\job_journal.json`), so locks still
+  held there are never driven. Drain them first, from an administrator console:
+
+  1. `nssm set zkminer AppExit 0 Exit` and `nssm set zkminer AppExit 130 Exit`, so that the
+     miner's stop stops the service instead of restarting it.
+  2. `psexec -s "C:\Program Files\zkminer\zkminer.exe" stop --wait`: it proves what it holds,
+     or releases it, and exits; the service stays stopped. (A service already running this build
+     as LocalSystem is refused and proves nothing: its drain releases each lock near its cutoff
+     and exits once none is left; see the next paragraph.)
+  3. Check that the old journal holds nothing: `psexec -s "C:\Program Files\zkminer\zkminer.exe"
+     status` says "Held locks: none". If some are left (a release that did not confirm), start
+     the service again and repeat step 2, or end them with `stop --abandon --wait`.
+  4. Move the key, or leave it behind; never delete the old copy before one of these is done:
+     - **Keep the address.** As an administrator, copy
+       `C:\Windows\System32\config\systemprofile\.zkminer\key` to `C:\Users\zkminer\.zkminer\key`
+       and run `icacls C:\Users\zkminer\.zkminer\key /inheritance:r /grant:r zkminer:(R,WO)
+       SYSTEM:F`. For a key in `AppEnvironmentExtra`, run `zkminer init --import-env-key` as the
+       account instead (it reads the service's environment). Then `zkminer doctor` as the account
+       must show the same address as before; only then delete the old copy.
+     - **Rotate.** While still LocalSystem, `psexec -s ... unstake --all`, `withdraw` 7 days on,
+       move the HEMI, and only then delete the old copy; give the new account a new key
+       (`zkminer init --generate-key` as the account).
+  5. Only then change the account (`nssm set zkminer ObjectName .\zkminer <password>`) and
+     `nssm start zkminer`.
+
+  A LocalSystem service upgraded in place to this build while it holds locks does not prove
+  them: it holds them and releases each one near its cutoff (above), then exits with the refusal
+  and the list of what it released; what it could not release is tried again at its next start.
+  Leave it running as LocalSystem until `psexec -s ... status` shows no held locks (or `psexec -s
+  ... stop --abandon --wait` to release them now), and change the account after that. Consider a
+  key that was in `AppEnvironmentExtra` exposed.
+
+  A service wrapper's stop (NSSM sends Ctrl+C, then kills the process after its timeout) starts
+  a drain: keep NSSM's timeout long enough for one (`AppStopMethodConsole` above), or run
+  `zkminer stop --wait` (as the service account) first. To upgrade: `nssm stop zkminer` (it
+  waits for the drain), replace the files, `nssm start zkminer`.
+- **Back the key up, but not as a plain file in a synced folder.** The key file is the only
+  copy: stake and payouts belong to it. Put the key in a password manager, or copy the file to a
+  removable drive you keep offline, and label that copy (a bare key file says nothing of what it
+  is for). Not to Documents, Desktop, OneDrive, Dropbox or Google Drive: a sync client uploads it
+  and keeps old versions and deleted files for weeks, and on Windows a plain copy there has no
+  label keeping the Low-integrity workers from reading it. `zkminer init` refuses to make a key
+  file inside OneDrive (`%OneDrive%`, `%OneDriveCommercial%`), Dropbox, Google Drive, iCloud
+  Drive or Nextcloud folders, and `zkminer doctor` fails one that is there.
+- **The journal belongs to one key.** `~/.zkminer/job_journal.json` records the address whose
+  locks it holds. A miner started with another key while it holds locks refuses to start
+  (`PAGE: KEY-CHANGED`): start it with the old key to drive them, or pass `zkminer run
+  --forget-foreign-locks` to give them up (each is slashed at its deadline unless that key
+  drives it). `zkminer init --force` keeps the config's key settings unless given a key option.
 - **One miner per key.** Two miners on one key drive the same locks and replace each
   other's transactions. `run` holds `~/.zkminer/miner.lock`, so a second one from the same
   home refuses to start (including while the first is still draining); it can't see one in
   another home or on another host. `--watch-only` takes no lock.
 - **`PAGE:` lines need a human.** They say claiming has stopped (the deployment or proof
   system failed its check, the protocol is paused, the clock is off, funds are short) or a
-  lock is at risk. The dashboard shows them; headless, they go to stderr.
+  lock is at risk. The dashboard shows them; headless, they go to stderr. Either way `zkminer
+  run` also keeps its log in `~/.zkminer/logs/zkminer.log` (daily, two weeks; worker output
+  stays out of it) and every page in `~/.zkminer/logs/pages.log` (1 MB and one `.1`), with URLs
+  cut to their host in both (an RPC URL's key never reaches a file). On Windows each page also
+  goes to the Application event log, source `zkminer`, at most once per code every 5 minutes,
+  with a fixed event id per code (`SLASHED` 100, `LOCK-LATE` 101, `JOB-CRASH-LOOP` 106,
+  `SECRETS-UNLABELLED` 110, `PRIVILEGED-ACCOUNT` 111, `PASSWORD-EXPIRES` 117, `STAKE-DROP` 140,
+  `SLEPT-WHILE-HOLDING` 141, others 199; see
+  `crates/zkminer-cli/src/logging.rs`): a Task Scheduler task "On an event" (log Application,
+  source zkminer) or a monitoring agent can alert on them. `zkminer status` prints the last ten
+  pages and exits 2 while one is unacknowledged or locks are held with no miner running to drive
+  them (0 otherwise, 1 when it cannot run); `zkminer status --ack` acknowledges the pages shown.
+  The NSSM recipe above keeps the service's own stdout and stderr in the account's
+  `.zkminer\logs\service.log` (a start-up error or a refusal is said there only), rotated at 10
+  MB while the miner runs too (without `AppRotateOnline 1` NSSM rotates only when the service
+  starts, and the file grows until then). NSSM deletes none of its rotated copies; each headless
+  start keeps the newest ten in that folder, if the account owns it. Make the folder as the
+  account before the first start (`runas /user:zkminer cmd`, then `mkdir
+  %USERPROFILE%\.zkminer\logs`), so that NSSM can open the file there and the account owns it. `zkminer doctor` warns of a service that keeps neither stream,
+  that does not rotate them while it runs, and of an unregistered event source.
+  `PAGE: CHAIN-UNREACHABLE` says no chain read has succeeded for a minute while locks are held
+  (repeated every 5 minutes): fulfils and releases go through the same RPC, so the locks can be
+  neither proven nor given back until it returns. `PAGE: LOCK-AT-RISK <job>` follows for each lock
+  whose cutoff comes inside its release margin meanwhile. The dashboard's link badge shows the age
+  of the last chain read (`STALE`, then `DISCONNECTED` after 2 minutes). On Windows, where a Low
+  worker has the network, an outage of 10 minutes with locks held also checks the sockets each
+  worker holds (its job's processes included). Only a worker holding more than 8 TCP or 4 UDP
+  sockets after its first 2 minutes is stopped, busy or not: `PAGE: WORKERS-RECYCLED` names the
+  slot, its pids and its sockets. It starts again on demand, and a proof stopped this way is
+  retried without counting against its job or card (twice per job at most). When no worker holds
+  sockets, no proof is stopped (only idle workers), and `PAGE: CHAIN-UNREACHABLE` says the link
+  or the RPC is down. Checks repeat at least 30 minutes apart, the gap doubling with each recycle
+  in the last 24 hours up to 4 hours. `ZKMINER_RECYCLE_TCP_MAX`, `ZKMINER_RECYCLE_UDP_MAX` and
+  `ZKMINER_RECYCLE_GRACE_SECS` change the limits.
+  `PAGE: ESTIMATE-OVERRUN <card>` says jobs claimed on that card's benchmark rate overran their
+  cutoff (a release penalty each) after its learned rate had refused them: the card is proving
+  slower than benchmarked (a VRAM spill, heat, a smaller shard size). For the next 6 hours claims
+  for it are sized on the learned rate; re-run `zkminer benchmark` once the cause is fixed.
+- **After a slash the miner stops claiming until you say so.** `PAGE: SLASHED` says a lock of
+  this prover was slashed (the on-chain `jobsSlashed` rose, the staking contract's `StakeReduced`
+  event marked a reduction as a slash, a lock ended past its deadline with no release of ours on
+  chain, or the miner slashed its own expired lock); a release of ours that landed after the
+  cutoff is not read as a slash when the router's `JobReleased` says it was one. `PAGE:
+  STAKE-DROP` says the stake fell by more than the chain's own events explain (`StakeReduced` for
+  release penalties, `Withdrawn` for withdrawals). A fall is checked against those events on the
+  next refresh; meanwhile new claims wait (no page, it clears itself), and if the events cannot
+  be read for 10 minutes, the release penalties the miner noted itself decide. Either trips the
+  slash latch,
+  `~/.zkminer/slash_latch.json`: no new claims, across restarts, until `zkminer resume-claims`
+  (it prints what tripped it, then clears it; `--yes` skips the prompt). Locks already held are
+  still fulfilled or released. The page repeats every 30 minutes while it holds; `zkminer status`
+  shows it and exits 2, `zkminer doctor` fails on it, and the dashboard shows `SLASHED`. Find out
+  why the lock was lost (the link, the RPC, the card) before resuming: see the cut-off point below.
 - **Drain before an upgrade that changes the `sys_rand` rule.** risc0 guests' randomness is a
   public function of the program and input (`crates/zkminer-prover-protocol/src/sys_rand.rs`), so
   a measurement and the proof after it agree on any host, and no key needs keeping (an old
@@ -734,10 +1059,32 @@ Worth knowing:
   per-job floor (`MIN_COLLATERAL_AMOUNT`, 100 HEMI on 743111), so a stake of 100–199 HEMI can still
   claim one job (the miner says so once at startup). A job whose collateral at its maximum price is
   over the cap is set aside, not claimed; one that would take the jobs of its program, or of its
-  submitter, that this miner holds and has not proven yet over the cap waits until they are proven.
-  Witness jobs are held to the same cap, inline and witness locks counting together, and
-  `run --watch-only` reports a job over it. A value that is not a number from 0 up is warned
-  about and the default used.
+  submitter, that this miner holds and has not settled yet (fulfilled, released or slashed) over
+  the cap waits until they settle. Witness jobs are held to the same cap, inline and witness locks
+  counting together, and `run --watch-only` reports a job over it. A value that is not a number
+  from 0 up is warned about and the default used.
+- **Every lock held at once comes to at most half the stake.** Programs and submitters cost
+  nothing to make, so the per-program and per-submitter caps alone let a few of them lock nearly
+  the whole stake together. `[prover] max_locked_stake_fraction` (default `0.5`, more than 0 and
+  at most 1; `1` lets the whole stake be locked) bounds the collateral of every lock this prover
+  holds on chain, and of its claims in flight, across programs and submitters, with the same
+  per-job floor. A lock counts until it settles, not until its proof is done or its task hands it
+  back to recovery, and the miner counts the larger of the locks it knows of and the stake's own
+  locked figure (while that read is fresh) plus the claims that figure does not show yet, so locks
+  not yet found again after a restart count too. A job that would take them over the cap waits. `zkminer status` and the startup log show
+  the cap in HEMI.
+- **A miner cut off from the chain is slashed for every lock it holds.** A lock that is neither
+  fulfilled nor released by its deadline (plus grace) is slashed in full, and the miner reaches the
+  chain through one `[chain] rpc_url`. A submitter can single a miner out (a job assigned to it, or
+  one only it measures), learn its IP from the ELF download, and then flood that link, or drop its
+  traffic from an on-path position, until the deadlines pass: a home connection or a small VPS
+  without DDoS protection is the realistic target. The cap above bounds what one such round costs
+  to its share of the stake, not what an incident costs: the cap is taken of the stake that is
+  left, so every further round could take that share again. The slash latch (above) is what stops
+  the next round: after a slash the miner claims nothing new until `zkminer resume-claims`, so do
+  not clear it while the cause is still there. Neither stops the slash itself. Stake only what you
+  accept losing, lower `max_locked_stake_fraction` on a link a booter can saturate, and prefer a
+  DDoS-protected host with an RPC endpoint you trust.
 - **SP1 jobs are sized by gas** (protocol 15): SP1's measured cost weights precompiles (keccak,
   sha, bigint) by what they cost to prove, where the instruction count counted each as one.
   Benchmarks saved by an older miner count SP1 instructions per second, which is close for code
@@ -758,6 +1105,77 @@ Worth knowing:
   killed worker's by hand. Workers that share one home from different pid namespaces (containers)
   cannot see each other and would remove each other's: give each its own home, or its own
   `[retention] segment_dir`.
+- **A card that proves nothing says why.** At startup the log lists, card by card, whether
+  each zkVM proves there, and if not, why and what changes it: a worker binary that isn't
+  found (with the directories searched) or isn't executable, a card the build has no GPU code
+  for, too little VRAM. The ones that need attention also go to the dashboard's activity log.
+  `zkminer doctor` prints the same table on demand, with the config, chain, gas and stake
+  checks, and starts nothing.
+- **12 GB NVIDIA cards prove both zkVMs** (measured on an RTX 4070). SP1 runs at its larger
+  shard size when about 11.6 GiB of the card is free, which an idle 12 GB card has, and at the
+  smaller one (about 20% slower) from 9 GiB, so a card driving a display steps down by itself.
+  On NVIDIA cards above 16 GiB, SP1 needs 17.1 GiB free for the smaller shard size and 22.9 GiB
+  for the larger one (measured on an RTX 5090), so an idle 24 GB card runs the larger. AMD and
+  Intel cards of any size (not yet measured) need 15.2 GiB free, so a smaller one gets no SP1
+  jobs. `ZKMINER_MIN_AVAILABLE_VRAM_MB` lowers that floor, untested: a larger job can run out
+  part-way and lose its lock. A 12–16 GB NVIDIA card
+  gets none either while `SP1_GPU_DROP_LDES` or `SP1_GPU_RECOMPUTE_FIRST_LAYER` is set to `0`:
+  that switches off the server memory savers the figures above were measured with. An SP1 proof
+  that runs out of GPU memory is retried on the same card one shard size smaller, and when it
+  proves there the card keeps that size in later runs too (`~/.zkminer/sp1_shard_caps.json`;
+  `zkminer doctor` lists it; stop the miner and remove the card's entry to lift it). Until it is
+  re-benchmarked, such a card's SP1 jobs are planned about 20% slower per size step. Under
+  Windows too, whatever the driver's settings (below). RISC Zero
+  proves at po2 19 on a 12 GB card, 20 from 14 GiB, and benchmarks at that size. A 12 GB card
+  benchmarked by an earlier version (at 20, which doesn't fit) has saved rates far too low:
+  re-benchmark it with `b` on the Benchmark screen, or `zkminer benchmark --calibrate` with the
+  miner stopped (a plain `zkminer benchmark` saves nothing). Under Windows, at the NVIDIA driver's
+  default CUDA - Sysmem Fallback Policy, a proof that outgrows its card isn't refused memory: the
+  driver puts part of it in system memory and it runs many times slower (an SP1 proof on an RTX
+  4070: 408 s instead of 33), which can cost a lock. The SP1 server refuses that memory itself, so
+  an SP1 proof fails at once and is retried one shard size smaller (60 s, the same proof), with no
+  setting changed. For RISC Zero, which has no such check, "Prefer No Sysmem Fallback" (NVIDIA
+  Control Panel → Manage 3D settings, globally or for `zkminer-prove-risc0-cuda.exe`) makes the
+  driver refuse it instead (not measured for RISC Zero). `zkminer doctor` can't read the setting:
+  the driver hides it. Memory another program takes while a proof runs doesn't fail the
+  proof under either setting: Windows pages the two programs' memory in turns, and the proof runs
+  8–12 times slower. The miner watches for that (Windows' per-process GPU memory counters): the
+  dashboard's GPU row shows "⚠ … GiB paged to RAM", and once it has gone on for a few seconds the
+  proof is stopped and run again where it fits, on another card or on this one at a size that
+  fits beside the other program (on an RTX 4070: stopped 6 s after a 2 GB program started, then
+  proved in 62 s, against 242 s left to page). Benchmarks are guarded the same way, since the
+  miner saves their rates and plans with them: one that another program's memory paged, or that
+  ran while another program took more of the card, is measured again (up to four runs, 30 s
+  apart), and an SP1 benchmark that runs out of GPU memory is measured again one shard size
+  smaller, that size then kept for the card. Still, leave the card the room these figures say.
+  The miner helps:
+  a RISC Zero proof on an NVIDIA card starts only when its segment size's measured peak fits in
+  what is free (else it waits, or goes to another card, and no RISC Zero job is claimed for that
+  card until a check every 5 minutes finds the room; a job that waits about 2 minutes without room
+  is released), and under Windows an NVIDIA card that another program also uses (a display) is
+  sized 1 GiB smaller, for that program to grow into (on a 12 GB card that means SP1's smaller
+  shard size: re-benchmark such a card after upgrading, as its saved SP1 rate was measured at the
+  larger one). `ZKMINER_MIN_AVAILABLE_VRAM_MB=0` turns all of this off.
+
+- **Under Windows, a proof needs both RAM and commit** (Task Manager → Performance → Memory,
+  "Committed"). Windows charges every allocation to its commit limit, RAM plus the page file, and
+  under WDDM it charges a program's GPU memory too, which never touches RAM. Measured on an RTX
+  5090: an SP1 proof uses 37 GB of RAM and commits 63 GB (22 GB of it VRAM), and a RISC Zero proof
+  at po2 20 uses 2–6 GB of RAM and commits 28 GB. A proof starts when its card's RAM figure fits in
+  free RAM and its commit figure fits in what can still be committed, beside what the proofs
+  already running have still to take. Until a card has proved, those figures are 8 / 30 GiB for
+  RISC Zero and 40 / 64 GiB for SP1; after that, they are that card's own peaks plus an eighth.
+  Windows' default page file (system-managed) grows by itself when commit runs short, so it needs
+  no setting: the miner counts how far it can still grow. A fixed page file can't grow, so with
+  one, keep it at least as large as the commit the proofs you run at once need beyond RAM, or make
+  it system-managed again (System Properties → Advanced → Performance → Virtual memory). Only the
+  VRAM part of a proof's commit counts on the page file growing: the miner waits to start a proof
+  until the commit free now holds the RAM it and the running proofs have still to take, plus
+  4 GiB, since pinned memory fails at the limit instead of waiting for the page file to grow
+  (measured). An idle worker of the other zkVM is stopped
+  when a proof needs what it holds (an idle SP1 server keeps 11 GB of RAM and 22 GB of VRAM on an
+  RTX 5090). If a proof fails while the host is out of commit, the failure isn't held against the
+  card.
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
@@ -771,17 +1189,21 @@ Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
   or a po2 under Settings → Advanced, which applies for the session while Advanced mode is on.
   The config is read when the miner starts. The log lists each card's size whenever it changes,
   and names a configured card that isn't here;
-- else po2 20, or none for a card with less than 14 GiB of VRAM (po2 20 peaks around 12.1 GiB).
-  A card whose VRAM isn't known gets 20: an Intel card, a CUDA query that failed, or the card
+- else, on an NVIDIA card, the largest measured size that fits it with 1.9 GiB to spare: 20
+  from 14 GiB of VRAM (po2 20 peaks around 12.1 GiB), 19 from 9.8 GiB (8.0 GiB), 18 from
+  6.5 GiB (4.6 GiB), and none below that; on an AMD or Intel card, whose sizes haven't been
+  measured, 20 from 14 GiB and none below.
+  A card whose VRAM isn't known gets 20: an Intel card on the i915 driver, a CUDA query that
+  failed, or the card
   behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card).
   A Mac's GPU instead takes the Metal tier of its RAM (19 on a 16 GB Mac, 20 from 24 GB; see
   [Supported Macs](#supported-macs));
 - `benchmark --calibrate` proves a 62M-cycle Groth16 job at each size, on a card whose VRAM
-  is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with the miner
-  stopped. A card then uses its fastest size,
-  up to one step below the largest that proved when a larger one failed (or at 22, past which
-  the prover refuses). Calibration can raise a card above 20, or give a smaller card a size, but
-  never takes a card below 20 if 20 proved during calibration. A plain re-benchmark drops the
+  is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with
+  the miner stopped. A card then uses its fastest size, up to one step below the largest that
+  proved when a larger one failed (or at 22, past which the prover refuses). On an NVIDIA card
+  the sweep also stops at the largest measured size its free VRAM holds, below 20. Calibration can raise a card above 20, or give a smaller card a size, but
+  never takes a card below its default size if that size proved during calibration. A plain re-benchmark drops the
   calibration. A slow card may need a larger `benchmark_timeout_secs` at sizes below 18.
 
 A guest can tell the segment size it runs at, so every job is measured at each card size on the
@@ -792,6 +1214,38 @@ sizes, each card proves the job at its own size rather than releasing it. If no 
 a size, the job waits for one (switch a card back on, or give one a po2 under Settings →
 Advanced; a config size or a calibration applies only after a restart, which releases it) and
 is released before its deadline.
+
+## Upgrading from a version without `zkminer stop`
+
+The miner already running is the old binary, which never reads `zkminer stop` requests (they
+time out with that as a likely cause). For that one upgrade, stop it the old way: Ctrl+C or
+SIGINT to stop claiming (`systemctl kill -s INT --kill-whom=main zkminer` under systemd), then
+SIGKILL (`systemctl kill -s KILL zkminer`) to keep its locks for the next start, or let it
+drain. Then install the new miner and every worker, `contrib/zkminer.service` if you use it
+(`systemctl daemon-reload`), and start it promptly. What changes for an operator:
+
+- Quitting the dashboard with jobs held asks how to stop; a second `q` or Ctrl+C does nothing
+  (`k` is the quick restart that keeps the locks). The setup wizard's stake takes two presses.
+- `zkminer run` with no terminal (cron, `nohup`) runs headless instead of failing: check for
+  forgotten `@reboot` entries. A dropped SSH session (SIGHUP) now drains instead of killing the
+  miner: from a new session, `zkminer stop --keep-locks` or `--abandon` changes course.
+- On Windows, Ctrl+C no longer kills the workers (a drain now really finishes its proofs), the
+  workers end with the miner, and closing the window keeps the locks for the next start.
+- `stake`, `unstake` and `withdraw` refuse while a miner holds this home's lock, even with
+  `--force` (which now only overrides the cross-home and mempool checks), and `stake` refuses a
+  deployment that fails the check `run` makes (set the same `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT`
+  / `ZKMINER_SKIP_CODE_PINS` for it as for the miner, if you rely on them). A top-up script
+  that staked beside the running miner should stake from the dashboard, or stop with
+  `--keep-locks`, stake, and start again.
+- `zkminer status` prints `Network:`, `Deployment:`, `Unstake pending:` and `Payouts held:`
+  lines, and checks the deployment (more RPC reads per call). Exit 75 also means a keep-locks
+  stop, with or without locks held.
+- Logs: a `claims:` line (why open jobs are not claimed) at most every minute or on a change, a
+  per-card table at start, no colour codes when stderr is not a terminal, and some reworded
+  lines ("drain interrupted — abandoning", "another zkminer holds ...", stake amounts in HEMI).
+- `~/.zkminer` gains `stop-request`, `stop-response` and `miner.lock.holder`, and is made
+  private (0700) on Linux. `zkminer init --generate-key` refuses an existing key file others can
+  read on Linux.
 
 ## Simulate (measure jobs without mining)
 

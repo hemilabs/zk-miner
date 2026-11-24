@@ -16,7 +16,9 @@ use zkminer_prover::dispatcher::WorkerPool;
 use zkminer_prover::engine::{backend_sources, init_worker_pool, BackendSource};
 use zkminer_strategy::cost_model::CostParams;
 use zkminer_strategy::evaluator::{evaluate_job, JobParams, Recommendation};
-use zkminer_tui::state::{new_shared_state, LogLevel, MinerJobStatus, TrackedJob, WorkerStatus};
+use zkminer_tui::state::{
+    new_shared_state, ClaimOutlook, LogLevel, MinerJobStatus, SharedState, TrackedJob, WorkerStatus,
+};
 
 use crate::journal::JobJournal;
 
@@ -25,11 +27,30 @@ use zkminer_chain::adapter::AdapterInfo;
 /// Witness-construction jobs: routing, the witness runtime and its pure policy (see its docs).
 mod witness;
 
-/// The collateral cap: what one job, and the unproven jobs of one program or submitter, may lock.
-mod collateral;
+/// The collateral cap: what one job, the unsettled jobs of one program or submitter, and every lock
+/// held here together, may lock.
+pub(crate) mod collateral;
 
 /// Disk for risc0 proof segments, reserved for every proof planned or running, inline and witness.
 mod segment_disk;
+
+/// The slash latch: after a slash, no new claims until `zkminer resume-claims` (review r6 M6-1).
+pub(crate) mod slash_latch;
+
+/// Pages when the chain is lost while locks are held (review r6 D2), and on Windows recycles the
+/// workers when that lasts (G-1).
+mod chain_watch;
+
+/// A miner run as root: a `PAGE:` on a bare host (review r4 LD2).
+#[cfg(target_os = "linux")]
+pub(crate) mod privilege;
+
+/// Linux: the key's files readable by others, and who can replace the miner (review r6 LS1, LS3).
+#[cfg(target_os = "linux")]
+pub(crate) mod file_access;
+/// Windows: a refused account's held locks, each released at its keep horizon (review 6 CR6-1).
+#[cfg(windows)]
+mod refused;
 
 /// Safety margin (seconds) before lock_deadline beyond which we will not start
 /// or continue work, to leave room for the fulfill tx to land before slashing.
@@ -46,7 +67,7 @@ const DEADLINE_FULFILL_MARGIN_SECS: u64 = 60;
 /// rung strands every congested release (a 100% slash instead of the flat release penalty). The
 /// proving-budget cost (jobs finish this much earlier) is the right trade: the penalty is flat, so
 /// releasing earlier costs nothing, whereas a stranded lock is lost.
-const DEADLINE_RELEASE_MARGIN_SECS: u64 = zkminer_chain::jobs::RELEASE_LADDER_SECS + 60;
+pub(crate) const DEADLINE_RELEASE_MARGIN_SECS: u64 = zkminer_chain::jobs::RELEASE_LADDER_SECS + 60;
 
 /// The shortest lock window the contract allows: MIN_FULFILLMENT_TIMEOUT (300 s) + PROVER_GRACE.
 const MIN_JOB_WINDOW_SECS: u64 = 300 + zkminer_chain::auction::PROVER_GRACE_SECS;
@@ -55,7 +76,7 @@ const MIN_JOB_WINDOW_SECS: u64 = 300 + zkminer_chain::auction::PROVER_GRACE_SECS
 /// Far above a header's normal lag (a 12 s block plus RPC latency), and well below the skew at which
 /// a fresh lock on the shortest window (300 s + the 30-min PROVER_GRACE) would already look due for
 /// release (about 1,470 s with the host ahead).
-const MAX_CLAIM_CLOCK_SKEW_SECS: u64 = 300;
+pub(crate) const MAX_CLAIM_CLOCK_SKEW_SECS: u64 = 300;
 
 /// Below this much remaining proving budget it isn't worth starting another attempt
 /// — abandon the job now, while `releaseJob` can still land, instead of
@@ -93,6 +114,15 @@ const HOST_MEMORY_BACKOFF_SECS: u64 = 15;
 /// flight, bounded so a permanently short host cannot hold a claim until its deadline.
 const MAX_HOST_MEMORY_WAITS: u32 = 20;
 
+/// The longest a job waits for host memory in all (`MAX_HOST_MEMORY_WAITS` backoffs): its waits
+/// are bounded by the clock, since a wake-up (`MEMORY_RELEASED`) ends one early. Counting them let
+/// a run of wake-ups spend all 20 in well under a second.
+const HOST_MEMORY_WAIT_LIMIT: Duration =
+    Duration::from_secs(MAX_HOST_MEMORY_WAITS as u64 * HOST_MEMORY_BACKOFF_SECS);
+
+/// The least time between two tries for host memory, however soon a wake-up comes.
+const HOST_MEMORY_MIN_RETRY: Duration = Duration::from_secs(2);
+
 /// How long to wait before retrying a job refused because the card's VRAM is held — by another
 /// process, or by one of our own workers of the other backend that could not be recycled to make room
 /// (its slot was busy, or its memory had not come back yet).
@@ -111,6 +141,27 @@ const GPU_MEMORY_BACKOFF_SECS: u64 = 5;
 /// be able to hold a claim until its deadline.
 const MAX_GPU_MEMORY_WAITS: u32 = 24;
 
+/// How many times one job's proof may be retried free after the outage recycle stopped its worker
+/// (`WorkerRecycled`). A recycle is not the job's failure, but a guest that holds the network on
+/// purpose is stopped this way each time it runs: past this, each such stop costs an attempt, so
+/// the job still ends.
+const MAX_RECYCLED_RETRIES: u32 = 2;
+
+/// Whether a failed proof attempt is retried free because the outage recycle stopped its worker
+/// (`chain_watch`, `WorkerPool::stop_slots`): no attempt counted, no card excluded, nothing marked
+/// against the program or submitter. Up to [`MAX_RECYCLED_RETRIES`] per job (`recycled_retries`,
+/// counted here); after that it is an ordinary worker death. Typed: no text can produce it.
+fn free_retry_after_recycle(e: &anyhow::Error, recycled_retries: &mut u32) -> bool {
+    if e.downcast_ref::<zkminer_prover::dispatcher::WorkerRecycled>()
+        .is_none()
+        || *recycled_retries >= MAX_RECYCLED_RETRIES
+    {
+        return false;
+    }
+    *recycled_retries += 1;
+    true
+}
+
 /// How long a claimed risc0 job waits between looks for a card that can prove it, when none enabled
 /// here has a job size. Unbounded in count: the job's deadline budget ends the wait in time to release.
 const NO_RISC0_CARD_WAIT: Duration = Duration::from_secs(60);
@@ -125,13 +176,8 @@ const MAX_CLAIM_BATCH: usize = 10;
 const MIN_EARLY_PASS_SPACING: Duration = Duration::from_secs(1);
 
 
-/// Committed-cycle count above which a job is treated as "large" and proactively
-/// pinned to a high-VRAM GPU (only takes effect when the job commits a cycle
-/// count; uncommitted jobs still get the reactive OOM→high-VRAM retry).
-const LARGE_JOB_CYCLES: u64 = 150_000_000;
-
-/// VRAM floor (30 GiB) for large jobs — includes 32 GB cards, excludes 24 GB
-/// ones, keeping OOM-prone multi-segment proofs off the smaller GPUs.
+/// VRAM floor (30 GiB) for the retry of a job that ran out of GPU memory on a card whose VRAM is
+/// unknown (non-CUDA, or nvidia-smi unavailable); with it known, the retry asks for more than it.
 const LARGE_JOB_MIN_VRAM_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 /// Default blocks to scan on startup for locked-but-unfulfilled jobs (recovery; floored at the
@@ -286,7 +332,8 @@ fn is_invalid_proof(msg: &str) -> bool {
 /// A drain that waits for a 1-5 minute proof therefore never reaches the release step, so
 /// a supervised stop would release NOTHING — strictly worse than the pre-drain code, which
 /// released within ~2s. Supervised stops get a short drain that auto-escalates.
-static SUPERVISED_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SUPERVISED_STOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Drain budget for a supervised (SIGTERM) stop. DERIVED, not picked: the smallest common
 /// grace period is `docker stop` = 10s, and the ABANDON stage needs essentially all of it.
@@ -336,7 +383,693 @@ const CLAIM_INTENT_MAX_AGE_SECS: u64 = 900;
 /// key toggles `paused` too (zkminer-tui/src/app.rs), and there it means only "stop claiming
 /// new work" — gating RECOVERY on it would let an operator pause silently disable the only
 /// path that still releases a job whose earlier release failed on RPC.
-static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Locks a keep-locks stop releases anyway: too close to their cutoff for a restart to release
+/// them in time (see `RESTART_ALLOWANCE_SECS`).
+static KEEP_LOCKS_EXEMPT: std::sync::Mutex<Option<std::collections::HashSet<B256>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a keep-locks stop holds on to `job_id`, so it must not be released now: one was asked
+/// for (or committed) and has not given way to an abandon, and the lock is not one of those it
+/// releases anyway. Read from the ladder's phase, so it cannot disagree with it: a lifecycle whose
+/// worker is stopped on the way out does not release a lock the stop keeps.
+fn keeping_lock(job_id: B256) -> bool {
+    keep_in_progress() && !keep_exempt(job_id)
+}
+
+/// How long the next start needs, past the release margin, before its recovery can release a kept
+/// lock: restart delay, chain checks, worker discovery and the recovery scan. A keep-locks stop
+/// releases what is closer to its cutoff than the margin plus this.
+const RESTART_ALLOWANCE_SECS: u64 = 600;
+
+/// How long before a kept lock's cutoff the miner must be started again for its recovery to still
+/// release the lock in time: every "start it by" an operator reads is the cutoff less this.
+pub(crate) const RESTART_BY_SECS: u64 = DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS;
+
+/// "start it by HH:MM UTC" for the earliest of `cutoffs` (unix seconds, 0 = unknown), or `None`.
+pub(crate) fn start_by(cutoffs: impl IntoIterator<Item = u64>) -> Option<String> {
+    cutoffs
+        .into_iter()
+        .filter(|d| *d > 0)
+        .min()
+        .map(|d| zkminer_chain::exit::fmt_unix(d.saturating_sub(RESTART_BY_SECS)))
+}
+
+/// What a keep-locks stop itself still takes after it picks the locks to release: their whole
+/// release ladder, a nonce-gap repair, and the worker reap.
+const KEEP_LOCKS_EXIT_SLACK_SECS: u64 = zkminer_chain::jobs::RELEASE_LADDER_SECS + 120;
+
+/// A lock whose cutoff is at or before this (unix seconds) is too close for a keep-locks stop to
+/// keep: the next start could not release it in time.
+fn keep_horizon() -> u64 {
+    zkminer_chain::client::chain_now().saturating_add(
+        DEADLINE_RELEASE_MARGIN_SECS + RESTART_ALLOWANCE_SECS + KEEP_LOCKS_EXIT_SLACK_SECS,
+    )
+}
+
+fn keep_exempt(job_id: B256) -> bool {
+    KEEP_LOCKS_EXEMPT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&job_id))
+}
+
+/// Whether a keep-locks stop is under way or committed. A stop signal then leaves it be: it is
+/// already the quickest way out, and turning it into an abandon would release every lock the
+/// operator chose to keep (a supervisor's SIGTERM, a closing terminal, `systemctl stop`). Only an
+/// explicit abandon (`zkminer stop --abandon`, `a` on the dashboard) overrides it.
+pub(crate) fn keep_in_progress() -> bool {
+    matches!(ladder_phase(), PHASE_KEEPING | PHASE_KEPT)
+}
+
+/// The locks a keep-locks stop releases rather than keeps: a cutoff within [`keep_horizon`] (an
+/// unknown one counted from the contract's shortest window), or a fulfil that gave up with its
+/// nonce stashed (that stuck tx sits below every release sent after it, and only the job's own
+/// release, which reuses the stashed nonce, displaces it). A breadcrumb already past its recorded
+/// cutoff is left out: nothing releases it now, and the next start re-checks it.
+fn keep_too_close(
+    journal: &SharedJournal,
+    client: &ChainClient,
+) -> std::collections::HashSet<B256> {
+    let horizon = keep_horizon();
+    let past = zkminer_chain::client::chain_now_floor();
+    let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+    j.iter()
+        .filter(|e| {
+            if client.has_abandoned_nonce(e.job_id) {
+                return true;
+            }
+            if e.lock_deadline != 0 && e.lock_deadline <= past {
+                return false;
+            }
+            let cutoff = if e.lock_deadline != 0 {
+                e.lock_deadline
+            } else {
+                (e.claimed_at.max(0) as u64).saturating_add(MIN_JOB_WINDOW_SECS)
+            };
+            cutoff <= horizon
+        })
+        .map(|e| e.job_id)
+        .collect()
+}
+
+/// Exempt `ids` from a keep-locks stop (they are released, see [`keep_too_close`]).
+fn exempt_from_keep(ids: impl IntoIterator<Item = B256>) {
+    KEEP_LOCKS_EXEMPT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(Default::default)
+        .extend(ids);
+}
+
+/// What a signal says when the ABANDON stage was reached by a request or by the drain itself,
+/// not by an earlier signal: it does not force an exit (which would drop the releases' fee bumps
+/// and the nonce repair, and is not restarted); one more does.
+pub(crate) const ALREADY_RELEASING_MSG: &str =
+    "Already releasing the jobs (abandon was asked for). One more signal forces an exit, which \
+     stops waiting for the releases to land.";
+
+/// What a signal that reaches the ABANDON stage says during a keep-locks stop.
+pub(crate) const KEEP_SIGNAL_MSG: &str =
+    "A stop signal arrived during a keep-locks stop: it goes on keeping the locks. `zkminer stop \
+     --abandon` (or [a] on the dashboard) releases them instead; one more signal forces an exit.";
+
+/// How long a keep-locks stop waits for proofs already being submitted: their fulfil is on its way
+/// to the chain, and cutting it off would leave the job for the next start to sort out.
+const KEEP_LOCKS_SUBMIT_GRACE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Where the shutdown ladder is. A stop asked for while it runs may only move it forward, and
+/// every move that decides between keeping and releasing locks is one compare-and-swap, so a
+/// keep-locks request and an abandon cannot both win: a keep-locks request cannot switch off
+/// releases already under way, and an abandon after a keep-locks stop committed is refused, not
+/// announced and then skipped. [`keeping_lock`] reads it directly.
+static LADDER_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(PHASE_MINING);
+const PHASE_MINING: u8 = 0;
+const PHASE_DRAINING: u8 = 1;
+/// A keep-locks stop was asked for and has not committed yet.
+const PHASE_KEEPING: u8 = 2;
+const PHASE_ABANDONING: u8 = 3;
+/// Nothing left to release or keep: reaping the workers and exiting.
+const PHASE_FINISHING: u8 = 4;
+/// A keep-locks stop committed: exiting with its locks held for the next start. Terminal (the
+/// highest value, so `set_ladder_phase(PHASE_FINISHING)` leaves it be).
+const PHASE_KEPT: u8 = 5;
+
+fn ladder_phase() -> u8 {
+    LADDER_PHASE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn set_ladder_phase(phase: u8) {
+    LADDER_PHASE.fetch_max(phase, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Move the phase from one of `from` to `to` in one step; `Err(phase)` with the phase found when
+/// it was in none of them.
+fn move_ladder_phase(from: &[u8], to: u8) -> Result<(), u8> {
+    let mut seen = ladder_phase();
+    loop {
+        if !from.contains(&seen) {
+            return Err(seen);
+        }
+        match LADDER_PHASE.compare_exchange(
+            seen,
+            to,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(now) => seen = now,
+        }
+    }
+}
+
+/// Raise the ladder to `stage` (1 DRAIN, 2 ABANDON), never lower it: a signal and a stop request
+/// handled at the same moment must not undo each other.
+pub(crate) fn raise_stage(sig_tx: &tokio::sync::watch::Sender<u8>, stage: u8) {
+    // A stop is decided: the proofs still running are not a crash, whatever ends the process from
+    // here (a service manager's timeout, Windows' end of a closing console).
+    if stage >= 1 {
+        end_counted_prove_starts();
+    }
+    sig_tx.send_if_modified(|v| {
+        if *v < stage {
+            *v = stage;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Begin ABANDON for a signal or a request, or say why it is too late. An abandon asked for before
+/// a keep-locks stop commits wins over it.
+pub(crate) fn begin_abandon() -> Result<(), &'static str> {
+    match move_ladder_phase(
+        &[
+            PHASE_MINING,
+            PHASE_DRAINING,
+            PHASE_KEEPING,
+            PHASE_ABANDONING,
+        ],
+        PHASE_ABANDONING,
+    ) {
+        Ok(()) => Ok(()),
+        Err(PHASE_KEPT) => Err(
+            "Too late to abandon: the miner is already exiting with its locks kept for the next \
+             start. Start it again (it finishes or releases them), and stop that one with \
+             `zkminer stop --abandon` if you want them released.",
+        ),
+        Err(_) => Err(
+            "Too late: the miner is already exiting (what it still holds is in its final report).",
+        ),
+    }
+}
+
+/// The dashboard is open while the miner stops: shutdown messages go to its shutdown panel, not to
+/// stdout (which would draw over it). Cleared once it has closed.
+static TUI_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn tui_up() -> bool {
+    TUI_UP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Print a line, ignoring a terminal that has gone away (`println!` panics on EIO, and a closed
+/// terminal must not take the shutdown down with it).
+pub(crate) fn say_out(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// `zkminer_tui::restore_terminal`, on a helper thread, given 3 s: writing to a terminal that
+/// stopped reading blocks, and a force exit must still exit.
+fn restore_terminal_bounded() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        zkminer_tui::restore_terminal();
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(3));
+}
+
+/// [`say_out`] for stderr.
+fn writeln_err(line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    writeln!(std::io::stderr(), "{line}")
+}
+
+/// If the dashboard ended during the stop (an error, a panic), carry on on the terminal: print
+/// what the panel had shown, and send everything after it there too. Without this a 50-minute
+/// drain would run behind a silent terminal.
+async fn check_dashboard(state: &zkminer_tui::state::SharedState) {
+    if tui_up() && zkminer_tui::app::dashboard_ended() {
+        TUI_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::error!("the dashboard closed during the shutdown — continuing on the terminal");
+        let s = state.read().await;
+        say_out("\nThe dashboard closed. The shutdown so far:");
+        if let Some(view) = s.shutdown.as_ref() {
+            for line in &view.lines {
+                say_out(line);
+            }
+        }
+    }
+}
+
+/// Report a step of the shutdown to the operator: on the dashboard's shutdown panel while it is open,
+/// else on stdout. (Each caller also logs it.)
+pub(crate) async fn shutdown_say(state: &zkminer_tui::state::SharedState, msg: impl Into<String>) {
+    let msg = msg.into();
+    check_dashboard(state).await;
+    if tui_up() {
+        // The first message of a stop opens the panel (the ladder sets its real stage as it starts).
+        let mut s = state.write().await;
+        s.shutdown
+            .get_or_insert_with(|| {
+                zkminer_tui::state::ShutdownView::new(zkminer_tui::state::ShutdownStage::Draining)
+            })
+            .lines
+            .push(msg.trim().to_string());
+        close_quit_prompt(&mut s);
+    } else {
+        say_out(&msg);
+    }
+}
+
+/// A quit question still open when a stop begins elsewhere no longer applies.
+fn close_quit_prompt(s: &mut zkminer_tui::state::MinerState) {
+    if s.stop_prompt == Some(zkminer_tui::state::StopPrompt::Quit) {
+        s.stop_prompt = None;
+    }
+}
+
+/// What the shutdown is waiting on right now: the shutdown panel's status line, or (with no
+/// dashboard, outside headless mode) a line on stdout.
+async fn shutdown_status(state: &zkminer_tui::state::SharedState, headless: bool, msg: String) {
+    check_dashboard(state).await;
+    if tui_up() {
+        if let Some(view) = state.write().await.shutdown.as_mut() {
+            view.status = msg;
+        }
+    } else if !headless {
+        say_out(&msg);
+    }
+}
+
+/// Move the dashboard's shutdown panel to `stage` (opening it on the first call).
+async fn shutdown_stage(
+    state: &zkminer_tui::state::SharedState,
+    stage: zkminer_tui::state::ShutdownStage,
+) {
+    let mut s = state.write().await;
+    match s.shutdown.as_mut() {
+        Some(view) => view.stage = stage,
+        None => s.shutdown = Some(zkminer_tui::state::ShutdownView::new(stage)),
+    }
+    close_quit_prompt(&mut s);
+}
+
+/// The third stop signal (or `x` at the dashboard, or `zkminer stop --force-exit`): reap the
+/// workers with a cap and exit at once, releasing nothing more.
+pub(crate) fn force_exit() -> ! {
+    // Stops the dashboard drawing before the terminal is handed back (a no-op without one).
+    restore_terminal_bounded();
+    // The operator's force exit is not a crash either (`ProveStart`).
+    end_counted_prove_starts();
+    let now = zkminer_chain::client::chain_now_floor();
+    let journal = crate::journal::JobJournal::peek();
+    let live: Vec<u64> = journal
+        .iter()
+        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+        .map(|e| e.lock_deadline)
+        .collect();
+    let _ = writeln_err(&format!(
+        "\nForce exit — in-flight jobs left locked on-chain{}.",
+        if live.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ": {} lock(s) held. Start the miner again {} (a service is not restarted after a \
+                 force exit), or they are slashed",
+                live.len(),
+                start_by(live.iter().copied())
+                    .map(|t| format!("by {t}"))
+                    .unwrap_or_else(|| "soon".into())
+            )
+        }
+    ));
+    // Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD that does NOT die with us; it can
+    // keep ~11.5 GB of VRAM allocated after the parent exited.
+    //
+    // BOUNDED, because `shutdown_all` is not: its phase 4 takes a BLOCKING slot lock, while phases
+    // 2/3 skip any slot whose `pid` is momentarily 0 — the respawn/recycle window (dispatcher.rs,
+    // where the pid is zeroed before the handle is dropped and only restored after
+    // `ensure_alive`). Such a worker is never signalled, so the lock it holds is not released until
+    // its whole proof finishes (up to the 600s watchdog). The "Force exit" print therefore comes
+    // BEFORE this call, and a force exit must terminate regardless: reap off-thread and cap the
+    // wait (a normal reap takes ~2.2s).
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            pool.close();
+        }
+        let _ = done_tx.send(());
+    });
+    if done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .is_err()
+    {
+        let _ = writeln_err(
+            "worker reap did not finish in 10s — exiting anyway; check for an orphaned \
+             sp1-gpu-server holding VRAM.",
+        );
+    }
+    std::process::exit(130);
+}
+
+/// `~/.zkminer`, where the instance lock, the job journal and stop requests live.
+pub(crate) fn zkminer_home() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".zkminer")
+}
+
+/// Where `zkminer stop` leaves its request for the running miner: one word, the stop mode.
+pub(crate) fn stop_request_path() -> PathBuf {
+    zkminer_home().join("stop-request")
+}
+
+/// Where the miner answers a `zkminer stop` request: `ok: <what it is doing>` or
+/// `refused: <why>`.
+pub(crate) fn stop_response_path() -> PathBuf {
+    zkminer_home().join("stop-response")
+}
+
+/// The word a stop request file holds for each mode.
+pub(crate) fn stop_mode_word(mode: zkminer_tui::state::StopMode) -> &'static str {
+    use zkminer_tui::state::StopMode;
+    match mode {
+        StopMode::Drain => "drain",
+        StopMode::KeepLocks => "keep-locks",
+        StopMode::Abandon => "abandon",
+        StopMode::Force => "force",
+    }
+}
+
+pub(crate) fn parse_stop_mode(word: &str) -> Option<zkminer_tui::state::StopMode> {
+    use zkminer_tui::state::StopMode;
+    [
+        StopMode::Drain,
+        StopMode::KeepLocks,
+        StopMode::Abandon,
+        StopMode::Force,
+    ]
+    .into_iter()
+    .find(|m| stop_mode_word(*m) == word.trim())
+}
+
+/// Take a pending `zkminer stop` request: read it and remove the file (the removal is what tells
+/// `zkminer stop` it was seen). An unreadable word is removed too, and answered.
+fn take_stop_request_file() -> Option<Result<zkminer_tui::state::StopMode, String>> {
+    let path = stop_request_path();
+    let word = std::fs::read_to_string(&path).ok()?;
+    if let Err(e) = std::fs::remove_file(&path) {
+        // Left in place it would be read again every second.
+        tracing::error!(
+            "cannot remove the stop request {}: {e} — ignoring it",
+            path.display()
+        );
+        return None;
+    }
+    Some(parse_stop_mode(&word).ok_or_else(|| {
+        tracing::warn!(
+            "ignored a stop request with an unknown mode {:?} ({})",
+            word.trim(),
+            path.display()
+        );
+        format!("unknown stop mode {:?}", word.trim())
+    }))
+}
+
+/// Answer a `zkminer stop` request (tmp + rename, so it never reads half an answer).
+fn write_stop_response(word: &str, answer: &Result<String, String>) {
+    // `<mode word> ok: …` / `<mode word> refused: …`: the client checks the word is its own.
+    let text = match answer {
+        Ok(what) => format!("{word} ok: {what}"),
+        Err(why) => format!("{word} refused: {why}"),
+    };
+    let path = stop_response_path();
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+        tracing::warn!("cannot answer the stop request in {}: {e}", path.display());
+    }
+}
+
+/// Act on a stop asked for at the dashboard or by `zkminer stop`, advancing the same ladder the
+/// signals drive (`sig_tx`: 1 DRAIN, 2 ABANDON). Returns what it is doing, or why not.
+pub(crate) async fn apply_stop_request(
+    mode: zkminer_tui::state::StopMode,
+    sig_tx: &tokio::sync::watch::Sender<u8>,
+    state: &zkminer_tui::state::SharedState,
+) -> Result<String, String> {
+    use zkminer_tui::state::StopMode;
+    let stage = *sig_tx.borrow();
+    match mode {
+        StopMode::Drain if stage == 0 => {
+            tracing::warn!("stop requested: draining");
+            let how = if tui_up() {
+                ""
+            } else {
+                " `zkminer stop --abandon` (or Ctrl+C) releases them now instead."
+            };
+            shutdown_say(
+                state,
+                format!("\nDRAINING — finishing in-flight proofs, no new claims.{how}"),
+            )
+            .await;
+            raise_stage(sig_tx, 1);
+            Ok("draining".into())
+        }
+        StopMode::Drain => {
+            tracing::info!("stop requested: already stopping");
+            Ok("already stopping".into())
+        }
+        StopMode::KeepLocks => {
+            let too_late = match move_ladder_phase(
+                &[PHASE_MINING, PHASE_DRAINING, PHASE_KEEPING],
+                PHASE_KEEPING,
+            ) {
+                Ok(()) => None,
+                Err(PHASE_ABANDONING) => Some("it is already releasing the jobs"),
+                Err(PHASE_KEPT) => Some("it is already exiting with its locks kept"),
+                Err(_) => Some("it is already exiting"),
+            };
+            if let Some(why) = too_late {
+                tracing::warn!("keep-locks stop requested too late: {why}");
+                shutdown_say(state, format!("Too late to keep the locks: {why}.")).await;
+                return Err(format!("too late to keep the locks: {why}"));
+            }
+            tracing::warn!("stop requested: keeping locks for the next start");
+            shutdown_say(
+                state,
+                "\nKEEPING LOCKS — no new claims; exiting without releasing (except a lock too \
+                 close to its deadline to survive a restart), so the next start finishes the \
+                 jobs held. `zkminer stop --abandon` releases them instead.",
+            )
+            .await;
+            if stage == 0 {
+                raise_stage(sig_tx, 1);
+            } else {
+                // Wake the drain so it sees the keep-locks request now, not at its next poll.
+                sig_tx.send_modify(|_| {});
+            }
+            Ok("keeping its locks".into())
+        }
+        StopMode::Abandon => {
+            if let Err(why) = begin_abandon() {
+                tracing::warn!("abandon requested: {why}");
+                shutdown_say(state, why).await;
+                return Err(why.to_string());
+            }
+            if stage < 2 {
+                tracing::warn!("stop requested: abandoning");
+                shutdown_say(
+                    state,
+                    "\nABANDONING — releasing jobs, nearest deadline first...",
+                )
+                .await;
+                raise_stage(sig_tx, 2);
+            }
+            Ok("abandoning".into())
+        }
+        StopMode::Force => force_exit(),
+    }
+}
+
+/// Publish, every 2 s for the life of the process, which cards' running proofs Windows is moving off
+/// the card for another program's memory (`WorkerPool::gpu_spills`), by the bus id the dashboard's
+/// GPU rows use. Nothing to publish elsewhere: a card that runs out there fails the allocation.
+fn spawn_spill_publisher(state: zkminer_tui::state::SharedState) {
+    if !cfg!(windows) {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            let Some(pool) = zkminer_prover::engine::worker_pool() else {
+                continue;
+            };
+            let spills = spills_by_card(&pool.gpu_spills(), |key| pool.bus_id_for_slot(key));
+            if state.read().await.gpu_spills != spills {
+                state.write().await.gpu_spills = spills;
+            }
+        }
+    });
+}
+
+/// Each slot's spill (`WorkerPool::gpu_spills`) under its card's bus id (`bus_of`). Both of a
+/// card's slots can report one; the card shows the one being stopped, else the larger.
+fn spills_by_card(
+    spills: &[(String, zkminer_prover::dispatcher::GpuSpill)],
+    bus_of: impl Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, zkminer_prover::dispatcher::GpuSpill> {
+    let mut by_card = std::collections::HashMap::new();
+    for (key, spill) in spills {
+        let Some(bus) = bus_of(key) else {
+            continue;
+        };
+        by_card
+            .entry(bus)
+            .and_modify(|shown: &mut zkminer_prover::dispatcher::GpuSpill| {
+                if (spill.stopping, spill.evicted_mib) > (shown.stopping, shown.evicted_mib) {
+                    *shown = *spill;
+                }
+            })
+            .or_insert(*spill);
+    }
+    by_card
+}
+
+/// Poll for stops asked for at the dashboard (`stop_request`) or by `zkminer stop` (the request
+/// file), once a second, for the life of the process.
+fn spawn_stop_watcher(
+    sig_tx: tokio::sync::watch::Sender<u8>,
+    state: zkminer_tui::state::SharedState,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let from_dashboard = state.write().await.stop_request.take();
+            if let Some(mode) = from_dashboard {
+                let _ = apply_stop_request(mode, &sig_tx, &state).await;
+                continue;
+            }
+            let from_file = tokio::task::spawn_blocking(take_stop_request_file)
+                .await
+                .ok()
+                .flatten();
+            if let Some(request) = from_file {
+                let (word, answer) = match request {
+                    Ok(mode) => {
+                        let word = stop_mode_word(mode);
+                        tracing::warn!("`zkminer stop` asked for: {word}");
+                        if mode == zkminer_tui::state::StopMode::Force {
+                            // Answered first: force_exit does not return.
+                            write_stop_response(word, &Ok("exiting at once".into()));
+                        }
+                        (word, apply_stop_request(mode, &sig_tx, &state).await)
+                    }
+                    Err(why) => ("unknown", Err(why)),
+                };
+                let _ =
+                    tokio::task::spawn_blocking(move || write_stop_response(word, &answer)).await;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod stop_ladder_tests {
+    use super::*;
+    use zkminer_tui::state::StopMode;
+
+    /// The only test touching the ladder's process-wide phase: stop requests move it forward only,
+    /// a keep-locks request cannot switch off an abandon, an abandon after a keep-locks stop
+    /// committed is refused rather than announced and skipped, and a keep-locks stop holds every
+    /// lock but those it exempted.
+    #[tokio::test]
+    async fn stop_requests_only_move_the_ladder_forward() {
+        let set = |p| LADDER_PHASE.store(p, std::sync::atomic::Ordering::SeqCst);
+        let (kept, close) = (B256::repeat_byte(1), B256::repeat_byte(2));
+        assert!(
+            !keeping_lock(kept),
+            "no keep-locks stop: nothing is held back"
+        );
+        KEEP_LOCKS_EXEMPT
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(close);
+
+        let (tx, rx) = tokio::sync::watch::channel(0u8);
+        let state = zkminer_tui::state::new_shared_state();
+        raise_stage(&tx, 2);
+        raise_stage(&tx, 1);
+        assert_eq!(*rx.borrow(), 2, "a late DRAIN must not undo an ABANDON");
+
+        let (tx, rx) = tokio::sync::watch::channel(0u8);
+        assert!(apply_stop_request(StopMode::Drain, &tx, &state)
+            .await
+            .is_ok());
+        assert_eq!(*rx.borrow(), 1);
+        set_ladder_phase(PHASE_DRAINING);
+        assert!(apply_stop_request(StopMode::KeepLocks, &tx, &state)
+            .await
+            .is_ok());
+        assert!(keeping_lock(kept) && !keeping_lock(close));
+        // Abandon before the keep commits: wins, and nothing is held back any more.
+        assert!(apply_stop_request(StopMode::Abandon, &tx, &state)
+            .await
+            .is_ok());
+        assert!(!keeping_lock(kept));
+        assert_eq!(*rx.borrow(), 2);
+        // From then on keep-locks is refused, and the commit fails.
+        assert!(apply_stop_request(StopMode::KeepLocks, &tx, &state)
+            .await
+            .is_err());
+        assert!(!keeping_lock(kept));
+        assert!(move_ladder_phase(&[PHASE_KEEPING], PHASE_KEPT).is_err());
+        set_ladder_phase(PHASE_DRAINING);
+        assert_eq!(
+            ladder_phase(),
+            PHASE_ABANDONING,
+            "the phase never moves back"
+        );
+
+        // A keep that commits holds its locks through the exit, and refuses an abandon.
+        set(PHASE_KEEPING);
+        assert!(move_ladder_phase(&[PHASE_KEEPING], PHASE_KEPT).is_ok());
+        set_ladder_phase(PHASE_FINISHING);
+        assert_eq!(ladder_phase(), PHASE_KEPT);
+        assert!(keeping_lock(kept));
+        assert!(begin_abandon().is_err());
+        assert!(apply_stop_request(StopMode::Abandon, &tx, &state)
+            .await
+            .is_err());
+        assert!(keeping_lock(kept));
+
+        // After a clean drain there is nothing to keep or release.
+        set(PHASE_FINISHING);
+        assert!(apply_stop_request(StopMode::KeepLocks, &tx, &state)
+            .await
+            .is_err());
+        assert!(begin_abandon().is_err());
+        set(PHASE_MINING);
+    }
+}
 
 /// `zkminer run --watch-only`: every check up to the claim runs against the live market, and the
 /// claim itself is replaced by a read-only preview that is logged. Nothing is signed or sent, no
@@ -357,6 +1090,12 @@ static HELD_LOCKS_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 fn held_locks_only() -> bool {
     HELD_LOCKS_ONLY.load(std::sync::atomic::Ordering::SeqCst)
 }
+
+/// `zkminer run --forget-foreign-locks`: start although the job journal's locks belong to another
+/// address than this config's key (`JobJournal::key_changed_refusal`), accepting that they will be
+/// slashed unless that key drives them. Set once by `main`, before `run`.
+pub static FORGET_FOREIGN_LOCKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The options of `zkminer run --watch-only`.
 pub struct WatchOnly {
@@ -409,6 +1148,25 @@ fn is_pause_kept(job_id: B256) -> bool {
     g.as_ref().is_some_and(|s| s.contains(&job_id))
 }
 
+/// Locks already reported as stranded (past their deadline, so only a keeper's slash frees the
+/// collateral) in this run. Every recovery pass meets them again until that slash, which can take
+/// hours, and the operator can do nothing about them: they are paged once, not every few minutes.
+/// Bounded by the journal (only held locks are ever inserted).
+static STRANDED_REPORTED: std::sync::Mutex<Option<std::collections::HashSet<B256>>> =
+    std::sync::Mutex::new(None);
+
+/// Records `job_id` as reported stranded; `true` the first time in this run.
+fn first_stranded_report(job_id: B256) -> bool {
+    let mut g = STRANDED_REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(Default::default).insert(job_id)
+}
+
+/// Whether `job_id` was already reported stranded in this run.
+fn stranded_reported(job_id: B256) -> bool {
+    let g = STRANDED_REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref().is_some_and(|s| s.contains(&job_id))
+}
+
 /// Whether the risczero.groth16.v1 proof system passed verification (adapter registered and
 /// claimable, audited code, SELECTOR equal to our seal prefix), and the adapter it verified. New
 /// claims for it are refused while false; locks we already hold are still driven (fulfilled, kept or
@@ -457,13 +1215,24 @@ const SP1_GROTH16_SEAL_LEN: usize = 4 + 3 * 32 + 256;
 /// A RISC Zero Groth16 seal on chain: the 4-byte selector, then the 256-byte proof (8 words).
 const RISC0_GROTH16_SEAL_LEN: usize = 4 + 256;
 
+/// [`hold_instance_lock`] found the lock held by another process (as opposed to failing to open it).
+#[derive(Debug)]
+pub(crate) struct InstanceLockBusy(pub String);
+
+impl std::fmt::Display for InstanceLockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for InstanceLockBusy {}
+
 /// One miner per home directory: two would recover, prove and release the same locks, collide on
 /// nonces, and overwrite each other's job journal (`~/.zkminer/job_journal.json`) — e.g. a second
 /// one started while the first is still draining. An exclusive `flock` on `~/.zkminer/miner.lock`,
 /// held for the life of the process (the kernel drops it when the process exits, however it exits;
 /// the descriptor is close-on-exec, so no worker inherits it). Watch-only takes none: it never
 /// writes the journal or sends anything.
-pub(crate) fn hold_instance_lock() -> Result<()> {
+pub(crate) fn hold_instance_lock(role: &str) -> Result<()> {
     static LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -483,6 +1252,12 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
         builder
             .create(&dir)
             .with_context(|| format!("create {}", dir.display()))?;
+        // Also when something else created it first (`zkminer init` makes it with the umask's
+        // 0755): the journal, stop requests and answers are this user's business.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
     }
     #[cfg(windows)]
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -509,23 +1284,35 @@ pub(crate) fn hold_instance_lock() -> Result<()> {
         .with_context(|| format!("open {}", path.display()))?;
     match file.try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-            "another zkminer is already running from {} (it holds {}) — two would drive the same \
-             locks; stop it first (a stopping miner may still be draining)",
-            dir.display(),
-            path.display()
-        ),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(anyhow::Error::new(InstanceLockBusy(format!(
+                "another zkminer holds {} (a miner, which may still be draining, a benchmark, or a \
+                 stake/unstake/withdraw waiting at its prompt) — two would drive the same locks; \
+                 stop it first",
+                path.display()
+            ))))
+        }
         Err(std::fs::TryLockError::Error(e)) => {
             return Err(e).with_context(|| format!("lock {}", path.display()))
         }
     }
     let _ = LOCK.set(file);
+    // Who holds it, for a command that finds it held (`signer_guard`): a benchmark signs nothing,
+    // a miner does. Beside the lock, which Windows does not let others read while it is held.
+    let _ = std::fs::write(dir.join("miner.lock.holder"), role);
     Ok(())
 }
 
+/// Who holds `~/.zkminer/miner.lock` ("miner", "benchmark", "stake", ...), as its holder recorded.
+pub(crate) fn instance_lock_holder() -> Option<String> {
+    std::fs::read_to_string(zkminer_home().join("miner.lock.holder"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
 /// Whether new claims on a job of `proof_system_id` from `submitter` for `program_id` are held right
-/// now: the deployment or (risc0) the proof system failed verification, or the post-claim divergence
-/// breaker holds them.
+/// now: the deployment or (risc0) the proof system failed verification, the post-claim divergence
+/// breaker holds them, or the slash latch is tripped (or a stake fall is being checked).
 fn claims_held_for(
     proof_system_id: B256,
     submitter: alloy::primitives::Address,
@@ -536,6 +1323,7 @@ fn claims_held_for(
         || (backend == Some("risc0") && !risc0_claimable())
         || (backend == Some("sp1") && !sp1_claimable())
         || backend.is_some_and(|b| divergence_blocks_claim(submitter, program_id, b))
+        || slash_latch::hold_short().is_some()
 }
 
 /// Whether the deployment itself last passed `verify_deployment` (this chain's live stack, wired to
@@ -683,6 +1471,10 @@ struct Measured {
     /// cache) let the hash be dropped while the measurement survived, re-opening the window — hence the
     /// move into the measurement entry.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The registry `elf_hash` the measured ELF was fetched under (its keccak; the fetch checked it).
+    /// `Some` only for a real measurement of a backend bound by that hash (SP1). A claim whose
+    /// registry now names another hash is not claimed on this measurement (see [`ElfHashChanged`]).
+    registry_elf_hash: Option<alloy::primitives::B256>,
     /// The journal this execution committed, which a journal-bound job's binding is checked against
     /// before it is claimed (`zkminer_chain::binding`). In THIS entry for the same reason as
     /// `verified_elf_hash`: a claim that resolves a measurement gets that measurement's journal in the
@@ -997,6 +1789,7 @@ fn insert_measured(
             peak_host_bytes: 0,
             retry_after: None,
             verified_elf_hash: None,
+            registry_elf_hash: None,
             journal: None,
             execute_secs: 0,
         },
@@ -1006,8 +1799,9 @@ fn insert_measured(
 /// Insert a real measurement: its cycle count, the execute's peak host footprint, and — for risc0 —
 /// the keccak of the image-id-verified ELF, the journal and how long the execute took (0: not
 /// known), stored in ONE value so they co-evict (finding C-8 and the independent-eviction residual).
-/// Expires only without a journal (`MEASURED_NO_JOURNAL_TTL`). `verified_elf_hash` is `Some` only for
-/// a real risc0 measurement; pass `None` for SP1 and for callers without a verified hash.
+/// Expires only without a journal (`MEASURED_NO_JOURNAL_TTL`). `elf_hash` is the keccak of the
+/// measured ELF: for risc0 the image-id-verified bytes (`verified_elf_hash`), for another backend the
+/// registry `elf_hash` they were fetched under (`registry_elf_hash`). `None` without one.
 #[allow(clippy::too_many_arguments)]
 fn insert_measurement(
     cache: &MeasuredCache,
@@ -1017,10 +1811,11 @@ fn insert_measurement(
     input_hash: alloy::primitives::B256,
     cycles: u64,
     peak_host_bytes: u64,
-    verified_elf_hash: Option<alloy::primitives::B256>,
+    elf_hash: Option<alloy::primitives::B256>,
     journal: Option<std::sync::Arc<[u8]>>,
     execute_secs: u64,
 ) {
+    let risc0 = backend == zkminer_prover_protocol::BACKEND_RISC0;
     insert_measured_value(
         cache,
         backend,
@@ -1033,7 +1828,8 @@ fn insert_measurement(
             retry_after: journal
                 .is_none()
                 .then(|| std::time::Instant::now() + MEASURED_NO_JOURNAL_TTL),
-            verified_elf_hash,
+            verified_elf_hash: elf_hash.filter(|_| risc0),
+            registry_elf_hash: elf_hash.filter(|_| !risc0),
             journal,
             execute_secs,
         },
@@ -1064,6 +1860,7 @@ fn insert_unmeasurable(
             peak_host_bytes: 0,
             retry_after: Some(std::time::Instant::now() + UNMEASURABLE_RETRY_TTL),
             verified_elf_hash: None,
+            registry_elf_hash: None,
             journal: None,
             execute_secs: 0,
         },
@@ -1475,13 +2272,15 @@ fn program_sim_reverted_recently(
 /// jobId -> `Instant` before which a claim refused for a TEMPORARY reason is not re-attempted: a live
 /// price below our high-water floor or a live bid (`Wait`), a router/Registry pause (`Paused`), or a
 /// free-stake shortfall (`StakeShort`). Keeps the job a candidate without re-quoting it every tick.
-static CLAIM_RETRY_AFTER: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>,
-> = std::sync::OnceLock::new();
+/// Per job: until when it is not claimed, and why (what the Jobs page and the claims summary say
+/// for it meanwhile).
+type RetryAfter =
+    std::collections::HashMap<alloy::primitives::B256, (std::time::Instant, &'static str)>;
 
-fn claim_retry_after_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<alloy::primitives::B256, std::time::Instant>>
-{
+static CLAIM_RETRY_AFTER: std::sync::OnceLock<std::sync::Mutex<RetryAfter>> =
+    std::sync::OnceLock::new();
+
+fn claim_retry_after_map() -> &'static std::sync::Mutex<RetryAfter> {
     CLAIM_RETRY_AFTER.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1495,7 +2294,7 @@ fn note_claim_retry_after(job_id: alloy::primitives::B256, class: zkminer_chain:
         ClaimClass::StakeShort => 60,
         _ => 30,
     };
-    note_preclaim_strike(job_id, base);
+    note_preclaim_strike(job_id, base, "backing off after a refused claim");
 }
 /// Post-claim FAILURE breaker. A claimed job whose (program, input) measured clean and then failed
 /// after the lock — ANY terminal prove failure (a guest fault, a watchdog kill, a health failure, a
@@ -1562,11 +2361,28 @@ fn note_post_claim_divergence(
     caller: alloy::primitives::Address,
     why: &str,
 ) {
+    note_post_claim_divergence_for(program_id, backend, caller, why, true);
+}
+
+/// [`note_post_claim_divergence`], marking the program (once enough distinct submitters fail on it)
+/// only if `may_mark_program`: false where the failure may be the submitter's own per-job choice
+/// rather than the program's (a descriptor carrying a revert lever), so a decoy that names a
+/// legitimate program's id cannot get that program marked. The submitter is marked either way, and
+/// the failure counts toward the hold.
+fn note_post_claim_divergence_for(
+    program_id: alloy::primitives::B256,
+    backend: &'static str,
+    caller: alloy::primitives::Address,
+    why: &str,
+    may_mark_program: bool,
+) {
     let mut g = DIVERGENCE.lock().unwrap_or_else(|p| p.into_inner());
     let st = g.get_or_insert_with(Default::default);
     let key = (program_id, backend);
     let now = std::time::Instant::now();
-    let failers = if st.failers.len() < MEASURED_CYCLES_CAP || st.failers.contains_key(&key) {
+    let failers = if !may_mark_program {
+        0
+    } else if st.failers.len() < MEASURED_CYCLES_CAP || st.failers.contains_key(&key) {
         let f = st.failers.entry(key).or_default();
         f.retain(|(t, a)| now.duration_since(*t) < DIVERGENCE_MARK_MAX && *a != caller);
         f.push((now, caller));
@@ -1739,6 +2555,45 @@ fn job_collateral_terms(job_id: B256) -> Option<(u128, u128)> {
         .and_then(|m| m.get(&job_id).copied())
 }
 
+/// The settled price of each lock a recovery pass found ours (its view's `settledPrice`), so the
+/// lock it releases counts against the stake-wide cap at what it locked, not the floor.
+static RECOVERED_SETTLED_PRICE: std::sync::Mutex<Option<HashMap<B256, u128>>> =
+    std::sync::Mutex::new(None);
+
+fn note_recovered_settled_price(job_id: B256, settled_price: u128) {
+    let mut g = RECOVERED_SETTLED_PRICE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= MEASURED_CYCLES_CAP {
+        m.clear();
+    }
+    m.insert(job_id, settled_price);
+}
+
+fn recovered_settled_price(job_id: B256) -> Option<u128> {
+    RECOVERED_SETTLED_PRICE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&job_id).copied())
+}
+
+/// What a recovered lock locked, for the collateral caps: its settled price under its own terms
+/// when both are known, and at least the deployment's floor, which every lock locks.
+fn recovered_lock_collateral(job_id: B256, settled_price: Option<u128>) -> u128 {
+    let floor = collateral::floor().unwrap_or(0);
+    let locked = match (settled_price, job_collateral_terms(job_id)) {
+        (Some(price), Some((min, bps))) => zkminer_chain::auction::compute_collateral(
+            price,
+            u64::try_from(bps).unwrap_or(u64::MAX),
+            min,
+        ),
+        _ => floor,
+    };
+    locked.max(floor)
+}
+
 /// What a claim of `info`'s job may lock at most, and whose job it is, for the collateral cap: its
 /// collateral at its maximum price (or `price`, if higher: the price ramps up until the claim mines)
 /// under its own snapshotted `terms`, `(minCollateral, collateralBps)`, as the claim computes it.
@@ -1813,19 +2668,255 @@ fn open_rank(j: &TrackedJob) -> u128 {
 }
 
 
+/// A job's tag for the dispatcher's memory line (`with_job_tag`): the first 8 bytes of its id.
+fn job_tag(job_id: B256) -> u64 {
+    u64::from_be_bytes(job_id.0[..8].try_into().unwrap_or_default())
+}
+
+/// How a lock of ours that is gone ended, for the history (`MinerState::record_finished`), judged
+/// from its record before that is dropped and from the job's view (`status`, `prover`) when read:
+/// fulfilled by us; else gone after its recorded deadline (`EndedPastDeadline`: a keeper's slash,
+/// or a release of ours that landed after a forced exit, which the view does not tell apart:
+/// `past_deadline_end` asks the chain's events); else released. `None` for a claim never confirmed
+/// ours (it may never have landed).
+fn lock_end(
+    journal: &SharedJournal,
+    job_id: B256,
+    view: Option<(u8, alloy::primitives::Address)>,
+    us: alloy::primitives::Address,
+) -> Option<zkminer_tui::state::MinerJobStatus> {
+    use zkminer_tui::state::MinerJobStatus;
+    let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    let e = j.entries.get(&job_id)?;
+    let held = e.state != crate::journal::JournalState::Claiming;
+    let past = e.lock_deadline != 0 && zkminer_chain::client::chain_now_floor() >= e.lock_deadline;
+    if view.is_some_and(|(status, prover)| {
+        status == zkminer_chain::jobs::JOB_STATUS_FULFILLED && prover == us
+    }) {
+        Some(MinerJobStatus::Fulfilled { payout: 0 })
+    } else if held && past {
+        Some(MinerJobStatus::EndedPastDeadline)
+    } else if held {
+        Some(MinerJobStatus::Released { penalty: 0 })
+    } else {
+        None
+    }
+}
+
+/// The block our lock on `job_id` was read locked at (`JournalEntry::lock_block`, 0 when not
+/// recorded or no entry), for [`past_deadline_end`]. Read before the entry is dropped.
+fn lock_block_of(journal: &SharedJournal, job_id: B256) -> u64 {
+    let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    j.entries.get(&job_id).map_or(0, |e| e.lock_block)
+}
+
+/// Review 7 LD-3 / VLA-1: a lock of ours that `lock_end` found gone past its recorded deadline,
+/// classified from the router's events (`slash_latch::classify_past_deadline`). A release of ours
+/// that landed late is a release (no trip); a slash, or events that cannot be read or name neither,
+/// trips the slash latch (fail closed). Every `EndedPastDeadline` site goes through here.
+async fn past_deadline_end(
+    client: &ChainClient,
+    job_id: B256,
+    lock_block: u64,
+    why: &str,
+) -> zkminer_tui::state::MinerJobStatus {
+    use zkminer_tui::state::MinerJobStatus;
+    match slash_latch::classify_past_deadline(client, job_id, lock_block).await {
+        slash_latch::PastEnd::Released { penalty } => {
+            tracing::info!(
+                "{}: ended after its recorded deadline, but the chain shows a release of ours \
+                 landed (penalty {} HEMI): not a slash",
+                short_id(job_id),
+                fmt_hemi(penalty)
+            );
+            MinerJobStatus::Released { penalty }
+        }
+        slash_latch::PastEnd::Slashed | slash_latch::PastEnd::Unknown => {
+            slash_latch::note_lock_lost(job_id, why);
+            MinerJobStatus::EndedPastDeadline
+        }
+    }
+}
+
+/// Put locks a recovery pass found gone (`RecoveryPass::ended`) in the history, and say so in the
+/// activity log: a slash loses the collateral, and nothing else would tell the operator.
+async fn record_lock_ends(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus, u64)>,
+) {
+    use zkminer_tui::state::MinerJobStatus;
+    if ended.is_empty() {
+        return;
+    }
+    // Classified before the state lock: it reads the chain.
+    let mut classified = Vec::with_capacity(ended.len());
+    for (job_id, end, lock_block) in ended {
+        let end = if matches!(end, MinerJobStatus::EndedPastDeadline) {
+            past_deadline_end(
+                client,
+                job_id,
+                lock_block,
+                "ended past its deadline (slashed, or its end could not be read)",
+            )
+            .await
+        } else {
+            end
+        };
+        classified.push((job_id, end));
+    }
+    let mut s = state.write().await;
+    for (job_id, end) in classified {
+        let (level, what) = match end {
+            MinerJobStatus::EndedPastDeadline => (
+                LogLevel::Warn,
+                "ended after its deadline: slashed (its collateral lost), or its end could not be \
+                 read from the chain",
+            ),
+            MinerJobStatus::Fulfilled { .. } => (LogLevel::Info, "was fulfilled"),
+            _ => (LogLevel::Info, "is no longer locked to this miner"),
+        };
+        s.record_finished(job_id, end);
+        s.add_log(level, format!("Job {} {what}", short_id(job_id)));
+    }
+}
+
+/// Windows: keep the machine from sleeping while this miner holds collateral (`holding`: a claim in
+/// flight or a lock on record). Asleep it proves nothing, and its locks run past their deadlines to a
+/// slash. The request belongs to the thread that makes it (`SetThreadExecutionState`), so a thread
+/// of its own makes it and keeps it. The display may still turn off, and a sleep asked for (the power
+/// button, the Start menu) still happens. Nothing elsewhere.
+fn keep_awake(holding: bool) {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HOLDING: AtomicBool = AtomicBool::new(false);
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        HOLDING.store(holding, Ordering::Relaxed);
+        STARTED.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("keep-awake".into())
+                .spawn(|| {
+                    extern "system" {
+                        fn SetThreadExecutionState(flags: u32) -> u32;
+                    }
+                    const ES_CONTINUOUS: u32 = 0x8000_0000;
+                    const ES_SYSTEM_REQUIRED: u32 = 0x0000_0001;
+                    let mut asked = false;
+                    loop {
+                        let want = HOLDING.load(Ordering::Relaxed);
+                        if want != asked {
+                            let flags = if want {
+                                ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                            } else {
+                                ES_CONTINUOUS
+                            };
+                            // SAFETY: takes a flag word only; no pointers, no ownership.
+                            unsafe { SetThreadExecutionState(flags) };
+                            tracing::debug!(
+                                "{}",
+                                if want {
+                                    "holding collateral: keeping Windows from sleeping"
+                                } else {
+                                    "no collateral held: Windows may sleep again"
+                                }
+                            );
+                            asked = want;
+                        }
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("could not keep Windows awake while holding collateral: {e}");
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = holding;
+}
+
+/// Why a lock this miner holds is not being worked on, recorded where its lifecycle let it go (kept
+/// through a pause, past its deadline, a failed release, a hand-back), for the Jobs page's held rows
+/// (`MinerState::kept_locks`). Dropped when a lifecycle takes the job up again.
+static KEPT_REASON: std::sync::Mutex<Option<std::collections::HashMap<B256, String>>> =
+    std::sync::Mutex::new(None);
+
+fn note_kept_reason(job_id: B256, reason: impl Into<String>) {
+    let reason = reason.into();
+    {
+        let mut g = KEPT_REASON.lock().unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        bounded_insert(m, job_id, reason.clone(), MEASURED_CYCLES_CAP);
+    }
+    // For the activity log and the row's notes, at the next brain tick (`refresh_kept_locks`), once
+    // per reason: a recovery pass keeps a lock for the same reason every few minutes.
+    let mut g = KEPT_ANNOUNCED.lock().unwrap_or_else(|p| p.into_inner());
+    let (said, pending) = g.get_or_insert_with(Default::default);
+    if said.get(&job_id) != Some(&reason) {
+        bounded_insert(said, job_id, reason.clone(), MEASURED_CYCLES_CAP);
+        pending.push((job_id, reason));
+    }
+}
+
+/// The last reason the activity log gave for each kept lock, and those still to log
+/// (`note_kept_reason`, drained by `refresh_kept_locks`).
+#[allow(clippy::type_complexity)]
+static KEPT_ANNOUNCED: std::sync::Mutex<
+    Option<(std::collections::HashMap<B256, String>, Vec<(B256, String)>)>,
+> = std::sync::Mutex::new(None);
+
+fn forget_kept_reason(job_id: B256) {
+    if let Some(m) = KEPT_REASON
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        m.remove(&job_id);
+    }
+    // Kept again later for the same reason (paused, lifted, paused again), it is logged again.
+    if let Some((said, _)) = KEPT_ANNOUNCED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        said.remove(&job_id);
+    }
+}
+
+fn kept_reason_of(job_id: B256) -> Option<String> {
+    KEPT_REASON
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&job_id).cloned())
+}
+
 /// Programs whose registry lists no ELF source (unregistered, or registered without URIs), with when
 /// that was seen. Every job of such a program is skipped by the candidate loop BEFORE the measure
 /// budget for `NO_ELF_SOURCE_TTL`, so a flood of decoys on one unregistered program costs one
 /// registry read per TTL, not a measure slot per job per tick. Self-healing: a later registration is
-/// picked up after the TTL.
-static NO_ELF_SOURCE: std::sync::Mutex<Option<std::collections::HashMap<B256, std::time::Instant>>> =
-    std::sync::Mutex::new(None);
+/// picked up after the TTL. Each entry is when it was marked and for how long (`NO_ELF_SOURCE_TTL`,
+/// or longer: [`rollout_backoff`]).
+static NO_ELF_SOURCE: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, (std::time::Instant, Duration)>>,
+> = std::sync::Mutex::new(None);
 const NO_ELF_SOURCE_TTL: Duration = Duration::from_secs(600);
 
 fn mark_program_no_elf_source(program_id: B256) {
+    mark_program_no_elf_source_for(program_id, NO_ELF_SOURCE_TTL);
+}
+
+/// [`mark_program_no_elf_source`] for `ttl`. A mark that already runs longer is kept.
+fn mark_program_no_elf_source_for(program_id: B256, ttl: Duration) {
     let mut g = NO_ELF_SOURCE.lock().unwrap_or_else(|p| p.into_inner());
     let m = g.get_or_insert_with(Default::default);
-    bounded_insert(m, program_id, std::time::Instant::now(), MEASURED_CYCLES_CAP);
+    let now = std::time::Instant::now();
+    if m.get(&program_id)
+        .is_some_and(|(at, held)| (*at + *held) > now + ttl)
+    {
+        return;
+    }
+    bounded_insert(m, program_id, (now, ttl), MEASURED_CYCLES_CAP);
 }
 
 fn program_has_no_elf_source(program_id: B256) -> bool {
@@ -1834,7 +2925,7 @@ fn program_has_no_elf_source(program_id: B256) -> bool {
         return false;
     };
     match m.get(&program_id) {
-        Some(t) if t.elapsed() < NO_ELF_SOURCE_TTL => true,
+        Some((t, ttl)) if t.elapsed() < *ttl => true,
         Some(_) => {
             m.remove(&program_id);
             false
@@ -1844,15 +2935,16 @@ fn program_has_no_elf_source(program_id: B256) -> bool {
 }
 
 /// Back a job off for `wait`: the candidate loop skips it (measurement included) until then.
-fn note_job_retry_after(job_id: alloy::primitives::B256, wait: Duration) {
+/// Back `job_id` off for `wait`; `why` is what is said for it until then.
+fn note_job_retry_after(job_id: alloy::primitives::B256, wait: Duration, why: &'static str) {
     if let Ok(mut m) = claim_retry_after_map().lock() {
         let now = std::time::Instant::now();
         // Full: drop the expired first, so the bound evicts a live back-off (re-admitting a decoy
         // early) only when every entry is live.
         if m.len() >= MEASURED_CYCLES_CAP {
-            m.retain(|_, until| *until > now);
+            m.retain(|_, (until, _)| *until > now);
         }
-        bounded_insert(&mut m, job_id, now + wait, MEASURED_CYCLES_CAP);
+        bounded_insert(&mut m, job_id, (now + wait, why), MEASURED_CYCLES_CAP);
     }
 }
 
@@ -1865,10 +2957,10 @@ static PRECLAIM_STRIKES: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn note_transient_preclaim_failure(job_id: alloy::primitives::B256) -> u32 {
-    note_preclaim_strike(job_id, 30)
+    note_preclaim_strike(job_id, 30, "backing off after a failed pre-claim step")
 }
 
-fn note_preclaim_strike(job_id: alloy::primitives::B256, base_secs: u64) -> u32 {
+fn note_preclaim_strike(job_id: alloy::primitives::B256, base_secs: u64, why: &'static str) -> u32 {
     let strikes = PRECLAIM_STRIKES.get_or_init(|| std::sync::Mutex::new(Default::default()));
     let k = match strikes.lock() {
         Ok(mut m) => {
@@ -1879,7 +2971,7 @@ fn note_preclaim_strike(job_id: alloy::primitives::B256, base_secs: u64) -> u32 
         Err(_) => 1,
     };
     let wait = Duration::from_secs(base_secs << (k - 1).min(6)).min(Duration::from_secs(1800));
-    note_job_retry_after(job_id, wait);
+    note_job_retry_after(job_id, wait, why);
     k
 }
 
@@ -1936,8 +3028,8 @@ static SET_ASIDE: std::sync::Mutex<Option<std::collections::HashMap<B256, std::t
 
 /// Back a job off for `wait` (see [`note_job_retry_after`]) on a verdict that lasts, so it also
 /// ranks last in the Open set (see [`open_rank`]).
-fn set_job_aside(job_id: B256, wait: Duration) {
-    note_job_retry_after(job_id, wait);
+fn set_job_aside(job_id: B256, wait: Duration, why: &'static str) {
+    note_job_retry_after(job_id, wait, why);
     let mut g = SET_ASIDE.lock().unwrap_or_else(|p| p.into_inner());
     let m = g.get_or_insert_with(Default::default);
     if m.len() >= MEASURED_CYCLES_CAP {
@@ -1952,6 +3044,40 @@ fn set_job_aside(job_id: B256, wait: Duration) {
     );
 }
 
+/// The reason given for a job the miner executed and could not measure: never claimed.
+const COULD_NOT_BE_MEASURED: &str =
+    "could not be measured (over the execute cycle cap, out of time, or a different journal at each size)";
+
+/// The reason given for a job whose proof attempt would outlast the per-attempt cap on the slowest
+/// card it could go to. Names where to raise it.
+const TOO_LONG_FOR_PROVING_TIMEOUT: &str =
+    "too long for the proving timeout (raise it in Settings)";
+
+/// Ends the back-off (and set-aside) of every job backed off for `why`; returns how many. For a
+/// verdict a setting decides, once the setting changes.
+fn release_set_aside_for(why: &'static str) -> usize {
+    let released: Vec<B256> = match claim_retry_after_map().lock() {
+        Ok(mut m) => {
+            let ids: Vec<B256> = m
+                .iter()
+                .filter(|(_, (_, w))| *w == why)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &ids {
+                m.remove(id);
+            }
+            ids
+        }
+        Err(_) => Vec::new(),
+    };
+    if let Some(m) = SET_ASIDE.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        for id in &released {
+            m.remove(id);
+        }
+    }
+    released.len()
+}
+
 /// What the candidate loop does with a job's witness route: `true` skips it this tick. A witness job
 /// the witness path serves is its; one this host does not serve is set aside for as long as that
 /// lasts, so it ranks last in the Open set (see [`open_rank`]) and stays out of the per-tick cut, as
@@ -1961,7 +3087,7 @@ fn witness_route_skips(job_id: B256, route: witness::Route) -> bool {
         witness::Route::Inline => false,
         witness::Route::Witness => true,
         witness::Route::WitnessUnserved { wait } => {
-            set_job_aside(job_id, wait);
+            set_job_aside(job_id, wait, "a witness job this host does not serve");
             true
         }
     }
@@ -1978,16 +3104,25 @@ fn job_set_aside(job_id: B256) -> bool {
         })
 }
 
+#[cfg(test)]
 fn claim_backing_off(job_id: alloy::primitives::B256) -> bool {
+    claim_backoff_reason(job_id).is_some()
+}
+
+/// Why `job_id` is backed off, while it is: the reason given when it was, not a generic "refused".
+/// Most back-offs are not refused claims at all (a verdict that lasts, a measurement of the same
+/// input in flight, a live bid), and showing every one as a refused claim told the operator nothing
+/// true about it.
+fn claim_backoff_reason(job_id: alloy::primitives::B256) -> Option<&'static str> {
     if let Ok(mut m) = claim_retry_after_map().lock() {
-        if let Some(&until) = m.get(&job_id) {
+        if let Some(&(until, why)) = m.get(&job_id) {
             if std::time::Instant::now() < until {
-                return true;
+                return Some(why);
             }
             m.remove(&job_id);
         }
     }
-    false
+    None
 }
 
 /// Journal bindings that a real fulfil showed unsatisfiable (`JournalMismatch`): the job's WHOLE
@@ -2255,6 +3390,8 @@ struct ResolvedMeasurement {
     peak_host_bytes: u64,
     /// The keccak of an image-id-verified risc0 ELF one of its sizes was measured from.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The registry `elf_hash` an SP1 measurement's ELF was fetched under.
+    registry_elf_hash: Option<alloy::primitives::B256>,
     /// The journal, when every size reported it and it was the same at all of them.
     journal: MeasuredJournal,
     /// The slowest execute, in whole seconds.
@@ -2267,6 +3404,7 @@ impl ResolvedMeasurement {
             cycles: UNMEASURABLE_CYCLES,
             peak_host_bytes: 0,
             verified_elf_hash: None,
+            registry_elf_hash: None,
             journal: None,
             execute_secs: 0,
         }
@@ -2297,7 +3435,13 @@ fn resolve_measured_at(
     for &po2 in sizes {
         let key = (backend_tag(backend), po2, program_id, input_hash);
         match m.get(&key) {
-            Some(e) if e.retry_after.is_some_and(|until| now >= until) => {
+            // Expired, or measured from an ELF the registry has since replaced (not this job's
+            // measurement any more): dropped, so the measure path sizes it again.
+            Some(e)
+                if e.retry_after.is_some_and(|until| now >= until)
+                    || e.registry_elf_hash
+                        .is_some_and(|h| registry_elf_hash_superseded(program_id, h)) =>
+            {
                 m.remove(&key);
                 missing = true;
             }
@@ -2327,6 +3471,7 @@ fn resolve_measured_at(
         cycles: entries.iter().map(|e| e.cycles).max().unwrap_or(0),
         peak_host_bytes: entries.iter().map(|e| e.peak_host_bytes).max().unwrap_or(0),
         verified_elf_hash: hash,
+        registry_elf_hash: entries.iter().find_map(|e| e.registry_elf_hash),
         journal,
         execute_secs: entries.iter().map(|e| e.execute_secs).max().unwrap_or(0),
     })
@@ -2521,6 +3666,23 @@ fn fmt_hemi(wei: u128) -> String {
     format!("{whole}.{cents:02}")
 }
 
+/// Render a wei amount as ETH with its unit, e.g. "0.0400 ETH" (gas balances are fractions of an
+/// ETH, so whole-ETH or raw-wei text tells the operator nothing): 4 decimals, 6 below 0.01 ETH so a
+/// small balance and a small need do not print the same. `up` rounds up (for an amount needed).
+fn fmt_eth(wei: u128, up: bool) -> String {
+    const ONE_ETH: u128 = 1_000_000_000_000_000_000;
+    let places: u32 = if wei < ONE_ETH / 100 { 6 } else { 4 };
+    let unit = ONE_ETH / 10u128.pow(places);
+    let units = wei / unit + u128::from(up && !wei.is_multiple_of(unit));
+    let scale = 10u128.pow(places);
+    format!(
+        "{}.{:0width$} ETH",
+        units / scale,
+        units % scale,
+        width = places as usize
+    )
+}
+
 /// Build the collateral-starvation warning.
 ///
 /// A FUNCTION, not two inline format! calls, because there are two output channels (the
@@ -2546,6 +3708,106 @@ pub(crate) fn collateral_warning(
     )
 }
 
+/// Windows: what `main` does when `zkminer run` refuses its account
+/// (`windows_sandbox::account_refusal`, the text `refusal`), given the lock journal (`journal`:
+/// `None` for a run that holds no locks, watch-only or mock). `Ok(refusal)`: the journal holds
+/// locks, so release them first ([`release_for_refused_account`]); `Err(text)`: refuse at once,
+/// with `text`. A LocalSystem service upgraded in place to a build that refuses it would otherwise
+/// leave every lock it holds undriven until slashed (review 5 X-G).
+#[cfg(windows)]
+pub(crate) fn refused_account_mode(
+    refusal: String,
+    journal: Option<Result<JobJournal, crate::journal::JournalLoadError>>,
+) -> std::result::Result<String, String> {
+    match journal {
+        None => Err(refusal),
+        Some(Err(e)) => Err(format!(
+            "{refusal}\n\nThe job journal could not be read ({e}), so the locks it records (if \
+             any) are not released: start this build as a dedicated standard user, or the build \
+             that wrote it with {ALLOW}=1, to drive them",
+            ALLOW = zkminer_prover::windows_sandbox::ALLOW_PRIVILEGED_ACCOUNT_ENV
+        )),
+        Some(Ok(j)) if j.entries.is_empty() => Err(refusal),
+        Some(Ok(_)) => Ok(refusal),
+    }
+}
+
+/// Windows: `zkminer run` refused its account (`refusal`, see [`refused_account_mode`]) with locks
+/// in the journal. Proving them would run requesters' guests as that account, and refusing outright
+/// strands them until they are slashed; so it holds them, starting no worker and taking no claim,
+/// pages, and releases each only as its cutoff comes within the keep horizon (`release_held`: all
+/// at once), answering `zkminer stop` meanwhile. See `refused`.
+#[cfg(windows)]
+pub async fn release_for_refused_account(
+    config_path: Option<&Path>,
+    refusal: &str,
+    release_held: bool,
+) -> Result<()> {
+    refused::hold_and_release(config_path, refusal, release_held).await
+}
+
+#[cfg(all(test, windows))]
+mod refused_account_tests {
+    use super::*;
+
+    /// A refused account releases held locks first only for a run that holds them: a journal with
+    /// entries. An empty one, none (watch-only, mock) and an unreadable one refuse at once, the
+    /// last saying its locks are not released.
+    #[test]
+    fn a_refused_account_releases_held_locks_first() {
+        let refusal = || "refusing to run as LocalSystem".to_string();
+        assert_eq!(refused_account_mode(refusal(), None), Err(refusal()));
+        assert_eq!(
+            refused_account_mode(refusal(), Some(Ok(JobJournal::default()))),
+            Err(refusal())
+        );
+        let mut held = JobJournal::default();
+        held.record_claim_intent(B256::repeat_byte(7), 1_900_000_000, None);
+        assert_eq!(
+            refused_account_mode(refusal(), Some(Ok(held))),
+            Ok(refusal())
+        );
+        let unreadable = crate::journal::JournalLoadError::NewerFormat {
+            path: PathBuf::from("job_journal.json"),
+            found: 99,
+        };
+        let text = refused_account_mode(refusal(), Some(Err(unreadable))).unwrap_err();
+        assert!(
+            text.starts_with(&refusal()) && text.contains("not released"),
+            "{text}"
+        );
+    }
+}
+
+/// Windows, with Low-integrity workers: the key file (if `config` names one), `.env` and the journal
+/// labelled unreadable to them before any worker starts (`windows_sandbox::protect_secrets`). Every
+/// command that starts workers calls it first.
+#[cfg(windows)]
+pub(crate) fn protect_secrets(config: &ZkMinerConfig) {
+    zkminer_prover::windows_sandbox::protect_secrets(
+        (config.wallet.key_source == "file")
+            .then(|| config.wallet.key_file_path.as_deref().map(Path::new))
+            .flatten(),
+        (config.wallet.key_source == "env").then_some(config.wallet.key_env_var.as_str()),
+        &JobJournal::default_path(),
+    );
+}
+
+/// Windows: page the crashes recorded since the last start (`windows_crash`), each once.
+#[cfg(windows)]
+fn page_previous_crashes() {
+    if let Some(lines) = zkminer_prover::windows_crash::take_previous_crashes() {
+        tracing::error!(
+            "PAGE: MINER-CRASHED — the miner crashed since its last start and was ended with the \
+             exception's code (recorded in {}): {}",
+            zkminer_prover::windows_crash::crash_dir()
+                .map(|d| d.join("crash.log").display().to_string())
+                .unwrap_or_else(|| "crash.log".into()),
+            lines.lines().collect::<Vec<_>>().join(" | ")
+        );
+    }
+}
+
 pub async fn run(
     config_path: Option<&Path>,
     headless: bool,
@@ -2553,11 +3815,108 @@ pub async fn run(
 ) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
+    // Windows, with Low-integrity workers: the key file, `.env` and the journal unreadable to them.
+    #[cfg(windows)]
+    protect_secrets(&config);
+    // Windows: a service account `main` was told to let through, or an elevated token, paged.
+    #[cfg(windows)]
+    zkminer_prover::windows_sandbox::page_account_risk();
+    // Windows, as a service: a password that can expire fails a later start's logon (OJ-1).
+    #[cfg(windows)]
+    if zkminer_prover::windows_account::is_service_logon().unwrap_or(false) {
+        super::windows_service::watch_own_password();
+    }
+    // Windows: the privileges `main` removed from this process (and so from its workers), or a
+    // page if it could not and was told to start anyway.
+    #[cfg(windows)]
+    zkminer_prover::windows_account::log_startup_strip();
+    // Windows: a crash of an earlier run, which its crash handler recorded.
+    #[cfg(windows)]
+    page_previous_crashes();
+    // Windows, an `env` key: a copy of its variable kept in the registry outlives its removal from
+    // this process, readable there by every user of this PC (the machine's or a service's
+    // environment) or by every process of this one (`setx`). Not a refusal: the key is out
+    // already, and refusing would only leave held locks undriven.
+    #[cfg(windows)]
+    if config.wallet.key_source == "env" {
+        for copy in zkminer_config::wallet_win::persisted_key_env_copies(&config.wallet.key_env_var)
+        {
+            let steps = zkminer_config::wallet::key_env_move_steps(
+                &config.wallet.key_env_var,
+                &copy.location,
+            );
+            if copy.machine_wide {
+                tracing::error!(
+                    "PAGE: KEY-IN-MACHINE-ENVIRONMENT — {} holds the signing key's variable, \
+                     which every user of this PC can read; move the key to a key file only the \
+                     miner's account can read: {steps}",
+                    copy.location
+                );
+            } else {
+                tracing::warn!(
+                    "{} holds the signing key's variable, which every process of this user can \
+                     read, Low-integrity workers included; move the key to a key file: {steps}",
+                    copy.location
+                );
+            }
+        }
+    }
+    // Linux: a key file, or the unit's environment file, that other users of the host can read
+    // or change (review r6 LS1). Not a refusal, as on Windows.
+    #[cfg(target_os = "linux")]
+    for msg in file_access::key_file_pages(&config.wallet) {
+        tracing::error!("{msg}");
+        note_page(msg);
+    }
     if let Some(banner) = config.dev_mode_banner() {
         tracing::warn!("{banner}");
     }
     if watch.is_none() {
-        hold_instance_lock()?;
+        hold_instance_lock("miner")?;
+        // Another miner of this user (another user's may well have its own key): a warning, as
+        // it may use another key of ours too.
+        let others = super::signer_guard::other_running_miners_of_this_user();
+        if !others.is_empty() {
+            tracing::warn!(
+                "another `zkminer run` of this user is running on this host (pid {others:?}), \
+                 under another home. If it uses this key, stop one of them now: two miners on one \
+                 key replace each other's transactions and drive (and release) each other's locks."
+            );
+        }
+        // A stop request left from before this start (one no miner picked up) must not stop this
+        // one. Requests made from here on are for this miner: it reads them once it is running.
+        match std::fs::remove_file(stop_request_path()) {
+            Ok(()) => tracing::warn!(
+                "removed a stale stop request ({}) left from before this start",
+                stop_request_path().display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!(
+                "cannot remove the stale stop request {}: {e} — remove it, or this miner would \
+                 stop as soon as it starts",
+                stop_request_path().display()
+            ),
+        }
+        // Root: allowed (the dashboard's GPU tuning needs it), but said loudly on a bare host.
+        #[cfg(target_os = "linux")]
+        {
+            let root = privilege::root_run_here();
+            if let Some(msg) = privilege::startup_line(root) {
+                if root == privilege::RootRun::BareHost {
+                    tracing::error!("{msg}");
+                    note_page(msg);
+                } else {
+                    tracing::warn!("{msg}");
+                }
+            }
+        }
+        // Workers with no memory ceiling (no delegated cgroup, no user manager): a PAGE, once, at
+        // start-up; each spawn still logs its own warning (review r4 LD1).
+        #[cfg(target_os = "linux")]
+        if let Some(msg) = zkminer_prover::containment::workers_uncapped_page() {
+            tracing::error!("{msg}");
+            note_page(msg);
+        }
     }
     // The lock journal, read before anything starts. One this build must not rewrite (a newer format)
     // or cannot read is left as it is, and this run drives only the locks it holds (the chain scan
@@ -2588,6 +3947,7 @@ pub async fn run(
     let splash = zkminer_tui::splash::Splash::start(!headless);
     splash.status("Connecting to the chain");
     let queue_horizon_secs = config.prover.queue_horizon_secs;
+    collateral::set_stake_fraction(config.prover.max_locked_stake_fraction);
     let client = match watch {
         Some(w) => {
             WATCH_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2621,6 +3981,33 @@ pub async fn run(
         }
         None => ChainClient::new(&config, load_signer(&config.wallet)?).await?,
     };
+    // Review 7 WR-1: a journal whose locks belong to another address (the key changed: a new key
+    // file, a config rewritten) is not taken over: recovery would drop each of those locks as
+    // "held by another prover", to be slashed. Refused unless the operator says so.
+    if !watch_only() {
+        if let Some(why) = loaded_journal.key_changed_refusal(client.address) {
+            let forget = FORGET_FOREIGN_LOCKS.load(std::sync::atomic::Ordering::SeqCst);
+            let msg = if forget {
+                format!(
+                    "PAGE: KEY-CHANGED — {why}. --forget-foreign-locks was given: starting, and \
+                     those locks are dropped as another prover's"
+                )
+            } else {
+                format!("PAGE: KEY-CHANGED — refusing to start: {why}")
+            };
+            tracing::error!("{msg}");
+            note_page(msg.clone());
+            if !forget {
+                anyhow::bail!("{msg}");
+            }
+            if let Some(previous) = loaded_journal.prover {
+                crate::journal::set_previous_owner(previous);
+            }
+        }
+        crate::journal::set_owner(client.address);
+    }
+    // Before the first state read, which it watches; a watch-only run never writes it.
+    slash_latch::init(client.chain_id, client.address, !watch_only());
 
     splash.status("Verifying the deployment contracts");
     // Before ANY transaction (handoff §13 tests 1-2): the configured stack must be the live
@@ -2712,6 +4099,19 @@ pub async fn run(
         ),
     }
     let state = new_shared_state();
+    // A job's claim, fulfil and release transactions say what they are waiting on as it happens
+    // (`zkminer_chain::tx_events`), for its status line (`MinerState::on_tx_event`).
+    {
+        let state = state.clone();
+        zkminer_chain::tx_events::set_tx_observer(move |job_id, kind, event| {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let state = state.clone();
+                handle.spawn(async move {
+                    state.write().await.on_tx_event(job_id, kind, event);
+                });
+            }
+        });
+    }
 
     // Initialize worker pool (before TUI, after config load)
     let benchmark_timeout = config.prover.benchmark_timeout();
@@ -2730,6 +4130,10 @@ pub async fn run(
             .collect(),
         benchmark_timeout,
     );
+    // Each card's SP1 shard-size cap, recorded when a job that ran out of GPU memory there
+    // proved at a smaller size.
+    pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());
+    pool.use_host_peaks(zkminer_prover::host_peaks::default_path());
     // A risc0 worker confines itself before its first guest, to what it is told of now: for witness
     // proofs, the retention store it reads `W` from and the segment directories it writes.
     if let Some(r) = &config.retention {
@@ -2764,6 +4168,61 @@ pub async fn run(
     }
     let found = zkminer_tui::splash::found_summary(&pool.started_provers());
     let mut startup_problems = pool.startup_problems().to_vec();
+    // What each card can prove, and why not, in every mode: the log has every row, the dashboard's
+    // activity log and the splash the ones that need attention.
+    {
+        let sizes: super::capability::Risc0Sizes = config
+            .prover
+            .risc0_job_po2
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let suite = tokio::task::spawn_blocking(zkminer_prover::benchmark::load_cached_benchmark)
+            .await
+            .ok()
+            .flatten();
+        let rows = super::capability::rows(
+            &pool.worker_survey(),
+            &served_backends(),
+            &sizes,
+            suite.as_ref(),
+        );
+        tracing::info!("What this host can prove (`zkminer doctor` checks it again):");
+        let mut attention = Vec::new();
+        for (row, line) in rows.iter().zip(super::capability::lines(&rows)) {
+            if row.verdict.is_ready() {
+                tracing::info!("  {line}");
+            } else {
+                tracing::warn!("  {line}");
+                attention.push(line);
+            }
+        }
+        if !super::capability::anything_proves(&rows) && !watch_only() {
+            tracing::error!(
+                "PAGE: nothing on this host can prove a job this miner claims, so it will claim \
+                 none. See the lines above, or run `zkminer doctor`."
+            );
+        }
+        {
+            let mut st = state.write().await;
+            for line in &attention {
+                st.add_log(zkminer_tui::state::LogLevel::Warn, line.clone());
+            }
+        }
+        // On the splash, a few seconds each: the first three, then a pointer to the rest. A worker
+        // that failed to start is already there.
+        let new: Vec<String> = attention
+            .into_iter()
+            .filter(|l| !l.contains("its worker failed to start"))
+            .collect();
+        let more = new.len().saturating_sub(3);
+        startup_problems.extend(new.into_iter().take(3));
+        if more > 0 {
+            startup_problems.push(format!(
+                "{more} more — see the activity log, or run `zkminer doctor`"
+            ));
+        }
+    }
     init_worker_pool(pool);
     // SP1's one-time setup, in the background: SP1 jobs are not claimed until it is done (see the
     // pre-claim gate), and everything else proceeds meanwhile. Not when watching: it proves on the
@@ -2870,13 +4329,13 @@ pub async fn run(
         s.runtime_settings.system_power_watts = config.prover.system_power_watts;
         s.runtime_settings.token_price_usd = config.prover.token_price_usd;
         s.runtime_settings.gas_cost_usd = config.prover.gas_cost_usd;
+        s.runtime_settings.proving_timeout_secs = config.prover.proving_timeout_secs();
         s.runtime_settings.risc0_job_po2_config = config.prover.risc0_job_po2.clone();
         // Default TRUE: every open-market job is journal-bound, and each is claimed only when the
         // journal its (program, input) measured satisfies its binding.
         s.runtime_settings.claim_predicate_jobs = config.chain.claim_predicate_jobs.unwrap_or(true);
 
         s.address = format!("{}", client.address);
-        s.connected = true;
         s.chain_id = config.chain.chain_id;
         if let Some(banner) = config.dev_mode_banner() {
             s.dev_private_network = true;
@@ -2895,6 +4354,7 @@ pub async fn run(
         match client.get_refresh_batch().await {
             Ok(data) => {
                 hydrated = true;
+                slash_latch::observe(data.stats.as_ref(), data.stake.as_ref());
                 if let Some(block) = data.head {
                     s.block_number = block;
                 }
@@ -2912,7 +4372,15 @@ pub async fn run(
                     let locked = fmt_hemi(stake.locked_collateral);
                     let total = fmt_hemi(stake.total_staked);
                     tracing::info!(
-                        "Collateral: {avail} HEMI available, {locked} locked, {total} staked"
+                        "Collateral: {avail} HEMI available, {locked} locked, {total} staked; locks \
+                         held here may come to {} HEMI together ({:.0}% of the stake, {})",
+                        fmt_hemi(
+                            collateral::stake_policy()
+                                .cap(stake.total_staked)
+                                .unwrap_or(stake.total_staked)
+                        ),
+                        collateral::stake_fraction() * 100.0,
+                        collateral::STAKE_FRACTION_KEY,
                     );
                     if stake.total_staked > 0
                         && stake.available_collateral < stake.total_staked / 10
@@ -3148,7 +4616,15 @@ pub async fn run(
                 MonitorEvent::JobClaimed { job_id, prover, .. } => {
                     forget_job_bound(job_id);
                     let before = s.open_jobs.len();
-                    s.open_jobs.retain(|j| j.info.job_id != job_id);
+                    // Our own claim's row stays until its lifecycle moves it to the claimed list
+                    // (a few seconds later): taken off here, it was in no list in between.
+                    let ours = prover == backfill_client.address
+                        && s.job_notes
+                            .get(&job_id)
+                            .is_some_and(|n| n.kind == zkminer_tui::state::JobNoteKind::Claim);
+                    if !ours {
+                        s.open_jobs.retain(|j| j.info.job_id != job_id);
+                    }
                     if s.open_jobs.len() != before {
                         tracing::debug!(
                             "pruned claimed job {} from candidates (prover {})",
@@ -3222,7 +4698,9 @@ pub async fn run(
                 let mut s = state_refresh.write().await;
                 s.rpc_total = rpc_total;
                 s.rpc_last_minute = rpc_min;
+                s.claims_latched = slash_latch::tripped().map(|t| t.summary());
             }
+            slash_latch::page_again_if_due();
             // 429 CIRCUIT-BREAKER: while the endpoint is rate-limiting, SKIP the
             // Multicall3 refresh — it would just deepen the backlog, and its OWN 429 re-arms
             // the backoff meter every 15s, which would keep the brain's
@@ -3245,6 +4723,10 @@ pub async fn run(
             // done OUTSIDE the state lock so we don't hold it during I/O.
             match refresh_client.get_refresh_batch().await {
                 Ok(data) => {
+                    slash_latch::observe(data.stats.as_ref(), data.stake.as_ref());
+                    // A fall held for the chain's events (also one carried over a restart): one
+                    // small eth_getLogs, outside every lock; nothing when none is pending.
+                    slash_latch::explain_pending(&refresh_client).await;
                     let mut s = state_refresh.write().await;
                     // Apply each field only if its sub-call succeeded; a single
                     // failed read never wipes the others (they share one snapshot).
@@ -3304,6 +4786,8 @@ pub async fn run(
         while let Some(output) = rx.recv().await {
             let mut s = state_hw.write().await;
             zkminer_tui::hardware::apply_hw_snapshot(&mut s, output);
+            // On the same 2 s beat: a proof's bar never moves back between its worker's reports.
+            s.refresh_proving_floors();
         }
     });
 
@@ -3325,8 +4809,17 @@ pub async fn run(
     let brain_state = state.clone();
     // Read at the start (see `loaded_journal`).
     let journal: SharedJournal = Arc::new(Mutex::new(loaded_journal));
+    // Locks on record from the last run: awake through startup and recovery, before the first tick.
+    keep_awake(
+        !journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .is_empty(),
+    );
     let brain_journal = journal.clone();
-    let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs.max(60));
+    // The startup value; the brain re-reads the Settings screen's every pass.
+    let proving_timeout = Duration::from_secs(config.prover.proving_timeout_secs().max(60));
     // Witness-construction jobs (docs/witness-construction-jobs.md §18): the retention store, the
     // sandbox and broker self-tests and the broker, before the brain can see a witness job. Any
     // failure leaves witness serving off with a page; inline jobs are unaffected.
@@ -3361,6 +4854,8 @@ pub async fn run(
         )
         .await;
     });
+    // Chain-loss pages and the outage worker recycle; nothing to watch in a watch-only run.
+    let watch_handle = (!watch_only()).then(|| chain_watch::spawn(state.clone(), journal.clone()));
 
     // Escalating shutdown. Each signal advances one stage:
     //   1st -> DRAIN   : stop claiming, let in-flight proofs FINISH and fulfil.
@@ -3410,6 +4905,27 @@ pub async fn run(
             // disposition either, so the operator's escalating Ctrl+C would silently no-op.
             // `sigterm` is hoisted for exactly this reason; keep the two symmetric.
             let mut sigint = signal(SignalKind::interrupt()).ok();
+            // The dashboard's terminal closing (an SSH session dropping, a terminal window shut).
+            // Unlike SIGTERM nothing follows it, so it starts a plain drain (the proofs in flight
+            // finish, and `zkminer stop` from a new session can still change course), and it
+            // never escalates: a closing session usually sends it twice, and a stop already chosen
+            // stays as chosen.
+            // Listened for whenever stdout is a terminal (the dashboard, or `--headless` in an SSH
+            // session, which the default disposition would kill outright, releasing nothing): a
+            // `nohup` miner has stdout redirected, and keeps ignoring it.
+            let mut sighup = {
+                use std::io::IsTerminal;
+                // Any of the three: `run --headless | tee log` over SSH has stdout on a pipe but
+                // still dies with the session. `nohup` takes all three off the terminal.
+                if std::io::stdout().is_terminal()
+                    || std::io::stderr().is_terminal()
+                    || std::io::stdin().is_terminal()
+                {
+                    signal(SignalKind::hangup()).ok()
+                } else {
+                    None
+                }
+            };
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -3435,27 +4951,54 @@ pub async fn run(
                     }
                 }
             };
-            // In TUI mode the quit KEY already advanced the ladder to stage 1 (DRAIN is
-            // running by the time we get here), so the operator's first Ctrl+C must mean
-            // ABANDON — not a second "draining" message that does nothing.
-            let mut n = if headless { 0u8 } else { 1u8 };
+            // Each signal advances from the stage the ladder is at, however it got there: the
+            // dashboard's quit prompt and `zkminer stop` advance it too (`apply_stop_request`), so
+            // a Ctrl+C after a drain began there must mean ABANDON — not a second "draining"
+            // message that does nothing.
+            let mut n = 0u8;
             loop {
                 // A supervisor (systemd/docker) sends exactly ONE catchable signal and then
                 // SIGKILLs after its grace period — nobody is there to press Ctrl+C twice.
                 // So SIGTERM gets a SHORT drain that auto-escalates to ABANDON, while SIGINT
                 // (a human at a terminal, who can escalate) keeps the long drain.
-                let supervised = match sigint.as_mut() {
+                let hangup = async {
+                    match sighup.as_mut() {
+                        Some(h) => {
+                            h.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                // (supervised, hung up)
+                let (supervised, hung_up) = match sigint.as_mut() {
                     Some(si) => tokio::select! {
-                        _ = si.recv() => false,
-                        _ = sigterm.recv() => true,
+                        _ = si.recv() => (false, false),
+                        _ = sigterm.recv() => (true, false),
+                        _ = hangup => (false, true),
                     },
                     // SIGINT registration failed: degrade to a per-iteration listener rather
                     // than losing SIGINT entirely.
                     None => tokio::select! {
-                        _ = tokio::signal::ctrl_c() => false,
-                        _ = sigterm.recv() => true,
+                        _ = tokio::signal::ctrl_c() => (false, false),
+                        _ = sigterm.recv() => (true, false),
+                        _ = hangup => (false, true),
                     },
                 };
+                if hung_up && n.max(*sig_tx.borrow()) >= 1 {
+                    tracing::warn!("the terminal closed during the stop; it goes on as chosen");
+                    continue;
+                }
+                if *sig_tx.borrow() >= 2 && n < 2 {
+                    // ABANDON came from `zkminer stop --abandon`, the dashboard or the drain:
+                    // this is the first signal to see it, so it does not force an exit yet. A
+                    // supervisor's SIGTERM still shortens the release wait to its grace.
+                    if supervised {
+                        SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    n = 2;
+                    shutdown_say(&sig_state, ALREADY_RELEASING_MSG).await;
+                    continue;
+                }
                 if supervised {
                     SUPERVISED_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -3466,72 +5009,85 @@ pub async fn run(
                     st.shutdown_requested = true;
                     st.paused = true;
                 }
-                n = n.saturating_add(1);
+                n = n.max(*sig_tx.borrow()).saturating_add(1);
                 match n {
                     // Wording must match what actually happens: with
                     // SUPERVISED_DRAIN_TIMEOUT == ZERO a supervised stop abandons on the same
                     // tick, so promising "signal again to ABANDON" there would be a lie — and
                     // this line is the only thing the operator sees.
-                    1 if supervised => println!(
-                        "\nSUPERVISED STOP — releasing held jobs now (no drain: a supervisor \
-                         will SIGKILL before any proof could finish)."
-                    ),
-                    1 => println!(
-                        "\nDRAINING — finishing in-flight proofs, no new claims. \
-                         Signal again to ABANDON (release jobs), a third time to force-exit."
-                    ),
-                    2 => println!("\nABANDONING — releasing jobs, nearest deadline first..."),
-                    _ => {
-                        eprintln!("\nForce exit — in-flight jobs left locked on-chain.");
-                        // Reap workers first. SP1's `sp1-gpu-server` is a GRANDCHILD
-                        // that does NOT die with us; it can keep ~11.5 GB of VRAM allocated
-                        // after the parent exited.
-                        //
-                        // BOUNDED, because `shutdown_all` is not: its phase 4 takes a
-                        // BLOCKING slot lock, while phases 2/3 skip any slot whose `pid` is
-                        // momentarily 0 — the respawn/recycle window (dispatcher.rs, where
-                        // the pid is zeroed before the handle is dropped and only restored
-                        // after `ensure_alive`). Such a worker is never signalled, so the
-                        // lock it holds is not released until its whole proof finishes (up
-                        // to the 600s watchdog). The "Force exit" print therefore comes BEFORE
-                        // this call, and the third signal must terminate regardless: reap
-                        // off-thread and cap the wait (a normal reap takes ~2.2s).
-                        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-                        std::thread::spawn(move || {
-                            if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                                pool.close();
-                            }
-                            let _ = done_tx.send(());
-                        });
-                        if done_rx
-                            .recv_timeout(std::time::Duration::from_secs(10))
-                            .is_err()
-                        {
-                            eprintln!(
-                                "worker reap did not finish in 10s — exiting anyway; check for \
-                                 an orphaned sp1-gpu-server holding VRAM."
-                            );
-                        }
-                        std::process::exit(130);
+                    1 if keep_in_progress() => shutdown_say(&sig_state, KEEP_SIGNAL_MSG).await,
+                    1 if supervised => {
+                        shutdown_say(
+                            &sig_state,
+                            "\nSUPERVISED STOP — releasing held jobs now (no drain: a supervisor \
+                             will SIGKILL before any proof could finish).",
+                        )
+                        .await
                     }
+                    1 => {
+                        shutdown_say(
+                            &sig_state,
+                            "\nDRAINING — finishing in-flight proofs, no new claims. Signal again \
+                             (or run `zkminer stop --abandon`) to ABANDON (release jobs), a third \
+                             time to force-exit.",
+                        )
+                        .await
+                    }
+                    2 if keep_in_progress() => shutdown_say(&sig_state, KEEP_SIGNAL_MSG).await,
+                    2 => match begin_abandon() {
+                        Ok(()) => {
+                            shutdown_say(
+                                &sig_state,
+                                "\nABANDONING — releasing jobs, nearest deadline first...",
+                            )
+                            .await
+                        }
+                        Err(why) => shutdown_say(&sig_state, why).await,
+                    },
+                    _ => force_exit(),
                 }
-                let _ = sig_tx.send(n);
+                raise_stage(&sig_tx, n);
             }
         });
     }
 
+    // Windows: the console's control events drive the same ladder (see `signals_windows`).
+    #[cfg(windows)]
+    super::signals_windows::spawn(sig_tx.clone(), state.clone());
+
+    // Stops asked for at the dashboard's quit prompt or by `zkminer stop` (watch-only takes none: it
+    // holds no instance lock, and may run beside the real miner).
+    if !watch_only() {
+        spawn_stop_watcher(sig_tx.clone(), state.clone());
+    }
+    spawn_spill_publisher(state.clone());
+
+    // The dashboard, when there is one. It stays open through the shutdown below and closes when
+    // the miner is about to exit.
+    let mut tui_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
     if headless {
-        println!("zkminer running in headless mode. Press Ctrl+C to stop.");
+        // Watch-only takes no stop requests (it may share a home with the real miner, which
+        // `zkminer stop` would stop).
+        println!(
+            "zkminer running in headless mode. Press Ctrl+C{} to stop (it finishes the jobs in \
+             flight first). SIGTERM (`kill`, `docker stop`, a plain systemd stop) releases every \
+             held job at once, at a 5-30% penalty each.",
+            if watch_only() {
+                ""
+            } else {
+                " (or run `zkminer stop`)"
+            }
+        );
         // Wait for the FIRST signal.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         while *sig_rx.borrow() == 0 {
             if sig_rx.changed().await.is_err() {
                 break;
             }
         }
-        // Non-unix has no signal task; fall back to plain Ctrl-C so headless does not
+        // Elsewhere there is no signal task; fall back to plain Ctrl-C so headless does not
         // park forever waiting on a channel nothing ever sends to.
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             tokio::signal::ctrl_c().await?;
             println!("\nShutting down...");
@@ -3547,14 +5103,48 @@ pub async fn run(
         // then ride past the lock deadline, after which releaseJob reverts permanently) and
         // the SP1 gpu-server grandchild holding its VRAM. Log and fall through instead.
         drop(splash);
-        let tui_result = zkminer_tui::run_tui(state.clone(), Some(client.clone())).await;
-        // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard —
-        // release the signal handler so the drain below still has the abandon/force ladder.
+        // Quitting then asks how to stop and hands the answer to the stop watcher, and the
+        // dashboard stays open through the shutdown with its keys (abandon, keep locks, force).
+        {
+            let mut st = state.write().await;
+            st.stop_handled_by_miner = true;
+            st.release_margin_secs = RESTART_BY_SECS;
+            st.keep_horizon_secs = RESTART_BY_SECS + KEEP_LOCKS_EXIT_SLACK_SECS;
+        }
+        TUI_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tui = tokio::spawn(zkminer_tui::run_tui(state.clone(), Some(client.clone())));
+        // Wait for a stop to begin, or for the dashboard to end on its own (an error).
+        let ended = loop {
+            if *sig_rx.borrow() >= 1 {
+                break None;
+            }
+            tokio::select! {
+                r = &mut tui => break Some(r),
+                c = sig_rx.changed() => if c.is_err() { break None },
+            }
+        };
+        match ended {
+            None => tui_task = Some(tui),
+            Some(r) => {
+                // Terminal is restored (raw mode off) and the TUI no longer owns the keyboard.
+                TUI_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+                match r {
+                    Ok(Ok(())) => tracing::warn!("the dashboard closed — stopping (draining)"),
+                    Ok(Err(e)) => {
+                        tracing::error!(
+                            "TUI exited with an error: {e:#} — continuing into shutdown"
+                        )
+                    }
+                    Err(e) => {
+                        tracing::error!("TUI task failed: {e} — continuing into shutdown")
+                    }
+                }
+                raise_stage(&sig_tx, 1);
+            }
+        }
+        // Release the signal handler so the drain below still has the abandon/force ladder.
         #[cfg(unix)]
         let _ = tui_done_tx.send(());
-        if let Err(e) = tui_result {
-            tracing::error!("TUI exited with an error: {e:#} — continuing into shutdown");
-        }
     }
 
     // ---- Shutdown -----------------------------------------------------------------
@@ -3573,9 +5163,21 @@ pub async fn run(
     if let Some(w) = &witness_rt {
         w.shutdown();
     }
+    set_ladder_phase(PHASE_DRAINING);
+    shutdown_stage(
+        &state,
+        if ladder_phase() == PHASE_KEEPING {
+            zkminer_tui::state::ShutdownStage::KeepingLocks
+        } else {
+            zkminer_tui::state::ShutdownStage::Draining
+        },
+    )
+    .await;
     monitor_handle.abort();
     event_handle.abort();
-    hw_handle.abort();
+    // `hw_handle` is NOT aborted here: the dashboard stays open through the drain, and the cards'
+    // figures (load, clocks, temperature, power) are what shows the proofs still running. Stopping
+    // it froze every card at the moment the drain began. Aborted at the end, with the brain.
     // brain_handle is NOT aborted here. The claim of "per-job lifecycles are
     // independent spawned tasks" holds for the normal and batch paths (spawn_lifecycle_task)
     // but NOT for recovery: `recover_claimed_jobs` awaits `process_job_lifecycle` INLINE
@@ -3616,14 +5218,24 @@ pub async fn run(
     }
     let drain_deadline = std::time::Instant::now() + drain_budget;
     let mut abandoned = false;
+    // A keep-locks stop: leave without releasing (see `keeping_lock`).
+    let mut kept = false;
     // Lifecycle-less entries the drain already released at the margin (see the loop below).
     // Lifecycle-less entries the drain handed to release_and_clean, and when. Re-armed: a lock that
     // was KEPT (a pause, a Disabled adapter, an unreadable state) can become releasable mid-drain.
-    let mut drain_released: std::collections::HashMap<B256, std::time::Instant> =
-        std::collections::HashMap::new();
+    let mut drain_released: std::collections::HashMap<
+        B256,
+        (std::time::Instant, tokio::task::JoinHandle<()>),
+    > = std::collections::HashMap::new();
     loop {
+        // The keep first: during one, a stop signal raises the stage without abandoning.
+        if ladder_phase() == PHASE_KEEPING {
+            tracing::warn!("drain ended: keeping the locks for the next start");
+            kept = true;
+            break;
+        }
         if *sig_rx.borrow() >= 2 {
-            tracing::warn!("drain interrupted by second signal — abandoning");
+            tracing::warn!("drain interrupted — abandoning");
             abandoned = true;
             break;
         }
@@ -3649,6 +5261,17 @@ pub async fn run(
                     .map(|j| j.info.job_id)
                     .collect(),
             )
+        };
+        // Locks held that nothing works on (`MinerState::kept_locks` without a claimed row): a drain
+        // cannot finish them, so once only they are left it waited out its whole budget for
+        // nothing. They go to the abandon step's re-check at once instead, as at the timeout.
+        let idle_held: std::collections::HashSet<B256> = {
+            let s = state.read().await;
+            s.kept_locks
+                .iter()
+                .map(|j| j.info.job_id)
+                .filter(|id| !s.active_jobs.iter().any(|j| j.info.job_id == *id))
+                .collect()
         };
         let now_s = zkminer_chain::client::chain_now();
         // "Already past" decisions use the LOWER estimate, and only ABANDON can re-read the live
@@ -3705,6 +5328,14 @@ pub async fn run(
                 }
             }
         }
+        if !outstanding.is_empty() && outstanding.iter().all(|id| idle_held.contains(id)) {
+            tracing::warn!(
+                "drain: only {} lock(s) nothing is working on remain — to the abandon step",
+                outstanding.len()
+            );
+            abandoned = true;
+            break;
+        }
         // A stale zero-deadline breadcrumb has no lifecycle behind it and is INVISIBLE to the
         // nearest-deadline cut below (which filters `d > now_s`), so it must never leave by the
         // CLEAN exit — that is the one drain exit that skips ABANDON, and ABANDON's on-chain
@@ -3740,10 +5371,21 @@ pub async fn run(
                 let j = journal.lock().unwrap_or_else(|e| e.into_inner());
                 j.iter().count()
             };
+            if move_ladder_phase(&[PHASE_MINING, PHASE_DRAINING], PHASE_FINISHING).is_err()
+                && ladder_phase() == PHASE_KEEPING
+            {
+                // A keep-locks request answered "ok" during this pass: honour it (exit 75).
+                kept = true;
+                break;
+            }
             if retained == 0 {
                 tracing::info!("drain complete — no jobs in flight, journal empty");
                 if !headless {
-                    println!("Shutdown clean — no jobs held, no collateral at risk.");
+                    shutdown_say(
+                        &state,
+                        "Shutdown clean — no jobs held, no collateral at risk.",
+                    )
+                    .await;
                 }
             } else {
                 tracing::warn!(
@@ -3751,11 +5393,15 @@ pub async fn run(
                      breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper slash"
                 );
                 if !headless {
-                    println!(
-                        "Drain complete — nothing in flight, but {retained} past-deadline \
-                         breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper \
-                         slash — details in ~/.zkminer/logs/zkminer.log"
-                    );
+                    shutdown_say(
+                        &state,
+                        format!(
+                            "Drain complete — nothing in flight, but {retained} past-deadline \
+                             breadcrumb(s) remain: that collateral is STILL LOCKED until a keeper \
+                             slash — details in ~/.zkminer/logs/zkminer.log"
+                        ),
+                    )
+                    .await;
                 }
             }
             break;
@@ -3777,9 +5423,11 @@ pub async fn run(
             j.iter()
                 .filter(|e| {
                     !live.contains(&e.job_id)
-                        && drain_released
-                            .get(&e.job_id)
-                            .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+                        // Again only once the last one finished (its ladder runs for minutes) and
+                        // left the lock held: a second one meanwhile would only race it.
+                        && drain_released.get(&e.job_id).is_none_or(|(t, h)| {
+                            h.is_finished() && t.elapsed() >= Duration::from_secs(60)
+                        })
                 })
                 .filter(|e| {
                     if e.lock_deadline == 0 {
@@ -3802,14 +5450,14 @@ pub async fn run(
                 "drain: {} has no live lifecycle and reached the release margin — releasing it now",
                 short_id(jid)
             );
-            drain_released.insert(jid, std::time::Instant::now());
             let (c, st, jr, w) = (client.clone(), state.clone(), journal.clone(), witness_rt.clone());
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if let Some(w) = &w {
                     w.note_release(jid, "released by the shutdown drain at its release margin").await;
                 }
                 release_and_clean(&c, &st, &jr, jid).await;
             });
+            drain_released.insert(jid, (std::time::Instant::now(), handle));
         }
         // `Submitting` jobs are excluded from the ABANDON release list, so the DRAIN is
         // the ONLY stage that can still free their collateral — by letting the fulfil land
@@ -3847,16 +5495,23 @@ pub async fn run(
                 .join(", ")
         );
         // In TUI mode every line above goes to ~/.zkminer/logs/zkminer.log and NOTHING to the
-        // terminal, so the operator sees a blank screen for up to DRAIN_TIMEOUT and cannot tell
-        // a working drain from a wedged process — the usual response is a kill that strands
-        // collateral. The TUI has already restored the terminal by this point (the signal
-        // ladder above prints here too), so stdout is safe.
-        if !headless {
-            println!(
-                "draining: {} job(s) still proving — Ctrl+C to abandon and release now",
-                outstanding.len()
-            );
-        }
+        // terminal, so without this the operator could not tell a working drain from a wedged
+        // process — and the usual response is a kill that strands collateral. On the dashboard's
+        // shutdown panel while it is open, else on stdout.
+        shutdown_status(
+            &state,
+            headless,
+            format!(
+                "draining: {} job(s) still in flight{}",
+                outstanding.len(),
+                if tui_up() {
+                    ""
+                } else {
+                    " — Ctrl+C (or `zkminer stop --abandon`) to abandon and release now"
+                }
+            ),
+        )
+        .await;
         // Clamp the poll to the remaining budget. `drain_deadline` is only tested at loop
         // TOP, so an unclamped 5s quantum rounds the 6s supervised budget up to 10s — i.e.
         // `docker stop`'s ENTIRE grace period — and SIGKILL lands at the instant the loop
@@ -3871,13 +5526,179 @@ pub async fn run(
         }
     }
 
+    // 2b. KEEP LOCKS — let proofs already being submitted reach the chain, release the locks too
+    //     close to their cutoff for a restart to save them (through the ABANDON stage below,
+    //     restricted to them), then exit without releasing anything else: the journal keeps every
+    //     other lock for the next start's recovery, which re-proves each one there is still time
+    //     for and releases the rest. Exit 75, so a supervisor with `Restart=on-failure` starts the
+    //     miner again.
+    // The locks the ABANDON stage releases on this pass; `None` releases every lock it can.
+    let mut release_only: Option<std::collections::HashSet<B256>> = None;
+    if abandoned && ladder_phase() == PHASE_KEEPING {
+        // The drain gave up (its timeout, a stale claim intent) in the pass a keep-locks request
+        // won the phase: that request was answered "ok", so keep.
+        abandoned = false;
+        kept = true;
+    }
+    if kept {
+        shutdown_stage(&state, zkminer_tui::state::ShutdownStage::KeepingLocks).await;
+        let grace_end = std::time::Instant::now() + KEEP_LOCKS_SUBMIT_GRACE;
+        loop {
+            // Exempted at once, and again each second: a lifecycle reaching its release margin
+            // during this wait must be free to release, not held back by the keep.
+            exempt_from_keep(keep_too_close(&journal, &client));
+            if ladder_phase() == PHASE_ABANDONING {
+                tracing::warn!("keep-locks stop escalated — abandoning");
+                abandoned = true;
+                break;
+            }
+            let submitting = {
+                let s = state.read().await;
+                s.active_jobs
+                    .iter()
+                    .filter(|j| matches!(j.status, MinerJobStatus::Submitting))
+                    .count()
+            };
+            if submitting == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= grace_end {
+                tracing::warn!(
+                    "keep-locks: {submitting} proof(s) still being submitted after {}s — exiting \
+                     anyway; the next start re-checks them",
+                    KEEP_LOCKS_SUBMIT_GRACE.as_secs()
+                );
+                break;
+            }
+            shutdown_status(
+                &state,
+                headless,
+                format!("keeping locks: waiting for {submitting} proof(s) being submitted"),
+            )
+            .await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = sig_rx.changed() => {}
+            }
+        }
+        if !abandoned {
+            // A lock this close to its cutoff would not survive a restart: the next start needs
+            // the release margin plus its own start-up to release it, so keeping it trades a
+            // release penalty for a slash (see `keep_too_close`). Those exempted during the wait
+            // and those that crossed the horizon since.
+            let mut too_close = keep_too_close(&journal, &client);
+            {
+                let exempt = KEEP_LOCKS_EXEMPT.lock().unwrap_or_else(|p| p.into_inner());
+                let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                too_close.extend(
+                    exempt
+                        .iter()
+                        .flatten()
+                        .filter(|id| j.entries.contains_key(*id))
+                        .copied(),
+                );
+            }
+            if !too_close.is_empty() {
+                exempt_from_keep(too_close.iter().copied());
+                let msg = format!(
+                    "Releasing {} lock(s) too close to their deadline for a restart to save them...",
+                    too_close.len()
+                );
+                tracing::warn!("keep-locks: {msg}");
+                shutdown_say(&state, msg).await;
+                release_only = Some(too_close);
+            }
+        }
+    }
+
     // 3. ABANDON — release whatever is still ours, NEAREST DEADLINE FIRST.
     //
     //    Ordering is the whole game for collateral: `releaseJob` reverts once a job is past
     //    its lock deadline, and the collateral is then locked until a keeper slashes. Every
     //    second spent on a job with hours of headroom is a second not spent on one about to
     //    expire, so releasing in deadline order is what actually minimises loss.
-    if abandoned {
+    // Releases a keep-locks pass left running when it stopped waiting (see the full pass).
+    let mut still_releasing: std::collections::HashSet<B256> = std::collections::HashSet::new();
+    loop {
+        let partial = release_only.is_some();
+        if !partial && !abandoned {
+            if kept {
+                // Commit the keep, unless an abandon won the race to the phase meanwhile.
+                if move_ladder_phase(&[PHASE_KEEPING], PHASE_KEPT).is_err() {
+                    tracing::warn!("keep-locks stop overtaken by an abandon — abandoning");
+                    abandoned = true;
+                    continue;
+                }
+                shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
+                let now = zkminer_chain::client::chain_now_floor();
+                let (held, earliest, unreleased) = {
+                    let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                    let live: Vec<(u64, bool)> = j
+                        .iter()
+                        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+                        .map(|e| (e.lock_deadline, keep_exempt(e.job_id)))
+                        .collect();
+                    let kept_ones = live.iter().filter(|(_, x)| !x);
+                    (
+                        kept_ones.clone().count(),
+                        kept_ones.map(|(d, _)| *d).filter(|d| *d > 0).min(),
+                        live.iter().filter(|(_, x)| *x).count(),
+                    )
+                };
+                if unreleased > 0 {
+                    let msg = format!(
+                        "{unreleased} lock(s) too close to their deadline to keep could not be \
+                         released: start the miner again at once, or they are slashed."
+                    );
+                    tracing::error!("{msg}");
+                    shutdown_say(&state, msg).await;
+                }
+                exit_code = 75;
+                let verdict = if held == 0 {
+                    "Keep-locks stop: no locks are held. Exiting with 75 so a supervisor starts \
+                     the miner again."
+                        .to_string()
+                } else {
+                    format!(
+                        "Keep-locks stop: {held} lock(s) left for the next start. START THE MINER \
+                         AGAIN {} (a service with Restart=on-failure does that itself): it \
+                         re-proves each kept job there is still time for and releases the rest; \
+                         a lock left past its deadline is slashed. Exiting with 75.",
+                        match start_by(earliest) {
+                            Some(t) => format!("by {t} at the latest"),
+                            None => "soon".to_string(),
+                        }
+                    )
+                };
+                tracing::warn!("{verdict}");
+                shutdown_say(&state, verdict).await;
+            }
+            break;
+        }
+        if !partial {
+            // Abandon wins over an earlier keep-locks request: release_and_clean releases again.
+            // Marked on the ladder too (a drain timeout gets here without a signal), so a
+            // keep-locks request from now on is refused rather than switching off releases still
+            // to start. One step: a keep request answered "ok" just before it is honoured instead.
+            if move_ladder_phase(
+                &[PHASE_MINING, PHASE_DRAINING, PHASE_ABANDONING],
+                PHASE_ABANDONING,
+            ) == Err(PHASE_KEEPING)
+            {
+                tracing::warn!("a keep-locks request arrived as the drain gave up — keeping");
+                abandoned = false;
+                kept = true;
+                let too_close = keep_too_close(&journal, &client);
+                if !too_close.is_empty() {
+                    exempt_from_keep(too_close.iter().copied());
+                    release_only = Some(too_close);
+                }
+                continue;
+            }
+            raise_stage(&sig_tx, 2);
+            shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Abandoning).await;
+            shutdown_status(&state, headless, "releasing held jobs...".to_string()).await;
+        }
         // The LOWER chain-time estimate: an entry is only treated as already past its deadline once
         // it surely is.
         let now = zkminer_chain::client::chain_now_floor();
@@ -3893,10 +5714,19 @@ pub async fn run(
                 .map(|j| j.info.job_id)
                 .collect()
         };
+        // Releases the drain started that are still on their ladder: a second one would race them.
+        for (jid, (_, handle)) in &drain_released {
+            if !handle.is_finished() {
+                still_releasing.insert(*jid);
+            }
+        }
         let mut doomed: Vec<(u64, B256)> = {
             let j = journal.lock().unwrap_or_else(|e| e.into_inner());
             j.iter()
                 .filter(|e| !submitting.contains(&e.job_id))
+                .filter(|e| release_only.as_ref().is_none_or(|o| o.contains(&e.job_id)))
+                // A keep-locks pass's release still on its ladder: a second one would race it.
+                .filter(|e| !still_releasing.contains(&e.job_id))
                 .map(|e| (e.lock_deadline, e.job_id))
                 .collect()
         };
@@ -4044,8 +5874,13 @@ pub async fn run(
         // happened concurrently by the time we get here; waiting for receipts is a nicety.
         // So cap the total wait and carry on — a job whose receipt we never saw is simply
         // reported as still-held, which is exactly what the exit-75 path is for.
-        let join_budget = if supervised {
+        // A keep-locks pass releases the locks closest to their cutoff: give them their whole
+        // release ladder (fee bumps included), not just the first broadcast.
+        let join_budget = if supervised || SUPERVISED_STOP.load(std::sync::atomic::Ordering::SeqCst)
+        {
             RELEASE_JOIN_BUDGET
+        } else if partial {
+            std::time::Duration::from_secs(zkminer_chain::jobs::RELEASE_LADDER_SECS + 30)
         } else {
             INTERACTIVE_RELEASE_JOIN_BUDGET
         };
@@ -4058,11 +5893,13 @@ pub async fn run(
                      broadcast — the journal is the source of truth for whether it landed)",
                     short_id(jid)
                 );
+                still_releasing.insert(jid);
             } else if tokio::time::timeout(left, handle).await.is_err() {
                 tracing::warn!(
                     "release of job {} did not confirm within budget",
                     short_id(jid)
                 );
+                still_releasing.insert(jid);
             }
             // `release_and_clean` returns (); the JOURNAL is its outcome signal — it removes
             // the breadcrumb only when the lock is provably gone (released, or no longer/
@@ -4212,6 +6049,41 @@ pub async fn run(
             );
         }
 
+        if partial {
+            let _ = (released, stranded);
+            let (gone, kept_back, left) = {
+                let j = journal.lock().unwrap_or_else(|e| e.into_inner());
+                let mut counts = (0usize, 0usize, 0usize);
+                for jid in release_only.iter().flatten() {
+                    if !j.entries.contains_key(jid) {
+                        counts.0 += 1;
+                    } else if !keep_exempt(*jid) {
+                        counts.1 += 1;
+                    } else {
+                        counts.2 += 1;
+                    }
+                }
+                counts
+            };
+            let msg = format!(
+                "keep-locks: released {gone} lock(s) too close to their deadline to keep{}{}",
+                if kept_back > 0 {
+                    format!("; {kept_back} turned out to have time left and are kept")
+                } else {
+                    String::new()
+                },
+                if left > 0 {
+                    format!("; {left} not released (yet)")
+                } else {
+                    String::new()
+                }
+            );
+            tracing::warn!("{msg}");
+            shutdown_say(&state, msg).await;
+            // Next: commit the keep (or, if an abandon arrived meanwhile, the full abandon).
+            release_only = None;
+            continue;
+        }
         // Leave a machine-readable verdict and a NON-ZERO exit when anything is still
         // held: every path previously returned Ok(()) -> exit 0, so `Restart=on-failure`
         // saw success and did NOT restart — disabling the recovery path that is the actual
@@ -4238,11 +6110,16 @@ pub async fn run(
         // Mirror the verdict to the terminal: in TUI mode this is the ONLY way an operator
         // learns that collateral was stranded rather than released (see the drain note above).
         if !headless {
-            println!(
-                "shutdown summary: {released} released, {stranded} STILL LOCKED (past deadline \
-                 or failed release), {still_held} journal breadcrumb(s) ({recoverable} \
-                 recoverable on restart) — details in ~/.zkminer/logs/zkminer.log"
-            );
+            shutdown_say(
+                &state,
+                format!(
+                    "shutdown summary: {released} released, {stranded} STILL LOCKED (past \
+                     deadline or failed release), {still_held} journal breadcrumb(s) \
+                     ({recoverable} recoverable on restart) — details in \
+                     ~/.zkminer/logs/zkminer.log"
+                ),
+            )
+            .await;
         }
         if recoverable > 0 {
             // EX_TEMPFAIL. Keep it — but it only produces an AUTO-restart when the signal did
@@ -4250,7 +6127,8 @@ pub async fn run(
             // liveness-probe kill). systemd never restarts a unit it stopped itself
             // (`systemctl stop` leaves it `failed`), `docker stop` disables the restart policy
             // until the container is started again, and k8s only SIGTERMs a container whose pod
-            // is already terminating — and SIGTERM is the ONLY thing that sets SUPERVISED_STOP.
+            // is already terminating — and SUPERVISED_STOP is set only by SIGTERM (and a Windows
+            // console close / shutdown), never by a stop the operator asked for.
             // So on the supervised path this code is a VERDICT, not a remedy: recovery runs on
             // the next START, and a human has to perform it. Say so where the human is looking.
             exit_code = 75;
@@ -4261,14 +6139,24 @@ pub async fn run(
                  once its deadline passes."
             );
             if !headless {
-                println!(
-                    "{recoverable} job(s) STILL HOLD COLLATERAL — start the miner again to run \
-                     recovery; a supervisor will not necessarily restart it for you."
-                );
+                shutdown_say(
+                    &state,
+                    format!(
+                        "{recoverable} job(s) STILL HOLD COLLATERAL — start the miner again to \
+                         run recovery; a supervisor will not necessarily restart it for you."
+                    ),
+                )
+                .await;
             }
         }
+        break;
     }
 
+    // An exit on purpose: the proofs still running did not end in a crash.
+    end_counted_prove_starts();
+    set_ladder_phase(PHASE_FINISHING);
+    shutdown_stage(&state, zkminer_tui::state::ShutdownStage::Finishing).await;
+    shutdown_status(&state, headless, "stopping the provers...".to_string()).await;
     // 4. Only now tear down the workers. Releasing needs nothing but the job id, so keeping
     //    them alive until this point costs nothing and lets the drain path finish real work.
     // BOUNDED, for the same reason as the hard-kill reap: `shutdown_all` phase 4 takes a
@@ -4299,6 +6187,48 @@ pub async fn run(
     }
     brain_handle.abort();
     refresh_handle.abort();
+    hw_handle.abort();
+    if let Some(h) = watch_handle {
+        h.abort();
+    }
+
+    // Close the dashboard, then print what the shutdown reported on it, so the verdict stays in
+    // the terminal's scrollback.
+    if let Some(mut tui) = tui_task {
+        check_dashboard(&state).await;
+        let was_up = tui_up();
+        if let Some(view) = state.write().await.shutdown.as_mut() {
+            view.done = true;
+        }
+        // It notices within its 1s tick.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut tui).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => tracing::error!("the dashboard ended with an error: {e:#}"),
+            Ok(Err(e)) => tracing::error!("the dashboard task failed: {e}"),
+            Err(_) => {
+                restore_terminal_bounded();
+                tui.abort();
+            }
+        }
+        TUI_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+        if !was_up {
+            // Already printed when it closed early (`check_dashboard`).
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            return Ok(());
+        }
+        let lines = state
+            .read()
+            .await
+            .shutdown
+            .as_ref()
+            .map(|v| v.lines.clone())
+            .unwrap_or_default();
+        for line in lines {
+            say_out(&line);
+        }
+    }
 
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -4376,6 +6306,8 @@ fn synthetic_conservative_benchmark(
                 // Unmeasured by construction: nothing has been benchmarked. Admission control treats
                 // that as "assume a conservative cost", not as "assume it is free".
                 host_peak_bytes: None,
+                benchmark_po2: None,
+                highest_proved_po2: None,
             },
         )
         .collect();
@@ -4454,6 +6386,9 @@ fn note_lock_block(job_id: B256, block: u64) {
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
         .insert(job_id, block);
+    // The stake-wide cap tells the same way whether the chain's locked figure counts it yet, for as
+    // long as the lock counts there (past its task, while handed back).
+    collateral::note_lock_block(job_id, block);
 }
 
 fn lock_blocks() -> HashMap<B256, u64> {
@@ -4502,34 +6437,125 @@ static OBSERVED_THROUGHPUT: std::sync::Mutex<Option<HashMap<(String, String), f6
 /// Weight of the newest proof in `OBSERVED_THROUGHPUT`'s moving average.
 const OBSERVED_THROUGHPUT_WEIGHT: f64 = 0.3;
 
-/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`).
-fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration) {
-    let Some((key, rate)) = observed_rate(slot, cycles, duration) else {
+/// Seconds of STARK work at a card's benchmark rate a proof must hold to teach it a rate: below
+/// that, what does not scale with cycles (worker start, the first segment's setup) is too much of
+/// it. About 150 M cycles on a 5090, 10 M on an A770.
+const MIN_LEARN_STARK_SECS: f64 = 60.0;
+
+/// The cycles a proof must hold to teach a rate to a card with no benchmark rate.
+const MIN_LEARN_CYCLES_FALLBACK: u64 = 50_000_000;
+
+/// The range a learned rate is held to, as fractions of the card's benchmark STARK rate: room for a
+/// real slowdown (a spill into shared memory, a hot card, an SP1 shard size lowered after an
+/// out-of-memory), none for one proof to make the card look ten times slower than it is.
+const LEARNED_RATE_FLOOR: f64 = 0.5;
+const LEARNED_RATE_CEILING: f64 = 2.0;
+
+/// Seconds of STARK work at the benchmark rate for a proof to move the average by the full
+/// `OBSERVED_THROUGHPUT_WEIGHT`; a smaller one moves it by its share of that.
+const LEARN_FULL_WEIGHT_SECS: f64 = 300.0;
+
+/// Record a finished proof's rate for its card (`slot` as `backend:tag:index`), as
+/// `next_learned_rate` makes it from the card's benchmark STARK rate (`CARD_BENCH_STARK_RATE`), its
+/// wrap (`card_fixed_secs`, without the SP1 server's setup, which runs before the proof's timer)
+/// and `execute_secs` for running the guest inside the proof. A whole-proof rate depends on the
+/// job's size: one learned on a 50 M-cycle SP1 proof (most of it the wrap) priced a 2 B one at
+/// twice what it took, and sent it to the slower card. And one learned on a small proof after a
+/// restart was taken as it was: about a tenth of the card's rate, at which the next large job was
+/// refused on the card it was claimed for, and released at a penalty.
+fn note_observed_throughput(slot: &str, cycles: u64, duration: Duration, execute_secs: u64) {
+    let backend = slot.split(':').next().unwrap_or(slot);
+    let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(slot);
+    let card = (device, backend.to_string());
+    let noted = |m: &std::sync::Mutex<Option<HashMap<(String, String), f64>>>| {
+        m.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(&card).copied())
+    };
+    let setup = if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        SP1_PROOF_SETUP_SECS
+    } else {
+        0.0
+    };
+    let wrap = noted(&CARD_FIXED_SECS).map_or(0.0, |f| (f - setup).max(0.0));
+    let bench = noted(&CARD_BENCH_STARK_RATE);
+    let Some((key, _)) = observed_rate(slot, cycles, duration) else {
         return;
     };
     let mut seen = OBSERVED_THROUGHPUT
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let entry = seen
-        .get_or_insert_with(HashMap::new)
-        .entry(key)
-        .or_insert(rate);
-    *entry += OBSERVED_THROUGHPUT_WEIGHT * (rate - *entry);
+    let seen = seen.get_or_insert_with(HashMap::new);
+    let learned = next_learned_rate(
+        seen.get(&key).copied(),
+        bench,
+        cycles,
+        duration,
+        wrap + execute_secs as f64,
+    );
+    if let Some(rate) = learned {
+        seen.insert(key, rate);
+    }
+}
+
+/// A card's learned rate after a proof of `cycles` that took `duration`, `fixed` seconds of it not
+/// STARK work (the wrap and the guest's execute), from what was learned before (`prev`) and its
+/// benchmark STARK rate (`bench`). `None` leaves it as it was: the proof is too small to say
+/// (`MIN_LEARN_STARK_SECS`, or `MIN_LEARN_CYCLES_FALLBACK` without a benchmark), or the fixed part
+/// is most of it. With a benchmark the average starts there, not at the first proof, moves by at
+/// most `OBSERVED_THROUGHPUT_WEIGHT` (less for a proof under `LEARN_FULL_WEIGHT_SECS`), and stays
+/// within `LEARNED_RATE_FLOOR`..`LEARNED_RATE_CEILING` of it.
+fn next_learned_rate(
+    prev: Option<f64>,
+    bench: Option<f64>,
+    cycles: u64,
+    duration: Duration,
+    fixed: f64,
+) -> Option<f64> {
+    let total = duration.as_secs_f64();
+    let net = total - fixed.max(0.0);
+    if cycles == 0 || total <= 0.0 || net < total / 2.0 {
+        return None;
+    }
+    let bench = bench.filter(|b| b.is_finite() && *b > 0.0);
+    let min_cycles = bench.map_or(MIN_LEARN_CYCLES_FALLBACK as f64, |b| {
+        b * MIN_LEARN_STARK_SECS
+    });
+    if (cycles as f64) < min_cycles {
+        return None;
+    }
+    let sample = cycles as f64 / net;
+    let Some(bench) = bench else {
+        let prev = prev.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(sample);
+        return Some(prev + OBSERVED_THROUGHPUT_WEIGHT * (sample - prev));
+    };
+    let held = |r: f64| r.clamp(LEARNED_RATE_FLOOR * bench, LEARNED_RATE_CEILING * bench);
+    let prev = held(prev.filter(|p| p.is_finite()).unwrap_or(bench));
+    let weight =
+        OBSERVED_THROUGHPUT_WEIGHT * (cycles as f64 / (bench * LEARN_FULL_WEIGHT_SECS)).min(1.0);
+    Some(held(prev + weight * (held(sample) - prev)))
 }
 
 /// `((device id, backend), cycles per second)` for one proof, or `None` for a slot that is not a
 /// card or a proof with nothing to measure.
 fn observed_rate(slot: &str, cycles: u64, duration: Duration) -> Option<((String, String), f64)> {
+    if cycles == 0 || duration.is_zero() {
+        return None;
+    }
+    Some((card_key(slot)?, cycles as f64 / duration.as_secs_f64()))
+}
+
+/// The `(device id, backend)` a proving slot's rates are kept under (`OBSERVED_THROUGHPUT`, the
+/// planner rows), or `None` for a slot that is not a card.
+fn card_key(slot: &str) -> Option<(String, String)> {
     let mut parts = slot.splitn(3, ':');
     let (backend, tag, index) = (parts.next()?, parts.next()?, parts.next()?);
-    if !matches!(tag, "cuda" | "rocm" | "intel") || cycles == 0 || duration.is_zero() {
+    if !matches!(tag, "cuda" | "rocm" | "intel") {
         return None;
     }
     let device = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(tag, index);
-    Some((
-        (device, backend.to_string()),
-        cycles as f64 / duration.as_secs_f64(),
-    ))
+    Some((device, backend.to_string()))
 }
 
 /// The learned rates, for the planner.
@@ -4652,6 +6678,141 @@ impl std::fmt::Display for AdmissionTally {
         }
         Ok(())
     }
+}
+
+/// Why each job the brain looked at this pass was not claimed, in words an operator can act on. The
+/// skips themselves log at debug (`-v`), which the operator does not see; this is what the dashboard's
+/// claims line, the Jobs screen's "Why" column and the headless claims summary are built from.
+#[derive(Default)]
+struct DeclineTally {
+    counts: std::collections::BTreeMap<&'static str, usize>,
+    why: Vec<(B256, &'static str)>,
+    seen: std::collections::HashSet<B256>,
+}
+
+impl DeclineTally {
+    /// Records a job's reason, once per pass (the open list is not deduplicated).
+    fn note(&mut self, jid: B256, why: &'static str) {
+        if !self.seen.insert(jid) {
+            return;
+        }
+        *self.counts.entry(why).or_insert(0) += 1;
+        self.why.push((jid, why));
+    }
+
+    /// The pass as the TUI shows it: declines most common first (ties by name, so the line does not
+    /// reshuffle between identical passes).
+    /// `not_evaluated` is filled in by [`publish_claim_outlook`], from the open jobs it sees.
+    fn outlook(&self, claimed: usize) -> ClaimOutlook {
+        let mut declined: Vec<(String, usize)> = self
+            .counts
+            .iter()
+            .map(|(w, n)| (w.to_string(), *n))
+            .collect();
+        declined.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ClaimOutlook {
+            held: None,
+            declined,
+            claimed,
+            not_evaluated: 0,
+        }
+    }
+}
+
+/// The operator-facing reason for an evaluation that did not recommend a claim.
+fn decline_reason(rec: &Recommendation) -> &'static str {
+    match rec {
+        Recommendation::Claim | Recommendation::AtomicFastPath => "claimable",
+        Recommendation::WatchAndWait => "waiting for the price to rise",
+        Recommendation::Skip { reason } => {
+            if reason.contains("collateral") {
+                "not enough free stake"
+            } else if reason.contains("deadline") {
+                "cannot finish before the deadline"
+            } else if reason.contains("Risk") {
+                "too risky for its window"
+            } else if reason.contains("Profit") {
+                "below the profit threshold"
+            } else if reason.contains("simulated") {
+                "benchmarks are simulated"
+            } else {
+                "not recommended"
+            }
+        }
+    }
+}
+
+/// How often the headless log repeats an unchanged claims summary; a change is logged at once
+/// (at most once per [`CLAIM_SUMMARY_MIN_GAP`]).
+const CLAIM_SUMMARY_REPEAT: Duration = Duration::from_secs(600);
+const CLAIM_SUMMARY_MIN_GAP: Duration = Duration::from_secs(60);
+
+/// Publishes a pass's [`ClaimOutlook`] and logs its summary at INFO when it changes (throttled), so a
+/// headless operator sees why open work is not being claimed without `-v`. `not_evaluated` is counted
+/// here, against the open jobs as they are now (a job evicted this pass is no longer one).
+async fn publish_claim_outlook(
+    state: &SharedState,
+    mut outlook: ClaimOutlook,
+    why: &[(B256, &'static str)],
+    claimed: &[B256],
+    last_logged: &mut Option<(std::time::Instant, String)>,
+) {
+    {
+        let mut s = state.write().await;
+        for (jid, w) in why {
+            s.job_why.insert(*jid, (*w).to_string());
+        }
+        for jid in claimed {
+            s.job_why.remove(jid);
+        }
+        let open: std::collections::HashSet<B256> =
+            s.open_jobs.iter().map(|j| j.info.job_id).collect();
+        s.job_why.retain(|jid, _| open.contains(jid));
+        if outlook.held.is_none() {
+            let looked_at = why.iter().filter(|(j, _)| open.contains(j)).count();
+            outlook.not_evaluated = open.len().saturating_sub(looked_at);
+        }
+        s.claim_outlook = outlook.clone();
+    }
+    let key = outlook.summary_key();
+    if claim_summary_due(last_logged.as_ref(), &key, std::time::Instant::now()) {
+        tracing::info!("claims: {}", outlook.summary());
+        *last_logged = Some((std::time::Instant::now(), key));
+    }
+}
+
+/// Whether the claims summary is due in the log, by its [`ClaimOutlook::summary_key`] (the reasons,
+/// not their counts, which move every pass): always the first time, then a changed key once
+/// [`CLAIM_SUMMARY_MIN_GAP`] has passed and an unchanged one every [`CLAIM_SUMMARY_REPEAT`].
+fn claim_summary_due(
+    last: Option<&(std::time::Instant, String)>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    match last {
+        None => true,
+        Some((at, prev)) => {
+            let since = now.saturating_duration_since(*at);
+            if prev == key {
+                since >= CLAIM_SUMMARY_REPEAT
+            } else {
+                since >= CLAIM_SUMMARY_MIN_GAP
+            }
+        }
+    }
+}
+
+/// Publishes a pass that held every claim before looking at a job.
+async fn publish_claim_hold(
+    state: &SharedState,
+    why: String,
+    last_logged: &mut Option<(std::time::Instant, String)>,
+) {
+    let outlook = ClaimOutlook {
+        held: Some(why),
+        ..ClaimOutlook::default()
+    };
+    publish_claim_outlook(state, outlook, &[], &[], last_logged).await;
 }
 
 /// `cpu_info` of the synthetic placeholder suite (`synthetic_conservative_benchmark`), which is how
@@ -4793,9 +6954,534 @@ fn risc0_slot_sizes(
                     .find(|d| d.device_id == *device && d.prover_backend == risc0)
             });
             let over = overrides.get(device).copied();
-            let po2 = zkminer_prover::benchmark::risc0_slot_job_po2(device, over, row, *vram);
+            let gpu_tag = slot.split(':').nth(1).unwrap_or("");
+            let po2 =
+                zkminer_prover::benchmark::risc0_slot_job_po2(device, gpu_tag, over, row, *vram);
             (slot.clone(), device.clone(), po2)
         })
+        .collect()
+}
+
+/// The SP1 retry pin (slot, device) after an attempt that dispatched to `used_slot`: dropped once
+/// an attempt has run there, kept when that attempt was refused before it started
+/// (`refused_before_start`), so the next goes back to the card holding the smaller size and not to
+/// one still at the size that ran out.
+fn retry_pin_after(
+    pin: Option<(String, String)>,
+    used_slot: Option<&str>,
+    refused_before_start: bool,
+) -> Option<(String, String)> {
+    match pin {
+        Some((slot, _)) if !refused_before_start && used_slot == Some(slot.as_str()) => None,
+        pin => pin,
+    }
+}
+
+/// Each card's fixed seconds by `(device id, backend)` (`card_fixed_secs`), noted where the benchmark
+/// is loaded for the estimates (`slot_estimates_for`, off the async runtime), for
+/// `note_observed_throughput`, which runs on it after every proof and must not load the file.
+static CARD_FIXED_SECS: std::sync::Mutex<Option<HashMap<(String, String), f64>>> =
+    std::sync::Mutex::new(None);
+
+/// Each card's benchmark STARK rate by `(device id, backend)` (`bench_stark_rate`), noted beside
+/// `CARD_FIXED_SECS`: what `note_observed_throughput` starts a card's learned rate at and holds it
+/// near.
+static CARD_BENCH_STARK_RATE: std::sync::Mutex<Option<HashMap<(String, String), f64>>> =
+    std::sync::Mutex::new(None);
+
+/// A card's STARK rate from its benchmark row: the slower of the cycle-weighted rate and the mean
+/// of the programs' rates (see `card_estimate_secs`). `None` without a usable one.
+fn bench_stark_rate(row: &zkminer_prover::benchmark::DeviceBenchmark) -> Option<f64> {
+    let positive = |r: &f64| r.is_finite() && *r > 0.0;
+    row.stark_rate()
+        .filter(positive)
+        .map(|r| r.min(row.throughput))
+        .filter(positive)
+}
+
+/// Seconds an SP1 proof spends before its first shard: the server's setup for the program.
+const SP1_PROOF_SETUP_SECS: f64 = 15.0;
+
+/// How much an estimate for choosing a card (`slot_estimates_for`) is padded: it decides where a job
+/// can still finish before its cutoff, so it leans long.
+const SLOT_ESTIMATE_PAD: f64 = 1.1;
+
+/// The part of a proof on a card that does not scale with cycles: its benchmarked wrap, plus the SP1
+/// server's setup for the program. `None` without a measured wrap.
+fn card_fixed_secs(
+    backend: &str,
+    row: Option<&zkminer_prover::benchmark::DeviceBenchmark>,
+) -> Option<f64> {
+    let setup = if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        SP1_PROOF_SETUP_SECS
+    } else {
+        0.0
+    };
+    row.and_then(|r| r.wrap_secs()).map(|w| w + setup)
+}
+
+/// How long a job of `cycles` takes on a card, from what is known of the card: its STARK rate (the
+/// one observed on it this run, net of the fixed part, which reflects the size it proves at and an
+/// SP1 shard cap; else the benchmark's) plus the fixed part (`card_fixed_secs`), plus `execute`
+/// seconds for running the guest first; else the benchmark's mean rate plus the planner's fixed
+/// allowance, as before.
+/// Padded by `SLOT_ESTIMATE_PAD`. The benchmark's STARK rate is weighted by cycles, which its
+/// precompile-heavy program dominates for SP1 (17 Mc/s on a 5090 against 9-11 for the rest), so the
+/// slower of it and the mean of the programs' rates is taken. A flat 120 s for every SP1 proof was
+/// right for neither card.
+fn card_estimate_secs(
+    backend: &str,
+    cycles: u64,
+    execute: u64,
+    observed: Option<f64>,
+    row: Option<&zkminer_prover::benchmark::DeviceBenchmark>,
+) -> Option<f64> {
+    let positive = |r: &f64| r.is_finite() && *r > 0.0;
+    let fixed = card_fixed_secs(backend, row);
+    // Held to the range a learned rate is kept in around the benchmark (`next_learned_rate`), for
+    // a rate learned before the card was benchmarked again.
+    let observed = match (observed, row.and_then(bench_stark_rate)) {
+        (Some(rate), Some(bench)) if positive(&rate) => {
+            Some(rate.clamp(LEARNED_RATE_FLOOR * bench, LEARNED_RATE_CEILING * bench))
+        }
+        (observed, _) => observed,
+    };
+    let secs = if let Some(rate) = observed.filter(positive) {
+        // The observed rate holds a proof's execute at the average: a third of the allowance (which
+        // is three times this job's measured execute) on top, for a guest slower than its cycles.
+        cycles as f64 / rate + fixed.unwrap_or(0.0) + execute as f64 / 3.0
+    } else {
+        let row = row?;
+        let stark = row
+            .stark_rate()
+            .filter(positive)
+            .map(|r| r.min(row.throughput).max(f64::MIN_POSITIVE))
+            .filter(|_| positive(&row.throughput));
+        match (stark, fixed) {
+            (Some(rate), Some(fixed)) => cycles as f64 / rate + fixed + execute as f64,
+            _ => {
+                let rate = Some(row.throughput).filter(positive)?;
+                cycles as f64 / rate + (fixed_proving_allowance_secs(backend) + execute) as f64
+            }
+        }
+    };
+    Some(secs * SLOT_ESTIMATE_PAD)
+}
+
+/// How long a job of `cycles` takes on each of `backend`'s slots, by slot key (`card_estimate_secs`,
+/// with `execute` seconds for executing the guest), and whether any of them rests on a rate learned
+/// this run. Without `use_observed`, on the benchmark alone. For `with_slot_estimates`; empty with
+/// nothing known of any slot's card.
+async fn slot_estimates_for(
+    backend: &'static str,
+    cycles: u64,
+    execute: u64,
+    use_observed: bool,
+) -> (HashMap<String, Duration>, bool) {
+    let keys = zkminer_prover::engine::worker_pool()
+        .map(|p| p.slot_keys_for(backend))
+        .unwrap_or_default();
+    let observed = if use_observed {
+        observed_throughputs()
+    } else {
+        HashMap::new()
+    };
+    tokio::task::spawn_blocking(move || {
+        let suite = zkminer_prover::benchmark::load_cached_benchmark();
+        let mut used_observed = false;
+        let estimates = keys
+            .into_iter()
+            .filter_map(|key| {
+                let device = zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&key);
+                let rate = observed
+                    .get(&(device.clone(), backend.to_string()))
+                    .copied();
+                let row = suite.as_ref().and_then(|s| {
+                    s.device_benchmarks
+                        .iter()
+                        .find(|d| d.device_id == device && d.prover_backend == backend)
+                });
+                if let Some(fixed) = card_fixed_secs(backend, row) {
+                    CARD_FIXED_SECS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(HashMap::new)
+                        .insert((device.clone(), backend.to_string()), fixed);
+                }
+                if let Some(bench) = row.and_then(bench_stark_rate) {
+                    CARD_BENCH_STARK_RATE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(HashMap::new)
+                        .insert((device.clone(), backend.to_string()), bench);
+                }
+                let secs = card_estimate_secs(backend, cycles, execute, rate, row)?;
+                used_observed |= rate.is_some_and(|r| r.is_finite() && r > 0.0);
+                Some((key, Duration::from_secs_f64(secs)))
+            })
+            .collect();
+        (estimates, used_observed)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// The benchmark's fastest card (its device id, e.g. "gpu0") for `backend`, if it measured one.
+fn fastest_benchmarked_device(
+    suite: &zkminer_prover::benchmark::BenchmarkSuite,
+    backend: &str,
+) -> Option<String> {
+    suite
+        .device_benchmarks
+        .iter()
+        .filter(|d| d.prover_backend == backend && d.throughput.is_finite() && d.throughput > 0.0)
+        .max_by(|a, b| a.throughput.total_cmp(&b.throughput))
+        .map(|d| d.device_id.clone())
+}
+
+/// How long, in seconds, a job of `backend` claimed now waits before it can start, with the planner
+/// off. Once every one of the `cards` has a job, the work already claimed and not yet proven
+/// (`outstanding`: cycles and backend) at all the cards' combined rate for each backend (`rates`, each
+/// card's, fastest first). Once as many of its own backend as fit side by side (`side_by_side`) are
+/// claimed, that backend's work at the combined rate of that many fastest cards. The larger of the
+/// two; 0 while a card and a turn are free. A running job counts in full, as a deadline estimate
+/// should. (Spreading the work at the fastest card's rate assumed every card was that fast: 40% low
+/// for RISC Zero on a 5090 beside a 4070.) Each job also takes its backend's fixed seconds (`fixed`:
+/// setup and wrap, which no rate covers), spread over the cards running them: ten small SP1 jobs
+/// queued ahead are ten wraps, not the few seconds their cycles make.
+fn expected_queue_wait_secs(
+    outstanding: &[(u64, &str)],
+    backend: &str,
+    cards: usize,
+    side_by_side: usize,
+    rates: impl Fn(&str) -> Vec<f64>,
+    fixed: impl Fn(&str) -> f64,
+) -> u64 {
+    let capacity = |b: &str, n: usize| -> f64 { rates(b).into_iter().take(n).sum() };
+    let secs = |(cycles, b): &(u64, &str), n: usize| {
+        let c = capacity(b, n);
+        if c > 0.0 {
+            *cycles as f64 / c + fixed(b) / n.max(1) as f64
+        } else {
+            0.0
+        }
+    };
+    let cards = cards.max(1);
+    let card_wait = if outstanding.len() >= cards {
+        outstanding.iter().map(|w| secs(w, cards)).sum::<f64>()
+    } else {
+        0.0
+    };
+    let side_by_side = side_by_side.max(1);
+    let same: Vec<&(u64, &str)> = outstanding.iter().filter(|(_, b)| *b == backend).collect();
+    let turn_wait = if same.len() >= side_by_side {
+        let n = side_by_side.min(cards);
+        same.iter().map(|w| secs(w, n)).sum::<f64>()
+    } else {
+        0.0
+    };
+    card_wait.max(turn_wait).ceil() as u64
+}
+
+/// The card an attempt tries first: the one an SP1 retry is pinned to (`retry_pin_after`), else the
+/// card the job was planned for (`planned`). A card that refused it admission moves to the back of
+/// the order instead (`job_card_order`).
+fn preferred_device(
+    retry_card: Option<&(String, String)>,
+    planned: Option<&String>,
+) -> Option<String> {
+    retry_card
+        .map(|(_, card)| card.clone())
+        .or_else(|| planned.cloned())
+}
+
+/// Where the next attempt goes after one on `used_slot` failed: an SP1 out-of-memory that lowered
+/// the card's shard size (`sp1_smaller_here`, its benchmark device id) pins the retry there, at the
+/// smaller size; otherwise any failure but an invalid proof excludes the card, and an out-of-memory
+/// asks for a card with more VRAM than it (`used_slot_vram`), or the large-job floor when unknown.
+#[allow(clippy::too_many_arguments)]
+fn steer_after_failure(
+    excluded: &mut Vec<String>,
+    retry_card: &mut Option<(String, String)>,
+    min_vram: &mut Option<u64>,
+    used_slot: Option<&str>,
+    invalid: bool,
+    real_oom: bool,
+    sp1_smaller_here: Option<&str>,
+    used_slot_vram: impl FnOnce(&str) -> Option<u64>,
+) {
+    if let Some(card) = sp1_smaller_here {
+        *retry_card = used_slot.map(|slot| (slot.to_string(), card.to_string()));
+    } else if !invalid {
+        if let Some(k) = used_slot {
+            if !excluded.iter().any(|e| e.as_str() == k) {
+                excluded.push(k.to_string());
+            }
+        }
+    }
+    if real_oom && sp1_smaller_here.is_none() {
+        *min_vram = used_slot
+            .and_then(used_slot_vram)
+            .map(|v| v.saturating_add(1))
+            .or(Some(LARGE_JOB_MIN_VRAM_BYTES));
+    }
+}
+
+/// The risc0 cards a job may be claimed for: `cards` less those whose last proof found too little
+/// VRAM free at their size and no check since has found it (`is_short`, by slot and size), and how
+/// many that took out.
+fn claimable_risc0_cards(
+    mut cards: Vec<Risc0Card>,
+    is_short: impl Fn(&str, u8) -> bool,
+) -> (Vec<Risc0Card>, usize) {
+    let before = cards.len();
+    cards.retain(|card| !is_short(&card.slot, card.po2));
+    let short = before - cards.len();
+    (cards, short)
+}
+
+/// A saved benchmark's time, in seconds since the Unix epoch, from its RFC 3339 `timestamp`.
+fn benchmark_unix_secs(timestamp: &str) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .and_then(|t| u64::try_from(t.timestamp()).ok())
+}
+
+/// The rate the planner gives a card's benchmark row `d`, or `None` for a risc0 row of a card that
+/// proves no risc0 job. A risc0 row is the rate of the card's job size (`risc0_job_throughput`),
+/// priced down above the largest size its VRAM holds (`risc0_vram`, by slot); an SP1 row is scaled
+/// by `sp1_factor(bus id, benchmarked)` (`WorkerPool::sp1_rate_factor`): a card whose shard size was
+/// capped after its benchmark proves slower than the benchmark did.
+fn planned_throughput(
+    d: &zkminer_prover::benchmark::DeviceBenchmark,
+    risc0_cards: &[Risc0Card],
+    risc0_vram: &HashMap<String, Option<u64>>,
+    benchmarked: Option<u64>,
+    sp1_factor: impl Fn(&str, Option<u64>) -> f64,
+) -> Option<f64> {
+    if d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0 {
+        let card = risc0_cards.iter().find(|c| c.device == d.device_id)?;
+        let fit = zkminer_prover::benchmark::risc0_largest_fitting_po2(
+            risc0_vram.get(&card.slot).copied().flatten(),
+            card.slot.split(':').nth(1).unwrap_or(""),
+        );
+        Some(zkminer_prover::benchmark::risc0_job_throughput(
+            d, card.po2, fit,
+        ))
+    } else if d.prover_backend == zkminer_prover_protocol::BACKEND_SP1 {
+        Some(d.throughput * sp1_factor(&d.pci_bus_id, benchmarked))
+    } else {
+        Some(d.throughput)
+    }
+}
+
+/// Whether a prove error is a refusal before the proof started on its card that a retry pin should
+/// outlast: short of GPU memory our own memory holds (the old server's still coming back), or of
+/// host memory at admission. Short of GPU memory another program holds is not: that card is then
+/// excluded, as any other, rather than waited on until the job is released while another card
+/// could prove it. Matched on the type, never the text.
+fn refused_before_start(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>()
+        .is_some_and(|s| s.ours_in_the_way)
+        || e.downcast_ref::<zkminer_prover_protocol::types::HostMemoryShortage>()
+            .is_some_and(|h| !h.attempted)
+}
+
+/// What the prove loop does with a deadline refusal (`deadline_refusal_action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeadlineRefusalAction {
+    /// Send the job back to the dispatcher once, on the benchmark's rates alone.
+    RetryOnBenchmark,
+    /// Release it, and blame no one: nothing of the job's guest ran before the refusal.
+    ReleaseNoMark,
+    /// Release it, and mark its program and submitter divergent (`note_post_claim_divergence`).
+    ReleaseAndMark,
+}
+
+/// What to do with a job's deadline refusal (`ProofDeadlineReached`). One refused before any proof
+/// of it started (`before_start`) was refused on this host's estimates, so it says nothing of the
+/// guest: it is never marked divergent, and when those estimates used a rate learned this run
+/// (`used_observed`) it is tried once more on the benchmark's (`retried`: that was done). After a
+/// restart one small proof taught a card a tenth of its rate, and every job claimed on the
+/// benchmark's was then refused there before it started, and its submitter blamed. A proof stopped
+/// at its cutoff marks a measured job's submitter (`rode_measurement`), as before, unless it ran on
+/// the benchmark's rates after that retry: our learned rate had already said it would not finish, so
+/// the overrun is our estimate's, not the guest's.
+fn deadline_refusal_action(
+    before_start: bool,
+    retried: bool,
+    used_observed: bool,
+    rode_measurement: bool,
+) -> DeadlineRefusalAction {
+    if before_start && used_observed && !retried {
+        DeadlineRefusalAction::RetryOnBenchmark
+    } else if before_start || retried || !rode_measurement {
+        DeadlineRefusalAction::ReleaseNoMark
+    } else {
+        DeadlineRefusalAction::ReleaseAndMark
+    }
+}
+
+/// When jobs were released after a refusal before their proof started (`note_estimate_refusal`),
+/// over the last `ESTIMATE_REFUSAL_WINDOW`.
+static ESTIMATE_REFUSALS: Mutex<std::collections::VecDeque<std::time::Instant>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The window `ESTIMATE_REFUSALS` counts over, and how many in it page the operator.
+const ESTIMATE_REFUSAL_WINDOW: Duration = Duration::from_secs(3600);
+const ESTIMATE_REFUSALS_PAGE: usize = 3;
+
+/// Adds a refusal at `now` to `recent`, dropping those older than `ESTIMATE_REFUSAL_WINDOW`: how
+/// many are left.
+fn count_estimate_refusal(
+    recent: &mut std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+) -> usize {
+    while recent
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= ESTIMATE_REFUSAL_WINDOW)
+    {
+        recent.pop_front();
+    }
+    recent.push_back(now);
+    recent.len()
+}
+
+/// Records that `job_id` was released after a refusal before its proof started. Each one costs a
+/// release penalty with no submitter to blame, so more than `ESTIMATE_REFUSALS_PAGE` in an hour
+/// (with the overruns after a retry, `note_estimate_overrun`) pages the operator: the estimates and
+/// what admission claims on disagree.
+fn note_estimate_refusal(job_id: B256, detail: &str) {
+    if !count_estimate_release(job_id, detail, std::time::Instant::now()) {
+        tracing::warn!(
+            "{} released before its proof started ({detail}); counted with the others of the last hour",
+            short_id(job_id)
+        );
+    }
+}
+
+/// Counts a release on this host's estimates (refused before the start, or overrun after the
+/// benchmark-rate retry) and pages past `ESTIMATE_REFUSALS_PAGE` in an hour. Whether it paged.
+fn count_estimate_release(job_id: B256, detail: &str, now: std::time::Instant) -> bool {
+    let count = count_estimate_refusal(
+        &mut ESTIMATE_REFUSALS.lock().unwrap_or_else(|e| e.into_inner()),
+        now,
+    );
+    if count <= ESTIMATE_REFUSALS_PAGE {
+        return false;
+    }
+    tracing::error!(
+        "PAGE: ESTIMATE-REFUSAL {count} jobs in the last hour were released before their proof \
+         started or overran after a retry, the latest {} ({detail}): this host's card estimates \
+         refuse jobs its admission claims",
+        short_id(job_id)
+    );
+    true
+}
+
+/// Overruns per card after which its admission uses its learned rate (`note_estimate_overrun`).
+const ESTIMATE_OVERRUN_PAGE: usize = 2;
+/// How long a card's admission uses its learned rate after that.
+const ADMISSION_OBSERVED_FOR: Duration = Duration::from_secs(6 * 3600);
+
+/// Per proving slot, when a job proved there overran its cutoff after the benchmark-rate retry,
+/// over the last `ESTIMATE_REFUSAL_WINDOW`.
+static ESTIMATE_OVERRUNS: Mutex<
+    Option<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
+> = Mutex::new(None);
+
+/// Cards whose admission uses the learned rate (`(device id, backend)`, as `card_key`), and until
+/// when.
+static ADMISSION_USE_OBSERVED: Mutex<Option<HashMap<(String, String), std::time::Instant>>> =
+    Mutex::new(None);
+
+/// Adds an overrun on `slot` at `now` to `overruns`: how many that slot has had in the window.
+fn count_estimate_overrun(
+    overruns: &mut HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    slot: &str,
+    now: std::time::Instant,
+) -> usize {
+    // A few cards, but bounded all the same.
+    if overruns.len() >= 256 && !overruns.contains_key(slot) {
+        overruns.clear();
+    }
+    count_estimate_refusal(overruns.entry(slot.to_string()).or_default(), now)
+}
+
+/// Records that `job_id`, claimed on the benchmark's rate and started on it after the card's learned
+/// rate refused it (`RetryOnBenchmark`), then overran its cutoff on `slot` and was released. Its
+/// submitter is not marked: our learned rate had said so. But it is a release penalty all the same,
+/// so it counts with the refusals before the start, and from `ESTIMATE_OVERRUN_PAGE` in an hour on
+/// one card the operator is paged and that card's admission uses its learned rate for
+/// `ADMISSION_OBSERVED_FOR`: the claims that would overrun the same way are not made.
+fn note_estimate_overrun(job_id: B256, slot: Option<&str>, detail: &str) {
+    let now = std::time::Instant::now();
+    count_estimate_release(job_id, detail, now);
+    let Some(slot) = slot else {
+        tracing::warn!(
+            "{} overran its cutoff after the benchmark-rate retry ({detail})",
+            short_id(job_id)
+        );
+        return;
+    };
+    let count = count_estimate_overrun(
+        ESTIMATE_OVERRUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new),
+        slot,
+        now,
+    );
+    if count < ESTIMATE_OVERRUN_PAGE {
+        tracing::warn!(
+            "{} overran its cutoff on {slot} after the benchmark-rate retry ({detail}); {count} such \
+             on it in the last hour",
+            short_id(job_id)
+        );
+        return;
+    }
+    if let Some(card) = card_key(slot) {
+        ADMISSION_USE_OBSERVED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(card, now + ADMISSION_OBSERVED_FOR);
+    }
+    let msg = format!(
+        "PAGE: ESTIMATE-OVERRUN {slot}: {count} jobs claimed on the benchmark rate overran mid-proof \
+         in the last hour after this card's learned rate refused them, the latest {} ({detail}); \
+         claims for it now use the learned rate for {} h",
+        short_id(job_id),
+        ADMISSION_OBSERVED_FOR.as_secs() / 3600
+    );
+    tracing::error!("{msg}");
+    note_page(msg);
+}
+
+/// The cards whose admission uses the learned rate now (`note_estimate_overrun`).
+fn admission_observed_cards() -> std::collections::HashSet<(String, String)> {
+    let now = std::time::Instant::now();
+    let mut g = ADMISSION_USE_OBSERVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(m) = g.as_mut() else {
+        return Default::default();
+    };
+    m.retain(|_, until| *until > now);
+    m.keys().cloned().collect()
+}
+
+/// The learned rates admission prices on: every one without a measured suite (`measured`), else
+/// those of the cards in `forced` only.
+fn admission_observed(
+    measured: bool,
+    observed: &HashMap<(String, String), f64>,
+    forced: &std::collections::HashSet<(String, String)>,
+) -> HashMap<(String, String), f64> {
+    observed
+        .iter()
+        .filter(|(k, _)| !measured || forced.contains(*k))
+        .map(|(k, v)| (k.clone(), *v))
         .collect()
 }
 
@@ -4934,18 +7620,87 @@ fn prove_watchdog(cycles: u64, planning_cps: Option<f64>, fixed: u64, cap: Durat
 }
 
 /// Whether a job may be admitted without look-ahead: fewer jobs in flight than `max_concurrent`, and
-/// for a risc0 job fewer risc0 jobs (all in flight but `other_backend` ones) than `risc0_cards`. A job
-/// is admitted to start now, one per card, and automatic concurrency counts every GPU, so a card with
-/// no risc0 size would otherwise queue a second risc0 job behind the first's card.
+/// for a risc0 job fewer risc0 jobs (all in flight but `other_backend` ones) than `risc0_cards`, or a
+/// risc0 card none of them can go to (`card_left_free`, see `risc0_card_left_free`). A job is admitted
+/// to start now, one per card, and automatic concurrency counts every GPU, so a card with no risc0
+/// size would otherwise queue a second risc0 job behind the first's card. A job that can finish on
+/// only some of the cards (`eligible_subset`) needs one of those free (`card_left_free` over them):
+/// fewer jobs than cards says nothing of which cards they are on.
 fn risc0_bypass_room(
     in_flight: usize,
     other_backend: usize,
     max_concurrent: usize,
     risc0_job: bool,
     risc0_cards: usize,
+    card_left_free: bool,
+    eligible_subset: bool,
 ) -> bool {
-    in_flight < max_concurrent
-        && (!risc0_job || in_flight.saturating_sub(other_backend) < risc0_cards)
+    let fewer_than_cards =
+        !eligible_subset && in_flight.saturating_sub(other_backend) < risc0_cards;
+    in_flight < max_concurrent && (!risc0_job || fewer_than_cards || card_left_free)
+}
+
+/// Where a risc0 job in its prove loop can go: the slot its attempt runs on, or while it waits, the
+/// slots it is kept off (one it just failed on, one switched off, one it cannot finish on inside the
+/// proving timeout), and those of the cards it was not admitted on (`ineligible`, which the
+/// dispatcher never sends it to). Set by the prove loop at each attempt and removed when the loop
+/// ends, for the claim gate's count of free risc0 cards (`risc0_card_left_free`).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Risc0Placement {
+    proving_on: Option<String>,
+    barred: Vec<String>,
+    ineligible: Vec<String>,
+}
+
+static RISC0_PLACEMENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<B256, Risc0Placement>>> =
+    std::sync::OnceLock::new();
+
+fn risc0_placements() -> std::sync::MutexGuard<'static, HashMap<B256, Risc0Placement>> {
+    RISC0_PLACEMENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// Removes a job's placement when its prove loop ends, however it ends.
+struct Risc0PlacementGuard(B256);
+
+impl Drop for Risc0PlacementGuard {
+    fn drop(&mut self) {
+        risc0_placements().remove(&self.0);
+    }
+}
+
+/// Whether one of `open` (risc0 slots: those of the risc0 `cards` the new job can go to) is a card no
+/// risc0 job in flight can go to, so a new one would start there now rather than queue: a job proving
+/// is on its own card; one waiting can take any card it was admitted on (not `ineligible`) and is not
+/// kept off (every such card, when it is kept off all of them, as the dispatcher then restores
+/// them); and one not yet at its prove loop (`None`) any card. A job kept off a card after failing
+/// there counted as that card's otherwise, and the card sat idle while it waited for another.
+fn risc0_card_left_free(
+    cards: &[String],
+    open: &[String],
+    jobs: &[Option<Risc0Placement>],
+) -> bool {
+    open.iter().any(|card| {
+        !jobs.iter().any(|job| match job {
+            None => true,
+            Some(Risc0Placement {
+                proving_on: Some(on),
+                ..
+            }) => on == card,
+            Some(Risc0Placement {
+                barred, ineligible, ..
+            }) => {
+                !ineligible.contains(card)
+                    && (!barred.contains(card)
+                        || cards
+                            .iter()
+                            .filter(|c| !ineligible.contains(c))
+                            .all(|c| barred.contains(c)))
+            }
+        })
+    })
 }
 
 /// A risc0 card that proves jobs but has no usable row in `rows` (its benchmark failed at po2 20, or
@@ -5045,7 +7800,8 @@ fn spawn_sp1_warmup() {
 async fn miner_brain(
     client: ChainClient,
     state: zkminer_tui::state::SharedState,
-    proving_timeout: Duration,
+    // The startup value: re-read from the Settings screen's every pass (see the loop).
+    mut proving_timeout: Duration,
     // Startup snapshot of the COST COMPOSITION only. The three figures the Settings screen
     // edits — `min_profit_threshold`, `deadline_safety_margin`, `token_price_usd`, plus the
     // three inside `CostParams` — are deliberately NOT parameters: the loop re-reads them
@@ -5103,6 +7859,11 @@ async fn miner_brain(
     // (with no collateral: theirs is already in the on-chain figures).
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<B256>();
     let mut in_flight: HashMap<B256, u128> = HashMap::new();
+    // Each claimed job's last row, for the held locks' rows (`refresh_kept_locks`).
+    let mut kept_rows: HashMap<B256, zkminer_tui::state::TrackedJob> = HashMap::new();
+    // The journal's locks listed before the startup recovery pass, so one it finds gone (slashed
+    // while the miner was down) has a row to move to the history (`record_lock_ends`).
+    refresh_kept_locks(&state, &journal, &in_flight, &mut kept_rows).await;
     // Witness locks join `in_flight` when they are locked (or recovered), with their collateral and
     // sized cycles, and leave it through `done_tx` like every other lock.
     let (witness_held_tx, mut witness_held_rx) = mpsc::unbounded_channel::<(B256, u128, u64)>();
@@ -5147,6 +7908,7 @@ async fn miner_brain(
             undecided: Vec::new(),
             actions: Vec::new(),
             scan: None,
+            ended: Vec::new(),
         }
     } else {
         recover_claimed_jobs(
@@ -5164,6 +7926,7 @@ async fn miner_brain(
     };
     let mut recovery_deferred = startup_pass.deferred;
     let mut recovery_scan = startup_pass.scan;
+    record_lock_ends(&client, &state, startup_pass.ended).await;
     spawn_recovery_actions(
         startup_pass.actions,
         (startup_pass.scan_ok, startup_pass.undecided),
@@ -5204,6 +7967,8 @@ async fn miner_brain(
     // Whether the clock-skew claim gate is closed (to log its opening and closing once), and when it
     // last re-read a header to confirm a large skew.
     let mut clock_skew_held = false;
+    // The last claims summary logged (see `publish_claim_outlook`), for its throttle.
+    let mut last_claim_summary: Option<(std::time::Instant, String)> = None;
     let mut last_skew_reread: Option<std::time::Instant> = None;
     // Where the rotating quarter of the per-tick candidate cut resumes.
     let mut candidate_rotation: usize = 0;
@@ -5454,10 +8219,16 @@ async fn miner_brain(
             witness_held.insert(jid);
         }
         witness_held.retain(|j| in_flight.contains_key(j));
+        // Locks the journal still holds (a task that handed its lock back to recovery, a kept lock):
+        // still on chain, so still counted against the collateral caps.
+        let journalled = collateral::journalled_locks(
+            &journal.lock().unwrap_or_else(|p| p.into_inner()),
+            zkminer_chain::client::chain_now(),
+        );
         // Reap finished job tasks before re-evaluating the concurrency budget.
         while let Ok(jid) = done_rx.try_recv() {
             in_flight.remove(&jid);
-            collateral::forget(jid);
+            collateral::forget_unless_journalled(jid, &journalled);
             segment_disk::release(jid);
             proved.remove(&jid);
             inflight_work.remove(&jid);
@@ -5468,9 +8239,9 @@ async fn miner_brain(
             if in_flight.contains_key(&jid) && proved.insert(jid) {
                 queue_model.settle(&jid.0);
             }
-            // Proven (or never going to be): no longer counted against its program's and
-            // submitter's share of the stake, and its segments are gone.
-            collateral::forget(jid);
+            // Proven (or never going to be): its segments are gone. Its lock still counts against the
+            // collateral caps until it settles (its task ends, above): a proof whose fulfil cannot be
+            // sent loses the lock all the same.
             segment_disk::release(jid);
         }
         // Only jobs still held. Every path that reaps one removes it here too, but an entry left
@@ -5478,13 +8249,17 @@ async fn miner_brain(
         // recovery pass's own reap, and the planner's model then never matched again.
         proved.retain(|j| in_flight.contains_key(j));
         inflight_work.retain(|j, _| in_flight.contains_key(j));
-        // Held and unproven, or a witness task's (claiming, or holding a lock the brain has not been
-        // told of yet): anything else left the count (a claim that did not land, a task that ended).
+        // Held (proven or not: until its lock settles), a witness task's (claiming, or holding a
+        // lock the brain has not been told of yet), or still in the journal (handed back, kept, not
+        // yet found again by recovery): anything else left the count (a claim that did not land, a
+        // lock fulfilled, released or found ended).
         collateral::retain(|j| {
-            (in_flight.contains_key(j) && !proved.contains(j))
+            in_flight.contains_key(j)
                 || witness_rt.as_ref().is_some_and(|w| w.owns(*j))
+                || journalled.contains(j)
         });
         prune_lock_blocks(&in_flight);
+        refresh_kept_locks(&state, &journal, &in_flight, &mut kept_rows).await;
         {
             // Advance the backlog model by real elapsed time, not by tick count: the brain
             // loop awaits `recover_claimed_jobs` inline and can stall for minutes, and a
@@ -5781,6 +8556,11 @@ async fn miner_brain(
                     .await;
                     recovery_deferred = pass.deferred;
                     recovery_scan = pass.scan;
+                    // A lock found ended no longer counts against the collateral caps.
+                    for (jid, _, _) in &pass.ended {
+                        collateral::forget(*jid);
+                    }
+                    record_lock_ends(&client, &state, pass.ended).await;
                     // Reap tasks that finished DURING the pass first, so a lock whose task just
                     // ended can be picked up again.
                     let mut rearm = false;
@@ -5795,6 +8575,12 @@ async fn miner_brain(
                     if rearm {
                         request_recovery();
                     }
+                    let releases: Vec<B256> = pass
+                        .actions
+                        .iter()
+                        .filter(|(_, a)| matches!(a, RecoveryAction::Release(_)))
+                        .map(|(j, _)| *j)
+                        .collect();
                     spawn_recovery_actions(
                         pass.actions,
                         (pass.scan_ok, pass.undecided),
@@ -5806,6 +8592,22 @@ async fn miner_brain(
                         proving_timeout,
                         witness_rt.as_ref(),
                     );
+                    // The releases are on their way: now read the terms of locks released at the
+                    // floor for want of them (after a restart), so each counts against the
+                    // stake-wide cap at what it locked. One batched read, only when there are some.
+                    let unread: Vec<B256> = releases
+                        .into_iter()
+                        .filter(|j| job_collateral_terms(*j).is_none())
+                        .collect();
+                    if !unread.is_empty() {
+                        prefetch_job_collateral_terms(&client, &unread).await;
+                        for jid in unread {
+                            collateral::raise(
+                                jid,
+                                recovered_lock_collateral(jid, recovered_settled_price(jid)),
+                            );
+                        }
+                    }
                 }
                 // Escalate the back-off on repeated deferrals; reset once a pass completes.
                 consecutive_defers = if recovery_deferred {
@@ -5852,13 +8654,24 @@ async fn miner_brain(
             )
         };
 
-        // The cards as a witness lock sees them: inline jobs still needing one, and the cap.
+        // The cards as a witness lock sees them: inline jobs still needing one, the cap, and the
+        // cards inline jobs are proving on.
         if let Some(w) = &witness_rt {
-            let inline_needing = in_flight
-                .keys()
-                .filter(|j| !proved.contains(*j) && !witness_held.contains(*j))
-                .count();
-            w.note_cards(inline_needing, max_concurrent);
+            let inline = || {
+                in_flight
+                    .keys()
+                    .filter(|j| !proved.contains(*j) && !witness_held.contains(*j))
+            };
+            let busy: Vec<String> = {
+                let placements = risc0_placements();
+                inline()
+                    .filter_map(|j| placements.get(j)?.proving_on.clone())
+                    .map(|slot| {
+                        zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(&slot)
+                    })
+                    .collect()
+            };
+            w.note_cards(inline().count(), max_concurrent, busy);
         }
 
         // Each risc0 card's job size (see `risc0_job_po2`), published for the Settings screen before
@@ -5903,6 +8716,25 @@ async fn miner_brain(
         }
 
         if paused || held_locks_only() || open_jobs.is_empty() {
+            if paused || held_locks_only() {
+                let why = if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                    "shutting down"
+                } else if held_locks_only() {
+                    "the lock journal could not be loaded: only the locks held are driven"
+                } else {
+                    "paused (p in the dashboard resumes)"
+                };
+                publish_claim_hold(&state, why.into(), &mut last_claim_summary).await;
+            } else {
+                publish_claim_outlook(
+                    &state,
+                    ClaimOutlook::default(),
+                    &[],
+                    &[],
+                    &mut last_claim_summary,
+                )
+                .await;
+            }
             continue;
         }
         // The hard concurrency cap still applies: look-ahead queues CLAIMS, it does not run
@@ -5952,6 +8784,31 @@ async fn miner_brain(
                 s.runtime_settings.token_price_usd,
             )
         };
+        // The per-attempt proving cap, live from the Settings screen too: the claim gate's "too
+        // large" check and each new lifecycle's watchdog use this pass's value. An attempt already
+        // running keeps the cap it started with. Assigned, not shadowed, so the recovery drive at
+        // the top of the next pass takes it too.
+        let previous_timeout = proving_timeout;
+        proving_timeout = Duration::from_secs(
+            state
+                .read()
+                .await
+                .runtime_settings
+                .proving_timeout_secs
+                .max(60),
+        );
+        // Raised: the jobs set aside as too long for the old cap are looked at again now, not when
+        // their set-aside runs out half an hour later.
+        if proving_timeout > previous_timeout {
+            let released = release_set_aside_for(TOO_LONG_FOR_PROVING_TIMEOUT);
+            if released > 0 {
+                tracing::info!(
+                    "proving timeout raised to {}s: looking again at {released} job(s) skipped as \
+                     too long for the old one",
+                    proving_timeout.as_secs()
+                );
+            }
+        }
         // Live, like the rest of them. See the claim gate below for why this one was load-bearing.
         let (disabled_backends, disabled_slots_by_backend) = {
             let st = state.read().await;
@@ -5991,7 +8848,19 @@ async fn miner_brain(
         // fail-open means "keep piling on". Absent facts mean we cannot classify, so we keep the
         // last thing we could prove: PSI alone, which is the symptom and the stronger signal.
         let stall_pct = zkminer_prover::memory::memory_stall_percent();
-        let mem_avail = zkminer_prover::memory::mem_available_bytes();
+        // Windows: idle workers keep RAM and commit, and a proof that needs it recycles them
+        // (`make_host_room`, `reserve_commit`). Braking on it would stop the dispatch that gives it
+        // back, for good. Commit counts what the page file can still grow (`CommitFigures`).
+        // And what our running proofs hold: it comes back when each is done, and the claim check
+        // charges it already, so it is not the host struggling (`busy_prove_holdings`).
+        let pool = zkminer_prover::engine::worker_pool();
+        let (busy_ram, busy_commit) = pool.map_or((0, 0), |pool| pool.busy_prove_holdings());
+        let mem_avail = zkminer_prover::memory::pressure_available_bytes(
+            pool.map_or(0, |pool| pool.idle_reclaimable_host_bytes())
+                .saturating_add(busy_ram),
+            pool.map_or(0, |pool| pool.idle_reclaimable_commit_bytes())
+                .saturating_add(busy_commit),
+        );
         let mem_total = zkminer_prover::memory::mem_total_bytes();
         let pressure = match (mem_avail, mem_total) {
             (Some(avail), Some(total)) => {
@@ -6057,6 +8926,12 @@ async fn miner_brain(
                     stall_pct.unwrap_or(0.0),
                     avail_gib,
                 );
+                publish_claim_hold(
+                    &state,
+                    format!("host memory under pressure ({avail_gib:.1} GiB free)"),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
             zkminer_prover::memory::PressureState::Critical => {
@@ -6074,6 +8949,12 @@ async fn miner_brain(
                     stall_pct.unwrap_or(0.0),
                     avail_gib,
                 );
+                publish_claim_hold(
+                    &state,
+                    format!("host memory critical ({avail_gib:.1} GiB free)"),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -6100,6 +8981,23 @@ async fn miner_brain(
             max_concurrent.saturating_mul(3)
         };
         if needing_card(&in_flight, &proved) >= claim_ceiling {
+            publish_claim_hold(
+                &state,
+                // The claim limit, not the cards: jobs beyond the cards wait for one.
+                format!(
+                    "{} job(s) being claimed or proven, the most it takes at once ({}); more as \
+                     they finish",
+                    needing_card(&in_flight, &proved),
+                    if planner_active {
+                        format!("{claim_ceiling}: 3 x max_concurrent_proofs")
+                    } else {
+                        // Its value in effect: 0 in the config means one per GPU.
+                        format!("max_concurrent_proofs, in effect {claim_ceiling}")
+                    }
+                ),
+                &mut last_claim_summary,
+            )
+            .await;
             continue;
         }
 
@@ -6127,6 +9025,22 @@ async fn miner_brain(
                     client.jammed_nonce()
                 );
             }
+            publish_claim_hold(
+                &state,
+                format!(
+                    "a transaction is stuck at nonce {:?}; held jobs continue",
+                    client.jammed_nonce()
+                ),
+                &mut last_claim_summary,
+            )
+            .await;
+            continue;
+        }
+
+        // A lock of this prover was slashed, or its stake fell unexplained (`slash_latch`): no new
+        // collateral until the operator clears it. Held locks continue.
+        if let Some(why) = slash_latch::hold_reason() {
+            publish_claim_hold(&state, why, &mut last_claim_summary).await;
             continue;
         }
 
@@ -6158,6 +9072,12 @@ async fn miner_brain(
                 }
             }
             if pause_seen.is_some_and(|(_, p)| p) {
+                publish_claim_hold(
+                    &state,
+                    "the protocol is paused on-chain".into(),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -6220,6 +9140,12 @@ async fn miner_brain(
                         tracing::warn!("{msg}");
                     }
                     clock_skew_held = true;
+                    publish_claim_hold(
+                        &state,
+                        format!("clock skew — {why}"),
+                        &mut last_claim_summary,
+                    )
+                    .await;
                     continue;
                 }
                 None if clock_skew_held => {
@@ -6274,6 +9200,18 @@ async fn miner_brain(
                         in_flight.len()
                     );
                 }
+                publish_claim_hold(
+                    &state,
+                    format!(
+                        "not enough ETH for gas: have {}, need {} for {} held fulfil(s) plus one \
+                         claim",
+                        fmt_eth(eth, false),
+                        fmt_eth(need, true),
+                        in_flight.len()
+                    ),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -6323,6 +9261,12 @@ async fn miner_brain(
                         ),
                     );
                 }
+                publish_claim_hold(
+                    &state,
+                    "the RPC is rate-limiting this miner; backing off".into(),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
@@ -6353,16 +9297,34 @@ async fn miner_brain(
                     last_rpc_backoff_warn = Some(now);
                     tracing::warn!(
                         "Pausing claims — collateral/state data is stale (last refresh >{}s ago); \
-                         RPC or the state-refresh read may be failing. In-flight jobs unaffected.",
-                        CLAIM_FRESHNESS_MAX.as_secs()
+                         RPC or the state-refresh read may be failing. If the RPC is unreachable, \
+                         held locks can be neither fulfilled nor released either (PAGE: \
+                         CHAIN-UNREACHABLE once that lasts {}s with locks held).",
+                        CLAIM_FRESHNESS_MAX.as_secs(),
+                        chain_watch::UNREACHABLE_AFTER.as_secs()
                     );
                 }
+                publish_claim_hold(
+                    &state,
+                    format!(
+                        "chain data is stale (no successful refresh in {}s; is the RPC failing?)",
+                        CLAIM_FRESHNESS_MAX.as_secs()
+                    ),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         }
 
         // The startup benchmark has the cards. Held-lock recovery is not behind this.
         if state.read().await.startup_benchmark_pending {
+            publish_claim_hold(
+                &state,
+                "the startup benchmark is still running".into(),
+                &mut last_claim_summary,
+            )
+            .await;
             continue;
         }
 
@@ -6391,6 +9353,12 @@ async fn miner_brain(
             }
             None => {
                 // No benchmarks yet — evaluator can't make a safe decision.
+                publish_claim_hold(
+                    &state,
+                    "no benchmark results yet (run `zkminer benchmark`)".into(),
+                    &mut last_claim_summary,
+                )
+                .await;
                 continue;
             }
         };
@@ -6416,30 +9384,59 @@ async fn miner_brain(
             &disabled_slots_by_backend,
             disabled_backends.contains(zkminer_prover_protocol::BACKEND_RISC0),
         );
+        // The dispatcher's figures that name no job (how many proofs fit side by side, what a job
+        // of another backend takes) charge each card's own size, not risc0's default.
+        if let Some(pool) = zkminer_prover::engine::worker_pool() {
+            pool.set_risc0_card_sizes(risc0_cards.iter().map(|c| (c.slot.clone(), c.po2)));
+        }
+        // Not a card whose last risc0 proof found too little VRAM free and still does: a job
+        // claimed for it would wait there and be released (see `WorkerPool::risc0_card_short`).
+        let (risc0_cards, risc0_cards_short) = match zkminer_prover::engine::worker_pool() {
+            Some(pool) => {
+                // Reading a card can take seconds (nvidia-smi), which this loop must not wait on.
+                for key in pool.risc0_short_due() {
+                    tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));
+                }
+                claimable_risc0_cards(risc0_cards, |slot, po2| pool.risc0_card_short(slot, po2))
+            }
+            None => (risc0_cards, 0),
+        };
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
 
         let device_backend_throughputs: Vec<(String, String, f64)> = {
+            // Each risc0 card's VRAM, so a size it is not known to hold is priced as such.
+            let risc0_vram: HashMap<String, Option<u64>> = zkminer_prover::engine::worker_pool()
+                .map(|p| {
+                    p.risc0_slots()
+                        .into_iter()
+                        .map(|(slot, _, vram)| (slot, vram))
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut v: Vec<(String, String, f64)> = Vec::new();
+            let benchmarked = benchmark_unix_secs(&benchmarks.timestamp);
             for d in &benchmarks.device_benchmarks {
                 if !d.device_id.starts_with("gpu") {
                     continue; // CPU rows are not proving slots here
                 }
-                // A risc0 row only for a card that proves risc0 jobs, at the rate of its job size.
-                let throughput = if d.prover_backend == zkminer_prover_protocol::BACKEND_RISC0 {
-                    match risc0_cards.iter().find(|c| c.device == d.device_id) {
-                        Some(card) => zkminer_prover::benchmark::risc0_job_throughput(d, card.po2),
-                        None => continue,
-                    }
-                } else {
-                    d.throughput
+                let Some(throughput) =
+                    planned_throughput(d, &risc0_cards, &risc0_vram, benchmarked, |bus, at| {
+                        zkminer_prover::engine::worker_pool()
+                            .map_or(1.0, |p| p.sp1_rate_factor(bus, at))
+                    })
+                else {
+                    continue;
                 };
                 v.push((d.device_id.clone(), d.prover_backend.clone(), throughput));
             }
             fill_risc0_rows(&mut v, &risc0_cards);
-            // No measured suite: what the cards have actually proved at, where they have.
-            if !measured {
-                v = with_observed(v, &observed);
-            }
+            // No measured suite: what the cards have actually proved at, where they have. With one,
+            // the learned rate only for a card whose benchmark-rate claims kept overrunning
+            // (`note_estimate_overrun`).
+            v = with_observed(
+                v,
+                &admission_observed(measured, &observed, &admission_observed_cards()),
+            );
             v
         };
         // The planner models only the jobs it placed, and is used only while that covers every job
@@ -6487,8 +9484,9 @@ async fn miner_brain(
         // a stranded lock is in `on_chain_locked` but not in `in_flight`, so max() dropped it.)
         let stake_read_block = stake_info.as_ref().and_then(|si| si.read_block);
         let lock_blocks = lock_blocks();
-        // The most one job, and the unproven jobs of one program or submitter, may lock
-        // (`collateral`): a share of the total stake, at least the deployment's per-job floor.
+        // The most one job, and the unsettled jobs of one program or submitter, may lock, and the
+        // most every lock held here may come to together (`collateral`): shares of the total stake,
+        // each at least the deployment's per-job floor.
         if collateral::floor().is_none()
             && last_floor_read.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
         {
@@ -6502,7 +9500,12 @@ async fn miner_brain(
         }
         let total_staked = stake_info.as_ref().map_or(0, |si| si.total_staked);
         collateral::note_stake(total_staked);
-        let job_collateral_cap = collateral::policy().cap(total_staked);
+        // The stake-wide cap also counts the chain's own locked figure while it is fresh: locks this
+        // process holds no entry for (handed back, not yet found again after a restart) count too.
+        let collateral_caps = collateral::caps_at(
+            stake_info.as_ref(),
+            collateral::fresh_reading(state.read().await.last_refresh),
+        );
         let mut available_collateral = stake_info
             .as_ref()
             .map(|si| si.available_collateral)
@@ -6531,13 +9534,31 @@ async fn miner_brain(
         }
         other_backend_in_flight.retain(|j| in_flight.contains_key(j));
         sp1_in_flight.retain(|j| in_flight.contains_key(j));
+        // Why each job looked at this pass was not claimed (see `DeclineTally`), starting with the
+        // ones this filter sets aside before the loop.
+        let mut declines = DeclineTally::default();
+        // Each job's measurement as this pass resolved it, for the Job Detail screen.
+        let mut measured_now: Vec<(B256, zkminer_tui::state::JobMeasurement)> = Vec::new();
         let mut candidates: Vec<_> = open_jobs
             .iter()
             .filter(|j| !in_flight.contains_key(&j.info.job_id))
             .filter(|j| !undecodable_now.contains(&j.info.job_id))
-            .filter(|j| !claim_backing_off(j.info.job_id))
-            .filter(|j| claim_predicate_now || !job_is_bound(j.info.job_id))
-            .filter(|j| !program_has_no_elf_source(j.info.program_id))
+            .filter(|j| {
+                let jid = j.info.job_id;
+                let why = if let Some(why) = claim_backoff_reason(jid) {
+                    Some(why)
+                } else if !claim_predicate_now && job_is_bound(jid) {
+                    Some("bound job (claim_predicate_jobs is off)")
+                } else if program_has_no_elf_source(j.info.program_id) {
+                    Some("its program's ELF has no source or could not be downloaded (checked again within 10 min)")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    declines.note(jid, why);
+                }
+                why.is_none()
+            })
             .collect();
         candidates.sort_by_key(|j| std::cmp::Reverse(j.current_price));
         cut_candidates(&mut candidates, &mut candidate_rotation);
@@ -6605,6 +9626,7 @@ async fn miner_brain(
                         "Skipping {}: no status in batch (revert/RPC miss)",
                         short_id(jid)
                     );
+                    declines.note(jid, "its status could not be read");
                     continue;
                 }
             };
@@ -6630,7 +9652,12 @@ async fn miner_brain(
                     .bid_deadline
                     .saturating_sub(zkminer_chain::client::chain_now_floor());
                 tracing::debug!("Skipping {}: a bid is live for {left}s more", short_id(jid));
-                note_job_retry_after(jid, Duration::from_secs(left.clamp(30, 3600)));
+                note_job_retry_after(
+                    jid,
+                    Duration::from_secs(left.clamp(30, 3600)),
+                    "a bid is live",
+                );
+                declines.note(jid, "a bid is live");
                 continue;
             }
             // A witness-construction job (`inputData` starts with WITNESS_JOB_TAG_V1) takes the witness
@@ -6715,6 +9742,7 @@ async fn miner_brain(
                      pending)",
                     short_id(jid)
                 );
+                declines.note(jid, "SP1 program has no ELF hash yet");
                 continue;
             }
             // SKIP (not evict) a program whose NON-predicate pre-fulfill simulation reverted recently.
@@ -6731,6 +9759,7 @@ async fn miner_brain(
                      revert, so not evicted)",
                     short_id(jid)
                 );
+                declines.note(jid, "fulfil simulation reverted recently");
                 continue;
             }
             // EVICT a job at MAX_REOPEN_COUNT (10) reopens: the router refuses every further claim
@@ -6743,18 +9772,30 @@ async fn miner_brain(
             // SKIP (not evict) a job whose last claim was refused for a TEMPORARY reason (a live price
             // below our high-water floor, a live bid, a pause, a free-stake shortfall): re-quote it after
             // a short back-off rather than every tick.
-            if claim_backing_off(jid) {
+            if let Some(why) = claim_backoff_reason(jid) {
+                declines.note(jid, why);
                 continue;
             }
             // A submitter whose job measured clean and then faulted after the claim, or the global
             // divergence breaker (see `note_post_claim_divergence`): no measure slot, no claim.
             if let Some(b) = resolve_backend(snapshot.proof_system_id) {
                 if divergence_blocks_claim(job.info.caller, job.info.program_id, b) {
+                    declines.note(jid, "held by the divergence breaker");
                     continue;
                 }
             }
+            // No claim (a batch claim included) while this host cannot record a proof's start, nor
+            // of a job or its submitter's program released as a crash loop (`start_record_hold`).
+            if start_record_hold(&journal, jid, job.info.caller, job.info.program_id).is_some() {
+                declines.note(
+                    jid,
+                    "held: proof starts cannot be recorded, or a crash loop",
+                );
+                continue;
+            }
             // FULL/FIELDS-bound with bound-job claiming off: settled by its one descriptor fetch.
             if !claim_predicate_now && job_is_bound(jid) {
+                declines.note(jid, "bound job (claim_predicate_jobs is off)");
                 continue;
             }
             // Proving-time budget if we claim now. getJobStatusView.timeRemaining is
@@ -6784,6 +9825,7 @@ async fn miner_brain(
                     "Skipping {}: the deployment is not verified right now",
                     short_id(jid)
                 );
+                declines.note(jid, "the deployment is not verified");
                 continue;
             }
             match resolve_backend(snapshot.proof_system_id) {
@@ -6793,6 +9835,7 @@ async fn miner_brain(
                         short_id(jid),
                         snapshot.proof_system_id
                     );
+                    declines.note(jid, "unsupported proof system");
                     continue;
                 }
                 Some("risc0") if !risc0_claimable() => {
@@ -6803,6 +9846,7 @@ async fn miner_brain(
                         "Skipping {}: risczero.groth16.v1 is not verified claimable right now",
                         short_id(jid)
                     );
+                    declines.note(jid, "risc0 verifier not verified");
                     continue;
                 }
                 Some("sp1") if !sp1_claimable() => {
@@ -6811,6 +9855,7 @@ async fn miner_brain(
                         "Skipping {}: sp1.groth16.v1 is not verified claimable right now",
                         short_id(jid)
                     );
+                    declines.note(jid, "SP1 verifier not verified");
                     continue;
                 }
                 Some(backend) => {
@@ -6835,6 +9880,7 @@ async fn miner_brain(
                             time_remaining,
                             min_deadline_floor
                         );
+                        declines.note(jid, "window too short to claim");
                         continue;
                     }
                     // Snapshot the backend sources ONCE so `available` and `sim_mode`
@@ -6866,6 +9912,7 @@ async fn miner_brain(
                             "Skipping {}: {backend} is disabled in settings",
                             short_id(jid)
                         );
+                        declines.note(jid, "proof system disabled in settings");
                         continue;
                     }
                     // And a backend whose every DEVICE is switched off is just as unclaimable, even
@@ -6881,6 +9928,7 @@ async fn miner_brain(
                                     "Skipping {}: every {backend} device is disabled in settings",
                                     short_id(jid)
                                 );
+                                declines.note(jid, "its cards are disabled in settings");
                                 continue;
                             }
                         }
@@ -6917,12 +9965,14 @@ async fn miner_brain(
                                          done"
                                     );
                                 }
+                                declines.note(jid, "prover setup still running");
                                 continue;
                             }
                         }
                     }
                     // No card here proves risc0 jobs: none has a size known to fit it (a card under
-                    // 14 GiB needs calibrating, or a size set for it), or each one that has is
+                    // 6.5 GiB, or an AMD or Intel one under 14, needs calibrating or a size set for
+                    // it), or each one that has is
                     // switched off. The job could only be released. (With no risc0 card at all, the
                     // availability check below says so.)
                     if !sim_mode
@@ -6935,31 +9985,63 @@ async fn miner_brain(
                             .is_none_or(|t| now.duration_since(t) >= COLLATERAL_WARN_EVERY)
                         {
                             last_no_risc0_card_warn = Some(now);
-                            let detail = "Not claiming risc0 jobs: no enabled card here has a risc0 \
-                                          job size. A card with under 14 GiB of VRAM needs one: a \
+                            if risc0_cards_short > 0 {
+                                let detail = "Not claiming risc0 jobs: every risc0 card here \
+                                              with a job size has too little VRAM free for it; \
+                                              each is checked again every 5 minutes.";
+                                tracing::warn!("{detail}");
+                                state
+                                    .write()
+                                    .await
+                                    .add_log(LogLevel::Warn, detail.to_string());
+                            } else {
+                                let detail = "Not claiming risc0 jobs: no enabled card here has a risc0 \
+                                          job size. A card with under 6.5 GiB of VRAM (14 GiB on \
+                                          AMD and Intel) needs one: a \
                                           po2 under Settings → Advanced for this session, or \
                                           `prover.risc0_job_po2` in the config or, on an NVIDIA \
                                           card, `zkminer benchmark --calibrate`, each read when the \
                                           miner starts.";
-                            tracing::warn!("{detail}");
-                            state
-                                .write()
-                                .await
-                                .add_log(LogLevel::Warn, detail.to_string());
+                                tracing::warn!("{detail}");
+                                state
+                                    .write()
+                                    .await
+                                    .add_log(LogLevel::Warn, detail.to_string());
+                            }
                         }
+                        declines.note(
+                            jid,
+                            if risc0_cards_short > 0 {
+                                "no risc0 card with a size has the VRAM free for it"
+                            } else {
+                                "no card has a risc0 job size"
+                            },
+                        );
                         continue;
                     }
                     if !sim_mode {
                         if let Some(pool) = zkminer_prover::engine::worker_pool() {
-                            // Reserve for the largest size a card proves risc0 jobs at, so a job
-                            // claimed here is one the PROVE gate can admit on any of them.
-                            let want = if backend == "risc0" {
-                                pool.expected_host_peak_at_po2(
+                            // risc0: charged for the cards it can start on now, at each card's
+                            // size (`risc0_claim_charge`): the most of those, so the PROVE gate
+                            // admits it on whichever it takes. Not a card another job proves on:
+                            // a free 4070 sat idle while SP1 proved on the 5090, its risc0 claims
+                            // charged the 5090's figure.
+                            let risc0_charge = if backend == "risc0" {
+                                let cards: Vec<(String, u8)> = risc0_cards
+                                    .iter()
+                                    .map(|c| (c.slot.clone(), c.po2))
+                                    .collect();
+                                pool.risc0_claim_charge(&cards)
+                            } else {
+                                None
+                            };
+                            let want = match &risc0_charge {
+                                Some((bytes, _, _)) => *bytes,
+                                None if backend == "risc0" => pool.expected_host_peak_at_po2(
                                     backend,
                                     risc0_sizes.iter().copied().max(),
-                                )
-                            } else {
-                                pool.expected_host_peak(backend)
+                                ),
+                                None => pool.expected_host_peak(backend),
                             };
                             // `in_flight` — claims outstanding, spawned or not — and the real
                             // concurrency bound. NOT a per-tick accumulator: claimed jobs prove
@@ -6976,34 +10058,86 @@ async fn miner_brain(
                                     .count();
                                 let room = pool.sp1_concurrent_capacity().unwrap_or(usize::MAX);
                                 if waiting > room.max(1) {
+                                    declines.note(jid, "SP1 jobs already queued");
                                     continue;
                                 }
                             }
-                            if !pool.backend_fits_for_claim(
+                            let outstanding = needing_card(&in_flight, &proved);
+                            let sp1_outstanding = sp1_in_flight
+                                .iter()
+                                .filter(|j| in_flight.contains_key(*j) && !proved.contains(*j))
+                                .count();
+                            let same_backend_outstanding =
+                                if backend == zkminer_prover_protocol::BACKEND_SP1 {
+                                    sp1_outstanding
+                                } else {
+                                    outstanding.saturating_sub(sp1_outstanding)
+                                };
+                            let (claim_po2, claim_slot) = match &risc0_charge {
+                                Some((_, slot, po2)) => (Some(*po2), Some(slot.as_str())),
+                                None if backend == "risc0" => {
+                                    (risc0_sizes.iter().copied().max(), None)
+                                }
+                                None => (None, None),
+                            };
+                            if !pool.backend_fits_for_claim_at_po2(
                                 want,
                                 backend,
-                                needing_card(&in_flight, &proved),
+                                outstanding,
+                                same_backend_outstanding,
                                 max_concurrent,
+                                claim_po2,
+                                claim_slot,
                             ) {
+                                // Windows: commit, not RAM, may be what is short (the remedy is the
+                                // page file, and RAM can show free meanwhile).
+                                let commit_short = pool.claim_short_of_commit(
+                                    want,
+                                    backend,
+                                    outstanding,
+                                    same_backend_outstanding,
+                                    max_concurrent,
+                                    claim_po2,
+                                    claim_slot,
+                                );
                                 // Rate-limited to once per backend per tick. On the market this
                                 // repo documents — 298 open jobs declaring zero cycles — a
                                 // memory-wedged miner emitted ~298 of these every 5s, about 60
                                 // lines a second, which buries every other signal in the log.
                                 if memory_skips_this_tick.insert(backend.to_string()) {
-                                    let detail = format!(
+                                    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+                                    let commit = zkminer_prover::memory::commit_figures()
+                                        .filter(|_| commit_short);
+                                    let detail = if let Some(c) = commit {
+                                        format!(
+                                            "Not claiming {backend} jobs: with {} job(s) \
+                                             outstanding, one more does not fit what Windows can \
+                                             commit ({:.1} GiB can still be committed of {:.1} \
+                                             GiB: RAM plus page file), though RAM may show free. \
+                                             A larger page file would let it. Claiming would mean \
+                                             waiting for memory, or releasing at a penalty.",
+                                            in_flight.len(),
+                                            c.available as f64 / GIB,
+                                            c.total as f64 / GIB,
+                                        )
+                                    } else {
+                                        format!(
                                         "Not claiming {backend} jobs: one proof needs ~{:.1} GiB \
-                                         of host RAM, {} already outstanding, and this {:.1} GiB \
-                                         box cannot run the resulting set ({:.1} GiB held by \
-                                         proofs in flight). Claiming would mean releasing at a \
-                                         penalty.",
-                                        want as f64 / (1024.0 * 1024.0 * 1024.0),
+                                         of host RAM, and with {} job(s) outstanding ({:.1} GiB \
+                                         held by proofs in flight, {:.1} GiB free of {:.1} GiB) \
+                                         it does not fit now. Claiming would mean waiting for \
+                                         memory, or releasing at a penalty.",
+                                        want as f64 / GIB,
                                         in_flight.len(),
+                                        pool.reserved_host_memory() as f64 / GIB,
+                                        zkminer_prover::memory::mem_available_bytes().unwrap_or(0)
+                                            as f64
+                                            / GIB,
                                         zkminer_prover::memory::mem_total_bytes().unwrap_or(0)
                                             as f64
-                                            / (1024.0 * 1024.0 * 1024.0),
-                                        pool.reserved_host_memory() as f64
-                                            / (1024.0 * 1024.0 * 1024.0),
-                                    );
+                                            / GIB,
+                                        )
+                                    };
                                     tracing::warn!("{detail}");
                                     // And on screen. Every memory message used to be
                                     // `tracing`-only, which in TUI mode is a log file the operator
@@ -7012,6 +10146,14 @@ async fn miner_brain(
                                     // showed "Queued (waiting for GPU)" about idle cards.
                                     state.write().await.add_log(LogLevel::Warn, detail);
                                 }
+                                declines.note(
+                                    jid,
+                                    if commit_short {
+                                        "not enough commit (RAM plus page file)"
+                                    } else {
+                                        "not enough host RAM"
+                                    },
+                                );
                                 continue;
                             }
                         }
@@ -7022,6 +10164,7 @@ async fn miner_brain(
                             short_id(jid),
                             backend
                         );
+                        declines.note(jid, "no worker here proves it");
                         continue;
                     }
                 }
@@ -7073,6 +10216,7 @@ async fn miner_brain(
                     short_id(jid),
                     adapter_info.status
                 );
+                declines.note(jid, "proof system not active on-chain");
                 continue;
             }
 
@@ -7131,7 +10275,18 @@ async fn miner_brain(
                 snapshot.descriptor_hash,
             ) {
                 Some(r) => {
+                    let risc0 = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
+                    measured_now.push((
+                        jid,
+                        zkminer_tui::state::JobMeasurement {
+                            cycles: (r.cycles < UNMEASURABLE_CYCLES).then_some(r.cycles),
+                            backend: backend_opt.unwrap_or("").to_string(),
+                            po2s: if risc0 { job_sizes.clone() } else { Vec::new() },
+                            execute_secs: r.execute_secs as f64,
+                        },
+                    ));
                     snapshot.verified_elf_hash = r.verified_elf_hash;
+                    snapshot.measured_registry_elf_hash = r.registry_elf_hash;
                     // The journal the lifecycle checks a bound job's binding against before the
                     // claim, from the same entries as the cycles.
                     snapshot.measured_journal = r.journal;
@@ -7151,11 +10306,86 @@ async fn miner_brain(
             snapshot.measured_cycles = measured_for_job;
             // The execute PEAK (same merged entry) for the RH2 prove reservation; carried on the snapshot.
             snapshot.measured_peak = measured_peak_for_job;
+            // An unmeasurable verdict (over the execute cycle cap, past the measuring time limit, or a
+            // different journal at each size) is never claimed, and says so. Its cycle count is the
+            // UNMEASURABLE_CYCLES marker, which only the proving-timeout gate below used to catch, so
+            // every such job read "too long for the proving timeout": no timeout could fit it.
+            if measured_for_job.is_some_and(|c| c >= UNMEASURABLE_CYCLES) {
+                set_job_aside(jid, UNMEASURABLE_RETRY_TTL, COULD_NOT_BE_MEASURED);
+                declines.note(jid, COULD_NOT_BE_MEASURED);
+                continue;
+            }
             // The proof executes the guest again, which its cycles do not size: out of the window,
             // into the watchdog gate and the planner's backlog below.
             let execute_allowance =
                 execute_allowance_secs(backend_opt.unwrap_or(""), snapshot.measured_execute_secs);
             let prove_window = prove_window.saturating_sub(execute_allowance);
+            // Without the planner (no queue horizon), a job claimed while every card already has a
+            // job, or behind as many of its own backend as run side by side, starts only once those
+            // are done: what is left of its window is what it has, not the whole of it. Checked as
+            // if it started now, a queued job could reach its cutoff waiting and be released.
+            // With the planner, which places jobs on cards as if each card ran its own, only the turn a
+            // backend waits for memory (fewer of it side by side than there are cards: one SP1 proof
+            // at a time on a ~100 GB Windows host) is added.
+            // Before any wait: a job admitted on only some cards waits for those (below).
+            let unqueued_window = prove_window;
+            let outstanding: Vec<(u64, &str)> = inflight_work
+                .iter()
+                .filter(|(j, _)| !proved.contains(*j))
+                .map(|(_, w)| *w)
+                .collect();
+            let side_by_side = zkminer_prover::engine::worker_pool().map_or(usize::MAX, |p| {
+                p.backend_side_by_side(backend_opt.unwrap_or(""))
+            });
+            // Each card's rate for backend `b` as observed this run where it has proved, else
+            // planned, fastest first: of every card, or of those named in `on`.
+            let card_rates = |b: &str, on: Option<&[String]>| -> Vec<f64> {
+                let mut rates: Vec<f64> = device_backend_throughputs
+                    .iter()
+                    .filter(|(d, rb, _)| rb == b && on.is_none_or(|on| on.contains(d)))
+                    .map(|(d, rb, t)| {
+                        observed
+                            .get(&(d.clone(), rb.clone()))
+                            .copied()
+                            .unwrap_or(*t)
+                    })
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .collect();
+                rates.sort_by(|x, y| y.total_cmp(x));
+                rates
+            };
+            let prove_window = {
+                let backend = backend_opt.unwrap_or("");
+                let mut cards: Vec<&str> = device_backend_throughputs
+                    .iter()
+                    .map(|(d, _, _)| d.as_str())
+                    .filter(|d| d.starts_with("gpu"))
+                    .collect();
+                cards.sort_unstable();
+                cards.dedup();
+                let card_count = if planner_active {
+                    if side_by_side >= cards.len() {
+                        0
+                    } else {
+                        usize::MAX
+                    }
+                } else {
+                    cards.len().clamp(1, max_concurrent.max(1))
+                };
+                let wait = if card_count == 0 {
+                    0
+                } else {
+                    expected_queue_wait_secs(
+                        &outstanding,
+                        backend,
+                        card_count,
+                        side_by_side,
+                        |b| card_rates(b, None),
+                        |b| fixed_proving_allowance_secs(b) as f64,
+                    )
+                };
+                prove_window.saturating_sub(wait)
+            };
 
             // H1 provability gate (SP1 only). A guest measured feasible on the SERVER-LESS measure
             // worker can still OOM at PROVE time, where `run_proof` replays the same deterministic
@@ -7183,6 +10413,7 @@ async fn miner_brain(
                                 peak as f64 / (1024.0 * 1024.0 * 1024.0),
                             );
                         }
+                        declines.note(jid, "too heavy for this host's RAM");
                         continue;
                     }
                 }
@@ -7215,23 +10446,57 @@ async fn miner_brain(
             // refuse every job too big for it, on every card; and fallback dispatch sent jobs to it
             // while faster cards were free. When no card can, nothing changes: the gates below refuse
             // the job on the slowest card's figure, as before.
+            let finishes_within = |cycles: u64, rate: f64, window: u64| {
+                card_finishes_in_time(
+                    cycles,
+                    rate,
+                    deadline_safety_margin,
+                    (backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0) + execute_allowance)
+                        as f64,
+                    proving_timeout.as_secs_f64(),
+                    window,
+                )
+            };
             let eligible_rows: Vec<(String, f64)> = match measured_for_job {
                 Some(cycles) => genuine_rows
                     .iter()
-                    .filter(|(_, rate)| {
-                        card_finishes_in_time(
-                            cycles,
-                            *rate,
-                            deadline_safety_margin,
-                            (backend_opt.map(fixed_proving_allowance_secs).unwrap_or(0)
-                                + execute_allowance) as f64,
-                            proving_timeout.as_secs_f64(),
-                            prove_window,
-                        )
-                    })
+                    .filter(|(_, rate)| finishes_within(cycles, *rate, prove_window))
                     .cloned()
                     .collect(),
                 None => Vec::new(),
+            };
+            // Without the planner, a job admitted on only some of the cards waits for one of those:
+            // the wait above, over every card, is none while any card is free, one it cannot finish
+            // on included. So its wait is reckoned again over those cards alone, counting every job
+            // outstanding (any of them may hold one), and it keeps the cards it still finishes on
+            // after that wait. None: it is not claimed.
+            let eligible_rows = match measured_for_job {
+                Some(cycles)
+                    if !planner_active
+                        && !eligible_rows.is_empty()
+                        && eligible_rows.len() < genuine_rows.len() =>
+                {
+                    let on: Vec<String> = eligible_rows.iter().map(|(d, _)| d.clone()).collect();
+                    let wait = expected_queue_wait_secs(
+                        &outstanding,
+                        backend_name,
+                        on.len().clamp(1, max_concurrent.max(1)),
+                        side_by_side,
+                        |b| card_rates(b, Some(&on)),
+                        |b| fixed_proving_allowance_secs(b) as f64,
+                    );
+                    let window = unqueued_window.saturating_sub(wait);
+                    let rows: Vec<(String, f64)> = eligible_rows
+                        .into_iter()
+                        .filter(|(_, rate)| finishes_within(cycles, *rate, window))
+                        .collect();
+                    if rows.is_empty() {
+                        declines.note(jid, "the cards it can finish on are busy past its window");
+                        continue;
+                    }
+                    rows
+                }
+                _ => eligible_rows,
             };
             let sizing_rows = if eligible_rows.is_empty() {
                 &genuine_rows
@@ -7244,6 +10509,39 @@ async fn miner_brain(
                 by_speed.sort_by(|a, b| b.1.total_cmp(&a.1));
                 by_speed.into_iter().map(|(d, _)| d).collect()
             };
+            // The host-memory gate above charged a risc0 job for a card it could start on now,
+            // before it was known which cards it can finish on: the free 4070's figure for a job
+            // that then waits for the busy 5090. Charged again over the cards it can finish on.
+            // (No worker pool in sim mode, so none there.)
+            if backend_name == zkminer_prover_protocol::BACKEND_RISC0 {
+                let cards: Vec<(String, u8)> = risc0_cards
+                    .iter()
+                    .filter(|c| snapshot.eligible_devices.contains(&c.device))
+                    .map(|c| (c.slot.clone(), c.po2))
+                    .collect();
+                let charge = zkminer_prover::engine::worker_pool()
+                    .filter(|_| !cards.is_empty() && cards.len() < risc0_cards.len())
+                    .and_then(|pool| Some((pool, pool.risc0_claim_charge(&cards)?)));
+                if let Some((pool, (want, slot, po2))) = charge {
+                    let outstanding = needing_card(&in_flight, &proved);
+                    let sp1_outstanding = sp1_in_flight
+                        .iter()
+                        .filter(|j| in_flight.contains_key(*j) && !proved.contains(*j))
+                        .count();
+                    if !pool.backend_fits_for_claim_at_po2(
+                        want,
+                        backend_name,
+                        outstanding,
+                        outstanding.saturating_sub(sp1_outstanding),
+                        max_concurrent,
+                        Some(po2),
+                        Some(slot.as_str()),
+                    ) {
+                        declines.note(jid, "not enough host RAM on the cards it can finish on");
+                        continue;
+                    }
+                }
+            }
             let slowest_eligible = if genuine_throughputs.is_empty() {
                 throughputs_for_backend(&device_backend_throughputs, backend_name)
                     .iter()
@@ -7326,6 +10624,7 @@ async fn miner_brain(
                          guaranteed-revert fulfill",
                         short_id(jid)
                     );
+                    declines.note(jid, "fulfil over the on-chain size cap");
                     continue;
                 }
             }
@@ -7349,6 +10648,7 @@ async fn miner_brain(
                         "Skipping {} this tick: its collateral terms are not read yet",
                         short_id(jid)
                     );
+                    declines.note(jid, "collateral terms not read yet");
                     continue;
                 }
             };
@@ -7379,15 +10679,15 @@ async fn miner_brain(
                 (job_min_collateral, u128::from(effective_bps)),
             );
             let required_collateral = exposure.collateral;
-            // No job may lock more than its share of the stake, nor the unproven jobs of its program
-            // or submitter held here with it (`collateral`). One whose terms alone ask for more is
-            // set aside: they are fixed while it is Open. One over a program's or submitter's share
-            // waits for their jobs to be proven.
-            let cap_verdict = collateral::check(jid, &exposure, job_collateral_cap);
+            // No job may lock more than its share of the stake, nor the unsettled jobs of its program
+            // or submitter held here with it, nor every lock held here with it more than theirs
+            // (`collateral`). One whose terms alone ask for more is set aside: they are fixed while it
+            // is Open. One over a share waits for the locks in it to settle.
+            let cap_verdict = collateral::check(jid, &exposure, collateral_caps);
             if let Some(why) = cap_verdict.describe() {
                 if cap_verdict.is_final() {
                     tracing::warn!("job {}: {why} — setting it aside", short_id(jid));
-                    set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                    set_job_aside(jid, DETERMINISTIC_SKIP_TTL, "over the collateral cap");
                 } else {
                     tracing::debug!("job {}: {why} — not now", short_id(jid));
                 }
@@ -7458,7 +10758,15 @@ async fn miner_brain(
                 && (measured_for_job.is_some()
                     || snapshot.expected_cycles >= FALLBACK_ESTIMATED_CYCLES)
             {
-                set_job_aside(jid, DETERMINISTIC_SKIP_TTL);
+                set_job_aside(
+                    jid,
+                    DETERMINISTIC_SKIP_TTL,
+                    if eval.deadline_feasible {
+                        "set aside: too risky to claim"
+                    } else {
+                        "set aside: cannot be proved by its deadline"
+                    },
+                );
             }
             // Count + remember the cheapest job blocked SOLELY by collateral —
             // i.e. under-collateralized but otherwise on-time. Requiring
@@ -7549,7 +10857,8 @@ async fn miner_brain(
                         // Deterministic for this (program, input) — an unmeasurable guest lands here
                         // too — so set the job aside rather than let it hold a slot of the per-tick
                         // candidate cut on every tick.
-                        set_job_aside(jid, UNMEASURABLE_RETRY_TTL);
+                        set_job_aside(jid, UNMEASURABLE_RETRY_TTL, TOO_LONG_FOR_PROVING_TIMEOUT);
+                        declines.note(jid, TOO_LONG_FOR_PROVING_TIMEOUT);
                         continue;
                     }
                 }
@@ -7797,6 +11106,28 @@ async fn miner_brain(
             // counts every GPU, and one with no risc0 size would queue a second job behind the first's
             // card).
             let risc0_job = backend_opt == Some(zkminer_prover_protocol::BACKEND_RISC0);
+            // The risc0 cards this job can finish on (`eligible_devices`; none named: every one).
+            // Only those count as free for it: a job that only the busy 5090 can finish waited
+            // there while the free 4070 was counted for it, and was refused at its cutoff.
+            let eligible_slots: Vec<String> = risc0_cards
+                .iter()
+                .filter(|c| {
+                    snapshot.eligible_devices.is_empty()
+                        || snapshot.eligible_devices.contains(&c.device)
+                })
+                .map(|c| c.slot.clone())
+                .collect();
+            let eligible_subset = risc0_job && eligible_slots.len() < risc0_cards.len();
+            let card_left_free = risc0_job && {
+                let placements = risc0_placements();
+                let jobs: Vec<Option<Risc0Placement>> = in_flight
+                    .keys()
+                    .filter(|j| !proved.contains(*j) && !other_backend_in_flight.contains(*j))
+                    .map(|j| placements.get(j).cloned())
+                    .collect();
+                let slots: Vec<String> = risc0_cards.iter().map(|c| c.slot.clone()).collect();
+                risc0_card_left_free(&slots, &eligible_slots, &jobs)
+            };
             let bypass_room = risc0_bypass_room(
                 needing_card(&in_flight, &proved),
                 other_backend_in_flight
@@ -7806,6 +11137,8 @@ async fn miner_brain(
                 max_concurrent,
                 risc0_job,
                 risc0_cards.len(),
+                card_left_free,
+                eligible_subset,
             );
             let would_commit = admission.is_some() || (queue_bypass && measurable && bypass_room);
             tally.note(Candidate {
@@ -7835,6 +11168,39 @@ async fn miner_brain(
                     deadline_safety_margin,
                 );
             }
+            if !(would_commit && matches!(eval.recommendation, Recommendation::Claim)) {
+                use zkminer_strategy::queue::Rejection;
+                let why = if !matches!(eval.recommendation, Recommendation::Claim) {
+                    decline_reason(&eval.recommendation)
+                } else if !measurable {
+                    if backend_measurable {
+                        // Running, or waiting in line: the measure pool runs a couple of executes per
+                        // backend at a time, so on a busy market most unmeasured jobs are waiting, and
+                        // calling them all "measuring" overstated what the miner was doing.
+                        let running = measuring
+                            .lock()
+                            .is_ok_and(|m| m.contains_key(&snapshot.descriptor_hash));
+                        if running {
+                            "measuring its cycles"
+                        } else {
+                            "waiting to be measured"
+                        }
+                    } else {
+                        "its cycles cannot be measured here"
+                    }
+                } else if let Some(r) = plan_rejection.as_ref() {
+                    match r {
+                        Rejection::HorizonFull => "the look-ahead queue is full",
+                        Rejection::DeadlineInfeasible => "would miss its deadline in the queue",
+                        Rejection::NoUsableDevice => "no card can take it",
+                    }
+                } else if planner_active && !model_complete {
+                    "queue model catching up"
+                } else {
+                    "every card is busy"
+                };
+                declines.note(jid, why);
+            }
             // A risc0 proof writes all its segments to disk first: claimed only while they fit beside
             // every proof planned or running here, witness ones included (`segment_disk`). Reserved
             // until its card is released.
@@ -7849,15 +11215,15 @@ async fn miner_brain(
                 }
             }
             // The cap again, deciding and recording in one step: a witness claim may have taken the
-            // program's or submitter's room since the check above.
+            // program's, submitter's or stake's room since the check above.
             if would_commit
                 && matches!(eval.recommendation, Recommendation::Claim)
-                && collateral::admit(jid, exposure, job_collateral_cap)
+                && collateral::admit(jid, exposure, collateral_caps)
                     != collateral::CapVerdict::Admit
             {
                 segment_disk::release(jid);
                 tracing::debug!(
-                    "job {}: its program's or submitter's share of the stake is taken — not now",
+                    "job {}: its program's, submitter's or the stake's share of locks is taken — not now",
                     short_id(jid)
                 );
                 continue;
@@ -7906,10 +11272,10 @@ async fn miner_brain(
                 }
                 reserved_this_tick = reserved_this_tick.saturating_add(required_collateral);
                 available_collateral = available_collateral.saturating_sub(required_collateral);
-                {
-                    let mut s = state.write().await;
-                    s.open_jobs.retain(|j| j.info.job_id != jid);
-                }
+                // Kept in the market list until its claim lands (it moves to `active_jobs` then):
+                // its row says it is being claimed (`JobNote`). Taken off here, it was in neither
+                // list for the claim's minute, while the claim limit counted it. The candidate
+                // loop skips it (`in_flight`).
                 batch.push(((*job).clone(), snapshot, required_collateral));
 
                 // Bound to free proving slots (never lock more than we can prove before
@@ -7921,6 +11287,50 @@ async fn miner_brain(
                     break;
                 }
             }
+        }
+
+        // Each job's measurement, kept while the job is open or ours (a claimed job's detail still
+        // shows what it was sized on).
+        {
+            let mut s = state.write().await;
+            for (jid, m) in measured_now {
+                s.job_measurements.insert(jid, m);
+            }
+            // In flight too: a claim takes a job off the open list at once, but it joins the claimed
+            // ones only once the claim lands, and its measurement must outlast the gap.
+            let live: std::collections::HashSet<B256> = s
+                .open_jobs
+                .iter()
+                .chain(s.active_jobs.iter())
+                .map(|j| j.info.job_id)
+                .chain(in_flight.keys().copied())
+                .collect();
+            s.proving.retain(|jid, _| live.contains(jid));
+            // A measurement also outlasts the claim on held locks and the history the Jobs page
+            // lists (`recent_finished`): their Job Detail said it was never recorded.
+            let shown: std::collections::HashSet<B256> = s
+                .kept_locks
+                .iter()
+                .map(|j| j.info.job_id)
+                .chain(
+                    s.recent_finished(zkminer_tui::state::RECENT_ROWS)
+                        .map(|j| j.info.job_id),
+                )
+                .collect();
+            s.job_measurements
+                .retain(|jid, _| live.contains(jid) || shown.contains(jid));
+        }
+        // Why each job looked at this pass was not claimed, for the dashboard and the headless log.
+        {
+            let claimed: Vec<B256> = batch.iter().map(|(j, _, _)| j.info.job_id).collect();
+            publish_claim_outlook(
+                &state,
+                declines.outlook(claimed.len()),
+                &declines.why,
+                &claimed,
+                &mut last_claim_summary,
+            )
+            .await;
         }
 
         // What admission saw this pass: why work that was offered was or was not claimed, and how
@@ -8236,6 +11646,10 @@ struct JobStatusSnapshot {
     /// swap is rejected at the re-fetch rather than reaching prove as a penalized release + permanent
     /// blacklist. `None` for SP1 (bound by `elf_hash`), recovery, and risc0 with no measured binding.
     verified_elf_hash: Option<alloy::primitives::B256>,
+    /// The registry `elf_hash` this (program, input)'s SP1 measurement was made under, from the same
+    /// cache entry as `measured_cycles`. The pre-claim ELF step compares it with the registry's now
+    /// (see [`ElfHashChanged`]). `None` for risc0, recovery, and without a measurement.
+    measured_registry_elf_hash: Option<alloy::primitives::B256>,
     /// The journal this (program, input) measured, with the keccak of that input, resolved from the
     /// same cache entry as `measured_cycles`. The lifecycle checks a journal-bound job's binding
     /// against it before claiming. `None` on recovery and wherever no whole journal was measured.
@@ -8286,6 +11700,7 @@ impl JobStatusSnapshot {
             preferred_device: None,
             eligible_devices: Vec::new(),
             verified_elf_hash: None,
+            measured_registry_elf_hash: None,
             measured_journal: None,
             measured_execute_secs: None,
             measured_po2s: Vec::new(),
@@ -8752,7 +12167,8 @@ async fn watch_inspect(
         return Inspected::Done(
             "no card",
             format!(
-                "{head}: no enabled card here proves risc0 jobs (one with under 14 GiB of VRAM needs \
+                "{head}: no enabled card here proves risc0 jobs (one with under 6.5 GiB of VRAM, 14 \
+                 GiB on AMD and Intel, needs \
                  a size: `prover.risc0_job_po2` in the config, or a calibration on an NVIDIA card)"
             ),
         );
@@ -8882,8 +12298,12 @@ async fn watch_inspect(
         .stake_info
         .as_ref()
         .map_or(0, |s| s.total_staked);
-    let cap = collateral::policy().cap(total_staked);
-    let verdict = collateral::decide(job_id, &exposure, cap, &HashMap::new());
+    let verdict = collateral::decide(
+        job_id,
+        &exposure,
+        collateral::caps(total_staked),
+        &HashMap::new(),
+    );
     if let (true, Some(why)) = (verdict.is_final(), verdict.describe()) {
         return Inspected::Done(
             "over the collateral cap",
@@ -8949,6 +12369,18 @@ fn spawn_lifecycle_task(
     tokio::spawn(async move {
         // Frees the concurrency slot on return OR panic.
         let _slot = SlotGuard(jid, done_tx);
+        // A job reserved for a claim is one of the jobs the claim limit counts from now on, while its
+        // pre-claim checks run (descriptor, binding; a minute on a slow RPC). Said so on its row, or
+        // it reads as held by the very limit it is counted in. The claim's own stage rewrites it.
+        // Worked on again: no longer a held lock's reason.
+        forget_kept_reason(jid);
+        if !already_locked {
+            state.write().await.set_job_note(
+                jid,
+                zkminer_tui::state::JobNoteKind::Claim,
+                "claiming: checking the job before claiming it",
+            );
+        }
         let outcome = process_job_lifecycle(
             &client,
             &state,
@@ -8960,18 +12392,26 @@ fn spawn_lifecycle_task(
             prefetched_descriptor,
         )
         .await;
+        // Over: nothing it said about a stage may outlive it (a row that comes back, re-driven, starts
+        // clean; a job not claimed after all goes back to the market's reasons). A release below sets
+        // its own note.
+        state.write().await.clear_job_notes(jid);
         if let Err(e) = outcome {
             // A lock we hold that must NOT be released (a pause / disable hold, an unreadable post-
             // claim state): keep the breadcrumb, leave the stashed fulfil nonce for the re-drive or
             // a later release to resume, and ask recovery to pick it up.
             if let Some(h) = e.downcast_ref::<HandBack>() {
                 tracing::warn!("KEEP: job {} {h}", short_id(jid));
-                let mut s = state.write().await;
-                s.active_jobs.retain(|j| j.info.job_id != jid);
-                s.add_log(
-                    zkminer_tui::state::LogLevel::Warn,
-                    format!("Job {} kept: {}", short_id(jid), h.0),
+                note_kept_reason(
+                    jid,
+                    format!("kept ({}); the recovery pass takes it up again", h.0),
                 );
+                // The activity log says why at the next tick (`note_kept_reason`).
+                state
+                    .write()
+                    .await
+                    .active_jobs
+                    .retain(|j| j.info.job_id != jid);
                 request_recovery();
                 return;
             }
@@ -9086,9 +12526,26 @@ async fn process_job_lifecycle(
              holds claims — nothing locked",
             short_id(job_id)
         );
-        note_job_retry_after(job_id, Duration::from_secs(300));
+        note_job_retry_after(
+            job_id,
+            Duration::from_secs(300),
+            "held: a claim gate is closed",
+        );
         requeue_open_job(state, requeue_job.clone()).await;
         return Ok(());
+    }
+    // No claim while this host could not record a proof's start (a full disk, an unwritable
+    // journal), nor of a job, or its submitter's job of the same program, released as a crash loop.
+    if !is_recovery {
+        if let Some((why, wait)) = start_record_hold(journal, job_id, submitter, program_id) {
+            tracing::debug!(
+                "Not claiming {} now: {why} — nothing locked",
+                short_id(job_id)
+            );
+            note_job_retry_after(job_id, wait, "held: a claim gate is closed");
+            requeue_open_job(state, requeue_job.clone()).await;
+            return Ok(());
+        }
     }
 
     // 0. Pre-claim binding gate (HemiProve v2, handoff §8). Every open-market job is FULL- or
@@ -9255,38 +12712,102 @@ async fn process_job_lifecycle(
     // into a release.
     let mut elf_in_hand: Option<Vec<u8>> = None;
     if !is_recovery {
-        match tokio::time::timeout(
+        let honor_registry_hash = resolve_backend(snapshot.proof_system_id) != Some("risc0");
+        // From the cache only, so a slow or withheld ELF never holds this claim slot: a miss puts the
+        // job back and fetches the ELF in the background (`schedule_elf_prefetch`). Only bytes that
+        // fetch would cache are left to it; unbound risc0 bytes are not cached, so they are still
+        // fetched here.
+        let cache_only = honor_registry_hash || snapshot.verified_elf_hash.is_some();
+        let fetched = tokio::time::timeout(
             MEASURE_FETCH_BUDGET,
             // Enforce the risc0 ELF binding co-resolved with this job's measurement: a swapped,
-            // still-retrievable ELF fails the keccak here and becomes a free pre-claim skip.
-            fetch_or_download_elf(
+            // still-retrievable ELF fails the keccak here and becomes a free pre-claim skip. An SP1
+            // job measured under another registry `elf_hash` is measured again first.
+            fetch_elf(
                 client,
                 state,
                 program_id,
                 snapshot.verified_elf_hash,
-                resolve_backend(snapshot.proof_system_id) != Some("risc0"),
+                honor_registry_hash,
+                snapshot.measured_registry_elf_hash,
+                !cache_only,
             ),
         )
         .await
         .map_err(|_| anyhow::anyhow!("ELF fetch exceeded the pre-claim budget"))
-        .and_then(|r| r)
-        {
-            Ok(elf) => {
+        .and_then(|r| r);
+        match preclaim_elf_action(&fetched, || note_preclaim_elf_failure(job_id)) {
+            PreclaimElfAction::Claim => {
                 clear_preclaim_elf_failures(job_id);
-                elf_in_hand = Some(elf)
+                note_registry_fetch_ok(program_id);
+                elf_in_hand = fetched.ok();
             }
-            Err(e) => {
-                tracing::warn!(
-                    "not claiming {}: its ELF is not obtainable now ({}) — skipping before locking \
-                     collateral (the submitter may have withdrawn the stored program)",
-                    short_id(job_id),
-                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+            PreclaimElfAction::RequeuePrefetch => {
+                // No job strike: copies of a job under new ids would each start over at none. A
+                // failing fetch strikes the program instead.
+                tracing::debug!(
+                    "not claiming {} yet: its ELF is not cached, fetching it in the background",
+                    short_id(job_id)
                 );
+                note_job_retry_after(
+                    job_id,
+                    ELF_PREFETCH_RETRY,
+                    "waiting for its ELF to download",
+                );
+                requeue_open_job(state, requeue_job.clone()).await;
+                schedule_elf_prefetch(
+                    client,
+                    state,
+                    program_id,
+                    snapshot.verified_elf_hash,
+                    honor_registry_hash,
+                );
+                return Ok(());
+            }
+            PreclaimElfAction::Remeasure => {
+                // Its measurement is dropped at the next resolve, and the measure path fetches the
+                // new ELF under its own budget and strikes. The change counts against the program.
+                if let Some(now) = fetched
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<ElfHashChanged>())
+                {
+                    note_registry_elf_hash(program_id, now.0);
+                }
+                tracing::debug!(
+                    "not claiming {} yet: its program's registry ELF hash changed since it was \
+                     measured, measuring it again",
+                    short_id(job_id)
+                );
+                note_job_retry_after(
+                    job_id,
+                    ELF_PREFETCH_RETRY,
+                    "to be measured again: its program's ELF changed",
+                );
+                requeue_open_job(state, requeue_job.clone()).await;
+                return Ok(());
+            }
+            action => {
+                if let Err(e) = &fetched {
+                    tracing::warn!(
+                        "not claiming {}: its ELF is not obtainable now ({}) — skipping before \
+                         locking collateral (the submitter may have withdrawn the stored program)",
+                        short_id(job_id),
+                        zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                    );
+                }
                 // Possibly transient (a storage outage): keep it a candidate behind an escalating
                 // back-off, up to a limit — a withheld ELF must not re-take a claim slot forever.
                 note_transient_preclaim_failure(job_id);
-                if note_preclaim_elf_failure(job_id) < MAX_PRECLAIM_ELF_FAILURES {
+                if action == PreclaimElfAction::RequeueStrike {
                     requeue_open_job(state, requeue_job.clone()).await;
+                } else {
+                    // Past the limit: off the market list (it stays listed while it is claimed).
+                    state
+                        .write()
+                        .await
+                        .open_jobs
+                        .retain(|j| j.info.job_id != job_id);
                 }
                 return Ok(());
             }
@@ -9316,7 +12837,11 @@ async fn process_job_lifecycle(
             "Not claiming {} now: a claim gate closed during its pre-claim fetches — nothing locked",
             short_id(job_id)
         );
-        note_job_retry_after(job_id, Duration::from_secs(300));
+        note_job_retry_after(
+            job_id,
+            Duration::from_secs(300),
+            "held: a claim gate is closed",
+        );
         requeue_open_job(state, requeue_job.clone()).await;
         return Ok(());
     }
@@ -9341,6 +12866,14 @@ async fn process_job_lifecycle(
             j.record_claim_intent(job_id, snapshot.lock_deadline, submit_tx);
             // A restart proves it on a card at a size it measured clean at.
             j.note_measured_po2s(job_id, &snapshot.measured_po2s);
+            // A restart shows how far its proof is from these.
+            j.note_measured_cycles(
+                job_id,
+                snapshot
+                    .measured_cycles
+                    .filter(|c| *c < UNMEASURABLE_CYCLES),
+                snapshot.measured_execute_secs,
+            );
         });
         let mut s = state.write().await;
         s.add_log(
@@ -9436,10 +12969,24 @@ async fn process_job_lifecycle(
             Err(e) => return Err(HandBack(format!("ownership re-read failed: {e:#}")).into()),
         }
     } else {
-        match client
+        // Shown as the job's status while the claim is out (`JobNote`): sent, waiting for the chain
+        // to confirm it, sent again. The transaction's own events rewrite it.
+        state.write().await.set_job_note(
+            job_id,
+            zkminer_tui::state::JobNoteKind::Claim,
+            "claiming: sending the claim transaction",
+        );
+        let claimed = client
             .claim_job_idempotent(job_id, snapshot.current_price)
-            .await
-        {
+            .await;
+        // Still being claimed until its row moves to the claimed list (it reads the lock's deadline
+        // first, seconds under a rate limit): cleared there, or when the lifecycle ends.
+        state.write().await.set_job_note(
+            job_id,
+            zkminer_tui::state::JobNoteKind::Claim,
+            "claiming: confirming the lock",
+        );
+        match claimed {
             Ok(ClaimOutcome::Claimed(r)) => r.block,
             Ok(ClaimOutcome::LostRace) if prior_claim => {
                 return Err(HandBack("another prover reads as holding a job an earlier claim of ours may hold".into()).into());
@@ -9569,9 +13116,27 @@ async fn process_job_lifecycle(
         });
     }
 
+    // A recovered lock's measurement from its breadcrumb (a fresh claim's is already shown), so its
+    // detail and its proving progress have the cycles it was claimed on.
+    let recovered_measurement = if is_recovery {
+        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+        j.entries.get(&job_id).and_then(|e| {
+            Some(zkminer_tui::state::JobMeasurement {
+                cycles: Some(e.measured_cycles?),
+                backend: resolve_backend(view.proofSystemId)?.to_string(),
+                po2s: e.measured_po2s.clone(),
+                execute_secs: e.measured_execute_secs.unwrap_or(0) as f64,
+            })
+        })
+    } else {
+        None
+    };
     {
         let mut s = state.write().await;
         s.open_jobs.retain(|j| j.info.job_id != job_id);
+        if let Some(m) = recovered_measurement {
+            s.job_measurements.insert(job_id, m);
+        }
         // The monitor ingest hardcodes `lock_deadline: 0` (run.rs ~489), so without this
         // backfill EVERY in-session job carries deadline 0 and the shutdown path's
         // "nearest deadline first" release ordering sorts on all-zero keys — i.e. does not
@@ -9579,6 +13144,20 @@ async fn process_job_lifecycle(
         // the authoritative value read from the post-claim status view a few lines above.
         let mut claimed_info = job.info.clone();
         claimed_info.lock_deadline = lock_deadline;
+        // What the claim locked (the view's settled price), for the Jobs page's price column.
+        claimed_info.settled_price = view.settledPrice.to::<u128>();
+        // A lock re-driven after its row was dropped starts over: no note from its last run.
+        s.clear_job_notes(job_id);
+        // The collateral the dashboard's quit prompt prices an abandon from: what the claim locked,
+        // `computeCollateral(settledPrice, collateralBps, minCollateral)` with the job's own terms
+        // (0, "unknown", without them).
+        if let Some((min_collateral, bps)) = job_collateral_terms(job_id) {
+            claimed_info.locked_collateral = zkminer_chain::auction::compute_collateral(
+                view.settledPrice.to::<u128>(),
+                u64::try_from(bps).unwrap_or(u64::MAX),
+                min_collateral,
+            );
+        }
         s.active_jobs.push(TrackedJob {
             info: claimed_info,
             // Queued, not Proving: this job holds collateral but has not started. Showing it
@@ -9590,6 +13169,10 @@ async fn process_job_lifecycle(
             prover_backend: String::new(),
             estimated_cycles: view.expectedCycles,
         });
+        // Its zkVM and wrap, for the dashboard's zkVM column.
+        if let Some(system) = zkminer_chain::auction::ProofSystem::from_id(view.proofSystemId) {
+            s.note_proof_system(job_id, system);
+        }
         s.add_log(
             LogLevel::Success,
             format!("Job {} claimed", short_id(job_id)),
@@ -9762,7 +13345,20 @@ async fn process_job_lifecycle(
             format!("Proving job {} with {}...", short_id(job_id), backend),
         );
     }
-    journal_update(journal, |j| j.mark_proving(job_id));
+    // A job whose proof the miner has died in the middle of, run after run, is released rather than
+    // proven once more (`crash_loop_refusal`).
+    let crash_loop = crash_loop_refusal(&journal.lock().unwrap_or_else(|p| p.into_inner()), job_id);
+    if let Some(why) = crash_loop {
+        tracing::error!("PAGE: JOB-CRASH-LOOP — {why}");
+        mark_crash_looped(journal, job_id, program_id, submitter);
+        return Err(anyhow::anyhow!("{why}"));
+    }
+    // Not started where its start could not be recorded: the crash-loop limit above would never
+    // be reached.
+    record_proving(journal, job_id, lock_deadline)?;
+    // Counted once a worker accepts the proof (its `Started`), until the proof ends, however it
+    // ends.
+    let prove_start = ProveStart::new(journal, job_id);
 
     let pool = zkminer_prover::engine::worker_pool()
         .ok_or_else(|| anyhow::anyhow!("no worker pool available"))?;
@@ -9793,11 +13389,30 @@ async fn process_job_lifecycle(
     // MEASURED count — not the adversarial declared `expected_cycles`. See `prove_sizing_cycles`.
     let sizing_cycles: u64 = prove_sizing_cycles(snapshot.expected_cycles, snapshot.measured_cycles);
 
-    // Proactive routing: a job that commits a large cycle count starts pinned to
-    // a high-VRAM GPU (0 = uncommitted → no floor; the reactive path below still
-    // catches an OOM on the first attempt).
-    let mut min_vram: Option<u64> =
-        (sizing_cycles >= LARGE_JOB_CYCLES).then_some(LARGE_JOB_MIN_VRAM_BYTES);
+    // A job re-driven at start (recovery) was never planned this run: prefer its backend's fastest
+    // card, from the benchmark, as the planner would have. Without it, a 1.1 B-cycle job kept over a
+    // restart went to the first free card, a 4070, and took 28 minutes while the 5090 sat idle.
+    // What every slot's estimate adds for executing the guest (`slot_estimates_for`).
+    let estimate_allowance = execute_allowance_secs(backend, snapshot.measured_execute_secs);
+    let mut snapshot = snapshot;
+    if is_recovery && snapshot.preferred_device.is_none() {
+        let backend_name = backend.to_string();
+        snapshot.preferred_device = tokio::task::spawn_blocking(move || {
+            zkminer_prover::benchmark::load_cached_benchmark()
+                .and_then(|suite| fastest_benchmarked_device(&suite, &backend_name))
+        })
+        .await
+        .ok()
+        .flatten();
+    }
+
+    // No VRAM floor up front, however long the job: both zkVMs prove in fixed-size pieces (risc0
+    // segments at the card's po2, SP1 shards at its threshold), so a card's VRAM need does not grow
+    // with the cycle count, and the dispatcher already gates each card on the room its size needs.
+    // A long job prefers the fastest card (`preferred_device`) and takes another when that one is
+    // busy. Pinning it to a >= 30 GiB card instead made it wait on a busy 5090 while a 12 GB 4070
+    // sat idle. Only an out-of-memory retry sets a floor (`steer_after_failure`).
+    let mut min_vram: Option<u64> = None;
     // Slot keys of workers that wedged/timed out on this job, so a retry
     // is steered to a *different* GPU instead of being re-pinned to a flaky one.
     // The slots the operator switched off in Settings. Those toggles were honoured by mock mode and
@@ -9817,6 +13432,10 @@ async fn process_job_lifecycle(
         );
     }
     let mut excluded: Vec<String> = Vec::new();
+    // The card an SP1 retry belongs on: the one whose shard size was just lowered after this job
+    // ran out of GPU memory there (`WorkerPool::take_sp1_retry_card`), preferred for the next
+    // attempt.
+    let mut retry_card: Option<(String, String)> = None;
 
     // Scale the proving-watchdog deadline to the job so a wedged GPU is
     // caught in minutes, not the full (large) configured timeout. Committed-cycle
@@ -9842,10 +13461,36 @@ async fn process_job_lifecycle(
         // Free host-RAM waits used by this job. Bounded separately from `attempt`, because a wait
         // deliberately refunds the attempt it would otherwise have spent.
         let mut memory_waits = 0u32;
+        // When this job first waited for host memory: its waits end `HOST_MEMORY_WAIT_LIMIT` after.
+        // Cleared once a pass is not a memory wait (an attempt ran): a later shortage is a new one.
+        let mut memory_wait_since: Option<std::time::Instant> = None;
+        let mut memory_waited_last = false;
+        // Its place in the dispatcher's memory line goes when its proving does, however it ends
+        // (`WorkerPool::forget_memory_waiter`), not after the line's timeout.
+        struct ForgetMemoryPlace(u64);
+        impl Drop for ForgetMemoryPlace {
+            fn drop(&mut self) {
+                if let Some(pool) = zkminer_prover::engine::worker_pool() {
+                    pool.forget_memory_waiter(self.0);
+                }
+            }
+        }
+        let _memory_place = ForgetMemoryPlace(job_tag(job_id));
+        // A note saying what the job waits for is up (no card, GPU or host memory): cleared when a
+        // pass gets past that wait, else it outlived it while the job only queued for a card.
+        let mut wait_note_up = false;
         // Free VRAM waits, counted separately from `memory_waits`: the two shortages have different
         // remedies and different timescales, and sharing one budget would let a card occupied by a
         // desktop consume the waits a genuine host-RAM dip needs.
         let mut gpu_memory_waits = 0u32;
+        // Free retries after the outage recycle stopped the worker (`free_retry_after_recycle`).
+        let mut recycled_retries = 0u32;
+        // Set once a proof of this job has started on a worker (its `Started` event), by any
+        // attempt: a deadline refusal after that is not one the guest had no part in.
+        let proof_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Set once a refusal on the rates learned this run sent the job back to the dispatcher on
+        // the benchmark's rates alone (`deadline_refusal_action`); every attempt after uses those.
+        let mut retried_on_benchmark = false;
         // Set once an attempt's worker declined (`WorkerDeclined`): it found, before running this
         // job's guest, that its backend cannot run on this host. An environment fault, so if every
         // attempt then fails the program and submitter are not marked divergent.
@@ -9854,6 +13499,9 @@ async fn process_job_lifecycle(
         // (`segment_disk::inline_short`, read here, not from the worker): this host's failure.
         let mut disk_short = false;
         let mut attempt = 0u32;
+        // Where this risc0 job can go, for the claim gate's free-card count; removed when proving ends.
+        let _placement = (backend == zkminer_prover_protocol::BACKEND_RISC0)
+            .then(|| Risc0PlacementGuard(job_id));
         // The cards that refused this job ADMISSION (an un-attempted host-RAM refusal), in the order
         // they refused. Unlike a GPU shortage that does not exclude the card, so if it stayed in the
         // order the dispatcher would re-pin the un-admittable card every retry while another idles →
@@ -9866,12 +13514,47 @@ async fn process_job_lifecycle(
         let mut warned_no_card = false;
         // Whether the last look found no card to take it (see the wait below).
         let mut waiting_for_card = false;
+        // Whether an attempt (or a wait for a card or memory) came before this pass.
+        let mut retrying = false;
+        // Whether the pass before this one was a failed attempt (not a wait or a refund).
+        let mut failed_last = false;
         loop {
             attempt += 1;
+            // Between attempts the job is not proving: back to Queued until a worker takes it again,
+            // and the last attempt's progress dropped, so the dashboard shows no stale bar or time.
+            if retrying {
+                end_attempt_display(state, job_id).await;
+                let mut s = state.write().await;
+                // Not "waiting for a GPU" when it is trying again. A wait for memory has set its own
+                // note (below), and a wait for a card is what Queued says. Only a pass that failed
+                // says it failed: a governance hold or a refunded cut-off proof did not.
+                if !waiting_for_card && !s.job_notes.contains_key(&job_id) {
+                    s.set_job_note(
+                        job_id,
+                        zkminer_tui::state::JobNoteKind::Wait,
+                        if failed_last {
+                            format!(
+                                "trying again after a failed attempt (attempt {attempt} of \
+                                 {MAX_PROVE_ATTEMPTS})"
+                            )
+                        } else {
+                            format!(
+                                "preparing to prove (attempt {attempt} of {MAX_PROVE_ATTEMPTS})"
+                            )
+                        },
+                    );
+                }
+            }
+            failed_last = false;
+            if !memory_waited_last {
+                memory_wait_since = None;
+            }
+            memory_waited_last = false;
+            retrying = true;
             // The EFFECTIVE deadline moves out while the protocol is paused or a Disabled window
             // lasts (and on a downtime extension): refresh it each attempt, so a proof is never cut
             // short — and its lock released — at a stale pre-pause cutoff.
-            refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await;
+            refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline).await;
             // Pre-deadline release margin: compute the absolute instant past
             // which this job must stop proving to still release its collateral, and
             // bail early if too little time remains to even start. `abort_at` is
@@ -9978,6 +13661,14 @@ async fn process_job_lifecycle(
                         .into());
                     }
                     waiting_for_card = true;
+                    // Not a queue: no enabled card can take it until the operator acts.
+                    state.write().await.set_job_note(
+                        job_id,
+                        zkminer_tui::state::JobNoteKind::Wait,
+                        "waiting: no enabled risc0 card has a job size (switch one on, or give one \
+                         a po2 under Settings, Advanced); released before its deadline otherwise",
+                    );
+                    wait_note_up = true;
                     if !warned_no_card {
                         warned_no_card = true;
                         let detail = format!(
@@ -10020,6 +13711,14 @@ async fn process_job_lifecycle(
             } else {
                 None
             };
+            // Past every wait before the dispatch: what it waited for is no longer what it waits for
+            // (the dispatcher's own memory and card waits set theirs again).
+            if std::mem::take(&mut wait_note_up) {
+                state
+                    .write()
+                    .await
+                    .clear_job_note(job_id, zkminer_tui::state::JobNoteKind::Wait);
+            }
             // Cloned for the progress callback below, which runs on the blocking thread, and the
             // runtime it hands the state update to.
             let state_for_prove_progress = state.clone();
@@ -10031,16 +13730,53 @@ async fn process_job_lifecycle(
             // it was planned for (benchmark id, e.g. "gpu1"), then the rest fastest first. After a
             // host-memory refusal of a card, that card leaves the order (see `refused_admission`).
             let eligible_for_prove = snapshot.eligible_devices.clone();
-            let order_for_prove = job_card_order(
-                snapshot.preferred_device.as_ref(),
-                &eligible_for_prove,
-                &refused_admission,
-            );
+            if backend == zkminer_prover_protocol::BACKEND_RISC0 {
+                let mut barred = excluded.clone();
+                barred.extend(disabled_slots.iter().cloned());
+                // The slots of the cards it was not admitted on, which it never goes to.
+                let ineligible: Vec<String> = if eligible_for_prove.is_empty() {
+                    Vec::new()
+                } else {
+                    pool.slot_keys_for(backend)
+                        .into_iter()
+                        .filter(|k| {
+                            let device =
+                                zkminer_prover::dispatcher::WorkerPool::slot_benchmark_device(k);
+                            !eligible_for_prove.contains(&device)
+                        })
+                        .collect()
+                };
+                risc0_placements().insert(
+                    job_id,
+                    Risc0Placement {
+                        proving_on: None,
+                        barred,
+                        ineligible,
+                    },
+                );
+            }
+            // An SP1 job whose card's shard size an out-of-memory lowered goes back there first, to
+            // prove at the smaller size (`take_sp1_retry_card`); else the card it was planned for.
+            let planned = preferred_device(retry_card.as_ref(), snapshot.preferred_device.as_ref());
+            let order_for_prove =
+                job_card_order(planned.as_ref(), &eligible_for_prove, &refused_admission);
             // This job's pre-claim measured execute PEAK (SP1 only; 0 otherwise), for the dispatcher's
             // RH2 prove reservation — charges the `server + execute` spike so a concurrent other-backend
             // proof is not admitted into memory the SP1 execute window will consume. Copy, so captured
             // by value into the move closure.
             let execute_peak_for_prove = snapshot.measured_peak.unwrap_or(0);
+            // How long it would take on each slot, as of this attempt (a re-benchmark, or a rate
+            // observed since, counts): the dispatcher starts it only where it can finish before its
+            // cutoff and queues it by its latest start.
+            let (estimates_for_prove, estimates_used_observed) = slot_estimates_for(
+                backend,
+                sizing_cycles,
+                estimate_allowance,
+                !retried_on_benchmark,
+            )
+            .await;
+            let started_flag = proof_started.clone();
+            let counted_start = prove_start.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
@@ -10062,70 +13798,127 @@ async fn process_job_lifecycle(
                 // read "Idle", the jobs never attributed to it.
                 let started_pool = pool;
                 let started_runtime = runtime_for_prove_progress;
-                let mark_started = move |_p: f64, slot_key: &str| {
-                    // Which physical card took this job. Resolved through the pool
-                    // rather than any index, so the dashboard can attribute the job
-                    // to the right GPU row on a mixed-vendor box.
-                    let bus = started_pool.bus_id_for_slot(slot_key);
-                    let slot_key = slot_key.to_string();
-                    let started_state = started_state.clone();
-                    started_runtime.spawn(async move {
+                // Called on the proving thread for each event: an attempt's start on a card, then each
+                // stage its worker reports. Sent to ONE task that applies them in order (a task per
+                // event could land a retry's start after its first report); the task ends when the
+                // proof does and this closure is dropped.
+                let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<(
+                    zkminer_prover_protocol::ProveEvent,
+                    String,
+                )>();
+                let events_task = started_runtime.spawn(async move {
+                    while let Some((event, slot_key)) = events_rx.recv().await {
+                        // Which physical card took this attempt. Resolved through the pool rather
+                        // than any index, so the dashboard can attribute the job to the right GPU
+                        // row on a mixed-vendor box.
+                        let bus = started_pool.bus_id_for_slot(&slot_key);
+                        let now = std::time::Instant::now();
                         let mut st = started_state.write().await;
-                        if let Some(j) = st
+                        match event {
+                            // A new attempt: its progress and time start over.
+                            zkminer_prover_protocol::ProveEvent::Started => {
+                                st.proving.insert(
+                                    started_id,
+                                    zkminer_tui::progress::AttemptProgress::new(&slot_key, now),
+                                );
+                            }
+                            zkminer_prover_protocol::ProveEvent::Stage(report) => {
+                                st.proving
+                                    .entry(started_id)
+                                    .or_insert_with(|| {
+                                        zkminer_tui::progress::AttemptProgress::new(&slot_key, now)
+                                    })
+                                    .record(report, now);
+                            }
+                        }
+                        // Proving: no longer waiting on memory or a retry.
+                        st.clear_job_note(started_id, zkminer_tui::state::JobNoteKind::Wait);
+                        let Some(j) = st
                             .active_jobs
                             .iter_mut()
                             .find(|j| j.info.job_id == started_id)
-                        {
-                            if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
-                                j.status = zkminer_tui::state::MinerJobStatus::Proving {
-                                    progress: 0.0,
-                                    elapsed_secs: 0,
-                                };
-                            }
-                            // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after the GPU-OOM arm
-                            // rerouted a job to a bigger card the dashboard kept naming the card it had failed on — and this
-                            // is the only signal an operator has for which card a job is on. The callback carries the
-                            // authoritative slot key for the attempt that is actually starting.
-                            j.gpu_bus_id = bus;
-                            // And WHICH SLOT. `prover_backend` was set only after a proof
-                            // succeeded, so while work was running the dashboard showed the card
-                            // but not the backend — and with two slots per card that is the one
-                            // thing an operator checking their routing needs to see.
-                            j.prover_backend = slot_key;
+                        else {
+                            continue;
+                        };
+                        if matches!(j.status, zkminer_tui::state::MinerJobStatus::Queued) {
+                            j.status = zkminer_tui::state::MinerJobStatus::Proving {
+                                progress: 0.0,
+                                elapsed_secs: 0,
+                            };
                         }
-                    });
+                        // Overwrite UNCONDITIONALLY. `is_none()` made the attribution sticky, so after
+                        // the GPU-OOM arm rerouted a job to a bigger card the dashboard kept naming the
+                        // card it had failed on — and this is the only signal an operator has for which
+                        // card a job is on. The event carries the slot of the attempt actually running.
+                        j.gpu_bus_id = bus;
+                        // And WHICH SLOT: with two slots per card, the one thing an operator checking
+                        // their routing needs to see.
+                        j.prover_backend = slot_key;
+                        st.refresh_proving_floors();
+                    }
+                });
+                let mark_started = move |event: zkminer_prover_protocol::ProveEvent,
+                                         slot_key: &str| {
+                    if matches!(event, zkminer_prover_protocol::ProveEvent::Started) {
+                        started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        counted_start.count();
+                        if let Some(p) = risc0_placements().get_mut(&job_id) {
+                            p.proving_on = Some(slot_key.to_string());
+                        }
+                    }
+                    let _ = events_tx.send((event, slot_key.to_string()));
                 };
                 let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
-                let r = pool.prove_min_vram(
-                    &backend_str,
-                    &elf_clone,
-                    &input_clone,
-                    None,
-                    Some(effective_timeout),
-                    Some(Box::new(mark_started)),
-                    mv,
-                    &excl,
-                    &disabled_for_prove,
-                    &mut used,
-                    abort_at,
-                    job_sizes
-                        .is_some()
-                        .then_some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
-                    program_id_bytes,
-                    zkminer_prover::dispatcher::JobCards {
-                        eligible: &eligible_for_prove,
-                        order: &order_for_prove,
-                    },
-                    execute_peak_for_prove,
-                );
-                (r, used)
+                // As this job, so a wait for memory keeps its place across attempts.
+                let r = zkminer_prover::dispatcher::with_job_tag(job_tag(job_id), || {
+                    zkminer_prover::dispatcher::with_slot_estimates(estimates_for_prove, || {
+                        pool.prove_min_vram(
+                            &backend_str,
+                            &elf_clone,
+                            &input_clone,
+                            None,
+                            Some(effective_timeout),
+                            Some(Box::new(mark_started)),
+                            mv,
+                            &excl,
+                            &disabled_for_prove,
+                            &mut used,
+                            abort_at,
+                            job_sizes
+                                .is_some()
+                                .then_some(&size_on as zkminer_prover::dispatcher::SlotPo2<'_>),
+                            program_id_bytes,
+                            zkminer_prover::dispatcher::JobCards {
+                                eligible: &eligible_for_prove,
+                                order: &order_for_prove,
+                            },
+                            execute_peak_for_prove,
+                        )
+                    })
+                });
+                (r, used, events_task)
             })
             .await
             {
-                Ok(pair) => pair,
+                Ok((r, used, events_task)) => {
+                    // Its last events applied before anything resets its row: one arriving after
+                    // (a stage report still queued) put a job back to "proving on GPUx" while it
+                    // waited for memory or was being released. Bounded: the task ends once the
+                    // attempt's callback is dropped.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), events_task).await;
+                    (r, used)
+                }
                 Err(e) => return Err(anyhow::anyhow!("prove task panicked: {e}")),
             };
 
+            retry_card = retry_pin_after(
+                retry_card,
+                used_slot.as_deref(),
+                proof_result
+                    .as_ref()
+                    .err()
+                    .is_some_and(refused_before_start),
+            );
             match proof_result {
                 Ok(p) => {
                     proved_on = used_slot;
@@ -10146,13 +13939,18 @@ async fn process_job_lifecycle(
                     // on-chain job. Since this arm is terminal with zero retries, a substring match
                     // let a submitter end their own provable job and collect the release penalty.
                     // The substring predicate this replaced is gone, not kept.
-                    if e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
-                        .is_some()
+                    if let Some(refusal) =
+                        e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
                     {
+                        // Refused before any proof of this job started: on this host's estimates
+                        // and queue alone.
+                        let before_start = refusal.before_start
+                            && !proof_started.load(std::sync::atomic::Ordering::SeqCst);
                         // Unless the deadline itself moved out meanwhile (a pause began during this
                         // proof): then the kill was against a stale cutoff, and there is room to prove
                         // again. The refund is bounded — every one needs the deadline to have moved.
-                        if refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await
+                        if refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline)
+                            .await
                             && deadline_proof_budget(lock_deadline)
                                 .is_some_and(|b| b >= Duration::from_secs(MIN_ATTEMPT_BUDGET_SECS))
                         {
@@ -10164,8 +13962,33 @@ async fn process_job_lifecycle(
                             attempt = attempt.saturating_sub(1);
                             continue;
                         }
-                        if rode_measurement {
-                            note_post_claim_divergence(program_id, backend, submitter, "proof overran its deadline budget");
+                        match deadline_refusal_action(
+                            before_start,
+                            retried_on_benchmark,
+                            estimates_used_observed,
+                            rode_measurement,
+                        ) {
+                            DeadlineRefusalAction::RetryOnBenchmark => {
+                                tracing::warn!(
+                                    "{}: no card here could finish it by the rates learned this \
+                                     run ({msg}); trying once more on the benchmark's rates",
+                                    short_id(job_id)
+                                );
+                                retried_on_benchmark = true;
+                                attempt = attempt.saturating_sub(1);
+                                continue;
+                            }
+                            DeadlineRefusalAction::ReleaseNoMark => {}
+                            DeadlineRefusalAction::ReleaseAndMark => {
+                                note_post_claim_divergence(program_id, backend, submitter, "proof overran its deadline budget");
+                            }
+                        }
+                        if before_start {
+                            note_estimate_refusal(job_id, &msg);
+                        } else if retried_on_benchmark {
+                            // Started on the benchmark's rate after the learned one refused it, and
+                            // overran: not the submitter's, but counted per card (`RP2`).
+                            note_estimate_overrun(job_id, used_slot.as_deref(), &msg);
                         }
                         return Err(anyhow::anyhow!(
                             "proving stopped for {} (deadline): {msg}",
@@ -10220,6 +14043,14 @@ async fn process_job_lifecycle(
                                     "preferring another card"
                                 },
                             );
+                            state.write().await.set_job_note(
+                                job_id,
+                                zkminer_tui::state::JobNoteKind::Wait,
+                                format!(
+                                    "waiting for GPU memory, checking again every {GPU_MEMORY_BACKOFF_SECS}s"
+                                ),
+                            );
+                            wait_note_up = true;
                             tokio::time::sleep(Duration::from_secs(GPU_MEMORY_BACKOFF_SECS)).await;
                             continue;
                         }
@@ -10310,31 +14141,95 @@ async fn process_job_lifecycle(
                         // attempt means `MAX_PROVE_ATTEMPTS` no longer bounds anything by itself:
                         // an alternating health-fail / shortage sequence refunds each increment the
                         // health-fail spends, so without this cap the only bound was the deadline.
-                        if !shortage.attempted && memory_waits < MAX_HOST_MEMORY_WAITS {
+                        // A proof that died in a host shortage while staying within what was
+                        // reserved for it (`ShortageFromOutside`) was not too big for the box: it
+                        // waits like a refusal, inside the same clock bound, and is not held
+                        // against the job.
+                        let outside = e
+                            .downcast_ref::<zkminer_prover_protocol::types::ShortageFromOutside>()
+                            .is_some();
+                        // Kept for a job that has waited longer (the dispatcher's memory line):
+                        // the memory is ours to come, so this is a turn, not a shortage.
+                        let kept_for_another = e
+                            .downcast_ref::<zkminer_prover_protocol::types::MemoryKeptForWaiter>()
+                            .is_some();
+                        let waited = memory_wait_since
+                            .get_or_insert_with(std::time::Instant::now)
+                            .elapsed();
+                        // Refused only because our own proofs hold the memory (what they hold
+                        // and what is free would cover it): it waits its turn behind them, which
+                        // the deadline budget bounds (released in time), not the 5-minute cap
+                        // meant for memory held by something else. A second SP1 proof behind a
+                        // first waits the first's few minutes.
+                        let behind_ours = !shortage.attempted
+                            && (kept_for_another
+                                || (shortage.reserved > 0
+                                    && pool.fits_when_ours_finish(
+                                        backend,
+                                        shortage.needed,
+                                        shortage.kind,
+                                    )));
+                        if (!shortage.attempted || outside)
+                            && (waited < HOST_MEMORY_WAIT_LIMIT || behind_ours)
+                        {
                             memory_waits += 1;
                             attempt = attempt.saturating_sub(1);
                             tracing::warn!(
-                                "{} is waiting for host RAM, not failing: {msg}. Retrying the same \
-                                 slot in {}s (wait {}/{}); the deadline budget decides when to give \
-                                 up.",
+                                "{} is waiting for {}, not failing: {msg}. Retrying the same \
+                                 slot in {}s at most (waited {}s of {}s, try {}); the deadline \
+                                 budget decides when to give up.",
                                 short_id(job_id),
+                                shortage.kind.name(),
                                 HOST_MEMORY_BACKOFF_SECS,
+                                waited.as_secs(),
+                                HOST_MEMORY_WAIT_LIMIT.as_secs(),
                                 memory_waits,
-                                MAX_HOST_MEMORY_WAITS,
                             );
+                            // The attempt is over: no progress bar or card while it waits.
+                            end_attempt_display(state, job_id).await;
+                            state.write().await.set_job_note(
+                                job_id,
+                                zkminer_tui::state::JobNoteKind::Wait,
+                                if kept_for_another {
+                                    format!(
+                                        "waiting for {}: a job that has waited longer for it goes \
+                                         first",
+                                        shortage.kind.name()
+                                    )
+                                } else if shortage.kind
+                                    == zkminer_prover_protocol::types::HostMemoryKind::Commit
+                                    && !behind_ours
+                                {
+                                    // RAM can look free: commit is what is short, held by more
+                                    // than our own proofs, and the page file is the remedy.
+                                    "waiting for commit (RAM plus page file) to free up; a \
+                                     larger page file would let it start"
+                                        .to_string()
+                                } else {
+                                    format!("waiting for {} to free up", shortage.kind.name())
+                                },
+                            );
+                            wait_note_up = true;
                             // Until memory is given back, or the backoff at most: a release is a
                             // wake-up, not a promise, and one before this wait began is missed.
+                            let began = std::time::Instant::now();
                             let _ = tokio::time::timeout(
                                 Duration::from_secs(HOST_MEMORY_BACKOFF_SECS),
                                 zkminer_prover::memory::MEMORY_RELEASED.notified(),
                             )
                             .await;
+                            // Not straight back: a wake-up is often one of several releases.
+                            tokio::time::sleep(
+                                HOST_MEMORY_MIN_RETRY.saturating_sub(began.elapsed()),
+                            )
+                            .await;
+                            memory_waited_last = true;
                             continue;
                         }
                         // Still not the slot's fault, so do not exclude it or call it unhealthy —
                         // but this one DOES cost an attempt, so fall through to the normal budget.
                         tracing::warn!(
-                            "{} hit a host-RAM limit that cost a real attempt ({}): {msg}",
+                            "{} hit a host-memory limit that cost a real attempt ({}): {msg}",
                             short_id(job_id),
                             if shortage.attempted {
                                 "the proof was OOM-killed mid-run"
@@ -10343,12 +14238,16 @@ async fn process_job_lifecycle(
                             },
                         );
                         if attempt < MAX_PROVE_ATTEMPTS {
+                            // Give memory a backoff to come back before the next real attempt.
+                            end_attempt_display(state, job_id).await;
+                            failed_last = true;
+                            tokio::time::sleep(Duration::from_secs(HOST_MEMORY_BACKOFF_SECS)).await;
                             continue;
                         }
                         // A proof OOM-killed mid-run is a failure after a clean measurement like any
                         // other (a guest can balloon host memory on purpose). Only an admission refusal
                         // — nothing ran — is exempt.
-                        if rode_measurement && shortage.attempted {
+                        if rode_measurement && shortage.attempted && !outside {
                             note_post_claim_divergence(program_id, backend, submitter, "proof OOM-killed mid-run");
                         }
                         return Err(anyhow::anyhow!(
@@ -10365,6 +14264,37 @@ async fn process_job_lifecycle(
                     // largest card and set a VRAM floor, and panicking with "proof is invalid"
                     // suppressed the slot exclusion so the retry landed straight back on the card
                     // that had just failed. `ErrorKind` is set by the worker about itself.
+                    // The workers are being shut down (the miner is stopping): this attempt was
+                    // stopped, not failed. No retry, no card excluded, nothing counted against the
+                    // card or the job; a kept lock is proved again by the next start.
+                    if pool.is_closing() {
+                        return Err(anyhow::anyhow!(
+                            "proving stopped for {}: the miner is shutting its workers down",
+                            short_id(job_id)
+                        ));
+                    }
+                    // The outage recycle stopped the worker for holding network sockets: like the
+                    // shutdown above, not the job's failure or the card's. Retried (the slot's worker
+                    // starts again) without counting the attempt, excluding the card or marking a
+                    // divergence; a few times per job at most, then it counts as a death.
+                    if free_retry_after_recycle(&e, &mut recycled_retries) {
+                        attempt = attempt.saturating_sub(1);
+                        tracing::warn!(
+                            "{}: {msg}; retrying, not counted as an attempt (recycled retry {}/{})",
+                            short_id(job_id),
+                            recycled_retries,
+                            MAX_RECYCLED_RETRIES,
+                        );
+                        end_attempt_display(state, job_id).await;
+                        state.write().await.set_job_note(
+                            job_id,
+                            zkminer_tui::state::JobNoteKind::Wait,
+                            "retrying: its worker was stopped by the chain-outage recycle"
+                                .to_string(),
+                        );
+                        wait_note_up = true;
+                        continue;
+                    }
                     let worker_err =
                         e.downcast_ref::<zkminer_prover_protocol::types::WorkerProofError>();
                     // A programId/vkey mismatch is PERMANENT for this program: the served ELF's
@@ -10390,9 +14320,15 @@ async fn process_job_lifecycle(
                             short_id(job_id)
                         ));
                     }
+                    // A worker that DIED has no typed error, and its message carries its last
+                    // lines of output (`WorkerHandle::death_note`), which can be a job's guest
+                    // program's: never classified by text. It is a health failure.
+                    let died = e
+                        .downcast_ref::<zkminer_prover::worker::WorkerDied>()
+                        .is_some();
                     let invalid = match worker_err {
                         Some(w) => w.is_invalid(),
-                        None => is_invalid_proof(&msg),
+                        None => !died && is_invalid_proof(&msg),
                     };
                     // A genuine GPU OOM means the job is too big for that card (retry on
                     // a bigger card). Everything else non-invalid is a worker-health /
@@ -10403,7 +14339,7 @@ async fn process_job_lifecycle(
                     // whitelist only retried wedge/EOF and dropped the rest).
                     let real_oom = match worker_err {
                         Some(w) => w.is_gpu_oom(),
-                        None => zkminer_prover_protocol::types::is_gpu_oom(&msg),
+                        None => !died && zkminer_prover_protocol::types::is_gpu_oom(&msg),
                     };
                     let health_fail = !invalid && !real_oom;
                     // This host's segment disk, read now: a full disk (ENOSPC or a quota) is the
@@ -10420,6 +14356,16 @@ async fn process_job_lifecycle(
                             short_id(job_id),
                         );
                     }
+                    // An SP1 OOM that lowered its card's shard size is retried THERE, at the
+                    // smaller size: another card is still at the size that ran out, and would run
+                    // out too.
+                    let sp1_smaller_here = if real_oom {
+                        used_slot
+                            .as_deref()
+                            .and_then(|k| pool.take_sp1_retry_card(k))
+                    } else {
+                        None
+                    };
                     if attempt < MAX_PROVE_ATTEMPTS {
                         // BOTH non-invalid classes steer OFF the card that just failed.
                         //
@@ -10434,13 +14380,7 @@ async fn process_job_lifecycle(
                         //
                         // Excluding cannot strand a job: `prove_min_vram` restores the
                         // full set when pruning empties it.
-                        if !invalid {
-                            if let Some(k) = used_slot.clone() {
-                                if !excluded.contains(&k) {
-                                    excluded.push(k);
-                                }
-                            }
-                        }
+                        //
                         // A VRAM OOM means the job did not fit THAT card, so ask for a
                         // strictly bigger one. A fixed floor cannot do that job:
                         // LARGE_JOB_MIN_VRAM_BYTES is 30 GiB and exceeds every card on
@@ -10451,19 +14391,23 @@ async fn process_job_lifecycle(
                         // correctly on the first retry while a 30 GiB floor routes it
                         // nowhere. Falls back to the constant when the card's VRAM is
                         // unknown (non-CUDA, or nvidia-smi unavailable).
-                        if real_oom {
-                            // `used_slot`, NOT `proved_on`: the latter is assigned only on
-                            // the success path, so reading it here always yields None and
-                            // silently falls back to the inert constant.
-                            min_vram = used_slot
-                                .as_deref()
-                                .and_then(|k| pool.vram_bytes_for_slot(k))
-                                .map(|v| v.saturating_add(1))
-                                .or(Some(LARGE_JOB_MIN_VRAM_BYTES));
-                        }
+                        //
+                        // `used_slot`, NOT `proved_on`: the latter is assigned only on the
+                        // success path, so reading it here always yields None and silently
+                        // falls back to the inert constant.
+                        steer_after_failure(
+                            &mut excluded,
+                            &mut retry_card,
+                            &mut min_vram,
+                            used_slot.as_deref(),
+                            invalid,
+                            real_oom,
+                            sp1_smaller_here.as_deref(),
+                            |k| pool.vram_bytes_for_slot(k),
+                        );
                         // invalid ⇒ just re-prove (round-robin may pick another worker).
                         tracing::warn!(
-                            "Proof attempt {attempt}/{} for {} failed ({}); retrying{}",
+                            "Proof attempt {attempt}/{} for {} failed ({}); retrying{}. Error: {msg}",
                             MAX_PROVE_ATTEMPTS,
                             short_id(job_id),
                             if invalid {
@@ -10473,7 +14417,9 @@ async fn process_job_lifecycle(
                             } else {
                                 "worker unhealthy"
                             },
-                            if real_oom {
+                            if sp1_smaller_here.is_some() {
+                                " on the same GPU, one shard size smaller"
+                            } else if real_oom {
                                 " on a high-VRAM GPU"
                             } else if health_fail {
                                 " on a different GPU"
@@ -10481,6 +14427,7 @@ async fn process_job_lifecycle(
                                 ""
                             },
                         );
+                        failed_last = true;
                         continue;
                     }
                     // Every attempt failed on a job that measured clean. Class-agnostic on purpose: the
@@ -10495,11 +14442,20 @@ async fn process_job_lifecycle(
             }
         }
     };
+    prove_start.completed();
+    drop(prove_start);
 
     card.release();
     if let Some(slot) = &proved_on {
         tracing::info!("Job {} proved on {}", short_id(job_id), slot);
-        note_observed_throughput(slot, proof.cycles, proof.duration);
+        // The guest's execute is inside a risc0 proof's time, once at the measured figure; SP1's
+        // runs before the timer starts.
+        let execute = if backend == zkminer_prover_protocol::BACKEND_RISC0 {
+            snapshot.measured_execute_secs.unwrap_or(0)
+        } else {
+            0
+        };
+        note_observed_throughput(slot, proof.cycles, proof.duration, execute);
     }
     {
         let mut s = state.write().await;
@@ -10660,7 +14616,15 @@ async fn process_job_lifecycle(
         let mut s = state.write().await;
         if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
             j.status = MinerJobStatus::Submitting;
+            // Off its card: the card is free for its next job, and its row is that job's.
+            j.gpu_bus_id = None;
         }
+        // Rewritten by the fulfil transaction's own events (`JobNote`).
+        s.set_job_note(
+            job_id,
+            zkminer_tui::state::JobNoteKind::Submit,
+            "submitting the proof: sending the fulfil transaction",
+        );
         s.add_log(
             LogLevel::Info,
             format!("Submitting fulfillment for {}...", short_id(job_id)),
@@ -10685,7 +14649,7 @@ async fn process_job_lifecycle(
     // lock kept through a pause is fulfilled after the lift instead of released for nothing.
     loop {
         let before = lock_deadline;
-        if refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await {
+        if refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline).await {
             tracing::info!(
                 "{}: effective deadline moved out by {}s (pause credit / downtime extension)",
                 short_id(job_id),
@@ -10784,6 +14748,23 @@ async fn process_job_lifecycle(
                         if fulfill_no_lever {
                             mark_program_sim_reverted(fulfill_program_id, fulfill_proof_system);
                         }
+                        // A proof that passed our own verify and then failed the on-chain verifier is a
+                        // post-claim failure like any other, so it feeds the divergence breaker: the
+                        // submitter is marked on the escalating TTL, and the program too once
+                        // `PROGRAM_MARK_SUBMITTERS` distinct submitters fail on it. Without this a
+                        // requester could re-arm the 10-minute sim-revert cooldown with fresh programIds
+                        // and force a released (penalized) claim per job. A descriptor that carries a
+                        // submitter-controlled revert lever marks the submitter only: its programId may
+                        // be a legitimate program's.
+                        if rode_measurement {
+                            note_post_claim_divergence_for(
+                                program_id,
+                                backend,
+                                submitter,
+                                "the on-chain verifier rejected the proof",
+                                fulfill_no_lever,
+                            );
+                        }
                         clear_submitting("verifier rejected the proof — releasing").await;
                         return Err(anyhow::anyhow!(
                             "fulfil rejected by the verifier (VerifierCallFailed, no governance cause) \
@@ -10813,10 +14794,33 @@ async fn process_job_lifecycle(
                 // `fulfill_job` only returns Stale once a `jobs()` read pinned at or after the lock
                 // block agrees (a lagging preflight node's JobNotLocked is retried, not trusted).
                 tracing::warn!("LOCK-LOST: {} — {reason}", short_id(job_id));
+                let view = client
+                    .get_job_status_view(job_id)
+                    .await
+                    .ok()
+                    .map(|v| (v.status, v.prover));
+                let ended = lock_end(journal, job_id, view, client.address);
+                let lock_block = lock_block_of(journal, job_id);
                 journal_update(journal, |j| j.remove(job_id));
                 // No release will ever run for this job, and release is the stash's only consumer.
                 client.settle_abandoned_nonce(job_id).await;
+                // Past its deadline: the one classifier decides slash or late release (VLA-1).
+                let ended = match ended {
+                    Some(MinerJobStatus::EndedPastDeadline) => Some(
+                        past_deadline_end(
+                            client,
+                            job_id,
+                            lock_block,
+                            "lost past its deadline (slashed, or its end could not be read)",
+                        )
+                        .await,
+                    ),
+                    other => other,
+                };
                 let mut s = state.write().await;
+                if let Some(ended) = ended {
+                    s.record_finished(job_id, ended);
+                }
                 s.active_jobs.retain(|j| j.info.job_id != job_id);
                 s.add_log(
                     LogLevel::Warn,
@@ -10852,12 +14856,28 @@ async fn process_job_lifecycle(
             clear_submitting("shutdown during a held fulfil").await;
             return Err(HandBack(format!("shutdown while the fulfil is held: {reason}")).into());
         }
+        // What it waits on now, while nothing is out: the last send's note would go stale.
+        if !published_unconfirmed {
+            state.write().await.set_job_note(
+                job_id,
+                zkminer_tui::state::JobNoteKind::Submit,
+                format!(
+                    "submitting the proof: {} ({reason}); trying again every {}s",
+                    if matches!(class, FulfilClass::Keep | FulfilClass::VerifierFailed) {
+                        "held"
+                    } else {
+                        "not settled"
+                    },
+                    FULFIL_RETRY_WAIT.as_secs()
+                ),
+            );
+        }
         // Never sleep past the release point: the release must start with its whole reserved ladder
         // (DEADLINE_RELEASE_MARGIN_SECS) still ahead of the window's close. When the next round
         // would have too little budget, go to the release now instead of after one more wait.
         match deadline_proof_budget(lock_deadline) {
             Some(b) if b <= FULFIL_RETRY_WAIT + Duration::from_secs(MIN_ATTEMPT_BUDGET_SECS) => {
-                if refresh_lock_deadline(client, journal, job_id, &mut lock_deadline).await {
+                if refresh_lock_deadline(client, state, journal, job_id, &mut lock_deadline).await {
                     continue;
                 }
                 if clock_stopped_or_unknown(client, fulfill_proof_system, b).await {
@@ -10885,23 +14905,8 @@ async fn process_job_lifecycle(
     journal_update(journal, |j| j.remove(job_id));
     {
         let mut s = state.write().await;
-        let completed = s
-            .active_jobs
-            .iter()
-            .find(|j| j.info.job_id == job_id)
-            .cloned();
-        s.active_jobs.retain(|j| j.info.job_id != job_id);
-        if let Some(mut cj) = completed {
-            cj.status = MinerJobStatus::Fulfilled { payout: 0 };
-            s.completed_jobs.push(cj);
-            // Bound completed_jobs — keep most recent COMPLETED_JOBS_CAP entries.
-            // Prevents unbounded memory growth over long-running operation.
-            const COMPLETED_JOBS_CAP: usize = 500;
-            if s.completed_jobs.len() > COMPLETED_JOBS_CAP {
-                let excess = s.completed_jobs.len() - COMPLETED_JOBS_CAP;
-                s.completed_jobs.drain(0..excess);
-            }
-        }
+        // Into the Jobs page's history, with the time (bounded there).
+        s.record_finished(job_id, MinerJobStatus::Fulfilled { payout: 0 });
         s.add_log(
             LogLevel::Success,
             format!("Job {} fulfilled on-chain", short_id(job_id)),
@@ -11010,7 +15015,7 @@ pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Optio
 }
 
 /// The backends `resolve_backend` serves in this build.
-fn served_backends() -> Vec<&'static str> {
+pub(crate) fn served_backends() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = zkminer_chain::auction::ProofSystem::ALL
         .iter()
         .filter_map(|p| resolve_backend(p.id()))
@@ -11051,6 +15056,7 @@ async fn clock_stopped_or_unknown(client: &ChainClient, proof_system_id: B256, b
 /// downtime extension), raise `lock_deadline` and the journal breadcrumb to it. True if it moved.
 async fn refresh_lock_deadline(
     client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
     journal: &SharedJournal,
     job_id: B256,
     lock_deadline: &mut u64,
@@ -11071,7 +15077,143 @@ async fn refresh_lock_deadline(
             e.lock_deadline = c;
         }
     });
+    // And the row's: the Jobs page counts down to it, and read "PAST its deadline" in red after a
+    // pause credit moved the cutoff out.
+    if let Some(j) = state
+        .write()
+        .await
+        .active_jobs
+        .iter_mut()
+        .find(|j| j.info.job_id == job_id)
+    {
+        j.info.lock_deadline = c;
+    }
     true
+}
+
+/// A proof attempt of `job_id` is over (failed, waiting, or released): its row goes back to Queued,
+/// with no progress and no card, so neither the bar nor the card's row show work that is not running.
+async fn end_attempt_display(state: &zkminer_tui::state::SharedState, job_id: B256) {
+    let mut s = state.write().await;
+    s.proving.remove(&job_id);
+    if let Some(j) = s.active_jobs.iter_mut().find(|j| j.info.job_id == job_id) {
+        if matches!(
+            j.status,
+            zkminer_tui::state::MinerJobStatus::Proving { .. }
+                | zkminer_tui::state::MinerJobStatus::Skipped { .. }
+        ) {
+            j.status = zkminer_tui::state::MinerJobStatus::Queued;
+        }
+        j.gpu_bus_id = None;
+    }
+}
+
+/// Rebuild the Jobs page's held locks (`MinerState::kept_locks`): the claim journal's locks that no
+/// task works on, or that one works on (a recovery release) without a claimed or market row, each
+/// with why (`note_kept_reason`, else what its journal state implies). `rows` keeps each claimed
+/// job's last row, so a held one keeps its terms.
+async fn refresh_kept_locks(
+    state: &zkminer_tui::state::SharedState,
+    journal: &SharedJournal,
+    in_flight: &HashMap<B256, u128>,
+    rows: &mut HashMap<B256, zkminer_tui::state::TrackedJob>,
+) {
+    let entries: Vec<(B256, u64, bool)> = {
+        let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+        j.entries
+            .values()
+            .map(|e| {
+                (
+                    e.job_id,
+                    e.lock_deadline,
+                    matches!(e.state, crate::journal::JournalState::Claiming),
+                )
+            })
+            .collect()
+    };
+    // Awake while any collateral is ours: a claim in flight, or a lock on record.
+    keep_awake(!entries.is_empty() || !in_flight.is_empty());
+    let announced: Vec<(B256, String)> = KEPT_ANNOUNCED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .map(|(_, pending)| std::mem::take(pending))
+        .unwrap_or_default();
+    let mut s = state.write().await;
+    // A lock just kept: its stage note ("releasing the lock") no longer holds, and the activity log
+    // says why it was kept.
+    for (id, why) in announced {
+        s.job_notes.remove(&id);
+        s.add_log(
+            LogLevel::Warn,
+            format!("Job {} kept, not released: {why}", short_id(id)),
+        );
+    }
+    // Held: no task works on it, or one does (a recovery release, a self-slash) without a row of
+    // its own in the claimed or market list, which would leave it in none while that runs.
+    let held: Vec<(B256, u64, bool)> = entries
+        .into_iter()
+        .filter(|(id, _, _)| {
+            !in_flight.contains_key(id)
+                || !(s.active_jobs.iter().any(|j| j.info.job_id == *id)
+                    || s.open_jobs.iter().any(|j| j.info.job_id == *id))
+        })
+        .collect();
+    // What a lock no task works on says is its reason, not a stage note left from its last task
+    // ("releasing the lock" on a lock that was kept).
+    for (id, _, _) in &held {
+        if !in_flight.contains_key(id) {
+            s.job_notes.remove(id);
+        }
+    }
+    for j in &s.active_jobs {
+        rows.insert(j.info.job_id, j.clone());
+    }
+    rows.retain(|id, _| {
+        held.iter().any(|(h, _, _)| h == id) || s.active_jobs.iter().any(|j| j.info.job_id == *id)
+    });
+    s.kept_reasons = held
+        .iter()
+        .map(|(id, _, claiming)| {
+            let why = kept_reason_of(*id).unwrap_or_else(|| {
+                if in_flight.contains_key(id) {
+                    "being recovered (re-driven or released)".to_string()
+                } else if *claiming {
+                    "its claim was not confirmed; the recovery pass checks whether it holds the lock"
+                        .to_string()
+                } else {
+                    "held on-chain; the recovery pass re-drives or releases it".to_string()
+                }
+            });
+            (*id, why)
+        })
+        .collect();
+    s.kept_locks = held
+        .iter()
+        .map(|(id, deadline, _)| {
+            // Its last claimed row, else its market row (a claim that was not confirmed), else what
+            // is known: the id and deadline.
+            let known = rows
+                .get(id)
+                .or_else(|| s.open_jobs.iter().find(|j| j.info.job_id == *id))
+                .cloned();
+            let mut row = known.unwrap_or_else(|| zkminer_tui::state::TrackedJob {
+                info: zkminer_chain::jobs::JobInfo {
+                    job_id: *id,
+                    ..Default::default()
+                },
+                status: zkminer_tui::state::MinerJobStatus::Queued,
+                current_price: 0,
+                gpu_bus_id: None,
+                prover_backend: String::new(),
+                estimated_cycles: 0,
+            });
+            row.info.lock_deadline = row.info.lock_deadline.max(*deadline);
+            row.status = zkminer_tui::state::MinerJobStatus::Queued;
+            row.gpu_bus_id = None;
+            row
+        })
+        .collect();
 }
 
 /// How often the brain re-reads the router/Registry pause state before claiming.
@@ -11404,7 +15546,7 @@ async fn measure_cycles(
                 );
                 mark_assigned_elsewhere(assigned_elsewhere, job_id, wait);
                 if paces_claims {
-                    set_job_aside(job_id, wait);
+                    set_job_aside(job_id, wait, "assigned to another prover");
                 }
                 return;
             }
@@ -11486,6 +15628,40 @@ async fn measure_cycles(
         return;
     }
 
+    // A size measured by execution a moment ago and gone again (dropped because the registry hash
+    // moved, or evicted) waits out its re-measure cooldown, so no path executes one (program, input)
+    // on every tick.
+    let mut rerun_wait: Option<Duration> = None;
+    let missing: Vec<u8> = missing
+        .into_iter()
+        .filter(
+            |&p| match measure_rerun_wait_for(&(input_key.0, p, program_id, input_hash)) {
+                Some(w) => {
+                    rerun_wait = Some(rerun_wait.map_or(w, |r| r.min(w)));
+                    false
+                }
+                None => true,
+            },
+        )
+        .collect();
+    if missing.is_empty() {
+        let wait = rerun_wait.unwrap_or(MEASURE_RERUN_COOLDOWN);
+        tracing::debug!(
+            "measure {}: this input was measured a moment ago and its measurement is gone again — \
+             executing it again in {}s at the earliest",
+            short_id(program_id),
+            wait.as_secs()
+        );
+        if paces_claims {
+            note_job_retry_after(
+                job_id,
+                wait,
+                "measured a moment ago; waiting to measure it again",
+            );
+        }
+        return;
+    }
+
     // (The SP1 program-wide `elf_hash` requirement is enforced EARLIER — before the descriptor scan
     // above — via the self-healing SP1_ELF_HASH_MISSING cooldown, so a no-hash program is declined
     // without paying the scan. See that block near the top of this function.)
@@ -11507,7 +15683,11 @@ async fn measure_cycles(
         // The winner decides for this descriptor too (its resolver is recorded): no need to take a
         // measure slot again until it has.
         if paces_claims {
-            note_job_retry_after(job_id, Duration::from_secs(15));
+            note_job_retry_after(
+                job_id,
+                Duration::from_secs(15),
+                "waiting on a measurement of the same input",
+            );
         }
         return;
     }
@@ -11566,10 +15746,13 @@ async fn measure_cycles(
     )
     .await
     {
-        Ok(Ok(e)) => e,
+        Ok(Ok(e)) => {
+            note_registry_fetch_ok(program_id);
+            e
+        }
         Ok(Err(e))
-            if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>().is_some()
-                || e.downcast_ref::<RegistryUnavailable>().is_some() =>
+            if measure_fetch_failure(&e, registry_rollout_state(program_id))
+                == MeasureFetchFailure::NoSource =>
         {
             // Not registered yet, or registered with no URIs yet: says nothing about the program's
             // future. A back-off, never a strike toward a permanent UNMEASURABLE verdict.
@@ -11585,6 +15768,28 @@ async fn measure_cycles(
             tracing::debug!(
                 "measure {}: no ELF source now ({e:#}) — backing off",
                 short_id(program_id)
+            );
+            return;
+        }
+        Ok(Err(e))
+            if measure_fetch_failure(&e, registry_rollout_state(program_id))
+                == MeasureFetchFailure::RolloutPending =>
+        {
+            // The registry names a new `elf_hash`, and its URIs still serve the bytes of the one
+            // before: the new ELF is not uploaded yet. Says nothing of this input, so no strike, a
+            // bounded number of times per change (`ROLLOUT_PENDING_MAX`); the program waits, longer
+            // each time until a fetch succeeds (`rollout_backoff`), and its next read may see the
+            // new bytes.
+            let k = note_rollout_pending(program_id);
+            if paces_claims {
+                note_transient_preclaim_failure(job_id);
+                mark_program_no_elf_source_for(program_id, rollout_backoff(k));
+            }
+            tracing::warn!(
+                "ROLLOUT-PENDING measure {}: its URIs still serve the ELF of the registry's previous \
+                 elf_hash (#{k} since its last good fetch) — skipping the program for {} min",
+                short_id(program_id),
+                rollout_backoff(k).as_secs() / 60
             );
             return;
         }
@@ -11615,6 +15820,12 @@ async fn measure_cycles(
                 // never-yet-cached measurement) is narrow — the on-disk ELF cache means a once-fetched
                 // program never hits this — and is the accepted trade-off the strike bound already made.
                 strike_out_missing();
+                // And the PROGRAM, for a while: where its ELF comes from is the program's (its
+                // registry URIs), not the input's, so every other input of it would fetch and fail
+                // three times too (seen: one program struck out every 15 s). Self-healing after the TTL.
+                if paces_claims {
+                    mark_program_no_elf_source(program_id);
+                }
             } else {
                 tracing::debug!(
                     "measure {}: ELF fetch failed #{strikes} (< {}, may be transient): {}",
@@ -11642,6 +15853,10 @@ async fn measure_cycles(
                 // deliberately stalling ELF host), so a retry TTL would reopen the same per-pair
                 // re-fetch DoS. Keep it permanent, as at HEAD (see the fetch-failure arm above).
                 strike_out_missing();
+                // The program too, for a while (see the fetch-failure arm above).
+                if paces_claims {
+                    mark_program_no_elf_source(program_id);
+                }
             } else {
                 tracing::debug!(
                     "measure {}: ELF fetch exceeded the {}s budget #{strikes} (< {}) — a later tick \
@@ -11683,6 +15898,19 @@ async fn measure_cycles(
     // binding; SP1 is bound by the mandatory registry `elf_hash` gate above instead.
     let capture_risc0_keccak = backend == "risc0";
     let elf = std::sync::Arc::new(elf);
+    // Another backend's bytes were checked against the registry `elf_hash` by the fetch above, so
+    // their keccak is that hash. Stored with the measurement, so a claim can tell when the registry
+    // has since named other bytes (see [`ElfHashChanged`]). The fetch recorded that hash as the
+    // program's current one (see [`REGISTRY_ELF_HASH`]), so this measurement stands until a later
+    // read sees another.
+    let registry_elf_hash = if capture_risc0_keccak {
+        None
+    } else {
+        let elf = elf.clone();
+        tokio::task::spawn_blocking(move || alloy::primitives::keccak256(&elf[..]))
+            .await
+            .ok()
+    };
     let input = std::sync::Arc::new(input);
     // One execute per missing size, side by side (the brain admitted as many as had free workers; the
     // rest race for one): blocking, since the worker protocol is synchronous, and each bounded by the
@@ -11748,6 +15976,7 @@ async fn measure_cycles(
                 if paces_claims {
                     clear_preclaim_strikes(job_id);
                 }
+                note_measure_run((input_key.0, po2, program_id, input_hash));
                 // The guest committed `journal_len` bytes. fulfillJob re-encodes the journal
                 // AND the input (plus the rest of the descriptor) into its calldata under a fixed gas
                 // limit. Both the journal and the input are a deterministic function of (program, input)
@@ -11827,7 +16056,8 @@ async fn measure_cycles(
                     // measurement a claim rides survives). A later claim's ELF re-fetch binds to it,
                     // catching a post-measure ELF swap as a clean pre-claim skip rather than a
                     // prove-time penalized release + permanent blacklist. `elf_keccak` is `Some` only
-                    // for a real risc0 measurement; SP1 and the infeasible branches pass `None`.
+                    // for a real risc0 measurement; SP1 passes its registry `elf_hash` instead, and the
+                    // infeasible branches pass `None`.
                     let measured_journal: MeasuredJournal =
                         journal.map(|j| (input_hash, std::sync::Arc::from(j)));
                     insert_measurement(
@@ -11838,7 +16068,7 @@ async fn measure_cycles(
                         input_hash,
                         cycles,
                         peak_host_bytes,
-                        elf_keccak,
+                        elf_keccak.or(registry_elf_hash),
                         measured_journal.as_ref().map(|(_, j)| j.clone()),
                         duration_secs.max(0.0).ceil() as u64,
                     );
@@ -12089,6 +16319,31 @@ pub(crate) async fn fetch_or_download_elf(
     // the image id already binds the bytes to the programId, so it can only purge good bytes.
     honor_registry_hash: bool,
 ) -> Result<Vec<u8>> {
+    fetch_elf(
+        client,
+        state,
+        program_id,
+        expected_risc0_hash,
+        honor_registry_hash,
+        None,
+        true,
+    )
+    .await
+}
+
+/// [`fetch_or_download_elf`], with two more checks for the pre-claim step. `measured_registry_hash`
+/// is the registry `elf_hash` the job was measured under: when the registry now names another, this
+/// fails with [`ElfHashChanged`] before reading anything. Without `allow_download`, an ELF that is not
+/// in the cache fails with [`ElfNotCached`] instead of being downloaded.
+async fn fetch_elf(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    program_id: alloy::primitives::B256,
+    expected_risc0_hash: Option<alloy::primitives::B256>,
+    honor_registry_hash: bool,
+    measured_registry_hash: Option<alloy::primitives::B256>,
+    allow_download: bool,
+) -> Result<Vec<u8>> {
     let cache = zkminer_chain::programs::ElfCache::new();
     // Query the registry for the canonical content hash so we can verify cached
     // bytes. For SP1 `program_id` is the vkey (not keccak256(elf)), so we cannot
@@ -12124,6 +16379,9 @@ pub(crate) async fn fetch_or_download_elf(
             .into());
         }
     };
+    // Every registry read of an SP1 program's `elf_hash` is recorded, so a measurement stored under
+    // the hash read here is judged against it, and a change back to an earlier hash counts.
+    record_registry_hash(honor_registry_hash, program_id, info.elf_hash);
     // The registry marks a program Active / Deprecated / Revoked. A non-Active status
     // (Active is the zero/default variant) means the program author pulled it; proving it wastes GPU
     // + gas. We WARN by default rather than hard-refuse because the exact enum ordering is not
@@ -12178,26 +16436,36 @@ pub(crate) async fn fetch_or_download_elf(
     } else {
         expected_risc0_hash
     };
+    if let (true, Some(then), Some(now)) =
+        (honor_registry_hash, measured_registry_hash, info.elf_hash)
+    {
+        if then != now {
+            return Err(ElfHashChanged(now).into());
+        }
+    }
     let expected_cache_hash = integrity_hash;
+    // Checked against the registry `elf_hash` alone (no measurement binding), which its registrant
+    // can change at will: a mismatch is a miss, and the bytes verified under the earlier hash stay
+    // for a change back, instead of being purged and downloaded again on every flip (RP1).
+    let keep_mismatch = honor_registry_hash && expected_risc0_hash.is_none();
     let cache_read = cache.clone();
-    let cached = tokio::task::spawn_blocking(move || cache_read.get(&program_id, expected_cache_hash))
-        .await
-        .ok()
-        .flatten();
+    let cached = tokio::task::spawn_blocking(move || match expected_cache_hash {
+        Some(h) if keep_mismatch => cache_read.get_keeping(&program_id, h),
+        h => cache_read.get(&program_id, h),
+    })
+    .await
+    .ok()
+    .flatten();
     if let Some(elf) = cached {
         tracing::info!("Using cached ELF for {} ({} bytes)", program_id, elf.len());
         return Ok(elf);
     }
+    if !allow_download {
+        return Err(ElfNotCached.into());
+    }
     {
         let mut s = state.write().await;
-        s.add_log(
-            LogLevel::Info,
-            format!(
-                "Downloading ELF '{}' ({} URIs)",
-                zkminer_chain::programs::sanitize_log(&info.name),
-                info.storage_uris.len()
-            ),
-        );
+        s.add_log(LogLevel::Info, elf_download_note(program_id, &info));
     }
     // Through the network guard built from this config (`client.elf_fetcher()`): every storage URI
     // and redirect is submitter-controlled, so only public destinations are reached unless
@@ -12227,6 +16495,30 @@ pub(crate) async fn fetch_or_download_elf(
     Ok(elf)
 }
 
+/// The dashboard's line for an ELF fetch. A program with no download address is not fetched at all
+/// (its jobs are skipped for `NO_ELF_SOURCE_TTL`): it read "Downloading ELF '' (0 URIs)", an
+/// unregistered program's empty name and empty list, which looked like a fault of ours.
+fn elf_download_note(
+    program_id: alloy::primitives::B256,
+    info: &zkminer_chain::programs::ProgramInfo,
+) -> String {
+    let name = zkminer_chain::programs::sanitize_log(&info.name);
+    let program = if name.is_empty() {
+        format!("program {}", short_id(program_id))
+    } else {
+        format!("'{name}' ({})", short_id(program_id))
+    };
+    match info.storage_uris.len() {
+        0 => format!(
+            "No ELF download for {program}: the ProgramRegistry lists no address for it (not \
+             registered, or registered without one). Its jobs are skipped for {} min.",
+            NO_ELF_SOURCE_TTL.as_secs() / 60
+        ),
+        1 => format!("Downloading ELF for {program}"),
+        n => format!("Downloading ELF for {program} ({n} sources)"),
+    }
+}
+
 /// The ProgramRegistry could not be read (and no cached ELF stood in): an RPC failure, which says
 /// nothing about the program — a back-off, never a measure strike.
 #[derive(Debug)]
@@ -12238,6 +16530,484 @@ impl std::fmt::Display for RegistryUnavailable {
     }
 }
 impl std::error::Error for RegistryUnavailable {}
+
+/// The ELF is not in the cache, and the caller asked not to download it (see [`fetch_elf`]). The
+/// pre-claim step then puts the job back and leaves the download to [`schedule_elf_prefetch`], so a
+/// slow or withheld ELF never holds a claim slot.
+#[derive(Debug)]
+pub(crate) struct ElfNotCached;
+
+impl std::fmt::Display for ElfNotCached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("its ELF is not in the cache")
+    }
+}
+impl std::error::Error for ElfNotCached {}
+
+/// The registry `elf_hash` (carried) is not the one the job was measured under: its measurement is of
+/// other bytes, so it is measured again before it is claimed (see [`note_registry_elf_hash`]).
+#[derive(Debug)]
+pub(crate) struct ElfHashChanged(alloy::primitives::B256);
+
+impl std::fmt::Display for ElfHashChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the registry has named another ELF ({}) since it was measured",
+            short_id(self.0)
+        )
+    }
+}
+impl std::error::Error for ElfHashChanged {}
+
+/// What the pre-claim step does with the result of its ELF fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreclaimElfAction {
+    /// The ELF is in hand: go on to the claim.
+    Claim,
+    /// Not cached: put the job back for [`ELF_PREFETCH_RETRY`] with no strike, and fetch the ELF in
+    /// the background.
+    RequeuePrefetch,
+    /// The registry names another ELF than the one measured: put the job back with no strike, to be
+    /// measured again, and count the change against the program.
+    Remeasure,
+    /// Any other failure: put the job back behind a job strike.
+    RequeueStrike,
+    /// Any other failure, at [`MAX_PRECLAIM_ELF_FAILURES`]: drop the job.
+    Drop,
+}
+
+/// Decide [`PreclaimElfAction`] for a pre-claim fetch result. `elf_failures` records one more failure
+/// of this job and returns how many there have been; it is called only for a failure the job is
+/// struck for.
+fn preclaim_elf_action(
+    fetched: &Result<Vec<u8>>,
+    elf_failures: impl FnOnce() -> u32,
+) -> PreclaimElfAction {
+    match fetched {
+        Ok(_) => PreclaimElfAction::Claim,
+        Err(e) if e.downcast_ref::<ElfNotCached>().is_some() => PreclaimElfAction::RequeuePrefetch,
+        Err(e) if e.downcast_ref::<ElfHashChanged>().is_some() => PreclaimElfAction::Remeasure,
+        Err(_) if elf_failures() < MAX_PRECLAIM_ELF_FAILURES => PreclaimElfAction::RequeueStrike,
+        Err(_) => PreclaimElfAction::Drop,
+    }
+}
+
+/// How long a job whose ELF is not cached waits before its next pre-claim step: about one
+/// background fetch.
+const ELF_PREFETCH_RETRY: Duration = Duration::from_secs(60);
+/// Background ELF fetches running at once, over all programs.
+const MAX_ELF_PREFETCHES: usize = 2;
+/// Failed background fetches of a program's ELF after which its jobs are skipped for
+/// `NO_ELF_SOURCE_TTL` (see [`mark_program_no_elf_source`]).
+const MAX_PROGRAM_ELF_STRIKES: u32 = 3;
+
+/// Programs whose ELF is being fetched in the background. Jobs of one program share its fetch.
+static ELF_PREFETCHES: std::sync::Mutex<Option<std::collections::HashSet<B256>>> =
+    std::sync::Mutex::new(None);
+
+/// Failed background fetches per program, and when the next may start. Kept per program, not per
+/// job, so copies of one job under new ids cannot each start a fetch. Cleared by a success.
+static PROGRAM_ELF_STRIKES: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, (u32, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// The wait before the next background fetch of a program after its `strikes`-th failure: 60 s,
+/// doubling, up to 30 min.
+fn program_elf_backoff(strikes: u32) -> Duration {
+    Duration::from_secs(60 << strikes.saturating_sub(1).min(5)).min(Duration::from_secs(1800))
+}
+
+/// Count a failed background fetch against `program_id`; returns its strikes. At
+/// [`MAX_PROGRAM_ELF_STRIKES`] its jobs are skipped for `NO_ELF_SOURCE_TTL`.
+fn note_program_elf_strike(program_id: B256) -> u32 {
+    let k = {
+        let mut g = PROGRAM_ELF_STRIKES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        let k = m.get(&program_id).map_or(0, |e| e.0).saturating_add(1);
+        let until = std::time::Instant::now() + program_elf_backoff(k);
+        bounded_insert(m, program_id, (k, until), MEASURED_CYCLES_CAP);
+        k
+    };
+    if k >= MAX_PROGRAM_ELF_STRIKES {
+        mark_program_no_elf_source(program_id);
+    }
+    k
+}
+
+fn clear_program_elf_strikes(program_id: B256) {
+    let mut g = PROGRAM_ELF_STRIKES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(m) = g.as_mut() {
+        m.remove(&program_id);
+    }
+}
+
+fn program_elf_backing_off(program_id: B256) -> bool {
+    let g = PROGRAM_ELF_STRIKES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&program_id))
+        .is_some_and(|&(_, until)| std::time::Instant::now() < until)
+}
+
+/// A program's place among the running background fetches, given up when dropped.
+struct ElfPrefetchSlot(B256);
+
+impl Drop for ElfPrefetchSlot {
+    fn drop(&mut self) {
+        let mut g = ELF_PREFETCHES.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = g.as_mut() {
+            s.remove(&self.0);
+        }
+    }
+}
+
+/// A slot for a background fetch of `program_id`'s ELF, or `None` when one is running for it already,
+/// [`MAX_ELF_PREFETCHES`] are running, or the program is backing off or has no ELF source.
+fn try_begin_elf_prefetch(program_id: B256) -> Option<ElfPrefetchSlot> {
+    if program_has_no_elf_source(program_id) || program_elf_backing_off(program_id) {
+        return None;
+    }
+    let mut g = ELF_PREFETCHES.lock().unwrap_or_else(|p| p.into_inner());
+    let running = g.get_or_insert_with(Default::default);
+    if running.contains(&program_id) || running.len() >= MAX_ELF_PREFETCHES {
+        return None;
+    }
+    running.insert(program_id);
+    Some(ElfPrefetchSlot(program_id))
+}
+
+/// Fetch `program_id`'s ELF into the cache in the background, for a job the pre-claim step put back
+/// on a cache miss. Bounded by [`try_begin_elf_prefetch`], and outside `in_flight`, so it never counts
+/// toward the claim limit. A failure strikes the program (see [`note_program_elf_strike`]), not the
+/// job: copies of a job under new ids would each start over at no strikes.
+fn schedule_elf_prefetch(
+    client: &ChainClient,
+    state: &zkminer_tui::state::SharedState,
+    program_id: B256,
+    expected_risc0_hash: Option<B256>,
+    honor_registry_hash: bool,
+) {
+    let Some(slot) = try_begin_elf_prefetch(program_id) else {
+        return;
+    };
+    let (client, state) = (client.clone(), state.clone());
+    tokio::spawn(async move {
+        let _slot = slot;
+        let fetched = tokio::time::timeout(
+            MEASURE_FETCH_BUDGET,
+            fetch_or_download_elf(
+                &client,
+                &state,
+                program_id,
+                expected_risc0_hash,
+                honor_registry_hash,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "ELF fetch exceeded the {}s budget",
+                MEASURE_FETCH_BUDGET.as_secs()
+            )
+        })
+        .and_then(|r| r);
+        match fetched {
+            Ok(_) => clear_program_elf_strikes(program_id),
+            Err(e)
+                if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>()
+                    .is_some() =>
+            {
+                mark_program_no_elf_source(program_id);
+            }
+            // An RPC failure says nothing about the program.
+            Err(e) if e.downcast_ref::<RegistryUnavailable>().is_some() => {
+                tracing::debug!(
+                    "ELF prefetch for {}: {}",
+                    short_id(program_id),
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+            }
+            Err(e) => {
+                let k = note_program_elf_strike(program_id);
+                tracing::warn!(
+                    "ELF prefetch for program {} failed (#{k} of {MAX_PROGRAM_ELF_STRIKES}): {}",
+                    short_id(program_id),
+                    zkminer_chain::programs::sanitize_log(&format!("{e:#}"))
+                );
+            }
+        }
+    });
+}
+
+/// Registry `elf_hash` changes per hour past which a program's jobs are skipped for
+/// `NO_ELF_SOURCE_TTL`: each change makes its jobs measured, and their ELF fetched, again.
+const MAX_ELF_HASH_CHANGES_PER_HOUR: usize = 2;
+
+/// Measure fetches a change of the registry `elf_hash` may answer with the previous hash's bytes
+/// (`MeasureFetchFailure::RolloutPending`) before they strike like any other failure: a rollout
+/// whose new bytes are not up by then is not waited on for free. Each such fetch holds a measure
+/// slot for up to `MEASURE_FETCH_BUDGET`, and with no bound a few programs flipped once held every
+/// SP1 slot for good (RP1).
+const ROLLOUT_PENDING_MAX: u32 = 2;
+/// How long after a change of the registry `elf_hash` the previous hash's bytes still read as a
+/// rollout in progress: past it, `previous` is forgotten for that purpose.
+const ROLLOUT_GRACE: Duration = Duration::from_secs(3600);
+
+/// How long a program whose URIs serve its previous `elf_hash`'s bytes is skipped, after the `k`th
+/// such result since its last good fetch: `NO_ELF_SOURCE_TTL` doubling, to 16 times it (10, 20, 40,
+/// 80, then 160 minutes).
+fn rollout_backoff(k: u32) -> Duration {
+    NO_ELF_SOURCE_TTL * (1u32 << k.saturating_sub(1).min(4))
+}
+
+/// What is known of one program's registry `elf_hash` (see [`REGISTRY_ELF_HASH`]).
+#[derive(Clone)]
+struct RegistryElfHash {
+    /// The hash the registry named at the last read.
+    current: B256,
+    /// The hash it named before `current`, when a change was seen.
+    previous: Option<B256>,
+    /// When it changed, within the last hour.
+    changes: Vec<std::time::Instant>,
+    /// When `current` was first read after a change (`None`: seeded, never seen to change).
+    changed_at: Option<std::time::Instant>,
+    /// Measure fetches answered with `previous`'s bytes under this `current` (at most
+    /// [`ROLLOUT_PENDING_MAX`] go without a strike).
+    rollout_pending: u32,
+    /// Such answers since the program's last good fetch, across changes: what its back-off grows
+    /// with ([`rollout_backoff`]).
+    rollout_backoffs: u32,
+}
+
+/// A program's rollout as a failed measure fetch is judged against (see [`measure_fetch_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RolloutState {
+    /// The registry `elf_hash` before the current one.
+    previous: B256,
+    /// Fetches already answered with `previous`'s bytes under the current hash.
+    pending: u32,
+    /// Since the change.
+    age: Duration,
+}
+
+/// Per program, the registry `elf_hash` at the last read of it on any path (measure, pre-claim,
+/// prove, recovery), the one before, and when it changed within the last hour. Every SP1 registry
+/// read updates it (see [`record_registry_hash`]), so a measurement stored under the hash just read
+/// is never taken as superseded by an older one, and a change back to an earlier hash counts.
+static REGISTRY_ELF_HASH: std::sync::Mutex<
+    Option<std::collections::HashMap<B256, RegistryElfHash>>,
+> = std::sync::Mutex::new(None);
+
+/// Record that the registry names `now` for `program_id`. A change is counted once per new hash, not
+/// once per job. A program with no entry counts a change when `count_unknown`, and is otherwise
+/// seeded with `now`. Returns the changes in the last hour; past [`MAX_ELF_HASH_CHANGES_PER_HOUR`]
+/// the program is marked as having no ELF source.
+fn record_registry_elf_hash(program_id: B256, now: B256, count_unknown: bool) -> usize {
+    let changes = {
+        let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+        let m = g.get_or_insert_with(Default::default);
+        let mut entry = match m.get(&program_id) {
+            Some(e) => e.clone(),
+            None => RegistryElfHash {
+                // A zero hash is never a registry `elf_hash`, so it differs from `now` and counts.
+                current: if count_unknown { B256::ZERO } else { now },
+                previous: None,
+                changes: Vec::new(),
+                changed_at: None,
+                rollout_pending: 0,
+                rollout_backoffs: 0,
+            },
+        };
+        entry
+            .changes
+            .retain(|t| t.elapsed() < Duration::from_secs(3600));
+        if entry.current != now {
+            entry.previous = (entry.current != B256::ZERO).then_some(entry.current);
+            entry.current = now;
+            entry.changes.push(std::time::Instant::now());
+            entry.changed_at = Some(std::time::Instant::now());
+            // A new hash gets its own free answers; the back-off keeps growing until a good fetch.
+            entry.rollout_pending = 0;
+        }
+        let changes = entry.changes.len();
+        bounded_insert(m, program_id, entry, MEASURED_CYCLES_CAP);
+        changes
+    };
+    if changes > MAX_ELF_HASH_CHANGES_PER_HOUR {
+        mark_program_no_elf_source(program_id);
+    }
+    changes
+}
+
+/// Record that the pre-claim step found the registry naming `now` for `program_id`, at a job measured
+/// under another hash. The program has no entry here only when the map evicted it, so that still
+/// counts as a change (see [`record_registry_elf_hash`]).
+fn note_registry_elf_hash(program_id: B256, now: B256) -> usize {
+    record_registry_elf_hash(program_id, now, true)
+}
+
+/// Record a registry read naming `now` for `program_id`. The first read of a program seeds it and is
+/// not a change (see [`record_registry_elf_hash`]).
+fn observe_registry_elf_hash(program_id: B256, now: B256) -> usize {
+    record_registry_elf_hash(program_id, now, false)
+}
+
+/// Record a registry read in [`fetch_elf`]: only where the registry `elf_hash` binds the bytes
+/// (`honor`, not risc0) and the program has one. Returns the changes in the last hour, or `None` when
+/// nothing was recorded.
+fn record_registry_hash(honor: bool, program_id: B256, info_hash: Option<B256>) -> Option<usize> {
+    match (honor, info_hash) {
+        (true, Some(now)) => Some(observe_registry_elf_hash(program_id, now)),
+        _ => None,
+    }
+}
+
+/// Whether the registry is known to name another ELF for `program_id` than `measured_under` (see
+/// [`REGISTRY_ELF_HASH`]): a measurement made under it is not of the ELF a claim would prove.
+fn registry_elf_hash_superseded(program_id: B256, measured_under: B256) -> bool {
+    let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&program_id))
+        .is_some_and(|e| e.current != measured_under)
+}
+
+/// The registry `elf_hash` `program_id` had before its current one, when a change was seen.
+#[cfg(test)]
+fn registry_elf_hash_previous(program_id: B256) -> Option<B256> {
+    let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    g.as_ref()
+        .and_then(|m| m.get(&program_id))
+        .and_then(|e| e.previous)
+}
+
+/// `program_id`'s rollout, when a change of its registry `elf_hash` was seen (see
+/// [`RolloutState`]).
+fn registry_rollout_state(program_id: B256) -> Option<RolloutState> {
+    let g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    let e = g.as_ref()?.get(&program_id)?;
+    Some(RolloutState {
+        previous: e.previous?,
+        pending: e.rollout_pending,
+        age: e.changed_at?.elapsed(),
+    })
+}
+
+/// Counts a measure fetch of `program_id` answered with its previous `elf_hash`'s bytes and let go
+/// without a strike. Returns how many there have been since its last good fetch, for
+/// [`rollout_backoff`].
+fn note_rollout_pending(program_id: B256) -> u32 {
+    let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    match g.as_mut().and_then(|m| m.get_mut(&program_id)) {
+        Some(e) => {
+            e.rollout_pending = e.rollout_pending.saturating_add(1);
+            e.rollout_backoffs = e.rollout_backoffs.saturating_add(1);
+            e.rollout_backoffs
+        }
+        None => 1,
+    }
+}
+
+/// A fetch of `program_id`'s ELF succeeded: its rollout is over, and its back-off starts over.
+fn note_registry_fetch_ok(program_id: B256) {
+    let mut g = REGISTRY_ELF_HASH.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(e) = g.as_mut().and_then(|m| m.get_mut(&program_id)) {
+        e.rollout_pending = 0;
+        e.rollout_backoffs = 0;
+    }
+}
+
+/// What the measure path does with a failed ELF fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeasureFetchFailure {
+    /// No ELF source now: not registered, no URIs, or the registry unreadable. A back-off.
+    NoSource,
+    /// The URIs still serve the bytes of the registry's previous `elf_hash`: the new hash was set
+    /// before its bytes were uploaded. A back-off, not a strike: a strike-out here would retire the
+    /// input for good over a rollout. Only [`ROLLOUT_PENDING_MAX`] times per change, and within
+    /// [`ROLLOUT_GRACE`] of it: past that it is a [`MeasureFetchFailure::Strike`].
+    RolloutPending,
+    /// Anything else: a strike toward a permanent UNMEASURABLE verdict.
+    Strike,
+}
+
+/// Classify a measure-path ELF fetch failure. `rollout` is the program's change of registry
+/// `elf_hash`, when one was seen (see [`registry_rollout_state`]).
+fn measure_fetch_failure(e: &anyhow::Error, rollout: Option<RolloutState>) -> MeasureFetchFailure {
+    if e.downcast_ref::<zkminer_chain::programs::NoStorageUris>()
+        .is_some()
+        || e.downcast_ref::<RegistryUnavailable>().is_some()
+    {
+        MeasureFetchFailure::NoSource
+    } else if e
+        .downcast_ref::<zkminer_chain::programs::ElfHashMismatch>()
+        .zip(rollout)
+        .is_some_and(|(m, r)| {
+            m.served.contains(&r.previous)
+                && r.pending < ROLLOUT_PENDING_MAX
+                && r.age < ROLLOUT_GRACE
+        })
+    {
+        MeasureFetchFailure::RolloutPending
+    } else {
+        MeasureFetchFailure::Strike
+    }
+}
+
+/// How long after a (backend, size, program, input) was measured by execution before it may be
+/// executed again, doubling with each run within [`MEASURE_RERUN_WINDOW`] up to
+/// [`MEASURE_RERUN_COOLDOWN_MAX`]. A measurement dropped soon after it was stored (a registry hash
+/// that moved, an eviction) is then not executed again on every tick.
+const MEASURE_RERUN_COOLDOWN: Duration = Duration::from_secs(60);
+const MEASURE_RERUN_COOLDOWN_MAX: Duration = Duration::from_secs(30 * 60);
+/// Runs older than this are forgotten: the cooldown starts over at [`MEASURE_RERUN_COOLDOWN`].
+const MEASURE_RERUN_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Per (backend, size, program, input): its executions that stored a measurement within
+/// [`MEASURE_RERUN_WINDOW`] of each other, and when the last one did.
+static MEASURE_RUNS: std::sync::Mutex<
+    Option<std::collections::HashMap<MeasureKey, (u32, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// How much longer a key measured `runs` times, last `since_last` ago, waits before it is executed
+/// again; `None` when it may run now.
+fn measure_rerun_wait(runs: u32, since_last: Duration) -> Option<Duration> {
+    if runs == 0 || since_last >= MEASURE_RERUN_WINDOW {
+        return None;
+    }
+    let cooldown = MEASURE_RERUN_COOLDOWN
+        .saturating_mul(1u32 << (runs - 1).min(5))
+        .min(MEASURE_RERUN_COOLDOWN_MAX);
+    cooldown.checked_sub(since_last).filter(|w| !w.is_zero())
+}
+
+/// [`measure_rerun_wait`] for `key`, from its recorded runs.
+fn measure_rerun_wait_for(key: &MeasureKey) -> Option<Duration> {
+    let g = MEASURE_RUNS.lock().unwrap_or_else(|p| p.into_inner());
+    let (runs, last) = *g.as_ref()?.get(key)?;
+    measure_rerun_wait(runs, last.elapsed())
+}
+
+/// Record that `key` was measured by execution now.
+fn note_measure_run(key: MeasureKey) {
+    let mut g = MEASURE_RUNS.lock().unwrap_or_else(|p| p.into_inner());
+    let m = g.get_or_insert_with(Default::default);
+    let runs = match m.get(&key) {
+        Some((runs, last)) if last.elapsed() < MEASURE_RERUN_WINDOW => runs.saturating_add(1),
+        _ => 1,
+    };
+    bounded_insert(
+        m,
+        key,
+        (runs, std::time::Instant::now()),
+        MEASURED_CYCLES_CAP,
+    );
+}
 
 /// What a read pinned at or after the block where we last saw our lock says about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12314,11 +17084,67 @@ async fn release_and_clean_with_nonce(
     pre_nonce: Option<u64>,
 ) {
     use zkminer_chain::jobs::GovernanceHold;
+    // On its row: being released, off its card (its next job may already be proving there), no
+    // progress bar. The release transaction's events rewrite the note.
+    end_attempt_display(state, job_id).await;
+    state.write().await.set_job_note(
+        job_id,
+        zkminer_tui::state::JobNoteKind::Release,
+        "releasing the lock",
+    );
+    // A reason from an earlier pass no longer holds; each path that keeps the lock says its own.
+    forget_kept_reason(job_id);
+    // A keep-locks stop hands every lock to the next start: a lifecycle that fails on the way out
+    // (its worker stopped under it) must not release its lock. The breadcrumb stays for recovery.
+    if keeping_lock(job_id) {
+        tracing::warn!(
+            "job {}: not releasing — keeping the lock for the next start",
+            short_id(job_id)
+        );
+        note_kept_reason(job_id, "kept for the next start (keep-locks stop)");
+        if let Some(n) = pre_nonce {
+            client.abort_nonce(n);
+        }
+        let mut s = state.write().await;
+        s.active_jobs.retain(|j| j.info.job_id != job_id);
+        return;
+    }
     // Read the view first: the governance-hold decision needs the job's proof system.
     let mut view_read = client.get_job_status_view(job_id).await;
     if view_read.is_err() {
         tokio::time::sleep(DEADLINE_READ_RETRY_DELAY).await;
         view_read = client.get_job_status_view(job_id).await;
+    }
+    // A keep-locks stop chose this lock from the journal's recorded cutoff, which a pause credit
+    // moves out unrecorded (and an unknown one was guessed from the shortest window). If the live
+    // cutoff leaves time for a restart after all, keep it rather than pay to release it, unless
+    // a stuck fulfil nonce of its own needs this release to displace it.
+    if ladder_phase() == PHASE_KEEPING && keep_exempt(job_id) && !client.has_abandoned_nonce(job_id)
+    {
+        if let Ok(v) = &view_read {
+            let cutoff = effective_cutoff(v);
+            if cutoff != 0 && cutoff > keep_horizon() {
+                if let Some(set) = KEEP_LOCKS_EXEMPT
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    set.remove(&job_id);
+                }
+                tracing::warn!(
+                    "job {}: its live deadline leaves time for a restart — keeping it after all",
+                    short_id(job_id)
+                );
+                if let Some(n) = pre_nonce {
+                    client.abort_nonce(n);
+                }
+                note_kept_reason(job_id, "kept for the next start (its deadline leaves time)");
+                let mut s = state.write().await;
+                s.active_jobs.retain(|j| j.info.job_id != job_id);
+                s.clear_job_notes(job_id);
+                return;
+            }
+        }
     }
     let proof_system = view_read
         .as_ref()
@@ -12362,6 +17188,10 @@ async fn release_and_clean_with_nonce(
                 client.abort_nonce(n);
             }
             request_recovery();
+            note_kept_reason(
+                job_id,
+                "its governance or lock state could not be read; the recovery pass retries",
+            );
             state
                 .write()
                 .await
@@ -12394,6 +17224,11 @@ async fn release_and_clean_with_nonce(
             }
         }
         note_pause_kept(job_id);
+        note_kept_reason(
+            job_id,
+            "the router or Registry is paused (its deadline is credited); proven again after the \
+             pause",
+        );
         if let Some(n) = pre_nonce {
             client.abort_nonce(n);
         }
@@ -12427,6 +17262,11 @@ async fn release_and_clean_with_nonce(
                 // path cannot tell which, so keep the lock and let recovery re-read it.
                 Ok(false) if view_read.is_err() => {
                     request_recovery();
+                    note_kept_reason(
+                        job_id,
+                        "its adapter is Disabled and the grace release was refused; the recovery \
+                         pass reads it again",
+                    );
                     state
                         .write()
                         .await
@@ -12439,6 +17279,7 @@ async fn release_and_clean_with_nonce(
                     journal_update(journal, |j| j.remove(job_id));
                     client.settle_abandoned_nonce(job_id).await;
                     let mut s = state.write().await;
+                    s.record_finished(job_id, MinerJobStatus::Released { penalty: 0 });
                     s.active_jobs.retain(|j| j.info.job_id != job_id);
                     s.add_log(
                         LogLevel::Warn,
@@ -12456,6 +17297,11 @@ async fn release_and_clean_with_nonce(
                         short_id(job_id)
                     );
                     request_recovery();
+                    note_kept_reason(
+                        job_id,
+                        "its adapter is Disabled and the grace release failed; the recovery pass \
+                         retries",
+                    );
                     state
                         .write()
                         .await
@@ -12551,19 +17397,39 @@ async fn release_and_clean_with_nonce(
                 if let Some(n) = pre_nonce {
                     client.abort_nonce(n);
                 }
+                note_kept_reason(
+                    job_id,
+                    "another prover reads as holding it, but our lock is not provably gone; the \
+                     recovery pass checks again",
+                );
                 let mut s = state.write().await;
                 s.active_jobs.retain(|j| j.info.job_id != job_id);
                 return;
             }
-            let why = if not_ours {
-                if view.prover == alloy::primitives::Address::ZERO {
-                    "never locked on-chain"
-                } else {
-                    "held by another prover"
+            // How the lock ended, for the history (`MinerState::record_finished`): only one this
+            // miner is known to have held (its claim confirmed). Fulfilled by us, else gone after its
+            // deadline (a keeper slashed it), else released.
+            let ended = lock_end(
+                journal,
+                job_id,
+                Some((view.status, view.prover)),
+                client.address,
+            );
+            let mut why = match &ended {
+                Some(MinerJobStatus::EndedPastDeadline) => {
+                    "ended after its deadline (slashed, or its end could not be read)"
                 }
-            } else {
-                "no longer locked (fulfilled or released)"
+                Some(MinerJobStatus::Fulfilled { .. }) => "fulfilled",
+                _ if not_ours => {
+                    if view.prover == alloy::primitives::Address::ZERO {
+                        "never locked on-chain"
+                    } else {
+                        "held by another prover"
+                    }
+                }
+                _ => "no longer locked (fulfilled or released)",
             };
+            let lock_block = lock_block_of(journal, job_id);
             journal_update(journal, |j| j.remove(job_id));
             // This path SKIPS release_job (the only stash consumer). If a fulfill
             // stashed its nonce for this job, drain it here or it becomes a permanent gap
@@ -12573,12 +17439,32 @@ async fn release_and_clean_with_nonce(
             if let Some(n) = pre_nonce {
                 client.abort_nonce(n);
             }
+            // Past its deadline: the one classifier decides slash (it trips the latch) or late
+            // release (LD-3).
+            let ended = match ended {
+                Some(MinerJobStatus::EndedPastDeadline) => {
+                    let end = past_deadline_end(client, job_id, lock_block, why).await;
+                    if !matches!(end, MinerJobStatus::EndedPastDeadline) {
+                        why = "ended after its deadline, released by a late send of ours";
+                    }
+                    Some(end)
+                }
+                other => other,
+            };
             let mut s = state.write().await;
+            let slashed = matches!(ended, Some(MinerJobStatus::EndedPastDeadline));
+            if let Some(ended) = ended {
+                s.record_finished(job_id, ended);
+            }
             s.active_jobs.retain(|j| j.info.job_id != job_id);
             s.add_log(
-                LogLevel::Info,
+                if slashed {
+                    LogLevel::Warn
+                } else {
+                    LogLevel::Info
+                },
                 format!(
-                    "Job {} {} — dropped stale claim breadcrumb",
+                    "Job {} {} — dropped its claim record",
                     short_id(job_id),
                     why
                 ),
@@ -12607,13 +17493,66 @@ async fn release_and_clean_with_nonce(
             });
         }
         if lock_deadline != 0 && now >= lock_deadline {
-            tracing::error!(
-                "PAGE: LOCK-LATE: {} is past its deadline ({} >= {}) — releaseJob would revert; \
-                 retaining breadcrumb (collateral stranded until a keeper slash)",
-                short_id(job_id),
-                now,
-                lock_deadline,
-            );
+            // It can be neither fulfilled nor released any more: once the slash opens, slash it
+            // ourselves (`slash_own_expired_lock`). The collateral is lost whoever slashes; done
+            // here, the keeper share comes back to this prover instead of a stranger, and the lock
+            // is cleared now. Judged on the LOWER chain-time estimate, and only on a lock the view
+            // shows as ours and Locked (checked above); an early send just reverts "Not expired
+            // yet" and is tried again on a later pass.
+            let slash_opens = view.slashOpensAt.to::<u64>();
+            if slash_opens != 0 && now >= slash_opens {
+                match client.slash_own_expired_lock(job_id).await {
+                    Ok(true) => {
+                        journal_update(journal, |j| j.remove(job_id));
+                        if let Some(n) = client.take_abandoned_nonce(job_id) {
+                            client.abort_nonce(n);
+                        }
+                        if let Some(n) = pre_nonce {
+                            client.abort_nonce(n);
+                        }
+                        let detail = format!(
+                            "Job {} could no longer be proved or released: slashed it ourselves. \
+                             Its collateral is lost either way; the keeper share (2%, at least 0.5 \
+                             HEMI) comes back to this prover.",
+                            short_id(job_id)
+                        );
+                        tracing::warn!("{detail}");
+                        slash_latch::note_lock_lost(
+                            job_id,
+                            "ran past its deadline and this miner slashed it itself",
+                        );
+                        let mut s = state.write().await;
+                        s.record_finished(job_id, MinerJobStatus::Slashed { by_us: true });
+                        s.active_jobs.retain(|j| j.info.job_id != job_id);
+                        s.add_log(LogLevel::Warn, detail);
+                        return;
+                    }
+                    Ok(false) => tracing::info!(
+                        "{}: the chain refused our slash of the expired lock for now; trying \
+                         again later",
+                        short_id(job_id)
+                    ),
+                    Err(e) => tracing::warn!(
+                        "{}: could not slash the expired lock ourselves ({e:#}); trying again \
+                         later",
+                        short_id(job_id)
+                    ),
+                }
+            }
+            let first = first_stranded_report(job_id);
+            if first {
+                tracing::error!(
+                    "PAGE: LOCK-LATE: {} is past its deadline ({} >= {}) — releaseJob would revert; \
+                     retaining breadcrumb; this miner slashes it itself from {} (the keeper share \
+                     comes back to it)",
+                    short_id(job_id),
+                    now,
+                    lock_deadline,
+                    slash_opens,
+                );
+            } else {
+                tracing::debug!("{} still stranded past its deadline", short_id(job_id));
+            }
             // Past-deadline SKIPS release_job — drain the fulfill stash so a stashed
             // nonce can't wedge the signer. (The stuck fulfill may still be pending at N;
             // unless it has mined, recycling it lets a reuser evict/replace it — far better
@@ -12624,18 +17563,46 @@ async fn release_and_clean_with_nonce(
             }
             let mut s = state.write().await;
             s.active_jobs.retain(|j| j.info.job_id != job_id);
-            s.add_log(
-                LogLevel::Warn,
-                format!(
-                    "Job {} past deadline — cannot release (stranded until slash)",
-                    short_id(job_id)
-                ),
+            note_kept_reason(
+                job_id,
+                if slash_opens != 0 && now >= slash_opens {
+                    "past its deadline, so it cannot be released; its slash is open and this miner \
+                     sends it on the next recovery pass"
+                        .to_string()
+                } else {
+                    format!(
+                        "past its deadline, so it cannot be released; this miner slashes it itself \
+                         from {}",
+                        zkminer_chain::exit::fmt_unix(slash_opens)
+                    )
+                },
             );
+            if first {
+                s.add_log(
+                    LogLevel::Warn,
+                    format!(
+                        "Job {} past deadline — cannot release; this miner slashes it itself once \
+                         the slash opens",
+                        short_id(job_id)
+                    ),
+                );
+            }
             return;
         }
     }
 
     let seen = lock_seen(journal, job_id);
+    // Its penalty, read while the lock is still on record. Noted with the slash latch BEFORE the send
+    // when it reads within 2 s (review 7 LD-1: a refresh can see the fall before the receipt); else
+    // read on beside the release, never delaying it more than that.
+    let mut penalty_read = tokio::spawn(slash_latch::release_penalty(client.clone(), job_id));
+    let penalty_early = tokio::time::timeout(Duration::from_secs(2), &mut penalty_read)
+        .await
+        .ok()
+        .map(|r| r.ok().flatten());
+    if let Some(Some(p)) = penalty_early {
+        slash_latch::note_release_sending(job_id, p);
+    }
     let mut release = client.release_job_with_nonce(job_id, pre_nonce, seen).await;
     // Inside the release margin there may be no time for a recovery pass: retry in place while the
     // window is open. A ladder can burn out in seconds on a burst of refused sends. A typed revert is
@@ -12675,13 +17642,51 @@ async fn release_and_clean_with_nonce(
                 "release_job({}) RPC failed: {e:#} — journal entry retained for recovery",
                 job_id,
             );
+            note_kept_reason(job_id, "its release failed; the recovery pass tries again");
             request_recovery();
             false
         }
     };
+    // `release_job_with_nonce` reports success whenever our lock is gone, which includes the fulfil
+    // it was displacing having mined: the history says which.
+    let fulfilled = release_ok
+        && client.get_job_status_view(job_id).await.is_ok_and(|v| {
+            v.status == zkminer_chain::jobs::JOB_STATUS_FULFILLED && v.prover == client.address
+        });
+    let penalty = match penalty_early {
+        Some(p) => p,
+        None => penalty_read.await.ok().flatten(),
+    };
+    if release_ok && !fulfilled {
+        // So the slash latch reads the stake it takes as ours, not as a slash.
+        slash_latch::note_own_release(job_id, penalty);
+    } else if fulfilled {
+        // The fulfil landed first: the release took nothing.
+        slash_latch::withdraw_own_release(job_id);
+    }
     let mut s = state.write().await;
-    s.active_jobs.retain(|j| j.info.job_id != job_id);
     if release_ok {
+        s.record_finished(
+            job_id,
+            if fulfilled {
+                MinerJobStatus::Fulfilled { payout: 0 }
+            } else {
+                MinerJobStatus::Released {
+                    penalty: penalty.unwrap_or(0),
+                }
+            },
+        );
+    }
+    s.active_jobs.retain(|j| j.info.job_id != job_id);
+    if release_ok && fulfilled {
+        s.add_log(
+            LogLevel::Info,
+            format!(
+                "Job {} fulfilled: its fulfil landed before the release",
+                short_id(job_id)
+            ),
+        );
+    } else if release_ok {
         s.add_log(LogLevel::Warn, format!("Released job {}", short_id(job_id)));
     } else {
         s.add_log(
@@ -12698,13 +17703,38 @@ async fn release_and_clean_with_nonce(
 /// go through this helper so that disk-full / permission errors are visible
 /// rather than silently swallowed.
 fn save_journal_or_warn(journal: &JobJournal) {
-    // Never from a watch-only run: the file is the running miner's record of its locks.
-    if watch_only() {
-        return;
-    }
-    if let Err(e) = journal.save() {
+    if let Err(e) = save_journal_checked(journal) {
         tracing::warn!("journal.save() failed: {e:#} — recovery on next restart may be stale");
     }
+}
+
+/// Set while the journal's last save failed: no job is claimed until one succeeds
+/// ([`start_record_hold`]).
+static JOURNAL_SAVE_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Save the journal, recording whether it failed ([`JOURNAL_SAVE_FAILED`]).
+fn save_journal_checked(journal: &JobJournal) -> Result<()> {
+    // Never from a watch-only run: the file is the running miner's record of its locks.
+    if watch_only() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    let saved = match TEST_JOURNAL_SAVES.get() {
+        Some(true) => Ok(()),
+        Some(false) => Err(anyhow::anyhow!("No space left on device (test)")),
+        None => journal.save(),
+    };
+    #[cfg(not(test))]
+    let saved = journal.save();
+    JOURNAL_SAVE_FAILED.store(saved.is_err(), std::sync::atomic::Ordering::SeqCst);
+    saved
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: whether this thread's journal saves succeed, without touching the disk.
+    static TEST_JOURNAL_SAVES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The proving journal, shared across concurrent per-job tasks (one job per GPU).
@@ -12717,6 +17747,270 @@ fn journal_update(journal: &SharedJournal, f: impl FnOnce(&mut JobJournal)) {
     let mut j = journal.lock().unwrap_or_else(|p| p.into_inner());
     f(&mut j);
     save_journal_or_warn(&j);
+}
+
+/// [`journal_update`], with the save's error.
+fn journal_update_checked(journal: &SharedJournal, f: impl FnOnce(&mut JobJournal)) -> Result<()> {
+    let mut j = journal.lock().unwrap_or_else(|p| p.into_inner());
+    f(&mut j);
+    save_journal_checked(&j)
+}
+
+/// Free space kept on the volumes the miner records and stages on (`~/.zkminer`; on Windows also
+/// the Low workers' directory): below it no job is claimed and no proof started, as the record of a
+/// proof's start may not fit ([`start_record_hold`]). Segment space is reserved on top of it
+/// (`segment_disk`).
+const STORAGE_FLOOR_BYTES: u64 = 2 << 30;
+
+/// The directories whose volumes must keep [`STORAGE_FLOOR_BYTES`] free.
+fn storage_floor_dirs() -> Vec<PathBuf> {
+    let home = dirs::home_dir().map(|h| h.join(".zkminer"));
+    #[cfg(windows)]
+    let local = dirs::data_local_dir();
+    #[cfg(not(windows))]
+    let local = None;
+    home.into_iter().chain(local).collect()
+}
+
+/// The first of `dirs` whose volume has less than [`STORAGE_FLOOR_BYTES`] free, by `free_bytes`
+/// (a volume whose free space cannot be read is not held on), as the reason.
+fn storage_short(
+    dirs: &[PathBuf],
+    free_bytes: impl Fn(&Path) -> std::io::Result<u64>,
+) -> Option<String> {
+    dirs.iter().find_map(|dir| match free_bytes(dir) {
+        Ok(free) if free < STORAGE_FLOOR_BYTES => Some(format!(
+            "{} has {} MiB free, under the {} MiB kept free",
+            dir.display(),
+            free >> 20,
+            STORAGE_FLOOR_BYTES >> 20
+        )),
+        _ => None,
+    })
+}
+
+/// Page `code` (`JOURNAL-UNWRITABLE`, `DISK-LOW`) for `why`, at most every 10 minutes: no job is
+/// claimed and no proof started while it lasts.
+fn page_storage(code: &str, why: &str) {
+    static PAGED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut paged = PAGED.lock().unwrap_or_else(|p| p.into_inner());
+    if paged.is_none_or(|at| at.elapsed() >= Duration::from_secs(600)) {
+        *paged = Some(std::time::Instant::now());
+        tracing::error!(
+            "PAGE: {code} — {why}: no job is claimed and no proof started until it is fixed (a \
+             proof whose start cannot be recorded could crash the miner over and over without the \
+             crash-loop limit ever seeing it). Free disk space on that volume"
+        );
+    }
+}
+
+/// Why this host's disk cannot take a proof now: a volume it records on is under
+/// [`STORAGE_FLOOR_BYTES`] (paged, `DISK-LOW`).
+fn disk_low() -> Option<String> {
+    let why = storage_short(&storage_floor_dirs(), segment_disk::free_bytes)?;
+    page_storage("DISK-LOW", &why);
+    Some(why)
+}
+
+/// Why `job_id` (of `program_id`, from `submitter`) is not claimed now, if it is not, and how long
+/// to wait: the journal's last save failed (tried again here at most every 30 s, so a disk with
+/// room again clears it), [`disk_low`], or a crash-loop mark (`JobJournal::crash_loop_hold`).
+fn start_record_hold(
+    journal: &SharedJournal,
+    job_id: B256,
+    submitter: alloy::primitives::Address,
+    program_id: B256,
+) -> Option<(String, Duration)> {
+    let held = Duration::from_secs(300);
+    if JOURNAL_SAVE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        static RETRIED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let retry = {
+            let mut retried = RETRIED.lock().unwrap_or_else(|p| p.into_inner());
+            let due = retried.is_none_or(|at| at.elapsed() >= Duration::from_secs(30));
+            if due {
+                *retried = Some(std::time::Instant::now());
+            }
+            due || cfg!(test)
+        };
+        if retry {
+            let _ = save_journal_checked(&journal.lock().unwrap_or_else(|p| p.into_inner()));
+        }
+        if JOURNAL_SAVE_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+            let why = "the job journal cannot be saved".to_string();
+            page_storage("JOURNAL-UNWRITABLE", &why);
+            return Some((why, held));
+        }
+    }
+    if let Some(why) = disk_low() {
+        return Some((why, held));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let (why, left) = journal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .crash_loop_hold(job_id, submitter, program_id, now)?;
+    // Looked at again within the hour: the brain's other gates may want it sooner.
+    Some((why, Duration::from_secs(left.clamp(60, 3600) as u64)))
+}
+
+/// Record that `job_id` is being proven, before its proof starts: `Err` (and no proof) where that
+/// cannot be done, so a proof never starts unrecorded. Handed back to recovery, which tries again,
+/// while its lock can still survive a restart; a plain error (the job released) once it is within
+/// the keep horizon, rather than left to a slash.
+fn record_proving(journal: &SharedJournal, job_id: B256, lock_deadline: u64) -> Result<()> {
+    let refused = match disk_low() {
+        Some(why) => Some(why),
+        None => journal_update_checked(journal, |j| j.mark_proving(job_id))
+            .err()
+            .map(|e| {
+                let why = format!("the job journal cannot be saved: {e:#}");
+                page_storage("JOURNAL-UNWRITABLE", &why);
+                why
+            }),
+    };
+    let Some(why) = refused else {
+        return Ok(());
+    };
+    let why = format!("the proof's start could not be recorded: {why}");
+    if lock_deadline <= keep_horizon() {
+        return Err(anyhow::anyhow!("{why}"));
+    }
+    Err(HandBack(why).into())
+}
+
+/// Mark `job_id` (of `program_id`, from `submitter`) released as a crash loop, so neither it nor its
+/// submitter's jobs of the same program are claimed again for a while (`JobJournal::crash_looped`).
+fn mark_crash_looped(
+    journal: &SharedJournal,
+    job_id: B256,
+    program_id: B256,
+    submitter: alloy::primitives::Address,
+) {
+    let now = chrono::Utc::now().timestamp();
+    journal_update(journal, |j| {
+        j.mark_crash_looped(job_id, program_id, submitter, now)
+    });
+}
+
+/// How many runs in a row may end in the middle of one job's proof (one a worker had accepted)
+/// before the job is released rather than proven again (`crash_loop_refusal`).
+const MAX_UNFINISHED_PROVE_STARTS: u8 = 3;
+
+/// Why `job_id` is released rather than proven again, if it is: its proof started
+/// [`MAX_UNFINISHED_PROVE_STARTS`] times in runs that ended before it did
+/// ([`JournalEntry::prove_starts`](crate::journal::JournalEntry::prove_starts)). Whatever ends the
+/// miner (a crash, a kill, or a requester's guest that broke out of its worker and ends it each time
+/// its job is proven again), every lock the miner holds would otherwise be driven to its deadline
+/// one restart after another, and slashed.
+fn crash_loop_refusal(journal: &JobJournal, job_id: B256) -> Option<String> {
+    let starts = journal.prove_starts(job_id);
+    (starts >= MAX_UNFINISHED_PROVE_STARTS).then(|| {
+        format!(
+            "job {}: its proof started {starts} times, and each time the miner ended before it \
+             did (a crash, a kill, or a guest that broke out of its worker and ended the miner). \
+             Releasing it rather than proving it again, so that it cannot keep the miner from \
+             its other locks",
+            short_id(job_id)
+        )
+    })
+}
+
+/// The proof starts counted in the journal ([`ProveStart`]) whose proofs have not ended:
+/// (token, job, journal).
+static COUNTED_PROVE_STARTS: Mutex<Vec<(u64, B256, SharedJournal)>> = Mutex::new(Vec::new());
+
+/// Set once a stop is decided ([`end_counted_prove_starts`]): no proof start counts after it.
+static PROVE_STARTS_ENDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A proof of one job, from the moment it is about to be handed to the dispatcher. Its start is
+/// counted in the journal (`note_prove_start`) only when a worker accepts the proof ([`Self::count`],
+/// at its `Started`): a job that was only queued for a card, host RAM or VRAM when the miner died
+/// was not being proven, and is not charged. Taken back when the proof ends in this run, however
+/// it ends (dropped), reset when it completes ([`Self::completed`]), or taken back when a stop is
+/// decided with it still running ([`end_counted_prove_starts`]): only a run that ended some other
+/// way leaves it counted.
+struct ProveStart {
+    token: u64,
+    job_id: B256,
+    journal: SharedJournal,
+}
+
+impl ProveStart {
+    fn new(journal: &SharedJournal, job_id: B256) -> Arc<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Arc::new(Self {
+            token: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            job_id,
+            journal: journal.clone(),
+        })
+    }
+
+    /// A worker accepted the proof: count its start, once (a retry's `Started` does not count it
+    /// again), unless a stop was decided.
+    fn count(&self) {
+        if !PROVE_STARTS_ENDED.load(std::sync::atomic::Ordering::SeqCst) {
+            self.count_now();
+        }
+    }
+
+    fn count_now(&self) {
+        // Held across the save, so a stop's `end_counted_prove_starts` cannot take it back first.
+        let mut counted = COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if counted.iter().any(|(token, ..)| *token == self.token) {
+            return;
+        }
+        counted.push((self.token, self.job_id, self.journal.clone()));
+        let job_id = self.job_id;
+        if let Err(e) = journal_update_checked(&self.journal, |j| j.note_prove_start(job_id)) {
+            tracing::error!(
+                "PAGE: JOURNAL-UNWRITABLE — {e:#}; the start of {}'s proof is not recorded, so a \
+                 crash during it would not count towards its crash-loop limit",
+                short_id(job_id)
+            );
+        }
+    }
+
+    /// The proof completed: the runs that ended in the middle of this job's earlier proofs no
+    /// longer count either.
+    fn completed(&self) {
+        COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(token, ..)| *token != self.token);
+        let job_id = self.job_id;
+        journal_update(&self.journal, |j| j.note_prove_completed(job_id));
+    }
+}
+
+impl Drop for ProveStart {
+    fn drop(&mut self) {
+        let mut counted = COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(at) = counted.iter().position(|(token, ..)| *token == self.token) else {
+            return;
+        };
+        let (_, job_id, journal) = counted.swap_remove(at);
+        drop(counted);
+        journal_update(&journal, |j| j.note_prove_end(job_id));
+    }
+}
+
+/// A stop is decided, or the miner is exiting on purpose (keep-locks included): the proofs still
+/// running are not a crash, so their starts no longer count, nor do any that start from now on.
+fn end_counted_prove_starts() {
+    PROVE_STARTS_ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let counted = std::mem::take(
+        &mut *COUNTED_PROVE_STARTS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    );
+    for (_, job_id, journal) in counted {
+        journal_update(&journal, |j| j.note_prove_end(job_id));
+    }
 }
 
 /// True if the shared journal currently holds an entry for `job_id`.
@@ -12762,6 +18056,9 @@ struct RecoveryPass {
     actions: Vec<(B256, RecoveryAction)>,
     /// The incremental locked-job scan state to hand to the next pass.
     scan: Option<RecoveryScan>,
+    /// Locks of ours this pass found gone, how each ended (`lock_end`) and its lock block, for the
+    /// history (`record_lock_ends`).
+    ended: Vec<(B256, zkminer_tui::state::MinerJobStatus, u64)>,
 }
 
 /// Incremental discovery of locks we hold. Only the startup pass scans the whole lookback window;
@@ -12894,6 +18191,8 @@ async fn recover_claimed_jobs(
     }
     // Ids found settled / not ours this pass: dropped from `known` at the end.
     let mut settled: Vec<B256> = Vec::new();
+    // And how each lock of ours among them ended (`lock_end`).
+    let mut ended: Vec<(B256, zkminer_tui::state::MinerJobStatus, u64)> = Vec::new();
     // A live lifecycle task owns these: it is the only writer of their breadcrumbs.
     job_ids.retain(|jid| !skip.contains(jid));
     // Every id this pass is about: whatever it neither settles nor acts on is left undecided.
@@ -12974,13 +18273,19 @@ async fn recover_claimed_jobs(
                     jid
                 );
                 journal_update(journal, |j| j.mark_claimed(*jid, None, d));
-            } else if d != 0 {
+            } else {
                 // Backfill the authoritative (pause-credited) deadline onto an EXISTING breadcrumb
                 // too: every shutdown decision keys off it. Field-level write, not `mark_claimed`:
-                // that would regress a Proving/Fulfilling entry's state back to Claimed.
+                // that would regress a Proving/Fulfilling entry's state back to Claimed. A claim
+                // never confirmed is confirmed now: this view proves the lock ours.
                 journal_update(journal, |j| {
                     if let Some(e) = j.entries.get_mut(jid) {
-                        e.lock_deadline = d;
+                        if d != 0 {
+                            e.lock_deadline = d;
+                        }
+                        if e.state == crate::journal::JournalState::Claiming {
+                            e.state = crate::journal::JournalState::Claimed;
+                        }
                     }
                 });
             }
@@ -13014,8 +18319,26 @@ async fn recover_claimed_jobs(
             false
         }
         // Present but settled / held by another prover → drop the stale breadcrumb.
-        Some(_) => {
+        Some(v) => {
+            // Held by the address this journal belonged to before a key change the operator
+            // accepted (`--forget-foreign-locks`): said, as it will be slashed.
+            if v.status == JOB_STATUS_LOCKED
+                && v.prover != alloy::primitives::Address::ZERO
+                && Some(v.prover) == crate::journal::previous_owner()
+            {
+                let msg = format!(
+                    "PAGE: KEY-CHANGED — {jid} is still locked by {}, this journal's previous \
+                     address; this miner signs as {} and drops it: it is slashed at its deadline \
+                     unless a miner with that key drives it",
+                    v.prover, client.address
+                );
+                tracing::error!("{msg}");
+                note_page(msg);
+            }
             settled.push(*jid);
+            if let Some(end) = lock_end(journal, *jid, Some((v.status, v.prover)), client.address) {
+                ended.push((*jid, end, lock_block_of(journal, *jid)));
+            }
             journal_update(journal, |j| j.remove(*jid));
             take_pause_kept(*jid);
             // Dropping the breadcrumb means no `release_job` will ever run for this job again,
@@ -13126,6 +18449,14 @@ async fn recover_claimed_jobs(
             }
             tracing::info!("recover: {} no longer ours (prover={})", jid, view.prover);
             settled.push(jid);
+            if let Some(end) = lock_end(
+                journal,
+                jid,
+                Some((view.status, view.prover)),
+                client.address,
+            ) {
+                ended.push((jid, end, lock_block_of(journal, jid)));
+            }
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
             client.settle_abandoned_nonce(jid).await;
@@ -13140,12 +18471,22 @@ async fn recover_claimed_jobs(
                 view.status,
             );
             settled.push(jid);
+            if let Some(end) = lock_end(
+                journal,
+                jid,
+                Some((view.status, view.prover)),
+                client.address,
+            ) {
+                ended.push((jid, end, lock_block_of(journal, jid)));
+            }
             journal_update(journal, |j| j.remove(jid));
             take_pause_kept(jid);
             client.settle_abandoned_nonce(jid).await;
             continue;
         }
         let lock_deadline = effective_cutoff(&view);
+        // What it locked, should this pass release it (`recovered_lock_collateral`).
+        note_recovered_settled_price(jid, view.settledPrice.to::<u128>());
         // Ownership is PROVEN by the read above. An id that reached the loop via the `None => true`
         // arm may have NO journal entry: write one so the shutdown paths can see the lock.
         if !journal_has(journal, jid) {
@@ -13156,6 +18497,14 @@ async fn recover_claimed_jobs(
             );
             journal_update(journal, |j| j.mark_claimed(jid, None, lock_deadline));
         }
+        // Ours and Locked, read just now: a claim never confirmed is confirmed (see the batch arm).
+        journal_update(journal, |j| {
+            if let Some(e) = j.entries.get_mut(&jid) {
+                if e.state == crate::journal::JournalState::Claiming {
+                    e.state = crate::journal::JournalState::Claimed;
+                }
+            }
+        });
         journal_update(journal, |j| j.note_lock_seen(jid, None, view.reopenCount));
         // A lock KEPT through this pause after its lifecycle failed: re-driving it now would repeat
         // the failure (the fulfil cannot land until the lift) and releasing would burn the penalty
@@ -13180,13 +18529,21 @@ async fn recover_claimed_jobs(
         // inside a resume grace has its job-local clock frozen, but the lifecycle's pre-prove fetches
         // are budgeted on the view's room alone, so driving it would only release it there instead.)
         if lock_deadline > 0 && now + recovery_margin >= lock_deadline {
-            tracing::warn!(
-                "recover: {} past deadline room (now={} deadline={} margin={}s) — releasing",
-                jid,
-                now,
-                lock_deadline,
-                recovery_margin,
-            );
+            // A lock already reported stranded comes back every pass until its slash: once is enough.
+            if now >= lock_deadline && stranded_reported(jid) {
+                tracing::debug!(
+                    "recover: {} still stranded past its deadline",
+                    short_id(jid)
+                );
+            } else {
+                tracing::warn!(
+                    "recover: {} past deadline room (now={} deadline={} margin={}s) — releasing",
+                    jid,
+                    now,
+                    lock_deadline,
+                    recovery_margin,
+                );
+            }
             actions.push((jid, RecoveryAction::Release(jid)));
             continue;
         }
@@ -13238,7 +18595,17 @@ async fn recover_claimed_jobs(
             speed_premium: view.speedPremium.to::<u128>(),
             exclusivity_duration: 0,
         };
-        let snapshot = JobStatusSnapshot::from_view(&view);
+        let mut snapshot = JobStatusSnapshot::from_view(&view);
+        // What it measured before it was claimed (the journal keeps it), so it is sized on that and
+        // not on the declared count, which its submitter chose (`with_slot_estimates`).
+        {
+            let j = journal.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(e) = j.entries.get(&jid) {
+                snapshot.measured_cycles = snapshot.measured_cycles.or(e.measured_cycles);
+                snapshot.measured_execute_secs =
+                    snapshot.measured_execute_secs.or(e.measured_execute_secs);
+            }
+        }
 
         // We need program_id to fetch the ELF — derive from the descriptor (checked fetch, handed
         // to the lifecycle so it is fetched ONCE per recovered job). Only a PERMANENT decode verdict
@@ -13341,6 +18708,7 @@ async fn recover_claimed_jobs(
         undecided: considered.into_iter().filter(|j| !decided.contains(j)).collect(),
         actions,
         scan: next_scan,
+        ended,
     }
 }
 
@@ -13391,27 +18759,29 @@ fn spawn_recovery_actions(
             _ => None,
         };
         in_flight.insert(jid, 0);
+        // A lock released here counts toward every lock held together until its release settles (its
+        // program is not read for a release): at what it locked when its settled price and terms are
+        // known, else the deployment's floor.
+        if let RecoveryAction::Release(_) = &action {
+            collateral::record_settling(
+                jid,
+                recovered_lock_collateral(jid, recovered_settled_price(jid)),
+            );
+        }
         if let RecoveryAction::Drive {
             job, descriptor, ..
         } = &action
         {
-            // A lock held and not proven yet counts against its program's and submitter's share of
-            // the stake: at what its settled price locks under its terms when they are known, and at
-            // least the deployment's floor, which every lock locks.
-            let floor = collateral::floor().unwrap_or(0);
-            let locked = job_collateral_terms(jid).map_or(floor, |(min, bps)| {
-                zkminer_chain::auction::compute_collateral(
-                    job.info.settled_price,
-                    u64::try_from(bps).unwrap_or(u64::MAX),
-                    min,
-                )
-            });
+            // A lock held and not settled yet counts against its program's and submitter's share of
+            // the stake, and the stake's: at what its settled price locks under its terms when they
+            // are known, and at least the deployment's floor, which every lock locks.
+            let locked = recovered_lock_collateral(jid, Some(job.info.settled_price));
             collateral::record(
                 jid,
                 collateral::Exposure {
                     program: descriptor.programId,
                     submitter: job.info.caller,
-                    collateral: locked.max(job.info.locked_collateral).max(floor),
+                    collateral: locked.max(job.info.locked_collateral),
                 },
             );
         }
@@ -13433,7 +18803,17 @@ fn spawn_recovery_actions(
                 Some(descriptor),
             ),
             RecoveryAction::Release(jid) => {
-                let (c, st, jr, done) = (client.clone(), state.clone(), journal.clone(), done_tx.clone());
+                // A release needs no card: not one of the jobs the claim limit counts.
+                CARDS_FREED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(jid);
+                let (c, st, jr, done) = (
+                    client.clone(),
+                    state.clone(),
+                    journal.clone(),
+                    done_tx.clone(),
+                );
                 tokio::spawn(async move {
                     let _slot = SlotGuard(jid, done);
                     if let Some(r) = &witness_release {
@@ -13541,6 +18921,569 @@ mod tests {
         assert_eq!(&seal[4..], &proof[..]);
     }
 
+    /// A volume under the floor holds claims and proofs, naming it; one whose free space cannot be
+    /// read does not.
+    #[test]
+    fn a_volume_under_the_floor_holds_proofs() {
+        let (home, local) = (PathBuf::from("/home/z/.zkminer"), PathBuf::from("/local"));
+        let dirs = [home.clone(), local.clone()];
+        assert_eq!(storage_short(&dirs, |_| Ok(STORAGE_FLOOR_BYTES)), None);
+        let why = storage_short(&dirs, |d| {
+            Ok(if d == local {
+                STORAGE_FLOOR_BYTES - 1
+            } else {
+                u64::MAX
+            })
+        })
+        .expect("held");
+        assert!(why.contains(&local.display().to_string()), "{why}");
+        assert_eq!(
+            storage_short(&dirs, |_| Err(std::io::Error::other("unreadable"))),
+            None
+        );
+    }
+
+    /// Held by the tests that save the journal: whether the last save failed is process-wide.
+    static JOURNAL_SAVE_TESTS: Mutex<()> = Mutex::new(());
+
+    fn journal_with(job: B256) -> SharedJournal {
+        let mut j = JobJournal::default();
+        j.mark_claimed(job, None, u64::MAX);
+        Arc::new(Mutex::new(j))
+    }
+
+    fn starts(journal: &SharedJournal, job: B256) -> u8 {
+        journal.lock().unwrap().prove_starts(job)
+    }
+
+    /// A proof's start counts once its worker accepted it, once however many attempts start, and
+    /// is taken back when the proof ends in its run; a completed proof also clears the runs that
+    /// ended in the middle of earlier ones. A job only queued when the miner died is not charged.
+    #[test]
+    fn a_proof_start_counts_only_once_a_worker_accepts_it() {
+        let _serial = JOURNAL_SAVE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        TEST_JOURNAL_SAVES.set(Some(true));
+        let job = B256::repeat_byte(0x4a);
+        let journal = journal_with(job);
+        // Queued for a card, then ended (the miner stopping it, or a refusal): never counted.
+        drop(ProveStart::new(&journal, job));
+        assert_eq!(starts(&journal, job), 0);
+        // Started on a worker, then a retry started on another: one start.
+        let start = ProveStart::new(&journal, job);
+        start.count_now();
+        start.count_now();
+        assert_eq!(starts(&journal, job), 1);
+        // Ended in its run (failed): taken back.
+        drop(start);
+        assert_eq!(starts(&journal, job), 0);
+        // Two runs that ended mid-proof, then a proof that completes: back to 0.
+        journal.lock().unwrap().note_prove_start(job);
+        journal.lock().unwrap().note_prove_start(job);
+        let start = ProveStart::new(&journal, job);
+        start.count_now();
+        assert_eq!(starts(&journal, job), 3);
+        start.completed();
+        drop(start);
+        assert_eq!(starts(&journal, job), 0);
+        TEST_JOURNAL_SAVES.set(None);
+    }
+
+    /// A proof whose start cannot be recorded is not started: handed back while the lock can still
+    /// survive a restart, released (a plain error) once it cannot; and claims stop until a save
+    /// succeeds again.
+    #[test]
+    fn a_proof_is_not_started_when_its_start_cannot_be_recorded() {
+        let _serial = JOURNAL_SAVE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let job = B256::repeat_byte(0x4b);
+        let journal = journal_with(job);
+        TEST_JOURNAL_SAVES.set(Some(false));
+        let far = keep_horizon() + 3600;
+        let e = record_proving(&journal, job, far).expect_err("started unrecorded");
+        assert!(e.downcast_ref::<HandBack>().is_some(), "{e:#}");
+        let e = record_proving(&journal, job, keep_horizon()).expect_err("started unrecorded");
+        assert!(e.downcast_ref::<HandBack>().is_none(), "{e:#}");
+        let other = B256::repeat_byte(0x4c);
+        let (why, _) = start_record_hold(
+            &journal,
+            other,
+            alloy::primitives::Address::ZERO,
+            B256::ZERO,
+        )
+        .expect("claimed with an unwritable journal");
+        assert!(why.contains("cannot be saved"), "{why}");
+        // The disk has room again: the next claim's retry clears it.
+        TEST_JOURNAL_SAVES.set(Some(true));
+        assert_eq!(
+            start_record_hold(
+                &journal,
+                other,
+                alloy::primitives::Address::ZERO,
+                B256::ZERO
+            ),
+            None
+        );
+        record_proving(&journal, job, far).unwrap();
+        TEST_JOURNAL_SAVES.set(None);
+    }
+
+    /// A job released as a crash loop is marked: neither it nor its submitter's jobs of the same
+    /// program are claimed again for a while.
+    #[test]
+    fn a_crash_looped_job_is_not_claimed_again() {
+        let _serial = JOURNAL_SAVE_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        TEST_JOURNAL_SAVES.set(Some(true));
+        let (job, again) = (B256::repeat_byte(0x4d), B256::repeat_byte(0x4e));
+        let (program, submitter) = (
+            B256::repeat_byte(0x5d),
+            alloy::primitives::Address::repeat_byte(0x6d),
+        );
+        let journal = journal_with(job);
+        assert_eq!(start_record_hold(&journal, job, submitter, program), None);
+        mark_crash_looped(&journal, job, program, submitter);
+        let (_, wait) = start_record_hold(&journal, job, submitter, program).expect("held");
+        assert_eq!(wait, Duration::from_secs(3600));
+        assert!(start_record_hold(&journal, again, submitter, program).is_some());
+        assert_eq!(
+            start_record_hold(&journal, again, alloy::primitives::Address::ZERO, program),
+            None
+        );
+        TEST_JOURNAL_SAVES.set(None);
+    }
+
+    /// A job whose proof the miner died in the middle of in three runs in a row is released, not
+    /// proven a fourth time; a proof that ended in its run (proved, failed, stopped) does not count.
+    #[test]
+    fn a_job_the_miner_keeps_dying_while_proving_is_released() {
+        let mut journal = JobJournal::default();
+        let job = B256::repeat_byte(0x3c);
+        journal.mark_claimed(job, None, u64::MAX);
+        // Proofs that end in their run, however many.
+        for _ in 0..5 {
+            journal.note_prove_start(job);
+            journal.note_prove_end(job);
+        }
+        assert_eq!(crash_loop_refusal(&journal, job), None);
+        // Runs that end mid-proof: the miner killed each time the job is proven again.
+        for run in 0..MAX_UNFINISHED_PROVE_STARTS {
+            assert_eq!(crash_loop_refusal(&journal, job), None, "run {run}");
+            journal.note_prove_start(job);
+        }
+        let why = crash_loop_refusal(&journal, job).expect("released");
+        assert!(why.contains("started 3 times"), "{why}");
+        // Another job is not affected.
+        assert_eq!(crash_loop_refusal(&journal, B256::repeat_byte(0x3d)), None);
+    }
+
+    /// Raising the proving timeout brings back the jobs skipped as too long for the old one at once,
+    /// and only those: a job set aside for another reason stays aside.
+    #[test]
+    fn raising_the_proving_timeout_releases_only_the_jobs_it_set_aside() {
+        let too_long = B256::repeat_byte(0x71);
+        let elsewhere = B256::repeat_byte(0x72);
+        set_job_aside(
+            too_long,
+            Duration::from_secs(600),
+            TOO_LONG_FOR_PROVING_TIMEOUT,
+        );
+        set_job_aside(elsewhere, Duration::from_secs(600), "assigned to another prover");
+        assert!(release_set_aside_for(TOO_LONG_FOR_PROVING_TIMEOUT) >= 1);
+        assert!(!claim_backing_off(too_long));
+        assert!(!job_set_aside(too_long));
+        assert_eq!(
+            claim_backoff_reason(elsewhere),
+            Some("assigned to another prover")
+        );
+        assert!(job_set_aside(elsewhere));
+    }
+
+    /// The dashboard says plainly that a program has nothing to download, naming it by id when the
+    /// registry has no name for it, instead of "Downloading ELF '' (0 URIs)".
+    #[test]
+    fn an_elf_fetch_names_the_program_and_says_when_there_is_nothing_to_fetch() {
+        use zkminer_chain::programs::{ProgramInfo, ResolvedURI, StorageKind};
+        let id = B256::repeat_byte(0x5e);
+        let mut info = ProgramInfo {
+            program_id: id,
+            proof_system_id: B256::ZERO,
+            name: String::new(),
+            status: 0,
+            estimated_cycles: 0,
+            storage_uris: Vec::new(),
+            elf_hash: None,
+        };
+        let none = elf_download_note(id, &info);
+        assert!(
+            none.starts_with("No ELF download for program 0x5e5e5e5e"),
+            "{none}"
+        );
+        assert!(none.contains("skipped for 10 min"), "{none}");
+        info.name = "fibonacci".into();
+        info.storage_uris.push(ResolvedURI {
+            storage_type: StorageKind::HTTP,
+            uri: "http://example.invalid/f.bin".into(),
+            content_hash: B256::ZERO,
+        });
+        assert_eq!(
+            elf_download_note(id, &info),
+            "Downloading ELF for 'fibonacci' (0x5e5e5e5e)"
+        );
+    }
+
+    /// A lock past its deadline meets every recovery pass until a keeper slashes it: it is paged
+    /// the first time only, per job.
+    #[test]
+    fn a_stranded_lock_is_reported_once() {
+        let a = B256::repeat_byte(0xa7);
+        let b = B256::repeat_byte(0xb8);
+        assert!(!stranded_reported(a));
+        assert!(first_stranded_report(a));
+        assert!(stranded_reported(a));
+        assert!(!first_stranded_report(a));
+        assert!(!stranded_reported(b));
+        assert!(first_stranded_report(b));
+    }
+
+    #[test]
+    fn an_sp1_retry_pin_holds_until_an_attempt_runs_on_its_card() {
+        let pin = || Some(("sp1:cuda:1".to_string(), "gpu1".to_string()));
+        // Ran there: done.
+        assert_eq!(retry_pin_after(pin(), Some("sp1:cuda:1"), false), None);
+        // Refused there before it started (memory short a moment): kept for the next attempt.
+        assert_eq!(retry_pin_after(pin(), Some("sp1:cuda:1"), true), pin());
+        // Ran elsewhere (the card was busy): kept.
+        assert_eq!(retry_pin_after(pin(), Some("sp1:cuda:0"), false), pin());
+        assert_eq!(retry_pin_after(None, Some("sp1:cuda:1"), false), None);
+        // Which errors are refusals before a start: typed, and only those.
+        let gpu = anyhow::Error::new(zkminer_prover_protocol::types::GpuMemoryShortage {
+            slot_key: "sp1:cuda:1".into(),
+            foreign_bytes: 0,
+            sibling_bytes: 0,
+            available_bytes: 0,
+            needed_bytes: None,
+            ours_in_the_way: true,
+            total_bytes: 0,
+            evicted_bytes: 0,
+        });
+        assert!(refused_before_start(&gpu));
+        assert!(!refused_before_start(&anyhow::anyhow!("GpuMemoryShortage")));
+    }
+
+    /// A pin outlasts only a refusal our own memory causes, or a host-memory admission refusal:
+    /// short of GPU memory another program holds drops it (that card is then excluded), and a
+    /// host-memory shortage met mid-proof is an attempt that ran.
+    #[test]
+    fn a_retry_pin_outlasts_only_a_refusal_that_clears_on_its_own() {
+        use zkminer_prover_protocol::types::{GpuMemoryShortage, HostMemoryShortage};
+        let gpu = |ours_in_the_way| {
+            anyhow::Error::new(GpuMemoryShortage {
+                slot_key: "sp1:cuda:1".into(),
+                foreign_bytes: 1 << 30,
+                sibling_bytes: 0,
+                available_bytes: 0,
+                needed_bytes: Some(1 << 33),
+                ours_in_the_way,
+                total_bytes: 12 << 30,
+                evicted_bytes: 0,
+            })
+        };
+        let host = |attempted| {
+            anyhow::Error::new(HostMemoryShortage {
+                kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
+                attempted,
+                slot_key: "sp1:cuda:1".into(),
+                needed: 1 << 34,
+                reserved: 0,
+                available: 1 << 30,
+            })
+        };
+        assert!(refused_before_start(&gpu(true)));
+        assert!(!refused_before_start(&gpu(false)));
+        assert!(refused_before_start(&host(false)));
+        assert!(!refused_before_start(&host(true)));
+        let pin = || Some(("sp1:cuda:1".to_string(), "gpu1".to_string()));
+        let after =
+            |e: &anyhow::Error| retry_pin_after(pin(), Some("sp1:cuda:1"), refused_before_start(e));
+        assert_eq!(after(&gpu(true)), pin());
+        assert_eq!(after(&gpu(false)), None);
+        assert_eq!(after(&host(false)), pin());
+        assert_eq!(after(&host(true)), None);
+    }
+
+    /// The card an attempt tries first: the pinned one, else the planned one.
+    #[test]
+    fn a_pinned_card_is_preferred_over_the_planned_one() {
+        let pin = ("sp1:cuda:1".to_string(), "gpu1".to_string());
+        let planned = "gpu0".to_string();
+        assert_eq!(
+            preferred_device(Some(&pin), Some(&planned)).as_deref(),
+            Some("gpu1")
+        );
+        assert_eq!(
+            preferred_device(None, Some(&planned)).as_deref(),
+            Some("gpu0")
+        );
+        assert_eq!(preferred_device(None, None), None);
+    }
+
+    /// After a failed attempt: an SP1 out-of-memory that lowered its card pins the retry there and
+    /// neither excludes the card nor asks for a bigger one; any other out-of-memory excludes the card
+    /// and asks for more VRAM than it has (or the large-job floor); a health failure excludes it; an
+    /// invalid proof steers nowhere.
+    #[test]
+    fn a_failed_attempt_steers_the_next() {
+        struct Steer {
+            excluded: Vec<String>,
+            pin: Option<(String, String)>,
+            min_vram: Option<u64>,
+        }
+        let steer = |used: Option<&str>, invalid, oom, smaller: Option<&str>, vram: Option<u64>| {
+            let mut s = Steer {
+                excluded: vec!["sp1:cuda:2".to_string()],
+                pin: None,
+                min_vram: None,
+            };
+            steer_after_failure(
+                &mut s.excluded,
+                &mut s.pin,
+                &mut s.min_vram,
+                used,
+                invalid,
+                oom,
+                smaller,
+                |_| vram,
+            );
+            s
+        };
+        let lowered = steer(
+            Some("sp1:cuda:1"),
+            false,
+            true,
+            Some("gpu1"),
+            Some(12 << 30),
+        );
+        assert_eq!(
+            lowered.pin,
+            Some(("sp1:cuda:1".to_string(), "gpu1".to_string()))
+        );
+        assert_eq!(lowered.excluded, ["sp1:cuda:2"]);
+        assert_eq!(lowered.min_vram, None);
+
+        let oom = steer(Some("sp1:cuda:1"), false, true, None, Some(12 << 30));
+        assert_eq!(oom.pin, None);
+        assert_eq!(oom.excluded, ["sp1:cuda:2", "sp1:cuda:1"]);
+        assert_eq!(oom.min_vram, Some((12 << 30) + 1));
+        let unknown = steer(Some("sp1:cuda:1"), false, true, None, None);
+        assert_eq!(unknown.min_vram, Some(LARGE_JOB_MIN_VRAM_BYTES));
+
+        let unhealthy = steer(Some("sp1:cuda:1"), false, false, None, Some(12 << 30));
+        assert_eq!(unhealthy.excluded, ["sp1:cuda:2", "sp1:cuda:1"]);
+        assert_eq!(unhealthy.min_vram, None);
+        // Excluded once only.
+        let again = steer(Some("sp1:cuda:2"), false, false, None, None);
+        assert_eq!(again.excluded, ["sp1:cuda:2"]);
+
+        let invalid = steer(Some("sp1:cuda:1"), true, false, None, Some(12 << 30));
+        assert_eq!(invalid.excluded, ["sp1:cuda:2"]);
+        assert_eq!((invalid.pin, invalid.min_vram), (None, None));
+    }
+
+    fn row(device: &str, backend: &str, bus: &str) -> zkminer_prover::benchmark::DeviceBenchmark {
+        zkminer_prover::benchmark::DeviceBenchmark {
+            device_id: device.to_string(),
+            device_label: String::new(),
+            prover_backend: backend.to_string(),
+            throughput: 1_000_000.0,
+            power_watts: 300.0,
+            optimal_po2: 20,
+            memory_usage_bytes: 1,
+            max_feasible_po2: 22,
+            program_throughputs: HashMap::new(),
+            po2_samples: Vec::new(),
+            program_stages: Vec::new(),
+            pci_bus_id: bus.to_string(),
+            host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
+        }
+    }
+
+    /// A card short of VRAM for its risc0 size claims no risc0 job, by slot AND size, and is counted
+    /// for the claim side's message; the rest are claimable.
+    /// Each slot's spill goes to its card; a card's two slots show the one being stopped, else the
+    /// larger; a slot whose card is unknown shows nowhere.
+    #[test]
+    fn spills_are_shown_by_card() {
+        use zkminer_prover::dispatcher::GpuSpill;
+        let spill = |evicted_mib, stopping| GpuSpill {
+            evicted_mib,
+            stopping,
+        };
+        let bus = |key: &str| match key {
+            "risc0:cuda:1" | "sp1:cuda:1" => Some("0000:03:00.0".to_string()),
+            "sp1:cuda:0" => Some("0000:01:00.0".to_string()),
+            _ => None,
+        };
+        let shown = spills_by_card(
+            &[
+                ("risc0:cuda:1".to_string(), spill(9_000, false)),
+                ("sp1:cuda:1".to_string(), spill(500, true)),
+                ("sp1:cuda:0".to_string(), spill(700, false)),
+                ("sp1:rocm:9".to_string(), spill(800, false)),
+            ],
+            bus,
+        );
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown["0000:03:00.0"], spill(500, true));
+        assert_eq!(shown["0000:01:00.0"], spill(700, false));
+        let shown = spills_by_card(
+            &[
+                ("sp1:cuda:1".to_string(), spill(500, false)),
+                ("risc0:cuda:1".to_string(), spill(9_000, false)),
+            ],
+            bus,
+        );
+        assert_eq!(shown["0000:03:00.0"], spill(9_000, false));
+        assert!(spills_by_card(&[], bus).is_empty());
+    }
+
+    #[test]
+    fn a_risc0_card_short_at_its_size_is_not_claimable() {
+        let card = |slot: &str, device: &str, po2| Risc0Card {
+            slot: slot.to_string(),
+            device: device.to_string(),
+            po2,
+        };
+        let cards = vec![
+            card("risc0:cuda:0", "gpu0", 19),
+            card("risc0:cuda:1", "gpu1", 20),
+        ];
+        let (left, short) = claimable_risc0_cards(cards.clone(), |slot, po2| {
+            slot == "risc0:cuda:0" && po2 == 19
+        });
+        assert_eq!(short, 1);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].slot, "risc0:cuda:1");
+        let (left, short) = claimable_risc0_cards(cards, |_, _| false);
+        assert_eq!((left.len(), short), (2, 0));
+    }
+
+    /// The planner's rates: an SP1 row scaled by the card's cap factor, asked with the row's bus id
+    /// and the benchmark's time; a risc0 row only for a card that proves risc0 jobs; others as
+    /// measured.
+    #[test]
+    fn the_planner_prices_each_row_as_its_card_runs_now() {
+        assert_eq!(
+            benchmark_unix_secs("2026-11-17T00:00:00Z"),
+            Some(1_794_873_600)
+        );
+        assert_eq!(benchmark_unix_secs("yesterday"), None);
+        let asked = std::sync::Mutex::new(Vec::new());
+        let factor = |bus: &str, at: Option<u64>| {
+            asked.lock().unwrap().push((bus.to_string(), at));
+            0.79
+        };
+        let none = HashMap::new();
+        let sp1 = row("gpu1", "sp1", "0000:03:00.0");
+        let rate = planned_throughput(&sp1, &[], &none, Some(42), factor).unwrap();
+        assert!((rate - 790_000.0).abs() < 1e-6);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [("0000:03:00.0".to_string(), Some(42))]
+        );
+        // A risc0 row of a card that proves no risc0 job: none.
+        let r0 = row("gpu0", "risc0", "");
+        assert_eq!(planned_throughput(&r0, &[], &none, None, |_, _| 1.0), None);
+        let cards = [Risc0Card {
+            slot: "risc0:cuda:0".to_string(),
+            device: "gpu0".to_string(),
+            po2: 20,
+        }];
+        assert!(planned_throughput(&r0, &cards, &none, None, |_, _| 1.0).is_some());
+        // Another backend: as measured, with no factor asked.
+        let ovm = row("gpu0", "openvm", "");
+        assert_eq!(
+            planned_throughput(&ovm, &[], &none, None, |_, _| panic!("not SP1")),
+            Some(1_000_000.0)
+        );
+    }
+
+    /// `f`'s body in `src`, up to the next item at module or impl depth.
+    fn body<'a>(src: &'a str, f: &str) -> &'a str {
+        let after = src
+            .split_once(f)
+            .unwrap_or_else(|| panic!("{f} moved; move this assertion with it"))
+            .1;
+        let end = ["\nfn ", "\nasync fn ", "\npub fn ", "\npub async fn "]
+            .iter()
+            .filter_map(|n| after.find(n))
+            .min()
+            .unwrap_or(after.len());
+        &after[..end]
+    }
+
+    /// The claim side never reads a card itself: a short card's re-check runs on a blocking thread,
+    /// and what it found is a lookup, applied to the cards before their sizes are taken. The retry
+    /// after an out-of-memory asks the pool for its pinned card only for an out-of-memory, and the
+    /// steering and the preference go through the helpers tested above.
+    #[test]
+    fn the_brain_and_the_job_loop_use_the_tested_helpers() {
+        let src = include_str!("run.rs");
+        let brain = body(src, "\nasync fn miner_brain(");
+        let due = brain
+            .find("pool.risc0_short_due()")
+            .expect("re-checks short cards");
+        assert!(brain[due..]
+            .starts_with("pool.risc0_short_due() {\n                    tokio::task::spawn_blocking(move || pool.recheck_risc0_short(&key));"));
+        assert_eq!(brain.matches("recheck_risc0_short").count(), 1);
+        let claimable = brain
+            .find(
+                "claimable_risc0_cards(risc0_cards, |slot, po2| pool.risc0_card_short(slot, po2))",
+            )
+            .expect("filters short cards");
+        assert!(claimable < brain.find("risc0_job_sizes(&risc0_cards)").unwrap());
+        assert!(brain.contains("let benchmarked = benchmark_unix_secs(&benchmarks.timestamp);"));
+        assert!(brain.contains(".map_or(1.0, |p| p.sp1_rate_factor(bus, at))"));
+        let job = body(src, "\nasync fn process_job_lifecycle(");
+        assert!(job.contains(
+            "let sp1_smaller_here = if real_oom {\n                        used_slot\n                            \
+             .as_deref()\n                            .and_then(|k| pool.take_sp1_retry_card(k))"
+        ));
+        assert_eq!(job.matches("pool.take_sp1_retry_card(").count(), 1);
+        assert_eq!(job.matches("steer_after_failure(").count(), 1);
+        assert!(job.contains("let planned = preferred_device(retry_card.as_ref(), snapshot.preferred_device.as_ref());"));
+        assert!(job.contains(".is_some_and(refused_before_start),"));
+    }
+
+    /// The miner, its benchmark and `zkminer mock` (which writes the miner's benchmarks.json) keep
+    /// the SP1 cap record, set before any worker is spawned; nothing else does, so a simulation or
+    /// a test never writes `~/.zkminer`.
+    #[test]
+    fn only_the_miner_and_its_benchmarks_keep_the_cap_record() {
+        for (name, src) in [
+            ("run.rs", include_str!("run.rs")),
+            ("benchmark.rs", include_str!("benchmark.rs")),
+            ("mock.rs", include_str!("mock.rs")),
+        ] {
+            // The first of each: the production code, before this test's own text.
+            let kept = src
+                .find("pool.use_sp1_shard_caps(zkminer_prover::sp1_shard_caps::default_path());")
+                .unwrap_or_else(|| panic!("{name} no longer keeps the cap record"));
+            let spawned = src
+                .find(".discover_and_spawn()")
+                .unwrap_or_else(|| panic!("{name} no longer spawns workers"));
+            assert!(
+                kept < spawned,
+                "{name}: the record must be read before the spawn"
+            );
+        }
+        for (name, src) in [
+            ("simulate.rs", include_str!("simulate.rs")),
+            ("doctor.rs", include_str!("doctor.rs")),
+        ] {
+            assert!(!src.contains("use_sp1_shard_caps"), "{name}");
+        }
+    }
+
     #[test]
     fn a_job_tries_its_planned_card_then_the_fastest_and_a_refusing_card_last() {
         let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
@@ -13598,6 +19541,7 @@ mod tests {
 
         let real: anyhow::Error = anyhow::Error::new(ProofDeadlineReached {
             detail: "proof on risc0:cuda:1 stopped: job deadline reached mid-proof".to_string(),
+            before_start: false,
         });
         assert!(real.downcast_ref::<ProofDeadlineReached>().is_some());
 
@@ -13657,6 +19601,127 @@ mod tests {
         assert!(zkminer_prover_protocol::types::is_gpu_oom(&f.message));
     }
 
+    /// A job reserved for a claim says so on its row from the moment it is reserved, through its
+    /// pre-claim checks, and the note goes when its lifecycle ends unclaimed: the jobs the claim
+    /// limit counts are always visible as such.
+    #[test]
+    fn a_reserved_job_reads_as_being_claimed() {
+        let src = include_str!("run.rs");
+        let spawn = &src[src.find("fn spawn_lifecycle_task(").unwrap()..];
+        let spawn = &spawn[..spawn.find("\n}\n").unwrap()];
+        let set = spawn
+            .find("\"claiming: checking the job before claiming it\"")
+            .expect("note set at spawn");
+        let run = spawn.find("process_job_lifecycle(").unwrap();
+        let clear = spawn
+            .find(".clear_job_notes(jid)")
+            .expect("note cleared at the end");
+        assert!(set < run && run < clear);
+        let mut state = zkminer_tui::state::MinerState::default();
+        let id = B256::repeat_byte(7);
+        state.open_jobs.push(TrackedJob {
+            info: zkminer_chain::jobs::JobInfo {
+                job_id: id,
+                ..Default::default()
+            },
+            status: zkminer_tui::state::MinerJobStatus::Open,
+            current_price: 1,
+            gpu_bus_id: None,
+            prover_backend: String::new(),
+            estimated_cycles: 0,
+        });
+        state.claim_outlook.held = Some("holding 4 job(s)".into());
+        state.set_job_note(
+            id,
+            zkminer_tui::state::JobNoteKind::Claim,
+            "claiming: checking the job before claiming it",
+        );
+        let text = state.job_note_text(&state.open_jobs[0]).unwrap();
+        assert!(text.starts_with("claiming: checking the job"), "{text}");
+    }
+
+    /// With the planner off, a claim waits for the work ahead of it once every card has a job, or
+    /// once as many of its backend as fit side by side are claimed; nothing while both are free.
+    #[test]
+    fn a_queued_claim_is_charged_the_work_ahead_of_it() {
+        // A 5090 and a 4070: SP1 13 and 5 Mc/s, RISC Zero 5 and 1 Mc/s.
+        let rates = |b: &str| match b {
+            "sp1" => vec![13_000_000.0, 5_000_000.0],
+            "risc0" => vec![5_000_000.0, 1_000_000.0],
+            _ => Vec::new(),
+        };
+        let sp1_job = (1_800_000_000u64, "sp1");
+        // One SP1 job out, two cards, two SP1 fit: a card and a turn are free.
+        let none = |_: &str| 0.0;
+        assert_eq!(
+            expected_queue_wait_secs(&[sp1_job], "sp1", 2, 2, rates, none),
+            0
+        );
+        // Only one SP1 fits in memory: a second waits the first, at the fastest card's rate.
+        assert_eq!(
+            expected_queue_wait_secs(&[sp1_job], "sp1", 2, 1, rates, none),
+            139
+        );
+        // A RISC Zero job is not behind SP1's turn while a card is free...
+        assert_eq!(
+            expected_queue_wait_secs(&[sp1_job], "risc0", 2, 4, rates, none),
+            0
+        );
+        // ...but once both cards have work, it waits for it at both cards' combined rate.
+        let both = [sp1_job, (600_000_000, "risc0")];
+        assert_eq!(
+            expected_queue_wait_secs(&both, "risc0", 2, 4, rates, none),
+            200
+        );
+        // A backend with no rate counts nothing.
+        assert_eq!(
+            expected_queue_wait_secs(&[(9, "openvm"), (9, "openvm")], "sp1", 1, 1, rates, none),
+            0
+        );
+        // Each job's fixed seconds count too, shared by the cards running them: the SP1 job's 120
+        // over the two cards.
+        let fixed = |b: &str| if b == "sp1" { 120.0 } else { 0.0 };
+        assert_eq!(
+            expected_queue_wait_secs(&both, "risc0", 2, 4, rates, fixed),
+            260
+        );
+    }
+
+    /// A shortage the proof did not cause (`ShortageFromOutside`) is read through its marker: the
+    /// retry loop still sees the shortage, waits instead of spending the attempt, and does not hold
+    /// it against the submitter. Without the marker, a proof that died mid-run still costs one.
+    #[test]
+    fn a_shortage_from_outside_waits_and_blames_no_one() {
+        use zkminer_prover_protocol::types::{HostMemoryShortage, ShortageFromOutside};
+        let shortage = || HostMemoryShortage {
+            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
+            attempted: true,
+            slot_key: "risc0:cuda:0".to_string(),
+            needed: 8 << 30,
+            reserved: 13 << 30,
+            available: 54 << 30,
+        };
+        let outside = anyhow::Error::new(shortage()).context(ShortageFromOutside);
+        assert!(outside
+            .downcast_ref::<HostMemoryShortage>()
+            .is_some_and(|s| s.attempted));
+        assert!(outside.downcast_ref::<ShortageFromOutside>().is_some());
+        let own = anyhow::Error::new(shortage());
+        assert!(own.downcast_ref::<ShortageFromOutside>().is_none());
+        // The loop: an outside shortage waits as a refusal does, and is not a divergence.
+        // The code only, not this test's own strings.
+        let src = include_str!("run.rs");
+        let code = &src[..src
+            .find(
+                "
+mod tests {",
+            )
+            .unwrap()];
+        assert!(code.contains("if (!shortage.attempted || outside)"));
+        assert!(code.contains("&& (waited < HOST_MEMORY_WAIT_LIMIT || behind_ours)"));
+        assert!(code.contains("if rode_measurement && shortage.attempted && !outside {"));
+    }
+
     /// The same property for the host-memory class, where a forgery buys the opposite prize:
     /// unbounded free retries that never consume an attempt.
     #[test]
@@ -13664,6 +19729,7 @@ mod tests {
         use zkminer_prover_protocol::types::HostMemoryShortage;
 
         let real: anyhow::Error = anyhow::Error::new(HostMemoryShortage {
+            kind: zkminer_prover_protocol::types::HostMemoryKind::Ram,
             attempted: false,
             slot_key: "sp1:cuda:0".to_string(),
             needed: 18 << 30,
@@ -13681,6 +19747,135 @@ mod tests {
         );
     }
 
+    /// The claim gate's memory check credits a warm worker's holdings per backend: it is told how
+    /// many outstanding jobs are of the job's own backend (SP1 from `sp1_in_flight`, the rest
+    /// otherwise), so a RISC Zero job outstanding does not withhold the idle SP1 server's memory
+    /// from an SP1 claim.
+    #[test]
+    fn the_claim_gate_credits_a_warm_worker_per_backend() {
+        let brain = body(
+            include_str!("run.rs"),
+            "
+async fn miner_brain(",
+        );
+        let count = brain
+            .find("let sp1_outstanding = sp1_in_flight")
+            .expect("the SP1 count");
+        let call = brain
+            .find("if !pool.backend_fits_for_claim_at_po2(")
+            .expect("the gate");
+        assert!(count < call);
+        assert!(brain[count..call].contains("outstanding.saturating_sub(sp1_outstanding)"));
+        assert!(brain[call..].starts_with(
+            "if !pool.backend_fits_for_claim_at_po2(
+                                want,
+                                backend,
+                                outstanding,
+                                same_backend_outstanding,"
+        ));
+    }
+
+    /// A lock of ours that can be neither fulfilled nor released any more is slashed by this miner
+    /// itself, and only then: inside the past-the-cutoff branch (the deadline plus the grace, after
+    /// the not-ours / not-locked drop), once the chain-time floor reaches `slashOpensAt`; a slash
+    /// that went through drops the breadcrumb, and the page says the miner will do it.
+    #[test]
+    fn an_expired_lock_of_ours_is_slashed_by_this_miner() {
+        let f = body(
+            include_str!("run.rs"),
+            "
+async fn release_and_clean_with_nonce(",
+        );
+        let not_ours = f
+            .find("let mut why = match &ended {")
+            .expect("the not-ours drop");
+        let cutoff = f
+            .find("if lock_deadline != 0 && now >= lock_deadline {")
+            .expect("the past-the-cutoff branch");
+        let opens = f
+            .find("if slash_opens != 0 && now >= slash_opens {")
+            .expect("the slash-open check");
+        let slash = f
+            .find("client.slash_own_expired_lock(job_id).await")
+            .expect("the slash");
+        let page = f.find("PAGE: LOCK-LATE:").expect("the page");
+        let release = f
+            .find("client.release_job_with_nonce(job_id, pre_nonce, seen)")
+            .expect("the release");
+        assert!(not_ours < cutoff && cutoff < opens && opens < slash && slash < page);
+        assert!(page < release);
+        assert!(f[slash..page].contains(
+            "Ok(true) => {
+                        journal_update(journal, |j| j.remove(job_id));"
+        ));
+        assert!(f[page..release].contains("cannot release; this miner slashes it itself once"));
+        assert!(f.contains("let slash_opens = view.slashOpensAt.to::<u64>();"));
+        assert!(f.contains("let now = zkminer_chain::client::chain_now_floor();"));
+    }
+
+    /// A worker that died carries its last lines of output in its error (`death_note`), and those
+    /// can be a job's guest program's. Their text trips the classifiers, so it must never reach
+    /// them: a guest that prints "proof is invalid" and then crashes the worker would end the job,
+    /// and one that prints "out of memory" would be read as a GPU out-of-memory. The death is
+    /// recognised by its type under the added context, and is a health failure.
+    #[test]
+    fn a_dead_workers_output_is_never_classified_by_text() {
+        let note = "risc0:cuda:0: worker exited with code -1073741819 (0xC0000005); its last \
+                    output: guest says out of memory | proof is invalid";
+        assert!(zkminer_prover_protocol::types::is_gpu_oom(note) && is_invalid_proof(note));
+        let died = anyhow::Error::new(zkminer_prover::worker::WorkerDied {
+            backend: "risc0".to_string(),
+            last_output: None,
+        })
+        .context(note);
+        assert!(died
+            .downcast_ref::<zkminer_prover::worker::WorkerDied>()
+            .is_some());
+        let job = body(include_str!("run.rs"), "\nasync fn process_job_lifecycle(");
+        assert!(job.contains("None => !died && is_invalid_proof(&msg),"));
+        assert!(job.contains("None => !died && zkminer_prover_protocol::types::is_gpu_oom(&msg),"));
+        assert!(job.contains(".downcast_ref::<zkminer_prover::worker::WorkerDied>()"));
+    }
+
+    /// A worker the outage recycle stopped (review r7 EC-2/VEC-1) is retried free: no attempt, no
+    /// card excluded, no divergence. Twice per job at most; then it is an ordinary death, so a guest
+    /// that holds the network on purpose each time it runs still ends its job.
+    #[test]
+    fn a_recycled_worker_is_retried_free_twice_then_counts() {
+        let recycled = || {
+            anyhow::Error::new(zkminer_prover::dispatcher::WorkerRecycled {
+                slot_key: "risc0:cuda:0".to_string(),
+            })
+        };
+        let mut n = 0;
+        assert!(free_retry_after_recycle(&recycled(), &mut n));
+        assert!(free_retry_after_recycle(&recycled(), &mut n));
+        assert!(!free_retry_after_recycle(&recycled(), &mut n));
+        assert_eq!(n, MAX_RECYCLED_RETRIES);
+        // An ordinary death, or one whose text says "recycle", is not it.
+        let mut n = 0;
+        let died = anyhow::Error::new(zkminer_prover::worker::WorkerDied {
+            backend: "risc0".to_string(),
+            last_output: None,
+        })
+        .context("stopped by the outage recycle (it held network sockets)");
+        assert!(!free_retry_after_recycle(&died, &mut n));
+        assert_eq!(n, 0);
+        // In the loop: before the card is steered off or anything is marked, and it continues
+        // without counting the attempt.
+        let job = body(include_str!("run.rs"), "\nasync fn process_job_lifecycle(");
+        let arm = job
+            .find("if free_retry_after_recycle(&e, &mut recycled_retries) {")
+            .expect("the recycle arm is in the prove loop");
+        let steer = job.find("steer_after_failure(").unwrap();
+        assert!(arm < steer);
+        let arm_body = &job[arm..];
+        let arm_body = &arm_body[..arm_body.find("continue;").unwrap()];
+        assert!(arm_body.contains("attempt = attempt.saturating_sub(1);"));
+        assert!(!arm_body.contains("note_post_claim_divergence"));
+        assert!(!arm_body.contains("excluded"));
+    }
+
     /// The same property for the GPU-memory class. This arm refunds its attempt AND excludes a slot,
     /// so a forgery buys both free retries and the power to steer a job off a healthy card.
     #[test]
@@ -13695,6 +19890,7 @@ mod tests {
             needed_bytes: Some(16_000_000_000),
             ours_in_the_way: false,
             total_bytes: 16 << 30,
+            evicted_bytes: 0,
         });
         assert!(real.downcast_ref::<GpuMemoryShortage>().is_some());
 
@@ -14744,6 +20940,38 @@ mod r2_sizing_tests {
         assert!(!divergence_blocks_claim(addr(0xEE), prog(0xD3), "risc0"));
     }
 
+    /// A failure that may be the submitter's own per-job choice (a revert lever) marks the submitter
+    /// but never the program, however many submitters it comes from. (Reads the program marks
+    /// directly: the global hold is shared with the other breaker tests.)
+    #[test]
+    fn a_lever_failure_marks_the_submitter_but_not_the_program() {
+        let addr = alloy::primitives::Address::repeat_byte;
+        let prog = B256::repeat_byte(0xA7);
+        let program_marked = || {
+            DIVERGENCE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|st| st.programs.contains_key(&(prog, "sp1")))
+        };
+        for submitter in [0xA1, 0xA2, 0xA3] {
+            note_post_claim_divergence_for(prog, "sp1", addr(submitter), "test", false);
+            assert!(divergence_blocks_claim(
+                addr(submitter),
+                B256::repeat_byte(0xA8),
+                "sp1"
+            ));
+        }
+        assert!(
+            !program_marked(),
+            "a lever decoy must not mark the program it names"
+        );
+        // Without a lever, two distinct submitters mark it.
+        note_post_claim_divergence_for(prog, "sp1", addr(0xA4), "test", true);
+        note_post_claim_divergence_for(prog, "sp1", addr(0xA5), "test", true);
+        assert!(program_marked());
+    }
+
     #[test]
     fn bound_jobs_rank_last_and_are_forgotten_with_the_job() {
         let jid = B256::repeat_byte(0xB1);
@@ -14783,16 +21011,33 @@ mod r2_sizing_tests {
         // A temporary refusal backs a job off, and it is then put back: it keeps its price, or a full
         // Open set would evict exactly the job just requeued.
         let backing_off = job(0xB2);
-        note_job_retry_after(backing_off.info.job_id, Duration::from_secs(60));
+        note_job_retry_after(
+            backing_off.info.job_id,
+            Duration::from_secs(60),
+            "a bid is live",
+        );
         assert!(claim_backing_off(backing_off.info.job_id));
         assert_eq!(open_rank(&backing_off), 1_000);
         // A lasting verdict (assigned elsewhere, too slow) ranks it last, and backs it off too.
         let aside = job(0xB3);
-        set_job_aside(aside.info.job_id, Duration::from_secs(60));
+        set_job_aside(
+            aside.info.job_id,
+            Duration::from_secs(60),
+            "assigned to another prover",
+        );
+        assert_eq!(
+            claim_backoff_reason(aside.info.job_id),
+            Some("assigned to another prover"),
+            "a set-aside job keeps saying why, not that a claim was refused"
+        );
         assert!(claim_backing_off(aside.info.job_id));
         assert_eq!(open_rank(&aside), 0);
         let expired = job(0xB4);
-        set_job_aside(expired.info.job_id, Duration::ZERO);
+        set_job_aside(
+            expired.info.job_id,
+            Duration::ZERO,
+            "assigned to another prover",
+        );
         assert_eq!(open_rank(&expired), 1_000, "only while it lasts");
     }
 
@@ -15081,6 +21326,423 @@ mod r2_sizing_tests {
             resolve_measured_with_hash(&measured, &desc_input, "risc0", &[R0], prog, desc2),
             Some((UNMEASURABLE_CYCLES, None, None, 0))
         );
+    }
+
+    // E3: a pre-claim cache miss and a changed registry hash put the job back with no job strike;
+    // only the remaining failures strike the job, and drop it at the limit.
+    #[test]
+    fn preclaim_elf_action_strikes_the_job_only_for_other_failures() {
+        let not_called = || -> u32 { panic!("a job strike for a cache miss or a changed hash") };
+        assert_eq!(
+            preclaim_elf_action(&Ok(vec![1]), not_called),
+            PreclaimElfAction::Claim
+        );
+        assert_eq!(
+            preclaim_elf_action(&Err(ElfNotCached.into()), not_called),
+            PreclaimElfAction::RequeuePrefetch
+        );
+        assert_eq!(
+            preclaim_elf_action(&Err(ElfHashChanged(B256::ZERO).into()), not_called),
+            PreclaimElfAction::Remeasure
+        );
+        // Wrapped in context, as the timeout and download errors are.
+        let wrapped: Result<Vec<u8>> = Err(anyhow::Error::from(ElfNotCached).context("pre-claim"));
+        assert_eq!(
+            preclaim_elf_action(&wrapped, not_called),
+            PreclaimElfAction::RequeuePrefetch
+        );
+        let other = || Err(anyhow::anyhow!("cache read failed"));
+        assert_eq!(
+            preclaim_elf_action(&other(), || 1),
+            PreclaimElfAction::RequeueStrike
+        );
+        assert_eq!(
+            preclaim_elf_action(&other(), || MAX_PRECLAIM_ELF_FAILURES - 1),
+            PreclaimElfAction::RequeueStrike
+        );
+        assert_eq!(
+            preclaim_elf_action(&other(), || MAX_PRECLAIM_ELF_FAILURES),
+            PreclaimElfAction::Drop
+        );
+    }
+
+    #[test]
+    fn program_elf_strikes_back_off_and_mark_the_program_at_three() {
+        let secs: Vec<u64> = (1..=7).map(|k| program_elf_backoff(k).as_secs()).collect();
+        assert_eq!(secs, [60, 120, 240, 480, 960, 1800, 1800]);
+
+        let prog = keccak256(b"e3-program-strikes");
+        assert!(try_begin_elf_prefetch(prog).is_some());
+        assert_eq!(note_program_elf_strike(prog), 1);
+        assert!(program_elf_backing_off(prog));
+        assert!(!program_has_no_elf_source(prog));
+        // Backing off: no new fetch until the wait is over.
+        assert!(try_begin_elf_prefetch(prog).is_none());
+        assert_eq!(note_program_elf_strike(prog), 2);
+        assert!(!program_has_no_elf_source(prog));
+        assert_eq!(note_program_elf_strike(prog), MAX_PROGRAM_ELF_STRIKES);
+        assert!(program_has_no_elf_source(prog));
+
+        // A success clears the strikes.
+        let healed = keccak256(b"e3-program-heals");
+        note_program_elf_strike(healed);
+        clear_program_elf_strikes(healed);
+        assert!(!program_elf_backing_off(healed));
+        assert_eq!(note_program_elf_strike(healed), 1);
+    }
+
+    #[test]
+    fn elf_prefetches_are_shared_per_program_and_bounded() {
+        let (a, b, c) = (
+            keccak256(b"e3-prefetch-a"),
+            keccak256(b"e3-prefetch-b"),
+            keccak256(b"e3-prefetch-c"),
+        );
+        let slot_a = try_begin_elf_prefetch(a).expect("first fetch of a");
+        // Jobs of one program share its fetch.
+        assert!(try_begin_elf_prefetch(a).is_none());
+        let _slot_b = try_begin_elf_prefetch(b).expect("first fetch of b");
+        // At most MAX_ELF_PREFETCHES at once.
+        assert_eq!(MAX_ELF_PREFETCHES, 2);
+        assert!(try_begin_elf_prefetch(c).is_none());
+        drop(slot_a);
+        assert!(try_begin_elf_prefetch(c).is_some());
+    }
+
+    #[test]
+    fn an_sp1_measurement_under_a_replaced_registry_hash_is_unmeasured() {
+        let (measured, desc_input) = fresh();
+        let prog = keccak256(b"e3-sp1-churn");
+        let desc = keccak256(b"e3-sp1-churn-desc");
+        let ih = keccak256(b"e3-sp1-churn-input");
+        insert_desc_input(&desc_input, desc, ih);
+        let (h1, h2, h3) = (
+            keccak256(b"elf-1"),
+            keccak256(b"elf-2"),
+            keccak256(b"elf-3"),
+        );
+
+        // SP1 stores the registry hash it was measured under, not a verified risc0 hash.
+        insert_measurement(
+            &measured,
+            "sp1",
+            NO_PO2,
+            prog,
+            ih,
+            5_000,
+            7,
+            Some(h1),
+            None,
+            0,
+        );
+        let r = resolve_measured_at(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc).unwrap();
+        assert_eq!((r.verified_elf_hash, r.registry_elf_hash), (None, Some(h1)));
+        assert!(!registry_elf_hash_superseded(prog, h1));
+
+        // The registry now names H2: one change, and the job is unmeasured.
+        assert_eq!(note_registry_elf_hash(prog, h2), 1);
+        assert!(registry_elf_hash_superseded(prog, h1));
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            None
+        );
+        assert!(measured.lock().unwrap().is_empty());
+        // Measured again under H2, it sizes the job.
+        insert_measurement(
+            &measured,
+            "sp1",
+            NO_PO2,
+            prog,
+            ih,
+            6_000,
+            7,
+            Some(h2),
+            None,
+            0,
+        );
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            Some(6_000)
+        );
+
+        // Seen again at a sibling job: not another change.
+        assert_eq!(note_registry_elf_hash(prog, h2), 1);
+        assert!(!program_has_no_elf_source(prog));
+        assert_eq!(note_registry_elf_hash(prog, h3), 2);
+        assert!(!program_has_no_elf_source(prog));
+        // More than two changes in an hour: the program is skipped.
+        assert_eq!(note_registry_elf_hash(prog, h2), 3);
+        assert!(program_has_no_elf_source(prog));
+
+        // risc0 stores its hash as the verified one, and never as a registry hash.
+        let r0prog = keccak256(b"e3-risc0");
+        insert_measurement(&measured, "risc0", R0, r0prog, ih, 1, 0, Some(h1), None, 0);
+        let r = resolve_measured_at(&measured, &desc_input, "risc0", &[R0], r0prog, desc).unwrap();
+        assert_eq!((r.verified_elf_hash, r.registry_elf_hash), (Some(h1), None));
+    }
+
+    /// A registry read seeds a program without counting a change, and only an SP1 read that carries
+    /// an `elf_hash` is recorded.
+    #[test]
+    fn a_first_registry_read_seeds_without_counting() {
+        let prog = keccak256(b"f1-seed");
+        let (h1, h2) = (keccak256(b"f1-seed-elf-1"), keccak256(b"f1-seed-elf-2"));
+        // risc0 (the registry hash does not bind its bytes) and a program with no hash: nothing.
+        assert_eq!(record_registry_hash(false, prog, Some(h1)), None);
+        assert_eq!(record_registry_hash(true, prog, None), None);
+        assert!(!registry_elf_hash_superseded(prog, h2));
+        // The first SP1 read seeds it: no change, and a measurement under it stands.
+        assert_eq!(record_registry_hash(true, prog, Some(h1)), Some(0));
+        assert!(!registry_elf_hash_superseded(prog, h1));
+        assert!(registry_elf_hash_superseded(prog, h2));
+        assert_eq!(registry_elf_hash_previous(prog), None);
+        // Read again: still no change.
+        assert_eq!(observe_registry_elf_hash(prog, h1), 0);
+        // The pre-claim step on a program it has no entry for (evicted) counts the change.
+        let evicted = keccak256(b"f1-seed-evicted");
+        assert_eq!(note_registry_elf_hash(evicted, h1), 1);
+        assert_eq!(registry_elf_hash_previous(evicted), None);
+    }
+
+    /// F1: an elfHash flip-back (H1 -> H2 -> H1) used to leave the map at H2, so every measurement
+    /// made under H1 was dropped at the next resolve and the input executed again on every tick.
+    /// Every read now records the hash it saw: the measurement under H1 stands, the flip-back counts,
+    /// and a registrant that keeps flipping has its program skipped.
+    #[test]
+    fn an_elf_hash_flip_back_counts_and_ends_in_a_skip_not_a_loop() {
+        let (measured, desc_input) = fresh();
+        let prog = keccak256(b"f1-flip");
+        let desc = keccak256(b"f1-flip-desc");
+        let ih = keccak256(b"f1-flip-input");
+        insert_desc_input(&desc_input, desc, ih);
+        let (h1, h2) = (keccak256(b"f1-flip-elf-1"), keccak256(b"f1-flip-elf-2"));
+        let measure_under = |h: B256| {
+            insert_measurement(
+                &measured,
+                "sp1",
+                NO_PO2,
+                prog,
+                ih,
+                5_000,
+                7,
+                Some(h),
+                None,
+                0,
+            )
+        };
+
+        // Measured under H1 (the measure fetch read H1).
+        assert_eq!(observe_registry_elf_hash(prog, h1), 0);
+        measure_under(h1);
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            Some(5_000)
+        );
+        // The registry names H2: the pre-claim fetch reads it, and the pre-claim arm's own note is
+        // then not a second change. The H1 measurement is dropped.
+        assert_eq!(record_registry_hash(true, prog, Some(h2)), Some(1));
+        assert_eq!(note_registry_elf_hash(prog, h2), 1);
+        assert_eq!(registry_elf_hash_previous(prog), Some(h1));
+        assert_eq!(
+            resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+            None
+        );
+        // Back to H1: the measure fetch reads H1, which counts, and its measurement stands. Before
+        // the fix the map stayed at H2 and this resolve dropped it again.
+        assert_eq!(record_registry_hash(true, prog, Some(h1)), Some(2));
+        assert_eq!(registry_elf_hash_previous(prog), Some(h2));
+        measure_under(h1);
+        for _ in 0..3 {
+            assert_eq!(
+                resolve_measured(&measured, &desc_input, "sp1", &[NO_PO2], prog, desc),
+                Some(5_000),
+                "the measurement under the hash just read stands"
+            );
+        }
+        assert!(!program_has_no_elf_source(prog));
+        // Flipping once more is past two changes in the hour: the program is skipped.
+        assert_eq!(record_registry_hash(true, prog, Some(h2)), Some(3));
+        assert!(program_has_no_elf_source(prog));
+    }
+
+    /// The re-measure cooldown: none before a first run, then 60 s doubling with each run inside an
+    /// hour, capped at 30 min, and forgotten after an hour.
+    #[test]
+    fn a_measured_input_waits_out_a_cooldown_before_it_executes_again() {
+        let secs = Duration::from_secs;
+        assert_eq!(measure_rerun_wait(0, secs(0)), None);
+        assert_eq!(measure_rerun_wait(1, secs(0)), Some(secs(60)));
+        assert_eq!(measure_rerun_wait(1, secs(5)), Some(secs(55)));
+        assert_eq!(measure_rerun_wait(1, secs(60)), None);
+        assert_eq!(measure_rerun_wait(2, secs(60)), Some(secs(60)));
+        assert_eq!(measure_rerun_wait(3, secs(0)), Some(secs(240)));
+        assert_eq!(measure_rerun_wait(6, secs(0)), Some(secs(30 * 60)));
+        assert_eq!(measure_rerun_wait(u32::MAX, secs(0)), Some(secs(30 * 60)));
+        assert_eq!(measure_rerun_wait(u32::MAX, secs(30 * 60)), None);
+        assert_eq!(measure_rerun_wait(6, secs(3600)), None);
+
+        // Recorded per (backend, size, program, input).
+        let key = (
+            backend_tag("sp1"),
+            NO_PO2,
+            keccak256(b"f1-cool"),
+            keccak256(b"f1-cool-in"),
+        );
+        let other_size = (backend_tag("risc0"), 20, key.2, key.3);
+        assert_eq!(
+            measure_rerun_wait_for(&key),
+            None,
+            "a first measurement runs at once"
+        );
+        note_measure_run(key);
+        let w = measure_rerun_wait_for(&key).expect("a re-run waits");
+        assert!(w <= secs(60) && w > secs(50), "{w:?}");
+        note_measure_run(key);
+        let w = measure_rerun_wait_for(&key).expect("a second re-run waits longer");
+        assert!(w <= secs(120) && w > secs(110), "{w:?}");
+        assert_eq!(
+            measure_rerun_wait_for(&other_size),
+            None,
+            "another size is not held"
+        );
+    }
+
+    /// N1: a download whose bytes hash to the registry's previous `elf_hash` is a rollout in
+    /// progress (the new hash set before its bytes were uploaded): a back-off, not a strike. RP1:
+    /// only `ROLLOUT_PENDING_MAX` times per change, and within `ROLLOUT_GRACE` of it.
+    #[test]
+    fn old_bytes_after_an_elf_hash_change_back_off_instead_of_striking() {
+        use zkminer_chain::programs::{ElfHashMismatch, NoStorageUris};
+        let (old, other) = (keccak256(b"n1-old"), keccak256(b"n1-other"));
+        let mismatch = |served: Vec<B256>| -> anyhow::Error {
+            anyhow::Error::from(ElfHashMismatch::new(served, "ELF hash mismatch"))
+                .context("ELF download failed")
+        };
+        let rollout = |pending: u32, age_secs: u64| {
+            Some(RolloutState {
+                previous: old,
+                pending,
+                age: Duration::from_secs(age_secs),
+            })
+        };
+        use MeasureFetchFailure::*;
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![old]), rollout(0, 60)),
+            RolloutPending
+        );
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![other, old]), rollout(1, 60)),
+            RolloutPending
+        );
+        // Past the free answers for this change, or its grace: a strike like any other failure.
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![old]), rollout(ROLLOUT_PENDING_MAX, 60)),
+            Strike
+        );
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![old]), rollout(0, ROLLOUT_GRACE.as_secs())),
+            Strike
+        );
+        // Bytes of anything else, or no earlier hash known: a strike, as before.
+        assert_eq!(
+            measure_fetch_failure(&mismatch(vec![other]), rollout(0, 60)),
+            Strike
+        );
+        assert_eq!(measure_fetch_failure(&mismatch(vec![old]), None), Strike);
+        assert_eq!(
+            measure_fetch_failure(&anyhow::anyhow!("HTTP 500"), rollout(0, 60)),
+            Strike
+        );
+        // No ELF source: a back-off, as before.
+        assert_eq!(
+            measure_fetch_failure(
+                &anyhow::Error::from(NoStorageUris).context("x"),
+                rollout(ROLLOUT_PENDING_MAX, 7_200)
+            ),
+            NoSource
+        );
+        assert_eq!(
+            measure_fetch_failure(
+                &anyhow::Error::from(RegistryUnavailable("down".into())),
+                None
+            ),
+            NoSource
+        );
+    }
+
+    /// RP1: each change of the registry `elf_hash` starts its own free answers; a good fetch ends
+    /// the rollout and starts the program's back-off over. The back-off doubles from 10 minutes and
+    /// stops at 160.
+    #[test]
+    fn rollout_answers_reset_on_a_change_or_a_good_fetch_and_the_back_off_grows() {
+        let prog = keccak256(b"rp1-reset");
+        let (h1, h2, h3) = (
+            keccak256(b"rp1-reset-1"),
+            keccak256(b"rp1-reset-2"),
+            keccak256(b"rp1-reset-3"),
+        );
+        assert_eq!(observe_registry_elf_hash(prog, h1), 0);
+        assert_eq!(registry_rollout_state(prog), None, "seeded: no change seen");
+        assert_eq!(observe_registry_elf_hash(prog, h2), 1);
+        let s = registry_rollout_state(prog).expect("a change was seen");
+        assert_eq!((s.previous, s.pending), (h1, 0));
+        assert!(s.age < Duration::from_secs(60));
+        assert_eq!(note_rollout_pending(prog), 1);
+        assert_eq!(note_rollout_pending(prog), 2);
+        assert_eq!(registry_rollout_state(prog).unwrap().pending, 2);
+        // Another change: its own free answers, but the back-off keeps growing.
+        assert_eq!(observe_registry_elf_hash(prog, h3), 2);
+        assert_eq!(registry_rollout_state(prog).unwrap().pending, 0);
+        assert_eq!(note_rollout_pending(prog), 3);
+        // A good fetch: both start over.
+        note_registry_fetch_ok(prog);
+        assert_eq!(registry_rollout_state(prog).unwrap().pending, 0);
+        assert_eq!(note_rollout_pending(prog), 1);
+
+        let mins = |k| rollout_backoff(k).as_secs() / 60;
+        assert_eq!(
+            [1, 2, 3, 4, 5, 6, 100].map(mins),
+            [10, 20, 40, 80, 160, 160, 160]
+        );
+        // A program skipped for longer keeps the longer mark.
+        let p = keccak256(b"rp1-mark");
+        mark_program_no_elf_source_for(p, rollout_backoff(5));
+        mark_program_no_elf_source(p);
+        let g = NO_ELF_SOURCE.lock().unwrap();
+        assert_eq!(g.as_ref().unwrap()[&p].1, rollout_backoff(5));
+    }
+
+    /// RP1 regression: a registrant flips its program's `elf_hash` once and keeps serving the old
+    /// bytes. Before, every measure fetch was a free back-off for the life of the process; now the
+    /// (program, input) strikes out by the fifth fetch (two free answers, then three strikes).
+    #[test]
+    fn a_flip_with_the_old_bytes_still_served_strikes_out_by_the_fifth_fetch() {
+        use zkminer_chain::programs::ElfHashMismatch;
+        let prog = keccak256(b"rp1-flip");
+        let (h1, h2) = (keccak256(b"rp1-flip-1"), keccak256(b"rp1-flip-2"));
+        observe_registry_elf_hash(prog, h1);
+        observe_registry_elf_hash(prog, h2);
+        let served_h1 = || {
+            anyhow::Error::from(ElfHashMismatch::new(vec![h1], "ELF hash mismatch"))
+                .context("ELF download failed")
+        };
+        let mut strikes = 0u8;
+        let mut struck_out_at = None;
+        for fetch in 1..=5 {
+            match measure_fetch_failure(&served_h1(), registry_rollout_state(prog)) {
+                MeasureFetchFailure::RolloutPending => {
+                    note_rollout_pending(prog);
+                }
+                MeasureFetchFailure::Strike => {
+                    strikes += 1;
+                    if strikes >= MEASURE_TIMEOUT_STRIKES && struck_out_at.is_none() {
+                        struck_out_at = Some(fetch);
+                    }
+                }
+                MeasureFetchFailure::NoSource => panic!("not a missing source"),
+            }
+        }
+        assert_eq!(struck_out_at, Some(5));
     }
 
     // A later cycle-only write to the SAME (program, input) replaces the whole entry, so a stale hash
@@ -15450,6 +22112,7 @@ mod r2_sizing_tests {
                 peak_host_bytes: 0,
                 retry_after: Some(std::time::Instant::now() - Duration::from_secs(1)),
                 verified_elf_hash: None,
+                registry_elf_hash: None,
                 journal: None,
                 execute_secs: 0,
             },
@@ -15551,6 +22214,7 @@ mod r2_sizing_tests {
             peak_host_bytes: cycles / 1000,
             retry_after: None,
             verified_elf_hash: hash,
+            registry_elf_hash: None,
             journal: journal.map(std::sync::Arc::from),
             execute_secs: secs,
         }
@@ -15746,6 +22410,8 @@ mod r2_sizing_tests {
             program_stages: Vec::new(),
             pci_bus_id: String::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 
@@ -15837,8 +22503,8 @@ mod r2_sizing_tests {
             |i: usize, vram: Option<u64>| (format!("risc0:cuda:{i}"), format!("gpu{i}"), vram);
         let slots = vec![
             slot(0, Some(24 * GIB)), // uncalibrated: the default size
-            slot(1, Some(12 * GIB)), // uncalibrated, too small for it: none
-            slot(2, Some(12 * GIB)), // calibrated: its measured best
+            slot(1, Some(6 * GIB)),  // uncalibrated, too small for any size: none
+            slot(2, Some(6 * GIB)),  // calibrated, too small for a default: its measured best
             slot(3, None),           // VRAM unknown: the default size
             slot(4, Some(8 * GIB)),  // a size set in Settings
             slot(5, Some(24 * GIB)), // a heuristic row, no samples: the default size
@@ -16083,13 +22749,247 @@ mod r2_sizing_tests {
         assert_eq!(observed_rate("risc0:cuda:0", 1_000, Duration::ZERO), None);
         assert_eq!(observed_rate("risc0:cuda:0", 0, secs(1)), None);
 
-        // Smoothed: the first proof sets it, a later one moves it part of the way.
-        note_observed_throughput("openvm:cuda:7", 10_000_000, secs(10));
+        // Smoothed: with no benchmark rate the first proof sets it, a later one moves it part of
+        // the way.
+        note_observed_throughput("openvm:cuda:7", 100_000_000, secs(100), 0);
         let key = ("gpu7".to_string(), "openvm".to_string());
         assert_eq!(observed_throughputs()[&key], 1_000_000.0);
-        note_observed_throughput("openvm:cuda:7", 20_000_000, secs(10));
+        note_observed_throughput("openvm:cuda:7", 200_000_000, secs(100), 0);
         let expected = 1_000_000.0 + OBSERVED_THROUGHPUT_WEIGHT * 1_000_000.0;
         assert!((observed_throughputs()[&key] - expected).abs() < 1e-6);
+    }
+
+    /// A proof too small to say, or one mostly fixed cost, teaches its card nothing.
+    #[test]
+    fn a_small_or_fixed_cost_proof_teaches_no_rate() {
+        let secs = Duration::from_secs;
+        // Under the fallback minimum with no benchmark: no entry at all.
+        note_observed_throughput("openvm:cuda:31", 10_000_000, secs(10), 0);
+        assert!(!observed_throughputs().contains_key(&("gpu31".to_string(), "openvm".to_string())));
+        // Under a minute of STARK work at the benchmark's 2.5 M cycles/s.
+        assert_eq!(
+            next_learned_rate(None, Some(2.5e6), 100_000_000, secs(100), 5.0),
+            None
+        );
+        // Over it, but the wrap and execute are most of the proof.
+        assert_eq!(
+            next_learned_rate(None, Some(2.5e6), 200_000_000, secs(100), 60.0),
+            None
+        );
+        assert!(next_learned_rate(None, Some(2.5e6), 200_000_000, secs(100), 40.0).is_some());
+        assert_eq!(next_learned_rate(None, None, 0, secs(100), 0.0), None);
+    }
+
+    /// With a benchmark rate the average starts there: a first proof moves it part of the way, not
+    /// all of it, and a run of slow proofs leaves it at no less than half the benchmark's.
+    #[test]
+    fn a_learned_rate_starts_at_the_benchmark_and_stays_near_it() {
+        let secs = Duration::from_secs_f64;
+        let bench = 2e6;
+        // 600 M cycles (300 s at the benchmark rate, full weight) at 1.5 M cycles/s.
+        let first = next_learned_rate(None, Some(bench), 600_000_000, secs(400.0), 0.0).unwrap();
+        assert!((first - (bench + OBSERVED_THROUGHPUT_WEIGHT * (1.5e6 - bench))).abs() < 1e-6);
+        // Twenty proofs at 1% of it.
+        let mut rate = None;
+        for _ in 0..20 {
+            rate = next_learned_rate(rate, Some(bench), 600_000_000, secs(30_000.0), 0.0);
+        }
+        let rate = rate.unwrap();
+        assert!(rate >= LEARNED_RATE_FLOOR * bench, "{rate}");
+        let row = zkminer_prover::benchmark::DeviceBenchmark {
+            throughput: bench,
+            program_stages: vec![zkminer_prover::benchmark::ProgramStage {
+                program_name: "p".to_string(),
+                cycles: 2_000_000_000,
+                stark_secs: 1000.0,
+                wrap_secs: Some(5.0),
+                power_reduced: None,
+            }],
+            device_id: "gpu0".to_string(),
+            device_label: String::new(),
+            prover_backend: "risc0".to_string(),
+            power_watts: 300.0,
+            optimal_po2: 20,
+            memory_usage_bytes: 1,
+            max_feasible_po2: 22,
+            program_throughputs: HashMap::new(),
+            po2_samples: Vec::new(),
+            pci_bus_id: String::new(),
+            host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
+        };
+        let benchmark_only =
+            card_estimate_secs("risc0", 1_000_000_000, 0, None, Some(&row)).unwrap();
+        let learned =
+            card_estimate_secs("risc0", 1_000_000_000, 0, Some(rate), Some(&row)).unwrap();
+        assert!(
+            learned <= 2.2 * benchmark_only,
+            "{learned} against {benchmark_only}"
+        );
+        // A rate learned before the card was benchmarked again is held to the same range.
+        let stale = card_estimate_secs("risc0", 1_000_000_000, 0, Some(2e4), Some(&row)).unwrap();
+        assert!(
+            stale <= 2.2 * benchmark_only,
+            "{stale} against {benchmark_only}"
+        );
+        // And one proof cannot more than double it.
+        let fast = next_learned_rate(None, Some(bench), 600_000_000, secs(1.0), 0.0).unwrap();
+        assert!(fast <= LEARNED_RATE_CEILING * bench);
+    }
+
+    /// The guest's execute inside the proof is not counted as STARK work.
+    #[test]
+    fn a_learned_rate_is_net_of_the_execute() {
+        let secs = Duration::from_secs;
+        let without = next_learned_rate(None, None, 100_000_000, secs(100), 0.0).unwrap();
+        let with = next_learned_rate(None, None, 100_000_000, secs(100), 20.0).unwrap();
+        assert_eq!(without, 1e6);
+        assert_eq!(with, 1.25e6);
+    }
+
+    /// A refusal before the proof started blames no one, and a refusal on learned rates is tried
+    /// once more on the benchmark's; a proof cut at its cutoff marks a measured job, as before,
+    /// unless it was that retry.
+    #[test]
+    fn a_refusal_before_the_proof_started_is_not_the_submitters() {
+        use DeadlineRefusalAction::*;
+        // (before_start, retried, used_observed, rode_measurement)
+        let table = [
+            ((true, false, true, true), RetryOnBenchmark),
+            ((true, false, true, false), RetryOnBenchmark),
+            ((true, true, true, true), ReleaseNoMark),
+            ((true, false, false, true), ReleaseNoMark),
+            ((true, true, false, false), ReleaseNoMark),
+            ((false, false, true, true), ReleaseAndMark),
+            ((false, false, false, true), ReleaseAndMark),
+            // An overrun on the benchmark's rates after the retry is not the submitter's.
+            ((false, true, false, true), ReleaseNoMark),
+            ((false, true, true, true), ReleaseNoMark),
+            ((false, true, false, false), ReleaseNoMark),
+            ((false, false, true, false), ReleaseNoMark),
+        ];
+        for ((before_start, retried, used_observed, rode), want) in table {
+            assert_eq!(
+                deadline_refusal_action(before_start, retried, used_observed, rode),
+                want,
+                "{before_start} {retried} {used_observed} {rode}"
+            );
+        }
+    }
+
+    /// RP2: overruns after the benchmark-rate retry are counted per card over the last hour.
+    #[test]
+    fn estimate_overruns_are_counted_per_card_over_an_hour() {
+        let now = std::time::Instant::now();
+        let mut m = HashMap::new();
+        assert_eq!(count_estimate_overrun(&mut m, "sp1:cuda:0", now), 1);
+        assert_eq!(count_estimate_overrun(&mut m, "sp1:cuda:1", now), 1);
+        assert_eq!(
+            count_estimate_overrun(&mut m, "sp1:cuda:0", now + Duration::from_secs(60)),
+            2
+        );
+        assert_eq!(
+            count_estimate_overrun(&mut m, "sp1:cuda:0", now + ESTIMATE_REFUSAL_WINDOW),
+            2,
+            "the first has aged out"
+        );
+    }
+
+    /// RP2: the second overrun on a card in an hour pages ESTIMATE-OVERRUN and switches that card's
+    /// admission to its learned rate; another card, and the submitter, are untouched.
+    #[test]
+    fn a_second_overrun_on_a_card_pages_and_switches_its_admission_to_the_learned_rate() {
+        // A card index no other test uses: the counters are process-wide.
+        let slot = "risc0:cuda:97";
+        let card = card_key(slot).unwrap();
+        assert_eq!(card.1, "risc0");
+        assert_eq!(card_key("cpu:0"), None);
+        let job = B256::repeat_byte(0x97);
+        let paged = |n: usize| {
+            let q = PAGES.lock().unwrap_or_else(|p| p.into_inner());
+            q.iter()
+                .filter(|p| p.contains("ESTIMATE-OVERRUN") && p.contains(slot))
+                .count()
+                == n
+        };
+        note_estimate_overrun(job, Some(slot), "cut at its cutoff");
+        assert!(!admission_observed_cards().contains(&card));
+        note_estimate_overrun(job, Some(slot), "cut at its cutoff");
+        assert!(admission_observed_cards().contains(&card));
+        assert!(paged(1), "an ESTIMATE-OVERRUN page for the card");
+        // An overrun with no card known is counted, never switches anything.
+        note_estimate_overrun(job, None, "cut at its cutoff");
+        // The submitter stays unmarked: the action after a retry is unchanged.
+        assert_eq!(
+            deadline_refusal_action(false, true, true, true),
+            DeadlineRefusalAction::ReleaseNoMark
+        );
+    }
+
+    /// RP2: with a measured suite admission prices on benchmark rows, except for a card switched to
+    /// its learned rate; without one, on every learned rate, as before.
+    #[test]
+    fn admission_uses_the_learned_rate_only_for_switched_cards() {
+        let key = |d: &str| (d.to_string(), "sp1".to_string());
+        let observed = HashMap::from([(key("gpu0"), 1.0e6), (key("gpu1"), 2.0e6)]);
+        let forced = std::collections::HashSet::from([key("gpu1")]);
+        let rows = vec![
+            ("gpu0".to_string(), "sp1".to_string(), 3.0e6),
+            ("gpu1".to_string(), "sp1".to_string(), 3.0e6),
+        ];
+        let mut got = with_observed(rows.clone(), &admission_observed(true, &observed, &forced));
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("gpu0".to_string(), "sp1".to_string(), 3.0e6),
+                ("gpu1".to_string(), "sp1".to_string(), 2.0e6),
+            ]
+        );
+        assert!(admission_observed(true, &observed, &Default::default()).is_empty());
+        assert_eq!(
+            admission_observed(false, &observed, &Default::default()),
+            observed
+        );
+    }
+
+    /// Refusals before the start are counted over the last hour.
+    #[test]
+    fn estimate_refusals_are_counted_over_an_hour() {
+        let now = std::time::Instant::now();
+        let mut recent = std::collections::VecDeque::new();
+        for i in 0..4u64 {
+            assert_eq!(
+                count_estimate_refusal(&mut recent, now + Duration::from_secs(i * 60)),
+                i as usize + 1
+            );
+        }
+        // An hour after the first, it has aged out.
+        assert_eq!(
+            count_estimate_refusal(&mut recent, now + ESTIMATE_REFUSAL_WINDOW),
+            4
+        );
+    }
+
+    /// A job admitted on one card of two, with one job outstanding, waits for it, though by the
+    /// count of all cards one is free.
+    #[test]
+    fn a_job_waits_for_the_cards_it_can_finish_on() {
+        let outstanding = [(1_000_000_000u64, "risc0")];
+        let rates = |_: &str| vec![2e6];
+        assert_eq!(
+            expected_queue_wait_secs(
+                &outstanding,
+                "risc0",
+                2,
+                2,
+                |_: &str| vec![2e6, 1e6],
+                |_| 0.0
+            ),
+            0
+        );
+        assert!(expected_queue_wait_secs(&outstanding, "risc0", 1, 2, rates, |_| 0.0) >= 500);
     }
 
     /// Learned rates replace what the rows said for that card and backend, keep the rest, and add a
@@ -16130,6 +23030,173 @@ mod r2_sizing_tests {
         let mut measured = zkminer_prover::benchmark::BenchmarkSuite::default();
         measured.cpu_info = "AMD Ryzen Threadripper 3970X 32-Core Processor".to_string();
         assert!(!is_synthetic_suite(&measured));
+    }
+
+    /// Declines are counted per reason, most common first (ties by name, so identical passes give
+    /// an identical line), and each job keeps its own reason for the Jobs screen.
+    #[test]
+    fn the_decline_tally_counts_reasons_and_keeps_each_jobs() {
+        let mut t = DeclineTally::default();
+        let (a, b, c) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+        );
+        t.note(a, "below the profit threshold");
+        t.note(b, "a bid is live");
+        t.note(c, "below the profit threshold");
+        t.note(a, "a different reason, same job, same pass");
+        let o = t.outlook(1);
+        assert_eq!(
+            o.declined,
+            vec![
+                ("below the profit threshold".to_string(), 2),
+                ("a bid is live".to_string(), 1)
+            ],
+            "a job is counted once per pass"
+        );
+        assert_eq!((o.claimed, o.held), (1, None));
+        assert_eq!(
+            t.why,
+            vec![
+                (a, "below the profit threshold"),
+                (b, "a bid is live"),
+                (c, "below the profit threshold"),
+            ]
+        );
+    }
+
+    /// The evaluator's free-text reasons map onto the operator's words.
+    #[test]
+    fn evaluator_skips_read_as_operator_reasons() {
+        let skip = |r: &str| Recommendation::Skip {
+            reason: r.to_string(),
+        };
+        assert_eq!(
+            decline_reason(&skip("Insufficient collateral")),
+            "not enough free stake"
+        );
+        assert_eq!(
+            decline_reason(&skip("Cannot finish before deadline")),
+            "cannot finish before the deadline"
+        );
+        assert_eq!(
+            decline_reason(&skip("Risk level too high")),
+            "too risky for its window"
+        );
+        assert_eq!(
+            decline_reason(&skip(
+                "Profit rate 1.0 HEMI/day below threshold 2.0 HEMI/day"
+            )),
+            "below the profit threshold"
+        );
+        assert_eq!(
+            decline_reason(&skip(
+                "Benchmarks are simulated — cannot reliably estimate proving time"
+            )),
+            "benchmarks are simulated"
+        );
+        assert_eq!(
+            decline_reason(&Recommendation::WatchAndWait),
+            "waiting for the price to rise"
+        );
+    }
+
+    /// The headless claims line: logged at once the first time, a change at most once a minute,
+    /// an unchanged one every ten minutes — "changed" meaning the reasons, not their counts.
+    #[test]
+    fn the_claims_summary_is_logged_on_change_and_throttled() {
+        let t0 = std::time::Instant::now();
+        let key = |claimed, n| {
+            ClaimOutlook {
+                declined: vec![("below the profit threshold".to_string(), n)],
+                claimed,
+                ..ClaimOutlook::default()
+            }
+            .summary_key()
+        };
+        let last = (t0, key(0, 37));
+        assert!(claim_summary_due(None, "x", t0));
+        let later = |s| t0 + Duration::from_secs(s);
+        assert!(
+            !claim_summary_due(Some(&last), &key(0, 41), later(120)),
+            "counts moved only"
+        );
+        assert!(claim_summary_due(
+            Some(&last),
+            &key(0, 41),
+            t0 + CLAIM_SUMMARY_REPEAT
+        ));
+        assert!(!claim_summary_due(Some(&last), &key(2, 37), later(30)));
+        assert!(claim_summary_due(
+            Some(&last),
+            &key(2, 37),
+            t0 + CLAIM_SUMMARY_MIN_GAP
+        ));
+    }
+
+    #[test]
+    fn eth_amounts_read_in_eth() {
+        assert_eq!(fmt_eth(40_000_000_000_000_000, false), "0.0400 ETH");
+        assert_eq!(fmt_eth(1_234_500_000_000_000_000, false), "1.2345 ETH");
+        assert_eq!(fmt_eth(0, false), "0.000000 ETH");
+        // Small amounts keep their difference: have 0.00012, need 0.00018.
+        assert_eq!(fmt_eth(120_000_000_000_000, false), "0.000120 ETH");
+        assert_eq!(fmt_eth(180_000_000_000_000, true), "0.000180 ETH");
+        // A need is never shown below itself.
+        assert_eq!(fmt_eth(180_000_000_000_001, true), "0.000181 ETH");
+        assert_eq!(fmt_eth(180_000_000_000_001, false), "0.000180 ETH");
+    }
+
+    /// Publishing a pass records each job's reason, drops claimed jobs and jobs no longer open.
+    #[tokio::test]
+    async fn a_published_pass_reaches_the_jobs_screen() {
+        let state = new_shared_state();
+        let (open, claimed, gone) = (
+            B256::repeat_byte(7),
+            B256::repeat_byte(9),
+            B256::repeat_byte(8),
+        );
+        {
+            let mut s = state.write().await;
+            for id in [open, claimed] {
+                s.open_jobs.push(TrackedJob {
+                    info: zkminer_chain::jobs::JobInfo {
+                        job_id: id,
+                        ..Default::default()
+                    },
+                    status: MinerJobStatus::Open,
+                    current_price: 0,
+                    gpu_bus_id: None,
+                    prover_backend: String::new(),
+                    estimated_cycles: 0,
+                });
+            }
+            s.job_why.insert(gone, "stale".into());
+            s.job_why.insert(claimed, "earlier reason".into());
+        }
+        let mut last = None;
+        let mut t = DeclineTally::default();
+        t.note(open, "a bid is live");
+        t.note(gone, "evicted later this pass");
+        publish_claim_outlook(&state, t.outlook(1), &t.why, &[claimed], &mut last).await;
+        let s = state.read().await;
+        // Two open: `open` was looked at; `claimed` was not (it is the claim); `gone` is no longer
+        // open, so it is not counted either way.
+        assert_eq!(s.claim_outlook.not_evaluated, 1);
+        assert_eq!(
+            s.job_why.get(&open).map(String::as_str),
+            Some("a bid is live")
+        );
+        assert!(
+            !s.job_why.contains_key(&claimed),
+            "a claimed job keeps no decline reason"
+        );
+        assert!(
+            !s.job_why.contains_key(&gone),
+            "a job no longer open keeps no reason"
+        );
+        assert!(last.is_some(), "the first summary is logged");
     }
 
     /// Each candidate lands under its first reason, and the summary names only what happened.
@@ -16273,20 +23340,123 @@ mod r2_sizing_tests {
     #[test]
     fn a_risc0_job_is_held_to_the_risc0_cards_without_look_ahead() {
         // Two GPUs, one with no risc0 size: one risc0 job at a time...
-        assert!(risc0_bypass_room(0, 0, 2, true, 1));
-        assert!(!risc0_bypass_room(1, 0, 2, true, 1));
+        assert!(risc0_bypass_room(0, 0, 2, true, 1, false, false));
+        assert!(!risc0_bypass_room(1, 0, 2, true, 1, false, false));
         // ...but an SP1 job in flight on the other card takes no risc0 room.
-        assert!(risc0_bypass_room(1, 1, 2, true, 1));
+        assert!(risc0_bypass_room(1, 1, 2, true, 1, false, false));
         assert!(
-            !risc0_bypass_room(2, 1, 2, true, 1),
+            !risc0_bypass_room(2, 1, 2, true, 1, false, false),
             "the total cap still holds"
         );
         // Another backend's job is held to the total alone.
-        assert!(risc0_bypass_room(1, 0, 2, false, 1));
+        assert!(risc0_bypass_room(1, 0, 2, false, 1, false, false));
         assert!(
-            !risc0_bypass_room(0, 0, 2, true, 0),
+            !risc0_bypass_room(0, 0, 2, true, 0, false, false),
             "no risc0 card, no risc0 job"
         );
+        // A risc0 card no job in flight can go to takes one more, within the total.
+        assert!(risc0_bypass_room(2, 0, 4, true, 2, true, false));
+        assert!(!risc0_bypass_room(4, 0, 4, true, 2, true, false));
+    }
+
+    /// A job kept off the card it failed on waits for the other: the card it left is free for a new
+    /// job, unless another can still go there.
+    #[test]
+    fn a_card_a_waiting_job_is_kept_off_is_free_for_another() {
+        let cards = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let proving = |s: &str| {
+            Some(Risc0Placement {
+                proving_on: Some(s.to_string()),
+                barred: Vec::new(),
+                ineligible: Vec::new(),
+            })
+        };
+        let waiting = |barred: &[&str]| {
+            Some(Risc0Placement {
+                proving_on: None,
+                barred: barred.iter().map(|s| s.to_string()).collect(),
+                ineligible: Vec::new(),
+            })
+        };
+        // One on the 4070, one waiting for it after failing on the 5090: the 5090 is free.
+        assert!(risc0_card_left_free(
+            &cards,
+            &cards,
+            &[proving("risc0:cuda:1"), waiting(&["risc0:cuda:0"])]
+        ));
+        // A waiting job that may go anywhere takes the free card.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &cards,
+            &[proving("risc0:cuda:1"), waiting(&[])]
+        ));
+        // Kept off every card, it may go anywhere (the dispatcher restores them).
+        assert!(!risc0_card_left_free(
+            &cards,
+            &cards,
+            &[
+                proving("risc0:cuda:1"),
+                waiting(&["risc0:cuda:0", "risc0:cuda:1"])
+            ]
+        ));
+        // A job not yet at its prove loop may go anywhere.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &cards,
+            &[proving("risc0:cuda:1"), None]
+        ));
+        // Both cards proving: none free.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &cards,
+            &[proving("risc0:cuda:0"), proving("risc0:cuda:1")]
+        ));
+    }
+
+    /// A job that can finish only on the 5090 is not admitted while the 5090 proves another, though
+    /// the 4070 is free: it would wait for the 5090 and be refused at its cutoff.
+    #[test]
+    fn a_job_needs_a_free_card_among_those_it_can_finish_on() {
+        let cards = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let only_5090 = vec!["risc0:cuda:0".to_string()];
+        let on_5090 = Some(Risc0Placement {
+            proving_on: Some("risc0:cuda:0".to_string()),
+            ..Default::default()
+        });
+        let free = risc0_card_left_free(&cards, &only_5090, std::slice::from_ref(&on_5090));
+        assert!(!free);
+        assert!(!risc0_bypass_room(1, 0, 2, true, 2, free, true));
+        // Before: one job on two cards was room, whichever card it held.
+        assert!(risc0_bypass_room(1, 0, 2, true, 2, free, false));
+        // Eligible on both, the 4070 is free for it.
+        assert!(risc0_card_left_free(&cards, &cards, &[on_5090]));
+    }
+
+    /// A job waiting for the 5090, the only card it was admitted on, leaves the 4070 free for a job
+    /// that can finish there, also when it is kept off the 5090 (restored to it, not to the 4070).
+    #[test]
+    fn a_waiting_job_holds_no_card_it_was_not_admitted_on() {
+        let cards = vec!["risc0:cuda:0".to_string(), "risc0:cuda:1".to_string()];
+        let only_4070 = vec!["risc0:cuda:1".to_string()];
+        let waiting = |barred: &[&str]| {
+            Some(Risc0Placement {
+                proving_on: None,
+                barred: barred.iter().map(|s| s.to_string()).collect(),
+                ineligible: vec!["risc0:cuda:1".to_string()],
+            })
+        };
+        assert!(risc0_card_left_free(&cards, &only_4070, &[waiting(&[])]));
+        assert!(risc0_card_left_free(
+            &cards,
+            &only_4070,
+            &[waiting(&["risc0:cuda:0"])]
+        ));
+        // A job that may go anywhere still takes the 4070.
+        assert!(!risc0_card_left_free(
+            &cards,
+            &only_4070,
+            &[Some(Risc0Placement::default())]
+        ));
     }
 
     #[test]

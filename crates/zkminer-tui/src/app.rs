@@ -48,6 +48,24 @@ enum PostKeyAction {
     SetupStake,
 }
 
+/// Whether `run_tui` has the terminal (raw mode, alternate screen). Cleared however it ends,
+/// error and panic included, so a caller can tell the dashboard is gone.
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held while drawing; `true` once [`restore_terminal`] has taken the terminal back, after which
+/// nothing draws again (a draw after it would scribble over the restored screen).
+static TERMINAL: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Set once a `run_tui` that had the terminal has ended (however: quit, error, panic), or once
+/// [`restore_terminal`] took the terminal back from it.
+static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the dashboard was up and is not any more: a caller still sending it messages should
+/// print them instead.
+pub fn dashboard_ended() -> bool {
+    ENDED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Run the full interactive TUI.
 ///
 /// If `chain_client` is provided, the setup wizard can perform on-chain actions
@@ -76,26 +94,54 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
     struct TermRestore;
     impl Drop for TermRestore {
         fn drop(&mut self) {
-            let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture,
-                crossterm::cursor::Show
-            );
+            RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+            ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Not again after `restore_terminal`: leaving the alternate screen a second time
+            // would move the cursor over what was printed since.
+            if !*TERMINAL.lock().unwrap_or_else(|p| p.into_inner()) {
+                let _ = disable_raw_mode();
+                let _ = execute!(
+                    io::stdout(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture,
+                    crossterm::cursor::Show
+                );
+            }
         }
     }
     let _restore = TermRestore;
+    RUNNING.store(true, std::sync::atomic::Ordering::SeqCst);
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut events = spawn_event_reader(Duration::from_secs(1));
 
     loop {
-        // Draw
+        // Draw: render the frame under the state lock, then write it to the terminal with the lock
+        // released (ratatui's `draw`, split). A terminal that stops reading (a frozen SSH session)
+        // blocks the write; holding the state lock through it would stall every shutdown step
+        // waiting to write the state.
+        {
+            if *TERMINAL.lock().unwrap_or_else(|p| p.into_inner()) {
+                // `restore_terminal` took it back (a force exit): stop, drawing nothing more.
+                return Ok(());
+            }
+            terminal.autoresize()?;
+        }
         {
             let state = state.read().await;
-            terminal.draw(|f| draw(f, &state))?;
+            let mut frame = terminal.get_frame();
+            draw(&mut frame, &state);
+        }
+        {
+            let taken = TERMINAL.lock().unwrap_or_else(|p| p.into_inner());
+            if *taken {
+                return Ok(());
+            }
+            terminal.flush()?;
+            terminal.hide_cursor()?;
+            terminal.swap_buffers();
+            io::Write::flush(terminal.backend_mut())?;
         }
 
         // Handle events
@@ -124,9 +170,17 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
 
             // A signal asked us to shut down: leave the TUI so `run()` continues into its
             // drain/abandon ladder. Without this the TUI owns the terminal forever and the
-            // ladder never runs.
-            if state.read().await.shutdown_requested {
-                break;
+            // ladder never runs. Under `zkminer run` the ladder runs while the dashboard stays
+            // open instead, and closes it (`shutdown.done`) when the miner is about to exit.
+            {
+                let s = state.read().await;
+                if s.stop_handled_by_miner {
+                    if s.shutdown.as_ref().is_some_and(|v| v.done) {
+                        break;
+                    }
+                } else if s.shutdown_requested {
+                    break;
+                }
             }
 
             // Process actions that need the lock released
@@ -175,7 +229,10 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
         }
     }
 
-    // Cleanup terminal
+    // Cleanup terminal (unless `restore_terminal` already did)
+    if *TERMINAL.lock().unwrap_or_else(|p| p.into_inner()) {
+        return Ok(());
+    }
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -187,7 +244,46 @@ pub async fn run_tui(state: SharedState, chain_client: Option<ChainClient>) -> R
     Ok(())
 }
 
+/// Put the terminal back the way `run_tui` found it, for a caller about to `process::exit` while
+/// the dashboard is still open (a force exit); harmless when it is not.
+pub fn restore_terminal() {
+    // Taken under the draw lock: a draw in progress finishes first, and none starts after. Not
+    // forever: a draw stuck writing to a terminal that stopped reading would hold it for good, and
+    // the caller (a force exit) must still exit; then the terminal is past restoring anyway.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut taken = loop {
+        match TERMINAL.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        }
+    };
+    if *taken || !RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    *taken = true;
+    ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+}
+
 fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKeyAction {
+    // Under `zkminer run`, quitting asks how to stop and the stop runs with the dashboard open
+    // (screens::stop); the keys below then never see a quit.
+    if state.stop_handled_by_miner && screens::stop::handle_key(state, key) {
+        return PostKeyAction::None;
+    }
     let quitting = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
     if state.return_to_setup_after_benchmark
@@ -271,7 +367,9 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         // Screen-specific keys
         KeyCode::Up | KeyCode::Char('k') => match state.current_screen {
             Screen::Jobs => {
-                state.selected_job_index = state.selected_job_index.saturating_sub(1);
+                state.move_jobs_cursor(-1);
+                // Job Detail then follows the highlight, not the job Enter picked earlier.
+                state.selected_job_id = None;
             }
             Screen::Logs => {
                 state.log_scroll = state.log_scroll.saturating_add(1);
@@ -286,8 +384,8 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         },
         KeyCode::Down | KeyCode::Char('j') => match state.current_screen {
             Screen::Jobs => {
-                let max = state.open_jobs.len().saturating_sub(1);
-                state.selected_job_index = (state.selected_job_index + 1).min(max);
+                state.move_jobs_cursor(1);
+                state.selected_job_id = None;
             }
             Screen::Logs => {
                 state.log_scroll = state.log_scroll.saturating_sub(1);
@@ -303,8 +401,12 @@ fn handle_key(state: &mut MinerState, key: crossterm::event::KeyEvent) -> PostKe
         KeyCode::Enter | KeyCode::Char(' ') => match state.current_screen {
             Screen::Jobs => {
                 if key.code == KeyCode::Enter {
-                    if let Some(job) = state.open_jobs.get(state.selected_job_index) {
-                        state.selected_job_id = Some(job.info.job_id);
+                    let picked = state
+                        .jobs_page_rows()
+                        .get(state.jobs_cursor())
+                        .map(|job| job.info.job_id);
+                    if let Some(id) = picked {
+                        state.selected_job_id = Some(id);
                         state.current_screen = Screen::JobDetail;
                     }
                 }
@@ -798,6 +900,16 @@ async fn setup_stake_async(state: SharedState, chain_client: std::sync::Arc<Opti
         }
     };
 
+    // Not into a deployment `zkminer run` would refuse (a stale config naming an abandoned stack):
+    // the same check `zkminer stake` makes.
+    if let Err(e) = client.verify_deployment().await {
+        let mut s = state.write().await;
+        s.setup_status.pending_action = None;
+        let msg = format!("Not staking: the configured deployment did not pass its check: {e:#}");
+        s.setup_status.last_error = Some(msg.clone());
+        s.add_log(LogLevel::Error, msg);
+        return;
+    }
     // Stake the minimum amount (100 HEMI)
     let stake_amount = MIN_STAKE_WEI;
     match client.approve_and_stake(stake_amount).await {
@@ -874,8 +986,18 @@ fn draw(f: &mut Frame, state: &MinerState) {
 
     f.render_widget(tabs, chunks[0]);
 
-    // --- Content ---
-    let content_area = chunks[1];
+    // --- Content --- (with the shutdown panel under it while the miner stops)
+    let (content_area, panel_area) = match &state.shutdown {
+        Some(view) => {
+            let h = screens::stop::panel_height(view, chunks[1].width).min(chunks[1].height / 2);
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(h)])
+                .split(chunks[1]);
+            (split[0], Some(split[1]))
+        }
+        None => (chunks[1], None),
+    };
     match state.current_screen {
         Screen::Setup => screens::setup::render(f, content_area, state),
         Screen::Dashboard => screens::dashboard::render(f, content_area, state),
@@ -886,20 +1008,30 @@ fn draw(f: &mut Frame, state: &MinerState) {
         Screen::Logs => screens::logs::render(f, content_area, state),
         Screen::Settings => screens::settings::render(f, content_area, state),
     }
+    if let (Some(view), Some(area)) = (&state.shutdown, panel_area) {
+        screens::stop::render_panel(f, area, view);
+    }
+    screens::stop::render_prompt(f, chunks[1], state);
 
     // --- Status bar ---
     let mut left_spans: Vec<Span> = Vec::new();
 
-    // Connection badge
-    if state.connected {
-        left_spans.push(Span::styled(" CONNECTED ", theme::badge_ok()));
-    } else {
-        let badge = if state.tick_count.is_multiple_of(2) {
-            theme::badge_error()
-        } else {
-            theme::error()
-        };
-        left_spans.push(Span::styled(" DISCONNECTED ", badge));
+    // Connection badge, from the age of the last successful chain read
+    match state.chain_link() {
+        crate::state::ChainLink::Up => {
+            left_spans.push(Span::styled(" CONNECTED ", theme::badge_ok()));
+        }
+        crate::state::ChainLink::Stale(age) => {
+            left_spans.push(Span::styled(format!(" STALE {age}s "), theme::badge_warn()));
+        }
+        crate::state::ChainLink::Down => {
+            let badge = if state.tick_count.is_multiple_of(2) {
+                theme::badge_error()
+            } else {
+                theme::error()
+            };
+            left_spans.push(Span::styled(" DISCONNECTED ", badge));
+        }
     }
 
     // Developer mode: never on a public market, so it is never out of sight.
@@ -911,8 +1043,21 @@ fn draw(f: &mut Frame, state: &MinerState) {
         ));
     }
 
-    // Paused badge
-    if state.paused {
+    // A lock was slashed: no new claims until `zkminer resume-claims`. Never out of sight.
+    if state.claims_latched.is_some() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            " SLASHED: CLAIMS STOPPED (zkminer resume-claims) ",
+            theme::badge_error(),
+        ));
+    }
+
+    // Paused badge (STOPPING once the miner is shutting down: it is paused for that, and `p`
+    // cannot resume it)
+    if state.shutdown.is_some() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(" STOPPING ", theme::badge_warn()));
+    } else if state.paused {
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(" PAUSED ", theme::badge_warn()));
     }
@@ -934,7 +1079,16 @@ fn draw(f: &mut Frame, state: &MinerState) {
     left_spans.push(Span::styled(
         format!(
             "Locked: {}  Available: {}  ",
-            state.active_jobs.len(),
+            // Held locks hold collateral too (`kept_locks`); each job once.
+            state.active_jobs.len()
+                + state
+                    .kept_locks
+                    .iter()
+                    .filter(|k| !state
+                        .active_jobs
+                        .iter()
+                        .any(|a| a.info.job_id == k.info.job_id))
+                    .count(),
             state.open_jobs.len()
         ),
         Style::default().fg(theme::text()),
@@ -942,8 +1096,11 @@ fn draw(f: &mut Frame, state: &MinerState) {
 
     // Right-aligned keybind hints
     let mut right_spans: Vec<Span> = Vec::new();
-    right_spans.extend(theme::status_keybind("q", ":quit  "));
-    right_spans.extend(theme::status_keybind("p", ":pause  "));
+    // While stopping, the panel above names the keys; quit and pause no longer apply.
+    if state.shutdown.is_none() {
+        right_spans.extend(theme::status_keybind("q", ":quit  "));
+        right_spans.extend(theme::status_keybind("p", ":pause  "));
+    }
     right_spans.push(Span::styled("T", Style::default().fg(theme::peach())));
     right_spans.push(Span::styled(
         format!(":{name}  ", name = theme::active_theme().name()),
@@ -1021,5 +1178,76 @@ mod unusable_benchmark_tests {
         let log = logged(&s);
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(log[0].1.contains("SIMULATED") && log[0].1.contains("nothing was"));
+    }
+}
+
+#[cfg(test)]
+mod stop_view_tests {
+    use super::*;
+    use crate::state::{ShutdownStage, ShutdownView, StopPrompt};
+    use ratatui::backend::TestBackend;
+
+    fn screen(state: &MinerState, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, state)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// While the miner stops, every screen shows the shutdown panel (stage, status, what it said,
+    /// the keys) and the STOPPING badge; a confirmation draws over it.
+    #[test]
+    fn the_shutdown_panel_and_its_prompt_show_on_every_screen() {
+        for screen_kind in Screen::all() {
+            let mut view = ShutdownView::new(ShutdownStage::Draining);
+            view.status = "draining: 2 job(s) still in flight".into();
+            view.lines
+                .push("DRAINING — finishing in-flight proofs, no new claims.".into());
+            let mut state = MinerState {
+                stop_handled_by_miner: true,
+                paused: true,
+                shutdown: Some(view),
+                current_screen: *screen_kind,
+                ..MinerState::default()
+            };
+            let out = screen(&state, 100, 30);
+            for want in [
+                "STOPPING — DRAINING",
+                "2 job(s) still in flight",
+                "[a] abandon",
+                "[k] keep locks",
+            ] {
+                assert!(
+                    out.contains(want),
+                    "{screen_kind:?}: {want} missing:\n{out}"
+                );
+            }
+            let status_bar = out.lines().last().unwrap_or_default();
+            assert!(status_bar.contains(" STOPPING "), "the badge: {status_bar}");
+            assert!(!status_bar.contains("q:quit"), "{status_bar}");
+            state.stop_prompt = Some(StopPrompt::Confirm(crate::state::StopMode::Abandon));
+            let out = screen(&state, 100, 30);
+            assert!(out.contains("Abandon?") && out.contains("[y]"), "{out}");
+        }
+    }
+
+    /// The smallest terminal still shows the panel without panicking.
+    #[test]
+    fn a_small_terminal_still_draws() {
+        let state = MinerState {
+            stop_handled_by_miner: true,
+            shutdown: Some(ShutdownView::new(ShutdownStage::Abandoning)),
+            stop_prompt: Some(StopPrompt::Quit),
+            ..MinerState::default()
+        };
+        let out = screen(&state, 40, 10);
+        assert!(out.contains("RELEASING"), "the panel itself: {out}");
     }
 }

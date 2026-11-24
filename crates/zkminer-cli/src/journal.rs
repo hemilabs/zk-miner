@@ -100,10 +100,27 @@ pub struct JournalEntry {
     /// another rule can say that this lock's guest may now commit something else. `None` in a
     /// breadcrumb written before the rule was recorded.
     pub sys_rand_rule: Option<String>,
+    /// The cycles the job measured at before it was claimed, and how long that execution took in
+    /// seconds, so a restart still shows how far its proof is. `None` in a breadcrumb written before
+    /// they were recorded.
+    pub measured_cycles: Option<u64>,
+    pub measured_execute_secs: Option<u64>,
     /// For a witness-construction lock, the bundle it is proven from (format 2). `None` for an
     /// inline job and in every format-1 entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<WitnessBundleRef>,
+    /// Proofs of this job that started and never ended: each start counts one, and the proof's end
+    /// in the same run (proved, failed or stopped) takes it back, so what is left counts runs that
+    /// ended in the middle of its proof (the miner killed or crashed). A guest that breaks out of
+    /// its worker and ends the miner every time the job is proven again leaves one more each time,
+    /// and the job is released at a limit rather than proven forever (`run::crash_loop_refusal`).
+    /// Absent (0) in an entry written before it was recorded; an older build ignores it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub prove_starts: u8,
+}
+
+fn is_zero(n: &u8) -> bool {
+    *n == 0
 }
 
 impl Default for JournalEntry {
@@ -119,7 +136,10 @@ impl Default for JournalEntry {
             lock_reopens: None,
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
+            measured_cycles: None,
+            measured_execute_secs: None,
             witness: None,
+            prove_starts: 0,
         }
     }
 }
@@ -136,7 +156,60 @@ pub struct JobJournal {
     /// nothing is lost (an operator, or a newer build, can still read them).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub unparsed: BTreeMap<String, serde_json::Value>,
+    /// Jobs released because the miner kept ending in the middle of their proofs (JOB-CRASH-LOOP),
+    /// by job id: not claimed again, nor their submitter's jobs of the same program for a while
+    /// ([`Self::crash_loop_hold`]). Outlives the job's entry, which its release removes. An older
+    /// build ignores it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub crash_looped: BTreeMap<B256, CrashLoopMark>,
+    /// The address whose locks these are: the signer of the miner that last saved it
+    /// ([`set_owner`]). `None` in a journal written before it was recorded (stamped at its next
+    /// save). A miner started with another key refuses to take the journal over while it holds
+    /// entries ([`JobJournal::key_changed_refusal`]). An older build ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prover: Option<Address>,
 }
+
+/// The signer of this process's miner, stamped into every journal it saves ([`JobJournal::prover`]).
+static OWNER: std::sync::OnceLock<Address> = std::sync::OnceLock::new();
+
+/// The address this journal's locks belonged to before a key change the operator accepted
+/// (`run --forget-foreign-locks`): recovery pages each lock still held by it.
+static PREVIOUS_OWNER: std::sync::OnceLock<Address> = std::sync::OnceLock::new();
+
+/// Record `address` as the owner of every journal this process saves from now on (once per
+/// process: a later call is ignored).
+pub fn set_owner(address: Address) {
+    let _ = OWNER.set(address);
+}
+
+/// Record that the journal's locks belonged to `address` before a key change that was accepted.
+pub fn set_previous_owner(address: Address) {
+    let _ = PREVIOUS_OWNER.set(address);
+}
+
+/// See [`set_previous_owner`].
+pub fn previous_owner() -> Option<Address> {
+    PREVIOUS_OWNER.get().copied()
+}
+
+/// A job released as a crash loop ([`JobJournal::crash_looped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrashLoopMark {
+    pub program_id: B256,
+    pub submitter: Address,
+    /// Unix seconds.
+    pub at: i64,
+}
+
+/// How long a crash-looped job id is not claimed again (a job's window is at most 7 days).
+pub const CRASH_LOOP_JOB_HOLD_SECS: i64 = 7 * 24 * 3600;
+
+/// How long a crash-looped job's submitter is not claimed from for the same program.
+pub const CRASH_LOOP_PAIR_HOLD_SECS: i64 = 24 * 3600;
+
+/// How many crash-loop marks are kept at most: the oldest go first.
+const CRASH_LOOP_MARKS_MAX: usize = 1000;
 
 impl Default for JobJournal {
     fn default() -> Self {
@@ -144,6 +217,8 @@ impl Default for JobJournal {
             format_version: JOURNAL_FORMAT_VERSION,
             entries: HashMap::new(),
             unparsed: BTreeMap::new(),
+            crash_looped: BTreeMap::new(),
+            prover: None,
         }
     }
 }
@@ -234,6 +309,21 @@ fn parse_journal(content: &str) -> std::result::Result<(JobJournal, Vec<String>)
             j.unparsed.entry(k.clone()).or_insert_with(|| e.clone());
         }
     }
+    // A mark that does not parse is dropped: it only holds claims back.
+    if let Some(serde_json::Value::Object(marks)) = obj.get("crash_looped") {
+        for (k, m) in marks {
+            if let (Ok(id), Ok(m)) = (
+                k.parse::<B256>(),
+                serde_json::from_value::<CrashLoopMark>(m.clone()),
+            ) {
+                j.crash_looped.insert(id, m);
+            }
+        }
+    }
+    // An owner that does not parse is as none: the journal is stamped again at its next save.
+    j.prover = obj
+        .get("prover")
+        .and_then(|p| serde_json::from_value::<Address>(p.clone()).ok());
     let unparsed = j.unparsed.keys().cloned().collect();
     Ok((j, unparsed))
 }
@@ -276,6 +366,27 @@ impl JobJournal {
             );
         }
         Ok(j)
+    }
+
+    /// The journal at the default path as it is, for a report (`zkminer doctor`, `zkminer stop`, a
+    /// forced exit): empty when it is missing, unreadable or does not parse, and never moved aside,
+    /// which only a run that takes the journal over does ([`Self::load_checked`]).
+    pub fn peek() -> Self {
+        std::fs::read_to_string(Self::default_path())
+            .ok()
+            .and_then(|content| parse_journal(&content).ok())
+            .map(|(j, _)| j)
+            .unwrap_or_default()
+    }
+
+    /// As [`Self::peek`], but saying why a journal that is there could not be read (`zkminer
+    /// status`): an empty journal must not be reported for one that did not parse.
+    pub fn peek_checked() -> std::result::Result<Self, String> {
+        match std::fs::read_to_string(Self::default_path()) {
+            Ok(content) => parse_journal(&content).map(|(j, _)| j),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// [`Self::load_checked_from`] without the logging, for tests.
@@ -343,6 +454,24 @@ impl JobJournal {
             .clone()
     }
 
+    /// Review 7 WR-1: why a miner signing as `signer` must not take this journal over: it holds
+    /// entries (parsed or not), and they belong to another address. Its recovery would see each of
+    /// those locks held by "another prover" and drop it, leaving it to be slashed. `None` for an
+    /// empty journal, one of `signer`'s, or one written before the owner was recorded.
+    pub fn key_changed_refusal(&self, signer: Address) -> Option<String> {
+        let owner = self.prover.filter(|&p| p != signer)?;
+        let held = self.entries.len() + self.unparsed.len();
+        if held == 0 {
+            return None;
+        }
+        Some(format!(
+            "the job journal holds {held} job(s) claimed by {owner:?}, but this config signs as \
+             {signer:?}: the key changed. Start with the key of {owner:?} to drive them (put its \
+             key file back, or `zkminer init --import-env-key`), or, to give them up and accept \
+             they will be slashed, `zkminer run --forget-foreign-locks`"
+        ))
+    }
+
     /// Job ids of the entries that did not parse but whose key is a job id: an authoritative read
     /// of each can show it terminal ([`Self::drop_unparsed`]).
     pub fn unparsed_job_ids(&self) -> Vec<B256> {
@@ -357,17 +486,31 @@ impl JobJournal {
         before - self.unparsed.len()
     }
 
+    /// This journal as it is written: in this build's format, owned by `owner` when known (else
+    /// by whoever it was read as owned by).
+    fn stamped(&self, owner: Option<Address>) -> Self {
+        let mut out = self.clone();
+        out.format_version = JOURNAL_FORMAT_VERSION;
+        if owner.is_some() {
+            out.prover = owner;
+        }
+        out
+    }
+
     pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create journal dir {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        let mut out = self.clone();
-        out.format_version = JOURNAL_FORMAT_VERSION;
+        let out = self.stamped(OWNER.get().copied());
         let content = serde_json::to_string_pretty(&out).context("Failed to serialize journal")?;
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("Failed to write journal tmp {}", tmp.display()))?;
+        // Windows, with Low-integrity workers: unreadable to them from its creation.
+        #[cfg(windows)]
+        let written = zkminer_prover::windows_sandbox::write_secret_file(&tmp, content.as_bytes());
+        #[cfg(not(windows))]
+        let written = std::fs::write(&tmp, content);
+        written.with_context(|| format!("Failed to write journal tmp {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("Failed to rename journal tmp to {}", path.display()))?;
         Ok(())
@@ -389,7 +532,10 @@ impl JobJournal {
             lock_reopens: None,
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
+            measured_cycles: None,
+            measured_execute_secs: None,
             witness: None,
+            prove_starts: 0,
         });
         // A new claim: whatever was seen of an earlier lock on this job says nothing about it (a
         // read showing the new claim pending, at a higher reopen count, would look like proof that
@@ -431,7 +577,10 @@ impl JobJournal {
             lock_reopens: None,
             measured_po2s: Vec::new(),
             sys_rand_rule: None,
+            measured_cycles: None,
+            measured_execute_secs: None,
             witness: None,
+            prove_starts: 0,
         });
         if claim_tx.is_some() {
             e.claim_tx = claim_tx;
@@ -476,6 +625,22 @@ impl JobJournal {
     }
 
     /// The sizes recorded for a job (see [`JournalEntry::measured_po2s`]).
+    /// Record the cycles a claim about to be sent measured at, and how long measuring took (see
+    /// [`JournalEntry::measured_cycles`]). Kept when there is none to record.
+    pub fn note_measured_cycles(
+        &mut self,
+        job_id: B256,
+        cycles: Option<u64>,
+        execute_secs: Option<u64>,
+    ) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            if cycles.is_some() {
+                e.measured_cycles = cycles;
+                e.measured_execute_secs = execute_secs;
+            }
+        }
+    }
+
     pub fn measured_po2s(&self, job_id: B256) -> Vec<u8> {
         self.entries
             .get(&job_id)
@@ -487,6 +652,108 @@ impl JobJournal {
         if let Some(e) = self.entries.get_mut(&job_id) {
             e.state = JournalState::Proving;
         }
+    }
+
+    /// A proof of `job_id` starts: one more unfinished start ([`JournalEntry::prove_starts`]).
+    pub fn note_prove_start(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = e.prove_starts.saturating_add(1);
+        }
+    }
+
+    /// That proof ended in this run, however: its start no longer counts.
+    pub fn note_prove_end(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = e.prove_starts.saturating_sub(1);
+        }
+    }
+
+    /// How many proofs of `job_id` started in runs that ended before they did.
+    pub fn prove_starts(&self, job_id: B256) -> u8 {
+        self.entries.get(&job_id).map_or(0, |e| e.prove_starts)
+    }
+
+    /// A proof of `job_id` completed: the runs that ended in the middle of its earlier proofs no
+    /// longer count, so the limit counts runs in a row ([`JournalEntry::prove_starts`]).
+    pub fn note_prove_completed(&mut self, job_id: B256) {
+        if let Some(e) = self.entries.get_mut(&job_id) {
+            e.prove_starts = 0;
+        }
+    }
+
+    /// `job_id`, of `program_id` from `submitter`, is released as a crash loop at `now` (unix
+    /// seconds): marked so it is not claimed again ([`Self::crash_loop_hold`]). Marks past their hold
+    /// are dropped, and the oldest beyond [`CRASH_LOOP_MARKS_MAX`].
+    pub fn mark_crash_looped(
+        &mut self,
+        job_id: B256,
+        program_id: B256,
+        submitter: Address,
+        now: i64,
+    ) {
+        self.crash_looped.insert(
+            job_id,
+            CrashLoopMark {
+                program_id,
+                submitter,
+                at: now,
+            },
+        );
+        self.crash_looped
+            .retain(|_, m| now.saturating_sub(m.at) < CRASH_LOOP_JOB_HOLD_SECS);
+        while self.crash_looped.len() > CRASH_LOOP_MARKS_MAX {
+            let Some(oldest) = self
+                .crash_looped
+                .iter()
+                .min_by_key(|(_, m)| m.at)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.crash_looped.remove(&oldest);
+        }
+    }
+
+    /// Why `job_id` (of `program_id`, from `submitter`) is not claimed at `now`, if a crash-loop mark
+    /// holds it: the job itself was released as one in the last [`CRASH_LOOP_JOB_HOLD_SECS`], or a job
+    /// of the same program from the same submitter in the last [`CRASH_LOOP_PAIR_HOLD_SECS`]. With
+    /// the seconds the hold has left.
+    pub fn crash_loop_hold(
+        &self,
+        job_id: B256,
+        submitter: Address,
+        program_id: B256,
+        now: i64,
+    ) -> Option<(String, i64)> {
+        if let Some(m) = self.crash_looped.get(&job_id) {
+            let left =
+                m.at.saturating_add(CRASH_LOOP_JOB_HOLD_SECS)
+                    .saturating_sub(now);
+            if left > 0 {
+                return Some((
+                    "it was released as a crash loop: the miner kept ending in the middle of its \
+                     proof"
+                        .to_string(),
+                    left,
+                ));
+            }
+        }
+        self.crash_looped
+            .values()
+            .filter(|m| m.submitter == submitter && m.program_id == program_id)
+            .map(|m| {
+                m.at.saturating_add(CRASH_LOOP_PAIR_HOLD_SECS)
+                    .saturating_sub(now)
+            })
+            .filter(|left| *left > 0)
+            .max()
+            .map(|left| {
+                (
+                    "another job of its program from its submitter was released as a crash loop"
+                        .to_string(),
+                    left,
+                )
+            })
     }
 
     pub fn mark_fulfilling(&mut self, job_id: B256) {
@@ -776,6 +1043,84 @@ mod tests {
         assert!(!j.entries.contains_key(&jid));
     }
 
+    /// A proof that ends in its run takes its start back; one whose run ended first (the miner
+    /// killed mid-proof) stays counted across a save and a load, and an entry written before the
+    /// count existed (or with none) loads at 0 and writes none.
+    #[test]
+    fn unfinished_proof_starts_survive_a_restart() {
+        let path = tmp_path("prove-starts");
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x07);
+        j.mark_claimed(jid, None, 100);
+        j.note_prove_start(jid);
+        j.note_prove_end(jid);
+        assert_eq!(j.prove_starts(jid), 0);
+        assert!(!serde_json::to_string(&j).unwrap().contains("prove_starts"));
+        for _ in 0..2 {
+            j.note_prove_start(jid);
+            j.save_to(&path).unwrap();
+            j = JobJournal::load_checked_from(&path).unwrap();
+        }
+        assert_eq!(j.prove_starts(jid), 2);
+        j.note_prove_end(jid);
+        j.note_prove_end(jid);
+        j.note_prove_end(jid);
+        assert_eq!(j.prove_starts(jid), 0, "never below 0");
+        assert_eq!(j.prove_starts(B256::ZERO), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A completed proof resets the count (it counts runs in a row); a crash-loop mark survives a
+    /// save and a load and the job's own removal, holds the job for its window and its submitter's
+    /// jobs of the same program for a day, and is dropped after.
+    #[test]
+    fn crash_loop_marks_survive_a_restart_and_expire() {
+        let path = tmp_path("crash-looped");
+        let mut j = JobJournal::default();
+        let (jid, other) = (B256::repeat_byte(0x51), B256::repeat_byte(0x52));
+        let (program, submitter) = (B256::repeat_byte(0x61), Address::repeat_byte(0x71));
+        j.mark_claimed(jid, None, 100);
+        j.note_prove_start(jid);
+        j.note_prove_start(jid);
+        j.note_prove_completed(jid);
+        assert_eq!(j.prove_starts(jid), 0);
+
+        let now = 1_800_000_000;
+        assert_eq!(j.crash_loop_hold(jid, submitter, program, now), None);
+        j.mark_crash_looped(jid, program, submitter, now);
+        j.remove(jid);
+        j.save_to(&path).unwrap();
+        let j = JobJournal::load_checked_from(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(j
+            .crash_loop_hold(jid, submitter, program, now + 60)
+            .is_some());
+        // Its submitter's other job of the same program: a day.
+        let (_, left) = j
+            .crash_loop_hold(other, submitter, program, now + 60)
+            .unwrap();
+        assert_eq!(left, CRASH_LOOP_PAIR_HOLD_SECS - 60);
+        assert_eq!(
+            j.crash_loop_hold(other, submitter, program, now + CRASH_LOOP_PAIR_HOLD_SECS),
+            None
+        );
+        // Another program, or another submitter: not held.
+        assert_eq!(j.crash_loop_hold(other, submitter, B256::ZERO, now), None);
+        assert_eq!(j.crash_loop_hold(other, Address::ZERO, program, now), None);
+        // The job itself: its window, then free.
+        assert!(j
+            .crash_loop_hold(jid, submitter, program, now + CRASH_LOOP_PAIR_HOLD_SECS)
+            .is_some());
+        assert_eq!(
+            j.crash_loop_hold(jid, submitter, program, now + CRASH_LOOP_JOB_HOLD_SECS),
+            None
+        );
+        // Expired marks are dropped at the next mark.
+        let mut j = j;
+        j.mark_crash_looped(other, program, submitter, now + CRASH_LOOP_JOB_HOLD_SECS);
+        assert_eq!(j.crash_looped.len(), 1);
+    }
+
     #[test]
     fn a_claims_measured_sizes_are_kept_across_a_restart() {
         let path = tmp_path("po2s");
@@ -799,5 +1144,78 @@ mod tests {
         // A breadcrumb written before sizes were recorded loads with none.
         let old: JournalEntry = serde_json::from_str(r#"{"job_id":"0x0505050505050505050505050505050505050505050505050505050505050505","claimed_at":1,"lock_deadline":9,"state":"Claimed"}"#).unwrap();
         assert!(old.measured_po2s.is_empty());
+    }
+
+    #[test]
+    fn a_claims_measured_cycles_are_kept_across_a_restart() {
+        let path = tmp_path("cycles");
+        let _ = std::fs::remove_file(&path);
+        let mut j = JobJournal::default();
+        let jid = B256::repeat_byte(0x08);
+        j.record_claim_intent(jid, 100, None);
+        j.note_measured_cycles(jid, Some(85_000_000), Some(4));
+        // A later claim without a measurement keeps the one recorded.
+        j.note_measured_cycles(jid, None, None);
+        j.save_to(&path).unwrap();
+        let e = JobJournal::load_checked_from(&path).unwrap().entries[&jid].clone();
+        assert_eq!(
+            (e.measured_cycles, e.measured_execute_secs),
+            (Some(85_000_000), Some(4))
+        );
+        std::fs::remove_file(&path).unwrap();
+        // A breadcrumb written before cycles were recorded loads with none.
+        let old: JournalEntry = serde_json::from_str(r#"{"job_id":"0x0505050505050505050505050505050505050505050505050505050505050505","claimed_at":1,"lock_deadline":9,"state":"Claimed"}"#).unwrap();
+        assert_eq!(old.measured_cycles, None);
+    }
+
+    /// Review 7 WR-1: the journal records whose locks it holds. A miner with another key refuses
+    /// to take over one with entries; an empty one, its own, or one written before the owner was
+    /// recorded (then stamped at its next save) is taken over.
+    #[test]
+    fn a_journal_of_another_address_is_not_taken_over() {
+        let a: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let b: Address = "0x00000000000000000000000000000000000000bb"
+            .parse()
+            .unwrap();
+        let mut j = JobJournal::default();
+        j.record_claim_intent(B256::repeat_byte(1), 1, None);
+        // Written before the owner was recorded: accepted, and stamped with the new owner.
+        assert_eq!(j.prover, None);
+        assert_eq!(j.key_changed_refusal(b), None);
+        assert_eq!(j.stamped(Some(b)).prover, Some(b));
+        assert_eq!(j.stamped(None).prover, None);
+        // Owned by `a`: round-trips through the file, and `b` is refused.
+        j.prover = Some(a);
+        let path = tmp_path("owner");
+        j.save_to(&path).unwrap();
+        let loaded = JobJournal::load_checked_from(&path).unwrap();
+        assert_eq!(loaded.prover, Some(a));
+        let why = loaded
+            .key_changed_refusal(b)
+            .expect("another key is refused");
+        assert!(
+            why.contains(&format!("{a:?}"))
+                && why.contains(&format!("{b:?}"))
+                && why.contains("--forget-foreign-locks"),
+            "{why}"
+        );
+        assert_eq!(loaded.key_changed_refusal(a), None);
+        // Empty: nothing to lose.
+        let mut empty = loaded.clone();
+        empty.entries.clear();
+        assert_eq!(empty.key_changed_refusal(b), None);
+        // An entry that did not parse counts.
+        empty.unparsed.insert("x".into(), serde_json::Value::Null);
+        assert!(empty.key_changed_refusal(b).is_some());
+        // An old journal without the field, or an owner that does not parse, loads as unowned.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.replace(&format!("{a:?}"), "not-an-address");
+        std::fs::write(&path, text).unwrap();
+        let loaded = JobJournal::load_checked_from(&path).unwrap();
+        assert_eq!(loaded.prover, None);
+        assert_eq!(loaded.entries.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

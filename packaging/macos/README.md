@@ -86,21 +86,22 @@ Then, to mine on Hemi testnet (chain 743111, the HemiProve deployment of 2026-11
 
 ```sh
 export PATH="$HOME/.zkminer:$PATH"       # add to ~/.zshrc to keep it
-zkminer init                            # writes ~/.zkminer/config.toml for testnet, lists these steps
-export ZKMINER_PRIVATE_KEY=0x...        # the prover's key: a new key of your own for this miner
-zkminer stake 100                       # approve and stake 100 tHEMI (needs the tHEMI and ETH below)
+zkminer init --generate-key             # writes ~/.zkminer/config.toml for testnet and a new key file
+                                        # beside it, prints its address, lists these steps
+zkminer stake 150                       # approve and stake 150 tHEMI (needs the tHEMI and ETH below)
 zkminer status                          # balance, stake, collateral
 zkminer benchmark                       # optional: measures this Mac the way the miner does
 zkminer run
 ```
 
-- **The key.** zkminer reads it from `ZKMINER_PRIVATE_KEY` (the config's `[wallet]` can name
-  another variable, or a key file). It does not make one: `init --generate-key` is not implemented.
-  Use a key that holds nothing else.
+- **The key.** `init --generate-key` makes a new key in a file only you can read
+  (`~/.zkminer/key`) and points the config at it. Without it, `init` leaves the key to
+  `ZKMINER_PRIVATE_KEY` (`export ZKMINER_PRIVATE_KEY=0x...`; the config's `[wallet]` can name
+  another variable). Use a key that holds nothing else.
 - **tHEMI and gas.** Before `zkminer stake`, ask the HemiProve team for testnet ETH (gas; a Hemi
   testnet faucet also works) and tHEMI for the key's address. tHEMI is minted only by its owner.
-  Each job the miner holds at once locks at least 100 tHEMI of stake, so stake about 100 tHEMI per
-  job you want in flight. The first claim can come one block after the first stake.
+  A claim typically locks about 150 tHEMI of stake, so stake at least that per job you want in
+  flight. The first claim can come one block after the first stake.
 - **`zkminer benchmark`** takes about 4.5 to 5 minutes on an M5 Max (262-314 s measured, the first
   pipeline compile not included) and longer on a Mac with fewer GPU cores. `zkminer run` benchmarks
   by itself when no saved results cover this Mac, and claims no jobs until that is done.
@@ -109,8 +110,9 @@ Run `zkminer init` once, on the first install (with or without `--with-groth16`)
 existing `~/.zkminer/config.toml` alone, so an update needs no `init`. Do not run
 `zkminer init --force` after an update: it overwrites your config.
 
-Neither `zkminer` nor the worker has a `--version` flag: the kit's version, commit and risc0
-revision are in its `BUILDINFO` file, and `zkminer help` lists the commands.
+`zkminer --version` prints the CLI's version; the worker has no `--version` flag. The kit's
+version, commit and risc0 revision are in its `BUILDINFO` file, and `zkminer help` lists the
+commands.
 
 `~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark` exits with status 1 when any program
 (the warm-up included) does not prove and verify, after printing the rows of those that did.

@@ -1031,7 +1031,7 @@ pub fn configured_card_po2s(
     config: &ZkMinerConfig,
     suite: Option<&zkminer_prover::benchmark::BenchmarkSuite>,
 ) -> Option<(Vec<u8>, String)> {
-    use zkminer_prover::benchmark::{risc0_job_po2, RISC0_JOB_MIN_VRAM_BYTES};
+    use zkminer_prover::benchmark::{risc0_job_po2, RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED};
     use zkminer_prover_protocol::{BACKEND_RISC0, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let overrides = &config.prover.risc0_job_po2;
     let mut cards: Vec<(String, u8)> = Vec::new();
@@ -1044,11 +1044,12 @@ pub fn configured_card_po2s(
         .filter(|d| d.prover_backend == BACKEND_RISC0)
     {
         let over = overrides.get(&row.device_id).copied();
-        if let Some(po2) = risc0_job_po2(over, Some(row), None) {
+        // The cache records no card's vendor: sized by the 14 GiB rule (`gpu_tag` other than cuda).
+        if let Some(po2) = risc0_job_po2(over, Some(row), None, "") {
             if !cards.iter().any(|(d, _)| *d == row.device_id) {
                 cards.push((row.device_id.clone(), po2));
                 // A CPU slot has no VRAM: the miner sizes it as one of unknown VRAM.
-                let under = risc0_job_po2(over, Some(row), Some(RISC0_JOB_MIN_VRAM_BYTES - 1));
+                let under = risc0_job_po2(over, Some(row), Some(RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED - 1), "");
                 if row.device_id != "cpu" && under != Some(po2) {
                     small.push((row.device_id.clone(), under));
                 }
@@ -2227,11 +2228,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            risc0_job_po2(None, Some(&calibrated), Some(12 * gib)),
+            risc0_job_po2(None, Some(&calibrated), Some(12 * gib), ""),
             Some(19)
         );
         assert_eq!(
-            risc0_job_po2(None, Some(&uncalibrated), Some(12 * gib)),
+            risc0_job_po2(None, Some(&uncalibrated), Some(12 * gib), ""),
             None
         );
         let config = ZkMinerConfig::default();

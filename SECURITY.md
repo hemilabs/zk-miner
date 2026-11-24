@@ -127,8 +127,13 @@ Every connection a requester can cause goes through one guard
     source the kernel picks, then with that source; a `from` rule that sends the connection to
     another table than the first lookup used is refused. (IPv6 looks the route up once, matching
     source rules inside that lookup, and is asked once.) Answers are reused for the life of one
-    facts snapshot (about a second). On Linux; macOS asks its routing socket instead (below),
-    and elsewhere every query fails, so a public-mode miner refuses every requester connection;
+    facts snapshot (about a second). On Linux; macOS asks its routing socket instead (below).
+    On Windows the routing table is read with
+    `GetIpForwardTable2` (one table, no policy rules) and `GetBestRoute2` is asked once per
+    destination (Windows does not route by port), judged the same way; interface kinds come from
+    `GetIfTable2`, and only a hardware Ethernet, Wi-Fi or mobile-broadband adapter with no VPN
+    name counts as physical. Elsewhere every query fails, so a public-mode miner refuses every
+    requester connection, and says so at start and in `zkminer status`;
   - **the site around each of the host's global IPv6 addresses**: its enclosing `/32`
     (`[egress] ipv6_site_prefix_len`, 16 to 64), what an organisation (a campus, a company)
     usually holds, whose other networks hold its other machines. This also refuses the rest of
@@ -230,10 +235,15 @@ Every connection a requester can cause goes through one guard
   kernel's matching of the ICMP error to the probe (on macOS through a private `TCP_INFO`
   layout). A box that hides hops (a second NAT router behind the ISP's, a VM's NAT, a VPN, a
   userspace NAT64) moves the limit: at `near_hop_limit` 2 it then does not reach the ISP's first
-  box. Paths whose first hops send no "time exceeded" refuse every destination. Windows has no
-  way to read the ICMP errors yet (`TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are
-  a possible path, unverified), so every decision there refuses; it already refuses every
-  requester connection in public mode. See "The near-hop probe's own limits" below and
+  box. Paths whose first hops send no "time exceeded" refuse every destination. **Public mode
+  is not supported on Windows:** Windows TCP does not end a connect on a router's Time Exceeded
+  (measured on Windows 11 with `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO`: every
+  hop-limited SYN to a public host times out, though `tracert` shows the routers answer), so
+  every decision there refuses: ELF, IPFS and Arweave downloads and `artifact publish` cannot
+  work, and each is refused at once with that reason. The miner says so at start and in
+  `zkminer status`. Run public mode on Linux or macOS. Developer mode (`[dev]
+  private_network`) is no substitute on a shared market, the Hemi testnet included: it lets
+  every requester reach this host's network (below). See "The near-hop probe's own limits" below and
   [docs/netguard-hardening.md](docs/netguard-hardening.md), "Near-hop rule: positive evidence".
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
@@ -573,11 +583,17 @@ executor:
   `FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, their 32-bit twins, `FS_IOC_ENABLE_VERITY`) are
   refused like the rest.
 - **Ending.** Nothing a worker started outlives it. Where the miner runs in a cgroup delegated to
-  it (as witness jobs need: a systemd service with `Delegate=yes`, or
+  it (as witness jobs need: a systemd service with `Delegate=yes`, such as
+  `contrib/zkminer.service` with `Delegate=cpu memory pids`, or
   `systemd-run --user --scope -p Delegate=yes`), each worker starts in a cgroup of its own below
   it (`zkminer-worker-<miner pid>-<n>`), joined before `exec`, with the worker's memory ceiling as
   its `memory.max`. Elsewhere the user's systemd manager adopts the worker into a transient scope,
-  and the miner sends it nothing (so no guest runs in it) until the scope holds it. Every end of a
+  and the miner sends it nothing (so no guest runs in it) until the scope holds it. Where neither
+  is possible (a system unit without `Delegate=` has no user manager), workers run with no memory
+  ceiling and no cgroup of their own: the miner says so at start-up (`PAGE: WORKERS-UNCAPPED`) and
+  `zkminer doctor` warns. A unit also needs `OOMPolicy=continue` (the contrib unit has it): a
+  worker's OOM kill counts in the unit's `memory.events`, and systemd's default `OOMPolicy=stop`
+  would stop the whole miner over it. Every end of a
   worker (a recycle, a timeout, a kill, its death, shutdown) writes that cgroup's `cgroup.kill`,
   which reaches every process in it whatever its process group or session. If the miner dies,
   however abruptly (SIGKILL, the OOM killer), a reaper it started with its first worker
@@ -595,6 +611,29 @@ executor:
   `clone3` fails as unimplemented (`ENOSYS`), since a filter cannot see its flags; libc then falls
   back to `clone`, so threads, `fork` and `posix_spawn` keep working. The worker and the
   supervised server check that `unshare` and `clone3` are refused before they run anything.
+  Nothing that controls the host either, as in the sandbox profiles: kernel modules
+  (`init_module`, `finit_module`, `delete_module`), `kexec_load`, `kexec_file_load`, `reboot`,
+  the clock (`clock_settime`, `clock_adjtime`, `settimeofday`, `adjtimex`), `swapon`, `swapoff`,
+  `acct`, `quotactl`, `quotactl_fd`, `syslog`, `sethostname`, `setdomainname` and, on x86_64,
+  `iopl`, `ioperm` and `uselib`; `personality` may only be queried or reset to `PER_LINUX`. No GPU
+  runtime makes these calls. A unit test holds the inline list against the profiles', so a call
+  the profiles start refusing has to be decided on for the workers too.
+- **Capabilities.** None, on any thread. Every worker drops them all first thing in `main`, while
+  it has one thread (the bounding set too, where it may, then the ambient, inheritable, permitted
+  and effective sets; a worker that held any, or runs as uid 0, also sets `NO_NEW_PRIVS`, so no
+  `exec` gives one back), so every thread and process it ever has, `sp1-gpu-server` included,
+  starts with none; the confinement checks every thread (`/proc/self/task/*/status`) and refuses
+  otherwise, and so does the supervised server. For a worker of an unprivileged uid this changes
+  nothing. A miner run as root still runs its workers as uid 0, without capabilities: Landlock's
+  grants do not look at the uid, so a guest that escaped its executor could read root's files
+  among those a worker may read (`/etc` is one: `/etc/shadow`, SSH host keys, a service's
+  `EnvironmentFile`). So `zkminer run` as root on a bare host logs `PAGE: RUNNING-AS-ROOT`, and
+  `zkminer doctor` warns of it; in a container it is a warning (Docker's default capability set
+  and seccomp profile already refuse what root would add, and the container's `/etc` is its own).
+  The miner is not refused as root: the dashboard's GPU tuning needs it. A worker that dropped
+  to another uid as well would need its GPU device nodes, its provers (under `/root`, mode 0700),
+  `~/.sp1`, its GPU caches and its temporary directories to be that uid's; run the miner as an
+  unprivileged user instead.
 - **`sp1-gpu-server`** runs every SP1 proof's guest, so it is confined from its first
   instruction. The SDK starts it as `~/.sp1/bin/zkminer-confined-<name>`, a link to the worker,
   which starts the real server under a supervisor: the server's `socket`, `bind`, `listen` and
@@ -637,6 +676,62 @@ executor:
 Linux with Landlock ABI 6 or later is required; a worker with more than one thread at the moment
 it confines itself (the SP1 worker, a GPU runtime's threads) needs ABI 8
 (`LANDLOCK_RESTRICT_SELF_TSYNC`), or it refuses to run guests.
+
+## Windows workers: Low integrity
+
+Windows has no Landlock or seccomp, and `confine()` does nothing there. The workers are kept
+from the operator's key by the Windows integrity levels instead
+(`crates/zkminer-prover/src/windows_sandbox.rs`), on the same assumption that a guest can
+escape its executor:
+
+- **Low integrity, by default.** Each worker is created suspended, lowered to Low and resumed
+  in a job of its own (no desktop, clipboard or breakaway). `ZKMINER_WINDOWS_LOW_IL_WORKERS=0`
+  runs them at Medium instead, as the operator's own processes; that is paged at every start
+  (`PAGE: MEDIUM-WORKERS`) and `zkminer doctor` warns.
+- **The key.** The key file, `~/.zkminer/.env` and the job journal carry a Medium no-read-up
+  label, read back after it is set. A file the account can neither label nor, as its owner, open
+  to labelling (one another account owns and made private to it without `WO`) is paged
+  (`PAGE: SECRETS-UNLABELLED`), and no Low worker starts until it is fixed.
+- **The miner.** Its process and threads grant the user only seeing, waiting for and ending them,
+  and carry a Medium no-write, no-read, no-execute-up label: a Low worker can neither read nor
+  end the miner. A job whose proof the miner died in the middle of in three runs in a row (counted
+  from when a worker accepts the proof) is released (`PAGE: JOB-CRASH-LOOP`) and marked in the
+  journal so it is not claimed again, so a guest that ends the miner each time cannot hold every
+  lock past its deadline. A proof is not started while its start cannot be recorded (a full disk:
+  `PAGE: DISK-LOW`, `PAGE: JOURNAL-UNWRITABLE`), which would keep that count from ever rising.
+- **Other workers.** A Low worker cannot open another's process or first thread (the same
+  label), nor the threads it starts later (each worker narrows its own, as the miner does).
+- **Files.** A Low worker writes only its temporary, cache and segment directories, which the
+  miner makes plain directories again before each Low worker (a file or a link a Low process
+  put there is removed, never followed). What a warm-up downloads or builds in the profile (the
+  SP1 server, the Groth16 artifacts) the worker binary installs first at Medium
+  (`--install-artifacts`), so no Low process writes anything a worker later runs or reads from
+  there.
+- **What an escaped guest in a Low worker can still do.** Use the network: a Low process has it,
+  and no firewall rule is installed. Read what the user's files grant Everyone or Users and the
+  user's files without a label (the operator's documents, `config.toml` with a keyed RPC URL,
+  unless they are kept elsewhere or labelled). Open, read and end the processes another Low
+  worker starts (SP1's `sp1-gpu-server`) and their threads, which keep the token's default DACL,
+  and tamper with the temporary and cache directories every Low worker shares (a poisoned kernel
+  cache, or a full disk), which can fail other jobs' proofs. Reach the GPU driver's kernel
+  interface. It cannot read the key, the miner's memory or the journal, nor write a file a
+  Medium worker or the miner later runs. With the network it can also cut the miner off its RPC
+  without ending it (the host's ephemeral ports held open, or the uplink flooded), so nothing
+  crashes and every held lock runs to a slash. The miner pages that (`PAGE: CHAIN-UNREACHABLE`),
+  and once no chain read has succeeded for 10 minutes with locks held and workers running it counts
+  the sockets each worker's processes hold (its job's, so a child is counted too). A worker past
+  the limits (more than 8 TCP or 4 UDP after its first 2 minutes; an honest one holds none while it
+  proves) is stopped, busy or not (`PAGE: WORKERS-RECYCLED`, with its slot, pids and sockets), and
+  its proof is retried without counting an attempt, twice per job at most. With no worker past
+  them, no proof is stopped. A stop of a suspect waits 30 minutes after the last; otherwise the gap
+  doubles with each recycle in the last 24 hours, up to 4 hours. Rate limits do not hold it back.
+  That ends a worker's hold on the network; it does not stop the same job's guest escaping again
+  when it is proven again, and a guest that floods the link through a socket or two stays under
+  the limits.
+
+Each GPU runtime must work at Low: a worker that fails there is paged with its binary's name and
+its last output (`PAGE: LOW-IL-WORKER-FAILED`, `PAGE: LOW-IL-WARMUP-FAILED`) and never falls back
+to Medium on its own.
 
 ## Witness jobs: the broker
 
@@ -777,6 +872,22 @@ no second one):
 
 ## Known limits
 
+- **A targeted outage slashes every lock held.** A submitter can single out one miner (assign it a
+  job, or post one only it measures), learn its IP address from the ELF download, and then flood
+  its link, or drop its traffic from an on-path position, until the locks pass their deadline and
+  grace: each is then slashed in full, and the miner reaches the chain through one RPC endpoint.
+  The miner bounds the collateral of every lock it holds and has not settled, across programs and
+  submitters, to `[prover] max_locked_stake_fraction` of the stake (default 0.5), counting each
+  lock until it settles. That bounds the loss of one round, not of an incident: the cap is taken of
+  the stake that is left, so a miner that went on claiming could be lured and cut off again, each
+  round taking that share of what remains. So a slash (the on-chain `jobsSlashed` rising, a lock
+  ending past its deadline) or a stake fall that a withdrawal and the miner's own release penalties
+  do not explain trips a persisted slash latch (`~/.zkminer/slash_latch.json`, labelled against
+  Low-integrity workers on Windows): `PAGE: SLASHED` / `PAGE: STAKE-DROP`, no new claims across
+  restarts until the operator runs `zkminer resume-claims`, held locks still driven. Clearing it
+  while the cause remains allows another round. None of this prevents the slash. Size the stake to
+  what you accept losing, and run on a DDoS-protected link where you can.
+
 - **DNS lookups leak, to public resolvers.** Resolving a requester's name tells the
   DNS-over-HTTPS resolver the name, and the name's own DNS servers that the resolver asked, and
   when (not this host's subnet: Client Subnet is asked off). Where the compiled-in resolvers are
@@ -820,7 +931,8 @@ no second one):
   - **Silent paths refuse.** A path whose routers at hops `N` to `N+2` send no "time exceeded"
     (many cloud providers' networks, EC2 included, and corporate edges that filter ICMP)
     refuses every destination, every time; a router rate-limiting its ICMP refuses some. Cloud
-    servers are out of scope for now. Windows refuses every decision (no ICMP plumbing yet).
+    servers are out of scope for now. Windows refuses every decision (its TCP does not report a
+    Time Exceeded; public mode is not supported there, above).
   - **Per-connection balancers.** The connection is made from a new local port, not the far
     probe's (the owner's decision: stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
     probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
@@ -847,7 +959,10 @@ no second one):
   traffic by source port, mark or cgroup, list what those paths reach in `[egress] deny_cidrs`.
   A destination rule into a table that routes it out the same uplink is refused all the same
   (refusing too much). Routes and rules are read on Linux; macOS reads its routes (it has no
-  rules; see "The network guard on macOS"); elsewhere neither.
+  rules; see "The network guard on macOS"); on Windows the one routing table is
+  read, and a WFP callout or a VPN client's per-application redirect is not followed. Windows
+  does not tell a PPPoE dial-up from a VPN, so a PPPoE uplink there needs `[egress]
+  internal_ranges` (`[]` if there are none).
 - **Public-address discovery depends on outside services.** If the reflectors cannot confirm
   a family's address (a firewall blocking outbound DNS and HTTPS to them, an outage), no
   requester connection goes out over that family until they can or `[egress]

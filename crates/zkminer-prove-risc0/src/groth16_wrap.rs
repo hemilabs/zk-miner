@@ -27,9 +27,7 @@
 
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
-#[cfg(not(target_os = "linux"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
@@ -434,12 +432,19 @@ pub fn helper_main() -> ! {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
-    #[cfg(target_os = "linux")]
-    let work = zkminer_witness_sandbox::confine::private_tmpdir("risc0-g16").ok();
-    #[cfg(not(target_os = "linux"))]
-    let work: Option<PathBuf> = None;
-    let Some(work) = work.or_else(|| Some(std::env::temp_dir())) else {
-        std::process::exit(1);
+    // Only a directory of its own, which it removes when it ends: never the shared temporary
+    // directory itself, whose other entries (other workers' directories, the wraps other helpers
+    // have mounted into their containers) its removal would take with it (review r6 LR-2).
+    let work = match private_workdir() {
+        Ok(work) => work,
+        Err(e) => {
+            eprintln!(
+                "zkminer: the Groth16 helper cannot make a working directory of its own under {} \
+                 ({e}); it serves no wrap",
+                std::env::temp_dir().display()
+            );
+            std::process::exit(1);
+        }
     };
     let code = serve(
         std::io::stdin().lock(),
@@ -449,6 +454,35 @@ pub fn helper_main() -> ! {
     );
     let _ = std::fs::remove_dir_all(&work);
     std::process::exit(code);
+}
+
+/// A new directory for the helper's wraps, readable by this user only, below the temporary
+/// directory: one it made itself, so the helper may remove it, and all below it, when it ends.
+fn private_workdir() -> std::io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        zkminer_witness_sandbox::confine::private_tmpdir("risc0-g16")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "zkminer-risc0-g16-{}-{nanos:09}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Not `recursive`: one already there is not ours.
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
+        Ok(dir)
+    }
 }
 
 /// Answers the requests on `input` on `output`, until `input` ends (0) or `output` fails (1).
@@ -586,6 +620,30 @@ fn read_proof(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review r6 LR-2: the helper works, and removes, only a directory it made itself, never the
+    /// shared temporary directory.
+    #[test]
+    fn the_helper_works_in_a_directory_of_its_own() {
+        let shared = std::env::temp_dir();
+        let a = private_workdir().unwrap();
+        let b = private_workdir().unwrap();
+        for dir in [&a, &b] {
+            assert_ne!(dir, &shared);
+            assert_eq!(dir.parent(), Some(shared.as_path()), "{}", dir.display());
+            assert!(std::fs::read_dir(dir).unwrap().next().is_none());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+                assert_eq!(mode & 0o077, 0, "{mode:o}");
+            }
+        }
+        assert_ne!(a, b);
+        for dir in [a, b] {
+            std::fs::remove_dir(dir).unwrap();
+        }
+    }
 
     /// A seal `to_json` takes: field elements anything, digests below BN254's modulus.
     fn a_seal(seed: u32) -> Vec<u8> {

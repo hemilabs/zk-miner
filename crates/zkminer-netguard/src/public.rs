@@ -920,14 +920,10 @@ mod tls {
         /// global address of the wanted family the trace reports (`ip=`), or why there is none.
         pub(super) fn poll(&mut self, want_v6: bool) -> Option<io::Result<IpAddr>> {
             if !self.connected {
-                match self.stream.peer_addr() {
-                    Ok(_) => self.connected = true,
-                    Err(_) => {
-                        return match self.stream.take_error() {
-                            Ok(Some(e)) | Err(e) => Some(Err(e)),
-                            Ok(None) => None,
-                        }
-                    }
+                match connect_done(&self.stream) {
+                    Ok(true) => self.connected = true,
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
                 }
             }
             let mut eof = false;
@@ -985,6 +981,48 @@ mod tls {
                 }
             }
         }
+    }
+
+    /// Whether a non-blocking connect has completed: `Ok(false)` while it is in progress, the
+    /// error it failed with. A connected socket has a peer.
+    #[cfg(not(windows))]
+    fn connect_done(stream: &TcpStream) -> io::Result<bool> {
+        match stream.peer_addr() {
+            Ok(_) => Ok(true),
+            Err(_) => match stream.take_error() {
+                Ok(Some(e)) | Err(e) => Err(e),
+                Ok(None) => Ok(false),
+            },
+        }
+    }
+
+    /// [`connect_done`] on Windows, where a socket whose connect is still in progress already
+    /// has a peer (`getpeername` succeeds, and a write then fails with `WSAENOTCONN`, which made
+    /// the reflector count as connected and failed): the connect is done once the socket is
+    /// writable (`WSAPoll`), and failed once it reports an error.
+    #[cfg(windows)]
+    fn connect_done(stream: &TcpStream) -> io::Result<bool> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLWRNORM, SOCKET, WSAPOLLFD,
+        };
+        let mut fd = WSAPOLLFD {
+            fd: stream.as_raw_socket() as SOCKET,
+            events: POLLWRNORM,
+            revents: 0,
+        };
+        // SAFETY: one valid WSAPOLLFD; a zero timeout does not block.
+        let rc = unsafe { WSAPoll(&mut fd, 1, 0) };
+        if rc < 0 {
+            // SAFETY: no arguments; reads this thread's last Winsock error.
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        if fd.revents & (POLLERR | POLLHUP) != 0 {
+            return Err(stream
+                .take_error()?
+                .unwrap_or_else(|| io::Error::from(io::ErrorKind::ConnectionRefused)));
+        }
+        Ok(fd.revents & POLLWRNORM != 0)
     }
 
     /// The `ip=` line of a trace response's body, when it is complete and holds a global address

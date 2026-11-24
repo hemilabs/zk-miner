@@ -110,6 +110,8 @@ pub struct SetupStatus {
     pub last_error: Option<String>,
     /// Currently highlighted step in the wizard (0-indexed).
     pub selected_step: usize,
+    /// `s` was pressed once: the next `s` stakes (any other key disarms it).
+    pub stake_armed: bool,
 }
 
 impl SetupStatus {
@@ -240,6 +242,10 @@ pub struct RuntimeSettings {
     pub deadline_safety_margin: f64,
     pub token_price_usd: f64,
     pub gas_cost_usd: f64,
+    /// The cap on one proof attempt, in seconds: a job whose attempt would take longer on the
+    /// slowest card it could go to is not claimed. Read by the miner every pass; an attempt keeps
+    /// the cap it started with.
+    pub proving_timeout_secs: u64,
     /// Whether to claim journal-bound jobs (a non-zero `expectedJournalHash`). Each is claimed only
     /// when the journal its (program, input) measured satisfies its binding. Default TRUE; `false`
     /// claims only NONE jobs assigned to this prover.
@@ -264,6 +270,7 @@ impl Default for RuntimeSettings {
             deadline_safety_margin: 1.5,
             token_price_usd: 0.80,
             gas_cost_usd: 0.01,
+            proving_timeout_secs: 3600,
             claim_predicate_jobs: true,
         }
     }
@@ -324,8 +331,55 @@ pub enum MinerJobStatus {
     Fulfilled { payout: u128 },
     /// Job was released.
     Released { penalty: u128 },
+    /// The lock ran past its deadline and this miner slashed it itself (`by_us`; the keeper share
+    /// comes back to it). Its collateral is lost.
+    Slashed { by_us: bool },
+    /// The lock was found gone after its deadline: a keeper's slash, or a release of ours that
+    /// landed late; the job's state does not tell which.
+    EndedPastDeadline,
     /// Job evaluation resulted in skip.
     Skipped { reason: String },
+}
+
+/// What a job this miner is claiming or holding is waiting on right now, when its status alone
+/// would say something older: a claim or fulfil transaction the testnet has not confirmed yet (and
+/// its retries), a wait for host or GPU memory, a retry after a failed attempt. Shown in place of
+/// "queued, waiting for a GPU" or "submitting" while set, with how long it has been so.
+#[derive(Debug, Clone)]
+pub struct JobNote {
+    pub kind: JobNoteKind,
+    pub text: String,
+    /// When this kind of wait began (a new text of the same kind keeps it).
+    pub since: std::time::Instant,
+}
+
+/// Which stage a `JobNote` belongs to. A transaction's events update only a note of its own stage,
+/// so one that arrives after the stage has moved on changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobNoteKind {
+    /// The claim transaction.
+    Claim,
+    /// Between proving attempts: memory, a retry.
+    Wait,
+    /// The fulfil transaction.
+    Submit,
+    /// The release transaction.
+    Release,
+}
+
+/// A job's measured cycle count: what the miner executed the guest at and sized the job on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobMeasurement {
+    /// The count the job is sized on: for risc0 the most across the sizes it was run at. `None`: it
+    /// was executed and could not be measured (over the execute cycle cap, out of time, or a
+    /// different journal at each size), so it is never claimed.
+    pub cycles: Option<u64>,
+    /// "risc0" or "sp1".
+    pub backend: String,
+    /// risc0: the segment sizes (po2) it was executed at; empty for SP1.
+    pub po2s: Vec<u8>,
+    /// How long the measuring execution took, in seconds.
+    pub execute_secs: f64,
 }
 
 /// A job tracked by the miner.
@@ -378,6 +432,145 @@ impl HeadroomView {
     }
 }
 
+/// What the brain's most recent pass did with the open work: claimed some, held every claim for one
+/// reason, or looked at each job and declined it for its own. Published by the brain each pass so
+/// the operator can see why a miner with open jobs is not claiming them without reading debug logs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaimOutlook {
+    /// The pass stopped before looking at any job (paused, benchmark running, RPC rate-limited, no
+    /// ETH for gas...): why. `None` when jobs were evaluated.
+    pub held: Option<String>,
+    /// Jobs looked at and not claimed, by reason, most common first.
+    pub declined: Vec<(String, usize)>,
+    /// Jobs this pass claimed.
+    pub claimed: usize,
+    /// Open jobs this pass did not reach (already set aside, backing off, or past the claim limit).
+    pub not_evaluated: usize,
+}
+
+impl ClaimOutlook {
+    /// How many reasons the one-line summary names before folding the rest into "N other".
+    const SHOWN_REASONS: usize = 4;
+
+    /// What the summary says, without its counts (which move every pass): the headless log repeats
+    /// the line when this changes.
+    pub fn summary_key(&self) -> String {
+        match &self.held {
+            Some(why) => format!("held:{}", why.replace(|c: char| c.is_ascii_digit(), "")),
+            None => {
+                // Sorted: two reasons swapping rank as counts move is not news.
+                let mut reasons: Vec<&str> =
+                    self.declined.iter().map(|(w, _)| w.as_str()).collect();
+                reasons.sort_unstable();
+                format!(
+                    "claiming:{} declined:{}",
+                    self.claimed > 0,
+                    reasons.join("|")
+                )
+            }
+        }
+    }
+
+    /// One line for the dashboard and the headless log, e.g. "2 claiming · 6 below the profit
+    /// threshold, 3 measuring cycles".
+    pub fn summary(&self) -> String {
+        if let Some(why) = &self.held {
+            return format!("not claiming: {why}");
+        }
+        let mut parts = Vec::new();
+        if self.claimed > 0 {
+            // Handed to the claim path this pass; it can still drop or refuse them.
+            parts.push(format!("{} claiming", self.claimed));
+        }
+        let mut reasons: Vec<String> = self
+            .declined
+            .iter()
+            .take(Self::SHOWN_REASONS)
+            .map(|(why, n)| format!("{n} {why}"))
+            .collect();
+        let rest: usize = self
+            .declined
+            .iter()
+            .skip(Self::SHOWN_REASONS)
+            .map(|(_, n)| n)
+            .sum();
+        if rest > 0 {
+            reasons.push(format!("{rest} other"));
+        }
+        if !reasons.is_empty() {
+            parts.push(format!("not claimed: {}", reasons.join(", ")));
+        }
+        if self.not_evaluated > 0 {
+            parts.push(format!("{} not re-checked this pass", self.not_evaluated));
+        }
+        if parts.is_empty() {
+            return "waiting for jobs".to_string();
+        }
+        parts.join(" · ")
+    }
+}
+
+/// How to stop the miner, as asked for at the dashboard's quit prompt, by `zkminer stop`, or by a
+/// signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopMode {
+    /// Stop claiming, let the proofs in flight finish and be paid, then exit.
+    Drain,
+    /// Stop claiming and exit within minutes, leaving the locks held for the next start to finish
+    /// (exit 75); a lock too close to its deadline to keep is released first.
+    KeepLocks,
+    /// Release every lock now (each pays its release penalty), then exit.
+    Abandon,
+    /// Exit at once without releasing anything.
+    Force,
+}
+
+/// A question the dashboard is asking before it stops the miner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopPrompt {
+    /// Quit was pressed with jobs held: drain, keep the locks, abandon, or cancel.
+    Quit,
+    /// Confirm one of the stop modes (asked during a stop already under way).
+    Confirm(StopMode),
+}
+
+/// What the shutdown is doing, while the dashboard stays open through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownStage {
+    Draining,
+    KeepingLocks,
+    Abandoning,
+    /// Releasing workers and exiting.
+    Finishing,
+}
+
+/// The shutdown as the dashboard shows it. Written by the CLI's shutdown ladder.
+#[derive(Debug, Clone)]
+pub struct ShutdownView {
+    pub stage: ShutdownStage,
+    /// What is happening right now (refreshed, not appended), e.g. "2 proofs still running".
+    pub status: String,
+    /// Everything the shutdown reported, in order. Printed to the terminal once the dashboard
+    /// closes, so the verdict stays in the scrollback.
+    pub lines: Vec<String>,
+    /// The shutdown is over: the dashboard closes.
+    pub done: bool,
+}
+
+impl ShutdownView {
+    pub fn new(stage: ShutdownStage) -> Self {
+        Self {
+            stage,
+            status: String::new(),
+            lines: Vec::new(),
+            done: false,
+        }
+    }
+}
+
+/// How many finished jobs the Jobs page lists below the open market.
+pub const RECENT_ROWS: usize = 8;
+
 /// The complete miner state, shared between TUI and background tasks.
 #[derive(Debug)]
 pub struct MinerState {
@@ -394,6 +587,34 @@ pub struct MinerState {
     pub completed_jobs: Vec<TrackedJob>,
     pub selected_job_index: usize,
     pub selected_job_id: Option<alloy_primitives::B256>,
+    /// Why each open job was not claimed when the brain last evaluated it (see [`ClaimOutlook`]).
+    /// Jobs it has not evaluated yet have no entry.
+    pub job_why: std::collections::HashMap<alloy_primitives::B256, String>,
+    /// The cycle count each job was measured at, once it has been, for open and claimed jobs alike
+    /// (the Job Detail screen). A job with no entry has not been measured: its `job_why` says why.
+    pub job_measurements: std::collections::HashMap<alloy_primitives::B256, JobMeasurement>,
+    /// Each proving job's current attempt: when it started, on which slot, the worker's latest stage
+    /// report (see `crate::progress`). A retry replaces it, so its progress and time start over.
+    pub proving:
+        std::collections::HashMap<alloy_primitives::B256, crate::progress::AttemptProgress>,
+    /// What each job is waiting on now, where its status would say something older (`JobNote`).
+    pub job_notes: std::collections::HashMap<alloy_primitives::B256, JobNote>,
+    /// Locks this miner holds on-chain that nothing is proving or settling now (kept through a
+    /// pause, past their deadline, a release that failed, a claim not confirmed), rebuilt from the
+    /// claim journal every tick, with why (`kept_reasons`). Without them a lock holding collateral
+    /// was in no list at all.
+    pub kept_locks: Vec<TrackedJob>,
+    pub kept_reasons: std::collections::HashMap<alloy_primitives::B256, String>,
+    /// When each job in `completed_jobs` finished (unix seconds), for the Jobs page's history.
+    pub finished_at: std::collections::HashMap<alloy_primitives::B256, u64>,
+    /// The job the Jobs page's highlight is on (`jobs_cursor`): rows move between sections as jobs
+    /// are claimed, held and finished, so a row number alone lands on another job.
+    pub selected_row_id: Option<alloy_primitives::B256>,
+    /// Each claimed job's proof system (zkVM and wrap), recorded at claim (`job_zkvm_text`).
+    pub job_proof_systems:
+        std::collections::HashMap<alloy_primitives::B256, zkminer_chain::auction::ProofSystem>,
+    /// What the brain's most recent pass did with the open work, for the dashboard's claims line.
+    pub claim_outlook: ClaimOutlook,
 
     // Benchmark
     pub benchmark_results: Option<BenchmarkSuite>,
@@ -401,6 +622,10 @@ pub struct MinerState {
     /// (`zkminer_prover::benchmark::risc0_job_po2`): `None` for a card that proves no risc0 job.
     /// Published by the brain; empty until it runs.
     pub risc0_job_po2s: Vec<(String, Option<u8>)>,
+    /// Cards whose running proof Windows is moving off the card to make room for another
+    /// program's memory, by PCI bus id as the pool names it (`WorkerPool::bus_id_for_slot`), so
+    /// the GPU row can say so. Published every 2 s; empty except under Windows.
+    pub gpu_spills: std::collections::HashMap<String, zkminer_prover::dispatcher::GpuSpill>,
     pub benchmark_running: bool,
     /// The benchmark started at launch is still running. It has the cards, so no job is claimed.
     pub startup_benchmark_pending: bool,
@@ -445,7 +670,26 @@ pub struct MinerState {
     /// exits the TUI *into* the shutdown ladder (drain -> abandon -> reap) instead of
     /// killing the process outright with collateral still held.
     pub shutdown_requested: bool,
-    pub connected: bool,
+    /// Set by `zkminer run`, whose shutdown runs while the dashboard stays open: quitting then asks
+    /// how to stop (`stop_request`) instead of closing the dashboard. False in mock mode, where
+    /// quit just closes it.
+    pub stop_handled_by_miner: bool,
+    /// A stop asked for at the dashboard, waiting for the miner to take it.
+    pub stop_request: Option<StopMode>,
+    /// The question the dashboard is asking before it stops the miner.
+    pub stop_prompt: Option<StopPrompt>,
+    /// The shutdown under way, if any.
+    pub shutdown: Option<ShutdownView>,
+    /// How long before a kept lock's cutoff the miner must be started again (its `RESTART_BY_SECS`):
+    /// the quit prompt's "start it again by" is the earliest kept cutoff less this. 0 until the
+    /// miner sets it.
+    pub release_margin_secs: u64,
+    /// A lock whose cutoff is within this of now is too close for a keep-locks stop to keep: it is
+    /// released first. 0 until the miner sets it.
+    pub keep_horizon_secs: u64,
+    /// The slash latch while it is tripped (what tripped it, and when): no new claims until
+    /// `zkminer resume-claims`. `None` when claims are allowed.
+    pub claims_latched: Option<String>,
     pub block_number: u64,
     pub errors: Vec<String>,
 
@@ -549,6 +793,27 @@ pub(crate) fn zkvm_label(backend: &str) -> &str {
         "openvm" => "OpenVM",
         other => other,
     }
+}
+
+/// A proof system as the dashboard names it: the zkVM, then the wrap its seals use.
+pub fn proof_system_name(system: zkminer_chain::auction::ProofSystem) -> &'static str {
+    use zkminer_chain::auction::ProofSystem;
+    match system {
+        ProofSystem::Risc0Groth16 => "risc0:Groth16",
+        ProofSystem::Sp1Groth16 => "sp1:Groth16",
+        ProofSystem::Sp1Plonk => "sp1:PLONK",
+        ProofSystem::OpenVmHalo2 => "openvm:Halo2",
+    }
+}
+
+/// The width of a column of `proof_system_name`s: the longest there is, and 4 more.
+pub fn proof_system_column_width() -> u16 {
+    zkminer_chain::auction::ProofSystem::ALL
+        .into_iter()
+        .map(|system| proof_system_name(system).len())
+        .max()
+        .unwrap_or(0) as u16
+        + 4
 }
 
 /// Shorten a driver-reported GPU name for places that have to fit several of them on one line.
@@ -883,11 +1148,22 @@ impl Default for MinerState {
             prover_stats: None,
             open_jobs: Vec::new(),
             active_jobs: Vec::new(),
+            job_notes: HashMap::new(),
+            kept_locks: Vec::new(),
+            kept_reasons: HashMap::new(),
+            finished_at: HashMap::new(),
+            selected_row_id: None,
+            job_proof_systems: HashMap::new(),
             completed_jobs: Vec::new(),
             selected_job_index: 0,
             selected_job_id: None,
+            job_why: std::collections::HashMap::new(),
+            job_measurements: std::collections::HashMap::new(),
+            proving: std::collections::HashMap::new(),
+            claim_outlook: ClaimOutlook::default(),
             benchmark_results: None,
             risc0_job_po2s: Vec::new(),
+            gpu_spills: std::collections::HashMap::new(),
             benchmark_running: false,
             startup_benchmark_pending: false,
             startup_problems: Vec::new(),
@@ -906,7 +1182,13 @@ impl Default for MinerState {
             last_refresh: None,
             paused: false,
             shutdown_requested: false,
-            connected: false,
+            stop_handled_by_miner: false,
+            stop_request: None,
+            stop_prompt: None,
+            shutdown: None,
+            release_margin_secs: 0,
+            keep_horizon_secs: 0,
+            claims_latched: None,
             block_number: 0,
             errors: Vec::new(),
             rpc_total: 0,
@@ -949,7 +1231,352 @@ impl TuiContext {
     }
 }
 
+/// How fresh the chain data is, for the connection badges: from the age of the last successful
+/// state refresh (`MinerState::last_refresh`), so a lost RPC shows as lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainLink {
+    /// Read within [`CHAIN_UP_SECS`].
+    Up,
+    /// Last read this many seconds ago, within [`CHAIN_DOWN_SECS`].
+    Stale(u64),
+    /// Never read, or not for [`CHAIN_DOWN_SECS`].
+    Down,
+}
+
+/// A refresh younger than this is current (two refresh periods).
+pub const CHAIN_UP_SECS: u64 = 30;
+/// A refresh older than this is a lost chain.
+pub const CHAIN_DOWN_SECS: u64 = 120;
+
+impl ChainLink {
+    /// The link for a last refresh at `last`, seen at `now`.
+    pub fn of(
+        last: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let Some(last) = last else {
+            return ChainLink::Down;
+        };
+        let age = (now - last).num_seconds().max(0) as u64;
+        if age < CHAIN_UP_SECS {
+            ChainLink::Up
+        } else if age < CHAIN_DOWN_SECS {
+            ChainLink::Stale(age)
+        } else {
+            ChainLink::Down
+        }
+    }
+}
+
 impl MinerState {
+    /// The chain link now (`ChainLink::of` the last refresh).
+    pub fn chain_link(&self) -> ChainLink {
+        ChainLink::of(self.last_refresh, chrono::Utc::now())
+    }
+}
+
+impl MinerState {
+    /// How long a proving job has been proving, in seconds: live from when it started, or what its
+    /// status last carried when the start was not seen.
+    /// Note what `job_id` is waiting on (`JobNote`). The same kind keeps its start time.
+    pub fn set_job_note(
+        &mut self,
+        job_id: alloy_primitives::B256,
+        kind: JobNoteKind,
+        text: impl Into<String>,
+    ) {
+        let since = match self.job_notes.get(&job_id) {
+            Some(note) if note.kind == kind => note.since,
+            _ => std::time::Instant::now(),
+        };
+        // Drop the notes of jobs no longer listed (fulfilled, released, handed back): a job leaves
+        // the lists from many places, and none of them needs to know about notes.
+        let listed: std::collections::HashSet<alloy_primitives::B256> = self
+            .open_jobs
+            .iter()
+            .chain(self.active_jobs.iter())
+            .chain(self.kept_locks.iter())
+            .map(|j| j.info.job_id)
+            .collect();
+        self.job_notes
+            .retain(|id, _| *id == job_id || listed.contains(id));
+        self.job_notes.insert(
+            job_id,
+            JobNote {
+                kind,
+                text: text.into(),
+                since,
+            },
+        );
+    }
+
+    /// Drop `job_id`'s note if it is of `kind`: that stage is over.
+    /// Drop every note of `job_id`: its lifecycle ended, or it starts over (a re-driven lock), so
+    /// nothing said about an earlier stage may show again.
+    pub fn clear_job_notes(&mut self, job_id: alloy_primitives::B256) {
+        self.job_notes.remove(&job_id);
+    }
+
+    pub fn clear_job_note(&mut self, job_id: alloy_primitives::B256, kind: JobNoteKind) {
+        if self.job_notes.get(&job_id).is_some_and(|n| n.kind == kind) {
+            self.job_notes.remove(&job_id);
+        }
+    }
+
+    /// A transaction event from the chain client (`zkminer_chain::tx_events`): rewrite the job's
+    /// note, if it is waiting on that transaction's stage. Events of a stage that has ended (no
+    /// note, or another kind) are ignored.
+    pub fn on_tx_event(
+        &mut self,
+        job_id: alloy_primitives::B256,
+        kind: zkminer_chain::tx_events::TxKind,
+        event: zkminer_chain::tx_events::TxEvent,
+    ) {
+        use zkminer_chain::tx_events::{TxEvent, TxKind};
+        let (note_kind, what) = match kind {
+            TxKind::Claim => (JobNoteKind::Claim, "claiming"),
+            TxKind::Fulfil => (JobNoteKind::Submit, "submitting the proof"),
+            TxKind::Release => (JobNoteKind::Release, "releasing"),
+        };
+        if self.job_notes.get(&job_id).map(|n| n.kind) != Some(note_kind) {
+            return;
+        }
+        let text = match event {
+            TxEvent::Sent { attempt, of } => {
+                format!("{what}: waiting for the chain to confirm (try {attempt} of {of})")
+            }
+            TxEvent::Unconfirmed { attempt, of } => format!(
+                "{what}: not confirmed yet, checking the chain before sending again (try {attempt} \
+                 of {of})"
+            ),
+            TxEvent::SendFailed {
+                attempt,
+                of,
+                rate_limited: true,
+            } => format!(
+                "{what}: the RPC is rate-limiting, sending again shortly (try {attempt} of {of})"
+            ),
+            TxEvent::SendFailed { attempt, of, .. } => {
+                format!("{what}: the send failed, sending again (try {attempt} of {of})")
+            }
+        };
+        self.set_job_note(job_id, note_kind, text);
+    }
+
+    /// What `job` is waiting on, with for how long, when there is a note for it and its status is
+    /// one the note can speak for (not proving or finished).
+    pub fn job_note_text(&self, job: &TrackedJob) -> Option<String> {
+        if !matches!(
+            job.status,
+            MinerJobStatus::Open | MinerJobStatus::Queued | MinerJobStatus::Submitting
+        ) {
+            return None;
+        }
+        let note = self.job_notes.get(&job.info.job_id)?;
+        Some(format!(
+            "{}, {}",
+            note.text,
+            crate::screens::dashboard::format_duration(note.since.elapsed().as_secs())
+        ))
+    }
+
+    /// Record `job_id`'s proof system, at claim. The records of jobs no longer listed go.
+    pub fn note_proof_system(
+        &mut self,
+        job_id: alloy_primitives::B256,
+        system: zkminer_chain::auction::ProofSystem,
+    ) {
+        let listed: std::collections::HashSet<alloy_primitives::B256> = self
+            .open_jobs
+            .iter()
+            .chain(self.active_jobs.iter())
+            .map(|j| j.info.job_id)
+            .collect();
+        self.job_proof_systems.retain(|id, _| listed.contains(id));
+        self.job_proof_systems.insert(job_id, system);
+    }
+
+    /// The zkVM and wrap `job` proves with (`proof_system_name`), or, with no proof system recorded
+    /// (a lock recovered after a restart), the zkVM its worker slot names.
+    pub fn job_zkvm_text(&self, job: &TrackedJob) -> String {
+        match self.job_proof_systems.get(&job.info.job_id) {
+            Some(system) => proof_system_name(*system).to_string(),
+            None => match job.prover_backend.split(':').next() {
+                Some(backend) if !backend.is_empty() => backend.to_string(),
+                _ => "—".to_string(),
+            },
+        }
+    }
+
+    pub fn proving_secs(&self, job: &TrackedJob) -> u64 {
+        match self.proving.get(&job.info.job_id) {
+            Some(attempt) => attempt.started.elapsed().as_secs(),
+            None => match job.status {
+                MinerJobStatus::Proving { elapsed_secs, .. } => elapsed_secs,
+                _ => 0,
+            },
+        }
+    }
+
+    /// How far a proving job's current attempt is, in [0, 0.99], from its worker's stage reports
+    /// weighed by the job's measured cycles and its card's benchmark (`crate::progress`). `None`
+    /// when there is nothing to weigh them by: no measurement, or no benchmark row for the backend.
+    pub fn proving_fraction(&self, job: &TrackedJob) -> Option<f64> {
+        let attempt = self.proving.get(&job.info.job_id)?;
+        let exp = self.expected_stage_secs(job, attempt)?;
+        crate::progress::attempt_fraction(attempt, &exp, std::time::Instant::now())
+    }
+
+    /// The stage a proving job's current attempt is in, with its counts, e.g. "segment 40/91".
+    pub fn proving_stage_label(&self, job: &TrackedJob) -> Option<String> {
+        let attempt = self.proving.get(&job.info.job_id)?;
+        let backend = attempt.slot.split(':').next().unwrap_or("");
+        Some(crate::progress::stage_label(backend, attempt.report))
+    }
+
+    /// Raises each attempt's floor to what it shows now, so the bar never moves back between the
+    /// worker's reports. Called as the dashboard refreshes.
+    pub fn refresh_proving_floors(&mut self) {
+        let now = std::time::Instant::now();
+        let floors: Vec<(alloy_primitives::B256, f64)> = self
+            .active_jobs
+            .iter()
+            .filter_map(|job| {
+                let attempt = self.proving.get(&job.info.job_id)?;
+                let exp = self.expected_stage_secs(job, attempt)?;
+                Some((
+                    job.info.job_id,
+                    crate::progress::attempt_fraction(attempt, &exp, now)?,
+                ))
+            })
+            .collect();
+        for (id, f) in floors {
+            if let Some(attempt) = self.proving.get_mut(&id) {
+                attempt.floor = attempt.floor.max(f);
+            }
+        }
+    }
+
+    /// The expected seconds of each stage of `job` on the card of `attempt`: from the job's measured
+    /// cycles, and the card's benchmark row for the backend, else the slowest row of that backend.
+    /// Without a measurement (a lock recovered from a breadcrumb that did not record one) the `Prove`
+    /// stage is left to its observed rate.
+    fn expected_stage_secs(
+        &self,
+        job: &TrackedJob,
+        attempt: &crate::progress::AttemptProgress,
+    ) -> Option<crate::progress::StageSecs> {
+        let mut parts = attempt.slot.split(':');
+        let (backend, tag, index) = (parts.next()?, parts.next()?, parts.next()?);
+        let measurement = self.job_measurements.get(&job.info.job_id);
+        let cycles = measurement.and_then(|m| m.cycles);
+        let device = zkminer_prover::dispatcher::WorkerPool::gpu_device_id(tag, index);
+        let rows = &self.benchmark_results.as_ref()?.device_benchmarks;
+        let of_backend = || rows.iter().filter(|r| r.prover_backend == backend);
+        let row = of_backend().find(|r| r.device_id == device).or_else(|| {
+            of_backend()
+                .filter(|r| r.stark_rate().is_some())
+                .min_by(|a, b| {
+                    a.stark_rate()
+                        .partial_cmp(&b.stark_rate())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })?;
+        let execute_secs = measurement.map(|m| m.execute_secs);
+        crate::progress::expected_stage_secs(backend, cycles, execute_secs, row)
+    }
+
+    /// The Jobs page's rows, in order: the jobs this miner has claimed, then the open market less
+    /// any job also among them (a claim the market list has not caught up with yet). Its selection
+    /// (`selected_job_index`) indexes this list.
+    /// The Jobs page's rows, in order: claimed jobs being worked on, locks held but not being
+    /// worked on (`kept_locks`), the open market, then the most recent finished jobs (`RECENT_ROWS`),
+    /// each job once.
+    pub fn jobs_page_rows(&self) -> Vec<&TrackedJob> {
+        let mut seen = std::collections::HashSet::new();
+        let mut rows = Vec::new();
+        for job in self
+            .active_jobs
+            .iter()
+            .chain(self.kept_locks.iter())
+            .chain(self.open_jobs.iter())
+            .chain(self.recent_finished(RECENT_ROWS))
+        {
+            if seen.insert(job.info.job_id) {
+                rows.push(job);
+            }
+        }
+        rows
+    }
+
+    /// The Jobs page's highlighted row: the highlighted job's, wherever it moved, else the row number.
+    pub fn jobs_cursor(&self) -> usize {
+        let rows = self.jobs_page_rows();
+        self.selected_row_id
+            .and_then(|id| rows.iter().position(|j| j.info.job_id == id))
+            .unwrap_or_else(|| self.selected_job_index.min(rows.len().saturating_sub(1)))
+    }
+
+    /// Move the Jobs page's highlight by `step` rows, onto that row's job.
+    pub fn move_jobs_cursor(&mut self, step: isize) {
+        let rows = self.jobs_page_rows();
+        let last = rows.len().saturating_sub(1);
+        let at = self.jobs_cursor().saturating_add_signed(step).min(last);
+        let id = rows.get(at).map(|j| j.info.job_id);
+        self.selected_job_index = at;
+        self.selected_row_id = id;
+    }
+
+    /// Why a lock is held but not worked on, if it is one (`kept_locks`) and not being worked on.
+    pub fn kept_reason(&self, job_id: alloy_primitives::B256) -> Option<&str> {
+        if self.active_jobs.iter().any(|j| j.info.job_id == job_id) {
+            return None;
+        }
+        self.kept_reasons.get(&job_id).map(String::as_str)
+    }
+
+    /// The `n` most recently finished jobs (fulfilled or released), newest first.
+    pub fn recent_finished(&self, n: usize) -> impl Iterator<Item = &TrackedJob> {
+        self.completed_jobs.iter().rev().take(n)
+    }
+
+    /// `job_id` is done (fulfilled, or released): its row leaves the claimed list for the history,
+    /// with `status` and the time.
+    pub fn record_finished(&mut self, job_id: alloy_primitives::B256, status: MinerJobStatus) {
+        // Its claimed row, or its held row (a lock recovery released, with no claimed row).
+        let mut row = if let Some(at) = self
+            .active_jobs
+            .iter()
+            .position(|j| j.info.job_id == job_id)
+        {
+            self.active_jobs.remove(at)
+        } else if let Some(at) = self.kept_locks.iter().position(|j| j.info.job_id == job_id) {
+            self.kept_locks.remove(at)
+        } else {
+            return;
+        };
+        row.status = status;
+        row.gpu_bus_id = None;
+        self.completed_jobs.retain(|j| j.info.job_id != job_id);
+        self.completed_jobs.push(row);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        self.finished_at.insert(job_id, now);
+        // Not held any more: no held reason may make its history row read as one.
+        self.kept_reasons.remove(&job_id);
+        // Bounded, for a long run.
+        const COMPLETED_JOBS_CAP: usize = 500;
+        if self.completed_jobs.len() > COMPLETED_JOBS_CAP {
+            let excess = self.completed_jobs.len() - COMPLETED_JOBS_CAP;
+            self.completed_jobs.drain(0..excess);
+            let kept: std::collections::HashSet<alloy_primitives::B256> =
+                self.completed_jobs.iter().map(|j| j.info.job_id).collect();
+            self.finished_at.retain(|id, _| kept.contains(id));
+        }
+        self.job_notes.remove(&job_id);
+    }
+
     /// Map a GPU-tuning device id (see `gpu_tuning::tuning_device_id`) to the
     /// benchmark `device_id` for the same physical card.
     ///
@@ -992,7 +1619,54 @@ pub fn new_shared_state() -> SharedState {
 }
 
 #[cfg(test)]
+mod chain_link_tests {
+    use super::ChainLink;
+
+    #[test]
+    fn the_badge_follows_the_age_of_the_last_refresh() {
+        let now = chrono::Utc::now();
+        let ago = |s: i64| Some(now - chrono::Duration::seconds(s));
+        assert_eq!(ChainLink::of(ago(5), now), ChainLink::Up);
+        assert_eq!(ChainLink::of(ago(45), now), ChainLink::Stale(45));
+        assert_eq!(ChainLink::of(ago(119), now), ChainLink::Stale(119));
+        assert_eq!(ChainLink::of(ago(120), now), ChainLink::Down);
+        assert_eq!(ChainLink::of(None, now), ChainLink::Down);
+    }
+}
+
+#[cfg(test)]
 mod benchmark_tracker_tests {
+    use super::ClaimOutlook;
+
+    #[test]
+    fn the_claims_summary_says_what_the_last_pass_did() {
+        assert_eq!(ClaimOutlook::default().summary(), "waiting for jobs");
+        let held = ClaimOutlook {
+            held: Some("paused (press p to resume)".into()),
+            declined: vec![("ignored".into(), 3)],
+            ..ClaimOutlook::default()
+        };
+        assert_eq!(held.summary(), "not claiming: paused (press p to resume)");
+        let o = ClaimOutlook {
+            held: None,
+            declined: vec![
+                ("below the profit threshold".into(), 6),
+                ("waiting for its cycle measurement".into(), 3),
+                ("a".into(), 1),
+                ("b".into(), 1),
+                ("c".into(), 1),
+                ("d".into(), 2),
+            ],
+            claimed: 2,
+            not_evaluated: 4,
+        };
+        assert_eq!(
+            o.summary(),
+            "2 claiming · not claimed: 6 below the profit threshold, 3 waiting for its cycle \
+             measurement, 1 a, 1 b, 3 other · 4 not re-checked this pass"
+        );
+    }
+
     use super::*;
 
     fn event(

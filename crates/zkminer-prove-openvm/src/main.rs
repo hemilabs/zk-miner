@@ -25,6 +25,14 @@ fn dup_cloexec(fd: std::os::unix::io::RawFd) -> std::io::Result<std::os::unix::i
 }
 
 fn main() {
+    // First, while the process has one thread: no capability on any thread it will ever have, nor
+    // on anything it starts (a no-op unless the miner runs as root). The confinement checks this
+    // before the first guest and refuses otherwise.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = zkminer_witness_sandbox::drop_all_capabilities() {
+        eprintln!("zkminer: this worker cannot drop its capabilities ({e}): it runs no guest");
+    }
+
     // Save the real stdout FD for IPC, then redirect FD 1 to stderr so nothing a guest or a native
     // library prints to stdout can corrupt the length-prefixed bincode control stream the dispatcher
     // reads (same hardening the SP1 and risc0 workers do).
@@ -148,7 +156,7 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 write_message(&mut stdout, &resp)?;
             }
 
-            WorkerCommand::Benchmark { programs } => {
+            WorkerCommand::Benchmark { programs, .. } => {
                 tracing::info!("Running benchmarks...");
                 let results = run_benchmarks(&programs);
                 let resp = WorkerResponse::BenchmarkResult { results };

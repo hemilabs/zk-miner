@@ -331,11 +331,12 @@ mod tests {
     /// the macOS beta's v13 (`BenchmarkEntry.power_state`, risc0 3.1) are two different wires. A
     /// worker of either still answers a decodable `HelloAck`, and the exact version check refuses it.
     /// v17 (W11-ON37): the same for the beta's own 14 (no witness fields) and main's 14-16 (no
-    /// `power_state`): every one of them is a different wire from 17.
+    /// `power_state`): every one of them is a different wire from 17. v18: the beta's 17 and
+    /// max/usability's 17 (`Benchmark.po2`, `ProveStage`) are two different wires from 18.
     #[test]
     fn a_worker_of_either_v13_is_refused() {
-        assert_eq!(PROTOCOL_VERSION, 17);
-        for version in [13, 14, 15, 16] {
+        assert_eq!(PROTOCOL_VERSION, 18);
+        for version in [13, 14, 15, 16, 17] {
             let hello = bincode::serialize(&WorkerResponse::HelloAck {
                 protocol_version: version,
                 backend: "risc0".to_string(),
@@ -861,6 +862,32 @@ mod tests {
             "a v15 response must not decode as v16"
         );
         const _: () = assert!(PROTOCOL_VERSION >= 16);
+    }
+
+    /// v17 gave `Benchmark` the segment size a risc0 card's suite is proved at: every value
+    /// round-trips, `None` included (the default size), and the programs keep their place.
+    #[test]
+    fn a_benchmark_carries_its_segment_size() {
+        for po2 in [None, Some(18), Some(19), Some(20)] {
+            let mut buf = Vec::new();
+            write_message(
+                &mut buf,
+                &WorkerCommand::Benchmark {
+                    programs: crate::benchmark_suite(crate::BACKEND_RISC0),
+                    po2,
+                },
+            )
+            .unwrap();
+            match read_message::<_, WorkerCommand>(&mut Cursor::new(buf)).unwrap() {
+                WorkerCommand::Benchmark { programs, po2: got } => {
+                    assert_eq!(got, po2);
+                    assert_eq!(programs, crate::benchmark_suite(crate::BACKEND_RISC0));
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
+        // v17: an SP1 worker before it ignored the card's shard-size cap.
+        const _: () = assert!(PROTOCOL_VERSION >= 17);
     }
 
     #[test]

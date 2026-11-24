@@ -16,7 +16,8 @@ param([string]$Version = '0.1.0')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is far slower with it
 
-$base = 'https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/risc0-groth16'
+# rzup's current download host (the old S3 bucket now answers 403).
+$base = 'https://artifacts.risczero.net/rzup/components/risc0-groth16'
 $risc0Home = if ($env:RISC0_HOME) { $env:RISC0_HOME } else { Join-Path $env:USERPROFILE '.risc0' }
 $dest = Join-Path $risc0Home "extensions\v$Version-risc0-groth16"
 if (Test-Path $dest) {

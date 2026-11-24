@@ -1679,7 +1679,8 @@ mod tests {
         let v = policy.vet_path(addr, addr).unwrap();
         assert_eq!(v.source, Some(src));
         let interface = crate::nearhop::interface_of(src).unwrap();
-        assert!(interface.is_some());
+        // Windows has no interface pin (`nearhop::bind_interface`): the source address pins the path.
+        assert_eq!(interface.is_some(), !cfg!(windows));
         assert_eq!(v.interface, interface, "the interface that holds the source");
         assert_eq!(probe.pins.lock().unwrap()[0].interface, interface, "probed through it");
         assert_eq!(probe.pins.lock().unwrap()[0].source, Some(src), "probed from it");

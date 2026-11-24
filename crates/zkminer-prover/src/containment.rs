@@ -109,9 +109,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// The delegated cgroup root, if the miner runs in one (looked up once).
-fn delegated_root() -> Option<&'static Path> {
-    static ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// The delegated cgroup root, or why the miner's cgroup is not one (looked up once).
+fn delegation() -> &'static Result<PathBuf, String> {
+    static ROOT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     ROOT.get_or_init(|| match zkminer_witness_sandbox::delegated_root() {
         Ok(root) => {
             remove_stale(&root);
@@ -119,17 +119,95 @@ fn delegated_root() -> Option<&'static Path> {
                 "workers start in cgroups of their own below {}",
                 root.display()
             );
-            Some(root)
+            Ok(root)
         }
         Err(e) => {
-            tracing::info!(
-                "the miner's cgroup is not delegated to it ({e}); workers are adopted into scopes \
-                 of the user's systemd manager instead"
-            );
-            None
+            // Without a user manager either, `workers_uncapped_page` says so at start-up.
+            if user_bus_reachable() {
+                tracing::info!(
+                    "the miner's cgroup is not delegated to it ({e}); workers are adopted into \
+                     scopes of the user's systemd manager instead"
+                );
+            }
+            Err(e.to_string())
         }
     })
-    .as_deref()
+}
+
+/// The delegated cgroup root, if the miner runs in one (looked up once).
+fn delegated_root() -> Option<&'static Path> {
+    delegation().as_ref().ok().map(PathBuf::as_path)
+}
+
+/// The socket `busctl --user` reaches the user's systemd manager through: the `unix:path=` of
+/// `DBUS_SESSION_BUS_ADDRESS` (an empty path for an address of another form, which is taken on
+/// trust), else `$XDG_RUNTIME_DIR/bus`. `None` where neither names one.
+fn user_bus_socket(session_bus: Option<&str>, runtime_dir: Option<&Path>) -> Option<PathBuf> {
+    match session_bus {
+        Some(addr) => {
+            let first = addr.split(';').next().unwrap_or(addr);
+            Some(match first.strip_prefix("unix:path=") {
+                Some(rest) => PathBuf::from(rest.split(',').next().unwrap_or(rest)),
+                None => PathBuf::new(),
+            })
+        }
+        None => runtime_dir.map(|d| d.join("bus")),
+    }
+}
+
+/// Whether the user's systemd manager can be reached, which `memory::cap_process_memory` needs to
+/// cap a worker where the miner's cgroup is not delegated. A system unit's process has no session
+/// bus (no `XDG_RUNTIME_DIR`, no lingering manager): there, it cannot.
+pub fn user_bus_reachable() -> bool {
+    let session_bus = std::env::var("DBUS_SESSION_BUS_ADDRESS").ok();
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    match user_bus_socket(session_bus.as_deref(), runtime_dir.as_deref()) {
+        Some(p) if p.as_os_str().is_empty() => true,
+        Some(p) => p.exists(),
+        None => false,
+    }
+}
+
+/// Called once as the miner starts: a `PAGE:` line when its workers would run with no memory
+/// ceiling and no cgroup of their own (its cgroup is not delegated to it, and no user manager can
+/// adopt them), else `None`. Without a ceiling a runaway guest can push the host into swap and a
+/// global OOM; under a systemd unit a worker's OOM kill also counts in the unit's `memory.events`,
+/// and the default `OOMPolicy=stop` then stops the whole miner (a drain, then a restart). It looks
+/// the delegation up now ([`delegated_root`] would at the first worker), which moves the miner
+/// into its `supervisor` cgroup where the cgroup is delegated.
+pub fn workers_uncapped_page() -> Option<String> {
+    let Err(why) = delegation() else {
+        return None;
+    };
+    if user_bus_reachable() {
+        return None;
+    }
+    let unit = match zkminer_witness_sandbox::own_systemd_unit() {
+        Some(zkminer_witness_sandbox::SystemdUnit::System(u))
+        | Some(zkminer_witness_sandbox::SystemdUnit::User(u)) => Some(u),
+        _ => None,
+    };
+    Some(uncapped_page(why, unit.as_deref()))
+}
+
+/// The text of [`workers_uncapped_page`]: what to change in `unit`, when it is a service.
+fn uncapped_page(why: &str, unit: Option<&str>) -> String {
+    let fix = match unit {
+        Some(u) if u.ends_with(".service") => format!(
+            "add Delegate=cpu memory pids and OOMPolicy=continue to {u} (contrib/zkminer.service \
+             has both), then `systemctl daemon-reload` and restart it"
+        ),
+        _ => "run the miner from a unit with Delegate=cpu memory pids and OOMPolicy=continue \
+              (contrib/zkminer.service), or under `systemd-run --user --scope -p Delegate=yes`"
+            .to_string(),
+    };
+    format!(
+        "PAGE: WORKERS-UNCAPPED the miner's cgroup is not delegated to it ({why}) and no systemd \
+         user manager can adopt its workers: every worker runs with no memory ceiling and no \
+         cgroup of its own, so a runaway guest can exhaust the host's memory, and under a systemd \
+         unit without OOMPolicy=continue a worker's OOM kill stops the whole miner. To fix it, \
+         {fix}"
+    )
 }
 
 /// Worker cgroups left below `root` by a miner that is gone (its reaper killed too): killed and
@@ -489,6 +567,45 @@ fn start_mount_watch() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_user_bus_is_found_where_busctl_looks() {
+        let run = Path::new("/run/user/1000");
+        assert_eq!(user_bus_socket(None, None), None);
+        assert_eq!(
+            user_bus_socket(None, Some(run)),
+            Some(PathBuf::from("/run/user/1000/bus"))
+        );
+        // The session bus address wins over XDG_RUNTIME_DIR: its first address, and only the path.
+        assert_eq!(
+            user_bus_socket(Some("unix:path=/tmp/b,guid=1234;unix:path=/x"), Some(run)),
+            Some(PathBuf::from("/tmp/b"))
+        );
+        // An address of another form: no path to check.
+        assert_eq!(
+            user_bus_socket(Some("unix:abstract=/tmp/dbus-1"), None),
+            Some(PathBuf::new())
+        );
+    }
+
+    #[test]
+    fn the_uncapped_page_names_the_unit_to_fix() {
+        let service = uncapped_page(
+            "systemd unit zkminer.service has Delegate=\"no\"",
+            Some("zkminer.service"),
+        );
+        assert!(service.starts_with("PAGE: WORKERS-UNCAPPED "), "{service}");
+        assert!(service.contains("to zkminer.service"), "{service}");
+        assert!(service.contains("OOMPolicy=continue"), "{service}");
+        let none = uncapped_page("no cgroup2 filesystem is mounted", None);
+        assert!(none.contains("systemd-run --user --scope"), "{none}");
+        // A session scope is no unit the operator can edit.
+        let scope = uncapped_page("owned by uid 0, we are uid 1000", Some("session-3.scope"));
+        assert!(!scope.contains("to session-3.scope"), "{scope}");
+        for page in [service, none, scope] {
+            assert!(!page.contains("  "), "{page}");
+        }
+    }
 
     /// The reaper script, driven as the miner drives it: registered workers (a process group, a
     /// lone process, one removed again) are killed when its stdin ends, and only those.

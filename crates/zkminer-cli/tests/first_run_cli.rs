@@ -10,6 +10,10 @@
 //! user's `~/.zkminer` is read or written and nothing reaches the network: `run` stops at the missing
 //! key, before it connects to the chain.
 
+// Windows resolves the home directory through the known-folder API, not `HOME`, so these runs
+// would read and write the real `~/.zkminer` (its config, logs and miner.lock.holder).
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 

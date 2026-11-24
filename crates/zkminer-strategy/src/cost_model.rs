@@ -231,6 +231,8 @@ mod power_tests {
             pci_bus_id: bus.to_string(),
             po2_samples: Vec::new(),
             host_peak_bytes: None,
+            benchmark_po2: None,
+            highest_proved_po2: None,
         }
     }
 
@@ -539,6 +541,8 @@ mod rate_tests {
                 pci_bus_id: "0000:06:10.0".to_string(),
                 po2_samples: Vec::new(),
                 host_peak_bytes: None,
+                benchmark_po2: None,
+                highest_proved_po2: None,
             }],
             cpu_power_watts: Some(0.0),
             ..Default::default()

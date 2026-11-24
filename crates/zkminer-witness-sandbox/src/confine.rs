@@ -14,14 +14,19 @@
 //!   loader), write only below what it names with [`Rights::WRITE`] (its private temporary
 //!   directory, GPU caches it needs, `/dev/shm` where needed), open only the device nodes it names
 //!   with [`Rights::DEVICE`]. Anything else, the user's home first of all (dotfiles, `~/.config`,
-//!   `~/.zkminer`, the provers, keys), is out of reach, for reading and writing alike. TCP bind and
-//!   connect are refused by Landlock too;
+//!   `~/.zkminer`, the provers, keys), is out of reach, for reading and writing alike, and so are
+//!   the miner's files and the host's secrets in `/etc` ([`ETC_DENIED`]). TCP bind and connect are
+//!   refused by Landlock too;
 //! - **other processes**: no signal to, and no `ptrace`-class access (`/proc/<pid>/mem`, `environ`,
 //!   `fd`) to, a process outside its Landlock domain (the miner, other workers); no abstract Unix
 //!   socket of another domain. The miner can still signal it;
 //! - **kernel surface**: no namespace and no mount, no `userfaultfd`, `perf_event_open` or file
-//!   handles, and no metadata writes (mode, owner, extended attributes, times; see
-//!   [`crate::netdeny`]).
+//!   handles, no metadata writes (mode, owner, extended attributes, times), and nothing that
+//!   controls the host (modules, `kexec`, `reboot`, the clock, swap, port I/O; see
+//!   [`crate::netdeny`]);
+//! - **capabilities**: none, on any thread. A worker drops them all first thing in `main`, while
+//!   it has one thread ([`crate::drop_all_capabilities`]: a miner run as root would otherwise hand
+//!   them to its guests); the confinement checks it and refuses otherwise.
 //!
 //! Since Landlock does not govern the path walk (a `stat` or a lookup reaches any directory), a
 //! process confines itself only where no filesystem it can reach is a network or FUSE filesystem or
@@ -147,10 +152,11 @@ impl Confinement {
         }
     }
 
-    /// `sockets`, with the host's system files readable ([`system_read_paths`]) and the parts of
-    /// `/proc` GPU runtimes read ([`proc_read_paths`]: this process's own entries, not other
-    /// processes'), the dynamic loader executable ([`loader_paths`]), `/dev` listable and its
-    /// harmless nodes (`null`, `zero`, `full`, `random`, `urandom`) usable.
+    /// `sockets`, with the host's system files readable ([`system_read_paths`]: `/etc` without
+    /// [`ETC_DENIED`], whose names stay listable) and the parts of `/proc` GPU runtimes read
+    /// ([`proc_read_paths`]: this process's own entries, not other processes'), the dynamic loader
+    /// executable ([`loader_paths`]), `/dev` listable and its harmless nodes (`null`, `zero`,
+    /// `full`, `random`, `urandom`) usable.
     ///
     /// `/proc/self` is resolved when the rules are applied, to the process that applies them: a
     /// confinement built in one process for another ([`crate::supervise::run_supervised`]) must
@@ -163,6 +169,9 @@ impl Confinement {
         for p in loader_paths() {
             c.allow(p, Rights::EXEC);
         }
+        // Listable as when it was readable whole; its files are granted one by one
+        // (`etc_read_paths`).
+        c.allow("/etc", Rights::LIST);
         c.allow("/dev", Rights::LIST);
         for p in [
             "/dev/null",
@@ -327,7 +336,8 @@ impl std::fmt::Display for ConfinementReport {
 /// a path lookup gets to, or under a path `c` grants), before applying anything.
 ///
 /// After applying it checks the result rather than the calls: `PR_GET_SECCOMP == 2`,
-/// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode, sockets of every kind refused,
+/// `PR_GET_NO_NEW_PRIVS == 1`, every thread in seccomp filter mode and holding no capability
+/// (the caller drops them first: [`crate::drop_all_capabilities`]), sockets of every kind refused,
 /// `unshare` refused and `clone3` unimplemented (no namespace), the root directory unreadable
 /// (Landlock is on), the parent process unreachable by signal, and still no filesystem in reach
 /// that is not local. Then it fails if a socket the policy does not let the process keep is still
@@ -525,6 +535,13 @@ fn verify(c: &Confinement) -> Result<Vec<&'static str>, SandboxError> {
         return fail(format!("thread {tid} is not in seccomp filter mode"));
     }
     passed.push("every thread filtered");
+    if let Some(tid) = crate::caps::threads_holding_capabilities()?.first() {
+        return fail(format!(
+            "thread {tid} holds a capability: the worker must drop them all while it has one \
+             thread (drop_all_capabilities)"
+        ));
+    }
+    passed.push("no capabilities");
     for (name, domain, kind) in [
         ("AF_INET", libc::AF_INET, libc::SOCK_STREAM),
         ("AF_INET6", libc::AF_INET6, libc::SOCK_DGRAM),
@@ -629,27 +646,114 @@ pub fn proc_read_paths() -> Vec<PathBuf> {
     .collect()
 }
 
-/// The host's system files, readable by every confined process: `/usr`, `/etc`, `/opt`, the `lib`
-/// and `bin` directories, `/sys` and udev's device database (`/proc` is [`proc_read_paths`]).
-/// Those that exist.
+/// The host's system files, readable by every confined process: `/usr`, `/etc` but for
+/// [`ETC_DENIED`] ([`etc_read_paths`]), `/opt`, the `lib` and `bin` directories, `/sys` and udev's
+/// device database (`/proc` is [`proc_read_paths`]). Those that exist.
 pub fn system_read_paths() -> Vec<PathBuf> {
-    [
-        "/usr",
-        "/etc",
-        "/opt",
-        "/lib",
-        "/lib32",
-        "/lib64",
-        "/libx32",
-        "/bin",
-        "/sbin",
-        "/sys",
-        "/run/udev",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .filter(|p| p.exists())
-    .collect()
+    let mut paths = etc_read_paths(Path::new("/etc"));
+    paths.extend(
+        [
+            "/usr",
+            "/opt",
+            "/lib",
+            "/lib32",
+            "/lib64",
+            "/libx32",
+            "/bin",
+            "/sbin",
+            "/sys",
+            "/run/udev",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.exists()),
+    );
+    paths
+}
+
+/// What below `/etc` no confined process may read, as paths relative to it (a trailing `*` in the
+/// last component matches any name it starts with): the miner's own files (the systemd unit's
+/// `EnvironmentFile`, which may hold the key, wherever the distribution keeps such files; the
+/// witness broker's key), systemd's credential stores, the password hashes, SSH host keys and
+/// sudo's rules. Review r6 LS1: a guest that escaped its executor must not read the key there,
+/// whatever the file's mode.
+pub const ETC_DENIED: &[&str] = &[
+    "zkminer*",
+    "default/zkminer*",
+    "sysconfig/zkminer*",
+    "credstore",
+    "credstore.encrypted",
+    "shadow*",
+    "gshadow*",
+    "ssh",
+    "sudoers*",
+];
+
+/// `etc` readable but for [`ETC_DENIED`]. Landlock only grants, and a grant reaches everything
+/// below its path, so a directory with something denied below it is granted entry by entry instead,
+/// without the denied ones; every other directory is granted whole. Symbolic links are not granted:
+/// opening one reaches its target, which is readable only where a rule grants it, as with `/etc`
+/// granted whole. A file put in such a directory (or put in place by a rename) after the rules are
+/// applied cannot be read; the dynamic loader's `ld.so.cache` is mapped before then. `/etc` and the
+/// directories below it stay listable ([`Confinement::with_system`]): names only, no contents.
+pub fn etc_read_paths(etc: &Path) -> Vec<PathBuf> {
+    let denied: Vec<Vec<&str>> = ETC_DENIED.iter().map(|d| d.split('/').collect()).collect();
+    let mut out = Vec::new();
+    read_paths_without(etc, &denied, &mut out);
+    out
+}
+
+/// Whether the name `name` matches the pattern component `pat` (a trailing `*`: any name it starts
+/// with).
+fn name_matches(pat: &str, name: &str) -> bool {
+    match pat.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pat,
+    }
+}
+
+/// Adds to `out` what [`etc_read_paths`] grants below `dir` with `denied` (each relative to `dir`,
+/// split into components).
+fn read_paths_without(dir: &Path, denied: &[Vec<&str>], out: &mut Vec<PathBuf>) {
+    if !dir.exists() {
+        return;
+    }
+    if denied.is_empty() {
+        out.push(dir.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // Not listable: nothing below it is granted, the denied paths included.
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if denied
+            .iter()
+            .any(|d| d.len() == 1 && name_matches(d[0], name))
+        {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        let below: Vec<Vec<&str>> = denied
+            .iter()
+            .filter(|d| d.len() > 1 && name_matches(d[0], name))
+            .map(|d| d[1..].to_vec())
+            .collect();
+        if kind.is_dir() {
+            read_paths_without(&entry.path(), &below, out);
+        } else {
+            out.push(entry.path());
+        }
+    }
 }
 
 /// The dynamic loader, which the kernel opens for execution with every dynamically linked program.
@@ -762,6 +866,117 @@ fn remove_stale_tmpdirs(base: &Path, tag: &str) {
         };
         if meta.is_dir() && meta.uid() == uid {
             let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    /// Review r6 LS1: nothing granted reaches the miner's environment file, the broker's key or the
+    /// host's secrets, whatever their mode; everything else in `/etc` stays readable, and a
+    /// directory with nothing denied below it is granted whole.
+    #[test]
+    fn etc_is_granted_without_the_denied_entries() {
+        let etc = tempfile::tempdir().unwrap();
+        let etc = etc.path();
+        for f in [
+            "zkminer/env",
+            "zkminer.env",
+            "zkminer-broker/base.key",
+            "default/zkminer",
+            "default/grub",
+            "sysconfig/zkminer-env",
+            "sysconfig/network",
+            "credstore/zkminer-key",
+            "credstore.encrypted/k",
+            "shadow",
+            "shadow-",
+            "gshadow",
+            "ssh/ssh_host_ed25519_key",
+            "sudoers",
+            "sudoers.d/x",
+            "OpenCL/vendors/nvidia.icd",
+            "nvidia/nvidia-application-profiles-rc",
+            "ld.so.cache",
+            "passwd",
+        ] {
+            touch(&etc.join(f));
+        }
+        // A link to a denied file is not granted (it reaches its target, which is not either).
+        std::os::unix::fs::symlink(etc.join("zkminer/env"), etc.join("innocent")).unwrap();
+        let mut got: Vec<String> = etc_read_paths(etc)
+            .iter()
+            .map(|p| p.strip_prefix(etc).unwrap().to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "OpenCL",
+                "default/grub",
+                "ld.so.cache",
+                "nvidia",
+                "passwd",
+                "sysconfig/network"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_deny_list_names_the_miners_files() {
+        for (pat, name, hit) in [
+            ("zkminer*", "zkminer", true),
+            ("zkminer*", "zkminer-broker", true),
+            ("zkminer*", "zkminerd.conf", true),
+            ("zkminer*", "zk", false),
+            ("ssh", "ssh", true),
+            ("ssh", "sshd", false),
+            ("ssh", "ss", false),
+        ] {
+            assert_eq!(name_matches(pat, name), hit, "{pat} {name}");
+        }
+        // The unit's documented file and the broker's documented key are covered.
+        let denied = |rel: &str| {
+            let parts: Vec<&str> = rel.split('/').collect();
+            ETC_DENIED.iter().any(|d| {
+                let d: Vec<&str> = d.split('/').collect();
+                d.len() <= parts.len() && d.iter().zip(&parts).all(|(p, n)| name_matches(p, n))
+            })
+        };
+        for rel in ["zkminer/env", "zkminer-broker/base.key", "default/zkminer"] {
+            assert!(denied(rel), "{rel}");
+        }
+        assert!(!denied("ld.so.cache"));
+        assert!(!denied("OpenCL/vendors/nvidia.icd"));
+    }
+
+    /// The rules of every inline worker: no grant on `/etc` itself or the miner's files there, only
+    /// listing.
+    #[test]
+    fn a_system_confinement_reads_no_miner_file_in_etc() {
+        let c = Confinement::with_system(Sockets::None);
+        for (path, rights) in c.rules() {
+            if path == Path::new("/etc") {
+                assert_eq!(*rights, Rights::LIST);
+            }
+            if let Ok(rel) = path.strip_prefix("/etc") {
+                let first = rel
+                    .components()
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy());
+                assert!(
+                    !first.is_some_and(|f| f.starts_with("zkminer")),
+                    "{}",
+                    path.display()
+                );
+            }
         }
     }
 }

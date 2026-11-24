@@ -1,0 +1,29 @@
+# `cargo deny check advisories` (CI: e2e.yml). Any RustSec advisory against a locked crate fails the
+# check unless it is listed here with the reason it does not reach a running miner. Review the list
+# whenever the lockfile or a fork pin moves: an entry whose crate is bumped past it should go.
+
+[advisories]
+yanked = "warn"
+ignore = [
+    # Not reachable from a running miner.
+    { id = "RUSTSEC-2023-0071", reason = "rsa: only through rzup, risc0's toolchain installer; the miner never decrypts or signs with RSA." },
+    { id = "RUSTSEC-2025-0055", reason = "tracing-subscriber 0.2: ark-relations' constraint tracing; no requester text is logged through it." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1 is unmaintained; no known vulnerability." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; no known vulnerability." },
+    { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch: only its fmt::Pointer impl, which nothing formats." },
+    { id = "RUSTSEC-2026-0220", reason = "ruint: wrong overflow flags of checked/saturating shifts; the miner shifts U256 only with plain >> and <<, whose values are correct." },
+    { id = "RUSTSEC-2026-0344", reason = "ruzstd: via object/backtrace, which decompresses only this binary's own debug sections." },
+    { id = "RUSTSEC-2026-0386", reason = "tokio AsyncFd constructors: not called by the miner." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing: local transaction signing, not observable by a remote party." },
+    # wasmtime =48.0.8 (witness builder; fixed in 48.0.9, which the exact pin keeps out). Its engine
+    # (zkminer-witness-builder/src/engine.rs) turns off GC, threads and function references, the
+    # advisories' workaround, and the crate is built without WASI or the component model.
+    { id = "RUSTSEC-2026-0566", reason = "wasmtime-wasi: not compiled in." },
+    { id = "RUSTSEC-2026-0567", reason = "wasmtime without `threads`: the threads proposal is off in the engine config." },
+    { id = "RUSTSEC-2026-0568", reason = "wasmtime GC heap: wasm_gc is off in the engine config." },
+    { id = "RUSTSEC-2026-0569", reason = "wasmtime Caller::get_module_export: not called by the host functions." },
+    { id = "RUSTSEC-2026-0570", reason = "wasmtime without `gc`: GC types and function references are off in the engine config." },
+    { id = "RUSTSEC-2026-0571", reason = "wasmtime-wasi-http: not compiled in." },
+    { id = "RUSTSEC-2026-0572", reason = "wasmtime component-model streams: the component model is not compiled in." },
+    { id = "RUSTSEC-2026-0573", reason = "wasmtime GC heap reservation: wasm_gc is off in the engine config." },
+]

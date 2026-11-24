@@ -1,0 +1,133 @@
+# systemd unit for a headless zkminer.
+#
+# It runs as the user `zkminer`, whose home holds the config, key, workers and job journal:
+#   sudo useradd --system --create-home --groups render,video zkminer
+#   sudo -u zkminer -H zkminer init --generate-key        # then edit ~zkminer/.zkminer/config.toml
+#   sudo -u zkminer -H mkdir -p ~zkminer/.zkminer/provers # and install the workers there
+#   sudo -u zkminer -H zkminer doctor                     # as the service user, not yourself
+#   sudo cp contrib/zkminer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now zkminer
+#   journalctl -u zkminer -f
+#
+# Memory: the miner puts every worker in a cgroup of its own, with a memory ceiling and no swap,
+# below its own cgroup, which Delegate= hands it (cpu, memory and pids are the controllers it
+# needs; cgroup v2 only). Without it the workers run with no ceiling at all, which the miner reports
+# at start-up as `PAGE: WORKERS-UNCAPPED`. OOMPolicy=continue: when the kernel kills a worker for
+# memory, the miner sees it and carries on, where systemd's default (stop) would stop the whole
+# unit over one proof (a drain, then a restart). After changing either, `systemctl daemon-reload`
+# and restart; `zkminer doctor` checks both.
+#
+# Stopping:
+#   sudo systemctl stop zkminer
+#       Drains: no new claims, the proofs in flight are fulfilled and paid, then it exits (up to
+#       ~50 min, then whatever is still held is released). KillSignal=SIGINT is what makes this a
+#       drain: SIGTERM, systemd's default, releases every held lock at once, at a 5-30% penalty
+#       each.
+#   sudo -u zkminer -H zkminer stop --keep-locks
+#       For upgrades and restarts: exits without releasing (exit 75; a lock too close to its
+#       deadline to survive a restart is released first, and a proof being submitted lands), and
+#       Restart=on-failure starts it again, on the new binary if you replaced it; the new start
+#       finishes the jobs held. A lock still held at its deadline is slashed, so don't leave it
+#       stopped. To upgrade, `install -m755` the new miner and every worker first (all of them:
+#       a worker from another build is refused). During a `systemctl stop`, a keep-locks stop
+#       is not restarted (the stop job wins): start it again yourself. Signals never turn a
+#       keep-locks stop into an abandon, and `systemctl stop` during any stop already under way
+#       just waits for it (ExecStop asks for a drain, which is answered "already stopping").
+#   sudo -u zkminer -H zkminer stop --abandon
+#       Releases everything now (penalties apply), then exits. Use it, not `systemctl kill`, to
+#       cut a drain short: `systemctl kill` signals the proving workers too (unless
+#       `--kill-whom=main`), which kills the proofs in flight.
+#   `systemctl restart` drains first, like `stop`.
+#
+# To stop it for good, use `systemctl disable --now zkminer` (a plain `systemctl stop` starts it
+# again at the next boot): systemd never restarts a unit it stopped itself. A
+# stop the miner was asked for with `zkminer stop` (drain or --abandon) ends with exit 75 when a
+# release could not be confirmed, and Restart=on-failure then starts it again to finish the job,
+# after which it mines again. `zkminer stop --force-exit` exits 130, which is not restarted.
+#
+# Shutting the machine down (poweroff, reboot) stops this unit like `systemctl stop`: it drains,
+# but systemd forces a reboot or poweroff after 30 min (JobTimeoutSec of those targets), and a
+# hypervisor or a cloud stop rarely waits that long; what is cut off keeps its locks. Run `systemctl stop zkminer` first and let
+# it finish, or `zkminer stop --abandon`; or, for maintenance you'll be back from by the start-by
+# time it prints, `sudo -u zkminer -H zkminer stop --keep-locks --wait && sudo systemctl stop
+# zkminer` (within the 10 s before it is restarted).
+#
+# Run `zkminer stop` as the user the unit runs as, with its home: the request goes to that
+# user's ~/.zkminer.
+
+[Unit]
+Description=zkminer (HemiProve prover)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zkminer
+Group=zkminer
+# GPU access for AMD and Intel cards.
+SupplementaryGroups=render video
+WorkingDirectory=~
+# The key: either `key_source = "file"` in ~/.zkminer/config.toml (`zkminer init --generate-key`
+# writes one), or ZKMINER_PRIVATE_KEY in this file, readable by root only. Create it that way
+# before the key goes in: an editor or `tee` alone makes it readable by every user of the host.
+#   sudo install -d -m 700 -o root -g root /etc/zkminer
+#   sudo install -m 600 -o root -g root /dev/null /etc/zkminer/env
+#   sudoedit /etc/zkminer/env                             # ZKMINER_PRIVATE_KEY=0x...
+# Or keep the key in a root-only file and pass it as a systemd credential (systemd 247+), which
+# only this unit's processes can read: create /etc/zkminer/key the same way, uncomment
+# LoadCredential= below, and set `key_source = "file"` and `key_file_path =
+# "/run/credentials/zkminer.service/zkminer-key"` in the config. (`zkminer doctor`, run outside the
+# unit, cannot read that key.) The miner pages KEY-FILE-READABLE, and `zkminer doctor` fails, when
+# other users can read or change the key's file. The workers cannot read /etc/zkminer at all.
+EnvironmentFile=-/etc/zkminer/env
+#LoadCredential=zkminer-key:/etc/zkminer/key
+ExecStart=/usr/local/bin/zkminer run --headless
+# A stop (systemctl stop, a reboot) asks the miner to drain and waits for it to exit, so a stop
+# already under way (`zkminer stop`, a keep-locks stop) is not escalated by systemd's own signal;
+# KillSignal below is the fallback if the miner does not take the request.
+# `-`: when the miner already exited by itself (a `zkminer stop`), this finds none and fails,
+# and without it systemd would count that as a failure and restart it.
+ExecStop=-/usr/local/bin/zkminer stop --wait
+
+# A stop drains instead of releasing (see above).
+KillSignal=SIGINT
+# The signal goes to the miner only. Its proving workers must keep running through the drain;
+# whatever is left of them is killed once the miner has exited.
+KillMode=mixed
+# Drain (up to 3000 s) plus the releases after it (up to 800 s).
+TimeoutStopSec=4200
+
+# The unit's cgroup is the miner's to divide among its workers (see Memory above); systemd runs
+# ExecStop in a `.control` cgroup of its own below it, and still kills every worker cgroup after
+# the miner exits (KillMode=mixed).
+Delegate=cpu memory pids
+# A worker killed for memory fails its proof; the miner carries on.
+OOMPolicy=continue
+
+# Hardening. Running as an unprivileged user is what matters most here; the workers confine
+# themselves on top of it (Landlock, seccomp, no capabilities). /usr, /boot and /etc read-only:
+ProtectSystem=full
+# Left out on purpose:
+# - PrivateTmp=yes: the CPU risc0 worker's Docker Groth16 wrap mounts a directory under /tmp into
+#   the container, and the Docker daemon, outside this unit, would not see a private /tmp.
+# - NoNewPrivileges=yes, CapabilityBoundingSet=, and what implies NoNewPrivileges for a unit with
+#   User= (SystemCallFilter=, RestrictAddressFamilies=, RestrictNamespaces=, LockPersonality=,
+#   RestrictRealtime=, RestrictSUIDSGID=, MemoryDenyWriteExecute=, ProtectKernelModules=,
+#   ProtectKernelLogs=, ProtectHostname=): NVIDIA's libraries create missing device nodes and load
+#   nvidia-uvm through the setuid nvidia-modprobe, which these would stop. Each worker sets
+#   NO_NEW_PRIVS itself when it confines itself.
+# - PrivateDevices=, DevicePolicy=, DeviceAllow=, ProtectClock= (which adds a device allow-list):
+#   the GPUs' device nodes.
+# - ProtectControlGroups=, ProtectKernelTunables=: the delegated cgroup, under /sys/fs/cgroup, must
+#   stay writable.
+# - ProtectHome=: the miner's home holds its config, workers and job journal.
+
+# Exit 75: the miner stopped with locks held, or a keep-locks stop. Start it again so the new
+# start finishes or releases them.
+Restart=on-failure
+RestartSec=10
+# A force exit (`zkminer stop --force-exit`, a third signal) means stop now: not restarted.
+RestartPreventExitStatus=130
+
+[Install]
+WantedBy=multi-user.target

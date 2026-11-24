@@ -32,6 +32,7 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(banner_height), // Readiness banner (0 if ready)
+            Constraint::Length(1),             // Claims line: what the miner is doing and why
             Constraint::Length(3),             // CPU + ZK Engines (compact, never shrink)
             Constraint::Min(gpu_ideal),        // GPUs (protected — shrinks last)
             Constraint::Max(8),                // Wallet & Staking + Performance (shrinks first)
@@ -44,6 +45,8 @@ pub fn render(f: &mut Frame, area: Rect, state: &MinerState) {
     if show_banner {
         render_readiness_banner(f, chunks[0], state);
     }
+    render_claims_line(f, chunks[1], state);
+    let chunks = &chunks[1..];
 
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -89,6 +92,37 @@ fn render_readiness_banner(f: &mut Frame, area: Rect, state: &MinerState) {
     ]);
 
     let paragraph = Paragraph::new(line).style(Style::default().bg(theme::base()));
+    f.render_widget(paragraph, area);
+}
+
+/// One line under the banner saying what the brain's last pass did with the open work: claimed some,
+/// held every claim (and why), or declined each job (and why). See `ClaimOutlook`.
+fn render_claims_line(f: &mut Frame, area: Rect, state: &MinerState) {
+    let outlook = &state.claim_outlook;
+    let (badge, badge_bg) = if outlook.held.is_some() {
+        (" HELD ", theme::yellow())
+    } else if outlook.claimed > 0 {
+        (" CLAIMING ", theme::green())
+    } else if outlook.declined.is_empty() {
+        (" WAITING ", theme::blue())
+    } else {
+        (" DECLINING ", theme::blue())
+    };
+    let mut spans = vec![
+        Span::styled(
+            badge,
+            Style::default()
+                .fg(theme::base())
+                .bg(badge_bg)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(format!(" {}", outlook.summary()), theme::dim()),
+    ];
+    if !outlook.declined.is_empty() && outlook.held.is_none() {
+        spans.push(Span::styled("  2", theme::accent()));
+        spans.push(Span::styled(":jobs for each job's reason", theme::dim()));
+    }
+    let paragraph = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::base()));
     f.render_widget(paragraph, area);
 }
 
@@ -311,6 +345,7 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         Cell::from("VRAM").style(theme::table_header()),
         Cell::from("Temp").style(theme::table_header()),
         Cell::from("Power").style(theme::table_header()),
+        Cell::from("zkVM").style(theme::table_header()),
         Cell::from("Job").style(theme::table_header()),
         Cell::from("Progress").style(theme::table_header()),
     ]);
@@ -323,7 +358,8 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         .collect();
 
     let widths = [
-        Constraint::Min(16),
+        // As wide as the longest name here, not a share of the spare width: Progress gets that.
+        Constraint::Length(name_column_width(&hw.gpus)),
         Constraint::Length(9),
         Constraint::Length(5),
         Constraint::Length(8),
@@ -331,6 +367,8 @@ fn render_gpu(f: &mut Frame, area: Rect, state: &MinerState) {
         Constraint::Length(12),
         Constraint::Length(10),
         Constraint::Length(10),
+        // The longest proof system name, and 4 more.
+        Constraint::Length(crate::state::proof_system_column_width()),
         Constraint::Length(12),
         Constraint::Min(18),
     ];
@@ -367,6 +405,31 @@ fn temp_cell(gpu: &GpuInfo) -> Line<'static> {
 }
 
 /// After a card's name, why it is clocking itself down (`▼ THERMAL,PL1`); nothing when it is not.
+/// The vendor tag `gpu_row` starts a card's name with.
+fn vendor_tag(vendor: &GpuVendor) -> &'static str {
+    match vendor {
+        GpuVendor::Amd => "  AMD ",
+        GpuVendor::Nvidia => " NVDA ",
+        GpuVendor::Intel => " INTC ",
+        GpuVendor::Unknown => " GPU ",
+    }
+}
+
+/// The Name column's width: the widest of its cells (vendor tag, the card's short name, any
+/// throttle marker), no narrower than its header and no wider than 32.
+fn name_column_width(gpus: &[GpuInfo]) -> u16 {
+    gpus.iter()
+        .map(|gpu| {
+            vendor_tag(&gpu.vendor).chars().count()
+                + 1
+                + crate::state::short_gpu_name(&gpu.name).chars().count()
+                + throttle_marker(&gpu.throttle_reasons).chars().count()
+        })
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 32) as u16
+}
+
 fn throttle_marker(reasons: &[String]) -> String {
     if reasons.is_empty() {
         String::new()
@@ -403,6 +466,18 @@ fn card_job<'a>(jobs: &'a [TrackedJob], pci_bus_id: &str) -> Option<&'a TrackedJ
         .min_by_key(|j| rank(j))
 }
 
+/// What a GPU row says while Windows moves its proof's memory off the card for another program's
+/// (`WorkerPool::gpu_spills`): how much is off it, and once the proof is being stopped to run again
+/// where it fits, that.
+fn spill_text(spill: zkminer_prover::dispatcher::GpuSpill) -> String {
+    let gib = spill.evicted_mib as f64 / 1024.0;
+    if spill.stopping {
+        format!("⚠ {gib:.1} GiB in RAM: stopping")
+    } else {
+        format!("⚠ {gib:.1} GiB paged to RAM")
+    }
+}
+
 fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     let gpu_color = theme::usage_color(gpu.gpu_usage_percent);
 
@@ -413,11 +488,11 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     };
     let pwr_color = theme::usage_color(pwr_pct);
 
-    let (vendor_tag, vendor_bg) = match gpu.vendor {
-        GpuVendor::Amd => ("  AMD ", theme::amd_red()),
-        GpuVendor::Nvidia => (" NVDA ", theme::nvidia_green()),
-        GpuVendor::Intel => (" INTC ", theme::intel_blue()),
-        GpuVendor::Unknown => (" GPU ", theme::overlay()),
+    let vendor_bg = match gpu.vendor {
+        GpuVendor::Amd => theme::amd_red(),
+        GpuVendor::Nvidia => theme::nvidia_green(),
+        GpuVendor::Intel => theme::intel_blue(),
+        GpuVendor::Unknown => theme::overlay(),
     };
 
     // This card's score: its SP1 and RISC Zero results blended (`benchmark::gpu_zkops`).
@@ -439,6 +514,9 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     };
 
     let gpu_job = card_job(&state.active_jobs, &gpu.pci_bus_id);
+    let spill = state.gpu_spills.get(&gpu.pci_bus_id).copied();
+    // The zkVM and wrap of the job on the card: what it is proving with, or about to.
+    let zkvm_str = gpu_job.map_or_else(|| "—".to_string(), |job| state.job_zkvm_text(job));
 
     let (job_str, progress_str, progress_style) = if let Some(job) = gpu_job {
         let id = format!("{}", job.info.job_id);
@@ -448,13 +526,29 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
             id
         };
         match &job.status {
-            MinerJobStatus::Proving { progress, .. } => {
-                let (filled, empty) = theme::progress_bar(*progress, 12);
-                (
-                    id_short,
-                    format!("{}{} {:.0}%", filled, empty, progress * 100.0),
-                    Style::default().fg(theme::green()),
-                )
+            // What it is waiting on now (a transaction, memory, a retry), where the status would say
+            // something older (`JobNote`).
+            _ if state.job_note_text(job).is_some() => (
+                id_short,
+                state.job_note_text(job).unwrap_or_default(),
+                theme::warning(),
+            ),
+            // Said in place of the bar: the proof is running many times slower than it shows.
+            MinerJobStatus::Proving { .. } if spill.is_some() => (
+                id_short,
+                spill.map(spill_text).unwrap_or_default(),
+                theme::warning(),
+            ),
+            MinerJobStatus::Proving { .. } => {
+                let text = match state.proving_fraction(job) {
+                    Some(f) => {
+                        let (filled, empty) = theme::progress_bar(f, 12);
+                        format!("{}{} {:.0}%", filled, empty, f * 100.0)
+                    }
+                    // Nothing to weigh the stages by: how long it has run, not a bar at 0%.
+                    None => format!("proving {}", format_duration(state.proving_secs(job))),
+                };
+                (id_short, text, Style::default().fg(theme::green()))
             }
             // Explicit, not the `_ => "Pending"` catch-all: a queued job holds collateral
             // and is waiting for a card, which an operator must be able to tell apart from
@@ -475,13 +569,16 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
     Row::new(vec![
         Cell::from(Line::from(vec![
             Span::styled(
-                vendor_tag,
+                vendor_tag(&gpu.vendor),
                 Style::default()
                     .fg(theme::base())
                     .bg(vendor_bg)
                     .add_modifier(ratatui::style::Modifier::BOLD),
             ),
-            Span::styled(format!(" {}", gpu.name), theme::bold()),
+            Span::styled(
+                format!(" {}", crate::state::short_gpu_name(&gpu.name)),
+                theme::bold(),
+            ),
             Span::styled(throttle_marker(&gpu.throttle_reasons), theme::warning()),
         ])),
         Cell::from(zkops_str).style(theme::metric()),
@@ -501,6 +598,7 @@ fn gpu_row<'a>(gpu: &'a GpuInfo, state: &'a MinerState) -> Row<'a> {
             gpu.power_watts, gpu.power_cap_watts
         ))
         .style(Style::default().fg(pwr_color)),
+        Cell::from(zkvm_str),
         Cell::from(job_str).style(theme::identifier()),
         Cell::from(progress_str).style(progress_style),
     ])
@@ -523,12 +621,16 @@ fn render_wallet_staking(f: &mut Frame, area: Rect, state: &MinerState) {
         state.address.clone()
     };
 
-    let (status_tag, status_bg) = if state.paused {
+    let (status_tag, status_bg) = if state.claims_latched.is_some() {
+        (" SLASHED ", theme::red())
+    } else if state.paused {
         (" PAUSED ", theme::yellow())
-    } else if state.connected {
-        ("  UP  ", theme::green())
     } else {
-        (" DOWN ", theme::red())
+        match state.chain_link() {
+            crate::state::ChainLink::Up => ("  UP  ", theme::green()),
+            crate::state::ChainLink::Stale(_) => (" STALE ", theme::yellow()),
+            crate::state::ChainLink::Down => (" DOWN ", theme::red()),
+        }
     };
 
     let mut lines: Vec<Line> = vec![
@@ -771,7 +873,24 @@ fn render_performance(f: &mut Frame, area: Rect, state: &MinerState) {
 fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
     let block = Block::default()
         .title(Span::styled(
-            format!(" Active Jobs ({}) ", state.active_jobs.len()),
+            // Locks held but not being proven are on the Jobs page; say they exist.
+            match state
+                .kept_locks
+                .iter()
+                .filter(|k| {
+                    !state
+                        .active_jobs
+                        .iter()
+                        .any(|a| a.info.job_id == k.info.job_id)
+                })
+                .count()
+            {
+                0 => format!(" Active Jobs ({}) ", state.active_jobs.len()),
+                held => format!(
+                    " Active Jobs ({}, +{held} held: see Jobs) ",
+                    state.active_jobs.len()
+                ),
+            },
             theme::title(),
         ))
         .borders(Borders::ALL)
@@ -818,9 +937,21 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
             let cycles_str = format_compact(job.estimated_cycles as f64);
 
             let status_str = match &job.status {
-                MinerJobStatus::Proving { progress, .. } => {
-                    let (filled, empty) = theme::progress_bar(*progress, 15);
-                    format!("{}{} {:.0}%", filled, empty, progress * 100.0)
+                // What it is waiting on now, where the status would say something older.
+                _ if state.job_note_text(job).is_some() => {
+                    state.job_note_text(job).unwrap_or_default()
+                }
+                MinerJobStatus::Proving { .. } => {
+                    let secs = format_duration(state.proving_secs(job));
+                    let stage = state.proving_stage_label(job).unwrap_or_default();
+                    match state.proving_fraction(job) {
+                        Some(f) => {
+                            let (filled, empty) = theme::progress_bar(f, 15);
+                            format!("{}{} {:.0}% {secs} {stage}", filled, empty, f * 100.0)
+                        }
+                        // Nothing to weigh the stages by: how long, not a bar stuck at 0%.
+                        None => format!("Proving for {secs} {stage}"),
+                    }
                 }
                 // Queued jobs hold collateral but are not on a card yet — say so plainly
                 // rather than falling through to a generic label.
@@ -832,7 +963,13 @@ fn render_active_jobs(f: &mut Frame, area: Rect, state: &MinerState) {
                 _ => "Unknown".to_string(),
             };
 
-            let price_str = format!("{} HEMI", format_token_amount(job.current_price));
+            // What the claim locked, as the Jobs page shows.
+            let price = if job.info.settled_price > 0 {
+                job.info.settled_price
+            } else {
+                job.current_price
+            };
+            let price_str = format!("{} HEMI", format_token_amount(price));
 
             Row::new(vec![
                 Cell::from(id_short).style(theme::identifier()),
@@ -1204,6 +1341,175 @@ mod card_job_tests {
         assert!(card_job(&jobs, "").is_none());
     }
 
+    /// The GPU table names the zkVM of the job on each card (an idle card shows "—"), and the
+    /// Name column is as wide as the vendor tag and the card's short name, no wider.
+    #[test]
+    fn the_table_shows_each_cards_zkvm_and_a_short_name() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let card = |bus: &str, name: &str| crate::hardware::GpuInfo {
+            index: 0,
+            name: name.into(),
+            vendor: GpuVendor::Nvidia,
+            pci_id: String::new(),
+            pci_bus_id: bus.into(),
+            gpu_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            gpu_usage_percent: 0,
+            mem_usage_percent: 0,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            temp_edge_c: None,
+            temp_junction_c: None,
+            temp_mem_c: None,
+            fan_rpm: 0,
+            fan_max_rpm: 0,
+            power_watts: 0.0,
+            power_cap_watts: 0.0,
+            voltage_mv: 0,
+            pcie_speed: String::new(),
+            pcie_width: 0,
+            vbios: String::new(),
+            throttle_reasons: Vec::new(),
+        };
+        let mut state = MinerState::default();
+        state.hardware.gpus = vec![
+            card("0000:01:00.0", "NVIDIA GeForce RTX 5090"),
+            card("0000:03:00.0", "NVIDIA GeForce RTX 4070"),
+        ];
+        // " NVDA " + " " + "RTX 5090".
+        assert_eq!(name_column_width(&state.hardware.gpus), 15);
+        let mut sp1 = job(
+            1,
+            Some("0000:01:00.0"),
+            MinerJobStatus::Proving {
+                progress: 0.4,
+                elapsed_secs: 30,
+            },
+        );
+        // As the miner sets it once the proof starts: the worker slot.
+        sp1.prover_backend = "sp1:cuda:0".into();
+        state.active_jobs = vec![sp1];
+        // Before its proof system is recorded (a lock recovered after a restart): the slot's zkVM.
+        assert_eq!(state.job_zkvm_text(&state.active_jobs[0]), "sp1");
+        state.note_proof_system(
+            alloy_primitives::B256::repeat_byte(1),
+            zkminer_chain::auction::ProofSystem::Sp1Plonk,
+        );
+        // The longest name ("risc0:Groth16") and 4 more.
+        assert_eq!(crate::state::proof_system_column_width(), 17);
+        let mut term = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        term.draw(|f| render(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let row = |name: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}: {lines:#?}"))
+                .clone()
+        };
+        assert!(lines.iter().any(|l| l.contains("zkVM")), "{lines:#?}");
+        assert!(!row("RTX 5090").contains("GeForce"));
+        assert!(row("RTX 5090").contains("sp1:PLONK"));
+        assert!(!row("RTX 5090").contains("sp1:cuda"));
+        assert!(row("RTX 4070").contains("—"));
+    }
+
+    /// A card whose proof Windows is paging off it to make room for another program's memory says
+    /// so in place of its progress bar, and that the proof is being stopped once it is; a card
+    /// without a spill keeps its bar.
+    #[test]
+    fn the_row_says_when_a_proof_is_paged_off_its_card() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let card = "0000:03:00.0";
+        let mut state = MinerState::default();
+        state.hardware.gpus = vec![crate::hardware::GpuInfo {
+            index: 0,
+            name: "RTX 4070".into(),
+            vendor: GpuVendor::Nvidia,
+            pci_id: String::new(),
+            pci_bus_id: card.into(),
+            gpu_clock_mhz: 0,
+            mem_clock_mhz: 0,
+            gpu_usage_percent: 0,
+            mem_usage_percent: 0,
+            vram_used_bytes: 0,
+            vram_total_bytes: 0,
+            temp_edge_c: None,
+            temp_junction_c: None,
+            temp_mem_c: None,
+            fan_rpm: 0,
+            fan_max_rpm: 0,
+            power_watts: 0.0,
+            power_cap_watts: 0.0,
+            voltage_mv: 0,
+            pcie_speed: String::new(),
+            pcie_width: 0,
+            vbios: String::new(),
+            throttle_reasons: Vec::new(),
+        }];
+        state.active_jobs = vec![job(
+            1,
+            Some(card),
+            MinerJobStatus::Proving {
+                progress: 0.4,
+                elapsed_secs: 30,
+            },
+        )];
+        let screen = |state: &MinerState| {
+            let mut term = Terminal::new(TestBackend::new(200, 50)).unwrap();
+            term.draw(|f| render(f, f.area(), state)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let shown = screen(&state);
+        // No measurement or benchmark to estimate by in this state: the row says how long it has
+        // been proving (the status's own fraction is no longer shown).
+        assert!(shown.contains("proving 30s"), "{shown}");
+        assert!(!shown.contains("paged to RAM"), "{shown}");
+        state.gpu_spills.insert(
+            card.to_string(),
+            zkminer_prover::dispatcher::GpuSpill {
+                evicted_mib: 9_866,
+                stopping: false,
+            },
+        );
+        let shown = screen(&state);
+        assert!(shown.contains("⚠ 9.6 GiB paged to RAM"), "{shown}");
+        assert!(!shown.contains("proving 30s"), "{shown}");
+        state.gpu_spills.insert(
+            card.to_string(),
+            zkminer_prover::dispatcher::GpuSpill {
+                evicted_mib: 9_866,
+                stopping: true,
+            },
+        );
+        assert!(screen(&state).contains("⚠ 9.6 GiB in RAM: stopping"));
+        // Another card's spill is not this one's.
+        state.gpu_spills.clear();
+        state.gpu_spills.insert(
+            "0000:01:00.0".to_string(),
+            zkminer_prover::dispatcher::GpuSpill {
+                evicted_mib: 9_866,
+                stopping: false,
+            },
+        );
+        assert!(screen(&state).contains("proving 30s"));
+    }
+
     /// The Temp cell names the hottest VRAM sensor beside the core when there is one, and the name
     /// cell says why a card is throttled.
     #[test]
@@ -1249,5 +1555,74 @@ mod card_job_tests {
             throttle_marker(&["PL1".to_string(), "THERMAL".to_string()]),
             " ▼ PL1,THERMAL"
         );
+    }
+}
+
+#[cfg(test)]
+mod claims_line_tests {
+    use super::*;
+    use crate::state::ClaimOutlook;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn rendered(state: &MinerState, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, f.area(), state)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The line an operator reads to learn why open work is not being claimed must be on the
+    /// dashboard at the smallest supported size, held or not.
+    #[test]
+    fn the_dashboard_says_why_it_is_not_claiming() {
+        let mut state = MinerState {
+            claim_outlook: ClaimOutlook {
+                held: None,
+                declined: vec![("below the profit threshold".into(), 5)],
+                claimed: 0,
+                not_evaluated: 0,
+            },
+            ..MinerState::default()
+        };
+        let out = rendered(&state, 80, 24);
+        assert!(out.contains("DECLINING"), "{out}");
+        assert!(out.contains("5 below the profit threshold"), "{out}");
+        state.claim_outlook = ClaimOutlook {
+            held: Some("the startup benchmark is still running".into()),
+            ..ClaimOutlook::default()
+        };
+        let out = rendered(&state, 80, 24);
+        assert!(out.contains("HELD"), "{out}");
+        assert!(out.contains("not claiming: the startup benchmark"), "{out}");
+        let out = rendered(&MinerState::default(), 80, 24);
+        assert!(
+            out.contains("WAITING") && out.contains("waiting for jobs"),
+            "{out}"
+        );
+    }
+
+    /// With the readiness banner up too, both lines show and the panels below keep their places
+    /// (the claims line shifted every panel down one row in the layout).
+    #[test]
+    fn the_claims_line_and_the_banner_both_show() {
+        let mut state = MinerState::default();
+        state.setup_status.checked = true; // not ready: no gas, no HEMI, no stake
+        state.claim_outlook = ClaimOutlook {
+            held: Some("the startup benchmark is still running".into()),
+            ..ClaimOutlook::default()
+        };
+        let out = rendered(&state, 100, 30);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("NOT READY"), "{out}");
+        assert!(lines[1].contains("HELD"), "{out}");
+        assert!(out.contains("Recent Activity"), "{out}");
+        assert!(out.contains("Wallet & Staking"), "{out}");
     }
 }

@@ -94,7 +94,15 @@
 //!   least 100 HEMI, so the default holds ten jobs at once.
 //! - `ZKMINER_LOCALNET_FIB_N` (default 10): the fibonacci jobs' input. A larger one makes each proof
 //!   last long enough for several cards to prove at once.
-#![cfg(unix)]
+//!
+//! **Windows.** The tests also build there (no signals: the miner is stopped through its
+//! `stop-request` file and anvil is killed; worker links are hard links or copies), but the miner
+//! finds its home through the known-folder API, not `USERPROFILE`, so a run would use the real
+//! `~/.zkminer` (its lock, journal and key). They therefore refuse to start unless
+//! `ZKMINER_LOCALNET_WINDOWS_ISOLATED_HOME=1` says the `zkminer` under test resolves its home
+//! from `USERPROFILE` (a build with a patched `dirs-sys`); the TUI and `simulate` runs stay Unix
+//! only.
+#![cfg(any(unix, windows))]
 
 use alloy::primitives::aliases::{U40, U96};
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
@@ -523,7 +531,30 @@ fn free_port() -> u16 {
         .port()
 }
 
+#[cfg(windows)]
+mod libc {
+    #![allow(non_camel_case_types)]
+    pub type c_int = i32;
+    pub const SIGINT: c_int = 2;
+}
+
+/// Windows: no signals; anvil is killed (the miner is stopped with a stop request, see `Miner::stop`).
+#[cfg(windows)]
+fn signal(_child: &Child, _signal: libc::c_int) {}
+
+#[cfg(unix)]
+fn link_or_copy(src: &Path, dst: &Path) {
+    std::os::unix::fs::symlink(src, dst).unwrap();
+}
+#[cfg(windows)]
+fn link_or_copy(src: &Path, dst: &Path) {
+    if std::fs::hard_link(src, dst).is_err() {
+        std::fs::copy(src, dst).unwrap();
+    }
+}
+
 /// Send `signal` to `child`.
+#[cfg(unix)]
 fn signal(child: &Child, signal: libc::c_int) {
     // SAFETY: kill(2) on the pid of a child this process has not yet reaped.
     unsafe {
@@ -555,6 +586,13 @@ struct RunDir(PathBuf);
 
 impl RunDir {
     fn new(name: &str) -> Self {
+        // See the module docs: on Windows the miner would otherwise run in the real `~/.zkminer`.
+        if cfg!(windows) && !env_flag("ZKMINER_LOCALNET_WINDOWS_ISOLATED_HOME") {
+            panic!(
+                "localnet on Windows needs a zkminer whose home follows USERPROFILE; set \
+                 ZKMINER_LOCALNET_WINDOWS_ISOLATED_HOME=1 only for such a build (see the module docs)"
+            );
+        }
         let root = std::env::var_os("ZKMINER_LOCALNET_TMPDIR")
             .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
         let dir = root.join(format!("zkminer-localnet-{name}-{}", std::process::id()));
@@ -1348,7 +1386,7 @@ impl World {
             std::fs::create_dir_all(&provers).unwrap();
             let link = provers.join(worker.file_name().unwrap());
             let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink(worker, &link).unwrap();
+            link_or_copy(worker, &link);
             c.prover.worker_search_paths = vec![provers.display().to_string()];
         } else {
             // Named outright, so a host without a GPU still gets the risc0 measure pool, and the
@@ -1363,8 +1401,8 @@ impl World {
     }
 
     /// The miner's config with every worker in `workers` discovered (one per card each), and risc0
-    /// job sizes for the cards in `risc0_po2` (device id, po2): a card under 14 GiB proves risc0 jobs
-    /// only with a size, from calibration or the config.
+    /// job sizes for the cards in `risc0_po2` (device id, po2): a card under 6.5 GiB proves risc0
+    /// jobs only with a size, from calibration or the config.
     fn write_config_for(
         &self,
         dir: &Path,
@@ -1377,7 +1415,7 @@ impl World {
         for worker in &workers[1..] {
             let link = provers.join(worker.file_name().unwrap());
             let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink(worker, &link).unwrap();
+            link_or_copy(worker, &link);
         }
         for (device, po2) in risc0_po2 {
             c.prover.risc0_job_po2.insert(device.clone(), *po2);
@@ -1676,7 +1714,7 @@ fn path_without_workers() -> String {
         })
         .map(|d| d.display().to_string())
         .collect::<Vec<_>>()
-        .join(":")
+        .join(if cfg!(windows) { ";" } else { ":" })
 }
 
 /// A running `zkminer`, its log lines collected as they arrive; stopped on drop.
@@ -1685,6 +1723,9 @@ struct Miner {
     lines: Arc<Mutex<Vec<String>>>,
     /// Its HOME, which holds its log.
     dir: PathBuf,
+    /// Started with `--watch-only`, which takes no stop request on Windows (see `stop`).
+    #[cfg(windows)]
+    watch_only: bool,
 }
 
 impl Miner {
@@ -1727,6 +1768,8 @@ impl Miner {
             child,
             lines,
             dir: dir.to_path_buf(),
+            #[cfg(windows)]
+            watch_only: args.contains(&"--watch-only"),
         }
     }
 
@@ -1740,7 +1783,11 @@ impl Miner {
         args: &[&str],
         env: &[(&str, String)],
     ) -> Command {
-        let exe = dir.join("zkminer");
+        let exe = dir.join(if cfg!(windows) {
+            "zkminer.exe"
+        } else {
+            "zkminer"
+        });
         let _ = std::fs::remove_file(&exe);
         let zkminer = zkminer_exe();
         if std::fs::hard_link(&zkminer, &exe).is_err() {
@@ -1790,6 +1837,15 @@ impl Miner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            let (roaming, local) = (dir.join("AppData/Roaming"), dir.join("AppData/Local"));
+            let _ = std::fs::create_dir_all(&roaming);
+            let _ = std::fs::create_dir_all(&local);
+            cmd.env("USERPROFILE", dir)
+                .env("APPDATA", roaming)
+                .env("LOCALAPPDATA", local);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1814,7 +1870,23 @@ impl Miner {
         if let Some(status) = self.exit_status() {
             return Some(status);
         }
+        #[cfg(unix)]
         signal(&self.child, libc::SIGINT);
+        // Windows, watch-only: it takes no stop request (it holds no instance lock and may run
+        // beside the real miner, so `run.rs` starts no stop watcher for it), and there is no
+        // signal to send. It holds nothing and sends nothing, so it is ended, and that counts as
+        // its clean exit.
+        #[cfg(windows)]
+        if self.watch_only {
+            use std::os::windows::process::ExitStatusExt;
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            return Some(ExitStatus::from_raw(0));
+        }
+        // Windows: `zkminer stop` (drain) through its request file, which a headless miner polls.
+        #[cfg(windows)]
+        std::fs::write(self.dir.join(".zkminer").join("stop-request"), "drain")
+            .expect("write the stop request");
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if let Some(status) = self.exit_status() {
@@ -1966,7 +2038,15 @@ async fn watch_and_check(
         for job in &world.jobs {
             let verdicts = watch_lines(&lines, job.id);
             let want = job.case.inspector_verdict(staked);
-            if !verdicts.iter().any(|v| v.contains(&want)) {
+            // A wrong-journal job may instead be reported as dropped at measure: the measurement
+            // that finds the binding failed also marks the job undecodable
+            // (`mark_job_undecodable`), and an inspection that loses the race to it reads no
+            // measurement and reports the drop. Both refuse the job for good; neither claims it.
+            let dropped = matches!(job.case, Case::FullWrongJournal | Case::FieldsWrongJournal)
+                && verdicts
+                    .iter()
+                    .any(|v| v.contains("dropped while measuring"));
+            if !dropped && !verdicts.iter().any(|v| v.contains(&want)) {
                 missing.push(format!("{:?}: a verdict containing {want:?}", job.case));
             }
             if expect_claims
@@ -2169,6 +2249,7 @@ async fn watch_only_reports_every_job() {
 /// makes it `too_heavy`. Nothing is sent.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the release risc0 worker (a CPU one serves) and the 743111 RPC; see the module docs"]
+#[cfg(unix)]
 async fn simulate_reports_every_job() {
     let dir = RunDir::new("simulate");
     let risc0 = risc0_worker();
@@ -2970,6 +3051,7 @@ async fn mines_on_every_gpu() {
 /// log (`<run dir>/.zkminer/logs`), each card's occupancy.
 #[tokio::test]
 #[ignore = "serves a localnet to a miner run by hand"]
+#[cfg(unix)]
 async fn serves_a_tui_miner() {
     if !env_flag("ZKMINER_LOCALNET_TUI") {
         eprintln!("localnet: SKIPPED the TUI localnet; set ZKMINER_LOCALNET_TUI=1 to serve one");
@@ -3100,6 +3182,7 @@ async fn serves_a_tui_miner() {
 
 /// `<dir>/run-tui.sh`: the miner `Miner::start` would run, as a script someone runs in a terminal of
 /// their own, so it gets the TUI. The same cleaned environment and HOME, the same config.
+#[cfg(unix)]
 fn write_launcher(dir: &Path, config: &Path, env: &[(&str, String)]) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let cmd = Miner::command(dir, config, &[], "run", &[], env);

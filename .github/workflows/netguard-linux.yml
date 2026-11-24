@@ -53,7 +53,11 @@ jobs:
     timeout-minutes: 45
     env:
       ZKMINER_CI_STRICT: "1"
-      ZKMINER_CI_ALLOW_SKIP: "ipv6"
+      # GitHub-hosted runners receive no ICMP time exceeded from their routers (measured on
+      # PR #45: every TTL-limited probe times out), so the near-hop rule cannot find anything far
+      # there; tests that need one say "[time-exceeded]" and are allowed to skip. The rule itself
+      # is covered by the unit tests; a real-network run needs a host whose routers answer.
+      ZKMINER_CI_ALLOW_SKIP: "ipv6,time-exceeded"
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,7 +93,11 @@ jobs:
     timeout-minutes: 60
     env:
       ZKMINER_CI_STRICT: "1"
-      ZKMINER_CI_ALLOW_SKIP: "ipv6"
+      # GitHub-hosted runners receive no ICMP time exceeded from their routers (measured on
+      # PR #45: every TTL-limited probe times out), so the near-hop rule cannot find anything far
+      # there; tests that need one say "[time-exceeded]" and are allowed to skip. The rule itself
+      # is covered by the unit tests; a real-network run needs a host whose routers answer.
+      ZKMINER_CI_ALLOW_SKIP: "ipv6,time-exceeded"
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

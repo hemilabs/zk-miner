@@ -2,10 +2,15 @@
 //!
 //! Manages the lifecycle of a subprocess worker: spawn, handshake, IPC, shutdown.
 
+#[cfg(windows)]
+use crate::windows_sandbox::WorkerChild as Child;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -141,12 +146,255 @@ fn worker_env(
     env
 }
 
-/// When true, worker stderr forwarding is suppressed (TUI mode).
-static SUPPRESS_WORKER_STDERR: AtomicBool = AtomicBool::new(false);
+/// Windows, before the warm-up of a worker at Low integrity: what the warm-up downloads or builds
+/// in the user's profile (`~/.risc0`, `~/.sp1`), installed by the worker binary at `path` run with
+/// `--install-artifacts` at the miner's own (Medium) integrity, as any worker would run, with the
+/// environment its slot's workers get but no Low directory. A Low process cannot write those
+/// directories, and must not be able to: every worker reads what is there. No GPU and no guest in
+/// it, and it reads nothing a Low process can write but the SP1 Groth16 queue's lock files.
+/// `progress` is told each step, as a warm-up's are; ended at `timeout`. Once it succeeded for a
+/// binary (and SP1 server build) it is not run again in this process. What it said it did, or why
+/// it failed, with its last output.
+#[cfg(windows)]
+pub(crate) fn install_artifacts_at_medium(
+    backend: &str,
+    path: &Path,
+    env_overrides: &HashMap<String, String>,
+    timeout: Duration,
+    progress: &mut dyn FnMut(zkminer_prover_protocol::SetupStep),
+) -> Result<String> {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static DONE: std::sync::Mutex<std::collections::BTreeSet<(PathBuf, Option<String>)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let key = (
+        path.to_path_buf(),
+        env_overrides.get("SP1_GPU_SERVER_NAME").cloned(),
+    );
+    if DONE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&key)
+    {
+        return Ok("installed already in this run".to_string());
+    }
+    let env = worker_env(backend, std::env::vars_os(), env_overrides);
+    let mut child = Command::new(path)
+        .arg(zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .env_remove(zkminer_prover_protocol::types::LOW_INTEGRITY_WORKER_ENV)
+        // Its own hidden console: the miner's Ctrl+C is not for it.
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("cannot run {} to install its artifacts", path.display()))?;
+    let pid = child.id();
+    let started = crate::memory::pid_starttime(pid);
+    // Its last lines, for a failure; read to the end, so it never blocks on a full pipe.
+    let tail = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::BufReader::new(stderr)
+                .take(16 * 1024 * 1024)
+                .read_to_string(&mut text);
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            lines[lines.len().saturating_sub(4)..]
+                .iter()
+                .map(|l| sanitize_worker_line(l))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    });
+    let done = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if done.load(Ordering::Acquire) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            !done.load(Ordering::Acquire) && crate::memory::terminate_if_our_worker(pid, started)
+        })
+    };
+    let mut stdout = BufReader::new(child.stdout.take().context("no stdout")?);
+    let answer = loop {
+        match read_message::<_, WorkerResponse>(&mut stdout) {
+            Ok(WorkerResponse::SetupProgress {
+                status,
+                done_bytes,
+                total_bytes,
+                ..
+            }) => progress(zkminer_prover_protocol::SetupStep {
+                status,
+                done_bytes,
+                total_bytes,
+            }),
+            Ok(WorkerResponse::WarmupDone { summary, .. }) => break Ok(summary),
+            Ok(WorkerResponse::Error { message, .. }) => break Err(message),
+            Ok(other) => break Err(format!("it answered {other:?}")),
+            Err(e) => break Err(format!("no answer ({e})")),
+        }
+    };
+    done.store(true, Ordering::Release);
+    let timed_out = watchdog.join().unwrap_or(false);
+    let status = child.wait();
+    let tail = tail.and_then(|t| t.join().ok()).unwrap_or_default();
+    match answer {
+        Ok(summary) => {
+            DONE.lock().unwrap_or_else(|p| p.into_inner()).insert(key);
+            Ok(summary)
+        }
+        Err(why) => {
+            let mut why = format!(
+                "{} {} failed: {why}",
+                path.display(),
+                zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG
+            );
+            if timed_out {
+                why.push_str(&format!(" (ended after {} s)", timeout.as_secs()));
+            } else if let Ok(status) = status {
+                why.push_str(&format!(" ({status})"));
+            }
+            if !tail.is_empty() {
+                why.push_str(&format!("; its last output: {tail}"));
+            }
+            bail!(why)
+        }
+    }
+}
 
-/// Suppress worker stderr forwarding to prevent TUI corruption.
-pub fn suppress_worker_stderr(suppress: bool) {
-    SUPPRESS_WORKER_STDERR.store(suppress, Ordering::Relaxed);
+/// A worker's last lines of output, kept whether or not they are forwarded: forwarding is off by
+/// default, and a worker that crashed otherwise said only "process died (EOF)". Kept as the raw
+/// bytes (each capped), sanitized only when read, so that a drainer that forwards nothing does no
+/// per-line formatting.
+type RecentOutput = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>>;
+
+/// How many of a worker's last lines are kept, and how much of each: bounded, as a guest's own output
+/// reaches the worker's stderr. The raw cap leaves room for multi-byte characters.
+const RECENT_OUTPUT_LINES: usize = 12;
+const RECENT_OUTPUT_LINE_CHARS: usize = 240;
+const RECENT_OUTPUT_LINE_BYTES: usize = 4 * RECENT_OUTPUT_LINE_CHARS;
+
+fn remember_output(recent: &RecentOutput, raw: &[u8]) {
+    let mut lines = recent.lock().unwrap_or_else(|p| p.into_inner());
+    if lines.len() == RECENT_OUTPUT_LINES {
+        lines.pop_front();
+    }
+    lines.push_back(raw[..raw.len().min(RECENT_OUTPUT_LINE_BYTES)].to_vec());
+}
+
+/// [`RecentOutput`] as text: each line sanitized and capped at `RECENT_OUTPUT_LINE_CHARS`, empty
+/// ones left out.
+fn recent_lines(recent: &RecentOutput) -> Vec<String> {
+    recent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|raw| {
+            sanitize_worker_line(&String::from_utf8_lossy(raw))
+                .chars()
+                .take(RECENT_OUTPUT_LINE_CHARS)
+                .collect::<String>()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// What happens to a worker's output (its stderr, onto which the worker puts each guest's stdout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOutput {
+    /// Neither forwarded nor counted in the log (the dashboard: the log file is all there is, and
+    /// stderr would corrupt the screen).
+    Suppress,
+    /// Not forwarded; one line per worker per minute in which it printed says how many lines and
+    /// bytes, not what (the default: a guest's output must not reach a log no one rotates).
+    Tally,
+    /// Forwarded line by line to tracing target `worker` (rate-capped), for debugging a guest
+    /// (`ZKMINER_WORKER_OUTPUT=stderr`; unsafe with a hostile guest, whose output it is).
+    Forward,
+}
+
+/// The current [`WorkerOutput`], as its index.
+static WORKER_OUTPUT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Set what happens to the output of every worker from now on (see [`WorkerOutput`]).
+pub fn set_worker_output(mode: WorkerOutput) {
+    let index = match mode {
+        WorkerOutput::Suppress => 0,
+        WorkerOutput::Tally => 1,
+        WorkerOutput::Forward => 2,
+    };
+    WORKER_OUTPUT.store(index, Ordering::Relaxed);
+}
+
+fn worker_output() -> WorkerOutput {
+    match WORKER_OUTPUT.load(Ordering::Relaxed) {
+        0 => WorkerOutput::Suppress,
+        2 => WorkerOutput::Forward,
+        _ => WorkerOutput::Tally,
+    }
+}
+
+/// How often [`WorkerOutput::Tally`] reports a worker that printed.
+const OUTPUT_TALLY_PERIOD: Duration = Duration::from_secs(60);
+
+/// A worker's output counted since the last report: lines and bytes, never content.
+#[derive(Debug)]
+struct OutputTally {
+    lines: u64,
+    bytes: u64,
+    since: Instant,
+}
+
+impl OutputTally {
+    fn new(now: Instant) -> Self {
+        Self {
+            lines: 0,
+            bytes: 0,
+            since: now,
+        }
+    }
+
+    fn add(&mut self, lines: u64, bytes: u64) {
+        self.lines = self.lines.saturating_add(lines);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// The counts of the period that ended, once `OUTPUT_TALLY_PERIOD` has passed since it began,
+    /// starting a new one; `None` before that, or when the worker printed nothing in it.
+    fn due(&mut self, now: Instant) -> Option<(u64, u64)> {
+        if now.saturating_duration_since(self.since) < OUTPUT_TALLY_PERIOD {
+            return None;
+        }
+        self.since = now;
+        self.take()
+    }
+
+    /// What is counted so far (at the worker's end), or `None` for nothing; resets the counts.
+    fn take(&mut self) -> Option<(u64, u64)> {
+        let counts = (
+            std::mem::take(&mut self.lines),
+            std::mem::take(&mut self.bytes),
+        );
+        (counts != (0, 0)).then_some(counts)
+    }
+}
+
+/// Log a tally of `(lines, bytes)` for worker `backend` (PID `pid`), at most once a minute.
+fn report_output_tally(backend: &str, pid: u32, (lines, bytes): (u64, u64)) {
+    tracing::info!(
+        target: "zkminer::worker_output",
+        "worker {backend} (PID {pid}) printed {lines} line(s) ({bytes} bytes) in the last minute \
+         (not shown: guest output; ZKMINER_WORKER_OUTPUT=stderr forwards it, unsafe with a hostile \
+         guest)"
+    );
 }
 
 use anyhow::{bail, Context, Result};
@@ -704,6 +952,8 @@ pub struct WorkerHandle {
     /// forwarding is suppressed. A worker that dies before its handshake usually says why there
     /// ("dyld: Library not loaded"), and the spawn error carries it to the operator (W10-BFIX).
     last_stderr: Arc<Mutex<Option<String>>>,
+    /// The worker's last lines of output (see [`WorkerHandle::recent_output`]).
+    recent_output: RecentOutput,
     /// True once this handle has reaped its child. Every `kill(-pgid, …)` is gated on
     /// this: after the reap the pid number is free and may name an unrelated group.
     reaped: bool,
@@ -837,8 +1087,9 @@ impl WorkerHandle {
         // wallet). We rebuild the child env from ours MINUS secret-bearing names, rather than
         // `env_clear()` alone, so PATH / HOME / LD_LIBRARY_PATH / CUDA_* and everything the worker
         // genuinely needs are preserved. The dispatcher's explicit overrides are applied last.
+        let env = worker_env(backend, std::env::vars_os(), env_overrides);
         cmd.env_clear();
-        cmd.envs(worker_env(backend, std::env::vars_os(), env_overrides));
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
 
         // The worker's memory ceiling, and (Linux) what ends everything it starts: a cgroup of its
         // own below a delegated root, the reaper, the mount watch. See `containment`.
@@ -849,6 +1100,16 @@ impl WorkerHandle {
             .map_err(|e| anyhow::anyhow!("worker {backend}: {e}"))?;
         #[cfg(target_os = "linux")]
         let join_cgroup = prepared.as_ref().map(|p| p.procs_fd());
+
+        // Windows: a console delivers Ctrl+C, Ctrl+Break and a window close to EVERY process
+        // attached to it, and a worker sharing the miner's console has no handler, so it died at
+        // the operator's first Ctrl+C — the very key that starts a DRAIN, which then had no
+        // proofs left to finish. Its own hidden console keeps the miner's console events away
+        // from it (and from the sp1-gpu-server it starts, which inherits it); the miner still
+        // stops it, through its pipes and the reap. `windows_sandbox::spawn_worker` starts it so,
+        // in the miner's job (joined here, so it is in it from its creation) and a job of its own.
+        #[cfg(windows)]
+        crate::windows_job::join();
 
         // Kill worker if parent process dies (prevents orphan GPU processes after host crash).
         // PR_SET_PDEATHSIG is Linux-specific.
@@ -924,8 +1185,15 @@ impl WorkerHandle {
             cmd.process_group(0);
         }
 
-        let child = cmd
-            .spawn()
+        #[cfg(not(windows))]
+        let child = cmd.spawn();
+        // `std::process::Command` can start neither suspended in a job nor at Low integrity.
+        #[cfg(windows)]
+        let child = {
+            drop(cmd);
+            crate::windows_sandbox::spawn_worker(backend, path, env)
+        };
+        let child = child
             .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
 
         // From here until the `WorkerHandle` owns it, the child is held by a plain local and
@@ -987,10 +1255,14 @@ impl WorkerHandle {
         let reader = BufReader::new(child_stdout);
         let writer = BufWriter::new(child_stdin);
 
-        // Spawn stderr reader thread that forwards to tracing
+        // Spawn stderr reader thread: it drains the pipe, keeps the last lines, and forwards or
+        // counts them (`WorkerOutput`).
         let backend_name = backend.to_string();
         let last_stderr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_stderr_w = last_stderr.clone();
+        let recent_output = RecentOutput::default();
+        let recent_for_drain = recent_output.clone();
+        let drain_pid = spawn_guard.get().id();
         let stderr_task = child_stderr.map(|stderr| {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
@@ -1006,17 +1278,18 @@ impl WorkerHandle {
                     let mut buf: Vec<u8> = Vec::with_capacity(256);
                     let mut discarding = false;
                     let mut byte = [0u8; 1];
-                    // Aggregate flood cap on forwarding. A guest's stdout is dup2'd onto this
-                    // worker-stderr pipe, so a malicious guest can emit unbounded lines; the
-                    // per-line BYTE cap above bounds each line but not their NUMBER. Unbounded, a guest
-                    // in a tight print loop (free, on the pre-claim EXECUTE measurement path — no claim,
-                    // no collateral) floods the daily-rotated, size-uncapped log and fills the
-                    // operator's disk. Token-bucket it: a burst, then a steady trickle, with the excess
-                    // folded into one periodic "(N dropped)" summary so a genuine late diagnostic still
-                    // gets through while a flood cannot. Per drainer thread = per worker lifetime; a
-                    // respawn resets it. In TUI mode forwarding is gated off ENTIRELY below
-                    // (SUPPRESS_WORKER_STDERR), which closes the rolling-file disk-fill outright; the
-                    // bucket is the headless (operator-redirected stderr) defence-in-depth.
+                    // Forwarding is opt-in (`WorkerOutput::Forward`): a guest's stdout is dup2'd onto
+                    // this pipe, and a service wrapper keeps stderr in a file nothing rotates while
+                    // the miner runs, so a guest in a print loop (free, on the pre-claim EXECUTE
+                    // measurement path) would fill the operator's disk. By default only a count of
+                    // lines and bytes is logged, at most once a minute (`OutputTally`); the dashboard
+                    // logs not even that. Either way the pipe is drained (every byte is read), so
+                    // the worker never blocks on a full pipe.
+                    //
+                    // When forwarding, a flood cap still applies: token-bucket it, a burst, then a
+                    // steady trickle, with the excess folded into one periodic "(N dropped)" summary
+                    // so a genuine late diagnostic still gets through while a flood cannot. Per
+                    // drainer thread = per worker lifetime; a respawn resets it.
                     const BUCKET_CAP: u32 = 2048; // lines forwardable back-to-back
                     const REFILL_PER_SEC: u32 = 32; // steady trickle once the burst is spent
                     let mut tokens: u32 = BUCKET_CAP;
@@ -1026,6 +1299,9 @@ impl WorkerHandle {
                         if raw.is_empty() {
                             return;
                         }
+                        // Kept even when not forwarded, for a failed proof to report (sanitized
+                        // when read).
+                        remember_output(&recent_for_drain, raw);
                         // Sanitize (strip control/escape bytes, cap length) before it can reach the
                         // operator's console or log file.
                         let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
@@ -1039,11 +1315,7 @@ impl WorkerHandle {
                             *last_stderr_w.lock().unwrap_or_else(|e| e.into_inner()) =
                                 Some(line.clone());
                         }
-                        // TUI mode suppresses forwarding to BOTH sinks: the eprintln would corrupt the
-                        // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
-                        // tracing::warn would flood the rolling log file. The pipe is still drained (we
-                        // read every byte), so the worker never blocks on a full pipe regardless.
-                        if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
+                        if worker_output() != WorkerOutput::Forward {
                             return;
                         }
                         // Refill the bucket for the time since the last forward, then spend one token.
@@ -1067,35 +1339,58 @@ impl WorkerHandle {
                             );
                         }
                         if line.starts_with("[WITSUM]") || line.starts_with("[EVALCHECK_DIFF]") {
-                            eprintln!("[worker:{backend_name}] {line}");
+                            // Not `eprintln!`, which panics on a terminal gone away (a hung-up
+                            // session the miner now outlives), taking this drain thread with it.
+                            use std::io::Write;
+                            let _ = writeln!(std::io::stderr(), "[worker:{backend_name}] {line}");
                         }
                         tracing::warn!(target: "worker", "[worker:{backend_name}] {line}");
                     };
+                    let mut tally = OutputTally::new(Instant::now());
+                    let mut read_total: u64 = 0;
                     loop {
+                        let mut line_ended = false;
                         match reader.read(&mut byte) {
-                            Ok(0) => {
+                            Ok(0) | Err(_) => {
+                                tally.add(u64::from(!buf.is_empty()), 0);
                                 emit(&buf);
                                 break;
                             }
                             Ok(_) => {
+                                tally.add(0, 1);
+                                read_total = read_total.wrapping_add(1);
                                 if byte[0] == b'\n' {
+                                    tally.add(u64::from(!buf.is_empty()), 0);
                                     emit(&buf);
                                     buf.clear();
                                     discarding = false;
+                                    line_ended = true;
                                 } else if !discarding {
                                     buf.push(byte[0]);
                                     if buf.len() >= MAX_LINE_BYTES {
                                         // Line too long: emit what we have, then skip to the newline.
+                                        tally.add(1, 0);
                                         emit(&buf);
                                         buf.clear();
                                         discarding = true;
+                                        line_ended = true;
                                     }
                                 }
                             }
-                            Err(_) => {
-                                emit(&buf);
-                                break;
+                        }
+                        // Looked at on each line's end, and every 64 KiB of one that never ends.
+                        if line_ended || read_total.is_multiple_of(65_536) {
+                            if let Some(counts) = tally.due(Instant::now()) {
+                                if worker_output() == WorkerOutput::Tally {
+                                    report_output_tally(&backend_name, drain_pid, counts);
+                                }
                             }
+                        }
+                    }
+                    // What it printed since the last report, once, at its end.
+                    if let Some(counts) = tally.take() {
+                        if worker_output() == WorkerOutput::Tally {
+                            report_output_tally(&backend_name, drain_pid, counts);
                         }
                     }
                 })
@@ -1209,14 +1504,36 @@ impl WorkerHandle {
             writer,
             stderr_task,
             last_stderr,
+            recent_output,
             reaped: false,
             oom_kills_at_spawn,
             may_lack_network: false,
         };
 
-        // Perform Hello handshake. A worker that fails it (died at exec, a missing dylib, a crash
-        // before the handshake) has usually said why on stderr: carry its last line in the error, or
-        // the operator sees only "process died (EOF)" (W10-BFIX).
+        // Perform Hello handshake.
+        #[cfg(windows)]
+        if handle.child.is_low_integrity() {
+            // A worker that does not answer at Low integrity (a library that will not load there,
+            // or another Low worker that ended it) is NOT started again at Medium: that fallback
+            // would be any Low process's to trigger. It fails like any spawn, paged, and the
+            // dispatcher starts the next one at Low after its back-off. See `windows_sandbox`.
+            if let Err(e) = handle.handshake() {
+                // Its last words name what failed (a GPU runtime's call, a DLL that did not load).
+                let error = format!("{e:#}");
+                let note = handle.death_note_after(&error, Duration::from_millis(500));
+                drop(handle);
+                crate::windows_sandbox::low_il_worker_failed(
+                    backend,
+                    path,
+                    &format!("{error}; {note}"),
+                );
+                return Err(e);
+            }
+            return Ok(handle);
+        }
+        // A worker that fails it (died at exec, a missing dylib, a crash before the handshake) has
+        // usually said why on stderr: carry its last line in the error, or the operator sees only
+        // "process died (EOF)" (W10-BFIX).
         if let Err(e) = handle.handshake() {
             let quoted = format!("{e:#}").contains(LAST_OUTPUT); // a `WorkerDied` already has it
             return Err(match handle.last_stderr_line(STDERR_DRAIN_WAIT) {
@@ -1446,7 +1763,7 @@ impl WorkerHandle {
     pub fn recv_proof(
         &mut self,
         expected_request_id: u64,
-        on_progress: &Option<Box<dyn Fn(f64) + Send>>,
+        on_progress: &Option<Box<dyn Fn(zkminer_prover_protocol::ProveEvent) + Send>>,
     ) -> Result<WorkerResponse> {
         const MAX_STALE_DISCARDS: u32 = 16;
         let mut stale_count: u32 = 0;
@@ -1454,17 +1771,22 @@ impl WorkerHandle {
         loop {
             let resp = self.recv()?;
             match &resp {
-                WorkerResponse::Progress {
-                    request_id,
-                    fraction,
-                    ..
-                } => {
+                // The start of an attempt (`Progress`; its fraction is no longer read) and each
+                // stage report after it.
+                WorkerResponse::Progress { request_id, .. } => {
                     if *request_id == expected_request_id {
                         if let Some(cb) = on_progress {
-                            cb(*fraction);
+                            cb(zkminer_prover_protocol::ProveEvent::Started);
                         }
                     }
                     // Continue reading (don't count progress toward stale limit)
+                }
+                WorkerResponse::ProveStage { request_id, report } => {
+                    if *request_id == expected_request_id {
+                        if let Some(cb) = on_progress {
+                            cb(zkminer_prover_protocol::ProveEvent::Stage(*report));
+                        }
+                    }
                 }
                 WorkerResponse::ProofResult { request_id, .. }
                 | WorkerResponse::JournalDiverged { request_id, .. }
@@ -1528,6 +1850,12 @@ impl WorkerHandle {
         }
     }
 
+    /// Windows: whether the worker runs at Low integrity (`windows_sandbox`).
+    #[cfg(windows)]
+    pub fn is_low_integrity(&self) -> bool {
+        self.child.is_low_integrity()
+    }
+
     /// Check if the worker process is still alive.
     ///
     /// Does NOT reap. Reaping here (as `try_wait` would) frees the pid — and hence the
@@ -1575,9 +1903,29 @@ impl WorkerHandle {
         #[cfg(not(unix))]
         {
             match self.child.try_wait() {
-                Ok(Some(st)) => format!("exited with code {:?}", st.code()),
+                // A crash's code is an NTSTATUS, e.g. 0xC0000005, which says more in hex.
+                Ok(Some(st)) => match st.code() {
+                    Some(c) if c < 0 => format!("exited with code {c} (0x{:08X})", c as u32),
+                    c => format!("exited with code {c:?}"),
+                },
                 Ok(None) => "still running (spurious)".to_string(),
                 Err(e) => format!("try_wait ERROR: {e}"),
+            }
+        }
+    }
+
+    /// Windows: the worker's exit code, waiting up to `budget` for it to exit; `None` if it has
+    /// not, or cannot be asked. An NTSTATUS such as `0xC000012D` reads as a negative number.
+    #[cfg(not(unix))]
+    pub fn exit_code(&mut self, budget: Duration) -> Option<i32> {
+        let started = Instant::now();
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.code(),
+                Ok(None) if started.elapsed() < budget => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => return None,
             }
         }
     }
@@ -1643,6 +1991,48 @@ impl WorkerHandle {
             return;
         }
         await_exit_visible_of(self.child.id(), budget);
+    }
+
+    /// The worker's last lines of output, oldest first (at most `RECENT_OUTPUT_LINES`).
+    pub fn recent_output(&self) -> Vec<String> {
+        recent_lines(&self.recent_output)
+    }
+
+    /// How a worker whose output pipe closed ended, and what it said last, in one line for a failed
+    /// proof's error. Waits up to `budget` for the exit to show and for its last output to drain.
+    pub fn death_note(&mut self, budget: Duration) -> String {
+        let started = Instant::now();
+        #[cfg(unix)]
+        self.await_exit_visible(budget);
+        #[cfg(not(unix))]
+        while matches!(self.child.try_wait(), Ok(None)) && started.elapsed() < budget {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Its stderr may hold a last line or two after its stdout closed.
+        let drain = Duration::from_millis(200).min(budget.saturating_sub(started.elapsed()));
+        std::thread::sleep(drain);
+        let reason = self.exit_reason();
+        let lines = self.recent_output();
+        if lines.is_empty() {
+            format!("worker {reason}, with no output")
+        } else {
+            format!("worker {reason}; its last output: {}", lines.join(" | "))
+        }
+    }
+
+    /// [`death_note`](Self::death_note) for `error`, the failure it follows: only how the worker
+    /// ended when `error` already quotes its last output (a [`WorkerDied`]), which would otherwise
+    /// be said twice.
+    pub fn death_note_after(&mut self, error: &str, budget: Duration) -> String {
+        let note = self.death_note(budget);
+        if error.contains(LAST_OUTPUT) {
+            match note.split_once("; its last output: ") {
+                Some((ended, _)) => ended.to_string(),
+                None => note,
+            }
+        } else {
+            note
+        }
     }
 
     /// Get the worker's PID.
@@ -2257,6 +2647,68 @@ mod exit_classification_tests {
 }
 
 // Unix-only, as the `/proc` helpers it tests are.
+/// Review 7 LD-2: what a worker prints is counted, not shown, by default.
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    /// The tally reports lines and bytes once a minute has passed, then starts again from zero; a
+    /// minute with no output reports nothing; what is left is reported at the end.
+    #[test]
+    fn the_output_tally_counts_lines_and_bytes_per_minute() {
+        let t0 = Instant::now();
+        let mut tally = OutputTally::new(t0);
+        tally.add(1, 10);
+        tally.add(2, 5);
+        assert_eq!(tally.due(t0 + Duration::from_secs(59)), None);
+        assert_eq!(tally.due(t0 + Duration::from_secs(60)), Some((3, 15)));
+        // Reset: the next minute starts from zero, and an empty one says nothing.
+        assert_eq!(tally.due(t0 + Duration::from_secs(121)), None);
+        tally.add(1, 7);
+        assert_eq!(tally.due(t0 + Duration::from_secs(150)), None);
+        assert_eq!(tally.take(), Some((1, 7)));
+        assert_eq!(tally.take(), None);
+    }
+
+    /// The default is the tally; the mode is read back as set.
+    #[test]
+    fn worker_output_is_not_forwarded_by_default() {
+        assert_eq!(worker_output(), WorkerOutput::Tally);
+        for mode in [
+            WorkerOutput::Suppress,
+            WorkerOutput::Forward,
+            WorkerOutput::Tally,
+        ] {
+            set_worker_output(mode);
+            assert_eq!(worker_output(), mode);
+        }
+    }
+
+    /// The last lines are kept raw and capped, and sanitized and capped again when read: a death
+    /// note never carries a control character or more than its cap.
+    #[test]
+    fn recent_output_is_capped_and_sanitized_when_read() {
+        let recent = RecentOutput::default();
+        for i in 0..20 {
+            remember_output(&recent, format!("line {i}\u{1b}[31m").as_bytes());
+        }
+        remember_output(&recent, &[b'x'; 100_000]);
+        remember_output(&recent, b"\x07\x1b");
+        assert!(recent
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|raw| raw.len() <= RECENT_OUTPUT_LINE_BYTES));
+        let lines = recent_lines(&recent);
+        // 12 kept, the control-only one left out when read.
+        assert_eq!(lines.len(), RECENT_OUTPUT_LINES - 1, "{lines:?}");
+        assert_eq!(lines[0], "line 10[31m");
+        assert!(lines
+            .iter()
+            .all(|l| l.chars().count() <= RECENT_OUTPUT_LINE_CHARS && !l.contains('\u{1b}')));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     #[test]
@@ -2859,5 +3311,140 @@ mod tests {
             None,
             "an unreadable tree must be distinguishable from an empty one"
         );
+    }
+}
+
+/// The miner's console events must not reach a worker: a Ctrl+C there starts a DRAIN, which needs
+/// the proofs in flight to keep running.
+#[cfg(all(test, windows))]
+mod console_isolation_tests {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, process_group: u32) -> i32;
+        fn SetConsoleCtrlHandler(handler: *const std::ffi::c_void, add: i32) -> i32;
+    }
+    const CTRL_C_EVENT: u32 = 0;
+    const CHILD: &str = "ZKMINER_TEST_CONSOLE_ISOLATION_CHILD";
+
+    /// Run as its own process (in a console of its own, by the test below): it ignores Ctrl+C
+    /// itself, starts one child sharing its console and one isolated child, sends Ctrl+C to its
+    /// console, and reports which children survived.
+    #[test]
+    #[ignore = "run by a_ctrl_c_on_the_miners_console_does_not_reach_a_worker"]
+    fn console_isolation_child() {
+        if std::env::var(CHILD).is_err() {
+            return;
+        }
+        // The default handling, whatever this process inherited (a CI agent may have started it
+        // ignoring Ctrl+C, which the control child would inherit and survive).
+        // SAFETY: plain kernel32 call.
+        assert!(unsafe { SetConsoleCtrlHandler(std::ptr::null(), 0) } != 0);
+        let sleeper = || {
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            c
+        };
+        let mut shared = sleeper().spawn().unwrap();
+        let mut isolated = {
+            let mut c = sleeper();
+            super::isolate_from_console(&mut c);
+            c.spawn().unwrap()
+        };
+        // Only now ignore Ctrl+C here: the setting is inherited by children started after it, and
+        // the control child must keep the default (die), as a worker under the miner (whose
+        // handler is a function, not this inherited ignore) would.
+        // SAFETY: plain kernel32 calls; a NULL handler with TRUE makes this process ignore Ctrl+C.
+        assert!(unsafe { SetConsoleCtrlHandler(std::ptr::null(), 1) } != 0);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) } != 0);
+        std::thread::sleep(Duration::from_secs(2));
+        let shared_alive = shared.try_wait().unwrap().is_none();
+        let isolated_alive = isolated.try_wait().unwrap().is_none();
+        let _ = shared.kill();
+        let _ = isolated.kill();
+        println!("shared {shared_alive} isolated {isolated_alive}");
+    }
+
+    #[test]
+    fn a_ctrl_c_on_the_miners_console_does_not_reach_a_worker() {
+        // In a console of its own (made for it, so this needs none), so its Ctrl+C reaches
+        // nothing of ours.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "worker::console_isolation_tests::console_isolation_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("isolated true"),
+            "the isolated child died with the console's Ctrl+C:\n{text}"
+        );
+        // The control: a child sharing the console does get it (else the test proves nothing).
+        assert!(
+            text.contains("shared false"),
+            "the control child survived:\n{text}"
+        );
+    }
+}
+
+/// Start `cmd` with a console of its own that has no window (`CREATE_NO_WINDOW`), so the console
+/// events of the one the miner runs in (Ctrl+C, Ctrl+Break, closing it) never reach it: as
+/// `windows_sandbox::spawn_worker` starts every worker.
+#[cfg(all(test, windows))]
+pub(crate) fn isolate_from_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(all(test, windows))]
+mod low_integrity_tests {
+    use super::*;
+    use crate::windows_sandbox::{TEST_LOW_ROOT, TEST_SPAWNS};
+
+    /// With Low workers, one that fails its handshake (here a program that exits without one) is
+    /// not started again at Medium: the spawn fails, and the next one is at Low again. And one
+    /// whose directories cannot be prepared is not started at all.
+    #[test]
+    fn a_low_worker_that_fails_is_not_started_at_medium() {
+        let root = std::env::temp_dir().join(format!("zkminer-low-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        TEST_LOW_ROOT.with(|r| *r.borrow_mut() = Some(root.clone()));
+        let no_handshake = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("where.exe");
+        let env = HashMap::new();
+        let first = WorkerHandle::spawn_on_this_thread("mock", &no_handshake, &env);
+        let second = WorkerHandle::spawn_on_this_thread("mock", &no_handshake, &env);
+        let spawned = TEST_SPAWNS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        // Where a Low directory's parent should be, a file: nothing is started.
+        let _ = std::fs::remove_dir_all(root.join("home").join(".zkminer"));
+        std::fs::write(root.join("home").join(".zkminer"), b"not a directory").unwrap();
+        let unprepared = WorkerHandle::spawn_on_this_thread("mock", &no_handshake, &env);
+        let spawned_after = TEST_SPAWNS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        TEST_LOW_ROOT.with(|r| *r.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&root);
+        for failed in [first, second] {
+            // Started, and failed in its handshake (not before it).
+            let failed = format!("{:#}", failed.err().expect("a worker without a handshake"));
+            assert!(failed.contains("Handshake"), "{failed}");
+        }
+        assert_eq!(spawned, [true, true], "a worker was started at Medium");
+        let unprepared = format!("{:#}", unprepared.err().expect("started without its dirs"));
+        assert!(unprepared.contains("could not be prepared"), "{unprepared}");
+        assert!(spawned_after.is_empty(), "{spawned_after:?}");
     }
 }

@@ -68,6 +68,17 @@ pub(crate) fn warm_up(
 ) -> Result<WarmupReport> {
     let dir = sp1_prover::build::groth16_circuit_artifacts_dir()
         .context("cannot locate the Groth16 circuit artifacts directory")?;
+    // A Low-integrity worker (Windows) cannot write `~/.sp1`: the miner installs the artifacts at its
+    // own integrity first (`--install-artifacts`). Say so rather than fail inside the install.
+    if zkminer_prover_protocol::types::is_low_integrity_worker() && !is_complete(&dir) {
+        bail!(
+            "the Groth16 circuit artifacts are not installed in {}, and this worker runs at Low \
+             integrity, which cannot install them: the miner installs them at Medium integrity \
+             before a Low worker's warm-up (`{}`); its log says why that did not",
+            dir.display(),
+            zkminer_prover_protocol::types::INSTALL_ARTIFACTS_ARG,
+        );
+    }
     let started = Instant::now();
     let installed = ensure_installed(&dir, |staging| {
         // A worker that has run a requester's guest (or started its server) has no network: say so

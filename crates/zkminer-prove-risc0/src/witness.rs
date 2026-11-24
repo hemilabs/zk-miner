@@ -1049,6 +1049,8 @@ mod tests {
         ));
     }
 
+    // Unix symlinks (`std::os::unix::fs::symlink`).
+    #[cfg(unix)]
     #[test]
     fn the_segment_dir_is_created_and_emptied_without_following_links() {
         let root = tempfile::tempdir().unwrap();

@@ -39,8 +39,7 @@
 //! - **everything else is refused** ([`crate::Denied::NearCheckFailed`]): silence, any
 //!   Destination Unreachable, Time Exceeded code 1, a Time Exceeded sent by the destination
 //!   itself, an unreachable without its ICMP message, inconsistent results, local errors, a
-//!   platform without the ICMP plumbing (Windows today, which refuses every requester connection
-//!   in public mode anyway).
+//!   platform without the ICMP plumbing (the BSDs).
 //!
 //! An answer always dominates an ICMP error queued for the same probe (Linux can queue an error
 //! and still complete the connection: `sk_err_soft` while the socket is owned by the user).
@@ -76,6 +75,20 @@
 //! connection was in progress, is a local failure, never evidence (see docs/netguard-macos.md).
 //! A macOS host whose ICMP socket cannot be opened, or whose `TCP_INFO` cannot be read, refuses
 //! every requester connection (said once at startup: [`warn_if_unsupported`]).
+//!
+//! **Windows** (review r3 G1/G2) keeps retrying a SYN an ICMP error answered, so each probe sets
+//! `TCP_FAIL_CONNECT_ON_ICMP_ERROR` (Windows 10 1903 and later) and, once its connect fails,
+//! reads the ICMP error Windows matched to the connection from `TCP_ICMP_ERROR_INFO` (type, code,
+//! sender), judged by the same rule. In practice Windows TCP does not end a connect on a Time
+//! Exceeded at all (measured on Windows 11: SYNs with hop limits 1 to 5 to public IPv4 and IPv6
+//! hosts all time out, while an unprivileged `tracert` from the same host, and the ICMPv6
+//! firewall rule, show the routers do answer: the firewall is not the cause), so every probe ends
+//! in silence and every decision refuses. [`supported`] therefore reports Windows as unable to
+//! run public mode, said at start and in `zkminer status`: run public mode on Linux or macOS
+//! (`[dev] private_network` is for a local test chain only, never a shared market). Each public
+//! address is refused at once, nothing sent ([`TtlProbe`]); a local one is still probed. A new
+//! evidence source (an ICMP echo with a hop limit, say) needs its own review. There is no
+//! interface pin on Windows; the probes and the connection share the source address.
 //!
 //! **What it cannot help:** a probe that connects still reaches a near host (a SYN, a handshake,
 //! a reset; never data) before the refusal; a transparent proxy within the limit answers for every
@@ -378,6 +391,13 @@ impl NearProbe for TtlProbe {
         if wait.is_zero() {
             return Err(OUT_OF_TIME.into());
         }
+        // Windows: TCP never reports the Time Exceeded the rule needs ([`supported`]), so a round
+        // to a public address could only time out and be refused as silence. Refuse it at once,
+        // with the reason, and send nothing. (A local address is still probed: it answers, near.)
+        #[cfg(windows)]
+        if crate::is_global(addr.ip()) {
+            return Err(WINDOWS_REFUSED.into());
+        }
         observe(addr, hops, extra, pin, wait)
     }
 }
@@ -396,8 +416,8 @@ pub fn warn_if_unsupported() {
     ONCE.call_once(|| {
         if let Err(why) = supported() {
             tracing::warn!(
-                "network guard: the near-hop check cannot read ICMP errors on this host ({why}): \
-                 every requester connection will be refused"
+                "network guard: the near-hop check cannot work on this host, so every requester \
+                 connection will be refused: {why}"
             );
         }
     });
@@ -435,7 +455,20 @@ pub fn supported() -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    // Windows: TCP does not end a connect on an ICMP time exceeded, with or without
+    // `TCP_FAIL_CONNECT_ON_ICMP_ERROR` (measured on Windows 11 26300: SYNs with hop limits 1 to 5
+    // to public hosts, whose routers answer tracert, all time out, both families), so no probe is
+    // ever found far and every decision refuses. Said at start and in `zkminer status`.
+    #[cfg(windows)]
+    {
+        Err(WINDOWS_NO_TIME_EXCEEDED.into())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
         Err(UNSUPPORTED.into())
     }
@@ -814,7 +847,12 @@ pub(crate) fn new_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
     Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+))]
 fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()> {
     if addr.is_ipv4() {
         sock.set_ttl_v4(u32::from(hops))
@@ -905,7 +943,8 @@ fn bind_interface(sock: &socket2::Socket, addr: SocketAddr, index: u32) -> io::R
     }
 }
 
-/// No interface pin here (no far verdict is ever given on such a platform).
+/// No interface pin here (Windows: the probes and the connection share the source address; the
+/// BSDs: no far verdict is ever given).
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn bind_interface(_: &socket2::Socket, _: SocketAddr, _: u32) -> io::Result<()> {
     Ok(())
@@ -985,7 +1024,13 @@ fn unmapped(addr: SocketAddr) -> SocketAddr {
 /// skeptic); an unreachable is the ICMP error that caused it when one kind was matched (several
 /// different ones: a failure), a plain unreachable when none was; an ICMP error the socket did not
 /// end on is no evidence (no answer).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+))]
 fn settle(end: Option<ProbeOutcome>, icmp: &[(u8, u8, IpAddr)]) -> ProbeOutcome {
     match end {
         None => ProbeOutcome::TimedOut,
@@ -1006,7 +1051,13 @@ fn settle(end: Option<ProbeOutcome>, icmp: &[(u8, u8, IpAddr)]) -> ProbeOutcome 
 /// the round ends at once and the connection can follow its probe closely: an answer within the
 /// limit (near), or a far verdict whose every probe at or below its hop limit has ended (no later
 /// answer can contradict it: only an answer at or below that hop limit could).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+))]
 fn decided(dst: IpAddr, hops: u8, seen: &[(u8, Option<ProbeOutcome>)]) -> bool {
     let ended: Vec<Obs> = seen
         .iter()
@@ -1520,14 +1571,281 @@ fn observe(
         .collect())
 }
 
-/// Why no destination is found far on this platform.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-const UNSUPPORTED: &str = "this platform gives the near-hop check no way to read which router's \
-                           ICMP error ended a probe (Windows: TCP_FAIL_CONNECT_ON_ICMP_ERROR and \
-                           TCP_ICMP_ERROR_INFO are not yet verified), so no destination is found far";
+/// Windows: one round as [`observe`] reads it elsewhere, from what Windows gives in place of an
+/// error queue (see the module doc): each probe sets `TCP_FAIL_CONNECT_ON_ICMP_ERROR`, so its
+/// connect ends on an ICMP error instead of retrying the SYN, and the error Windows matched to
+/// the connection is read from `TCP_ICMP_ERROR_INFO` (type, code, sender). Far only on a matched
+/// Time Exceeded, as everywhere ([`rule`]); a probe whose ICMP message never reaches TCP (every
+/// Time Exceeded on the Windows 11 hosts measured, see the module doc; or a Windows whose
+/// `WSAPoll` does not report a failed connect) times out: silence, refused.
+#[cfg(windows)]
+fn observe(
+    addr: SocketAddr,
+    hops: u8,
+    extra: u8,
+    pin: &Pin,
+    wait: Duration,
+) -> Result<Vec<Obs>, String> {
+    let mut probes = Vec::new();
+    for t in hops..=hops.saturating_add(extra) {
+        probes.push(
+            win::Probe::open(addr, t, pin)
+                .map_err(|e| format!("a probe could not be sent: {e}"))?,
+        );
+    }
+    let end = Instant::now() + wait;
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        let seen: Vec<(u8, Option<ProbeOutcome>)> = probes
+            .iter()
+            .map(|p| (p.ttl, p.end.as_ref().map(|_| settle(p.end.clone(), &p.icmp))))
+            .collect();
+        if left.is_zero()
+            || probes.iter().all(|p| p.end.is_some())
+            || decided(addr.ip(), hops, &seen)
+        {
+            break;
+        }
+        win::poll(&mut probes, left)?;
+    }
+    Ok(probes
+        .into_iter()
+        .map(|p| Obs {
+            ttl: p.ttl,
+            outcome: settle(p.end, &p.icmp),
+            local: Some(p.local),
+        })
+        .collect())
+}
 
-/// Elsewhere (Windows): no round can be read; every decision refuses.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(windows)]
+mod win {
+    //! Winsock calls the Windows probes make (review r3 G1/G2, on the S3 rule).
+
+    use std::io;
+    use std::net::{IpAddr, SocketAddr};
+    use std::os::windows::io::AsRawSocket;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Networking::WinSock::{
+        getsockopt, setsockopt, WSAGetLastError, WSAPoll, AF_INET, AF_INET6, ICMP_ERROR_INFO,
+        IPPROTO_TCP, POLLERR, POLLHUP, POLLWRNORM, SOCKET, TCP_FAIL_CONNECT_ON_ICMP_ERROR,
+        TCP_ICMP_ERROR_INFO, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAENETUNREACH,
+        WSAETIMEDOUT, WSAEWOULDBLOCK, WSAPOLLFD,
+    };
+
+    use super::{new_socket, pin_socket, set_hops, Pin, ProbeOutcome};
+
+    /// One probe of a round.
+    pub(super) struct Probe {
+        sock: socket2::Socket,
+        pub(super) ttl: u8,
+        pub(super) local: SocketAddr,
+        /// How its socket ended.
+        pub(super) end: Option<ProbeOutcome>,
+        /// The ICMP error Windows matched to it: type, code, sender.
+        pub(super) icmp: Vec<(u8, u8, IpAddr)>,
+    }
+
+    impl Probe {
+        /// A probe to `addr` with hop limit `ttl`, from `pin`, its connect started.
+        pub(super) fn open(addr: SocketAddr, ttl: u8, pin: &Pin) -> io::Result<Self> {
+            let sock = new_socket(addr)?;
+            set_hops(&sock, addr, ttl)?;
+            fail_connect_on_icmp(&sock).map_err(|e| {
+                io::Error::new(e.kind(), format!("TCP_FAIL_CONNECT_ON_ICMP_ERROR: {e}"))
+            })?;
+            pin_socket(&sock, addr, pin, 0)?;
+            sock.set_nonblocking(true)?;
+            let end = match sock.connect(&addr.into()) {
+                Ok(()) => Some(ProbeOutcome::Connected),
+                Err(e)
+                    if e.raw_os_error() == Some(WSAEWOULDBLOCK)
+                        || e.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    None
+                }
+                Err(e) => Some(at_once(e)),
+            };
+            // Closed with a reset, never a byte of data.
+            let _ = sock.set_linger(Some(Duration::ZERO));
+            let local = sock
+                .local_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::other("the probe's own address is not an IP address"))?;
+            Ok(Probe {
+                sock,
+                ttl,
+                local,
+                end,
+                icmp: Vec::new(),
+            })
+        }
+
+        /// `WSAPoll` reported `revents` on the socket: how it ended. An error that is not an
+        /// answer is read with the ICMP error that caused it, when Windows matched one.
+        fn ready(&mut self, revents: i16) {
+            if revents & (POLLERR | POLLHUP) != 0 {
+                let end = match self.sock.take_error() {
+                    Ok(Some(e)) => ended(&e),
+                    Ok(None) => ProbeOutcome::Failed(format!(
+                        "the socket reported {revents:#x} with no error pending"
+                    )),
+                    Err(e) => ProbeOutcome::Failed(e.to_string()),
+                };
+                if !end.answered() {
+                    if let Some(e) = icmp_error(&self.sock, self.local.is_ipv6()) {
+                        self.icmp.push(e);
+                        self.end = Some(ProbeOutcome::Unreachable);
+                        return;
+                    }
+                }
+                self.end = Some(end);
+            } else if revents & POLLWRNORM != 0 {
+                self.end = Some(ProbeOutcome::Connected);
+            }
+        }
+    }
+
+    /// Waits up to `left` for the probes not yet ended, and reads how each that is ready ended.
+    pub(super) fn poll(probes: &mut [Probe], left: Duration) -> Result<(), String> {
+        let mut pf: Vec<WSAPOLLFD> = probes
+            .iter()
+            .filter(|p| p.end.is_none())
+            .map(|p| WSAPOLLFD {
+                fd: p.sock.as_raw_socket() as SOCKET,
+                events: POLLWRNORM,
+                revents: 0,
+            })
+            .collect();
+        let ms = left.as_millis().clamp(1, i32::MAX as u128) as i32;
+        // SAFETY: a valid WSAPOLLFD array of the length given.
+        let n = unsafe { WSAPoll(pf.as_mut_ptr(), pf.len() as u32, ms) };
+        if n < 0 {
+            return Err(format!("WSAPoll: {}", last_error()));
+        }
+        for f in pf.iter().filter(|f| f.revents != 0) {
+            if let Some(p) = probes
+                .iter_mut()
+                .find(|p| p.sock.as_raw_socket() as SOCKET == f.fd)
+            {
+                p.ready(f.revents);
+            }
+        }
+        Ok(())
+    }
+
+    /// How a probe's socket ended, from its pending error.
+    pub(super) fn ended(e: &io::Error) -> ProbeOutcome {
+        match e.raw_os_error() {
+            Some(WSAECONNREFUSED) => ProbeOutcome::Refused,
+            Some(WSAECONNRESET) => ProbeOutcome::Reset,
+            Some(WSAEHOSTUNREACH) | Some(WSAENETUNREACH) => ProbeOutcome::Unreachable,
+            Some(WSAETIMEDOUT) => ProbeOutcome::TimedOut,
+            _ => ProbeOutcome::Failed(e.to_string()),
+        }
+    }
+
+    /// An error `connect` reported at once, before the connection was in progress: a reset is an
+    /// answer; anything else is a local failure, never evidence.
+    pub(super) fn at_once(e: io::Error) -> ProbeOutcome {
+        match e.raw_os_error() {
+            Some(WSAECONNREFUSED) => ProbeOutcome::Refused,
+            Some(WSAECONNRESET) => ProbeOutcome::Reset,
+            _ => ProbeOutcome::Failed(format!("{e}, before any packet was answered")),
+        }
+    }
+
+    fn last_error() -> io::Error {
+        // SAFETY: no arguments; reads the calling thread's last Winsock error.
+        io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    /// Ends the socket's connect on an ICMP error (Windows 10 1903 and later); without it Windows
+    /// keeps retrying a SYN an ICMP error answered.
+    fn fail_connect_on_icmp(sock: &socket2::Socket) -> io::Result<()> {
+        let on: u32 = 1;
+        // SAFETY: a valid socket, and a DWORD option value of the size given.
+        let rc = unsafe {
+            setsockopt(
+                sock.as_raw_socket() as SOCKET,
+                IPPROTO_TCP,
+                TCP_FAIL_CONNECT_ON_ICMP_ERROR,
+                (&on as *const u32).cast(),
+                std::mem::size_of::<u32>() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+
+    /// The ICMP error that ended the socket's connect, if Windows matched one of the socket's
+    /// family (ICMP for IPv4, ICMPv6 for `v6`): type, code and sender.
+    fn icmp_error(sock: &socket2::Socket, v6: bool) -> Option<(u8, u8, IpAddr)> {
+        // SAFETY: plain data, overwritten by the call.
+        let mut info: ICMP_ERROR_INFO = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<ICMP_ERROR_INFO>() as i32;
+        // SAFETY: a valid socket, and `info` and `len` valid for the size given.
+        let rc = unsafe {
+            getsockopt(
+                sock.as_raw_socket() as SOCKET,
+                IPPROTO_TCP,
+                TCP_ICMP_ERROR_INFO,
+                (&mut info as *mut ICMP_ERROR_INFO).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 || len < std::mem::size_of::<ICMP_ERROR_INFO>() as i32 {
+            return None;
+        }
+        // SAFETY: the union is read by the family the call wrote into it.
+        let from = unsafe {
+            match info.srcaddress.si_family {
+                AF_INET => IpAddr::from(info.srcaddress.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes()),
+                AF_INET6 => IpAddr::from(info.srcaddress.Ipv6.sin6_addr.u.Byte),
+                _ => return None,
+            }
+        };
+        match (info.protocol, v6) {
+            (1, false) | (58, true) => Some((info.r#type, info.code, from)),
+            _ => None,
+        }
+    }
+}
+
+/// Why no destination is found far on Windows ([`supported`]).
+#[cfg(windows)]
+const WINDOWS_NO_TIME_EXCEEDED: &str = "Windows TCP does not report a router's ICMP time exceeded \
+     to a connecting socket (with or without TCP_FAIL_CONNECT_ON_ICMP_ERROR), so the near-hop \
+     check never finds a destination far: public mode refuses every requester connection on \
+     Windows (ELF, IPFS and Arweave downloads, artifact publish). Run public mode on Linux or \
+     macOS; `[dev] private_network` is for a local test chain only, never a shared market (it lets requesters reach this host's network)";
+
+/// The near-hop check's refusal of a public address on Windows ([`TtlProbe::round`]): short, as
+/// a round's failure is quoted in at most 160 characters.
+#[cfg(windows)]
+const WINDOWS_REFUSED: &str = "public mode is not supported on Windows: its TCP never reports a \
+     router's time exceeded, so the near-hop check finds nothing far (see `zkminer status`)";
+
+/// Why no destination is found far on this platform.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
+const UNSUPPORTED: &str = "this platform gives the near-hop check no way to read which router's \
+                           ICMP error ended a probe, so no destination is found far";
+
+/// Elsewhere (the BSDs): no round can be read; every decision refuses.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
 fn observe(_: SocketAddr, _: u8, _: u8, _: &Pin, _: Duration) -> Result<Vec<Obs>, String> {
     Err(UNSUPPORTED.into())
 }
@@ -1815,6 +2133,62 @@ mod tests {
         assert!(matches!(decide_until(&Broken(1), addr, 2, &Pin::default(), far), Verdict::NoEvidence(_)));
     }
 
+    /// Windows probe errors (review r3 G1/G2): WSAECONNREFUSED and WSAECONNRESET are answers,
+    /// WSAEHOSTUNREACH and WSAENETUNREACH an unreachable (far only with the matched Time
+    /// Exceeded), WSAETIMEDOUT silence; anything else, and any error `connect` reports at once
+    /// other than an answer, a failure.
+    #[cfg(windows)]
+    #[test]
+    fn windows_probe_errors_are_classified() {
+        let os = |e: i32| io::Error::from_raw_os_error(e);
+        assert_eq!(win::ended(&os(10061)), ProbeOutcome::Refused);
+        assert_eq!(win::ended(&os(10054)), ProbeOutcome::Reset);
+        assert_eq!(win::ended(&os(10065)), ProbeOutcome::Unreachable);
+        assert_eq!(win::ended(&os(10051)), ProbeOutcome::Unreachable);
+        assert_eq!(win::ended(&os(10060)), ProbeOutcome::TimedOut);
+        for e in [10013, 10049, 10022] {
+            assert!(matches!(win::ended(&os(e)), ProbeOutcome::Failed(_)), "{e}");
+            assert!(
+                matches!(win::at_once(os(e)), ProbeOutcome::Failed(_)),
+                "{e}"
+            );
+        }
+        assert!(matches!(win::at_once(os(10065)), ProbeOutcome::Failed(_)));
+        assert_eq!(win::at_once(os(10061)), ProbeOutcome::Refused);
+    }
+
+    /// Windows: a listener on loopback is zero hops away, so the probes connect (near); a loopback
+    /// port with nothing listening is never far (Windows retries a connect a reset answered for
+    /// about two seconds, so the probe may time out: silence, refused).
+    #[cfg(windows)]
+    #[test]
+    fn a_local_listener_is_near_on_windows() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        assert_eq!(
+            decide(&TtlProbe, addr, 2),
+            Verdict::Near("accepted a connection")
+        );
+        drop(l);
+        let v = decide(&TtlProbe, addr, 2);
+        assert!(refused(&v), "{v:?}");
+    }
+
+    /// Windows: a public address is refused at once, with the reason, and nothing is sent (no
+    /// round could find it far there: [`supported`]).
+    #[cfg(windows)]
+    #[test]
+    fn a_public_address_is_refused_at_once_on_windows() {
+        let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let t = Instant::now();
+        let v = decide(&TtlProbe, addr, 2);
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(
+            matches!(&v, Verdict::Failed(w) if w == WINDOWS_REFUSED),
+            "{v:?}"
+        );
+    }
+
     /// The S3 review's lab cases (rounds 1-3: `S3REV/r1-measure`, `r2-evidence/lab2.sh`,
     /// `r3-evidence`), as the observations they produced, through the decision. Topology: the
     /// miner, r1 (hop 1), the near host or r2 (hop 2), the far host or r3 (hop 3), far4 (hop 4);
@@ -1976,7 +2350,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        crate::skipped(format!("no Time Exceeded from the first router here: {seen:?}"));
+        crate::skipped(format!(
+            "[time-exceeded] no Time Exceeded from the first router here: {seen:?}"
+        ));
     }
 
     /// A destination nothing answers (TEST-NET-1, at a hop limit past every router): two rounds,

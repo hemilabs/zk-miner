@@ -10,18 +10,18 @@
 //!
 //! This command is the whole remedy in one line, with the units handled.
 
-use alloy::providers::Provider;
 use anyhow::{Context, Result};
-use std::io::Write;
 use std::path::Path;
 use zkminer_chain::client::ChainClient;
 use zkminer_config::wallet::load_signer;
 use zkminer_config::ZkMinerConfig;
 
+use super::signer_guard;
+
 /// 1 HEMI in wei.
 const WEI_PER_HEMI: u128 = 1_000_000_000_000_000_000;
 
-fn fmt_hemi(wei: u128) -> String {
+pub(crate) fn fmt_hemi(wei: u128) -> String {
     format!("{:.3}", wei as f64 / WEI_PER_HEMI as f64)
 }
 
@@ -38,7 +38,7 @@ fn fmt_u256_hemi(v: alloy::primitives::U256) -> String {
 /// Deliberately takes HEMI, not wei: an operator reading "short 4.25 HEMI" should be able to
 /// type `zkminer stake 10`. Accepting wei here would invite `zkminer stake 500` to mean 500
 /// wei — a 1e18 error that looks like success and stakes nothing measurable.
-fn parse_hemi(s: &str) -> Result<u128> {
+pub(crate) fn parse_hemi(s: &str) -> Result<u128> {
     let s = s.trim();
     if s.is_empty() {
         anyhow::bail!("empty amount");
@@ -67,65 +67,6 @@ fn parse_hemi(s: &str) -> Result<u128> {
     Ok(wei)
 }
 
-/// Does this process share our signing key?
-///
-/// Pure so it can actually be tested: the previous test asserted only that the scan does not
-/// match itself, which was vacuous — the test binary's comm is `zkminer-<hash>`, rejected by
-/// the name check before the self-skip ever mattered.
-fn shares_our_signer(comm: &str, cmdline: &[u8]) -> bool {
-    if comm != "zkminer" {
-        return false;
-    }
-    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
-    // `run --mock` never loads a signer or a provider (main.rs routes it before config load),
-    // so it shares no nonce. Refusing on it would teach --force as a habit, which is what
-    // makes a real collision likely.
-    args.iter().any(|a| *a == b"run") && !args.iter().any(|a| *a == b"--mock")
-}
-
-/// PIDs of other live `zkminer run` processes.
-///
-/// The mempool check below (pending != latest) is necessary but NOT sufficient: it only
-/// sees a tx that is in the mempool *right now*. Observed live — the miner confirms a tx
-/// in ~13s and claims every ~30-60s, so there are wide windows where pending == latest
-/// while the miner is very much running. The guard sailed straight through on the first
-/// live test for exactly that reason. Process presence has no such window.
-///
-/// Scans /proc directly rather than shelling out to pgrep: `pgrep -f zkminer` matches the
-/// invoking shell's own command line (this footgun killed the operator's shell twice in
-/// this project), and `comm` is the exact executable name, so it cannot self-match a
-/// pattern. Own PID is excluded.
-fn other_running_miners() -> Vec<i32> {
-    let me = std::process::id() as i32;
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return found; // not Linux, or /proc unavailable: fall through to the mempool check
-    };
-    for e in entries.flatten() {
-        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        // comm is the executable name, NUL/newline-terminated; not attacker-shaped here.
-        let Ok(comm) = std::fs::read_to_string(e.path().join("comm")) else {
-            continue;
-        };
-        if comm.trim() != "zkminer" {
-            continue;
-        }
-        // Only `run` shares the signer; a concurrent `status` or `benchmark` sends nothing.
-        let Ok(cmdline) = std::fs::read(e.path().join("cmdline")) else {
-            continue;
-        };
-        if shares_our_signer(comm.trim(), &cmdline) {
-            found.push(pid);
-        }
-    }
-    found
-}
-
 pub async fn run(
     config_path: Option<&Path>,
     amount: String,
@@ -139,6 +80,8 @@ pub async fn run(
     config.validate_for_chain()?;
     let signer = load_signer(&config.wallet)?;
     let client = ChainClient::new(&config, signer).await?;
+    // The check `zkminer run` makes: a stale config would otherwise stake into an abandoned stack.
+    signer_guard::verify_deployment(&client).await?;
 
     // Read the before-state so the operator can see the change rather than trust it.
     let before = client.get_stake_info(client.address).await.ok();
@@ -188,128 +131,20 @@ pub async fn run(
         return Ok(());
     }
 
-    // ── D1: cross-process nonce guard ────────────────────────────────────────────
-    // The miner and this CLI are separate processes over ONE signer, and the nonce
-    // allocator is per-process: each anchors a fresh NonceManager at the node's pending
-    // count, so both hand out the SAME nonce (asserted in zkminer-chain's
-    // tests/stake_tx_shape.rs). Worse, the staking path never joins the fee-escalation
-    // protocol -- it neither records a broadcast fee nor reads the per-nonce floor -- so
-    // if this tx outbids an in-flight fulfillJob it REPLACES it, the deadline is missed,
-    // and the collateral is locked until a keeper slashes it. That is fund loss, not delay.
-    //
-    // Second net, for a signer shared with something this box cannot see (another host, a
-    // script, a hardware wallet): pending > latest means txs are in the mempool right now.
-    // Narrower than the process check above — it misses the gaps between confirmations —
-    // but it catches sharers that are not local processes.
-    let running = other_running_miners();
-    if !running.is_empty() {
-        let pids = running
-            .iter()
-            .map(|p| p.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if force {
-            // Never bypass the PRIMARY fund-loss guard in silence. The weaker mempool check
-            // below already warns on its force path; this one held the pid and said nothing.
-            eprintln!(
-                "WARNING: --force with the miner running (pid {pids}). This tx may replace an \
-                 in-flight fulfillJob and get that job's collateral slashed."
-            );
-        }
-    }
-    if !running.is_empty() && !force {
-        anyhow::bail!(
-            "The miner is running (pid {}) and shares this signing key.\n\
-             \n\
-             Staking now would reuse a nonce the miner has already broadcast on. If this tx \
-             outbids an in-flight fulfillJob it replaces it, the job misses its deadline, and \
-             the collateral is slashed.\n\
-             \n\
-             Stop the miner (Ctrl-C drains queued jobs cleanly), stake, then restart it.\n\
-             Use --force only if you are certain no other process shares this key.",
-            running
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-    }
-
-    let latest = client
-        .provider
-        .get_transaction_count(client.address)
-        .await?;
-    let pending = client
-        .provider
-        .get_transaction_count(client.address)
-        .pending()
-        .await?;
-    if pending != latest {
-        let in_flight = pending.saturating_sub(latest);
-        if !force {
-            anyhow::bail!(
-                "This account has {in_flight} transaction(s) in flight (nonce {latest} -> \
-                 {pending}) — the miner is almost certainly running.\n\
-                 \n\
-                 Staking now would reuse a nonce the miner has already broadcast on. If this \
-                 tx outbids an in-flight fulfillJob it replaces it, the job misses its \
-                 deadline, and the collateral is slashed.\n\
-                 \n\
-                 Stop the miner (Ctrl-C drains cleanly), stake, then restart it.\n\
-                 Use --force only if you are certain no other process shares this key."
-            );
-        }
-        eprintln!(
-            "WARNING: --force with {in_flight} tx(s) in flight; this may displace a pending \
-             transaction and get a job slashed."
-        );
-    }
+    // ── D1: cross-process nonce guard (see `signer_guard`) ────────────────────────
+    let key_check = signer_guard::ensure_key_is_free(&client, force).await?;
 
     // ── D5: confirm an irreversible commitment ───────────────────────────────────
-    // Exit is requestUnstake -> cooldown -> withdrawUnstaked, not immediate, and this
-    // operator already has 2,955 HEMI permanently stranded. The only other bound on a
-    // fat-fingered extra digit is the wallet balance.
-    if !yes {
-        print!(
-            "\nStake {} HEMI? Unstaking is delayed, not immediate. [y/N] ",
+    // Exit is requestUnstake -> 7-day cooldown -> withdrawUnstaked, not immediate. The only
+    // other bound on a fat-fingered extra digit is the wallet balance.
+    signer_guard::confirm(
+        &format!(
+            "Stake {} HEMI? Unstaking takes 7 days (`zkminer unstake`, then `zkminer withdraw`).",
             fmt_hemi(wei)
-        );
-        std::io::stdout().flush().ok();
-        let mut answer = String::new();
-        let read = std::io::stdin().read_line(&mut answer)?;
-        // R5: decline and EOF must not exit 0. `main` returns Result, so a bare Ok(()) makes
-        // "staked" and "did nothing" indistinguishable to any wrapper or `&&` chain — for the
-        // very command the miner's warning tells operators to run.
-        if read == 0 {
-            anyhow::bail!(
-                "no input on stdin (not a terminal?) — nothing sent; pass --yes to \
-                           skip the confirmation in scripts"
-            );
-        }
-        if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
-            anyhow::bail!("declined; nothing sent");
-        }
-    }
-
-    // R4: the guard above is check-then-act, and the prompt just put unbounded HUMAN latency
-    // inside that window — on the primary fund-loss guard. The window is not hypothetical:
-    // this command tells the operator to "stake, then restart it", while the miner's own
-    // shutdown tells them to "start the miner again to run recovery", and a restarted miner's
-    // FIRST tx is recover_claimed_jobs -> fulfillJob. Re-check before committing.
-    if !force {
-        let now_running = other_running_miners();
-        if !now_running.is_empty() {
-            anyhow::bail!(
-                "The miner started while the confirmation was pending (pid {}) — nothing sent. \
-                 Stop it and re-run.",
-                now_running
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-        }
-    }
+        ),
+        yes,
+    )?;
+    signer_guard::recheck_after_prompt(&client, &key_check).await?;
 
     println!();
     println!("Approving (if needed) and staking...");
@@ -327,8 +162,19 @@ pub async fn run(
         .await
         .context("stake did not complete")?;
 
+    // Read before the stake below, so the slash latch's next range starts after this transaction.
+    let block = client.get_block_number().await.ok();
     match client.get_stake_info(client.address).await {
         Ok(after) => {
+            if let Some(b) = &before {
+                super::run::slash_latch::rebaseline_after_own_tx(
+                    client.chain_id,
+                    client.address,
+                    (b.total_staked, b.unstake_amount),
+                    (after.total_staked, after.unstake_amount),
+                    block,
+                );
+            }
             println!();
             println!("Staked:         {} HEMI", fmt_hemi(after.total_staked));
             println!(
@@ -408,66 +254,6 @@ mod tests {
                  staking it leaves the slot unfundable and the warning repeating"
             );
         }
-    }
-
-    /// The scan must never see the process doing the scanning; `pgrep -f zkminer` would,
-    /// and that self-match killed this operator's shell twice.
-    #[test]
-    fn the_miner_scan_never_matches_itself() {
-        let me = std::process::id() as i32;
-        assert!(
-            !other_running_miners().contains(&me),
-            "self-match: the guard would refuse to ever stake"
-        );
-    }
-
-    fn cmdline(args: &[&str]) -> Vec<u8> {
-        let mut v = Vec::new();
-        for a in args {
-            v.extend_from_slice(a.as_bytes());
-            v.push(0);
-        }
-        v
-    }
-
-    /// The predicate the guard actually turns on. Tested directly because the scan test
-    /// above cannot reach it — a positive case needs a real `zkminer run` process.
-    #[test]
-    fn identifies_processes_that_share_the_signer() {
-        // MUST refuse: these hold the key and allocate nonces.
-        assert!(shares_our_signer("zkminer", &cmdline(&["zkminer", "run"])));
-        assert!(shares_our_signer(
-            "zkminer",
-            &cmdline(&["./target/release/zkminer", "-v", "run", "--headless"])
-        ));
-
-        // MUST NOT refuse: no signer, or not our binary.
-        assert!(
-            !shares_our_signer("zkminer", &cmdline(&["zkminer", "run", "--mock"])),
-            "mock mode loads no signer; refusing here breeds a --force habit"
-        );
-        assert!(!shares_our_signer(
-            "zkminer",
-            &cmdline(&["zkminer", "status"])
-        ));
-        assert!(!shares_our_signer(
-            "zkminer",
-            &cmdline(&["zkminer", "benchmark"])
-        ));
-        assert!(!shares_our_signer(
-            "zkminer",
-            &cmdline(&["zkminer", "stake", "10"])
-        ));
-        assert!(
-            !shares_our_signer("zkminer-8852d4a1b", &cmdline(&["...", "run"])),
-            "the cargo test binary is named zkminer-<hash> and must not match"
-        );
-        assert!(
-            !shares_our_signer("bash", &cmdline(&["bash", "-c", "zkminer run"])),
-            "a shell whose ARGS mention the miner is not the miner — this is the pgrep -f \
-             self-match that killed the operator's shell twice"
-        );
-        assert!(!shares_our_signer("zkminer", &[]));
     }
 
     /// A whole-HEMI amount must never be mistaken for wei — the 1e18 error that looks like

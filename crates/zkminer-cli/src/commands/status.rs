@@ -4,14 +4,177 @@ use zkminer_chain::client::ChainClient;
 use zkminer_config::wallet::load_signer;
 use zkminer_config::ZkMinerConfig;
 
-pub async fn run(config_path: Option<&Path>) -> Result<()> {
+/// What this home's own files say, read before (and without) the chain: the locks the journal
+/// holds, and whether a miner is running to drive them.
+pub(crate) struct Local {
+    pub lines: Vec<String>,
+    /// Locks held with no miner running to drive them: each is slashed unless one starts in time.
+    pub harmful: bool,
+}
+
+/// [`Local`] for `journal` (the default path's, or why it could not be read) at `now` (unix
+/// seconds), with a miner `running` here or not (`None`: unknown).
+pub(crate) fn held_locks(
+    journal: &std::result::Result<crate::journal::JobJournal, String>,
+    now: u64,
+    running: Option<bool>,
+) -> Local {
+    let journal = match journal {
+        Ok(j) => j,
+        Err(e) => {
+            return Local {
+                lines: vec![format!(
+                    "Held locks:     unknown: the job journal could not be read ({e})"
+                )],
+                harmful: false,
+            }
+        }
+    };
+    let live: Vec<u64> = journal
+        .iter()
+        .filter(|e| e.lock_deadline == 0 || e.lock_deadline > now)
+        .map(|e| e.lock_deadline)
+        .collect();
+    let past = journal.iter().count() - live.len();
+    let mut lines = Vec::new();
+    if live.is_empty() && past == 0 {
+        lines.push("Held locks:     none".to_string());
+        return Local {
+            lines,
+            harmful: false,
+        };
+    }
+    let by = super::run::start_by(live.iter().copied())
+        .map(|t| format!(", start a miner by {t}"))
+        .unwrap_or_default();
+    lines.push(format!(
+        "Held locks:     {} in the job journal{}",
+        live.len(),
+        if past > 0 {
+            format!(" (and {past} past its cutoff, for the next start to clear up)")
+        } else {
+            String::new()
+        }
+    ));
+    let harmful = running == Some(false) && !live.is_empty();
+    match running {
+        Some(true) => lines.push("Miner:          running here, driving them".to_string()),
+        Some(false) if live.is_empty() => {
+            lines.push("Miner:          not running here".to_string())
+        }
+        Some(false) => lines.push(format!(
+            "Miner:          [!] NOT running here: nothing drives them{by}, or they are slashed"
+        )),
+        None => lines.push("Miner:          unknown (miner.lock could not be checked)".to_string()),
+    }
+    Local { lines, harmful }
+}
+
+/// [`Local`] for this home now.
+pub(crate) fn local() -> Local {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    held_locks(
+        &crate::journal::JobJournal::peek_checked(),
+        now,
+        super::stop::instance_running().ok(),
+    )
+}
+
+/// The recent pages (`pages.log`, review 6 D1), and how many are unacknowledged.
+pub(crate) struct Pages {
+    pub lines: Vec<String>,
+    pub unacked: usize,
+}
+
+/// How many of the pages shown at most.
+const PAGES_SHOWN: usize = 10;
+
+/// [`Pages`] from the logs directory `dir` at `now` (unix seconds); `ack` acknowledges them first.
+pub(crate) fn pages_report(dir: &Path, ack: bool, now: i64) -> Pages {
+    use crate::logging;
+    let pages = logging::read_pages(dir);
+    let mut acked = logging::read_ack(dir);
+    let mut lines = Vec::new();
+    if ack {
+        match logging::write_ack(dir, now) {
+            Ok(()) => acked = now,
+            Err(e) => lines.push(format!("Pages:          could not acknowledge them: {e}")),
+        }
+    }
+    let unacked = pages.iter().filter(|(at, _)| *at > acked).count();
+    if pages.is_empty() {
+        lines.push("Pages:          none".to_string());
+        return Pages { lines, unacked };
+    }
+    lines.push(format!(
+        "Pages:          {} in {}{}",
+        pages.len(),
+        logging::pages_path(dir).display(),
+        match unacked {
+            0 => ", all acknowledged".to_string(),
+            n => format!(
+                "; [!] {n} unacknowledged (`zkminer status --ack` once they are dealt with)"
+            ),
+        }
+    ));
+    let first = pages.len().saturating_sub(PAGES_SHOWN);
+    for (at, line) in &pages[first..] {
+        lines.push(format!(
+            "  {} {line}",
+            if *at > acked { "[new]" } else { "     " }
+        ));
+    }
+    Pages { lines, unacked }
+}
+
+/// `zkminer status`'s exit code: 2 while a page is unacknowledged or locks are held with nothing
+/// to drive them, else 0 (a status that could not be read is an error, 1).
+pub(crate) fn exit_code(local: &Local, pages: &Pages) -> i32 {
+    if local.harmful || pages.unacked > 0 {
+        2
+    } else {
+        0
+    }
+}
+
+pub async fn run(config_path: Option<&Path>, ack: bool) -> Result<()> {
+    println!("zkminer status");
+    println!("══════════════════════════════════════════════════");
+    // This home's own state first: it needs no chain, and an operator moving a service checks it.
+    let local = local();
+    for line in &local.lines {
+        println!("{line}");
+    }
+    let pages = pages_report(
+        &crate::logging::logs_dir(),
+        ack,
+        chrono::Utc::now().timestamp(),
+    );
+    for line in &pages.lines {
+        println!("{line}");
+    }
+    let chain = chain_status(config_path).await;
+    match exit_code(&local, &pages) {
+        0 => chain,
+        code => {
+            if let Err(e) = &chain {
+                eprintln!("Error: {}", super::simulate::redact_urls(&format!("{e:#}")));
+            }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code)
+        }
+    }
+}
+
+/// The chain's half of `zkminer status`.
+async fn chain_status(config_path: Option<&Path>) -> Result<()> {
     let config = ZkMinerConfig::load(config_path)?;
     config.validate_for_chain()?;
     let signer = load_signer(&config.wallet)?;
     let client = ChainClient::new(&config, signer).await?;
-
-    println!("zkminer status");
-    println!("══════════════════════════════════════════════════");
     if let Some(banner) = config.dev_mode_banner() {
         println!("!! {banner} !!");
         println!("══════════════════════════════════════════════════");
@@ -24,6 +187,23 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
         println!("══════════════════════════════════════════════════");
     }
     println!("Prover Address: {}", client.address);
+    println!(
+        "Network:        {} (chain {})",
+        match zkminer_chain::deployment::known_deployment(client.chain_id) {
+            Some(_) if client.chain_id == zkminer_chain::staking::TESTNET_CHAIN_ID =>
+                "Hemi testnet",
+            Some(_) => "a known deployment",
+            None => "no known deployment",
+        },
+        client.chain_id
+    );
+    // The check `zkminer run` makes before it claims, and `stake` before it sends.
+    match client.verify_deployment().await {
+        Ok(_) => println!("Deployment:     verified"),
+        Err(e) => {
+            println!("Deployment:     NOT verified, so `zkminer run` and `stake` refuse it: {e:#}")
+        }
+    }
 
     // ETH balance
     match client.get_eth_balance().await {
@@ -66,6 +246,21 @@ pub async fn run(config_path: Option<&Path>) -> Result<()> {
                 "Available:          {} HEMI",
                 format_token(stake.available_collateral)
             );
+            // What `run` lets every lock it holds come to together (`[prover]
+            // max_locked_stake_fraction`): a job that would take them over it waits.
+            let lock_cap = super::run::collateral::CapPolicy {
+                fraction: config.prover.max_locked_stake_fraction,
+                floor: per_claim,
+            }
+            .cap(stake.total_staked);
+            if let Some(cap) = lock_cap {
+                println!(
+                    "Lock cap:           {} HEMI held at once ({:.0}% of the stake, \
+                     [prover] max_locked_stake_fraction)",
+                    format_token(cap),
+                    config.prover.max_locked_stake_fraction * 100.0
+                );
+            }
             // Derived verdict: `status` printed the three numbers and left the division to
             // the reader, which is how a 4.25 HEMI shortfall idled a GPU unnoticed.
             // Reported as ADDITIONAL slots: from chain alone a live lock is indistinguishable
@@ -104,6 +299,15 @@ true figure is lower)"
         }
         Err(e) => println!("\nStaking info:   Error: {}", e),
     }
+    // The way out: a pending unstake and payouts the router holds (the stake lines are above).
+    match client.get_exit_state(client.address).await {
+        Ok(exit) => {
+            for line in super::unstake::describe_exit(&exit) {
+                println!("{line}");
+            }
+        }
+        Err(e) => println!("Unstake/payouts:    Error: {e:#}"),
+    }
 
     // Prover stats
     match client.get_prover_stats(client.address).await {
@@ -122,12 +326,24 @@ true figure is lower)"
         Err(e) => println!("\nProver stats:   Error: {}", e),
     }
 
+    // The slash latch: while it is tripped `run` claims nothing new, and this exits 2 so a cron or
+    // monitoring check can alert on it.
+    let (latched, lines) = super::run::slash_latch::describe(client.chain_id, client.address);
+    println!();
+    for (i, line) in lines.iter().enumerate() {
+        let label = if i == 0 { "Slash latch:" } else { "" };
+        println!("{label:<20}{line}");
+    }
+
     // Block number
     match client.get_block_number().await {
         Ok(block) => println!("\nCurrent Block:      {}", block),
         Err(e) => println!("\nBlock number:   Error: {}", e),
     }
 
+    if latched {
+        std::process::exit(2);
+    }
     Ok(())
 }
 
@@ -148,4 +364,85 @@ fn format_token(value: u128) -> String {
     let whole = value / 1_000_000_000_000_000_000;
     let frac = (value % 1_000_000_000_000_000_000) / 1_000_000_000_000_000;
     format!("{}.{:03}", whole, frac)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::JobJournal;
+    use alloy_primitives::B256;
+
+    /// The held-locks lines: none, held with a miner running, held with none (harmful), and a
+    /// journal that could not be read.
+    #[test]
+    fn held_locks_are_reported_from_the_journal() {
+        let now = 1_900_000_000;
+        let empty = held_locks(&Ok(JobJournal::default()), now, Some(false));
+        assert_eq!(empty.lines, ["Held locks:     none"]);
+        assert!(!empty.harmful);
+        let mut j = JobJournal::default();
+        j.record_claim_intent(B256::repeat_byte(1), now + 7_200, None);
+        j.record_claim_intent(B256::repeat_byte(2), now - 10, None);
+        let held = Ok(j);
+        let running = held_locks(&held, now, Some(true));
+        assert!(
+            running.lines[0].contains("1 in the job journal")
+                && running.lines[0].contains("1 past")
+        );
+        assert!(!running.harmful);
+        let stopped = held_locks(&held, now, Some(false));
+        assert!(stopped.harmful);
+        assert!(
+            stopped.lines[1].contains("NOT running"),
+            "{:?}",
+            stopped.lines
+        );
+        let unread = held_locks(&Err("denied".into()), now, Some(false));
+        assert!(unread.lines[0].contains("unknown") && !unread.harmful);
+    }
+
+    /// Review 6 D1: the pages section from a fixture `pages.log`, acknowledgement, and the exit
+    /// code (2 for an unacknowledged page or locks held with no miner, else 0).
+    #[test]
+    fn pages_and_the_exit_code() {
+        let dir = std::env::temp_dir().join(format!("zkminer-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let quiet = Local {
+            lines: Vec::new(),
+            harmful: false,
+        };
+        let none = pages_report(&dir, false, 1_900_000_000);
+        assert_eq!(none.lines, ["Pages:          none"]);
+        assert_eq!(exit_code(&quiet, &none), 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = String::new();
+        for n in 0..12 {
+            log.push_str(&format!(
+                "2026-11-21T10:{n:02}:00Z PAGE: LOCK-LATE — job {n}\n"
+            ));
+        }
+        std::fs::write(dir.join("pages.log"), log).unwrap();
+        let fresh = pages_report(&dir, false, 1_900_000_000);
+        assert_eq!(fresh.unacked, 12);
+        // A header and the last ten.
+        assert_eq!(fresh.lines.len(), 1 + PAGES_SHOWN);
+        assert!(
+            fresh.lines[0].contains("12 unacknowledged"),
+            "{:?}",
+            fresh.lines
+        );
+        assert!(fresh.lines[1].contains("[new]") && fresh.lines[1].contains("job 2"));
+        assert_eq!(exit_code(&quiet, &fresh), 2);
+        let acked = pages_report(&dir, true, 1_900_000_000);
+        assert_eq!(acked.unacked, 0);
+        assert_eq!(exit_code(&quiet, &acked), 0);
+        assert_eq!(pages_report(&dir, false, 1_900_000_001).unacked, 0);
+        // Locks held with nothing to drive them: 2 even with every page acknowledged.
+        let stranded = Local {
+            lines: Vec::new(),
+            harmful: true,
+        };
+        assert_eq!(exit_code(&stranded, &acked), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
