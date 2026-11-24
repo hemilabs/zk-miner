@@ -286,17 +286,8 @@ pub fn run(config_path: Option<&Path>, force: bool, network: &str, req: KeyReque
     } else {
         println!("Config file created at {}", path.display());
         println!();
-        if network == "testnet" {
-            println!("Pre-configured for Hemi Testnet (chain ID {TESTNET_CHAIN_ID})");
-            println!("  RPC:     {TESTNET_RPC}");
-            println!("  Router:  {}", TESTNET.router);
-            println!("  Token:   {} (tHEMI — owner-minted)", TESTNET.token);
-        } else {
-            println!("Hemi mainnet (chain ID {MAINNET_CHAIN_ID}) has no HemiProve deployment yet:");
-            println!(
-                "  fill in [contracts] in the config before running; `zkminer run` refuses an"
-            );
-            println!("  unknown deployment unless ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1.");
+        for line in summary(network) {
+            println!("{line}");
         }
     }
     for what in &left_behind {
@@ -375,14 +366,9 @@ pub fn run(config_path: Option<&Path>, force: bool, network: &str, req: KeyReque
     let address_hint = key
         .map(|m| format!(" ({:?})", m.address()))
         .unwrap_or_default();
-    if network == "testnet" {
-        println!("  2. Send testnet ETH (gas) and tHEMI to the address{address_hint}. tHEMI is");
-        println!("     minted only by its owner: ask the HemiProve team. A claim typically locks");
-        println!("     about 150 tHEMI, so stake at least that per job you want to hold at once.");
-    } else {
-        println!("  2. Send ETH (gas) and HEMI to the address{address_hint}.");
+    for line in funding_steps(network, &address_hint) {
+        println!("{line}");
     }
-    println!("  3. Stake it:          zkminer stake 150");
     println!("  4. Check everything:  zkminer status");
     println!("  5. Start mining:      zkminer run   (it benchmarks your GPUs first)");
     println!("  Check it first:       zkminer doctor");
@@ -390,6 +376,54 @@ pub fn run(config_path: Option<&Path>, force: bool, network: &str, req: KeyReque
     println!("                        then zkminer withdraw 7 days on");
 
     Ok(())
+}
+
+/// What `init` prints after writing the config: the network it targets (on testnet the built-in
+/// deployment; on mainnet, that none is built in and `[contracts]` must be filled in).
+fn summary(network: &str) -> Vec<String> {
+    if network != "testnet" {
+        return vec![
+            format!("Hemi mainnet (chain ID {MAINNET_CHAIN_ID}) has no HemiProve deployment yet:"),
+            "  fill in [contracts] in the config before running; `zkminer run` refuses an"
+                .to_string(),
+            "  unknown deployment unless ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1.".to_string(),
+        ];
+    }
+    vec![
+        format!("Pre-configured for Hemi Testnet (chain ID {TESTNET_CHAIN_ID})"),
+        format!("  RPC:     {TESTNET_RPC}"),
+        format!("  Router:  {}", TESTNET.router),
+        format!("  Token:   {} (tHEMI — owner-minted)", TESTNET.token),
+    ]
+}
+
+/// Next steps 2 and 3: funding the key's address and staking. Every step names the command that
+/// does it (W10-DOC). On testnet tHEMI is minted only by its owner, and the first claim can come
+/// one block after the first stake.
+fn funding_steps(network: &str, address_hint: &str) -> Vec<String> {
+    let mut lines = if network == "testnet" {
+        vec![
+            format!(
+                "  2. Send testnet ETH (gas) and tHEMI to the address{address_hint}. tHEMI is"
+            ),
+            "     minted only by its owner: ask the HemiProve team. A claim typically locks"
+                .to_string(),
+            "     about 150 tHEMI, so stake at least that per job you want to hold at once."
+                .to_string(),
+        ]
+    } else {
+        vec![format!(
+            "  2. Send ETH (gas) and HEMI to the address{address_hint}."
+        )]
+    };
+    lines.push("  3. Stake it:          zkminer stake 150".to_string());
+    if network == "testnet" {
+        lines.push(
+            "                        (the first claim can come one block after the first stake)"
+                .to_string(),
+        );
+    }
+    lines
 }
 
 fn apply_network(config: &mut ZkMinerConfig, network: &str) -> Result<()> {
@@ -553,5 +587,30 @@ mod tests {
                 KeyPlan::Env
             );
         }
+    }
+
+    #[test]
+    fn testnet_steps_name_the_commands() {
+        let text = [summary("testnet"), funding_steps("testnet", " (0xabc)")]
+            .concat()
+            .join("\n");
+        assert!(text.contains("HemiProve team"), "{text}");
+        assert!(text.contains("zkminer stake 150"), "{text}");
+        assert!(text.contains("one block after the first stake"), "{text}");
+        assert!(text.contains("(0xabc)"), "{text}");
+        assert!(!text.contains("Wallet screen"), "{text}");
+        assert!(text.contains(&TESTNET.router.to_string()), "{text}");
+        assert!(text.contains(&TESTNET.token.to_string()), "{text}");
+    }
+
+    #[test]
+    fn mainnet_is_not_described_as_testnet() {
+        let text = [summary("mainnet"), funding_steps("mainnet", "")]
+            .concat()
+            .join("\n");
+        assert!(!text.contains("Testnet"), "{text}");
+        assert!(!text.contains("tHEMI"), "{text}");
+        assert!(text.contains("43111"), "{text}");
+        assert!(text.contains("[contracts]"), "{text}");
     }
 }
