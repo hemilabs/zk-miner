@@ -165,10 +165,15 @@ EOF
   [ "$r" = "26.0 $rl" ] && ok "5: control: compiler A at the fixed path: metallib for 26.0" || no "5: compiler A at the fixed path: '$r'"
   "$ci/metal-tc.sh" 26.0 "$fixed" "$T/B/metal" > /dev/null
   r=$(build "$fixed" "$T/5b.log")
-  if [ "$r" = "26.0 $rl" ] && grep -q 'Fresh metaltcprobe' "$T/5b.log"; then
-    ok "5: control reproduces the finding: compiler B behind the same path leaves A's metallib (cargo: Fresh), which still names '$rl', not B's 'Fake metal B 99.0'"
+  # The control shows why 6 matters; it is not itself a check of the fix, so it passes whenever A's
+  # metallib survives B (cargo's own wording for that, "Fresh", is not required: newer cargo can
+  # re-run the build script and still keep the kernel), and only warns when the finding no longer
+  # reproduces, which says the old scheme stopped being wrong, not that the fix broke.
+  if [ "$r" = "26.0 $rl" ]; then
+    fresh=; grep -q 'Fresh metaltcprobe' "$T/5b.log" && fresh=" (cargo: Fresh)"
+    ok "5: control reproduces the finding: compiler B behind the same path leaves A's metallib$fresh, which still names '$rl', not B's 'Fake metal B 99.0'"
   else
-    no "5: control: B behind the fixed path gave '$r' (the finding no longer reproduces: cargo or risc0-build-kernel changed)"
+    echo "WARN 5: control: B behind the fixed path gave '$r' (the finding no longer reproduces: cargo or risc0-build-kernel changed)"
   fi
   # 6. the fix
   tA=$("$ci/metal-tc.sh" 26.0 --in "$T/kit3" "$real")

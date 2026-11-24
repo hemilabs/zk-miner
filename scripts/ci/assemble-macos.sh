@@ -254,7 +254,8 @@ g16=$repo/crates/zkminer-prove-risc0/src/groth16_component.rs
 g16_version=$(sed -n 's/^pub(crate) const VERSION: &str = "\(.*\)";/\1/p' "$g16")
 g16_sha=$(sed -n 's/^const ARCHIVE_SHA256: &str = "\([0-9a-f]\{64\}\)";/\1/p' "$g16")
 [ -n "$g16_version" ] && [ -n "$g16_sha" ] || die "cannot read the risc0-groth16 pin from $g16"
-g16_url=https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/risc0-groth16/sha256/$g16_sha
+# rzup's current download host (the old S3 bucket answers 403); install.sh checks the hash.
+g16_url=https://artifacts.risczero.net/rzup/components/risc0-groth16/sha256/$g16_sha
 
 commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
 dirty=$( [ -z "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo no || echo yes)
