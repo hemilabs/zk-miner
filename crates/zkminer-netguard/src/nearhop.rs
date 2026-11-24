@@ -79,9 +79,15 @@
 //! **Windows** (review r3 G1/G2) keeps retrying a SYN an ICMP error answered, so each probe sets
 //! `TCP_FAIL_CONNECT_ON_ICMP_ERROR` (Windows 10 1903 and later) and, once its connect fails,
 //! reads the ICMP error Windows matched to the connection from `TCP_ICMP_ERROR_INFO` (type, code,
-//! sender), judged by the same rule. Where the message does not reach TCP (as seen on Windows 11,
-//! likely withheld by the firewall) the probes time out: silence, refused. There is no interface
-//! pin on Windows; the probes and the connection share the source address.
+//! sender), judged by the same rule. In practice Windows TCP does not end a connect on a Time
+//! Exceeded at all (measured on Windows 11: SYNs with hop limits 1 to 5 to public IPv4 and IPv6
+//! hosts all time out, while an unprivileged `tracert` from the same host, and the ICMPv6
+//! firewall rule, show the routers do answer: the firewall is not the cause), so every probe ends
+//! in silence and every decision refuses. [`supported`] therefore reports Windows as unable to
+//! run public mode, said at start and in `zkminer status`; use `[dev] private_network` for a
+//! testnet or a local chain. A new evidence source (an ICMP echo with a hop limit, say) needs its
+//! own review. There is no interface pin on Windows; the probes and the connection share the
+//! source address.
 //!
 //! **What it cannot help:** a probe that connects still reaches a near host (a SYN, a handshake,
 //! a reset; never data) before the refusal; a transparent proxy within the limit answers for every
@@ -441,11 +447,13 @@ pub fn supported() -> Result<(), String> {
         }
         Ok(())
     }
-    // Windows: `TCP_FAIL_CONNECT_ON_ICMP_ERROR` and `TCP_ICMP_ERROR_INFO` are per connection; a
-    // probe that cannot set the first fails its round with the reason.
+    // Windows: TCP does not end a connect on an ICMP time exceeded, with or without
+    // `TCP_FAIL_CONNECT_ON_ICMP_ERROR` (measured on Windows 11 26300: SYNs with hop limits 1 to 5
+    // to public hosts, whose routers answer tracert, all time out, both families), so no probe is
+    // ever found far and every decision refuses. Said at start and in `zkminer status`.
     #[cfg(windows)]
     {
-        Ok(())
+        Err(WINDOWS_NO_TIME_EXCEEDED.into())
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
     {
@@ -1537,9 +1545,9 @@ fn observe(
 /// error queue (see the module doc): each probe sets `TCP_FAIL_CONNECT_ON_ICMP_ERROR`, so its
 /// connect ends on an ICMP error instead of retrying the SYN, and the error Windows matched to
 /// the connection is read from `TCP_ICMP_ERROR_INFO` (type, code, sender). Far only on a matched
-/// Time Exceeded, as everywhere ([`rule`]); a probe whose ICMP message never reaches TCP (the
-/// firewall withholding it, as seen on Windows 11; or a Windows whose `WSAPoll` does not report a
-/// failed connect) times out: silence, refused.
+/// Time Exceeded, as everywhere ([`rule`]); a probe whose ICMP message never reaches TCP (every
+/// Time Exceeded on the Windows 11 hosts measured, see the module doc; or a Windows whose
+/// `WSAPoll` does not report a failed connect) times out: silence, refused.
 #[cfg(windows)]
 fn observe(
     addr: SocketAddr,
@@ -1772,6 +1780,14 @@ mod win {
         }
     }
 }
+
+/// Why no destination is found far on Windows ([`supported`]).
+#[cfg(windows)]
+const WINDOWS_NO_TIME_EXCEEDED: &str = "Windows TCP does not report a router's ICMP time exceeded \
+     to a connecting socket (TCP_FAIL_CONNECT_ON_ICMP_ERROR ends a connect on destination \
+     unreachable only), so the near-hop check never finds a destination far: public mode \
+     refuses every requester connection on Windows (ELF, IPFS and Arweave downloads, artifact \
+     publish)";
 
 /// Why no destination is found far on this platform.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]

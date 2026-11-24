@@ -63,6 +63,11 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
         for a in all.iter().filter(|a| a.is_ipv4()) {
             assert_eq!(policy.admit(*a), Ok(()), "{name}: {a}");
         }
+        // Where the near-hop check cannot find anything far (Windows), every vet refuses.
+        if let Err(why) = zkminer_netguard::nearhop::supported() {
+            skipped(format!("the near-hop check refuses every destination here: {why}"));
+            continue;
+        }
         let first = SocketAddr::new(admitted[0], 443);
         let vetted = tokio::task::spawn_blocking({
             let p = policy.clone();
@@ -82,14 +87,20 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
     let client = guarded_client(&policy).unwrap();
     let r = client
         .get_following_redirects("https://github.com/", 5, Duration::from_secs(30))
-        .await
-        .expect("a guarded GET of github.com");
-    eprintln!("GET https://github.com/ -> {}", r.status());
-    assert!(
-        r.status().is_success() || r.status().is_redirection(),
-        "{}",
-        r.status()
-    );
+        .await;
+    if zkminer_netguard::nearhop::supported().is_err() {
+        // Fails closed: the fetch is refused, never made unchecked.
+        eprintln!("GET https://github.com/ refused here: {:?}", r.as_ref().err());
+        assert!(r.is_err(), "fetched with a near-hop check that finds nothing far");
+    } else {
+        let r = r.expect("a guarded GET of github.com");
+        eprintln!("GET https://github.com/ -> {}", r.status());
+        assert!(
+            r.status().is_success() || r.status().is_redirection(),
+            "{}",
+            r.status()
+        );
+    }
     // And the host itself is still refused, by the same client's checks.
     for own in policy.facts().own_addresses() {
         let url = match own {
@@ -150,6 +161,10 @@ fn this_hosts_facts_are_read() {
 /// never far).
 #[test]
 fn public_hosts_are_far_and_reachable() {
+    if let Err(why) = zkminer_netguard::nearhop::supported() {
+        skipped(format!("the near-hop check refuses every destination here: {why}"));
+        return;
+    }
     for addr in ["1.1.1.1:443", "[2606:4700:4700::1111]:443"] {
         let addr: SocketAddr = addr.parse().unwrap();
         let reachable = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3));

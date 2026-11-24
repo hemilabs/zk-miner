@@ -422,13 +422,14 @@ a neighbour dump the kernel denies; a nexthop object's `NHA_GATEWAY` from a real
 signature (parsed from built messages; the compat-0 repro ran the route side); Android at all.
 
 **Open for the owner.**
-- **Windows and ICMP time exceeded** (the probe lens's suspicion): whether Windows surfaces an
-  ICMP "time exceeded" for a SYN in `SYN-SENT` as a failed connect (`WSAEHOSTUNREACH` /
-  `WSAENETUNREACH`) at all is unverified; if it does not, every probe times out there and, with no
-  check connection on Windows, every public host is refused. It needs a Windows runner: probe a
-  far public host with hop limit 2 and see whether the connect fails fast. (Since the S3 review a
-  failed connect is not evidence anyway: Windows needs the ICMP error's type and sender, still
-  open, below.)
+- **Windows and ICMP time exceeded** (the probe lens's suspicion): measured since on Windows 11
+  (26300): it does not. SYNs with hop limits 1 to 5 to public IPv4 and IPv6 hosts all time out
+  after 4 s with `TCP_FAIL_CONNECT_ON_ICMP_ERROR` set, and `TCP_ICMP_ERROR_INFO` holds nothing,
+  while an unprivileged `tracert` from the same host gets each router's Time Exceeded (so the
+  firewall is not withholding it). Every public host is refused there; `nearhop::supported()`
+  now says so, at start and in `zkminer status`, and public mode is documented as unsupported
+  on Windows (`[dev] private_network` for a testnet). A different evidence source, such as an
+  unprivileged `IcmpSendEcho2Ex` with a TTL, would need its own review.
 - **CLAT detection** is by address and interface name; a CLAT numbered otherwise is not seen
   (its host then admits `<NSP>::10.x` until the prefix is learned, as before).
 - **A flapping or spoofed gateway MAC** now makes the Linux guard learn its public addresses
@@ -614,10 +615,8 @@ denies; Android at all. `NHA_GATEWAY` from a real dump ran live (`r6-cross/vm-r6
 `fix-r6/vm-r6-nh.log`), so it leaves the list.
 
 **Open for the owner.**
-- **Windows and ICMP time exceeded** in `SYN-SENT`: unverified (no Windows runner); if Windows
-  does not surface it, every probe times out there and, with no check connection, every public
-  host is refused. (Since the S3 review Windows refuses every decision until a way to read the
-  ICMP error is verified there.)
+- **Windows and ICMP time exceeded** in `SYN-SENT`: measured on Windows 11, not surfaced (see
+  above); every public host is refused there and public mode is unsupported on Windows.
 - **S3's positive control**: the control connection refuses a peer that never acknowledges a
   bare FIN (every AWS S3 front end); the last probe attempt makes S3 pass when its first hops
   answer ICMP (20/20 here), but behind first hops that never send ICMP S3 is refused every time.
@@ -687,8 +686,8 @@ past the limit said the probe ran out of hops), never on silence."
   startup). An error `connect` reports at once (Local Network privacy, a Network Extension
   policy) is a local failure, never evidence. **Windows:** no implementation; every decision
   refuses (it already refused every requester connection in public mode).
-  `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are a possible future path,
-  unverified; it must fail closed until verified on a Windows host.
+  `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` were measured since on Windows 11
+  and give nothing for a Time Exceeded; it fails closed, and says so.
 
 **Removed.** The check and control connections (the hop-limited FIN, the `TCP_INFO` /
 `TCP_CONNECTION_INFO` state readers, the RTO margins, the "AWS S3 never acknowledges a bare FIN"

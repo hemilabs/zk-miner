@@ -147,6 +147,13 @@ impl ElfFetcher {
             .map(|why| format!("network guard: {why}"))
             .into_iter()
             .collect();
+        // The near-hop check cannot find anything far here (Windows; a Mac without its ICMP
+        // socket): every requester connection is refused.
+        if lines.is_empty() {
+            if let Err(why) = zkminer_netguard::nearhop::supported() {
+                lines.push(format!("network guard: {why}"));
+            }
+        }
         lines.extend(facts.unknown_paths().into_iter().map(|path| {
             if facts.relearning(path) {
                 format!(

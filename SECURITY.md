@@ -235,10 +235,14 @@ Every connection a requester can cause goes through one guard
   kernel's matching of the ICMP error to the probe (on macOS through a private `TCP_INFO`
   layout). A box that hides hops (a second NAT router behind the ISP's, a VM's NAT, a VPN, a
   userspace NAT64) moves the limit: at `near_hop_limit` 2 it then does not reach the ISP's first
-  box. Paths whose first hops send no "time exceeded" refuse every destination. Windows has no
-  way to read the ICMP errors yet (`TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are
-  a possible path, unverified), so every decision there refuses; it already refuses every
-  requester connection in public mode. See "The near-hop probe's own limits" below and
+  box. Paths whose first hops send no "time exceeded" refuse every destination. **Public mode
+  is not supported on Windows:** Windows TCP does not end a connect on a router's Time Exceeded
+  (measured on Windows 11 with `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO`: every
+  hop-limited SYN to a public host times out, though `tracert` shows the routers answer), so
+  every decision there refuses: ELF, IPFS and Arweave downloads and `artifact publish` cannot
+  work. The miner says so at start and in `zkminer status`. On Windows use developer mode
+  (`[dev] private_network`) for a testnet or a local chain, or run public mode on Linux or
+  macOS. See "The near-hop probe's own limits" below and
   [docs/netguard-hardening.md](docs/netguard-hardening.md), "Near-hop rule: positive evidence".
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
@@ -926,7 +930,8 @@ no second one):
   - **Silent paths refuse.** A path whose routers at hops `N` to `N+2` send no "time exceeded"
     (many cloud providers' networks, EC2 included, and corporate edges that filter ICMP)
     refuses every destination, every time; a router rate-limiting its ICMP refuses some. Cloud
-    servers are out of scope for now. Windows refuses every decision (no ICMP plumbing yet).
+    servers are out of scope for now. Windows refuses every decision (its TCP does not report a
+    Time Exceeded; public mode is not supported there, above).
   - **Per-connection balancers.** The connection is made from a new local port, not the far
     probe's (the owner's decision: stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
     probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
