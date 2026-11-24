@@ -33,7 +33,10 @@ pub(crate) const GRAPH_SHA256_PREFIX: &str = "887aa345d6adc257";
 /// (`rzup/components/risc0-groth16/distribution_manifest.json`).
 /// (rzup's signed manifest, 2026-11-15: 0.2.0 = this blob, 2,406,044,780 bytes; 0.1.0 was 4b4f2b2f...).
 const ARCHIVE_SHA256: &str = "173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
-const ARCHIVE_URL: &str = "https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/\
+/// Served from `artifacts.risczero.net`, rzup's current download host: the old S3 bucket
+/// (risc0-artifacts.s3.us-west-2.amazonaws.com) now refuses anonymous reads (403). It is the same
+/// blob (checked against ARCHIVE_SHA256 on 2026-11-24), and the hash is checked after every download.
+const ARCHIVE_URL: &str = "https://artifacts.risczero.net/rzup/components/\
                            risc0-groth16/sha256/173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
 /// The files a complete install holds.
 const FILES: [&str; 4] = [
