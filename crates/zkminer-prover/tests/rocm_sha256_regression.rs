@@ -51,7 +51,11 @@ fn test_rocm_sha256_chain_at_scale() {
     let connected = pool.discover_and_spawn();
     eprintln!("Connected workers: {:?}", connected);
 
-    let rocm_workers: Vec<_> = connected.iter().filter(|k| k.contains("rocm")).collect();
+    // risc0 slots only: the ELF is a risc0 guest, and SP1 has ROCm slots too.
+    let rocm_workers: Vec<_> = connected
+        .iter()
+        .filter(|k| k.starts_with("risc0:rocm:"))
+        .collect();
     if rocm_workers.is_empty() {
         eprintln!("SKIP: no ROCm workers discovered");
         pool.shutdown_all();

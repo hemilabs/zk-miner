@@ -27,13 +27,28 @@ use serde::{Deserialize, Serialize};
 /// image id, the SP1 verifying-key hash), derived without executing it. A v10 worker cannot decode the
 /// command, so the handshake refuses it. And `ExecuteResult` gained `host_entropy_reads`, whether the
 /// guest read host-supplied nondeterministic input (both in the same unreleased version).
-/// 12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
-/// the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
-/// `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
-/// 13: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
-/// A v12 worker would seed guests by its host's key, unlike a v13 one proving the same job. And
-/// `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
-/// segment sizes (both in the same unreleased version).
+/// 12 and 13 were taken twice, by two lines of development (GitHub main and the macOS beta):
+/// - GitHub main:
+///   12: `Benchmark` carries the programs to run (`BenchmarkProgramSpec`): the suite is the host's, and
+///   the zkOP/s scoring proofs are requests of their own. A v11 worker ran its own list. And
+///   `SetupProgress`, what a `Warmup` is doing (both in the same unreleased version).
+///   13: no new field, a new meaning: the risc0 `sys_rand` seed is the public rule of `sys_rand.rs`, no key.
+///   A v12 worker would seed guests by its host's key, unlike a v13 one proving the same job. And
+///   `ExecuteResult` gained `user_cycles` and `keccak_cycles`, which `zkminer simulate` compares across
+///   segment sizes (both in the same unreleased version).
+/// - the macOS beta (metal-3.1):
+///   12: `BenchmarkEntry` gained `power_state`, the Mac's power state while that program was measured
+///   (Low Power Mode, battery, thermal state), so the host can mark a benchmark taken throttled
+///   (W7-M11). Last field, bincode-positional as for v4: a v11 entry is one field short, so the
+///   handshake refuses a v11 worker instead of the decoder failing mid-benchmark.
+///   13: risc0 3.1 (P31-19). The wire is unchanged, but the host prefixes every risc0 Groth16 proof
+///   with the seal selector of the risc0 IT links (0xe71e6620 for 3.1, 0x73c457ba for 3.0), and a proof
+///   verifies only under the selector of the risc0 the worker proved with. A v12 worker (risc0 3.0)
+///   under a v13 host, or a v13 worker under a v12 host, would have every fulfil revert after the
+///   collateral-locking claim, so the handshake refuses both. [`risc0_sdk_mismatch`] guards the same
+///   skew within one protocol version.
+///   14 (W10-INT, never on main): the union of both lines, `power_state` and risc0 3.1 with main's
+///   12 and 13. Main's own 14 (below) is a different wire; this beta number was retired at 17.
 /// 14: witness-construction jobs (plan §15.3). `Prove` gained `witness` ([`WitnessProve`]): the input
 /// is `prefix ‖ W`, read by the worker from a file and checked against the bundle's length and
 /// `sha256(prefix ‖ W)` (a mismatch is the new [`ErrorKind::InputMismatch`]), executed once with its
@@ -56,7 +71,39 @@ use serde::{Deserialize, Serialize};
 /// the seed, so a prover picks what the guest draws. The one-shot execute is not part of the IPC
 /// stream, but ships with the workers: a v15 binary's response lacks the field and fails to decode
 /// rather than pass for one that drew nothing.
-pub const PROTOCOL_VERSION: u32 = 16;
+/// 17: the macOS beta's additions on top of 16 (W11-ON37: main's line took 14-16 first, so the
+/// beta's 12-14 are renumbered here): `BenchmarkEntry.power_state` ([`BenchPowerState`], the beta's
+/// 12), still the entry's last field, and the risc0 3.1 seal-selector rule (the beta's 13): the host
+/// refuses a risc0 worker whose `HelloAck.sdk_version` is not risc0-zkvm
+/// [`RISC0_ZKVM_MAJOR_MINOR`] ([`risc0_sdk_mismatch`]), since a proof verifies only under the
+/// selector of the risc0 it was proven with. Bincode is positional: a v16 worker's entry is one
+/// field short, and a beta worker of its v14 lacks every 14-16 field, so the handshake refuses both
+/// instead of a decoder failing mid-benchmark or mid-job.
+pub const PROTOCOL_VERSION: u32 = 17;
+
+/// The risc0-zkvm `major.minor` a risc0 worker must report (`HelloAck.sdk_version`, "risc0-zkvm
+/// X.Y.Z") for this host: the risc0 whose Groth16 verifier parameters give the host's seal selector.
+/// The risc0 worker and the CLI each test that their linked risc0-zkvm has this `major.minor`.
+pub const RISC0_ZKVM_MAJOR_MINOR: &str = "3.1";
+
+/// Why a worker's handshake `sdk_version` cannot serve this host's risc0 seals, if it cannot: a
+/// "risc0-zkvm X.Y.Z" whose `X.Y` is not [`RISC0_ZKVM_MAJOR_MINOR`]. Other SDK strings (SP1, OpenVM,
+/// the test mock) are not risc0 proofs and pass.
+pub fn risc0_sdk_mismatch(sdk_version: &str) -> Option<String> {
+    let v = sdk_version.strip_prefix("risc0-zkvm ")?;
+    let mut parts = v.trim().split('.');
+    let major_minor = match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => format!("{a}.{b}"),
+        _ => String::new(),
+    };
+    (major_minor != RISC0_ZKVM_MAJOR_MINOR).then(|| {
+        format!(
+            "worker proves with {sdk_version}, but this host prefixes risc0-zkvm \
+             {RISC0_ZKVM_MAJOR_MINOR}'s Groth16 seal selector: every fulfil would revert. Install the \
+             worker built with this zkminer"
+        )
+    })
+}
 
 /// The segment size (po2) a risc0 worker executes or proves a job at when the host names none.
 ///
@@ -1216,7 +1263,11 @@ pub struct ProgramIdRefused {
 
 impl std::fmt::Display for ProgramIdRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the worker refused to derive a program id: {}", self.message)
+        write!(
+            f,
+            "the worker refused to derive a program id: {}",
+            self.message
+        )
     }
 }
 
@@ -1588,6 +1639,76 @@ pub struct BenchmarkEntry {
     /// per slot: the wrap is fixed, and a second full proof per program would multiply the suite's
     /// run time against a per-slot benchmark timeout.
     pub wrap_secs: Option<f64>,
+    /// The power state while this program was measured (protocol v12 of the macOS line, v17 since W11-ON37), or `None` when the worker
+    /// cannot read one (non-Mac workers) or does not report it (`ZKMINER_POWER_STATE_IN_BENCH=0`).
+    /// A state read reduced before or after the program counts ([`BenchPowerState::merge`]).
+    #[serde(default)]
+    pub power_state: Option<BenchPowerState>,
+}
+
+/// Revert knob for the power state in benchmarks (W7-M11): `0` makes the worker report none and
+/// the host ignore any it gets, so a benchmark taken throttled is used as measured, as before.
+pub const POWER_STATE_IN_BENCH_ENV: &str = "ZKMINER_POWER_STATE_IN_BENCH";
+
+/// Whether [`POWER_STATE_IN_BENCH_ENV`] is off (`0`, `off` or `false`) in this process.
+pub fn power_state_in_bench_off() -> bool {
+    std::env::var(POWER_STATE_IN_BENCH_ENV).is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false"))
+}
+
+/// The host's power state while a benchmark program ran (macOS: `NSProcessInfo` and IOKit, as the
+/// risc0 Metal worker reads them). `None` fields could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BenchPowerState {
+    /// Low Power Mode (`NSProcessInfo.isLowPowerModeEnabled`).
+    pub low_power_mode: Option<bool>,
+    /// The providing power source is the battery.
+    pub on_battery: Option<bool>,
+    /// `NSProcessInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical.
+    pub thermal: Option<u8>,
+}
+
+/// `NSProcessInfo.thermalState` from which proving is throttled (serious). Fair is normal under
+/// sustained load and does not count.
+pub const THERMAL_THROTTLED: u8 = 2;
+
+impl BenchPowerState {
+    /// Why proving in this state is slower than the host's full speed, or `None` when nothing says
+    /// so (unknown fields count as full speed).
+    pub fn reduced(&self) -> Option<String> {
+        let mut why = Vec::new();
+        if self.low_power_mode == Some(true) {
+            why.push("Low Power Mode");
+        }
+        if self.on_battery == Some(true) {
+            why.push("on battery");
+        }
+        match self.thermal {
+            Some(t) if t >= 3 => why.push("thermal critical"),
+            Some(t) if t >= THERMAL_THROTTLED => why.push("thermal serious"),
+            _ => {}
+        }
+        (!why.is_empty()).then(|| why.join(", "))
+    }
+
+    /// The worse of two readings, field by field (a reading of `true` or a higher thermal state
+    /// wins; a known value wins over an unknown one): the state a program was measured under, from
+    /// a reading before it and one after it.
+    pub fn merge(self, other: BenchPowerState) -> BenchPowerState {
+        let worst = |a: Option<bool>, b: Option<bool>| match (a, b) {
+            (Some(x), Some(y)) => Some(x || y),
+            (x, None) => x,
+            (None, y) => y,
+        };
+        BenchPowerState {
+            low_power_mode: worst(self.low_power_mode, other.low_power_mode),
+            on_battery: worst(self.on_battery, other.on_battery),
+            thermal: match (self.thermal, other.thermal) {
+                (Some(x), Some(y)) => Some(x.max(y)),
+                (x, None) => x,
+                (None, y) => y,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1604,6 +1725,7 @@ mod zkop_mix_tests {
             weight: 0.0,
             precompile: false,
             wrap_secs: None,
+            power_state: None,
         }
     }
 

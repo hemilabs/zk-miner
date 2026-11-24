@@ -52,8 +52,10 @@ fn test_gpu_groth16_proof_format() {
     let connected = pool.discover_and_spawn();
     eprintln!("Connected workers: {:?}", connected);
 
+    // risc0 slots only: the ELF is a risc0 guest, and SP1 has GPU slots too.
     let gpu_workers: Vec<_> = connected
         .iter()
+        .filter(|k| k.starts_with("risc0:"))
         .filter(|k| k.contains("cuda") || k.contains("rocm") || k.contains("intel"))
         .collect();
 

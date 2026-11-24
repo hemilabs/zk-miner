@@ -11,9 +11,7 @@ use zkminer_chain::jobs::ClaimOutcome;
 use zkminer_chain::monitor::{JobMonitor, MonitorEvent};
 use zkminer_config::wallet::load_signer;
 use zkminer_config::ZkMinerConfig;
-use zkminer_prover::benchmark::{
-    load_cached_benchmark, run_benchmark_gpu_only_streaming, save_benchmark,
-};
+use zkminer_prover::benchmark::load_cached_benchmark;
 use zkminer_prover::dispatcher::WorkerPool;
 use zkminer_prover::engine::{backend_sources, init_worker_pool, BackendSource};
 use zkminer_strategy::cost_model::CostParams;
@@ -152,30 +150,114 @@ const DEFAULT_MONITOR_BACKFILL_BLOCKS: u64 = u64::MAX;
 /// faster just burns eth_blockNumber/eth_getLogs calls. Override with `chain.monitor_poll_secs`.
 const DEFAULT_MONITOR_POLL_SECS: u64 = 10;
 
-/// RISC Zero Groth16 seal selector (risc0 v3.1.x: 0xe71e6620, the pinned verifier's `SELECTOR()`).
-/// On-chain verification requires the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the
-/// worker returns the bare 256-byte proof, so the miner prepends this. It is the first 4 bytes of
-/// the verifier-parameters digest and is fixed per risc0 version (the worker's
-/// `groth16_selector_tests` hold its risc0 to it) — override via config for a testnet on a
-/// different version.
-const RISC0_GROTH16_SELECTOR: [u8; 4] = zkminer_chain::deployment::pins::RISC0_V3_1_SELECTOR;
+/// The RISC Zero Groth16 seal selector of the linked risc0: the first 4 bytes of its default
+/// `Groth16ReceiptVerifierParameters` digest (control root, BN254 identity control id and Groth16
+/// verifying key), which is what risc0-ethereum's `encode_seal` prefixes and what a
+/// `RiscZeroGroth16Verifier` built for that release returns from `SELECTOR()`. On-chain verification
+/// requires the seal to be `selector ++ abi.encode(a,b,c)` (260 bytes); the worker returns the bare
+/// 256-byte proof, so the miner prepends this. risc0 3.1 (the GHSA-g6qg-9j8p-7j87 circuit and
+/// verifier fixes) is `0xe71e6620`; 3.0 was `0x73c457ba`. Derived rather than hard-coded so the
+/// default follows the risc0 the workspace links (the worker's); override it with
+/// `prover.risc0_groth16_selector` for a testnet on a different version.
+fn risc0_groth16_default_selector() -> [u8; 4] {
+    use risc0_zkvm::sha::Digestible;
+    let digest = risc0_zkvm::Groth16ReceiptVerifierParameters::default().digest();
+    let mut sel = [0u8; 4];
+    sel.copy_from_slice(&digest.as_bytes()[..4]);
+    sel
+}
 
 /// The resolved seal selector for this run (config override, else the default).
 static SEAL_SELECTOR: std::sync::OnceLock<[u8; 4]> = std::sync::OnceLock::new();
 
-/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620").
+/// Parse a 4-byte hex selector like "0xe71e6620" (or "e71e6620"). Anything but exactly 8 hex digits
+/// is refused (an odd length or a non-ASCII byte used to panic on the slice).
 fn parse_seal_selector(s: &str) -> Option<[u8; 4]> {
     let h = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = (0..h.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&h[i..i + 2], 16));
-    let v: Result<Vec<u8>, _> = bytes.collect();
-    v.ok().and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+    if h.len() != 8 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut sel = [0u8; 4];
+    for (i, b) in sel.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&h[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(sel)
+}
+
+/// Set to `1` to let `prover.risc0_groth16_selector` differ from the linked risc0's selector and
+/// still claim risc0 jobs. Only for a chain whose verifier really accepts this risc0's receipts under
+/// another selector (the localnet replay of a 3.0 fixture receipt sets it); see
+/// [`risc0_selector_refusal`].
+const RISC0_SELECTOR_OVERRIDE_ACK_ENV: &str = "ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE";
+
+/// Why risczero.groth16.v1 claims are refused for this run's seal selector, if they are (set once at
+/// startup from [`risc0_selector_refusal`]; [`reverify_risc0`] then never verifies the adapter).
+static RISC0_SELECTOR_REFUSAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The startup policy for a configured selector. A stock `RiscZeroGroth16Verifier`'s `SELECTOR()` is
+/// the digest of its own verifier parameters, and the worker proves under the linked risc0's
+/// parameters, so a seal prefixed with any other selector cannot verify there: an override that
+/// differs from `linked` (e.g. the 3.0 value 0x73c457ba left in a config on a 3.1 build) would still
+/// pass the SELECTOR() check against a verifier of that other version, and then every fulfil would
+/// revert after the collateral-locking claim. Refused (no risc0 claims) unless `acknowledged`.
+fn risc0_selector_refusal(
+    configured: Option<[u8; 4]>,
+    linked: [u8; 4],
+    acknowledged: bool,
+) -> Option<String> {
+    let sel = configured?;
+    if sel == linked || acknowledged {
+        return None;
+    }
+    Some(format!(
+        "prover.risc0_groth16_selector 0x{} differs from the linked risc0's selector 0x{} (risc0-zkvm \
+         {}): the worker's proofs verify only under 0x{}, so a seal prefixed with 0x{} would revert \
+         every fulfil. Remove the override, or set {RISC0_SELECTOR_OVERRIDE_ACK_ENV}=1 if this chain's \
+         verifier really accepts these receipts under 0x{}",
+        alloy::hex::encode(sel),
+        alloy::hex::encode(linked),
+        risc0_zkvm::VERSION,
+        alloy::hex::encode(linked),
+        alloy::hex::encode(sel),
+        alloy::hex::encode(sel),
+    ))
+}
+
+fn risc0_selector_override_acknowledged() -> bool {
+    matches!(
+        std::env::var(RISC0_SELECTOR_OVERRIDE_ACK_ENV).as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// What is missing before this build's risc0 seals can be checked against an audited verifier
+/// (`zkminer_chain::deployment::risc0_verifier_pin`), or `None`. A refused selector override is
+/// reported by [`risc0_selector_refusal`] instead.
+fn risc0_verifier_pin_startup_notice(selector: [u8; 4]) -> Option<String> {
+    if RISC0_SELECTOR_REFUSAL.get().is_some() {
+        return None;
+    }
+    zkminer_chain::deployment::risc0_verifier_pin_notice(
+        selector,
+        zkminer_chain::deployment::code_pins_skipped(),
+    )
 }
 
 /// The RISC Zero seal selector to prefix onto seals (config override or default).
 fn risc0_seal_selector() -> [u8; 4] {
-    *SEAL_SELECTOR.get().unwrap_or(&RISC0_GROTH16_SELECTOR)
+    match SEAL_SELECTOR.get() {
+        Some(sel) => *sel,
+        None => risc0_groth16_default_selector(),
+    }
+}
+
+/// The seal a RISC Zero Groth16 job is fulfilled with: `selector ++ proof`, the encoding of
+/// risc0-ethereum's `encode_seal` (260 bytes for the worker's 256-byte proof).
+fn risc0_onchain_seal(selector: [u8; 4], proof: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(selector.len() + proof.len());
+    s.extend_from_slice(&selector);
+    s.extend_from_slice(proof);
+    s
 }
 
 /// True if a proving error is the intermittent multi-segment invalid-proof (the
@@ -372,6 +454,8 @@ fn sp1_seal_prefix() -> [u8; 4] {
 /// An SP1 Groth16 seal: the verifier hash prefix (4), the exit code, the vk root and the proof nonce
 /// (32 each), then the 256-byte Groth16 proof.
 const SP1_GROTH16_SEAL_LEN: usize = 4 + 3 * 32 + 256;
+/// A RISC Zero Groth16 seal on chain: the 4-byte selector, then the 256-byte proof (8 words).
+const RISC0_GROTH16_SEAL_LEN: usize = 4 + 256;
 
 /// One miner per home directory: two would recover, prove and release the same locks, collide on
 /// nonces, and overwrite each other's job journal (`~/.zkminer/job_journal.json`) — e.g. a second
@@ -485,6 +569,12 @@ async fn reverify_deployment(client: &ChainClient) -> Result<Vec<String>> {
 
 /// Run `verify_proof_system` for risc0 and record the outcome (see [`RISC0_VERIFIED_ADAPTER`]).
 async fn reverify_risc0(client: &ChainClient) -> Result<alloy::primitives::Address> {
+    if let Some(why) = RISC0_SELECTOR_REFUSAL.get() {
+        *RISC0_VERIFIED_ADAPTER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        anyhow::bail!("{why}");
+    }
     let r = client
         .verify_proof_system(
             zkminer_chain::auction::ProofSystem::Risc0Groth16,
@@ -2551,16 +2641,40 @@ pub async fn run(
             DEPLOYMENT_RETRY.as_secs()
         ),
     }
-    // Resolve the RISC Zero groth16 seal selector (config override or the built-in risc0 v3.1.x
-    // default) BEFORE verifying it against the live verifier: verifying the default while seals are
+    // Resolve the RISC Zero groth16 seal selector (config override or the linked risc0's default,
+    // 0xe71e6620 for 3.1) BEFORE verifying it against the live verifier: verifying the default while seals are
     // later prefixed with an override would pass the check and then revert every fulfil.
     let sel = match config.prover.risc0_groth16_selector.as_deref() {
         Some(s) => parse_seal_selector(s).ok_or_else(|| {
             anyhow::anyhow!("prover.risc0_groth16_selector {s:?} is not a 4-byte hex selector")
         })?,
-        None => RISC0_GROTH16_SELECTOR,
+        None => risc0_groth16_default_selector(),
     };
     let _ = SEAL_SELECTOR.set(sel);
+    if let Some(why) = risc0_selector_refusal(
+        config
+            .prover
+            .risc0_groth16_selector
+            .is_some()
+            .then_some(sel),
+        risc0_groth16_default_selector(),
+        risc0_selector_override_acknowledged(),
+    ) {
+        let _ = RISC0_SELECTOR_REFUSAL.set(why);
+    } else if sel != risc0_groth16_default_selector() {
+        tracing::warn!(
+            "prover.risc0_groth16_selector 0x{} differs from the linked risc0's 0x{}; claiming anyway \
+             ({RISC0_SELECTOR_OVERRIDE_ACK_ENV} is set)",
+            alloy::hex::encode(sel),
+            alloy::hex::encode(risc0_groth16_default_selector())
+        );
+    }
+    // B9-ZK: seals with no audited verifier pin (a 3.0 or other selector the override check let
+    // through) say why up front, whatever the chain answers below; the check itself then refuses the
+    // adapter with the same text on every re-check.
+    if let Some(missing) = risc0_verifier_pin_startup_notice(risc0_seal_selector()) {
+        tracing::error!("PAGE: risczero.groth16.v1 cannot be served yet — {missing}");
+    }
     splash.status("Verifying the RISC Zero verifier contract");
     // NOT fatal: a held lock must still be recovered (fulfilled, kept through a Disabled window, or
     // released) when the adapter is disabled, swapped, or fails a pin. Exiting here would leave every
@@ -4679,7 +4793,7 @@ fn risc0_slot_sizes(
                     .find(|d| d.device_id == *device && d.prover_backend == risc0)
             });
             let over = overrides.get(device).copied();
-            let po2 = zkminer_prover::benchmark::risc0_job_po2(over, row, *vram);
+            let po2 = zkminer_prover::benchmark::risc0_slot_job_po2(device, over, row, *vram);
             (slot.clone(), device.clone(), po2)
         })
         .collect()
@@ -10447,11 +10561,7 @@ async fn process_job_lifecycle(
     // RISC Zero groth16 seals must be selector-prefixed for on-chain verification;
     // the worker returns the bare 256-byte proof, so prepend the 4-byte selector.
     let seal_bytes: Vec<u8> = if backend == "risc0" {
-        let selector = risc0_seal_selector();
-        let mut s = Vec::with_capacity(selector.len() + proof.seal.len());
-        s.extend_from_slice(&selector);
-        s.extend_from_slice(&proof.seal);
-        s
+        risc0_onchain_seal(risc0_seal_selector(), &proof.seal)
     } else {
         proof.seal.clone()
     };
@@ -10469,6 +10579,23 @@ async fn process_job_lifecycle(
             alloy::hex::encode(&seal_bytes[..seal_bytes.len().min(4)]),
             SP1_GROTH16_SEAL_LEN,
             alloy::hex::encode(sp1_seal_prefix())
+        ));
+    }
+
+    // A RISC Zero seal goes on chain as `selector ++ 256-byte proof` (risc0-ethereum-contracts 3.1.0
+    // `encode_seal`, handoff §3 and §7 step 6): any other length or prefix would revert
+    // VerifierCallFailed after the fulfil's gas, so release instead of publishing it (B9-CHAIN).
+    if backend == zkminer_prover_protocol::BACKEND_RISC0
+        && (seal_bytes.len() != RISC0_GROTH16_SEAL_LEN || seal_bytes[..4] != risc0_seal_selector())
+    {
+        return Err(anyhow::anyhow!(
+            "RISC Zero seal for {} is {} bytes prefixed 0x{} — not a Groth16 seal for this \
+             verifier ({} bytes prefixed 0x{}); releasing instead of publishing it",
+            short_id(job_id),
+            seal_bytes.len(),
+            alloy::hex::encode(&seal_bytes[..seal_bytes.len().min(4)]),
+            RISC0_GROTH16_SEAL_LEN,
+            alloy::hex::encode(risc0_seal_selector())
         ));
     }
 
@@ -10862,8 +10989,9 @@ pub(crate) fn resolve_backend(proof_system_id: alloy::primitives::B256) -> Optio
     use zkminer_chain::auction::ProofSystem;
     match ProofSystem::from_id(proof_system_id)? {
         // The one system this build can prove AND verify end-to-end against the deployed verifier:
-        // risc0 3.1.x Groth16 receipts encoded to the 260-byte seal (SELECTOR 0xe71e6620 ‖ proof).
-        // Checked at startup against the live adapter's native verifier.
+        // Groth16 receipts of the linked risc0 (3.1: SELECTOR 0xe71e6620) encoded to the 260-byte seal
+        // (SELECTOR ‖ proof). Checked at startup against the live adapter's native verifier, whose
+        // SELECTOR() must equal ours (a 3.0 verifier returns 0x73c457ba and is refused).
         ProofSystem::Risc0Groth16 => Some("risc0"),
         // SP1 6.8.1 (hemilabs/sp1 #19) Groth16 proofs of circuit v6.1.0, the circuit the 743111 SP1
         // verifiers accept; checked at startup against the live adapter's native verifier.
@@ -13327,93 +13455,91 @@ fn spawn_recovery_actions(
     }
 }
 
-async fn spawn_streaming_benchmark(state: zkminer_tui::state::SharedState) {
-    use zkminer_tui::state::{BenchmarkTracker, LogLevel};
-
-    // Initialize tracker
-    {
-        let mut s = state.write().await;
-        s.benchmark_running = true;
-        s.benchmark_tracker = Some(BenchmarkTracker {
-            devices: Vec::new(),
-            all_complete: false,
-            started_at: Some(std::time::Instant::now()),
-            active_device_index: 0,
-        });
-        s.add_log(LogLevel::Info, "Starting GPU benchmarks...");
-    }
-
-    let state_for_progress = state.clone();
-    let suite = tokio::task::spawn_blocking(move || {
-        let (sync_tx, sync_rx) =
-            std::sync::mpsc::channel::<zkminer_prover::dispatcher::BenchmarkProgressEvent>();
-
-        // Bridge: forwards benchmark progress events to TUI state.
-        // Uses tokio mpsc channel to avoid block_on deadlocks with limited workers.
-        let (bridge_tx, mut bridge_rx) =
-            tokio::sync::mpsc::channel::<zkminer_prover::dispatcher::BenchmarkProgressEvent>(32);
-        let bridge_state = state_for_progress.clone();
-
-        tokio::spawn(async move {
-            while let Some(event) = bridge_rx.recv().await {
-                let mut s = bridge_state.write().await;
-                if let Some(tracker) = s.benchmark_tracker.as_mut() {
-                    tracker.apply(&event);
-                }
-                if let zkminer_prover::dispatcher::BenchmarkProgressKind::ProgramDone {
-                    entry,
-                    ..
-                } = &event.kind
-                {
-                    s.add_log(
-                        LogLevel::Info,
-                        format!(
-                            "{}: {} done ({:.1}M c/s)",
-                            event.slot_key,
-                            entry.program_name,
-                            entry.throughput / 1_000_000.0
-                        ),
-                    );
-                }
-            }
-        });
-
-        let bridge = std::thread::spawn(move || {
-            while let Ok(event) = sync_rx.recv() {
-                if bridge_tx.blocking_send(event).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let on_progress = move |event: zkminer_prover::dispatcher::BenchmarkProgressEvent| {
-            let _ = sync_tx.send(event);
-        };
-        let suite = run_benchmark_gpu_only_streaming(&on_progress);
-        drop(on_progress); // drops sync_tx, closing the channel
-        let _ = bridge.join();
-        suite
-    })
-    .await
-    .unwrap_or_default();
-
-    // Finalize
-    let mut s = state.write().await;
-    save_benchmark(&suite);
-    let gpu_count = suite.device_benchmarks.len();
-    s.benchmark_results = Some(suite);
-    s.benchmark_running = false;
-    s.benchmark_tracker = None;
-    s.add_log(
-        LogLevel::Success,
-        format!("GPU benchmarks complete ({gpu_count} device entries)"),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::B256;
+
+    /// P31-19: the default RISC Zero seal selector is the linked risc0's, and that is 3.1's
+    /// (`Groth16ReceiptVerifierParameters::default().digest()` = e71e6620a834f4d8...). A 3.0 build
+    /// (0x73c457ba) fails here: its seals would only verify against a 3.0 verifier.
+    #[test]
+    fn the_default_seal_selector_is_risc0_3_1s() {
+        assert_eq!(risc0_groth16_default_selector(), [0xe7, 0x1e, 0x66, 0x20]);
+        assert_ne!(risc0_groth16_default_selector(), [0x73, 0xc4, 0x57, 0xba]);
+        // With no override resolved, the selector the miner prefixes is the derived default.
+        if SEAL_SELECTOR.get().is_none() {
+            assert_eq!(risc0_seal_selector(), [0xe7, 0x1e, 0x66, 0x20]);
+        }
+        assert_eq!(
+            parse_seal_selector("0xe71e6620"),
+            Some([0xe7, 0x1e, 0x66, 0x20])
+        );
+        assert_eq!(
+            parse_seal_selector("e71e6620"),
+            Some([0xe7, 0x1e, 0x66, 0x20])
+        );
+        assert_eq!(parse_seal_selector("0xe71e66"), None);
+        // Odd lengths and non-ASCII used to panic on the slice.
+        assert_eq!(parse_seal_selector("0xe71e662"), None);
+        assert_eq!(parse_seal_selector("0xe71e66206"), None);
+        assert_eq!(parse_seal_selector("0xé71e662"), None);
+        assert_eq!(parse_seal_selector("0xg71e6620"), None);
+    }
+
+    /// B9-ZK: zkminer-chain's 3.1 selector constant is this build's derived selector, and with the
+    /// 3.1 verifier pinned (the 2026-11-16 deployment) the startup has nothing to report.
+    #[test]
+    fn the_3_1_verifier_pin_slot_matches_the_linked_risc0() {
+        use zkminer_chain::deployment::pins;
+        assert_eq!(pins::RISC0_V3_1_SELECTOR, risc0_groth16_default_selector());
+        assert_eq!(
+            zkminer_chain::deployment::risc0_verifier_pin(risc0_groth16_default_selector()),
+            Ok(pins::RISC0_V3_1_GROTH16_VERIFIER)
+        );
+        assert_eq!(risc0_verifier_pin_startup_notice(risc0_groth16_default_selector()), None);
+    }
+
+    /// The risc0 this CLI derives its selector from is the one the protocol makes a risc0 worker
+    /// report, so a worker on another risc0 is refused at the handshake (P31-19).
+    #[test]
+    fn the_linked_risc0_is_the_protocols() {
+        let sdk = format!("risc0-zkvm {}", risc0_zkvm::VERSION);
+        assert_eq!(
+            zkminer_prover_protocol::risc0_sdk_mismatch(&sdk),
+            None,
+            "{sdk}"
+        );
+    }
+
+    /// A 3.0 selector left in the config of a 3.1 build passes the SELECTOR() check against the
+    /// live 3.0 verifier, yet every 3.1 proof would revert there: refused unless acknowledged.
+    #[test]
+    fn a_stale_selector_override_refuses_risc0_claims() {
+        let linked = risc0_groth16_default_selector();
+        let v30 = parse_seal_selector("0x73c457ba").unwrap();
+        let why = risc0_selector_refusal(Some(v30), linked, false).expect("refused");
+        assert!(
+            why.contains("0x73c457ba") && why.contains("0xe71e6620"),
+            "{why}"
+        );
+        assert!(why.contains(RISC0_SELECTOR_OVERRIDE_ACK_ENV), "{why}");
+        // Acknowledged (localnet's 3.0 fixture replay), no override, or an override equal to the
+        // linked selector: claims allowed.
+        assert_eq!(risc0_selector_refusal(Some(v30), linked, true), None);
+        assert_eq!(risc0_selector_refusal(None, linked, false), None);
+        assert_eq!(risc0_selector_refusal(Some(linked), linked, false), None);
+    }
+
+    /// The fulfilled seal is selector ++ the worker's 256-byte proof: 260 bytes.
+    #[test]
+    fn a_risc0_seal_is_the_selector_then_the_proof() {
+        let proof: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        let seal = risc0_onchain_seal(risc0_groth16_default_selector(), &proof);
+        assert_eq!(seal.len(), 260);
+        assert_eq!(&seal[..4], &[0xe7, 0x1e, 0x66, 0x20]);
+        assert_eq!(&seal[4..], &proof[..]);
+    }
 
     #[test]
     fn a_job_tries_its_planned_card_then_the_fastest_and_a_refusing_card_last() {
@@ -15621,6 +15747,87 @@ mod r2_sizing_tests {
             pci_bus_id: String::new(),
             host_peak_bytes: None,
         }
+    }
+
+    /// M8: a Mac's risc0 slot is sized by the shared Metal table: 19 for a 16 GB or 18 GB Mac (8 /
+    /// 10 GiB host figure) and 20 for a 24 GB Mac (16 GiB), where M1's table gave 18 / 18 / 19.
+    #[test]
+    fn a_macs_risc0_slot_takes_the_m8_tier() {
+        use zkminer_prover::metal_sizing as ms;
+        const GIB: u64 = 1 << 30;
+        let vrams = [8 * GIB, 10 * GIB, 16 * GIB, 28 * GIB];
+        let slots: Vec<_> = vrams
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("risc0:metal:{i}"), format!("gpu-metal{i}"), Some(*v)))
+            .collect();
+        let sizes = risc0_slot_sizes(&slots, None, &HashMap::new());
+        let got: Vec<Option<u8>> = sizes.iter().map(|(_, _, p)| *p).collect();
+        // Whatever this process's budget and knob: the table row of the smaller figure.
+        let want: Vec<Option<u8>> = vrams
+            .iter()
+            .map(|&v| Some(ms::job_po2_for_limit(ms::host_working_set_limit(Some(v)).unwrap())))
+            .collect();
+        assert_eq!(got, want);
+        if ms::env_working_set_budget().is_none() && ms::env_po2_table() == ms::Po2Table::M8 {
+            assert_eq!(got, vec![Some(19), Some(19), Some(20), Some(20)]);
+        }
+    }
+
+    /// W7-M10 (with `ZKMINER_OWNER_ACTIVE=auto` or `1`; the default keeps the idle tier): while the
+    /// owner uses the Mac, its slot's figure is the owner-active tier's (`WorkerPool::risc0_slots`,
+    /// `metal_sizing::claim_limit`), so jobs claimed then are measured one row down (16 / 18 GB: 18,
+    /// 24 GB: 19; a 36 GB Mac keeps 20 and reports its idle figure). A job measured at the active
+    /// size still proves at that size once the owner has left (the card's size rises; the measured
+    /// one fits under it).
+    #[test]
+    fn a_macs_risc0_slot_takes_the_owner_active_tier() {
+        use zkminer_prover::dispatcher::WorkerPool;
+        use zkminer_prover::metal_sizing::{self as ms, OwnerTier};
+        const GIB: u64 = 1 << 30;
+        let idle = [8 * GIB, 10 * GIB, 16 * GIB, 28 * GIB];
+        let active: Vec<_> = idle
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let figure = WorkerPool::metal_tier_limit(*v, OwnerTier::Active);
+                (
+                    format!("risc0:metal:{i}"),
+                    format!("gpu-metal{i}"),
+                    Some(figure),
+                )
+            })
+            .collect();
+        let sizes = risc0_slot_sizes(&active, None, &HashMap::new());
+        let got: Vec<Option<u8>> = sizes.iter().map(|(_, _, p)| *p).collect();
+        let want: Vec<Option<u8>> = active
+            .iter()
+            .map(|(_, _, v)| {
+                Some(ms::job_po2_for_limit(
+                    ms::host_working_set_limit(*v).unwrap(),
+                ))
+            })
+            .collect();
+        assert_eq!(got, want);
+        if ms::env_working_set_budget().is_none() && ms::env_po2_table() == ms::Po2Table::M8 {
+            assert_eq!(got, vec![Some(18), Some(18), Some(19), Some(20)]);
+        }
+        // A job measured at 18 while the owner was active, proved after the owner left (card 19):
+        // at its measured 18.
+        let card = |po2| Risc0Card {
+            slot: "risc0:metal:0".into(),
+            device: "gpu-metal0".into(),
+            po2,
+        };
+        let (fit, measured_here) = risc0_prove_sizes(&[card(19)], &[18]);
+        assert_eq!((fit["risc0:metal:0"], measured_here), (18, true));
+        // The other direction is why `risc0_slots` never switches to the active tier on a read
+        // (only a Metal job's start does): a job measured at 19 that meets an active card (18)
+        // proves at 18 unmeasured. That remains possible for a job claimed at 19 and still queued
+        // when another job's start switches the tier, which is why `auto` is opt-in until the
+        // prove step sizes from the idle figure (W7-M10 note, open issues).
+        let (fit, measured_here) = risc0_prove_sizes(&[card(18)], &[19]);
+        assert_eq!((fit["risc0:metal:0"], measured_here), (18, false));
     }
 
     #[test]

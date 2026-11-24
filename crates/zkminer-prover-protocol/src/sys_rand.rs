@@ -9,7 +9,7 @@
 //! from public data.
 //!
 //! The proof does not bind any of this: a prover running other software can answer `sys_rand` with
-//! anything, and a job proven before this rule (protocol 13) was seeded by its miner's own key. The
+//! anything, and a job proven before this rule (protocol 13 on GitHub main; on the macOS beta line, before 14) was seeded by its miner's own key. The
 //! rule says what a zkminer run under it is, not what every proof was.
 //!
 //! The seed covers every input byte on purpose. A seed an input could be crafted against (a job id,

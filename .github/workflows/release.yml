@@ -69,17 +69,35 @@ jobs:
       retention_days: 30
 
   # ---------------------------------------------------------------------------
+  # macOS (Apple Silicon, Metal): the beta kit zkminer-<version>-macos-arm64.tar.gz,
+  # built, tested without a GPU and checked on the repository's macOS runner
+  # (build-macos.yml, docs/ci-macos.md). Its metal-probe job is informational
+  # and not run here: the kit's GPU validation is the user checklist on real
+  # Macs (docs/macos-beta.md, docs/metal-port-notes/B9-M26.md).
+  # ---------------------------------------------------------------------------
+  macos:
+    needs: check-version
+    uses: ./.github/workflows/build-macos.yml
+    permissions:
+      contents: read
+    with:
+      retention_days: 30
+      metal_probe: false
+
+  # ---------------------------------------------------------------------------
   # Native Windows. The CUDA prover cannot be cross-compiled (it needs MSVC +
   # the CUDA toolkit), which is the whole reason this job exists.
   # ---------------------------------------------------------------------------
   # ---------------------------------------------------------------------------
   # Collect every artifact into the release: the CLI and NVIDIA provers as
   # single files, the AMD and Intel provers as tarballs with the runtimes they
-  # load (scripts/ci/assemble-release.sh). Then check, with no GPU, that every
-  # binary and library loads in stock Ubuntu 22.04, 24.04 and Fedora images.
+  # load (scripts/ci/assemble-release.sh), and the macOS kit as built. Then
+  # check, with no GPU, that every binary and library loads in stock Ubuntu
+  # 22.04, 24.04 and Fedora images, and that every macOS program links only
+  # macOS's own libraries (scripts/ci/check-release-libs.sh).
   # ---------------------------------------------------------------------------
   assemble:
-    needs: [check-version, linux]
+    needs: [check-version, linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -104,7 +122,12 @@ jobs:
       # The script fails if any expected file is missing: without that, a job
       # that silently produced nothing would yield a release quietly missing a
       # platform, which is how a half-published release happens.
+      # The macOS kit's name and BUILDINFO must carry the version check-version
+      # compared with the tag, and the commit being released.
       - name: "Assemble release assets"
+        env:
+          ZKMINER_VERSION: ${{ needs.check-version.outputs.version }}
+          EXPECT_COMMIT: ${{ github.sha }}
         run: scripts/ci/assemble-release.sh staging release kit
 
       - name: "Every binary and library loads with only the GPU driver to come"
@@ -214,12 +237,21 @@ jobs:
           | `zkminer-provers-intel-linux-x86_64.tar.zst` | Intel (Arc A and B series): the RISC Zero prover, SP1's SYCL server, and the oneAPI SYCL runtime and Intel compute runtime they load (`zkminer-intel/`; licenses in `zkminer-intel/LICENSES`) |
           | `zkminer-prove-openvm` | OpenVM prover |
 
+          ### macOS (Apple Silicon, macOS 26 or later): beta
+          | file | what it is |
+          |---|---|
+          | `zkminer-${{ needs.check-version.outputs.version }}-macos-arm64.tar.gz` | the miner CLI and the RISC Zero prover for Apple Silicon GPUs (Metal), with `install.sh`, for Macs with 16 GB of memory or more. Unsigned and not notarized: unpack it and run `./install.sh --with-groth16`, which clears the download quarantine on what it installs (the kit's README.md). The first start compiles the GPU pipelines once (about a minute) |
+
           ### Windows (x86-64)
           | file | what it is |
           |---|---|
           | `zkminer.exe` | the miner CLI (statically linked; no VC++ redistributable needed) |
 
-          Verify with `sha256sum -c SHA256SUMS`.
+          Verify the files you downloaded against `SHA256SUMS`, in the folder that holds them:
+          `sha256sum -c --ignore-missing SHA256SUMS` on Linux, `shasum -a 256 -c --ignore-missing SHA256SUMS`
+          on a Mac. Each file must print `OK`. `--ignore-missing` skips the files of the other
+          platforms; without it the check fails on them. On Windows, compare
+          `(Get-FileHash zkminer.exe).Hash` (PowerShell, SHA-256) with the file's line.
 
           On Linux, put the prover files (and `sp1-gpu-server`, `libcudart.so.12` and its
           license) in `~/.zkminer/provers/`, `chmod +x` the binaries, and unpack the AMD or Intel

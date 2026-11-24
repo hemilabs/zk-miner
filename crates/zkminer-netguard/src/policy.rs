@@ -4,12 +4,12 @@ use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::facts::{EgressPath, FactsOptions, HostFacts};
 use crate::host::HostDenied;
 use crate::ip::{canonical_ip, is_global, prefix_is_global, Prefix};
-use crate::nearhop::{NearProbe, TtlProbe, Verdict};
+use crate::nearhop::{FarEvidence, NearProbe, Pin, TtlProbe, Verdict};
 
 /// Whether connections a requester causes may reach non-public destinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -77,17 +77,55 @@ pub enum Denied {
     /// This host's public address on the path a connection to `ip` takes is not known (see
     /// [`HostFacts::unknown_paths`]): it could be this host or its router, reached by hairpin.
     PublicAddressUnknown { ip: IpAddr, path: EgressPath },
+    /// This host's public address on the path a connection to `ip` takes is being learned
+    /// again: the host just moved to another uplink (its default routes, or a default gateway's
+    /// link-layer address, changed), and until the address is known there it could be this host
+    /// or its router, reached by hairpin (review round 4, cross-2: this was a
+    /// [`Denied::PublicAddressUnknown`], whose advice to set `[egress] public_addresses` did not
+    /// apply).
+    PublicAddressRelearning { ip: IpAddr, path: EgressPath },
     /// The host's facts now need `[egress] internal_ranges` (a tunnel became the uplink, a global
     /// IPv4 address appeared: [`HostFacts::needs_internal_ranges`]), which the configuration does
     /// not state: every connection is refused until it does, or the condition clears.
     InternalRangesUnstated { ip: IpAddr, why: String },
-    /// The destination answered within `hops` hops of this host ([`crate::nearhop`]), or the
-    /// probe that asks failed: `what` says which.
+    /// The destination answered within `hops` hops of this host ([`crate::nearhop`]): `what`
+    /// says how.
     NearHop {
         addr: SocketAddr,
         hops: u8,
         what: String,
     },
+    /// The near-hop check found no positive evidence that the destination is farther than
+    /// `hops` hops (no router past the limit said a probe ran out of hops: silence, a Destination
+    /// Unreachable, an answer only beyond the limit), or its probes failed: `why` (review round
+    /// 4, cross-5: this was a [`Denied::NearHop`], "on its own network"). Silence is never taken
+    /// as far (the S3 review).
+    NearCheckFailed {
+        addr: SocketAddr,
+        hops: u8,
+        why: String,
+    },
+    /// This host's facts could not be read again (`why`, naming what failed) and are older than
+    /// [`FACTS_TTL`] and a grace of 2 s: every requester connection is refused until they can be
+    /// read (review round 2, bypass-1; on every platform since the Linux application).
+    FactsUnreadable { ip: IpAddr, why: String },
+    /// An IPv6 destination while this host, with IPv6 and no IPv4 route, has just joined a
+    /// network whose NAT64 prefix is still being learned ([`crate::nat64`]): an address under
+    /// that prefix can carry a private IPv4 address (review round 3, bypass-1; every platform
+    /// since the Linux application).
+    Nat64Unsettled(IpAddr),
+    /// An IPv6 destination while the network this host is on named a NAT64 prefix the guard
+    /// could not hold or does not believe (`why`: which source, and what it named;
+    /// [`crate::nat64::unheld`]): an address under it can carry a private IPv4 address. On any
+    /// host, until a round on that network holds everything it names (review round 5, cross-1:
+    /// this was [`Denied::Nat64Unsettled`], whose text said the prefix was still being learned).
+    Nat64Unheld { ip: IpAddr, why: String },
+    /// A connection to `addr`, once made, is not the one checked ([`NetPolicy::recheck_connected`]):
+    /// it reached another address, or left from another source address than the kernel chose
+    /// for it when it was checked (the route changed between the check and the connection), so
+    /// it was dropped before any request was written on it. The Linux application of review round
+    /// 2, bypass-3 (every platform).
+    PathChanged { addr: SocketAddr, why: String },
 }
 
 /// What is wrong with a URL, apart from where it points.
@@ -233,6 +271,13 @@ impl Denied {
                     )
                 }
             }
+            Denied::PublicAddressRelearning { ip, path } => write!(
+                f,
+                "{ip} is reached over {path}, and this host just moved to another network (its \
+                 default routes or default gateway changed): its public {path} address there is \
+                 being learned again (a few seconds), and until it is it could be this host or \
+                 its router, reached by hairpin"
+            ),
             Denied::InternalRangesUnstated { ip, why } => write!(
                 f,
                 "{ip} is not connected to: {why}, so this host now needs `internal_ranges = \
@@ -240,10 +285,40 @@ impl Denied {
                  `[]` if there are none), which the config does not state. Every connection is \
                  refused until it does"
             ),
+            Denied::FactsUnreadable { ip, why } => write!(
+                f,
+                "{ip} cannot be judged: this host's network facts (interfaces, routes, DNS \
+                 servers) could not be read again for more than {}s ({why}), so every \
+                 requester-caused connection is refused until they can be",
+                (FACTS_TTL + REFRESH_GRACE).as_secs()
+            ),
+            Denied::Nat64Unsettled(ip) => write!(
+                f,
+                "{ip} cannot be judged yet: this host has just joined a network whose NAT64 \
+                 prefix is still being learned (RFC 7050, at most {}s), and an IPv6 address \
+                 under that prefix can carry a private IPv4 address",
+                crate::nat64::DISCOVERY_TIMEOUT.as_secs()
+            ),
+            Denied::Nat64Unheld { ip, why } => write!(
+                f,
+                "{ip} is refused: on this network {why}, so IPv6 destinations are refused until \
+                 it names no more than the network guard holds (an IPv6 address under a NAT64 \
+                 prefix the guard does not hold can carry a private IPv4 address)"
+            ),
+            Denied::PathChanged { addr, why } => write!(
+                f,
+                "the connection to {addr} was dropped once made: {why}, so it is not the \
+                 connection that was checked"
+            ),
             Denied::NearHop { addr, hops, what } => write!(
                 f,
                 "{addr} is within {hops} hops of this host, on its own network (a probe limited \
                  to {hops} hops: {what})"
+            ),
+            Denied::NearCheckFailed { addr, hops, why } => write!(
+                f,
+                "could not tell how near {addr} is (whether it is within {hops} hops of this \
+                 host): {why}"
             ),
             Denied::NoAdmittedAddress { host, refused } => {
                 write!(f, "{host:?} resolves to no admitted address (")?;
@@ -267,16 +342,123 @@ impl Denied {
     pub fn depends_on_facts(&self) -> bool {
         matches!(
             self,
-            Denied::OwnAddress(_)
+            Denied::FactsUnreadable { .. }
+                | Denied::Nat64Unsettled(_)
+                | Denied::Nat64Unheld { .. }
+                | Denied::OwnAddress(_)
                 | Denied::ConnectedPrefix { .. }
                 | Denied::SitePrefix { .. }
                 | Denied::DnsServer(_)
                 | Denied::OffDefaultRoute { .. }
                 | Denied::RouteQueryFailed { .. }
                 | Denied::PublicAddressUnknown { .. }
+                | Denied::PublicAddressRelearning { .. }
                 | Denied::InternalRangesUnstated { .. }
         )
     }
+}
+
+/// What a connection was vetted as ([`NetPolicy::vet_path`]), for the connection itself
+/// ([`Vetted::socket`]: pinned to the source and interface the probes left from) and the check
+/// once it is made
+/// ([`NetPolicy::recheck_connected`]). Only the guard makes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Vetted {
+    /// The address judged, as the connection names it.
+    pub addr: SocketAddr,
+    /// The address connected to: `addr` with an IPv4-mapped address as its IPv4 address (in
+    /// tests, a loopback stand-in for it).
+    pub connect: SocketAddr,
+    /// The source address the kernel chose for a connection to `connect` right before it was
+    /// made (`None` in developer mode, which checks nothing).
+    pub source: Option<IpAddr>,
+    /// The interface that holds `source` (the connection is bound to it where the platform can:
+    /// [`crate::nearhop`]).
+    pub interface: Option<u32>,
+}
+
+impl Vetted {
+    /// A vetted connection as a test stages it (test builds only: the `test-util` feature).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn staged(addr: SocketAddr, connect: SocketAddr, source: Option<IpAddr>, interface: Option<u32>) -> Self {
+        Vetted {
+            addr,
+            connect: unmapped(connect),
+            source,
+            interface,
+        }
+    }
+
+    /// The socket for the connection to [`Self::connect`], pinned as the probes were (see
+    /// [`crate::nearhop`]): the interface, a fixed IPv6 flow label (Linux), bound to the source
+    /// address, from a new local port. (The owner's decision after the S3 review: not the far
+    /// probe's port; a stateful home or carrier-grade NAT drops a second SYN on the probe's
+    /// 4-tuple, measured on this project's own home path, so every IPv4 connection failed.)
+    /// Non-blocking.
+    pub fn socket(&self) -> io::Result<socket2::Socket> {
+        let sock = crate::nearhop::new_socket(self.connect)?;
+        let pin = Pin {
+            source: self.source,
+            interface: self.interface,
+        };
+        crate::nearhop::pin_socket(&sock, self.connect, &pin, 0)?;
+        sock.set_nonblocking(true)?;
+        Ok(sock)
+    }
+}
+
+/// An IPv4-mapped IPv6 address as its IPv4 address (what a connection to it reaches).
+fn unmapped_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+fn unmapped(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(unmapped_ip(addr.ip()), addr.port())
+}
+
+/// The source address the kernel chooses now for a connection to `dst`: a UDP socket connected
+/// to it (UDP `connect` sends nothing; it asks the route, as a TCP connect's first step does).
+fn source_for(dst: SocketAddr) -> io::Result<IpAddr> {
+    let any: SocketAddr = if dst.is_ipv4() {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    };
+    let s = std::net::UdpSocket::bind(any)?;
+    s.connect(dst)?;
+    Ok(s.local_addr()?.ip())
+}
+
+/// Whether a connection whose own addresses are `local` and `peer` is the one `vetted` describes
+/// ([`NetPolicy::recheck_connected`]): its peer must be the address connected to, and its source
+/// the one the kernel chose when it was checked (a route that moved the connection to another
+/// interface, a VPN that came up, gives it another source); why not, if not. Pure.
+pub fn connected_as_vetted(
+    vetted: &Vetted,
+    local: SocketAddr,
+    peer: SocketAddr,
+) -> Result<(), String> {
+    if unmapped(peer) != vetted.connect {
+        return Err(format!(
+            "it reached {}, not {}",
+            unmapped(peer),
+            vetted.connect
+        ));
+    }
+    if let Some(source) = vetted.source {
+        let from = unmapped_ip(local.ip());
+        if from != unmapped_ip(source) {
+            return Err(format!(
+                "it left from {from}, and the kernel chose {source} for it when it was checked \
+                 (the route changed between the check and the connection)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The single admission decision for one destination address of a connection a requester caused.
@@ -299,7 +481,7 @@ pub fn admit(
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
-    admit_inner(mode, ip, None, facts, extra_deny)
+    admit_inner(mode, ip, None, None, facts, extra_deny)
 }
 
 /// [`admit`] for a connection to `addr`, its port included: the kernel is asked how it routes a
@@ -310,18 +492,48 @@ pub fn admit_to(
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
-    admit_inner(mode, addr.ip(), Some(addr.port()), facts, extra_deny)
+    admit_inner(mode, addr.ip(), Some(addr.port()), None, facts, extra_deny)
+}
+
+/// [`admit_to`] for a connection that leaves from `src` (the kernel is asked how it routes a
+/// connection from that source: review round 4).
+fn admit_from(
+    mode: NetMode,
+    addr: SocketAddr,
+    src: IpAddr,
+    facts: &HostFacts,
+    extra_deny: &[Prefix],
+) -> Result<(), Denied> {
+    admit_inner(mode, addr.ip(), Some(addr.port()), Some(src), facts, extra_deny)
 }
 
 fn admit_inner(
     mode: NetMode,
     ip: IpAddr,
     dport: Option<u16>,
+    src: Option<IpAddr>,
     facts: &HostFacts,
     extra_deny: &[Prefix],
 ) -> Result<(), Denied> {
     if mode == NetMode::DevPrivate {
         return Ok(());
+    }
+    if let Some(why) = facts.unreadable() {
+        return Err(Denied::FactsUnreadable {
+            ip,
+            why: why.to_string(),
+        });
+    }
+    if ip.is_ipv6() {
+        if let Some(why) = facts.nat64_unheld() {
+            return Err(Denied::Nat64Unheld {
+                ip,
+                why: crate::printable(&why, 300),
+            });
+        }
+        if facts.nat64_unsettled() {
+            return Err(Denied::Nat64Unsettled(ip));
+        }
     }
     if !is_global(ip) {
         return Err(Denied::NotGlobal(ip));
@@ -359,10 +571,16 @@ fn admit_inner(
     }
     // Review r2 R2-NG-3: the kernel applies the policy rules exactly; the tables above are the
     // prefix model, which a destination rule into a default-only table slipped past.
-    facts.kernel_verdict(ip, dport)?;
+    facts.kernel_verdict_from(ip, dport, src)?;
     facts
         .path_known(ip)
-        .map_err(|path| Denied::PublicAddressUnknown { ip, path })?;
+        .map_err(|path| {
+            if facts.relearning(path) {
+                Denied::PublicAddressRelearning { ip, path }
+            } else {
+                Denied::PublicAddressUnknown { ip, path }
+            }
+        })?;
     // Re-judged with every snapshot: a tunnel that became the uplink after startup is refused
     // like one there at startup.
     let gaps = facts.config_gaps();
@@ -440,6 +658,16 @@ pub const FACTS_TTL: Duration = Duration::from_secs(1);
 /// this: a host that just changed networks is judged on its new facts.
 pub const FORCED_REFRESH_MIN_AGE: Duration = Duration::from_millis(100);
 
+/// How long after [`FACTS_TTL`] facts whose refresh failed are still judged with (review round 2,
+/// bypass-1): a failure that clears within it (a resolver file being rewritten) refuses nothing;
+/// one that lasts longer refuses every requester connection ([`Denied::FactsUnreadable`]) until
+/// the facts can be read again.
+pub const REFRESH_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a caller that finds the facts being re-read waits for that re-read (review round 3,
+/// 12(b)); a normal re-read takes tens of milliseconds.
+pub const REFRESH_WAIT: Duration = Duration::from_millis(500);
+
 /// The host facts a policy judges with: gathered and re-read once older than [`FACTS_TTL`] (or
 /// on a facts-dependent refusal, [`FORCED_REFRESH_MIN_AGE`]), or fixed by the caller.
 #[derive(Debug)]
@@ -451,6 +679,31 @@ struct FactsCell {
     warned: std::sync::Mutex<Vec<EgressPath>>,
     /// The configuration gaps last warned about ([`HostFacts::config_gaps`]).
     warned_gaps: std::sync::Mutex<Vec<String>>,
+    /// Held while the facts are re-read (one re-read at a time: review round 2, cross-3), with
+    /// the last re-read's failure, if it failed.
+    refreshing: std::sync::Mutex<Option<RefreshFailure>>,
+    /// When the re-read under way started, if one is (see [`Self::lock_refresh`]).
+    refresh_started: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Tests: a failure to stage in place of the next re-reads, and their count.
+    #[cfg(test)]
+    seam: RefreshSeam,
+}
+
+/// The last re-read of the facts failed.
+#[derive(Debug)]
+struct RefreshFailure {
+    /// When it was tried.
+    at: std::time::Instant,
+    /// Why it failed.
+    why: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RefreshSeam {
+    fail: std::sync::Mutex<Option<String>>,
+    delay: std::sync::Mutex<Duration>,
+    gathers: std::sync::atomic::AtomicUsize,
 }
 
 impl FactsCell {
@@ -458,30 +711,160 @@ impl FactsCell {
         self.get_fresher_than(FACTS_TTL)
     }
 
-    /// The facts, re-read first if they are older than `max_age` (and the cell refreshes).
+    /// The facts, re-read first if they are older than `max_age` (and the cell refreshes),
+    /// one re-read at a time: a caller that finds one under way waits for it and takes its facts.
+    /// A re-read that fails (an `/etc/resolver` file that cannot be read, a configuration daemon
+    /// that does not answer: review round 2, bypass-1) leaves the last good facts in force,
+    /// without their cached kernel verdicts, for [`REFRESH_GRACE`] past [`FACTS_TTL`]; after
+    /// that, and until a re-read succeeds, the facts in force refuse every requester connection
+    /// ([`Denied::FactsUnreadable`], naming the failure). A failed re-read is tried again on a
+    /// later call, at most every [`FORCED_REFRESH_MIN_AGE`]. A caller waits for a re-read under way
+    /// at most [`REFRESH_WAIT`] ([`Self::lock_refresh`]). On every platform since the Linux
+    /// application (before it, Linux kept the last good facts, cached verdicts included, for as
+    /// long as the re-read failed, and every stale caller re-read them itself).
     fn get_fresher_than(&self, max_age: Duration) -> Arc<HostFacts> {
+        let read = || {
+            self.current
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        };
+        let current = read();
+        if !self.refresh || current.gathered_at().elapsed() < max_age {
+            return current;
+        }
+        let mut failure = match self.lock_refresh() {
+            Ok(failure) => failure,
+            Err(facts) => return facts,
+        };
+        // Re-read by another caller while this one waited.
+        let current = read();
+        if current.gathered_at().elapsed() < max_age {
+            return current;
+        }
+        let retry = failure
+            .as_ref()
+            .is_none_or(|f| f.at.elapsed() >= FORCED_REFRESH_MIN_AGE);
+        if retry {
+            let started = |at| {
+                *self
+                    .refresh_started
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = at
+            };
+            started(Some(std::time::Instant::now()));
+            let gathered = self.gather();
+            started(None);
+            match gathered {
+                Ok(fresh) => {
+                    let fresh = Arc::new(fresh);
+                    if let Some(f) = failure.take() {
+                        tracing::info!(
+                            "network guard: this host's network facts are read again (after: \
+                             {}); connections are judged again",
+                            f.why
+                        );
+                    }
+                    self.warn_unknown(&fresh);
+                    *self.current.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
+                    return fresh;
+                }
+                Err(e) => {
+                    let why = crate::printable(&e.to_string(), 300);
+                    if failure.as_ref().is_none_or(|f| f.why != why) {
+                        tracing::warn!(
+                            "network guard: re-reading this host's network facts failed: {why}. \
+                             Unless that clears within {}s, every requester-caused connection is \
+                             refused until it does",
+                            REFRESH_GRACE.as_secs()
+                        );
+                    }
+                    *failure = Some(RefreshFailure {
+                        at: std::time::Instant::now(),
+                        why,
+                    });
+                    // What the kernel answered for the old facts is asked again.
+                    let kept = Arc::new(current.without_verdicts());
+                    *self.current.write().unwrap_or_else(|e| e.into_inner()) = kept;
+                }
+            }
+        }
+        let current = read();
+        let Some(f) = failure.as_ref() else {
+            return current;
+        };
+        if current.unreadable().is_some()
+            || current.gathered_at().elapsed() < FACTS_TTL + REFRESH_GRACE
+        {
+            return current;
+        }
+        tracing::error!(
+            "network guard: this host's network facts could not be read again for more than {}s \
+             ({}): refusing every requester-caused connection until they can be",
+            (FACTS_TTL + REFRESH_GRACE).as_secs(),
+            f.why
+        );
+        let refusing = Arc::new(current.refusing(f.why.clone()));
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = refusing.clone();
+        refusing
+    }
+
+    /// The re-read lock, waited for until the re-read under way is [`REFRESH_WAIT`] old
+    /// (review round 3, 12(b)). A re-read that takes longer (a configuration daemon that answers
+    /// just within its 2 s, or not at all) holds only the caller that runs it: the others get,
+    /// without waiting further, the
+    /// facts in force while those are within [`FACTS_TTL`] + [`REFRESH_GRACE`], and after that
+    /// those facts made to refuse every requester connection, saying why
+    /// ([`Denied::FactsUnreadable`]).
+    fn lock_refresh(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<RefreshFailure>>, Arc<HostFacts>> {
+        let first = std::time::Instant::now();
+        loop {
+            match self.refreshing.try_lock() {
+                Ok(g) => return Ok(g),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            let since = self
+                .refresh_started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or(first);
+            if since.elapsed() >= REFRESH_WAIT {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
         let current = self
             .current
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if !self.refresh || current.gathered_at().elapsed() < max_age {
-            return current;
+        if current.unreadable().is_some()
+            || current.gathered_at().elapsed() < FACTS_TTL + REFRESH_GRACE
+        {
+            return Err(current);
         }
-        match HostFacts::gather_with(&self.options) {
-            Ok(fresh) => {
-                let fresh = Arc::new(fresh);
-                self.warn_unknown(&fresh);
-                *self.current.write().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
-                fresh
-            }
-            Err(e) => {
-                // The last good facts stay in force (an interface read that fails says nothing about
-                // the interfaces), and the next call tries again.
-                tracing::warn!("network guard: re-reading this host's interfaces failed: {e}");
-                current
+        Err(Arc::new(current.refusing(format!(
+            "a re-read of them has not finished within {}s",
+            (FACTS_TTL + REFRESH_GRACE).as_secs()
+        ))))
+    }
+
+    /// One re-read of the facts (tests stage a failure, a delay, and count them).
+    fn gather(&self) -> io::Result<HostFacts> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            self.seam.gathers.fetch_add(1, Ordering::SeqCst);
+            let delay = *self.seam.delay.lock().unwrap();
+            std::thread::sleep(delay);
+            if let Some(why) = self.seam.fail.lock().unwrap().clone() {
+                return Err(io::Error::other(why));
             }
         }
+        HostFacts::gather_with(&self.options)
     }
 }
 
@@ -551,6 +934,14 @@ impl FactsCell {
             return;
         }
         for path in &now {
+            if facts.relearning(*path) {
+                tracing::info!(
+                    "network guard: this host moved to another network; its public {path} \
+                     address there is being learned again, and requester-caused connections over \
+                     {path} are refused until it is"
+                );
+                continue;
+            }
             tracing::warn!(
                 "network guard: this host's public {path} address is not known, so every \
                  requester-caused connection over {path} is refused (it could reach this host or \
@@ -632,6 +1023,7 @@ impl NetPolicy {
         };
         if mode == NetMode::Public {
             usable(&facts, &options)?;
+            crate::nearhop::warn_if_unsupported();
         }
         let policy = Self::build(mode, facts, refresh, deny, options);
         if mode == NetMode::Public {
@@ -661,6 +1053,10 @@ impl NetPolicy {
                 options,
                 warned: std::sync::Mutex::new(Vec::new()),
                 warned_gaps: std::sync::Mutex::new(Vec::new()),
+                refreshing: std::sync::Mutex::new(None),
+                refresh_started: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                seam: RefreshSeam::default(),
             }),
             deny: deny.into(),
             probe: Arc::new(TtlProbe),
@@ -680,6 +1076,16 @@ impl NetPolicy {
         self.mode
     }
 
+    /// Tests: every re-read of the facts from now on takes `delay` (and how many ran).
+    #[cfg(test)]
+    pub(crate) fn stage_slow_refresh(&self, delay: Duration) -> usize {
+        *self.facts.seam.delay.lock().unwrap() = delay;
+        self.facts
+            .seam
+            .gathers
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The operator's extra deny CIDRs.
     pub fn deny(&self) -> &[Prefix] {
         &self.deny
@@ -688,6 +1094,18 @@ impl NetPolicy {
     /// The host facts in force (re-read first if stale).
     pub fn facts(&self) -> Arc<HostFacts> {
         self.facts.get()
+    }
+
+    /// The host facts in force, as they are: never re-read (a snapshot for a caller that must
+    /// not block, an async runtime's worker: review round 4, parse-3). Whatever it decides with
+    /// them is admitted later on facts that are re-read.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn facts_in_force(&self) -> Arc<HostFacts> {
+        self.facts
+            .current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The options the facts are gathered with.
@@ -731,41 +1149,164 @@ impl NetPolicy {
     }
 
     /// The last check before a connection to `addr` is made, right before it (public mode;
-    /// developer mode admits everything): [`Self::admit_to`], then the near-hop probe
-    /// ([`crate::nearhop::decide`]): refused when the destination answers within `[egress]
-    /// near_hop_limit` hops — to the probe, or, when the probe had no answer, to a check
-    /// connection's hop-limited FIN — or the probe fails. Blocking (up to the probe's timeout, plus
-    /// a check connection when it had no answer): call it off an async runtime's worker threads.
+    /// developer mode admits everything): [`Self::admit_to`], then the near-hop decision
+    /// ([`crate::nearhop::decide`]): admitted only when a router past `[egress] near_hop_limit`
+    /// hops said a probe ran out of hops (positive evidence); refused when the destination
+    /// answered within the limit, and when there is no evidence either way. The probes leave
+    /// from the kernel's choice of source; a connection made after this is not pinned to them, so
+    /// a real connection is vetted with [`Self::vet_path`]. Blocking (up to
+    /// [`crate::nearhop::DECIDE_BUDGET`]): call it off an async runtime's worker threads.
     pub fn vet_connection(&self, addr: SocketAddr) -> Result<(), Denied> {
+        self.vet_connection_until(addr, Instant::now() + crate::nearhop::DECIDE_BUDGET)
+    }
+
+    /// [`Self::vet_connection`], given up on at `deadline` (refused: review round 5, probe-1): a
+    /// caller that stops waiting passes its own, so the probes it abandons stop too
+    /// ([`crate::nearhop::decide_until`]).
+    pub fn vet_connection_until(&self, addr: SocketAddr, deadline: Instant) -> Result<(), Denied> {
         if self.mode == NetMode::DevPrivate {
             return Ok(());
         }
         self.admit_to(addr)?;
-        // An IPv4-mapped address is connected to as its IPv4 address: probe that.
-        let target = match addr.ip() {
-            IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map_or(addr, |v4| SocketAddr::new(IpAddr::V4(v4), addr.port())),
-            IpAddr::V4(_) => addr,
-        };
+        self.decide_near(addr, &Pin::default(), deadline).map(|_| ())
+    }
+
+    /// The near-hop decision for `addr` from `pin` (an IPv4-mapped address probed as its IPv4
+    /// address): the far evidence, or the refusal.
+    fn decide_near(
+        &self,
+        addr: SocketAddr,
+        pin: &Pin,
+        deadline: Instant,
+    ) -> Result<FarEvidence, Denied> {
+        let target = unmapped(addr);
         let hops = self.near_hop_limit();
-        match crate::nearhop::decide(&*self.probe, target, hops) {
-            Verdict::Far => Ok(()),
+        // The S3 review: no far verdict is remembered for another connection (it belongs to the
+        // probe's 4-tuple, which the connection reuses), so each connection is decided afresh.
+        match crate::nearhop::decide_until(&*self.probe, target, hops, pin, deadline) {
+            Verdict::Far(e) => Ok(e),
             Verdict::Near(how) => Err(Denied::NearHop {
                 addr,
                 hops,
                 what: format!("it {how}"),
             }),
-            Verdict::Failed(why) => Err(Denied::NearHop {
+            Verdict::NoEvidence(why) | Verdict::Failed(why) => {
+                Err(Denied::NearCheckFailed { addr, hops, why })
+            }
+        }
+    }
+
+    /// [`Self::vet_connection`] for a connection to `addr` that is made to `connect` (`addr`
+    /// itself, but for test seams that stand a loopback server in for it), and what the
+    /// connection must be: the source address the kernel chooses for a connection to `connect`
+    /// now (a UDP socket connected to it: nothing is sent), read before the probes, which leave
+    /// from it and the interface that holds it, as the connection does ([`Vetted::socket`]; the
+    /// far probe left from that source, or the evidence is refused). [`Self::recheck_connected`] checks the connection
+    /// against it. Connect right after it. Blocking, like [`Self::vet_connection`].
+    pub fn vet_path(&self, addr: SocketAddr, connect: SocketAddr) -> Result<Vetted, Denied> {
+        self.vet_path_until(addr, connect, Instant::now() + crate::nearhop::DECIDE_BUDGET)
+    }
+
+    /// [`Self::vet_path`], given up on at `deadline` ([`Self::vet_connection_until`]).
+    pub fn vet_path_until(
+        &self,
+        addr: SocketAddr,
+        connect: SocketAddr,
+        deadline: Instant,
+    ) -> Result<Vetted, Denied> {
+        let connect = unmapped(connect);
+        if self.mode == NetMode::DevPrivate {
+            return Ok(Vetted {
                 addr,
-                hops,
-                what: format!("the probe failed: {why}"),
-            }),
-            Verdict::Undecided => Err(Denied::NearHop {
-                addr,
-                hops,
-                what: "no answer either way".into(),
-            }),
+                connect,
+                source: None,
+                interface: None,
+            });
+        }
+        self.admit_to(addr)?;
+        // The kernel's own choice for a TCP connection where it can say (Linux's TCP route
+        // query: review round 4, cross-3), else a connected UDP socket's.
+        let kernel = self
+            .facts()
+            .kernel_source(unmapped_ip(connect.ip()), Some(connect.port()));
+        let route_failed = |e: io::Error| Denied::RouteQueryFailed {
+            ip: addr.ip(),
+            why: format!(
+                "a socket to it could not be connected (nothing sent): {}",
+                crate::printable(&e.to_string(), 120)
+            ),
+        };
+        let source = kernel.map_or_else(|| source_for(connect), Ok).map_err(route_failed)?;
+        // The probes leave as the connection will (a test's stand-in for a public address is
+        // probed by the test's own probe, from anywhere).
+        let real = connect == unmapped(addr);
+        let pin = if real {
+            Pin {
+                source: Some(source),
+                interface: crate::nearhop::interface_of(source).map_err(route_failed)?,
+            }
+        } else {
+            Pin::default()
+        };
+        let evidence = self.decide_near(addr, &pin, deadline)?;
+        match evidence.local {
+            Some(local) if real && unmapped_ip(local.ip()) != unmapped_ip(source) => {
+                return Err(Denied::NearCheckFailed {
+                    addr,
+                    hops: self.near_hop_limit(),
+                    why: format!(
+                        "the probe that found it far left from {}, not from {source}",
+                        local.ip()
+                    ),
+                })
+            }
+            _ => {}
+        }
+        Ok(Vetted {
+            addr,
+            connect,
+            source: Some(source),
+            interface: pin.interface,
+        })
+    }
+
+    /// The check right after a connection vetted as `vetted` is made, before anything is written
+    /// on it (the Linux application of review round 2, bypass-3; every platform): the route,
+    /// address and near-hop checks ran just before the connection, on another socket, so a route
+    /// or a VPN that changed in between was not seen for it. Now the connection's own addresses
+    /// (`local`, `peer`: `getsockname`, `getpeername`) must be what was vetted
+    /// ([`connected_as_vetted`]: the peer the address checked, the source the one the kernel
+    /// chose for it then, which only an address of the interface the route named holds), and the
+    /// destination is admitted again on the facts in force with the kernel asked afresh (no
+    /// cached verdict: the route as it is now that the connection exists). A refusal drops the
+    /// connection. Developer mode admits everything. Blocking.
+    pub fn recheck_connected(
+        &self,
+        vetted: &Vetted,
+        local: SocketAddr,
+        peer: SocketAddr,
+    ) -> Result<(), Denied> {
+        if self.mode == NetMode::DevPrivate {
+            return Ok(());
+        }
+        connected_as_vetted(vetted, local, peer).map_err(|why| Denied::PathChanged {
+            addr: vetted.addr,
+            why,
+        })?;
+        // The kernel asked how it routes a connection from the connection's own source (a rule
+        // that selects by source sees it: review round 4), when the connection is to the address
+        // judged (a test's loopback stand-in for a public address leaves from loopback, a source
+        // the kernel refuses for that address).
+        let src = (vetted.connect == unmapped(vetted.addr)).then(|| unmapped_ip(local.ip()));
+        let judge = |f: &HostFacts| match src {
+            Some(src) => admit_from(self.mode, vetted.addr, src, &f.without_verdicts(), &self.deny),
+            None => admit_to(self.mode, vetted.addr, &f.without_verdicts(), &self.deny),
+        };
+        match judge(&self.facts()) {
+            Err(d) if d.depends_on_facts() && self.facts.refresh => {
+                judge(&self.facts.get_fresher_than(FORCED_REFRESH_MIN_AGE))
+            }
+            r => r,
         }
     }
 
@@ -1285,8 +1826,21 @@ mod tests {
                 kind: RouteKind::OtherGateway
             })
         );
-        assert_eq!(a("93.184.216.34"), Ok(()));
-        assert_eq!(a("1.0.0.1"), Ok(()));
+        // Review round 3, bypass-3 (every platform since the Linux application; before it Linux
+        // admitted both): a default-like answer must be one of these facts' default routes; the
+        // split default via the VPN and wg-quick's table on interface 9 are not
+        // (`a_new_uplink_is_refused_until_the_facts_hold_it`).
+        for (dst, kind) in [
+            ("93.184.216.34", RouteKind::OtherGateway),
+            ("1.0.0.1", RouteKind::OnLink),
+        ] {
+            let e = a(dst).unwrap_err();
+            assert!(
+                matches!(e, Denied::OffDefaultRoute { kind: k, .. } if k == kind),
+                "{dst}: {e:?}"
+            );
+            assert!(e.depends_on_facts());
+        }
         assert_eq!(a("172.233.157.223"), Ok(()));
         assert!(matches!(
             a("45.60.1.20"),
@@ -1328,6 +1882,284 @@ mod tests {
         // Developer mode asks nothing.
         assert_eq!(admit(NetMode::DevPrivate, ip("52.95.1.1"), &f, &[]), Ok(()));
         let _ = RouteType::Local;
+    }
+
+    /// Review round 3, bypass-3 (the reviewer's `r3_a_new_uplink_passes_the_kernel_check_
+    /// of_old_facts`; every platform since the Linux application): the kernel's default-like answer is admitted only when these facts hold
+    /// that default route (its family, hop and interface). A full-tunnel VPN that came up after
+    /// the facts were read (`0/1` on a `utun`, or its own default via its peer) and a second
+    /// network's default are refused as off the default path, a refusal that rests on the facts
+    /// (the policy reads them again and judges once more); the facts' own default, a clone through
+    /// their uplink, and the same VPN once the facts hold it are admitted.
+    #[test]
+    fn a_new_uplink_is_refused_until_the_facts_hold_it() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let raw = |extra: Vec<Route>| RawFacts {
+            interface_prefixes: vec![pfx("192.168.1.0/24")],
+            interface_addresses: vec![ip("192.168.1.33")],
+            routes: [
+                vec![
+                    Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 14),
+                    Route::on_link(pfx("192.168.1.0/24"), 14),
+                ],
+                extra,
+            ]
+            .concat(),
+            ..RawFacts::default()
+        };
+        let mut staged = Staged::default();
+        let answers = [
+            (
+                "8.8.8.8",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 14),
+            ),
+            (
+                "1.1.1.1",
+                Route::via(pfx("1.1.1.1/32"), ip("192.168.1.1"), 14),
+            ),
+            ("9.9.9.9", Route::on_link(pfx("0.0.0.0/1"), 20)),
+            ("4.2.2.2", Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 20)),
+            (
+                "4.2.2.3",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.50.1"), 15),
+            ),
+            // The facts' gateway, out of another interface; another gateway on the facts'
+            // interface.
+            (
+                "4.2.2.4",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 15),
+            ),
+            (
+                "4.2.2.5",
+                Route::via(pfx("0.0.0.0/0"), ip("192.168.1.254"), 14),
+            ),
+            // A link route of the other family on the VPN's interface.
+            ("2606:4700::6810:84e5", Route::on_link(pfx("::/1"), 20)),
+        ];
+        for (d, r) in &answers {
+            staged.answers.insert(ip(d), Some(vec![*r]));
+        }
+        let staged = Arc::new(staged);
+        let old =
+            HostFacts::assemble(raw(Vec::new()), &offline()).with_route_oracle(staged.clone());
+        let a = |f: &HostFacts, s: &str| admit(NetMode::Public, ip(s), f, &[]);
+        assert_eq!(a(&old, "8.8.8.8"), Ok(()));
+        assert_eq!(a(&old, "1.1.1.1"), Ok(()));
+        for (d, kind) in [
+            ("9.9.9.9", RouteKind::OnLink),
+            ("4.2.2.2", RouteKind::OtherGateway),
+            ("4.2.2.3", RouteKind::OtherGateway),
+            ("4.2.2.4", RouteKind::OtherGateway),
+            ("4.2.2.5", RouteKind::OtherGateway),
+        ] {
+            let e = a(&old, d).unwrap_err();
+            assert!(
+                matches!(e, Denied::OffDefaultRoute { kind: k, .. } if k == kind),
+                "{d}: {e:?}"
+            );
+            assert!(e.depends_on_facts(), "{d}");
+        }
+        // Once the facts hold the VPN's routes (read after it came up), its answers are admitted.
+        let new = HostFacts::assemble(
+            raw(vec![
+                Route::on_link(pfx("0.0.0.0/1"), 20),
+                Route::via(pfx("0.0.0.0/0"), ip("10.8.0.1"), 20),
+            ]),
+            &FactsOptions {
+                internal_ranges: Some(Vec::new()),
+                ..offline()
+            },
+        )
+        .with_route_oracle(staged);
+        assert_eq!(a(&new, "9.9.9.9"), Ok(()));
+        assert_eq!(a(&new, "4.2.2.2"), Ok(()));
+        assert!(a(&new, "4.2.2.3").is_err());
+        // The VPN's `0/1` is IPv4's: an IPv6 `::/1` on the same interface is not held.
+        assert!(matches!(
+            a(&new, "2606:4700::6810:84e5"),
+            Err(Denied::OffDefaultRoute {
+                kind: RouteKind::OnLink,
+                ..
+            })
+        ));
+    }
+
+    /// Review round 3, bypass-1 (the reviewer's `r3_an_unlearned_nsp_carries_private_
+    /// ipv4_as_global`; every platform since the Linux application): on a host with IPv6 and no IPv4 route, `<NSP>::<private IPv4>` under a
+    /// network-specific NAT64 prefix not learned yet is an ordinary global IPv6 address. While the
+    /// new uplink's discovery round has not finished, every IPv6 destination is refused, and the
+    /// refusal rests on the facts; once the prefix is learned, what it carries is judged.
+    #[test]
+    fn ipv6_is_refused_while_a_new_uplinks_nat64_prefix_is_learned() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let nsp = pfx("2a0b:7e40:64::/96");
+        let under =
+            |v4: [u8; 4]| IpAddr::V6(crate::nat64::synthesize(nsp, std::net::Ipv4Addr::from(v4)));
+        let facts = |unsettled: bool| {
+            HostFacts::assemble(
+                RawFacts {
+                    interface_prefixes: vec![pfx("2a02:db8:99::/64")],
+                    interface_addresses: vec![ip("2a02:db8:99::7")],
+                    routes: vec![Route::via(pfx("::/0"), ip("fe80::1"), 4)],
+                    nat64_unsettled: unsettled,
+                    ..RawFacts::default()
+                },
+                &FactsOptions {
+                    public_addresses: vec![ip("2a02:db8:99::7")],
+                    ..offline()
+                },
+            )
+        };
+        let targets = [
+            [10, 0, 0, 1],
+            [192, 168, 1, 1],
+            [169, 254, 169, 254],
+            [127, 0, 0, 1],
+        ];
+        let pending = facts(true);
+        for v4 in targets {
+            let e = admit(NetMode::Public, under(v4), &pending, &[]).unwrap_err();
+            assert_eq!(e, Denied::Nat64Unsettled(under(v4)));
+            assert!(e.depends_on_facts());
+            assert!(
+                e.to_string()
+                    .contains("NAT64 prefix is still being learned"),
+                "{e}"
+            );
+        }
+        let e = admit(NetMode::Public, ip("2606:4700:4700::1111"), &pending, &[]).unwrap_err();
+        assert!(matches!(e, Denied::Nat64Unsettled(_)), "{e:?}");
+        // Settled, and the prefix learned: refused as the IPv4 address it carries.
+        crate::nat64::add_learned(&[nsp]);
+        let settled = facts(false);
+        for v4 in targets {
+            let d = admit(NetMode::Public, under(v4), &settled, &[]);
+            assert_eq!(d, Err(Denied::NotGlobal(under(v4))));
+        }
+        assert_eq!(
+            admit(NetMode::Public, ip("2606:4700:4700::1111"), &settled, &[]),
+            Ok(())
+        );
+    }
+
+    /// Review round 5, cross-1: an uplink whose network named NAT64 prefixes the guard does not
+    /// hold refuses IPv6 on any host with a refusal of its own, naming the source and what it
+    /// named; it no longer says the prefix is still being learned (at most 2 s), which was false
+    /// for as long as the source kept naming them. It rests on the facts; IPv4 is unaffected.
+    #[test]
+    fn r5_an_unheld_nat64_prefix_has_its_own_refusal_naming_the_source() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let why = "the router advertisements of fe80::1 on interface 2 (PREF64) named 5 NAT64 \
+                   prefixes, more than the 4 the network guard believes of one source";
+        let f = HostFacts::assemble(
+            RawFacts {
+                interface_prefixes: vec![pfx("2a02:db8:99::/64")],
+                interface_addresses: vec![ip("2a02:db8:99::7"), ip("192.0.2.7")],
+                routes: vec![
+                    Route::via(pfx("::/0"), ip("fe80::1"), 2),
+                    Route::via(pfx("0.0.0.0/0"), ip("192.0.2.1"), 2),
+                ],
+                nat64_unheld: Some(why.into()),
+                ..RawFacts::default()
+            },
+            &FactsOptions {
+                public_addresses: vec![ip("2a02:db8:99::7"), ip("9.9.9.7")],
+                ..offline()
+            },
+        );
+        let e = admit(NetMode::Public, ip("2606:4700:4700::1111"), &f, &[]).unwrap_err();
+        assert_eq!(
+            e,
+            Denied::Nat64Unheld {
+                ip: ip("2606:4700:4700::1111"),
+                why: why.into()
+            }
+        );
+        assert!(e.depends_on_facts());
+        let text = e.to_string();
+        assert!(text.contains(why), "{text}");
+        assert!(!text.contains("still being learned"), "{text}");
+        assert_ne!(
+            admit(NetMode::Public, ip("1.1.1.1"), &f, &[]).err().map(|d| d.to_string().contains("NAT64")),
+            Some(true)
+        );
+    }
+
+    /// The S3 review (replacing review round 6, probe-3's far cache): no far verdict is
+    /// remembered: it belongs to the 4-tuple of the probe that found it, which the connection it
+    /// was found for reuses, so every connection is decided afresh, on any facts.
+    #[test]
+    fn s3_no_far_verdict_is_remembered() {
+        use crate::nearhop::FixedProbe;
+        let facts = |uplink: u64| HostFacts::new(vec![], vec![]).on_nat64_uplink(uplink);
+        let a: SocketAddr = "9.9.9.9:443".parse().unwrap();
+        let far = FixedProbe::far();
+        let p = NetPolicy::with_facts(NetMode::Public, facts(0x0f_a12), vec![]).with_near_probe(far.clone());
+        for n in 1..=3 {
+            assert_eq!(p.vet_connection(a), Ok(()));
+            assert_eq!(far.asked.lock().unwrap().len(), n, "asked each time");
+        }
+    }
+
+    /// Review round 6 (the parse lens's suspicion): a mark made between two facts reads (the
+    /// PREF64 listener hears a router naming too many) refuses IPv6 at once, not from the next
+    /// read; facts given by the caller (no uplink) are not affected.
+    #[test]
+    fn r6_an_unheld_mark_counts_before_the_next_facts_read() {
+        let uplink = 0x06_0001_6e71_u64;
+        let f = HostFacts::new(vec![], vec![]).on_nat64_uplink(uplink);
+        let plain = HostFacts::new(vec![], vec![]);
+        let v6 = ip("2606:4700:4700::1111");
+        assert_eq!(admit(NetMode::Public, v6, &f, &[]), Ok(()));
+        crate::nat64::mark_unheld_now(uplink, "test: named too many");
+        assert!(matches!(admit(NetMode::Public, v6, &f, &[]), Err(Denied::Nat64Unheld { .. })));
+        assert_eq!(admit(NetMode::Public, v6, &plain, &[]), Ok(()));
+        assert_eq!(admit(NetMode::Public, ip("1.1.1.1"), &f, &[]), Ok(()));
+    }
+
+    /// Review round 4, cross-2: an address refused because the host just moved to another
+    /// network, whose public address is being learned again, says so, and does not tell the
+    /// operator to set `[egress] public_addresses`; it rests on the facts (judged again once
+    /// they are read again).
+    #[test]
+    fn r4_a_public_address_being_learned_again_says_so() {
+        use crate::facts::RawFacts;
+        use crate::routes::Route;
+        let facts = |relearning: [bool; 2]| {
+            HostFacts::assemble(
+                RawFacts {
+                    interface_prefixes: vec![pfx("192.168.1.0/24")],
+                    interface_addresses: vec![ip("192.168.1.7")],
+                    routes: vec![Route::via(pfx("0.0.0.0/0"), ip("192.168.1.1"), 2)],
+                    public_relearning: relearning,
+                    ..RawFacts::default()
+                },
+                &FactsOptions {
+                    discover_public_addresses: true,
+                    ..FactsOptions::default()
+                },
+            )
+        };
+        let dst = ip("93.184.216.34");
+        let e = admit(NetMode::Public, dst, &facts([true, false]), &[]).unwrap_err();
+        assert_eq!(
+            e,
+            Denied::PublicAddressRelearning {
+                ip: dst,
+                path: EgressPath::Ipv4
+            }
+        );
+        assert!(e.depends_on_facts());
+        let text = e.to_string();
+        assert!(text.contains("being learned again"), "{text}");
+        assert!(!text.contains("public_addresses"), "{text}");
+        // Not being learned again: the advice stands.
+        let e = admit(NetMode::Public, dst, &facts([false, false]), &[]).unwrap_err();
+        assert!(matches!(e, Denied::PublicAddressUnknown { .. }));
+        assert!(e.to_string().contains("public_addresses"), "{e}");
     }
 
     /// Review r1 fetch F1 (PoC `facts`), inverted, on this host's real facts: neighbours in the
@@ -1405,6 +2237,170 @@ mod tests {
             ..offline()
         };
         assert!(NetPolicy::with_options(NetMode::Public, Vec::new(), bad).is_err());
+    }
+
+    /// Review round 2, bypass-1 (every platform since the Linux application): a re-read of the facts that keeps failing (here a
+    /// staged `/etc/resolver` error) refuses every requester connection once the facts are older
+    /// than `FACTS_TTL` and `REFRESH_GRACE`, naming the failure; within that time the last good
+    /// facts are judged with (without their cached kernel verdicts); and once a re-read succeeds
+    /// again, connections are admitted again. Before this change the first facts stayed in force
+    /// for as long as the failure lasted (`r2-bypass/frozen-facts.log`).
+    #[test]
+    fn a_failing_refresh_refuses_after_its_grace_and_recovers() {
+        use std::time::Instant;
+        let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
+        let public = ip("8.8.4.4");
+        if let Err(e) = p.admit(public) {
+            crate::skipped(format!("{public} is not admitted on this host: {e}"));
+            return;
+        }
+        let start = p.facts().gathered_at();
+        assert!(p.facts().cached_verdicts() > 0);
+        let why =
+            "the DNS resolver file /etc/resolver/corp.example: Permission denied (os error 13)";
+        *p.facts.seam.fail.lock().unwrap() = Some(why.into());
+        // Within the grace: judged with the last good facts.
+        std::thread::sleep(FACTS_TTL + Duration::from_millis(200));
+        let f = p.facts();
+        assert_eq!(f.gathered_at(), start);
+        assert!(f.unreadable().is_none());
+        // The kernel's verdicts for the old facts were dropped: asked again.
+        assert_eq!(f.cached_verdicts(), 0);
+        assert_eq!(p.admit(public), Ok(()));
+        // Past it: refused, naming the failure, and so is every other destination.
+        while start.elapsed() < FACTS_TTL + REFRESH_GRACE + Duration::from_millis(50) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let t = Instant::now();
+        let d = p.admit(public).unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(
+            matches!(&d, Denied::FactsUnreadable { why: w, .. } if w.contains("corp.example")),
+            "{d:?}"
+        );
+        assert!(d.to_string().contains("corp.example"), "{d}");
+        assert!(d.depends_on_facts());
+        for other in ["1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(
+                matches!(p.admit(ip(other)), Err(Denied::FactsUnreadable { .. })),
+                "{other}"
+            );
+        }
+        assert!(matches!(
+            p.admit_to("8.8.4.4:443".parse().unwrap()),
+            Err(Denied::FactsUnreadable { .. })
+        ));
+        assert!(matches!(
+            p.vet_connection("8.8.4.4:443".parse().unwrap()),
+            Err(Denied::FactsUnreadable { .. })
+        ));
+        // A caller judging with the facts in force (the witness broker's floor) refuses too.
+        assert!(matches!(
+            admit(NetMode::Public, public, &p.facts(), &[]),
+            Err(Denied::FactsUnreadable { .. })
+        ));
+        // And the operator's warnings can say why (review round 3, cross-6).
+        assert!(p
+            .facts()
+            .unreadable_reason()
+            .is_some_and(|w| w.contains("corp.example")));
+        // The condition clears: the next call reads the facts again and admits.
+        *p.facts.seam.fail.lock().unwrap() = None;
+        std::thread::sleep(FORCED_REFRESH_MIN_AGE);
+        assert_eq!(p.admit(public), Ok(()));
+        assert!(p.facts().unreadable().is_none());
+        assert!(p.facts().unreadable_reason().is_none());
+        assert!(p.facts().gathered_at() > start);
+    }
+
+    /// Review round 2, cross-3 (every platform since the Linux application): stale facts are re-read once however many callers find
+    /// them stale at the same time; the others wait for that re-read and take its facts.
+    #[test]
+    fn stale_facts_are_re_read_once_for_every_caller() {
+        use std::sync::atomic::Ordering;
+        let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
+        *p.facts.seam.delay.lock().unwrap() = Duration::from_millis(300);
+        std::thread::sleep(FACTS_TTL + Duration::from_millis(50));
+        let before = p.facts.seam.gathers.load(Ordering::SeqCst);
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (p, b) = (p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    p.facts().gathered_at()
+                })
+            })
+            .collect();
+        let got: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(p.facts.seam.gathers.load(Ordering::SeqCst) - before, 1);
+        assert!(got.iter().all(|g| *g == got[0]));
+    }
+
+    /// Review round 3, 12(b): a re-read that takes longer than [`REFRESH_WAIT`] (a configuration
+    /// daemon answering just after its 2 s, again and again) holds only the caller that runs it.
+    /// The others wait for it at most [`REFRESH_WAIT`], then judge with the facts in force while
+    /// they are within their grace, and are refused at once after it (round 2 held each of them
+    /// for the whole re-read, every time).
+    #[test]
+    fn a_slow_refresh_holds_only_the_caller_that_runs_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+        let p = NetPolicy::with_options(NetMode::Public, Vec::new(), offline()).unwrap();
+        let public = ip("8.8.4.4");
+        if let Err(e) = p.admit(public) {
+            crate::skipped(format!("{public} is not admitted on this host: {e}"));
+            return;
+        }
+        // Longer than the grace, so callers come past it while the first re-read still runs.
+        *p.facts.seam.delay.lock().unwrap() = Duration::from_millis(3500);
+        *p.facts.seam.fail.lock().unwrap() = Some("staged: configd answered late".into());
+        let before = p.facts.seam.gathers.load(Ordering::SeqCst);
+        let start = Instant::now();
+        static SLOW: AtomicUsize = AtomicUsize::new(0);
+        static ADMITTED_LATE: AtomicUsize = AtomicUsize::new(0);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let mut calls = 0;
+                    while start.elapsed() < Duration::from_secs(7) {
+                        let t = Instant::now();
+                        let f = p.facts();
+                        let r = p.admit(public);
+                        if t.elapsed() > REFRESH_WAIT + Duration::from_millis(400) {
+                            SLOW.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if r.is_ok()
+                            && f.gathered_at().elapsed()
+                                > FACTS_TTL + REFRESH_GRACE + Duration::from_millis(300)
+                        {
+                            ADMITTED_LATE.fetch_add(1, Ordering::SeqCst);
+                        }
+                        calls += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    calls
+                })
+            })
+            .collect();
+        let calls: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        let gathers = p.facts.seam.gathers.load(Ordering::SeqCst) - before;
+        let slow = SLOW.load(Ordering::SeqCst);
+        eprintln!("{calls} calls, {gathers} re-reads, {slow} calls slower than the wait");
+        // Each re-read holds the caller that runs it (and admit's forced re-read can be a
+        // second); every other caller is answered within the wait.
+        assert!(
+            slow <= 2 * gathers,
+            "{slow} slow calls for {gathers} re-reads"
+        );
+        assert!(calls > 100, "{calls}");
+        assert_eq!(ADMITTED_LATE.load(Ordering::SeqCst), 0);
+        // And past the grace, refused.
+        assert!(matches!(
+            p.admit(public),
+            Err(Denied::FactsUnreadable { .. })
+        ));
     }
 
     /// Review r2 R2-NG-1: local routes that hold every public address the host routes stop a

@@ -82,6 +82,9 @@ fn main() -> ExitCode {
     }
     // SAFETY: fd 4 is open (checked above) and nothing else in this process owns it.
     let connector = unsafe { OwnedFd::from_raw_fd(BROKER_CONNECTOR_FD) };
+    // The facts are read once, here, and `restrict_self` refuses a second thread: netguard must
+    // not start its PREF64 listener, whose thread outlives the read (the miner keeps one).
+    zkminer_netguard::nat64::without_listener();
     match HostFacts::gather(&config, &RealEgress) {
         Ok(h) => {
             if let Err(e) = config.validate_host(&h) {

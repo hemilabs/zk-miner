@@ -38,6 +38,23 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.unwrap()
 }
 
+/// A test that cannot check what it is for here says so; under `ZKMINER_CI_STRICT=1` (CI's
+/// callers job) it fails instead (review round 5, cross-4), as netguard's own tests do.
+fn skipped(why: &str) {
+    // A reason that starts with a token ZKMINER_CI_ALLOW_SKIP names exactly ("[ipv6] ...": a CI
+    // host without IPv6) is allowed, as in netguard's own tests.
+    let token = why.strip_prefix('[').and_then(|r| r.split_once(']')).map(|(t, _)| t.trim().to_string());
+    let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .any(|a| token.as_deref().is_some_and(|t| !t.is_empty() && a.trim() == t));
+    assert!(
+        allowed || std::env::var("ZKMINER_CI_STRICT").as_deref() != Ok("1"),
+        "SKIPPED under ZKMINER_CI_STRICT=1: {why}"
+    );
+    eprintln!("SKIPPED: {why}");
+}
+
 fn req(id: u64, endpoint: u32, port: u16) -> Request {
     Request { id, endpoint, role: Role::EvmRpc, port }
 }
@@ -336,6 +353,68 @@ async fn a_near_destination_is_refused_before_connecting() {
     }
 }
 
+/// Review round 4, cross-6: the connection, once made, is checked again before the broker gets
+/// it (`recheck_connected`): a route that is the default path when the address is vetted and
+/// gone once connected closes it (no socket handed over); one that stays hands it over. A real
+/// public peer (1.1.1.1:443; skipped where unreachable), a staged route oracle and probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_is_checked_again_once_made() {
+    use zkminer_netguard::routes::{KernelAnswer, Route, RouteOracle};
+    #[derive(Debug)]
+    struct Flip {
+        admitted: usize,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+    impl RouteOracle for Flip {
+        fn route_to(&self, _: IpAddr, dport: Option<u16>) -> io::Result<KernelAnswer> {
+            let default = Route::via("0.0.0.0/0".parse().unwrap(), "192.168.1.1".parse().unwrap(), 2);
+            if dport.is_none() {
+                return Ok(KernelAnswer::Entry(vec![default]));
+            }
+            let n = self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(if n < self.admitted { KernelAnswer::Entry(vec![default]) } else { KernelAnswer::NoRoute })
+        }
+    }
+    let peer: SocketAddr = "1.1.1.1:443".parse().unwrap();
+    if std::net::TcpStream::connect_timeout(&peer, Duration::from_secs(5)).is_err() {
+        skipped(&format!("{peer} unreachable here"));
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://1.1.1.1:443", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    let deny = Connector::deny_for(&cfg, &[], &[]);
+    for (admitted, connected) in [(1, false), (2, true)] {
+        let facts = zkminer_netguard::HostFacts::assemble(
+            zkminer_netguard::RawFacts {
+                interface_prefixes: vec!["192.168.1.0/24".parse().unwrap()],
+                interface_addresses: vec!["192.168.1.33".parse().unwrap()],
+                routes: vec![Route::via("0.0.0.0/0".parse().unwrap(), "192.168.1.1".parse().unwrap(), 2)],
+                ..Default::default()
+            },
+            &zkminer_netguard::FactsOptions {
+                discover_public_addresses: false,
+                public_addresses: vec!["198.51.99.7".parse().unwrap()],
+                ..Default::default()
+            },
+        )
+        .with_route_oracle(Arc::new(Flip { admitted, asked: Default::default() }));
+        let floor = NetPolicy::with_facts(NetMode::Public, facts, deny.clone()).with_near_probe(zkminer_netguard::FixedProbe::far());
+        let c = Connector::with_floor(&cfg, vec![], floor).unwrap();
+        let (b, s) = session(&c);
+        let (resp, fd) = blocking(move || {
+            let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+            drop(b);
+            r
+        })
+        .await;
+        assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "connected once");
+        assert_eq!(resp.status == Status::Connected, connected, "{admitted}: {resp:?}");
+        assert_eq!(fd.is_some(), connected, "{admitted}");
+        assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+    }
+}
+
 /// A listener that accepts every connection on a thread and keeps the accepted streams, so the
 /// connector's connects complete.
 struct Endpoint {
@@ -470,7 +549,10 @@ async fn a_broker_that_shuts_its_reading_side_is_cut_off() {
             b.shutdown(std::net::Shutdown::Read).unwrap();
             let mut w = &b;
             w.write_all(&req(1, 0, port).encode()).unwrap();
-            std::thread::sleep(Duration::from_millis(300));
+            // Time for the first answer's write to fail (the connector then serves nothing more).
+            // Review round 6: 300 ms was too little under Rosetta with the whole suite running
+            // (the first request answered after 290 ms: fix-r6/vm-gate-x86-broker-run*.log).
+            std::thread::sleep(Duration::from_millis(1000));
             if misuse_after {
                 // More requests for the endpoint, then misuse past the bound.
                 for id in 2..7 {
@@ -628,4 +710,161 @@ async fn a_cancelled_read_keeps_the_partial_frame() {
     }
     drop(theirs);
     assert!(matches!(frames.read(&ours).await, Ok(None)));
+}
+
+/// A probe that takes `delay` and then finds the destination far (a slow path, review round 5,
+/// probe-1).
+#[derive(Debug)]
+struct SlowFar {
+    delay: Duration,
+    asked: Mutex<Vec<SocketAddr>>,
+}
+
+impl zkminer_netguard::NearProbe for SlowFar {
+    #[allow(clippy::too_many_arguments)]
+    fn round(
+        &self,
+        round: u32,
+        addr: SocketAddr,
+        hops: u8,
+        extra: u8,
+        pin: &zkminer_netguard::nearhop::Pin,
+        wait: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<zkminer_netguard::nearhop::Obs>, String> {
+        lock(&self.asked).push(addr);
+        std::thread::sleep(self.delay);
+        zkminer_netguard::FixedProbe::far().round(round, addr, hops, extra, pin, wait, deadline)
+    }
+}
+
+/// Review round 5, probe-1: a near-hop check that takes 3.6 s (a silent hop at the limit) no
+/// longer outlives the per-address share of the connect time (5 s / 2 addresses): the check runs
+/// within the request's time, the share bounds only the TCP connect, so the first of two far
+/// addresses is connected to. Real public peers (1.1.1.1 and 1.0.0.1 on 443; skipped where
+/// unreachable), resolved by a test DNS server.
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_a_slow_near_hop_check_does_not_lose_its_address() {
+    use crate::testkit::TestDns;
+    let peers: [SocketAddr; 2] = ["1.1.1.1:443".parse().unwrap(), "1.0.0.1:443".parse().unwrap()];
+    if peers.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
+        skipped(&format!("{peers:?} unreachable here"));
+        return;
+    }
+    let dns = TestDns::start(&[("rpc.example.com", &["1.1.1.1", "1.0.0.1"])]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://rpc.example.com:443", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    assert_eq!(cfg.timeouts.connect(), Duration::from_secs(5));
+    let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
+    let probe = Arc::new(SlowFar { delay: Duration::from_millis(3600), asked: Mutex::new(Vec::new()) });
+    let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
+    let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
+    let (b, s) = session(&c);
+    let t = std::time::Instant::now();
+    let (resp, fd) = blocking(move || {
+        let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+        drop(b);
+        r
+    })
+    .await;
+    eprintln!("{resp:?} after {:?}; probed {:?}", t.elapsed(), lock(&probe.asked));
+    assert_eq!(resp.status, Status::Connected, "{resp:?}");
+    assert!(fd.is_some());
+    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+}
+
+/// Review round 5, bypass-5: an IPv4-mapped address is connected to on an IPv4 socket, from the
+/// IPv4 source the check vetted (an IPv6 socket bound to it failed with EINVAL).
+#[tokio::test(flavor = "multi_thread")]
+async fn r5_an_ipv4_mapped_address_is_connected_as_ipv4() {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
+    let vetted = zkminer_netguard::Vetted::staged(mapped, mapped, Some("127.0.0.1".parse().unwrap()), None);
+    let fd = connect_tcp(mapped, Some(&vetted)).await.expect("connected");
+    let stream = std::net::TcpStream::from(fd);
+    assert_eq!(stream.peer_addr().unwrap(), format!("127.0.0.1:{port}").parse::<SocketAddr>().unwrap());
+    assert!(stream.local_addr().unwrap().is_ipv4());
+    assert_eq!(stream.local_addr().unwrap().ip(), "127.0.0.1".parse::<IpAddr>().unwrap(), "the vetted source");
+    let fd = connect_tcp(mapped, None).await.expect("connected without a source too");
+    assert!(std::net::TcpStream::from(fd).local_addr().unwrap().is_ipv4());
+}
+
+/// A probe on a host one of whose families is blackholed: every round of probes of an address of
+/// that family takes `delay` (within the deadline) and finds no evidence; the other family is far.
+#[derive(Debug)]
+struct Blackholed {
+    v6: bool,
+    delay: Duration,
+    asked: Mutex<Vec<SocketAddr>>,
+}
+
+impl zkminer_netguard::NearProbe for Blackholed {
+    #[allow(clippy::too_many_arguments)]
+    fn round(
+        &self,
+        round: u32,
+        addr: SocketAddr,
+        hops: u8,
+        extra: u8,
+        pin: &zkminer_netguard::nearhop::Pin,
+        wait: Duration,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<zkminer_netguard::nearhop::Obs>, String> {
+        if round == 0 {
+            lock(&self.asked).push(addr);
+        }
+        if addr.is_ipv6() == self.v6 {
+            std::thread::sleep(self.delay.min(deadline.saturating_duration_since(std::time::Instant::now())));
+            return zkminer_netguard::FixedProbe::answering(zkminer_netguard::ProbeOutcome::TimedOut)
+                .round(round, addr, hops, extra, pin, wait, deadline);
+        }
+        zkminer_netguard::FixedProbe::far().round(round, addr, hops, extra, pin, wait, deadline)
+    }
+}
+
+/// Review round 6, cross-6 (a regression against pr/37): the connector vetted an endpoint's
+/// addresses one after another, each check given the whole 17 s budget, so a blackholed family
+/// whose addresses came first (~13.5 s a check) left the other no time. The resolver answers A
+/// first, so the staged case is a blackholed IPv4 path with IPv6 working (the reviewer's IPv6
+/// case is the same with the families swapped). The families are vetted at once now (the other
+/// FAMILY_DELAY later), and a family stops after MAX_UNANSWERED checks that could not tell.
+/// Real public peers (skipped where unreachable: `[ipv6]` where this host has no IPv6).
+#[tokio::test(flavor = "multi_thread")]
+async fn r6_a_blackholed_family_does_not_starve_the_other() {
+    use crate::testkit::TestDns;
+    let v6: [SocketAddr; 2] = ["[2606:4700:4700::1111]:443".parse().unwrap(), "[2606:4700:4700::1001]:443".parse().unwrap()];
+    if v6.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_secs(5)).is_err()) {
+        skipped(&format!("[ipv6] {v6:?} unreachable here"));
+        return;
+    }
+    let dns = TestDns::start(&[(
+        "rpc.example.com",
+        &["1.1.1.1", "1.0.0.1", "1.1.1.2", "2606:4700:4700::1111", "2606:4700:4700::1001"],
+    )])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let text = evm("p", "https://rpc.example.com:443", "");
+    let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
+    let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
+    let probe = Arc::new(Blackholed { v6: false, delay: Duration::from_millis(13_500), asked: Mutex::new(Vec::new()) });
+    let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
+    let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
+    let (b, s) = session(&c);
+    let t = std::time::Instant::now();
+    let (resp, fd) = blocking(move || {
+        let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+        drop(b);
+        r
+    })
+    .await;
+    let took = t.elapsed();
+    eprintln!("{resp:?} after {took:?}; probed {:?}", lock(&probe.asked));
+    assert_eq!(resp.status, Status::Connected, "{resp:?}");
+    assert!(resp.peer.is_some_and(|p| p.is_ipv6()), "{resp:?}");
+    assert!(fd.is_some());
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(s.await.unwrap(), SessionEnd::Closed);
 }

@@ -442,6 +442,23 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
     let mut s = state.write().await;
     let gpu_count = suite.device_benchmarks.len();
 
+    // W10-BENCH: a worker failed. Keep the previous results, save nothing, and say what failed and
+    // what to try (the progress view already marked the card failed).
+    if suite.failed() {
+        report_unusable_benchmark(&mut s, &suite);
+        s.benchmark_running = false;
+        s.benchmark_tracker = None;
+        s.benchmark_device_in_progress = None;
+        return;
+    }
+
+    // W10-BENCH round 1: slots that were down from the start (declined, or never started) do not
+    // fail a run in which another card measured; say which.
+    for line in benchmark::describe_not_benchmarked(&suite.not_benchmarked) {
+        tracing::warn!("{line}");
+        s.add_log(LogLevel::Warn, line);
+    }
+
     // A run that produced no GPU rows must not overwrite ones that had them, and must never be
     // saved. The suite arrives from `spawn_blocking(..).await.unwrap_or_default()`, so a panicked
     // task yields `BenchmarkSuite::default()` — and a wedged driver or VRAM starvation yields a
@@ -526,6 +543,29 @@ async fn run_streaming_gpu_benchmark(state: SharedState) {
     s.benchmark_device_in_progress = None;
 }
 
+/// Logs why a benchmark run is not used: the failed workers with their errors and what to try, or
+/// that it was simulated (W10-BENCH).
+fn report_unusable_benchmark(
+    s: &mut crate::state::MinerState,
+    suite: &zkminer_prover::benchmark::BenchmarkSuite,
+) {
+    if suite.failed() {
+        let message = "Benchmark FAILED: previous results kept, nothing saved";
+        tracing::error!("{message}");
+        s.add_log(LogLevel::Error, message);
+        for line in zkminer_prover::benchmark::describe_failures(&suite.failures) {
+            tracing::error!("{line}");
+            s.add_log(LogLevel::Error, line);
+        }
+    } else {
+        let message =
+            "No prover worker answered: the benchmark would be SIMULATED, so nothing was \
+                       measured or saved. Install a prover worker and press [b] again";
+        tracing::warn!("{message}");
+        s.add_log(LogLevel::Warn, message);
+    }
+}
+
 /// Benchmarks the GPUs, in the background, if the saved results don't cover every card and prover
 /// this miner started. `show` opens the Benchmark screen for it. Call before the miner can claim:
 /// `startup_benchmark_pending` holds claims back until the cards are free.
@@ -586,6 +626,19 @@ async fn run_full_benchmark(state: SharedState) {
 
     {
         let mut s = state.write().await;
+        // W10-BENCH: a failed run, or a simulated one (no worker at all), is reported and dropped:
+        // never saved, never shown as the results, never priced from.
+        if suite.failed() || suite.is_simulated() {
+            report_unusable_benchmark(&mut s, &suite);
+            s.benchmark_running = false;
+            s.benchmark_tracker = None;
+            s.benchmark_device_in_progress = None;
+            return;
+        }
+        for line in benchmark::describe_not_benchmarked(&suite.not_benchmarked) {
+            tracing::warn!("{line}");
+            s.add_log(LogLevel::Warn, line);
+        }
         benchmark::save_benchmark(&suite);
         s.add_log(
             LogLevel::Success,
@@ -903,4 +956,70 @@ fn draw(f: &mut Frame, state: &MinerState) {
     let status = Paragraph::new(Line::from(left_spans)).style(theme::status_bar());
 
     f.render_widget(status, chunks[2]);
+}
+
+/// W10-BENCH: what the Benchmark screen's log says about a run it does not use.
+#[cfg(test)]
+mod unusable_benchmark_tests {
+    use super::*;
+
+    fn logged(s: &MinerState) -> Vec<(LogLevel, String)> {
+        s.activity_log
+            .iter()
+            .map(|e| (e.level, e.message.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_run_names_the_worker_its_error_and_what_to_try() {
+        let state = crate::state::new_shared_state();
+        let mut s = state.try_write().unwrap();
+        let suite = zkminer_prover::benchmark::BenchmarkSuite {
+            failures: vec![zkminer_prover::dispatcher::SlotBenchmarkFailure {
+                slot_key: "risc0:metal:0".to_string(),
+                gpu_name: Some("Apple M5 Max".to_string()),
+                gpu_tag: "metal".to_string(),
+                error: "warm-up of risc0:metal:0 failed: stepAccumA".to_string(),
+            }],
+            ..Default::default()
+        };
+        report_unusable_benchmark(&mut s, &suite);
+        let log = logged(&s);
+        assert!(log.iter().all(|(l, _)| *l == LogLevel::Error), "{log:?}");
+        let text: Vec<&str> = log.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            text[0].contains("FAILED") && text[0].contains("nothing saved"),
+            "{text:?}"
+        );
+        assert!(text
+            .iter()
+            .any(|m| m.starts_with("risc0:metal:0") && m.contains("stepAccumA")));
+        assert!(text.iter().any(|m| m.contains("tools/macos-smoke.sh")));
+        assert!(
+            s.benchmark_results.is_none(),
+            "nothing replaced the results"
+        );
+    }
+
+    #[test]
+    fn a_simulated_run_is_called_simulated() {
+        let state = crate::state::new_shared_state();
+        let mut s = state.try_write().unwrap();
+        let suite = zkminer_prover::benchmark::BenchmarkSuite {
+            results: vec![zkminer_prover::benchmark::BenchmarkResult {
+                program_name: "sha256-chain".to_string(),
+                prover_backend: "simulated".to_string(),
+                cycles: 1,
+                duration: Duration::from_millis(1),
+                throughput: 1000.0,
+                weight: 0.2,
+                precompile: true,
+            }],
+            ..Default::default()
+        };
+        report_unusable_benchmark(&mut s, &suite);
+        let log = logged(&s);
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].1.contains("SIMULATED") && log[0].1.contains("nothing was"));
+    }
 }

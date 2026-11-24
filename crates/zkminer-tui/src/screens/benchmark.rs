@@ -1135,6 +1135,7 @@ mod tests {
                     cycles: 50_000_000,
                     stark_secs: 5.0 + i as f64,
                     wrap_secs: Some(1.0),
+                    power_reduced: None,
                 })
                 .collect(),
             device_id: format!("gpu{i}"),

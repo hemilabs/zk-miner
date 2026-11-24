@@ -1022,6 +1022,7 @@ mod benchmark_tracker_tests {
                 weight: 0.1,
                 precompile: false,
                 wrap_secs: None,
+                power_state: None,
             },
             program_index,
             total_programs: 6,

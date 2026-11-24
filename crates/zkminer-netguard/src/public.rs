@@ -138,6 +138,10 @@ pub struct Learned {
     pub confirmed: Vec<IpAddr>,
     /// The NAT64 prefixes through which an IPv4 address was confirmed (an IPv6-only host's).
     pub via_nat64: Vec<Prefix>,
+    /// [IPv4, IPv6]: the family's address was confirmed on another uplink, recently, and is
+    /// being learned again on this one ([`learned_on`]; review round 4, cross-2: such a refusal
+    /// says so, not that `[egress] public_addresses` should be set).
+    pub relearning: [bool; 2],
 }
 
 /// One family's last good answer.
@@ -155,8 +159,14 @@ struct State {
     confirmed_at: [Option<Instant>; 2],
     /// Per family: the uplink its answer was learned on ([`learned_on`]).
     uplink_of: [Option<u64>; 2],
-    /// The uplink the latest caller of [`learned_on`] is on.
-    uplink: Option<u64>,
+    /// The uplink the latest caller of [`learned_on`] is on, per family (review round 6, cross-4:
+    /// a spoofed IPv4 gateway's link-layer address made both families learn again).
+    uplink: Option<[u64; 2]>,
+    /// Per family: the answers confirmed on the last few uplinks, with when ([`MAX_RECENT`];
+    /// review round 6, cross-4: a host whose gateway's link-layer address flaps between two
+    /// values, a spoofer's and the real one, learned its address again on every flip, and was
+    /// refused all along).
+    recent: [Vec<(u64, FamilyAnswer, Instant)>; 2],
     learned_at: Option<Instant>,
     attempted_at: Option<Instant>,
     running: bool,
@@ -182,6 +192,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     confirmed_at: [None, None],
     uplink_of: [None, None],
     uplink: None,
+    recent: [Vec::new(), Vec::new()],
     learned_at: None,
     attempted_at: None,
     running: false,
@@ -214,7 +225,50 @@ pub fn learned() -> Learned {
 /// until it has, nothing learned on another uplink counts as confirmed: a new default gateway or a
 /// VPN that came up can mean a new public address.
 pub fn learned_on(uplink: u64) -> Learned {
-    learned_inner(Some(uplink))
+    learned_inner(Some([uplink, uplink]))
+}
+
+/// [`learned_on`] with each family's uplink of its own (`[IPv4, IPv6]`: Linux tells them apart by
+/// each family's gateways, review round 6, cross-4).
+pub fn learned_on_families(uplinks: [u64; 2]) -> Learned {
+    learned_inner(Some(uplinks))
+}
+
+/// Most uplinks per family whose confirmed answers are kept ([`State::recent`]).
+const MAX_RECENT: usize = 4;
+
+/// Back on an uplink whose answer was confirmed there within [`CONFIRMATION_LIFETIME`], that
+/// answer stands again (it was learned on that same network). Per family; whether every family
+/// whose uplink changed was restored.
+#[allow(clippy::needless_range_loop)]
+fn restore_recent(s: &mut State, uplinks: [u64; 2], now: Instant) -> bool {
+    let mut all = true;
+    for i in 0..2 {
+        if s.uplink_of[i] == Some(uplinks[i]) {
+            continue;
+        }
+        match s.recent[i]
+            .iter()
+            .find(|(u, _, at)| *u == uplinks[i] && now.saturating_duration_since(*at) < CONFIRMATION_LIFETIME)
+        {
+            Some((u, answer, at)) => {
+                s.families[i] = answer.clone();
+                s.confirmed_at[i] = Some(*at);
+                s.uplink_of[i] = Some(*u);
+            }
+            None => all = false,
+        }
+    }
+    all
+}
+
+/// Notes family `i`'s answer confirmed on `uplink` at `at` in [`State::recent`].
+fn remember_recent(s: &mut State, i: usize, uplink: u64, answer: &FamilyAnswer, at: Instant) {
+    s.recent[i].retain(|(u, _, _)| *u != uplink);
+    s.recent[i].push((uplink, answer.clone(), at));
+    if s.recent[i].len() > MAX_RECENT {
+        s.recent[i].remove(0);
+    }
 }
 
 fn spawn_discovery(s: &mut State) {
@@ -229,18 +283,24 @@ fn spawn_discovery(s: &mut State) {
     }
 }
 
-fn learned_inner(uplink: Option<u64>) -> Learned {
+fn learned_inner(uplink: Option<[u64; 2]>) -> Learned {
     let mut s = state();
-    let changed = uplink.is_some() && uplink != s.uplink && s.uplink.is_some();
-    if uplink.is_some() {
+    let mut changed = uplink.is_some() && uplink != s.uplink && s.uplink.is_some();
+    if let Some(ups) = uplink {
         if s.uplink.is_none() {
             // The first caller to name the uplink: what was learned before (by a caller that
             // named none) was learned on it, as far as anyone can tell.
-            for u in s.uplink_of.iter_mut().filter(|u| u.is_none()) {
-                *u = uplink;
+            for (i, u) in s.uplink_of.iter_mut().enumerate() {
+                if u.is_none() {
+                    *u = Some(ups[i]);
+                }
             }
         }
         s.uplink = uplink;
+        if changed && restore_recent(&mut s, ups, Instant::now()) {
+            tracing::debug!("network guard: back on an uplink whose public addresses were confirmed");
+            changed = false;
+        }
     }
     if s.attempted_at.is_none() && !s.running {
         // The first call: discover on this thread.
@@ -282,12 +342,29 @@ fn learned_inner(uplink: Option<u64>) -> Learned {
     let mut out = Learned::default();
     for (i, f) in s.families.iter().enumerate() {
         out.addresses.extend(&f.addresses);
-        if still_confirmed(s.confirmed_at[i], s.uplink_of[i], s.uplink, now) {
+        if still_confirmed(s.confirmed_at[i], s.uplink_of[i], s.uplink.map(|u| u[i]), now) {
             out.confirmed.extend(&f.confirmed);
             out.via_nat64.extend(&f.via_nat64);
+        } else {
+            out.relearning[i] =
+                relearning(s.confirmed_at[i], s.uplink_of[i], uplink.map(|u| u[i]), now);
         }
     }
     out
+}
+
+/// Whether a family whose confirmation does not count on `uplink` ([`still_confirmed`]) is being
+/// learned again: confirmed within [`CONFIRMATION_LIFETIME`], on another uplink than the one the
+/// caller names.
+fn relearning(
+    confirmed_at: Option<Instant>,
+    learned_on: Option<u64>,
+    uplink: Option<u64>,
+    now: Instant,
+) -> bool {
+    uplink.is_some()
+        && learned_on != uplink
+        && still_confirmed(confirmed_at, None, None, now)
 }
 
 /// Whether a family's confirmation still counts at `now`: confirmed within
@@ -309,7 +386,7 @@ fn still_confirmed(
 /// over it), or why every reflector failed.
 type FamilyFound = Result<Option<FamilyAnswer>, String>;
 
-fn learn((v4, v6): (FamilyFound, FamilyFound), uplink: Option<u64>) {
+fn learn((v4, v6): (FamilyFound, FamilyFound), uplink: Option<[u64; 2]>) {
     let mut guard = state();
     let s = &mut *guard;
     s.running = false;
@@ -340,14 +417,17 @@ fn learn((v4, v6): (FamilyFound, FamilyFound), uplink: Option<u64>) {
                     }
                 }
                 s.confirmed_at[i] = (!answer.confirmed.is_empty()).then_some(now);
-                s.uplink_of[i] = uplink;
+                s.uplink_of[i] = uplink.map(|u| u[i]);
+                if let (Some(u), false) = (uplink, answer.confirmed.is_empty()) {
+                    remember_recent(s, i, u[i], &answer, now);
+                }
                 s.families[i] = answer;
                 s.warned[i] = false;
                 any = true;
             }
             Ok(None) => {
                 tracing::debug!("network guard: no {family} route, so no public {family} address");
-                s.uplink_of[i] = uplink;
+                s.uplink_of[i] = uplink.map(|u| u[i]);
                 any = true;
             }
             Err(e) if !s.warned[i] => {
@@ -607,6 +687,11 @@ fn discover() -> (FamilyFound, FamilyFound) {
             let want_v6 = fam == 1;
             let got: Option<io::Result<IpAddr>> = match &mut q.pending {
                 Pending::Dns { sock, id, .. } => loop {
+                    // Review round 6 (the parse lens's suspicion): a flood of datagrams that are
+                    // no answer must not keep the loop past its deadline.
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
                     match sock.recv(&mut buf) {
                         Ok(n) => match parse_answer(&buf[..n], *id, want_v6) {
                             Some(r) => break Some(r),
@@ -666,7 +751,10 @@ fn discover() -> (FamilyFound, FamilyFound) {
             );
         }
     }
+    #[cfg(not(target_os = "macos"))]
     let dns_servers = crate::system_resolvers();
+    #[cfg(target_os = "macos")]
+    let dns_servers = dns_exclusion(crate::facts::read_system_resolvers(), &found, &mut vetoed);
     let result = |fam: usize, family: &str| -> FamilyFound {
         if !found[fam].is_empty() {
             Ok(Some(agree(family, &found[fam], &dns_servers, &vetoed[fam])))
@@ -677,6 +765,38 @@ fn discover() -> (FamilyFound, FamilyFound) {
         }
     };
     (result(0, "IPv4"), result(1, "IPv6"))
+}
+
+/// macOS (review round 3, cross-5): the DNS servers whose answers confirm nothing ([`agree`]),
+/// from `servers`. When they cannot be read (`servers` is an error), no DNS reflector answer
+/// confirms anything this round, since one could name a DNS server of this host (a site resolver
+/// that answers for the reflectors' names): every path an answer of `found` came over is vetoed in
+/// `vetoed`, as when the HTTPS reflector's TLS failed, so only the HTTPS reflector confirms.
+/// (Round 2 read an unreadable DNS configuration as no servers at all.)
+#[cfg(target_os = "macos")]
+fn dns_exclusion(
+    servers: io::Result<Vec<IpAddr>>,
+    found: &[Vec<Answer>; 2],
+    vetoed: &mut [Vec<Option<Prefix>>; 2],
+) -> Vec<IpAddr> {
+    match servers {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "network guard: this host's DNS servers could not be read ({e}), so no DNS \
+                 reflector answer confirms its public address this round (only the HTTPS \
+                 reflector's)"
+            );
+            for (fam, answers) in found.iter().enumerate() {
+                for a in answers {
+                    if !vetoed[fam].contains(&a.via) {
+                        vetoed[fam].push(a.via);
+                    }
+                }
+            }
+            Vec::new()
+        }
+    }
 }
 
 /// Whether `p` is an HTTPS reflector query.
@@ -1281,6 +1401,86 @@ mod tests {
         assert!(r.confirmed.is_empty() && r.via_nat64.is_empty());
     }
 
+    /// macOS, review round 3, cross-5: a round in which this host's DNS servers cannot be read
+    /// confirms nothing from DNS reflectors (any could name a DNS server of this host), only from
+    /// the HTTPS reflector; when they can be read, an answer naming one of them is left out as
+    /// before.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_answers_confirm_nothing_without_the_dns_servers() {
+        let a = |s: &str| s.parse::<IpAddr>().unwrap();
+        let p: Prefix = "64:ff9b::/96".parse().unwrap();
+        let through = |x: Answer| Answer { via: Some(p), ..x };
+        let v4 = vec![
+            dns(G, "81.2.69.160"),
+            dns(C, "81.2.69.160"),
+            through(dns(G, "81.2.69.161")),
+            through(dns(C, "81.2.69.161")),
+        ];
+        let found = [v4, vec![dns(G, "2001:db8::7"), dns(C, "2001:db8::7")]];
+        let mut vetoed: [Vec<Option<Prefix>>; 2] = [Vec::new(), Vec::new()];
+        let servers = dns_exclusion(Err(io::Error::other("staged")), &found, &mut vetoed);
+        assert!(servers.is_empty());
+        for (fam, family) in [(0, "IPv4"), (1, "IPv6")] {
+            let r = agree(family, &found[fam], &servers, &vetoed[fam]);
+            assert!(r.confirmed.is_empty(), "{family}: {r:?}");
+            assert!(r.via_nat64.is_empty());
+            assert!(!r.addresses.is_empty(), "still refused as this host's");
+        }
+        // The HTTPS reflector's answer still confirms.
+        let with_tls = [found[0].clone(), vec![tls("81.2.69.160")]].concat();
+        let r = agree("IPv4", &with_tls, &servers, &vetoed[0]);
+        assert_eq!(r.confirmed, vec![a("81.2.69.160")]);
+        // Read, the servers are left out of the agreement and nothing is vetoed.
+        let mut vetoed: [Vec<Option<Prefix>>; 2] = [Vec::new(), Vec::new()];
+        let servers = dns_exclusion(Ok(vec![a("81.2.69.160")]), &found, &mut vetoed);
+        assert_eq!(vetoed, [Vec::new(), Vec::new()]);
+        let r = agree("IPv4", &found[0], &servers, &vetoed[0]);
+        assert_eq!(r.confirmed, vec![a("81.2.69.161")]);
+    }
+
+    /// Review round 6, cross-4: back on an uplink whose answer was confirmed there within
+    /// CONFIRMATION_LIFETIME, that answer stands again, per family (a flap between a spoofed
+    /// gateway address and the real one no longer relearns on every flip); another uplink, or
+    /// one confirmed too long ago, is learned again.
+    #[test]
+    fn r6_a_recent_uplinks_answer_stands_again() {
+        let now = Instant::now();
+        let answer = |a: &str| FamilyAnswer {
+            addresses: vec![a.parse().unwrap()],
+            confirmed: vec![a.parse().unwrap()],
+            via_nat64: Vec::new(),
+        };
+        let mut s = State {
+            families: [answer("203.0.113.9"), FamilyAnswer::default()],
+            confirmed_at: [Some(now), None],
+            uplink_of: [Some(1), Some(10)],
+            uplink: Some([1, 10]),
+            recent: [Vec::new(), Vec::new()],
+            learned_at: None,
+            attempted_at: None,
+            running: false,
+            first_done: true,
+            warned: [false; 2],
+        };
+        remember_recent(&mut s, 0, 1, &answer("203.0.113.9"), now);
+        // The IPv4 side flips to an unsettled uplink 2, learns there, and flips back.
+        s.families[0] = answer("203.0.113.9");
+        s.uplink_of[0] = Some(2);
+        remember_recent(&mut s, 0, 2, &answer("203.0.113.9"), now);
+        assert!(restore_recent(&mut s, [1, 10], now));
+        assert_eq!(s.uplink_of, [Some(1), Some(10)]);
+        assert!(still_confirmed(s.confirmed_at[0], s.uplink_of[0], Some(1), now));
+        assert!(restore_recent(&mut s, [2, 10], now), "both are recent");
+        assert!(!restore_recent(&mut s, [3, 10], now), "a new one is learned");
+        let later = now + CONFIRMATION_LIFETIME;
+        assert!(!restore_recent(&mut s, [1, 10], later), "confirmed too long ago");
+        for u in 0..10 {
+            remember_recent(&mut s, 0, 100 + u, &answer("203.0.113.9"), now);
+        }
+        assert_eq!(s.recent[0].len(), MAX_RECENT);
+    }
+
     /// A confirmation counts for [`CONFIRMATION_LIFETIME`], and only on the uplink it was made
     /// on.
     #[test]
@@ -1307,6 +1507,14 @@ mod tests {
             "a caller that names no uplink"
         );
         assert_eq!(CONFIRMATION_LIFETIME, DISCOVERY_TTL * 2);
+        // Review round 4, cross-2: confirmed recently on another uplink is being learned again
+        // (its refusal says so); expired, never confirmed, or a caller naming no uplink is not.
+        assert!(relearning(ago(10), Some(1), Some(2), now));
+        assert!(relearning(ago(10), None, Some(2), now));
+        assert!(!relearning(ago(10), Some(2), Some(2), now));
+        assert!(!relearning(ago(600), Some(1), Some(2), now));
+        assert!(!relearning(None, Some(1), Some(2), now));
+        assert!(!relearning(ago(10), Some(1), None, now));
     }
 
     /// An HTTPS reflector query that connects, to something that does not speak TLS for

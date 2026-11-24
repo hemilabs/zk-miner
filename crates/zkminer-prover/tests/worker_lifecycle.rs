@@ -31,6 +31,53 @@ fn mock_env(hang_on: &str, crash_on: &str) -> HashMap<String, String> {
     env
 }
 
+// ---- risc0 version skew (P31-19) ----
+
+/// The host prefixes its own risc0's Groth16 seal selector to every risc0 proof, so a worker built on
+/// another risc0 (a stale 3.0 worker in ~/.zkminer/provers under a 3.1 host) or on another protocol
+/// version must fail the handshake: never advertised, so no job is claimed for it.
+#[test]
+fn a_worker_on_another_risc0_or_protocol_is_refused_at_the_handshake() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(5)));
+    let skewed = |sdk: &str, proto: Option<u32>| {
+        let mut env = mock_env("", "");
+        env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+        env.insert("MOCK_SDK_VERSION".to_string(), sdk.to_string());
+        if let Some(p) = proto {
+            env.insert("MOCK_PROTOCOL_VERSION".to_string(), p.to_string());
+        }
+        env
+    };
+    let this = format!(
+        "risc0-zkvm {}.0",
+        zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+    );
+    let err = pool
+        .insert_test_worker(
+            "risc0:a",
+            "risc0",
+            mock_worker_path(),
+            skewed("risc0-zkvm 3.0.6", None),
+        )
+        .expect_err("a risc0 3.0 worker must be refused");
+    assert!(format!("{err:#}").contains("risc0-zkvm 3.0.6"), "{err:#}");
+    let old = zkminer_prover_protocol::PROTOCOL_VERSION - 1;
+    let err = pool
+        .insert_test_worker(
+            "risc0:b",
+            "risc0",
+            mock_worker_path(),
+            skewed(&this, Some(old)),
+        )
+        .expect_err("a previous-protocol worker must be refused");
+    assert!(
+        format!("{err:#}").contains("Protocol version mismatch"),
+        "{err:#}"
+    );
+    pool.insert_test_worker("risc0:c", "risc0", mock_worker_path(), skewed(&this, None))
+        .expect("this build's risc0 on this protocol is accepted");
+}
+
 // ---- Handshake ----
 
 /// A worker built for another protocol version (an old one left in `~/.zkminer/provers`, which is
@@ -468,6 +515,10 @@ fn a_worker_that_lost_its_server_is_replaced_and_the_next_proof_succeeds() {
 /// the room is about to be given to the proof, so left there the two add up to a full tmpfs and a
 /// SIGBUS.
 #[test]
+// Linux only: there is no `/dev/shm` tmpfs on macOS (POSIX shm is not a directory there), SP1's native
+// executor does not stage that way off Linux, and `worker::unlink_group_sp1_shm` is compiled only for
+// Linux. On macOS the mock cannot stage, so the test failed with "the mock never staged" (M6).
+#[cfg(target_os = "linux")]
 fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
     let shm_name = format!("sp1_mocktest{}_t", std::process::id());
     let shm_file = format!("/dev/shm/{shm_name}");
@@ -508,34 +559,25 @@ fn preempting_an_sp1_measurement_unlinks_what_it_staged() {
     );
 }
 
-/// The same preemption with a real SP1 worker and guest, for what they really leave in `/dev/shm`.
+/// The same preemption with a real SP1 worker and guest, for what they really stage. SP1's executor
+/// shares the guest's memory and trace ring with its runner through memfds, not `/dev/shm` files
+/// (see `zkminer-prove-sp1`'s confinement), so what it stages is read from the host's shared memory
+/// (`Shmem` in `/proc/meminfo`, which counts memfd pages) and must come back once it is preempted.
 ///
 ///   ZKMINER_TEST_SP1_WORKER=<zkminer-prove-sp1> cargo test -p zkminer-prover --features testing \\
 ///     --test worker_lifecycle -- --ignored --test-threads=1 preempting_a_real_sp1_measurement
 #[test]
 #[ignore = "needs a real zkminer-prove-sp1, and no other SP1 execution on this host"]
-fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
-    /// What the tmpfs really has in use, which unlinked but still mapped pages count towards.
-    fn tmpfs_used() -> u64 {
-        let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) };
-        assert_eq!(rc, 0);
-        (fs.f_blocks - fs.f_bfree) as u64 * fs.f_frsize as u64
-    }
-    fn staged() -> u64 {
-        std::fs::read_dir("/dev/shm")
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                let name = e.file_name();
-                let name = name.to_string_lossy();
-                name.starts_with("sp1_") || name.starts_with("sem.sp1_")
-            })
-            .map(|e| {
-                use std::os::unix::fs::MetadataExt;
-                e.metadata().map(|m| m.blocks() * 512).unwrap_or(0)
-            })
-            .sum()
+fn preempting_a_real_sp1_measurement_frees_what_it_staged() {
+    /// The host's shared memory in use: tmpfs, SysV and memfd pages.
+    fn shmem() -> u64 {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+        let kib: u64 = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("Shmem:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("Shmem in /proc/meminfo");
+        kib * 1024
     }
     let worker =
         PathBuf::from(std::env::var("ZKMINER_TEST_SP1_WORKER").expect("the worker to run"));
@@ -551,8 +593,8 @@ fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
         .unwrap();
     assert!(exported.success());
     let elf = std::fs::read(&elf_path).unwrap();
-    assert_eq!(staged(), 0, "another SP1 execution is using /dev/shm");
-    let used_before = tmpfs_used();
+    let before_staging = shmem();
+    let staged = || shmem().saturating_sub(before_staging);
 
     let mut env = HashMap::new();
     env.insert(
@@ -581,11 +623,12 @@ fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
     while staged() < 500 * 1024 * 1024 {
         assert!(
             started.elapsed() < Duration::from_secs(120),
-            "it never staged"
+            "it never staged ({} bytes of shared memory)",
+            staged()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let before = staged();
+    let peak = staged();
     pool.test_preempt_all_inflight_measures();
     let err = measurer.join().unwrap().expect_err("it was preempted");
     assert!(
@@ -593,16 +636,14 @@ fn preempting_a_real_sp1_measurement_frees_its_dev_shm() {
             .is_some(),
         "{err:#}"
     );
-    let after = staged();
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(after, 0, "{before} bytes staged, {after} left behind");
-    // Not just the names: the pages themselves came back.
+    // The pages themselves come back, not just the names: the runner that mapped them is gone.
     let started = Instant::now();
-    while tmpfs_used() > used_before + 4 * 1024 * 1024 {
+    while staged() > 64 * 1024 * 1024 {
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "{} bytes still in use in /dev/shm, {used_before} before it staged",
-            tmpfs_used()
+            "{peak} bytes staged, {} still in use after the preemption",
+            staged()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -1066,6 +1107,793 @@ fn a_normal_measurement_leaves_no_inflight_registration() {
         "a finished measurement must not stay registered as preemptible"
     );
     assert_eq!(pool.test_consecutive_failures("mock:generic"), Some(0));
+}
+
+// ---- M9: the Metal recycle policy ----
+
+/// A worker is recycled after 20 proofs, but a Metal one is kept (its warm state is worth keeping,
+/// and its idle footprint does not grow; M9 note): 25 proofs on each, one pid for the Metal slot.
+#[test]
+fn a_metal_worker_outlives_the_20_proof_recycle() {
+    if std::env::var_os("ZKMINER_RECYCLE_AFTER_PROOFS").is_some()
+        || std::env::var_os("ZKMINER_METAL_RECYCLE_AFTER_PROOFS").is_some()
+    {
+        return;
+    }
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:generic", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    let mut metal = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    metal
+        .insert_test_worker("mock:metal", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    metal.test_set_gpu_tag("mock:metal", "metal");
+    let (generic_pid, metal_pid) = (pool.test_pid("mock:generic"), metal.test_pid("mock:metal"));
+    for i in 0..25 {
+        pool.prove("mock", &[], &[], None, Some(Duration::from_secs(10)), None)
+            .unwrap_or_else(|e| panic!("generic proof {i}: {e:#}"));
+        metal
+            .prove("mock", &[], &[], None, Some(Duration::from_secs(10)), None)
+            .unwrap_or_else(|e| panic!("metal proof {i}: {e:#}"));
+    }
+    assert_ne!(
+        pool.test_pid("mock:generic"),
+        generic_pid,
+        "recycled after 20 proofs"
+    );
+    assert_eq!(
+        metal.test_pid("mock:metal"),
+        metal_pid,
+        "kept past 20 proofs"
+    );
+    assert_eq!(metal.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+// ---- W7-M10: the owner-active tier and the respawn right after a proof ----
+
+const GIB: u64 = 1 << 30;
+
+/// A Metal slot (mock worker) with a 16 GB Mac's figure, 8 GiB.
+fn metal_16gb_pool() -> WorkerPool {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:metal", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    pool.test_set_gpu_tag("mock:metal", "metal");
+    pool.test_set_vram("mock:metal", 8 * GIB);
+    pool
+}
+
+fn prove_at(pool: &WorkerPool, po2: Option<u8>) -> u64 {
+    pool.prove("mock", &[], &[], po2, Some(Duration::from_secs(10)), None)
+        .unwrap_or_else(|e| panic!("proof at {po2:?}: {e:#}"))
+        .cycles
+}
+
+/// Whether this process has no explicit Metal budget: one (gpu-run's default) caps every figure the
+/// worker sees, so the 4 and 8 GiB tiers are the same worker and nothing respawns. The gate runs
+/// these with `gpu-run --light --no-budget` (the mock worker uses no GPU).
+fn no_budget(test: &str) -> bool {
+    let none = zkminer_prover::metal_sizing::env_working_set_budget().is_none();
+    if !none {
+        eprintln!("{test}: skipped under RISC0_METAL_MAX_WORKING_SET_BYTES (run with --no-budget)");
+    }
+    none
+}
+
+fn respawn_early_on() -> bool {
+    !std::env::var_os("ZKMINER_METAL_RESPAWN_EARLY").is_some_and(|v| v == "0")
+}
+
+/// Unenforced (the default), the tier follows the owner at each job's start, never changes a job's
+/// po2, is recorded per job, and never respawns the worker: a worker at the idle figure proves a job
+/// the active tier admits exactly as one at the active figure would (`metal_sizing::same_for_job`),
+/// so a respawn would only cost a cold worker. A count recycle while the owner is active keeps the
+/// idle figure (a worker moved to 4 GiB would refuse the next po2 19 job).
+#[test]
+fn a_metal_job_proves_at_the_owner_tier_its_po2_fits() {
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let pool = metal_16gb_pool();
+    pool.test_force_enforce(Some(false));
+    let pid0 = pool.test_pid("mock:metal");
+    pool.test_force_owner(Some(OwnerForce::Active));
+    // A job measured at 19 (before the owner came back) keeps 19 and the idle tier.
+    assert_eq!(prove_at(&pool, Some(19)), 1019);
+    assert_eq!(pool.metal_tier_jobs(), (1, 0));
+    // A job measured at 18 while the owner is active: the active tier, on the same worker.
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.metal_tier_jobs(), (1, 1));
+    // The owner leaves: a po2 18 job is an idle-tier job, still the same worker.
+    pool.test_force_owner(Some(OwnerForce::Idle));
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.metal_tier_jobs(), (2, 1));
+    // A benchmark-style proof (no po2) always runs at the idle tier.
+    pool.test_force_owner(Some(OwnerForce::Active));
+    assert_eq!(prove_at(&pool, None), 1000);
+    assert_eq!(pool.metal_tier_jobs(), (3, 1));
+    assert_eq!(pool.test_pid("mock:metal"), pid0, "no tier respawn unenforced");
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    // A count recycle while the owner is active respawns at the figure the worker had.
+    pool.test_set_recycle_after("mock:metal", 1);
+    prove_at(&pool, Some(18));
+    prove_at(&pool, Some(19));
+    assert_ne!(pool.test_pid("mock:metal"), pid0);
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    assert_eq!(pool.metal_tier_jobs(), (4, 2));
+    assert_eq!(pool.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+/// W7-M10 review finding: when the owner comes back with jobs measured at the idle po2 queued, the
+/// worker is not moved to the active tier in the idle gap after each of them (and back before the
+/// next): at most one respawn for the whole queue, and it happens at the first job the active tier
+/// can hold. With enforcement on, where the tier's figure is the worker's budget.
+#[test]
+fn queued_idle_po2_jobs_after_the_owner_returns_respawn_the_worker_at_most_once() {
+    if !no_budget("queued_idle_po2_jobs_after_the_owner_returns_respawn_the_worker_at_most_once") {
+        return;
+    }
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let pool = metal_16gb_pool();
+    pool.test_force_enforce(Some(true));
+    pool.test_force_owner(Some(OwnerForce::Active));
+    let pid0 = pool.test_pid("mock:metal");
+    for _ in 0..3 {
+        assert_eq!(prove_at(&pool, Some(19)), 1019);
+        assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    }
+    assert_eq!(pool.metal_tier_jobs(), (3, 0));
+    assert_eq!(
+        pool.test_pid("mock:metal"),
+        pid0,
+        "no respawn for idle-po2 jobs"
+    );
+    // The first job measured at the active po2: one respawn, before it, at 4 GiB.
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    let pid1 = pool.test_pid("mock:metal");
+    assert_ne!(pid1, pid0);
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(4 * GIB));
+    for _ in 0..2 {
+        assert_eq!(prove_at(&pool, Some(18)), 1018);
+    }
+    assert_eq!(pool.test_pid("mock:metal"), pid1, "already at its tier");
+    assert_eq!(pool.metal_tier_jobs(), (3, 3));
+    // The owner leaves: the next po2 18 job runs on the worker as it is (active tier, no respawn
+    // before it); right after it the worker goes back to idle in the idle gap, so the po2 19 jobs
+    // claimed from now find it there.
+    pool.test_force_owner(Some(OwnerForce::Idle));
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.metal_tier_jobs(), (3, 4));
+    if respawn_early_on() {
+        let pid2 = pool.test_pid("mock:metal");
+        assert_ne!(pid2, pid1, "back to idle right after the proof");
+        assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+        assert_eq!(prove_at(&pool, Some(19)), 1019);
+        assert_eq!(pool.test_pid("mock:metal"), pid2);
+    } else {
+        // Without the early respawn, the po2 19 job's start makes it (the worker would refuse).
+        assert_eq!(prove_at(&pool, Some(19)), 1019);
+        assert_ne!(pool.test_pid("mock:metal"), pid1);
+        assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    }
+    assert_eq!(pool.metal_tier_jobs(), (4, 4));
+    assert_eq!(pool.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+/// W7-M10 review finding: on a 36 GB Mac the active tier (20 GiB) keeps po2 20 and the Groth16 key
+/// decision of the idle one (28 GiB), so with enforcement off an owner switching back and forth
+/// never respawns the worker.
+#[test]
+fn a_36_gb_macs_owner_switches_never_respawn_the_worker() {
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let mut pool = metal_16gb_pool();
+    pool.test_set_vram("mock:metal", 28 * GIB);
+    pool.test_force_enforce(Some(false));
+    let pid = pool.test_pid("mock:metal");
+    for (i, force) in [
+        OwnerForce::Active,
+        OwnerForce::Idle,
+        OwnerForce::Active,
+        OwnerForce::Active,
+        OwnerForce::Idle,
+        OwnerForce::Active,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        pool.test_force_owner(Some(force));
+        assert_eq!(prove_at(&pool, Some(20)), 1020, "proof {i}");
+        assert_eq!(pool.test_pid("mock:metal"), pid, "proof {i}");
+    }
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(28 * GIB));
+    assert_eq!(pool.metal_tier_jobs(), (2, 4));
+}
+
+/// A benchmark prices the Mac at its idle tier: a worker left at the active tier (enforcement on)
+/// is respawned at the idle figure first.
+#[test]
+fn a_metal_benchmark_runs_at_the_idle_tier() {
+    if !no_budget("a_metal_benchmark_runs_at_the_idle_tier") {
+        return;
+    }
+    use zkminer_prover::metal_sizing::OwnerForce;
+    let pool = metal_16gb_pool();
+    pool.test_force_enforce(Some(true));
+    pool.test_force_owner(Some(OwnerForce::Active));
+    // Owner active, a job at 18: active tier (respawned before the proof).
+    assert_eq!(prove_at(&pool, Some(18)), 1018);
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(4 * GIB));
+    let pid = pool.test_pid("mock:metal");
+    pool.benchmark("mock").expect("benchmark");
+    assert_eq!(pool.test_spawn_vram("mock:metal"), Some(8 * GIB));
+    assert_ne!(
+        pool.test_pid("mock:metal"),
+        pid,
+        "respawned at the idle tier for the benchmark"
+    );
+}
+
+/// A worker due for its count-based recycle is respawned right after the proof that made it due,
+/// not before the next one.
+#[test]
+fn a_due_metal_worker_is_respawned_right_after_its_proof() {
+    if !respawn_early_on() {
+        return;
+    }
+    let pool = metal_16gb_pool();
+    pool.test_force_owner(Some(zkminer_prover::metal_sizing::OwnerForce::Idle));
+    pool.test_set_recycle_after("mock:metal", 2);
+    let pid0 = pool.test_pid("mock:metal");
+    prove_at(&pool, Some(19));
+    assert_eq!(pool.test_pid("mock:metal"), pid0);
+    prove_at(&pool, Some(19));
+    let pid1 = pool.test_pid("mock:metal");
+    assert_ne!(pid1, pid0, "respawned as the second proof ended");
+    assert_eq!(pool.test_has_handle("mock:metal"), Some(true));
+    // The new worker proves the next job without another respawn before it.
+    prove_at(&pool, Some(19));
+    assert_eq!(pool.test_pid("mock:metal"), pid1);
+    prove_at(&pool, Some(19));
+    assert_ne!(pool.test_pid("mock:metal"), pid1);
+    assert_eq!(pool.metal_tier_jobs(), (4, 0));
+    assert_eq!(pool.test_consecutive_failures("mock:metal"), Some(0));
+}
+
+/// A slot that is not an enumerated Apple GPU (no figure) is untouched by the tier.
+#[test]
+fn a_metal_slot_without_a_figure_ignores_the_owner_tier() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker("mock:metal", "mock", mock_worker_path(), mock_env("", ""))
+        .expect("failed to spawn mock worker");
+    pool.test_set_gpu_tag("mock:metal", "metal");
+    pool.test_force_owner(Some(zkminer_prover::metal_sizing::OwnerForce::Active));
+    let pid = pool.test_pid("mock:metal");
+    for _ in 0..3 {
+        assert_eq!(prove_at(&pool, Some(18)), 1018);
+    }
+    assert_eq!(pool.test_pid("mock:metal"), pid);
+    assert_eq!(pool.metal_tier_jobs(), (0, 0));
+}
+
+/// W7-M10 A/B harness (real Metal worker, ignored): proofs through the miner's own pool (the
+/// process-wide one, so the respawn right after a proof and its background growth check run as in
+/// the miner), each worker recycled after every proof (`ZKMINER_M10_RECYCLE`, default 1), with
+/// `ZKMINER_M10_GAP_MS` (default 3000) between proofs. Prints each proof's wall time as the caller
+/// sees it (respawn included) and the worker pid. Arms: `ZKMINER_METAL_RESPAWN_EARLY=0` or unset.
+///
+///   ZKMINER_M10_WORKER=<zkminer-prove-risc0-metal> cargo test --release -p zkminer-prover \
+///     --features testing --test worker_lifecycle -- --ignored --nocapture m10_recycled_first_prove
+#[test]
+#[ignore = "proves on the Apple GPU with ZKMINER_M10_WORKER; run alone under gpu-run"]
+fn m10_recycled_first_prove() {
+    let Ok(worker) = std::env::var("ZKMINER_M10_WORKER") else {
+        eprintln!("ZKMINER_M10_WORKER is not set");
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .try_init();
+    let num = |k: &str, d: u64| -> u64 {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let dir = std::env::temp_dir().join(format!("m10-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let guest = dir.join("fibonacci.elf");
+    let out = std::process::Command::new(&worker)
+        .arg("--export-guest")
+        .arg("fibonacci")
+        .arg(&guest)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let elf = std::fs::read(&guest).unwrap();
+    let iters = num("ZKMINER_M10_FIB_ITERS", 400_000) as u32;
+    let key = "risc0:metal";
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(key, "risc0", worker.into(), HashMap::new())
+        .expect("spawn the Metal worker");
+    pool.test_set_gpu_tag(key, "metal");
+    pool.test_set_recycle_after(key, num("ZKMINER_M10_RECYCLE", 1) as u32);
+    // An Apple GPU figure (e.g. a 16 GB Mac's 8 GiB) turns the owner tier on for this slot; the
+    // tier then follows ZKMINER_OWNER_ACTIVE (or the owner's real activity).
+    let vram = num("ZKMINER_M10_VRAM", 0);
+    if vram > 0 {
+        pool.test_set_vram(key, vram);
+    }
+    let po2 = std::env::var("ZKMINER_M10_PO2")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+    zkminer_prover::engine::init_worker_pool(pool);
+    let pool = zkminer_prover::engine::worker_pool().unwrap();
+    let gap = Duration::from_millis(num("ZKMINER_M10_GAP_MS", 3000));
+    let proofs = num("ZKMINER_M10_PROOFS", 3);
+    for i in 1..=proofs {
+        if i > 1 {
+            std::thread::sleep(gap);
+        }
+        let pid_before = pool.test_pid(key).unwrap_or(0);
+        let t = Instant::now();
+        let p = pool
+            .prove(
+                "risc0",
+                &elf,
+                &iters.to_le_bytes(),
+                po2,
+                Some(Duration::from_secs(300)),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("proof {i}: {e:#}"));
+        let wall = t.elapsed().as_secs_f64();
+        eprintln!(
+            "M10 tiers after proof {i}: (idle, active) = {:?}, spawn figure {:?}",
+            pool.metal_tier_jobs(),
+            pool.test_spawn_vram(key)
+        );
+        assert!(!p.seal.is_empty());
+        eprintln!(
+            "M10 proof {i}: {wall:.3} s wall, worker {:.3} s, pid {pid_before} -> {}",
+            p.duration.as_secs_f64(),
+            pool.test_pid(key).unwrap_or(0)
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    pool.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- W10-BENCH: a failed benchmark is reported, never silently dropped ----
+
+/// A Metal-tagged risc0 worker whose warm-up answers with an error, as a Mac whose GPU pipelines do
+/// not build does (the macOS 26 VM: "compute pipeline for stepAccumA: Compilation failed").
+fn failing_metal_pool(fail_on: &str) -> WorkerPool {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(30)));
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+    env.insert(
+        "MOCK_SDK_VERSION".to_string(),
+        format!(
+            "risc0-zkvm {}.0",
+            zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+        ),
+    );
+    env.insert("MOCK_FAIL_ON".to_string(), fail_on.to_string());
+    env.insert(
+        "MOCK_FAIL_MESSAGE".to_string(),
+        "warm-up failed: compute pipeline for stepAccumA: Compilation failed".to_string(),
+    );
+    pool.insert_test_worker("risc0:metal:0", "risc0", mock_worker_path(), env)
+        .expect("mock risc0 worker");
+    pool.test_set_gpu_tag("risc0:metal:0", "metal");
+    pool
+}
+
+#[test]
+fn a_failed_warm_up_is_reported_as_the_slots_failure() {
+    let pool = failing_metal_pool("warmup");
+    assert!(pool.has_any_worker());
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty(), "{:?}", run.results);
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    let f = &run.failures[0];
+    assert_eq!(f.slot_key, "risc0:metal:0");
+    assert_eq!(f.gpu_tag, "metal");
+    assert!(
+        f.error.contains("warm-up of risc0:metal:0 failed") && f.error.contains("stepAccumA"),
+        "{}",
+        f.error
+    );
+
+    // The streaming path (the TUI's and the miner's) reports it the same way, and its progress events
+    // mark the slot finished without success.
+    let finished = std::sync::Mutex::new(Vec::new());
+    let run = pool.benchmark_all_streaming(&|event| {
+        if let zkminer_prover::dispatcher::BenchmarkProgressKind::Finished { succeeded } =
+            event.kind
+        {
+            finished.lock().unwrap().push(succeeded);
+        }
+    });
+    assert!(run.results.is_empty());
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert!(run.failures[0].error.contains("stepAccumA"));
+    assert_eq!(*finished.lock().unwrap(), vec![false]);
+}
+
+/// A worker that answers its benchmark with an error, and one that answers with no rows (it proved
+/// none of the programs), are failures too.
+#[test]
+fn a_benchmark_error_or_an_empty_answer_is_the_slots_failure() {
+    let pool = failing_metal_pool("benchmark");
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty());
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert!(
+        run.failures[0].error.contains("stepAccumA"),
+        "{}",
+        run.failures[0].error
+    );
+
+    // The plain mock answers every Benchmark with zero rows.
+    let pool = failing_metal_pool("");
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty());
+    assert_eq!(run.failures.len(), 1, "{:?}", run.failures);
+    assert_eq!(
+        run.failures[0].error,
+        zkminer_prover::dispatcher::NO_BENCHMARK_ROWS
+    );
+}
+
+#[test]
+fn an_empty_pool_has_no_worker() {
+    let pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(5)));
+    assert!(!pool.has_any_worker());
+    let run = pool.benchmark_all_with_device_info();
+    assert!(run.results.is_empty() && run.failures.is_empty());
+}
+
+// ---- W10-BENCH round 1: declined siblings and short suites ----
+
+/// A Metal-tagged risc0 mock that answers every program with a row, except those in `drop`.
+fn measuring_metal_pool(drop: &str) -> WorkerPool {
+    let mut env = mock_env("", "");
+    env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+    env.insert(
+        "MOCK_SDK_VERSION".to_string(),
+        format!(
+            "risc0-zkvm {}.0",
+            zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+        ),
+    );
+    env.insert("MOCK_BENCH_ROWS".to_string(), "all".to_string());
+    env.insert("MOCK_BENCH_DROP".to_string(), drop.to_string());
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(30)));
+    pool.insert_test_worker("risc0:metal:0", "risc0", mock_worker_path(), env)
+        .expect("mock risc0 worker");
+    pool.test_set_gpu_tag("risc0:metal:0", "metal");
+    pool
+}
+
+/// Both entry points, so each check covers `zkminer benchmark` and the TUI/miner's streaming path.
+fn both_runs(pool: &WorkerPool) -> Vec<(&'static str, zkminer_prover::dispatcher::BenchmarkRun)> {
+    vec![
+        ("with_device_info", pool.benchmark_all_with_device_info()),
+        ("streaming", pool.benchmark_all_streaming(&|_| {})),
+    ]
+}
+
+/// The control: a worker on which every program and the score proved gives a clean run.
+#[test]
+fn a_complete_suite_is_a_clean_run() {
+    let pool = measuring_metal_pool("");
+    for (name, run) in both_runs(&pool) {
+        assert!(run.failures.is_empty(), "{name}: {:?}", run.failures);
+        assert!(run.not_benchmarked.is_empty(), "{name}");
+        assert_eq!(run.results.len(), 1, "{name}");
+        assert!(
+            zkminer_prover::dispatcher::missing_benchmark_rows("risc0", &run.results[0].entries)
+                .is_empty(),
+            "{name}: {:?}",
+            run.results[0].entries
+        );
+    }
+    pool.close();
+}
+
+/// A worker leaves out a program that did not prove and verify, and the dispatcher leaves out a
+/// score that failed. Either makes the slot's benchmark a failure that names what is missing; the
+/// rows that did prove are kept, to be shown (reviewer's repro: only memory-merkle came back, and
+/// `zkminer benchmark` printed a normal table, exit 0, and saved it under --calibrate).
+#[test]
+fn a_short_suite_is_the_slots_failure() {
+    for (drop, named) in [
+        (
+            "sha256-chain,ecdsa-verify,bigint-mul,chacha-mix,zkop-mix",
+            vec![
+                "sha256-chain",
+                "ecdsa-verify",
+                "bigint-mul",
+                "chacha-mix",
+                "zkop-mix",
+            ],
+        ),
+        ("memory-merkle", vec!["memory-merkle"]),
+        ("zkop-mix", vec!["zkop-mix"]),
+    ] {
+        let pool = measuring_metal_pool(drop);
+        let finished = std::sync::Mutex::new(Vec::new());
+        let streamed = pool.benchmark_all_streaming(&|event| {
+            if let zkminer_prover::dispatcher::BenchmarkProgressKind::Finished { succeeded } =
+                event.kind
+            {
+                finished.lock().unwrap().push(succeeded);
+            }
+        });
+        assert_eq!(*finished.lock().unwrap(), vec![false], "{drop}");
+        for (name, run) in [
+            ("with_device_info", pool.benchmark_all_with_device_info()),
+            ("streaming", streamed),
+        ] {
+            assert_eq!(
+                run.results.len(),
+                1,
+                "{drop}/{name}: the proved rows are kept"
+            );
+            assert_eq!(run.failures.len(), 1, "{drop}/{name}: {:?}", run.failures);
+            let error = &run.failures[0].error;
+            assert!(
+                error.contains(zkminer_prover::dispatcher::INCOMPLETE_BENCHMARK),
+                "{drop}/{name}: {error}"
+            );
+            for program in &named {
+                assert!(
+                    error.contains(program),
+                    "{drop}/{name}: {program} not named: {error}"
+                );
+            }
+        }
+        pool.close();
+    }
+}
+
+/// A worker that DECLINED at startup (`sp1 unavailable: libcudart.so.12 not found`) beside a working
+/// card, and a second card of the SAME backend whose worker could not be started: the working card's
+/// benchmark is a clean run, and the two are reported as not benchmarked. Before round 1 they failed
+/// the whole run, so `zkminer benchmark --calibrate` exited 1 and the TUI never saved the working
+/// card's rows.
+#[test]
+fn a_declined_or_unstartable_sibling_does_not_fail_a_working_card() {
+    let mut pool = measuring_metal_pool("");
+    pool.insert_test_down_worker(
+        "sp1:cuda:0",
+        "sp1",
+        "cuda",
+        mock_worker_path(),
+        Some("sp1 unavailable: libcudart.so.12 not found"),
+    );
+    pool.insert_test_down_worker(
+        "risc0:cuda:1",
+        "risc0",
+        "cuda",
+        PathBuf::from("/nonexistent/zkminer-prove-risc0-cuda"),
+        None,
+    );
+    for (name, run) in both_runs(&pool) {
+        assert!(run.failures.is_empty(), "{name}: {:?}", run.failures);
+        assert_eq!(run.results.len(), 1, "{name}");
+        assert_eq!(run.results[0].slot_key, "risc0:metal:0");
+        let mut down: Vec<&str> = run
+            .not_benchmarked
+            .iter()
+            .map(|f| f.slot_key.as_str())
+            .collect();
+        down.sort();
+        assert_eq!(down, ["risc0:cuda:1", "sp1:cuda:0"], "{name}");
+        let declined = run
+            .not_benchmarked
+            .iter()
+            .find(|f| f.slot_key == "sp1:cuda:0")
+            .unwrap();
+        assert!(declined.error.contains("libcudart"), "{}", declined.error);
+    }
+    // A declined slot is not a benchmark target either, so a start with saved results for every
+    // other card does not re-run the benchmark for a row that cannot come.
+    let targets: Vec<(String, String)> = pool.benchmark_targets();
+    assert!(targets.iter().all(|(_, b)| b != "sp1"), "{targets:?}");
+    assert!(
+        targets.iter().any(|(_, b)| b == "risc0"),
+        "a slot that may still start stays a target: {targets:?}"
+    );
+    pool.close();
+}
+
+/// W10-BENCH round 2 (reviewer's probe 1): the risc0 GPU worker could not start (a crash or a
+/// backoff, not a decline), and the host also has a CPU `generic` risc0 worker. The GPU slot's error
+/// is the run's failure: the CPU worker never stands in for it (before, the CPU worker was
+/// benchmarked instead and the run was clean: exit 0, cached under --calibrate, used for pricing).
+#[test]
+fn a_down_gpu_slot_is_not_covered_by_a_cpu_worker() {
+    for gpu in ["risc0:metal:0", "risc0:cuda:0"] {
+        let mut env = mock_env("", "");
+        env.insert("MOCK_BACKEND".to_string(), "risc0".to_string());
+        env.insert(
+            "MOCK_SDK_VERSION".to_string(),
+            format!(
+                "risc0-zkvm {}.0",
+                zkminer_prover_protocol::RISC0_ZKVM_MAJOR_MINOR
+            ),
+        );
+        env.insert("MOCK_BENCH_ROWS".to_string(), "all".to_string());
+        let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(30)));
+        pool.insert_test_worker("risc0:generic", "risc0", mock_worker_path(), env)
+            .expect("mock risc0 cpu worker");
+        pool.insert_test_down_worker(
+            gpu,
+            "risc0",
+            gpu.split(':').nth(1).unwrap(),
+            mock_worker_path(),
+            None,
+        );
+        for (name, run) in both_runs(&pool) {
+            assert!(
+                run.failures.iter().any(|f| f.slot_key == gpu),
+                "{gpu}/{name}: the down GPU slot must fail the run: {:?}",
+                run.failures
+            );
+            assert!(
+                run.not_benchmarked.iter().all(|f| f.slot_key != gpu),
+                "{gpu}/{name}: {:?}",
+                run.not_benchmarked
+            );
+            assert!(
+                run.results.iter().all(|r| r.slot_key != "risc0:generic"),
+                "{gpu}/{name}: the CPU worker is not benchmarked in the GPU's place"
+            );
+        }
+        pool.close();
+    }
+}
+
+/// W10-BENCH round 2 (reviewer's probe 2): the OpenVM worker cannot prove; its `Benchmark` answer
+/// times a stand-in workload under the name "openvm". Those rows are never measurements: not in
+/// `results` (so not shown, cached or priced), and a slot that only has them did not measure. With
+/// the only real prover (risc0 cuda) down, the run fails; beside a working card, OpenVM is reported
+/// as not benchmarked (SIMULATED) and the card's run is clean.
+#[test]
+fn openvm_stub_rows_are_never_measurements() {
+    let openvm_env = || {
+        let mut env = mock_env("", "");
+        env.insert("MOCK_BACKEND".to_string(), "openvm".to_string());
+        env.insert("MOCK_BENCH_ROWS".to_string(), "all".to_string());
+        env
+    };
+    // The only real prover is down.
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(30)));
+    pool.insert_test_worker("openvm:generic", "openvm", mock_worker_path(), openvm_env())
+        .expect("mock openvm worker");
+    pool.insert_test_down_worker(
+        "risc0:cuda:0",
+        "risc0",
+        "cuda",
+        PathBuf::from("/nonexistent/zkminer-prove-risc0-cuda"),
+        None,
+    );
+    for (name, run) in both_runs(&pool) {
+        assert!(run.results.is_empty(), "{name}: {:?}", run.results);
+        assert!(
+            run.failures.iter().any(|f| f.slot_key == "risc0:cuda:0"),
+            "{name}: {:?}",
+            run.failures
+        );
+        let openvm = run
+            .failures
+            .iter()
+            .find(|f| f.slot_key == "openvm:generic")
+            .unwrap_or_else(|| panic!("{name}: {:?}", run.failures));
+        assert!(
+            openvm
+                .error
+                .contains(zkminer_prover::dispatcher::SIMULATED_BENCHMARK),
+            "{name}: {}",
+            openvm.error
+        );
+    }
+    pool.close();
+
+    // Beside a working card: a clean run with the stub reported, never measured.
+    let mut pool = measuring_metal_pool("");
+    pool.insert_test_worker("openvm:generic", "openvm", mock_worker_path(), openvm_env())
+        .expect("mock openvm worker");
+    pool.insert_test_down_worker(
+        "openvm:cuda:1",
+        "openvm",
+        "cuda",
+        PathBuf::from("/nonexistent/zkminer-prove-openvm"),
+        None,
+    );
+    let queued = std::sync::Mutex::new(Vec::new());
+    let streamed = pool.benchmark_all_streaming(&|event| {
+        if matches!(
+            event.kind,
+            zkminer_prover::dispatcher::BenchmarkProgressKind::Queued
+        ) {
+            queued.lock().unwrap().push(event.slot_key);
+        }
+    });
+    assert_eq!(*queued.lock().unwrap(), ["risc0:metal:0"]);
+    for (name, run) in [
+        ("with_device_info", pool.benchmark_all_with_device_info()),
+        ("streaming", streamed),
+    ] {
+        assert!(run.failures.is_empty(), "{name}: {:?}", run.failures);
+        assert_eq!(run.results.len(), 1, "{name}");
+        assert_eq!(run.results[0].slot_key, "risc0:metal:0");
+        let mut skipped: Vec<&str> = run
+            .not_benchmarked
+            .iter()
+            .map(|f| f.slot_key.as_str())
+            .collect();
+        skipped.sort();
+        // openvm:generic is skipped silently, as every CPU worker beside a GPU one of its backend.
+        assert_eq!(skipped, ["openvm:cuda:1"], "{name}");
+    }
+    // Never a startup-benchmark target: its row can never be saved.
+    assert!(
+        pool.benchmark_targets().iter().all(|(_, b)| b != "openvm"),
+        "{:?}",
+        pool.benchmark_targets()
+    );
+    pool.close();
+}
+
+/// W10-BENCH round 2: a worker of ANOTHER backend that could not be started does not get a pass
+/// because a card measured: only a GPU of its own backend covers for it.
+#[test]
+fn a_down_slot_of_another_backend_fails_the_run() {
+    let mut pool = measuring_metal_pool("");
+    pool.insert_test_down_worker(
+        "sp1:cuda:0",
+        "sp1",
+        "cuda",
+        PathBuf::from("/nonexistent/zkminer-prove-sp1"),
+        None,
+    );
+    for (name, run) in both_runs(&pool) {
+        assert_eq!(run.results.len(), 1, "{name}");
+        assert!(
+            run.not_benchmarked.is_empty(),
+            "{name}: {:?}",
+            run.not_benchmarked
+        );
+        assert_eq!(run.failures.len(), 1, "{name}: {:?}", run.failures);
+        assert_eq!(run.failures[0].slot_key, "sp1:cuda:0", "{name}");
+    }
+    pool.close();
+}
+
+/// With nothing measured, the slots that could not be benchmarked are the run's failures, with their
+/// reasons: a lone worker that declined or never started fails the benchmark.
+#[test]
+fn only_down_slots_fail_the_run() {
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), Some(Duration::from_secs(5)));
+    pool.insert_test_down_worker(
+        "risc0:metal:0",
+        "risc0",
+        "metal",
+        mock_worker_path(),
+        Some("risc0 unavailable: no Metal device"),
+    );
+    for (name, run) in both_runs(&pool) {
+        assert!(run.results.is_empty(), "{name}");
+        assert!(run.not_benchmarked.is_empty(), "{name}");
+        assert_eq!(run.failures.len(), 1, "{name}: {:?}", run.failures);
+        assert!(run.failures[0].error.contains("no Metal device"), "{name}");
+    }
+    pool.close();
 }
 
 // ---- Declines expire ----

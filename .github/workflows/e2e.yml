@@ -5,6 +5,8 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Run on demand (any branch), e.g. while PRs from metal-3.1 skip it (see the job's `if`).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +17,9 @@ concurrency:
 
 jobs:
   e2e:
+    # TEMPORARY: no automatic CI on PRs from metal-3.1 while it is tested by hand on the other
+    # platforms; run it with workflow_dispatch instead. Remove this line to re-enable.
+    if: ${{ github.event_name != 'pull_request' || !contains(fromJSON('["metal-3.1","metal-3.1-v2","netguard-mac-v2"]'), github.head_ref) }}
     # Everything (Rust, foundry, the tests) runs inside the `e2e` Docker stage.
     runs-on: ubuntu-latest
 

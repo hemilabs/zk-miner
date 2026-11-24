@@ -29,8 +29,8 @@
 //!    run to the proven one: the chain never checks the input, so a requester who is also the prover can
 //!    prove another input with the same journal, and choose a count up to `--max-cycles`.
 //!
-//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 13
-//! (`zkminer_prover_protocol::sys_rand`), so this run takes the path such a proof took, up to the
+//! risc0 guests' `sys_rand` is seeded by the public rule zkminer's proofs use from protocol 13 (on
+//! the macOS line, from its 14, W10-INT; one line since 17, W11-ON37) (`zkminer_prover_protocol::sys_rand`), so this run takes the path such a proof took, up to the
 //! segment size: the count is the cost of that run at the size the report names. A prover on other software, or a job
 //! proven before the rule, was seeded otherwise; the proof does not bind it.
 //!
@@ -708,7 +708,7 @@ pub fn parse_po2_set(s: &str) -> Result<Vec<u8>> {
     v.sort_unstable();
     v.dedup();
     anyhow::ensure!(!v.is_empty(), "--po2 names no size");
-    if let Some(p) = v.iter().find(|p| !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(p)) {
+    if let Some(p) = v.iter().find(|&&p| !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(&p)) {
         anyhow::bail!("--po2 {p} is outside {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}");
     }
     Ok(v)

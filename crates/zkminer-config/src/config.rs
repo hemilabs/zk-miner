@@ -290,7 +290,7 @@ pub struct ChainConfig {
     pub fee_ceiling_gwei: Option<f64>,
     /// First block of every HemiProve log scan (job discovery, lock recovery, descriptor
     /// reconstruction): the deployment's `fromBlock`. None = the known deployment's value for this
-    /// chain (743111: 7226094), else no floor.
+    /// chain (743111: 7226094, the 2026-11-16 deployment), else no floor.
     #[serde(default)]
     pub scan_from_block: Option<u64>,
     /// Whether to claim journal-bound jobs: a non-zero `expectedJournalHash` (FULL or FIELDS
@@ -461,7 +461,13 @@ pub struct ProverConfig {
     /// Override for the RISC Zero groth16 seal selector (4-byte hex, e.g.
     /// "0xe71e6620"). The miner prepends this to each seal for on-chain
     /// verification; it must equal the target chain's verifier `SELECTOR` for
-    /// the risc0 version in use. Defaults to the risc0 v3.1.x value when unset.
+    /// the risc0 version in use. When unset it is derived from the linked risc0
+    /// (first 4 bytes of its default Groth16 verifier parameters digest):
+    /// 0xe71e6620 for risc0 3.1 (3.0 was 0x73c457ba). An override does not change
+    /// the proofs the worker makes, only the prefix: use it only for a chain whose
+    /// verifier accepts this risc0's receipts under another selector. An override
+    /// that differs from the linked risc0's selector refuses every risc0 claim
+    /// (a startup PAGE) unless `ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE=1` is set.
     #[serde(default)]
     pub risc0_groth16_selector: Option<String>,
     /// The segment size (po2) a card measures and proves risc0 jobs at, keyed by its benchmark device

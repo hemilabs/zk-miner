@@ -28,7 +28,7 @@ use zkminer_prover_protocol::{
 
 use super::{
     check_claim_output, groth16_proof_output, job_segment_po2, prove_session_cycle_limit,
-    prove_with_retries, release_groth16_cache_if_tight, sys_rand_seed, verify_program_id,
+    prove_with_retries, sys_rand_seed, verify_program_id,
     KECCAK_REQUEST_CYCLES,
 };
 
@@ -424,8 +424,17 @@ fn witness_prove_once(
         }
     }
     let start = Instant::now();
+    // On Metal, every proof returns this thread's cached provers (the owner's RAM), on unwind too,
+    // as `run_proof_once` does; elsewhere the Groth16 cache decision alone, after the proof.
+    #[cfg(feature = "metal")]
+    let proved = {
+        let _release = crate::ReleaseOnDrop;
+        crate::groth16_wrap::prove_session(session)
+    };
+    #[cfg(not(feature = "metal"))]
     let proved = crate::groth16_wrap::prove_session(session);
-    release_groth16_cache_if_tight();
+    #[cfg(not(feature = "metal"))]
+    crate::release_groth16_cache_if_tight();
     let prove_info = proved?;
     groth16_proof_output(prove_info, image_id, start.elapsed().as_secs_f64())
 }

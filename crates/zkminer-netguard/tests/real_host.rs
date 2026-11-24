@@ -1,7 +1,7 @@
 //! On this host's real facts (interfaces, routes, policy rules, the kernel asked per destination,
 //! public addresses, NAT64 discovery), the ELF path still admits ordinary public hosts: names
 //! resolve over DNS-over-HTTPS to the fixed public resolvers, every address is vetted right
-//! before connecting (its route with the port, the near-hop probe), and a real fetch goes
+//! before connecting (its route with the port, the near-hop decision), and a real fetch goes
 //! through the guarded client (redirects followed by hand).
 //!
 //! Needs public DNS-over-HTTPS and HTTPS; where the control lookup fails the test says so and
@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zkminer_netguard::nearhop::{decide, NearProbe, ProbeOutcome, Verdict, PROBE_TIMEOUT};
+use zkminer_netguard::nearhop::{decide, Verdict};
 use zkminer_netguard::{
     guarded_client, DohLookup, GuardedResolver, Lookup, NetMode, NetPolicy, TtlProbe,
 };
@@ -32,7 +32,7 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
     );
     let doh = DohLookup::new(&policy).unwrap();
     if let Err(e) = doh.lookup(names[0]).await {
-        eprintln!("SKIPPED: no DNS-over-HTTPS here ({e})");
+        skipped(format!("no DNS-over-HTTPS here ({e})"));
         return;
     }
     eprintln!("unknown paths here: {:?}", policy.facts().unknown_paths());
@@ -86,27 +86,30 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
     }
 }
 
-/// The near-hop probe for real, against public anycast resolvers: a probe limited to 2 hops dies
-/// on the way (far), one with the usual hop limit connects. Where a family has no route here the
-/// probe fails at once as unreachable, which also reads as far. A router on the way may rate-limit
-/// its time-exceeded answers, so the 2-hop probe alone can time out; the decision is the guard's,
-/// which then makes its check connection.
+/// The near-hop decision for real, against public anycast resolvers: probes limited to 2..4 hops
+/// run out of hops on the way and a router past the limit says so (far, the evidence naming the
+/// router and the probe's own address), and a connection with the usual hop limit connects. A
+/// family with no route here is skipped (a probe that fails at once is a local failure, refused,
+/// never far).
 #[test]
 fn public_hosts_are_far_and_reachable() {
     for addr in ["1.1.1.1:443", "[2606:4700:4700::1111]:443"] {
         let addr: SocketAddr = addr.parse().unwrap();
-        let near = TtlProbe.probe(addr, 2, PROBE_TIMEOUT);
-        eprintln!("{addr} within 2 hops: {near:?}");
+        let reachable = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3));
+        eprintln!("{addr} with the default hop limit: {reachable:?}");
         let decided = decide(&TtlProbe, addr, 2);
-        assert_eq!(
-            decided,
-            Verdict::Far,
-            "{addr}: probe {near:?}, decided {decided:?}"
-        );
-        let full = TtlProbe.probe(addr, 64, PROBE_TIMEOUT);
-        eprintln!("{addr} within 64 hops: {full:?}");
-        if full != ProbeOutcome::Unreachable {
-            assert_eq!(full, ProbeOutcome::Connected, "{addr}");
+        eprintln!("{addr} within 2 hops: {decided:?}");
+        if reachable.is_err() {
+            let family = if addr.is_ipv6() { "[ipv6] " } else { "" };
+            skipped(format!("{family}{addr} is not reachable here: {reachable:?}"));
+            continue;
+        }
+        match decided {
+            Verdict::Far(e) => {
+                assert!(e.ttl >= 2 && e.from != addr.ip(), "{e:?}");
+                assert!(e.local.is_some_and(|l| l.port() != 0), "{e:?}");
+            }
+            other => panic!("{addr}: {other:?}"),
         }
     }
     // Through the policy, at a public anycast address this host does not use as its DNS server.
@@ -118,14 +121,19 @@ fn public_hosts_are_far_and_reachable() {
             .find(|a| policy.admit(a.ip()).is_ok())
             .expect("a public anycast address the floor admits");
         assert_eq!(policy.vet_connection(addr), Ok(()), "{addr}");
+        // The path vetted is pinned to the probes' source address and its interface.
+        let v = policy.vet_path(addr, addr).expect("vetted");
+        assert!(v.source.is_some() && v.interface.is_some(), "{v:?}");
+        let sock = v.socket().expect("the pinned socket");
+        let bound = sock.local_addr().unwrap().as_socket().unwrap();
+        assert_eq!(Some(bound.ip()), v.source);
     }
 }
 
 /// A near target that is not this host, given by the operator as `ZKMINER_TEST_NEAR_TARGET`
-/// (`addr:port`, e.g. the first-hop router's own global address on a closed port): the probe
-/// finds it near (it answers within 2 hops), or reads it as far when it drops the probe silently
-/// (a router whose firewall drops what it does not serve; the real connection would be dropped
-/// too). One probe.
+/// (`addr:port`, e.g. the first-hop router's own global address on a closed port): the decision
+/// finds it near (it answers within 2 hops), or refuses it for want of evidence when it drops
+/// the probes silently; never far.
 #[test]
 #[ignore = "needs a near target named in ZKMINER_TEST_NEAR_TARGET"]
 fn a_near_target_is_near() {
@@ -134,10 +142,28 @@ fn a_near_target_is_near() {
         .parse()
         .expect("addr:port");
     let t = std::time::Instant::now();
-    let got = TtlProbe.probe(target, 2, PROBE_TIMEOUT);
+    let got = decide(&TtlProbe, target, 2);
     eprintln!("{target} within 2 hops: {got:?} in {:?}", t.elapsed());
-    assert!(
-        matches!(got.verdict(), Verdict::Near(_)) || got == ProbeOutcome::TimedOut,
-        "{got:?}"
-    );
+    assert!(!matches!(got, Verdict::Far(_)), "{got:?}");
+}
+
+/// Tests: a test that cannot check what it is for on this host (no route of a family, no network,
+/// a missing tool) says so and passes; under `ZKMINER_CI_STRICT=1` (a CI host that must run every
+/// test: review round 3, cross-2) it fails instead, unless `why` starts with a token in brackets
+/// (`"[ipv6] …"`) that `ZKMINER_CI_ALLOW_SKIP` (comma-separated tokens) names exactly (review
+/// round 4, cross-7).
+fn skipped(why: impl std::fmt::Display) {
+    let why = why.to_string();
+    if std::env::var("ZKMINER_CI_STRICT").is_ok_and(|v| v == "1") {
+        let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP").unwrap_or_default();
+        let token = why
+            .strip_prefix('[')
+            .and_then(|r| r.split_once(']'))
+            .map(|(t, _)| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        if !token.is_some_and(|t| allowed.split(',').any(|a| a.trim() == t)) {
+            panic!("SKIPPED under ZKMINER_CI_STRICT=1 (not in ZKMINER_CI_ALLOW_SKIP): {why}");
+        }
+    }
+    eprintln!("SKIPPED: {why}");
 }

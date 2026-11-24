@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use zkminer_config::ZkMinerConfig;
 use zkminer_prover::benchmark;
 use zkminer_prover::dispatcher::WorkerPool;
@@ -41,6 +40,8 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         benchmark_timeout,
     );
     let connected = pool.discover_and_spawn();
+    // Found but not started (died at startup, declined): named in the header, never "none" (W10-BFIX).
+    let not_started = pool.not_started().to_vec();
     init_worker_pool(pool);
 
     if !json {
@@ -51,11 +52,7 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         let cores = benchmark::get_cpu_cores();
         println!("CPU:    {}", cpu_info);
         println!("Cores:  {}", cores);
-        if connected.is_empty() {
-            println!("Workers: none — install prover binaries in ~/.zkminer/provers (CPU/simulated only)");
-        } else {
-            println!("Workers: {}", connected.join(", "));
-        }
+        println!("Workers: {}", workers_header(&connected, &not_started));
         println!();
 
         println!("Running benchmarks...");
@@ -103,7 +100,9 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     // fastest size is taken only from a sweep that exercised segmentation (see
     // `benchmark::calibration_is_usable`); otherwise its ceiling is.
     let mut results = results;
-    if !interrupted && calibrate {
+    // Never calibrate on a failed or simulated run: it is not saved (W10-BENCH).
+    let calibrable = matches!(&results, Some(Ok(suite)) if suite.not_cacheable().is_none());
+    if !interrupted && calibrate && calibrable {
         match results.take() {
             Some(Ok(suite)) => {
                 let out = tokio::task::spawn_blocking(move || {
@@ -144,10 +143,48 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     }
     let results = results.expect("results present when not interrupted")?;
 
+    // W10-BENCH: a run in which a worker failed is reported as a failure, with a non-zero exit, and
+    // nothing is saved. Its rows are shown only when other workers measured (never simulated ones).
+    if results.failed() {
+        if !results.results.is_empty() {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                print_results(&results);
+            }
+        }
+        eprintln!();
+        if results.results.is_empty() {
+            eprintln!("BENCHMARK FAILED: nothing was measured or saved.");
+        } else {
+            eprintln!(
+                "BENCHMARK FAILED: the results above are incomplete; nothing was saved or used for \
+                 pricing."
+            );
+        }
+        for line in benchmark::describe_failures(&results.failures) {
+            eprintln!("  {line}");
+        }
+        let slots: Vec<&str> = results
+            .failures
+            .iter()
+            .map(|f| f.slot_key.as_str())
+            .collect();
+        anyhow::bail!("the benchmark failed on {}", slots.join(", "));
+    }
+    let simulated = results.is_simulated();
+    // Slots that were down from the start (a declined SP1 beside a working card) do not fail a run in
+    // which another slot measured, but the operator is told (W10-BENCH round 1).
+    for line in benchmark::describe_not_benchmarked(&results.not_benchmarked) {
+        eprintln!("WARNING: {line}");
+    }
+
     // Persist only when calibration was requested. A calibration sweep is expensive
     // and useless unless the miner can load it (`load_cached_benchmark`), whereas a
     // plain `zkminer benchmark` stays a read-only measurement that writes no state.
-    if calibrate {
+    if calibrate && simulated {
+        eprintln!("--calibrate: nothing to calibrate or save, the benchmark was simulated");
+    } else if calibrate {
         benchmark::save_benchmark(&results);
         if !json {
             let calibrated: Vec<_> = results
@@ -180,7 +217,66 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
         println!("{}", serde_json::to_string_pretty(&results)?);
         return Ok(());
     }
+    if simulated {
+        print_simulated(&results);
+        return Ok(());
+    }
+    print_results(&results);
+    Ok(())
+}
 
+/// The header's worker list: the workers that started, then those found that did not (W10-BFIX).
+/// "none" only when no worker was found at all, which is the one case that runs simulated.
+fn workers_header(connected: &[String], not_started: &[(String, bool)]) -> String {
+    if connected.is_empty() && not_started.is_empty() {
+        return "none — install prover binaries in ~/.zkminer/provers (CPU/simulated only)".into();
+    }
+    connected
+        .iter()
+        .cloned()
+        .chain(not_started.iter().map(|(key, declined)| {
+            if *declined {
+                format!("{key} (declined; see below)")
+            } else {
+                format!("{key} (failed to start; see below)")
+            }
+        }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The table of a simulated run (no prover worker at all; W10-BENCH): every line says SIMULATED, and
+/// there is no zkOP/s score, because nothing was proved.
+fn print_simulated(results: &benchmark::BenchmarkSuite) {
+    println!();
+    println!("SIMULATED BENCHMARK: no prover worker was found, so nothing was proved or measured.");
+    println!(
+        "SIMULATED: these are CPU stand-ins, not proving speeds; no zkOP/s score; nothing saved."
+    );
+    println!(
+        "{:<10} {:<18} {:>12} {:>10} {:>18}",
+        "SIMULATED", "Program", "Cycles", "Time", "SIMULATED rate"
+    );
+    println!("{}", "─".repeat(72));
+    for r in &results.results {
+        println!(
+            "{:<10} {:<18} {:>12} {:>9.2}s {:>14.0} c/s",
+            "SIMULATED",
+            r.program_name,
+            r.cycles,
+            r.duration.as_secs_f64(),
+            r.throughput,
+        );
+    }
+    println!("{}", "─".repeat(72));
+    println!(
+        "SIMULATED: install a prover worker in ~/.zkminer/provers (on a Mac, the beta kit's \
+         install.sh) and run `zkminer benchmark` again."
+    );
+}
+
+/// The measured results: the program table, the zkOP/s score, the device rows and the stages.
+fn print_results(results: &benchmark::BenchmarkSuite) {
     println!();
     // "STARK", not "Time": from protocol v4 a worker's duration is the STARK proving time and
     // EXCLUDES the Groth16 wrap, which is reported per card under "Proving stages" below.
@@ -289,8 +385,6 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
     }
 
     print_proving_stages(&results.device_benchmarks);
-
-    Ok(())
 }
 
 /// `1.6M c/s`, `72.8K c/s`, `950 c/s`.

@@ -1,0 +1,351 @@
+# Apple Silicon (Metal) builds and tests, run natively on the Mac (no Docker).
+#
+# Usage:  make -f Makefile.mac <target>        (make -f Makefile.mac help lists them)
+#
+#   mac-check           Check this Mac and its toolchains, then `cargo check` the Metal worker and the CLI
+#   mac-test-risc0      The risc0 fork's Metal conformance suites (zkp, rv32im, recursion, keccak, groth16);
+#                       each also runs alone as mac-test-risc0-<unit>
+#   mac-test-miner      zk-miner's macOS tests: the Metal worker's unit tests, discovery/dispatcher,
+#                       and one Warmup + Prove of the real worker over its IPC protocol
+#   mac-build-worker    Build zkminer-prove-risc0-metal and the zkminer CLI (release)
+#   mac-build-aot       Build this Mac's offline (AOT) Metal archive set for the built worker
+#   mac-install-worker  Install the worker and its offline Metal archives into $(PROVERS_DIR), and warm
+#                       its GPU pipelines once
+#   mac-bench           Run the worker's own benchmark (BENCH_ONLY=fibonacci for one program)
+#
+# Every target sources $(ENV_SH) when it exists (Metal compiler on PATH, the RISC Zero C++ guest
+# archiver; without it the toolchains on PATH are used, as on a CI runner with Xcode: RELEASE-DEPS.md),
+# sets NVCC=off HIPCC=off (sppark must not look for CUDA/HIP) and builds with -j $(JOBS) (at least 4).
+#
+# Where the risc0 crates come from (B9-DEP, RELEASE-DEPS.md): RISC0_SRC=
+#   git    the hemilabs/risc0 rev that Cargo.toml's [patch.crates-io] pins (what CI and releases build;
+#          no risc0 checkout needed)
+#   local  the risc0 checkout at $(RISC0_DIR), patched in with `cargo --config` (Cargo.toml is not
+#          edited). Cargo.lock is swapped for its local-path form for the duration of each recipe and
+#          restored afterwards, and cargo runs --locked, so the checkout must have the pinned rev's
+#          dependency graph (RISC0_LOCAL_LOCKED=0 drops --locked for a checkout whose graph differs).
+#   auto   (default) local when $(RISC0_DIR) holds a risc0 checkout, else git
+# Local layout:  <root>/zk-miner* (this repo)   <root>/deps/risc0-3.1 (the fork)   <root>/env.sh
+# Don't run two local-mode recipes in one checkout at once (they share Cargo.lock).
+# Override any of ZKMINER_ROOT, ENV_SH, RISC0_DIR, RISC0_SRC, PROVERS_DIR, JOBS on the command line.
+
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+MAKEFILE_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+ZKMINER_ROOT ?= $(abspath $(MAKEFILE_DIR)/..)
+ENV_SH       ?= $(ZKMINER_ROOT)/env.sh
+RISC0_DIR    ?= $(ZKMINER_ROOT)/deps/risc0-3.1
+RISC0_SRC    ?= auto
+RISC0_LOCAL_LOCKED ?= 1
+PROVERS_DIR  ?= $(HOME)/.zkminer/provers
+
+# Parallel jobs: $CARGO_BUILD_JOBS if set, else the performance-core count, never below 4
+# (no core count is assumed: a base M1 has 4 performance cores, an M5 Max 6).
+JOBS ?= $(shell n=$${CARGO_BUILD_JOBS:-$$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.physicalcpu)}; \
+          [ "$$n" -ge 4 ] 2>/dev/null && echo $$n || echo 4)
+
+WORKER     := zkminer-prove-risc0-metal
+WORKER_BIN := $(MAKEFILE_DIR)/target/release/$(WORKER)
+CLI_BIN    := $(MAKEFILE_DIR)/target/release/zkminer
+
+# Warm the installed worker's pipelines at install (1) or not (0); see mac-install-worker.
+WARM ?= 1
+# Offline (AOT) Metal archives (risc0 W7-Z1 tools/metal_aot; W7-M11, P31-M9b). mac-install-worker
+# builds this Mac's set for the built worker (mac-build-aot, into AOT_OUT; reused while the worker is
+# unchanged) and installs it beside the worker, so the first start loads its GPU pipelines instead of
+# compiling them (~95 s -> a few s on an M5 Max).
+#   AOT=0          build and install none (the first start compiles; a previous install's set is removed)
+#   AOT_SRC=<set>  install that prebuilt set instead (tools/metal_aot/build_all.py output)
+#   AOT_ARCHES     the GPU families mac-build-aot builds (default: this Mac's)
+#   AOT_VALIDATED  the families whose archives were validated on hardware (risc0 tools/metal_aot
+#                  README); another Mac installs none and compiles at first start, as before
+#   AOT_JOBS       archive units built at once (default 3; ~2.2 GB of RAM for the rv32im one)
+AOT           ?= 1
+AOT_SRC       ?=
+AOT_ARCHES    ?=
+AOT_VALIDATED ?= applegpu_g17s
+AOT_OUT       ?= $(MAKEFILE_DIR)/target/metal-aot
+AOT_JOBS      ?= 3
+# Run the real worker over IPC in mac-test-miner (1) or skip it (0).
+MINER_IPC ?= 1
+
+# ---------------------------------------------------------------------------------------------
+# risc0 source (B9-DEP). The pinned rev is read from Cargo.toml, so it is written in one place.
+RISC0_REV := $(shell sed -n 's/^risc0-zkvm = { git = "https:\/\/github.com\/hemilabs\/risc0", rev = "\([0-9a-f]*\)" }.*/\1/p' "$(MAKEFILE_DIR)/Cargo.toml")
+ifeq ($(RISC0_SRC),auto)
+RISC0_MODE := $(if $(wildcard $(RISC0_DIR)/risc0/zkvm/Cargo.toml),local,git)
+else
+RISC0_MODE := $(RISC0_SRC)
+endif
+ifeq ($(filter $(RISC0_MODE),git local),)
+$(error RISC0_SRC must be git, local or auto (got '$(RISC0_SRC)'))
+endif
+# The crates Cargo.toml's [patch.crates-io] takes from hemilabs/risc0, with their directories in the fork.
+RISC0_PATCHED := risc0-zkvm:risc0/zkvm risc0-build:risc0/build risc0-zkp:risc0/zkp risc0-sys:risc0/sys \
+	risc0-core:risc0/core risc0-binfmt:risc0/binfmt risc0-build-kernel:risc0/build_kernel \
+	risc0-groth16:risc0/groth16 risc0-groth16-sys:risc0/groth16-sys \
+	risc0-circuit-rv32im:risc0/circuit/rv32im risc0-circuit-rv32im-sys:risc0/circuit/rv32im-sys \
+	risc0-circuit-recursion:risc0/circuit/recursion risc0-circuit-recursion-sys:risc0/circuit/recursion-sys \
+	risc0-circuit-keccak:risc0/circuit/keccak risc0-circuit-keccak-sys:risc0/circuit/keccak-sys \
+	risc0-zkos-v1compat:risc0/zkos/v1compat risc0-zkvm-platform:risc0/zkvm/platform
+RISC0_ABS := $(abspath $(RISC0_DIR))
+RISC0_LOCAL_CONFIG := $(foreach c,$(RISC0_PATCHED),--config 'patch.crates-io.$(word 1,$(subst :, ,$(c))).path="$(RISC0_ABS)/$(word 2,$(subst :, ,$(c)))"')
+
+# Cargo.lock in local mode: the committed (git) lock with the fork's git source lines dropped, and the
+# two zkrs crates (crates.io in git mode) as the fork's path crates with unused crates.io patches,
+# which is byte for byte what cargo itself writes for the local patches (B9-DEP note).
+define RISC0_LOCAL_LOCK_AWK
+/^\[\[package\]\]/ { name = "" }
+/^name = / { name = $$3 }
+$$0 == "source = \"git+https://github.com/hemilabs/risc0?rev=" rev "#" rev "\"" { next }
+(name == "\"risc0-circuit-recursion-zkrs\"" || name == "\"risc0-circuit-recursion-control-zkrs\"") && (/^source = / || /^checksum = /) { next }
+{ print }
+END {
+  print ""
+  print "[[patch.unused]]"; print "name = \"risc0-circuit-recursion-control-zkrs\""; print "version = \"4.1.0\""; print "source = \"registry+https://github.com/rust-lang/crates.io-index\""
+  print ""
+  print "[[patch.unused]]"; print "name = \"risc0-circuit-recursion-zkrs\""; print "version = \"4.1.0\""; print "source = \"registry+https://github.com/rust-lang/crates.io-index\""
+}
+endef
+export RISC0_LOCAL_LOCK_AWK
+
+ifeq ($(RISC0_MODE),local)
+# Swap in the local lock; the EXIT trap moves the committed one back whatever happens to the recipe.
+RISC0_LOCAL_BEGIN = [ -f "$(RISC0_DIR)/risc0/zkvm/Cargo.toml" ] || { echo "Makefile.mac: RISC0_SRC=local but no risc0 checkout at $(RISC0_DIR)" >&2; exit 1; }; \
+	r0_saved=$$(mktemp "$${TMPDIR:-/tmp}/zkminer-Cargo.lock.XXXXXX"); cp "$(MAKEFILE_DIR)/Cargo.lock" "$$r0_saved"; \
+	trap 'mv -f "'"$$r0_saved"'" "$(MAKEFILE_DIR)/Cargo.lock"' EXIT; \
+	awk -v rev="$(RISC0_REV)" "$$RISC0_LOCAL_LOCK_AWK" "$$r0_saved" > "$(MAKEFILE_DIR)/Cargo.lock"; \
+	echo "Makefile.mac: risc0 from the local checkout $(RISC0_DIR) ($$(git -C "$(RISC0_DIR)" rev-parse --short HEAD 2>/dev/null); Cargo.toml pins $(RISC0_REV))" >&2;
+MCARGO_FLAGS = $(RISC0_LOCAL_CONFIG)
+MLOCKED = $(if $(filter 1,$(RISC0_LOCAL_LOCKED)),--locked,)
+else
+RISC0_LOCAL_BEGIN = echo "Makefile.mac: risc0 from hemilabs/risc0 @ $(RISC0_REV) (git; RISC0_SRC=local builds the checkout at $(RISC0_DIR))" >&2;
+MCARGO_FLAGS =
+MLOCKED = --locked
+endif
+
+# Prefix of every recipe that runs cargo or the worker. env.sh is sourced before `set -e`
+# (its last line is a conditional export that may return 1). Without env.sh (a CI runner), the Metal
+# compiler comes from Xcode through xcrun and the RISC Zero toolchains from rzup (RELEASE-DEPS.md).
+CARGO_ENV = if [ -f "$(ENV_SH)" ]; then source "$(ENV_SH)"; \
+	else echo "Makefile.mac: no $(ENV_SH): using the toolchains on PATH and xcrun (RELEASE-DEPS.md)" >&2; fi; set -eo pipefail; \
+	if [ -n "$${RISC0_SKIP_BUILD:-}" ]; then echo "Makefile.mac: unset RISC0_SKIP_BUILD (it builds empty guest ELFs)" >&2; exit 1; fi; \
+	if [ -n "$${MACOSX_DEPLOYMENT_TARGET:-}" ]; then echo "Makefile.mac: unset MACOSX_DEPLOYMENT_TARGET: the Metal compiler would target it while risc0's kernel cache key ignores it (a library cached for another macOS would be reused), and with the release profile's strip it breaks the proc-macros; scripts/ci/assemble-macos.sh sets the minimum macOS (ZKMINER_MACOS_MIN, docs/macos-beta.md)" >&2; exit 1; fi; \
+	export NVCC=off HIPCC=off CARGO_BUILD_JOBS=$(JOBS);
+# The risc0 tree the worker builds from, for the AOT archive build (its tools/metal_aot, and dump tests
+# built in that tree's own workspace): the local checkout; in git mode, a copy of cargo's checkout of the
+# pinned rev (under $CARGO_HOME/git/checkouts, never modified) in target/aot-risc0-<rev>, in which the
+# two zkrs.tar.xz Git LFS pointer files are replaced by the crates.io 4.1.0 tarballs the build uses,
+# each checked against its pointer's sha256 (risc0-circuit-keccak depends on risc0-circuit-recursion, so
+# the dump tests build the zkrs crates of that workspace, which refuse an LFS pointer).
+ifeq ($(RISC0_MODE),local)
+RISC0_TREE = echo "$(RISC0_ABS)"
+else
+define RISC0_AOT_TREE_PY
+import hashlib, json, os, re, shutil, subprocess, sys
+dest = sys.argv[1]
+meta = json.loads(subprocess.run(['cargo', 'metadata', '-q', '--locked', '--format-version', '1'],
+                                 check=True, capture_output=True, text=True).stdout)
+def root(p):
+    return os.path.dirname(os.path.dirname(os.path.dirname(p['manifest_path'])))
+fork = [root(p) for p in meta['packages']
+        if p['name'] == 'risc0-zkvm' and (p['source'] or '').startswith('git+https://github.com/hemilabs/risc0?')]
+if len(fork) != 1:
+    sys.exit('Makefile.mac: risc0-zkvm does not resolve to one hemilabs/risc0 git checkout: %r' % fork)
+zkrs = {p['name']: os.path.dirname(p['manifest_path']) for p in meta['packages']
+        if p['name'] in ('risc0-circuit-recursion-zkrs', 'risc0-circuit-recursion-control-zkrs')
+        and (p['source'] or '').startswith('registry+')}
+if len(zkrs) != 2:
+    sys.exit('Makefile.mac: the zkrs crates are not the crates.io ones: %r' % zkrs)
+if not os.path.isfile(os.path.join(dest, '.aot-tree-ok')):
+    tmp = dest + '.tmp'
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copytree(fork[0], tmp, symlinks=True)
+    for name, crate in sorted(zkrs.items()):
+        sub = name.replace('risc0-circuit-', '')
+        ptr = os.path.join(tmp, 'risc0', 'circuit', sub, 'src', 'zkrs.tar.xz')
+        oid = re.search(rb'oid sha256:([0-9a-f]{64})', open(ptr, 'rb').read())
+        data = open(os.path.join(crate, 'src', 'zkrs.tar.xz'), 'rb').read()
+        if not oid or hashlib.sha256(data).hexdigest() != oid.group(1).decode():
+            sys.exit('Makefile.mac: %s: the crates.io zkrs.tar.xz does not match the LFS pointer of the fork' % name)
+        os.chmod(ptr, 0o644)
+        open(ptr, 'wb').write(data)
+    open(os.path.join(tmp, '.aot-tree-ok'), 'w').write(fork[0] + '\n')
+    shutil.rmtree(dest, ignore_errors=True)
+    os.rename(tmp, dest)
+print(dest)
+endef
+export RISC0_AOT_TREE_PY
+RISC0_TREE = cd "$(MAKEFILE_DIR)" && python3 -I -c "$$RISC0_AOT_TREE_PY" "$(MAKEFILE_DIR)/target/aot-risc0-$(RISC0_REV)"
+endif
+CARGO = cargo
+# cargo in this workspace, with the risc0 source of $(RISC0_MODE) mode; recipes using it start with $(MINER).
+MCARGO = cargo $(MCARGO_FLAGS)
+MINER = cd "$(MAKEFILE_DIR)" && $(RISC0_LOCAL_BEGIN)
+FORK  = { [ -f "$(RISC0_DIR)/risc0/zkvm/Cargo.toml" ] || { echo "Makefile.mac: the fork's suites need a risc0 checkout at $(RISC0_DIR) (pass RISC0_DIR=...)" >&2; exit 1; }; } && cd "$(RISC0_DIR)" &&
+
+.PHONY: help mac-check mac-prereqs mac-test-risc0 mac-test-risc0-zkp mac-test-risc0-rv32im \
+	mac-test-risc0-recursion mac-test-risc0-keccak mac-test-risc0-groth16 mac-test-miner \
+	mac-build-worker mac-build-aot mac-install-worker mac-bench
+
+help:
+	@echo "Apple Silicon (Metal) targets (make -f Makefile.mac <target>):"
+	@echo "  mac-check           - check this Mac and its toolchains, cargo check the Metal worker and CLI"
+	@echo "  mac-test-risc0      - the risc0 fork's Metal suites (also mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16})"
+	@echo "  mac-test-miner      - zk-miner macOS tests (worker unit tests, discovery/dispatcher, IPC prove; MINER_IPC=0 skips the last)"
+	@echo "  mac-build-worker    - release build of $(WORKER) and zkminer"
+	@echo "  mac-build-aot       - this Mac's offline Metal archive set for the built worker, into $(AOT_OUT)"
+	@echo "                        (AOT_ARCHES=<family ...> builds others)"
+	@echo "  mac-install-worker  - install $(WORKER) and its offline Metal archives into $(PROVERS_DIR), and warm"
+	@echo "                        its pipelines (WARM=0 skips; AOT=0 installs no archives; AOT_SRC=<set> installs that set)"
+	@echo "  mac-bench           - the worker's own benchmark (BENCH_ONLY=fibonacci for one program)"
+	@echo ""
+	@echo "Settings: ENV_SH=$(ENV_SH)"
+	@echo "          RISC0_SRC=$(RISC0_SRC) -> $(RISC0_MODE) (git: hemilabs/risc0 @ $(RISC0_REV); local: RISC0_DIR)"
+	@echo "          RISC0_DIR=$(RISC0_DIR)"
+	@echo "          PROVERS_DIR=$(PROVERS_DIR)  JOBS=$(JOBS)"
+
+# ---------------------------------------------------------------------------------------------
+# mac-check: what the worker itself requires (PLAN 9.1: Apple Silicon, >= 16 GB; refused: Intel
+# Macs, Rosetta, 8 GB Macs incl. the A18 Pro MacBook Neo), the Metal compiler, the RISC Zero
+# toolchains, the fork; then a cargo check of the Metal worker and the CLI.
+mac-prereqs:
+	@set -eo pipefail; fail=0; \
+	ok()  { printf '  ok    %s\n' "$$*"; }; \
+	bad() { printf '  FAIL  %s\n' "$$*"; fail=1; }; \
+	warn(){ printf '  warn  %s\n' "$$*"; }; \
+	echo "Mac:"; \
+	[ "$$(uname -s)" = Darwin ] && ok "macOS $$(sw_vers -productVersion 2>/dev/null)" || bad "not macOS ($$(uname -s))"; \
+	[ "$$(uname -m)" = arm64 ] && ok "arm64" || bad "not Apple Silicon ($$(uname -m)): Intel Macs are not supported"; \
+	[ "$$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 0 ] && ok "native (not under Rosetta)" || bad "this shell runs under Rosetta: use a native arm64 terminal"; \
+	mem=$$(sysctl -n hw.memsize); gib=$$((mem >> 30)); \
+	[ "$$mem" -ge $$((12 << 30)) ] && ok "$$gib GiB RAM ($$(sysctl -n machdep.cpu.brand_string))" \
+	  || bad "$$gib GiB RAM: Macs with 8 GB are not supported (the worker refuses them)"; \
+	echo "Toolchains:"; \
+	if [ -f "$(ENV_SH)" ]; then ok "env.sh: $(ENV_SH)"; source "$(ENV_SH)" || true; else warn "no env.sh at $(ENV_SH): using the toolchains on PATH and xcrun (RELEASE-DEPS.md)"; fi; \
+	if [ -n "$${RISC0_SKIP_BUILD:-}" ]; then bad "RISC0_SKIP_BUILD is set: unset it (it builds empty guest ELFs)"; fi; \
+	if v=$$(xcrun --sdk macosx metal --version 2>/dev/null | head -1) && [ -n "$$v" ]; then ok "Metal compiler: $$v ($$(command -v metal || echo via xcrun))"; \
+	  else bad "no Metal shader compiler (xcrun --sdk macosx metal): install Xcode's Metal Toolchain, see the README"; fi; \
+	command -v cargo >/dev/null && ok "$$(cd "$(MAKEFILE_DIR)" && cargo --version)" || bad "cargo not on PATH"; \
+	if p=$${PROTOC:-$$(command -v protoc)} && [ -x "$$p" ]; then ok "protoc: $$p ($$("$$p" --version 2>/dev/null))"; \
+	  else bad "no protoc (risc0-groth16's circom-witnesscalc build needs it): brew install protobuf, or set PROTOC"; fi; \
+	ls -d "$${RISC0_HOME:-$$HOME/.risc0}"/toolchains/*-rust-aarch64-apple-darwin >/dev/null 2>&1 && ok "RISC Zero Rust toolchain (rzup install rust)" \
+	  || bad "no RISC Zero Rust toolchain: rzup install rust"; \
+	if [ -n "$${AR_riscv32im_risc0_zkvm_elf:-}" ]; then ok "RISC Zero C++ toolchain archiver (AR_riscv32im_risc0_zkvm_elf)"; \
+	  else warn "no AR_riscv32im_risc0_zkvm_elf (rzup install cpp): only the fork's risc0-zkvm tests need it"; fi; \
+	ls "$${RISC0_HOME:-$$HOME/.risc0}"/extensions/v0.2.0-risc0-groth16/stark_verify_final.zkey >/dev/null 2>&1 || [ -n "$${RISC0_GROTH16_DIR:-}" ] \
+	  && ok "risc0-groth16 component" || warn "no risc0-groth16 component yet: the worker downloads it (2.4 GB) at its first Warmup"; \
+	command -v docker >/dev/null && warn "docker found: not needed, the Groth16 wrap runs natively on Metal" || ok "no Docker needed (native Metal Groth16)"; \
+	echo "risc0 ($(RISC0_MODE) mode, RISC0_SRC=$(RISC0_SRC)):"; \
+	if [ -z "$(RISC0_REV)" ]; then bad "no hemilabs/risc0 rev found in Cargo.toml's risc0-zkvm patch"; fi; \
+	if [ "$(RISC0_MODE)" = git ]; then ok "hemilabs/risc0 @ $(RISC0_REV) (cargo fetches it; no checkout needed)"; \
+	elif [ -f "$(RISC0_DIR)/risc0/zkvm/Cargo.toml" ]; then \
+	  head=$$(git -C "$(RISC0_DIR)" rev-parse HEAD 2>/dev/null || echo unknown); \
+	  ok "local checkout $(RISC0_DIR) ($$(git -C "$(RISC0_DIR)" rev-parse --abbrev-ref HEAD 2>/dev/null) $${head:0:9})"; \
+	  [ "$$head" = "$(RISC0_REV)" ] || warn "the checkout is at $${head:0:9}, Cargo.toml pins $(RISC0_REV): a local build is not the pinned build"; \
+	  [ -z "$$(git -C "$(RISC0_DIR)" status --porcelain --untracked-files=no 2>/dev/null)" ] || warn "the checkout has uncommitted changes"; \
+	else bad "RISC0_SRC=local but no risc0 checkout at $(RISC0_DIR)"; fi; \
+	echo "Build: -j $(JOBS), NVCC=off HIPCC=off"; \
+	exit $$fail
+
+mac-check: mac-prereqs
+	@$(CARGO_ENV) $(MINER) \
+	$(MCARGO) check $(MLOCKED) -p zkminer-prove-risc0 --features metal --bin $(WORKER) && \
+	$(MCARGO) check $(MLOCKED) -p zkminer-cli
+
+# ---------------------------------------------------------------------------------------------
+# The fork's Metal suites (PLAN 2.10), run in $(RISC0_DIR) under the default parallel harness.
+# Each compares the Metal backend with the CPU backend (bit-exact) or verifies Metal proofs.
+mac-test-risc0: mac-test-risc0-zkp mac-test-risc0-rv32im mac-test-risc0-recursion mac-test-risc0-keccak mac-test-risc0-groth16
+
+mac-test-risc0-zkp:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-zkp --features metal --lib -- hal::metal
+
+mac-test-risc0-rv32im:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-circuit-rv32im --features metal --lib -- prove::
+
+mac-test-risc0-recursion:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-circuit-recursion --features metal --lib
+
+mac-test-risc0-keccak:
+	@$(CARGO_ENV) $(FORK) $(CARGO) test --locked -p risc0-circuit-keccak --release --features metal --lib
+
+# groth16-sys: bn254, NTT, MSM and the prover vs arkworks; groth16: native wraps verified
+# (needs the risc0-groth16 component, ~/.risc0/extensions or RISC0_GROTH16_DIR).
+mac-test-risc0-groth16:
+	@$(CARGO_ENV) $(FORK) \
+	$(CARGO) test --locked -p risc0-groth16-sys --features metal --lib && \
+	$(CARGO) test --locked -p risc0-groth16 --features metal --lib
+
+# ---------------------------------------------------------------------------------------------
+mac-test-miner:
+	@$(CARGO_ENV) $(MINER) \
+	$(MCARGO) test $(MLOCKED) --release -p zkminer-prove-risc0 --features metal --bin $(WORKER) && \
+	$(MCARGO) test $(MLOCKED) -p zkminer-prover --lib -- discovery:: dispatcher:: && \
+	if [ "$(MINER_IPC)" = 1 ]; then \
+	  $(MCARGO) test $(MLOCKED) --release -p zkminer-prove-risc0 --features metal --test metal_worker -- --ignored --nocapture; \
+	else echo "MINER_IPC=0: skipped the worker IPC test"; fi
+
+# ---------------------------------------------------------------------------------------------
+mac-build-worker:
+	@$(CARGO_ENV) $(MINER) \
+	$(MCARGO) build $(MLOCKED) --release -j $(JOBS) -p zkminer-prove-risc0 --features metal --bin $(WORKER) && \
+	$(MCARGO) build $(MLOCKED) --release -j $(JOBS) -p zkminer-cli && \
+	ls -l "$(WORKER_BIN)" "$(CLI_BIN)"
+
+# P31-M9b: the offline archive set of the built worker (scripts/mac/build-metal-aot.sh): metallibs
+# extracted from the worker binary, kernel names from risc0's dump tests (built once per risc0 kernel
+# set under target/aot-dump, never in $(RISC0_DIR)'s target), archives built with metal-tt (the Metal
+# toolchain from env.sh; minutes and ~170 MB per family). Reused while the worker is unchanged.
+mac-build-aot: mac-build-worker
+	@$(CARGO_ENV) export RISC0_DIR="$$($(RISC0_TREE))" AOT_JOBS=$(AOT_JOBS); \
+	"$(MAKEFILE_DIR)/scripts/mac/build-metal-aot.sh" "$(WORKER_BIN)" "$(AOT_OUT)" $(AOT_ARCHES)
+
+# Copy, then rename over the old binary: a running worker keeps its (now unlinked) file, and
+# macOS never sees a signed binary modified in place (which gets the process killed).
+# Then (P31-M9b, by default) this Mac's offline Metal archives, mac-build-aot's set or AOT_SRC's, go to
+# $(PROVERS_DIR)/metal-aot (scripts/mac/install-metal-aot.sh: only this Mac's family, only an
+# AOT_VALIDATED one, every file checksummed and of a metallib the worker embeds), and the worker
+# points RISC0_METAL_AOT_DIR at them, so the first start loads its pipelines instead of compiling
+# them (~95 s -> a few s on an M5 Max; ZKMINER_METAL_AOT=0 turns it off at run time).
+# With WARM=1 the installed worker then proves fibonacci once (`--benchmark`, which first builds
+# every circuit's GPU pipelines): minutes on a cold machine, seconds once the OS shader cache
+# and the keccak binary archive hold them, so the first real job does not pay for it.
+mac-install-worker: mac-build-worker
+	@set -eo pipefail; mkdir -p "$(PROVERS_DIR)"; \
+	tmp="$(PROVERS_DIR)/.$(WORKER).tmp.$$$$"; \
+	cp "$(WORKER_BIN)" "$$tmp" && chmod 755 "$$tmp" && mv -f "$$tmp" "$(PROVERS_DIR)/$(WORKER)"; \
+	echo "installed $(PROVERS_DIR)/$(WORKER)"
+	@set -eo pipefail; inst="$(PROVERS_DIR)/$(WORKER)"; \
+	drop() { if [ -d "$(PROVERS_DIR)/metal-aot" ]; then rm -rf "$(PROVERS_DIR)/metal-aot"; \
+	  echo "$$1: removed the offline Metal archives of the previous install (built for another worker)"; fi; \
+	  echo "$$1: no offline Metal archives installed (the first start compiles the GPU pipelines, ~1.5 min on an M5 Max)"; }; \
+	if [ "$(AOT)" = 0 ]; then drop "AOT=0"; \
+	elif [ -n "$(AOT_SRC)" ]; then \
+	  "$(MAKEFILE_DIR)/scripts/mac/install-metal-aot.sh" "$(AOT_SRC)" "$$inst" $(AOT_VALIDATED); \
+	else \
+	  arch=$$("$$inst" --metal-arch) || { echo "mac-install-worker: $$inst --metal-arch failed" >&2; exit 1; }; \
+	  case " $(AOT_VALIDATED) " in \
+	  *" $$arch "*) \
+	    ( $(CARGO_ENV) export RISC0_DIR="$$($(RISC0_TREE))" AOT_JOBS=$(AOT_JOBS); \
+	      "$(MAKEFILE_DIR)/scripts/mac/build-metal-aot.sh" "$(WORKER_BIN)" "$(AOT_OUT)" $(AOT_ARCHES) ) \
+	      || { echo "mac-install-worker: building the offline Metal archives failed (AOT=0 installs without them)" >&2; exit 1; }; \
+	    "$(MAKEFILE_DIR)/scripts/mac/install-metal-aot.sh" "$(AOT_OUT)" "$$inst" $(AOT_VALIDATED);; \
+	  *) drop "this Mac's GPU is $$arch, offline archives are validated on hardware only for $(AOT_VALIDATED) (risc0 tools/metal_aot README; AOT_VALIDATED=$$arch builds them anyway)";; \
+	  esac; \
+	fi
+	@if [ "$(WARM)" = 1 ]; then \
+	  $(CARGO_ENV) echo "warming the GPU pipelines (BENCH_ONLY=fibonacci $(PROVERS_DIR)/$(WORKER) --benchmark)"; \
+	  t0=$$(date +%s); BENCH_ONLY=fibonacci "$(PROVERS_DIR)/$(WORKER)" --benchmark; \
+	  echo "warm-up done in $$(( $$(date +%s) - t0 )) s"; \
+	else echo "WARM=0: pipelines not warmed (the first Warmup or job builds them)"; fi
+
+# The worker's own benchmark: the suite the miner sends (a discarded fibonacci warm-up, then five programs)
+# and the zkOP/s scoring proofs, ~4.5 min at po2 20 on an M5 Max. BENCH_ONLY=<name> runs the warm-up and
+# that one program (BENCH_ONLY=fibonacci: the warm-up alone, still wrapped and verified).
+mac-bench: mac-build-worker
+	@$(CARGO_ENV) \
+	$(if $(BENCH_ONLY),export BENCH_ONLY="$(BENCH_ONLY)";) \
+	echo "running $(WORKER_BIN) --benchmark$(if $(BENCH_ONLY), (BENCH_ONLY=$(BENCH_ONLY)))"; \
+	"$(WORKER_BIN)" --benchmark

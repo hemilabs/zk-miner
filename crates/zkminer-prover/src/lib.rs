@@ -7,6 +7,7 @@ pub mod dispatcher;
 pub mod engine;
 pub mod gpu_code;
 pub mod memory;
+pub mod metal_sizing;
 pub mod registry;
 #[cfg(windows)]
 mod windows_gpu_memory;

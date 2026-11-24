@@ -115,18 +115,130 @@ const CAP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The kernel's own estimate of what can be allocated without swapping — NOT `MemFree`, which
 /// excludes reclaimable page cache and on this box reads ~9 GB while 26 GB is actually available.
+///
+/// On macOS there is no `/proc`; see [`macos_mem_available_bytes`] for the equivalent estimate.
 #[cfg(not(windows))]
 pub fn mem_available_bytes() -> Option<u64> {
-    parse_meminfo_kb(
-        &std::fs::read_to_string("/proc/meminfo").ok()?,
-        "MemAvailable",
-    )
+    #[cfg(target_os = "macos")]
+    {
+        macos_mem_available_bytes()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parse_meminfo_kb(
+            &std::fs::read_to_string("/proc/meminfo").ok()?,
+            "MemAvailable",
+        )
+    }
 }
 
+/// `MemTotal` from `/proc/meminfo`, in bytes. On macOS, `sysctl hw.memsize`.
+///
+/// Known on macOS so the host-memory ledger's committed term (`can_admit`, `host_side_refusal`,
+/// `sp1_concurrent_capacity`, `worker_memory_ceiling_bytes`) works there as it does on Linux,
+/// instead of every caller's `unwrap_or(u64::MAX)` fail-open path.
 /// `MemTotal` from `/proc/meminfo`, in bytes.
 #[cfg(not(windows))]
 pub fn mem_total_bytes() -> Option<u64> {
-    parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u64("hw.memsize").filter(|&b| b > 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        parse_meminfo_kb(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
+    }
+}
+
+/// macOS's nearest equivalent of Linux's `MemAvailable`: pages that can be handed out without
+/// compressing or swapping anyone's anonymous memory, i.e. free pages, file-backed pageable pages
+/// (page cache, which the kernel drops on demand) and purgeable (volatile) pages, all read with
+/// `sysctlbyname` and multiplied by `vm.pagesize`. Capped at `hw.memsize`.
+///
+/// Deliberately NOT `kern.memorystatus_level`, the kernel's own "percent available": that counts
+/// anonymous memory the compressor could squeeze, and read 90% on a 36 GiB M5 Max whose
+/// anonymous pages held 16 GB — the ledger would have admitted proofs into the compressor.
+/// Anonymous memory is excluded here exactly as `MemAvailable` excludes it (without swap).
+#[cfg(target_os = "macos")]
+fn macos_mem_available_bytes() -> Option<u64> {
+    let page = sysctl_u64("vm.pagesize").filter(|&p| p > 0)?;
+    let pages = sysctl_u64("vm.page_free_count")?
+        .saturating_add(sysctl_u64("vm.page_pageable_external_count")?)
+        .saturating_add(sysctl_u64("vm.page_purgeable_count").unwrap_or(0));
+    let bytes = pages.saturating_mul(page);
+    Some(match mem_total_bytes() {
+        Some(total) => bytes.min(total),
+        None => bytes,
+    })
+}
+
+/// An integer `sysctl` by name (`hw.memsize`, `vm.page_free_count`, ...), whether the kernel stores
+/// it as 32 or 64 bits. `None` when the name does not exist or the value is not an integer.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut buf = [0u8; 8];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: `cname` is NUL-terminated; `buf` is writable for `len` bytes and the kernel writes at
+    // most `len` bytes and stores the written size back into `len`. No new value is set.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    match len {
+        4 => Some(u32::from_ne_bytes(buf[..4].try_into().ok()?) as u64),
+        8 => Some(u64::from_ne_bytes(buf)),
+        _ => None,
+    }
+}
+
+/// A string `sysctl` by name (`machdep.cpu.brand_string`, ...), trimmed of its NUL and whitespace.
+/// `None` when the name does not exist or the value is empty.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_string(name: &str) -> Option<String> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut len: libc::size_t = 0;
+    // SAFETY: a NULL `oldp` asks only for the size, which the kernel stores into `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` is writable for `len` bytes; the kernel writes at most that and updates `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    let s = String::from_utf8_lossy(&buf)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// Windows: `GlobalMemoryStatusEx`'s available physical memory, which, like `MemAvailable`, counts
@@ -146,6 +258,7 @@ pub fn mem_total_bytes() -> Option<u64> {
 ///
 /// Split out so the parse is testable without a particular host: the field order and the presence
 /// of `MemAvailable` both vary by kernel version.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn parse_meminfo_kb(text: &str, key: &str) -> Option<u64> {
     for line in text.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -429,7 +542,7 @@ pub fn peak_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> 
 ///
 /// `None` on the same terms as `peak_memory_of_pid`, and for the same reason: a figure from a cgroup
 /// we did not create describes something other than this worker.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn anon_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> {
     let cg = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
     let rel = cg.lines().next()?.rsplit_once("::").map(|(_, p)| p)?.trim();
@@ -444,7 +557,82 @@ pub fn anon_memory_of_pid(pid: u32, expected_unit: Option<&str>) -> Option<u64> 
     parse_memory_stat_anon(&std::fs::read_to_string(path).ok()?)
 }
 
+/// macOS: what a worker (and anything it forked into its process group) holds right now, as the
+/// kernel's `phys_footprint`, the figure Activity Monitor calls "Memory" and the one jetsam acts on.
+/// On unified memory it includes the GPU allocations the process made (IOAccelerator memory), which
+/// is right here: they come out of the same RAM that `mem_available_bytes` counts. `pid` is the
+/// group leader (every worker leads its own group). There are no cgroups, so `_expected_unit` has
+/// nothing to match; a pid that is not a live group leader answers `None`.
+#[cfg(target_os = "macos")]
+pub fn anon_memory_of_pid(pid: u32, _expected_unit: Option<&str>) -> Option<u64> {
+    let id = proc_identity(pid)?;
+    if id.pgid != pid as i32 {
+        return None;
+    }
+    macos_group_footprint(pid as i32).map(|f| f.current)
+}
+
+/// Sum of `phys_footprint` now, and of each member's lifetime peak, across a process group.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    pub current: u64,
+    /// Over-counts like the Linux `VmHWM` sum (members' peaks need not coincide): the safe direction.
+    pub peak: u64,
+}
+
+/// `Footprint` of process group `pgid` from `proc_listpids(PROC_PGRP_ONLY)` and
+/// `proc_pid_rusage(RUSAGE_INFO_V4)`, or `None` if no member could be read.
+#[cfg(target_os = "macos")]
+pub fn macos_group_footprint(pgid: i32) -> Option<Footprint> {
+    if pgid <= 0 {
+        return None;
+    }
+    const PROC_PGRP_ONLY: u32 = 2; // <sys/proc_info.h>
+    let mut buf = vec![0 as libc::pid_t; 256];
+    let bytes = (buf.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes and the call writes at most that many.
+    let n =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pgid as u32, buf.as_mut_ptr().cast(), bytes) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize / std::mem::size_of::<libc::pid_t>());
+    let mut total = Footprint {
+        current: 0,
+        peak: 0,
+    };
+    let mut found = false;
+    for pid in buf.into_iter().filter(|&p| p > 0) {
+        if let Some(f) = macos_pid_footprint(pid as u32) {
+            total.current = total.current.saturating_add(f.current);
+            total.peak = total.peak.saturating_add(f.peak);
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+/// `phys_footprint` and its lifetime maximum for one process (our own children need no privilege).
+#[cfg(target_os = "macos")]
+pub fn macos_pid_footprint(pid: u32) -> Option<Footprint> {
+    // SAFETY: plain old data; `proc_pid_rusage` fills at most one `rusage_info_v4`.
+    let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V4,
+            (&mut ri as *mut libc::rusage_info_v4).cast(),
+        )
+    };
+    (rc == 0).then_some(Footprint {
+        current: ri.ri_phys_footprint,
+        peak: ri.ri_lifetime_max_phys_footprint.max(ri.ri_phys_footprint),
+    })
+}
+
 /// The `anon` line of a cgroup v2 `memory.stat`, in bytes.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn parse_memory_stat_anon(text: &str) -> Option<u64> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("anon ") {
@@ -464,6 +652,12 @@ pub(crate) const CAP_UNIT_PREFIX: &str = "zkminer-";
 /// for an admission decision. `proc_root` is a parameter so the arithmetic is testable against a
 /// synthetic tree.
 pub fn process_group_peak_bytes(proc_root: &std::path::Path, pgid: i32) -> Option<u64> {
+    // macOS has no `/proc`: the real tree is asked of libproc (M6). A synthetic root (tests) still
+    // goes through the parser below.
+    #[cfg(target_os = "macos")]
+    if proc_root == std::path::Path::new("/proc") {
+        return macos_group_footprint(pgid).map(|f| f.peak);
+    }
     let entries = std::fs::read_dir(proc_root).ok()?;
     let mut total = 0u64;
     let mut found = false;
@@ -509,6 +703,7 @@ pub(crate) fn parent_of_stat(stat: &str) -> Option<i32> {
 ///
 /// The one field that makes a pid an identity rather than a number. Read past the last `)` so a
 /// `comm` containing spaces and parentheses cannot shift the offsets.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn starttime_of_stat(stat: &str) -> Option<u64> {
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     rest.split_whitespace().nth(19)?.parse().ok()
@@ -517,9 +712,76 @@ pub(crate) fn starttime_of_stat(stat: &str) -> Option<u64> {
 /// `(pid, starttime)` for a live process, or `None` if it is gone.
 ///
 /// Captured at spawn and re-checked before any signal: see `pid_is_our_worker`.
+///
+/// The unit is the platform's own and only ever compared for equality with another reading of the
+/// same process: clock ticks since boot on Linux (`/proc/<pid>/stat` field 22), microseconds since
+/// the epoch on macOS (`proc_bsdinfo.pbi_start_tv*`). Never 0 for a live process on either.
 #[cfg(unix)]
 pub fn pid_starttime(pid: u32) -> Option<u64> {
-    starttime_of_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+    Some(proc_identity(pid)?.start)
+}
+
+/// What the kernel says about a live process: enough to tell OUR worker from a stranger.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcIdentity {
+    pub(crate) ppid: i32,
+    pub(crate) pgid: i32,
+    /// See `pid_starttime` for the unit.
+    pub(crate) start: u64,
+}
+
+/// `ProcIdentity` from one short read of `/proc/<pid>/stat`, `None` if the process is gone.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn proc_identity(pid: u32) -> Option<ProcIdentity> {
+    if pid == 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some(ProcIdentity {
+        ppid: parent_of_stat(&stat)?,
+        pgid: group_of_stat(&stat)?,
+        start: starttime_of_stat(&stat)?,
+    })
+}
+
+/// `ProcIdentity` from `proc_pidinfo(PROC_PIDTBSDINFO)`, `None` if the process is gone (or reaped:
+/// the kernel then answers ESRCH, the same as for a pid that never existed).
+///
+/// macOS has no `/proc`. Before this existed every identity check answered "not ours", so the proving
+/// watchdog, `close` and preemption could never signal a Metal worker: a timed-out benchmark ran on to
+/// completion and the tests that time a worker out hung (M6). `proc_pidinfo` is the libproc call
+/// `ps` itself uses; it needs no privilege for our own children.
+#[cfg(target_os = "macos")]
+pub(crate) fn proc_identity(pid: u32) -> Option<ProcIdentity> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return None;
+    }
+    // SAFETY: `proc_bsdinfo` is plain old data, so all-zero is a valid value; `proc_pidinfo` writes
+    // at most `size` bytes into it and returns how many it wrote.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size || info.pbi_pid != pid {
+        return None;
+    }
+    let start = info
+        .pbi_start_tvsec
+        .saturating_mul(1_000_000)
+        .saturating_add(info.pbi_start_tvusec);
+    Some(ProcIdentity {
+        ppid: i32::try_from(info.pbi_ppid).ok()?,
+        pgid: i32::try_from(info.pbi_pgid).ok()?,
+        start: start.max(1),
+    })
 }
 
 /// Is this pid still OUR worker, rather than a stranger that inherited the number?
@@ -534,7 +796,8 @@ pub fn pid_starttime(pid: u32) -> Option<u64> {
 /// box could be their login session. `may_signal_group`'s own-pgid refusal does not help: it screens
 /// our group, not a stranger's.
 ///
-/// Two facts settle it, both from one short read of `/proc/<pid>/stat`:
+/// Two facts settle it, both from one short read of `/proc/<pid>/stat` (on macOS, one
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`; see `proc_identity`):
 ///
 /// * **Parent.** Every worker is a direct child of this process. A recycled pid belongs to something
 ///   the kernel gave the number to, whose parent is not us. (An unreaped zombie of ours still reads
@@ -551,11 +814,11 @@ pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
     if pid == 0 {
         return false;
     }
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Some(id) = proc_identity(pid) else {
         return false;
     };
     let ours = std::process::id() as i32;
-    if parent_of_stat(&stat) != Some(ours) || group_of_stat(&stat) != Some(pid as i32) {
+    if id.ppid != ours || id.pgid != pid as i32 {
         return false;
     }
     // The decisive check when we have it. Parent-and-group alone cannot distinguish our worker from
@@ -568,7 +831,7 @@ pub fn pid_is_our_worker(pid: u32, expected_starttime: Option<u64>) -> bool {
     // is still far better than the bare number, and it is the safe direction (we may fail to signal
     // a worker, rather than signal a stranger).
     match expected_starttime {
-        Some(expected) => starttime_of_stat(&stat) == Some(expected),
+        Some(expected) => id.start == expected,
         None => true,
     }
 }
@@ -1661,6 +1924,89 @@ pub(crate) fn volunteer_as_oom_victim() {
 }
 
 /// Does the protection actually reach the kernel? These spawn real processes and read `/proc`.
+
+/// The macOS figures the host-memory ledger runs on (`sysctl`, since there is no `/proc`).
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    /// M6: a worker's memory is readable on macOS (it was `None`, so admission charged a Mac
+    /// worker's resident memory as 0 and benchmarks never recorded a host peak). A child that leads
+    /// its own group and touches 256 MiB must show at least that, now and at peak.
+    #[test]
+    fn a_workers_footprint_is_read_from_its_process_group() {
+        use std::os::unix::process::CommandExt;
+        // Python-free: `dd` into a shell variable would not stay resident; `perl` holds it.
+        let mut child = std::process::Command::new("/usr/bin/perl")
+            .args(["-e", "my $x = 'a' x (256*1024*1024); sleep 30;"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn perl");
+        let pid = child.id();
+        let mut seen = None;
+        for _ in 0..200 {
+            seen = super::anon_memory_of_pid(pid, None).filter(|&b| b >= 256 << 20);
+            if seen.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let peak = super::process_group_peak_bytes(std::path::Path::new("/proc"), pid as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            seen.is_some(),
+            "footprint of a 256 MiB child: {:?}",
+            super::anon_memory_of_pid(pid, None)
+        );
+        assert!(peak.is_some_and(|p| p >= 256 << 20), "{peak:?}");
+        // Not a group leader (our own pid leads no group of its own here): no answer.
+        assert_eq!(
+            super::anon_memory_of_pid(std::process::id(), None).is_some(),
+            super::proc_identity(std::process::id())
+                .is_some_and(|i| i.pgid == std::process::id() as i32)
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn sysctl_reads_integers_and_strings() {
+        let total = sysctl_u64("hw.memsize").expect("hw.memsize");
+        assert!(total > 1 << 30, "implausible hw.memsize: {total}");
+        let page = sysctl_u64("vm.pagesize").expect("vm.pagesize");
+        assert!(page.is_power_of_two() && page >= 4096, "{page}");
+        // A 32-bit sysctl (`unsigned int` in the kernel) reads as well as the 64-bit `hw.memsize`.
+        let free = sysctl_u64("vm.page_free_count").expect("vm.page_free_count");
+        assert!(free.saturating_mul(page) <= total);
+        assert!(sysctl_string("machdep.cpu.brand_string").is_some_and(|b| !b.is_empty()));
+        assert_eq!(sysctl_u64("no.such.sysctl"), None);
+        assert_eq!(sysctl_string("no.such.sysctl"), None);
+    }
+
+    #[test]
+    fn memory_is_known_and_the_ledger_is_active() {
+        let total = mem_total_bytes().expect("hw.memsize");
+        assert_eq!(Some(total), sysctl_u64("hw.memsize"));
+        let avail = mem_available_bytes().expect("available estimate");
+        assert!(avail > 0 && avail <= total, "{avail} of {total}");
+        // The per-worker ceiling follows from a known total, as on Linux.
+        assert_eq!(
+            worker_memory_ceiling_bytes(DEFAULT_HOST_RESERVE_BYTES),
+            Some(total - DEFAULT_HOST_RESERVE_BYTES)
+        );
+        // With both figures known, the ledger admits a small proof and refuses one larger than the
+        // machine, instead of failing open on an unreadable host.
+        let ledger = MemoryLedger::default();
+        assert!(ledger
+            .try_reserve(1 << 20, 0, avail, total, DEFAULT_HOST_RESERVE_BYTES)
+            .is_some());
+        let ledger = MemoryLedger::default();
+        assert!(ledger
+            .try_reserve(total, 0, avail, total, DEFAULT_HOST_RESERVE_BYTES)
+            .is_none());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod live_tests {
     use super::*;
@@ -1668,6 +2014,9 @@ mod live_tests {
     /// A worker must volunteer as the OOM victim, and its CHILDREN must inherit that — the latter is
     /// the point, because `sp1-gpu-server` is forked by the SDK where we cannot reach it.
     #[test]
+    // Linux only: `oom_score_adj` and `/proc/self` do not exist on macOS, whose memory killer
+    // (jetsam) has no per-process knob an unprivileged parent can raise (M6).
+    #[cfg(target_os = "linux")]
     fn oom_score_adj_is_raised_and_inherited() {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
@@ -1807,6 +2156,9 @@ mod live_tests {
     /// The cap must land on the pid we already own, leaving its identity alone. If this ever starts
     /// reporting a different pid, every pid-keyed path in `worker.rs` is compromised.
     #[test]
+    // Linux only: the cap is a systemd transient scope's `MemoryMax`; macOS has neither systemd nor
+    // cgroups (`cap_process_memory` is a no-op there, see M6 note) (M6).
+    #[cfg(target_os = "linux")]
     fn capping_preserves_pid_identity_and_applies_a_real_limit() {
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")

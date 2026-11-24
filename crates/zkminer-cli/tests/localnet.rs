@@ -49,6 +49,19 @@
 //!   with the requester tools, its `publicValues` checked against that chain's state. See the
 //!   witness section.
 //!
+//! risc0 3.1 (P31-19, B9-CHAIN): the 743111 deployment of 2026-11-16 verifies risc0 3.1 receipts only
+//! (risc0-ethereum v3.1.0 `RiscZeroGroth16Verifier`, SELECTOR 0xe71e6620, the selector this build
+//! derives from the linked risc0, see `risc0_groth16_default_selector` in `run.rs`). So:
+//! - the replay tests replay a risc0 3.1 Groth16 receipt made by the Metal worker (the fibonacci
+//!   benchmark guest, [`FIXTURE_IMAGE_ID`]), under the build's own selector: no override;
+//! - `refuses_to_claim_without_a_matching_verifier` is the negative case: a miner configured with
+//!   the risc0 3.0 selector (0x73c457ba, acknowledged with `ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE=1`)
+//!   must refuse every risc0 claim (zkminer-chain refuses a 3.0 seal prefix before any eth_call);
+//! - the tests that prove with the real risc0 worker (`watch_only_reports_every_job`,
+//!   `mines_the_claimable_jobs`, `mines_on_every_gpu`) run whenever zkminer-chain pins a verifier for
+//!   the build's selector (it does: `pins::RISC0_V3_1_GROTH16_VERIFIER`). On macOS point
+//!   `ZKMINER_LOCALNET_RISC0_WORKER` at `target/release/zkminer-prove-risc0-metal`.
+//!
 //! All are ignored by default: they need anvil (Foundry), the workers, and the testnet RPC, which
 //! must serve state at the fork block (it does: it is an archive node). anvil caches what it
 //! fetches under `~/.foundry/cache/rpc`, so later runs at the same block are quicker.
@@ -111,7 +124,7 @@ use zkminer_contracts::bindings::{
 /// run the old deployment, and zkminer's startup checks refuse it. A later block is fine even once
 /// someone registers this test's programs on 743111 (their ids are content-derived): setup clears
 /// such a registration first (see [`register_program`]).
-const FORK_BLOCK: u64 = 7_226_550;
+const FORK_BLOCK: u64 = 7_234_420;
 const DEFAULT_FORK_URL: &str = "https://testnet.rpc.hemi.network/rpc";
 const HEMI: u128 = 1_000_000_000_000_000_000;
 /// The fibonacci guest's jobs prove fibonacci(FIB_N), unless `ZKMINER_LOCALNET_FIB_N` says otherwise
@@ -125,21 +138,50 @@ fn fib_n() -> u32 {
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or(FIB_N)
 }
-/// The contract suite's RISC Zero Groth16 receipt (hemiprove-contracts 3bc441dd8,
-/// `test/fixtures/RiscZeroTestReceipt.sol`, risc0-ethereum v3.1.0's `TestReceiptV3_1.sol`): risc0
-/// v3.1 Groth16, accepted by the `RiscZeroGroth16Verifier` (SELECTOR 0xe71e6620) for this image id
-/// and journal.
+/// The replayed receipt: a risc0 3.1 Groth16 receipt of the fibonacci benchmark guest (image id
+/// below, input 1000), made by the Metal worker (`zkminer-prove-risc0-metal --benchmark` with
+/// `ZKMINER_BENCH_RECEIPT_DIR`, B9-CHAIN 2026-11-17) and checked with the stock crates.io risc0-zkvm
+/// 3.1.0 verifier and by `eth_call` against the live 743111 `RiscZeroGroth16Verifier` (v3.1.0).
 const FIXTURE_IMAGE_ID: B256 =
-    alloy::primitives::b256!("c92414d80cdeb43ba0f4ff4882447c21f18b547d41ffa506a84da164e8e31f7d");
-const FIXTURE_JOURNAL: &[u8] = b"just a simple receipt";
-/// The fixture's 260-byte seal: the 4-byte selector, then the proof.
+    alloy::primitives::b256!("245dd297a191e76f29e9263832a6653d19e34f4ebbe0ca5ad8bbd14e8e3158aa");
+/// The fixture's journal: the guest's 8-byte commit (`4b60c05cc74d590b`).
+const FIXTURE_JOURNAL: &[u8] = &[0x4b, 0x60, 0xc0, 0x5c, 0xc7, 0x4d, 0x59, 0x0b];
+/// The fixture's 260-byte seal: the 4-byte selector (0xe71e6620), then the proof.
 const FIXTURE_SEAL_HEX: &str = concat!(
-    "e71e662021a0c81a5cc1c5cddabc3eefe6a3841315ad1a1cd74da3f34db1db91d01240a70b220d069e774da52f06c0d0ca166b21",
-    "9f0e1b0548a08270fa88f5e71a55bb2911fba8d9c52968295894f9b6e1804afcda16b66956ad973a290cb8d6736813502b336b4e",
-    "c0382ab1a7508781f3e1a8d7ea73d4491382cae39ec9f14aff07f53623bc5d3d6a718a686588bd6027b1713110031c85fa34117a",
-    "4fed94d98a41fe8e0bcf572d3389eedcc34ec00bd1aa571b0bcaa80af13b30bf3cb26741e56deabb23d1abf7efdfba3f55523687",
-    "ce10ef220c8d6d879f2e9161684f044e6e3597a2087d050b687d2242476dde08f789d726635f51ccd6fc216091297f0b7b416a6a",
+    "e71e6620146c454daa44bad2f5d36d5477dc27c2b64fd4d3f4f602457547b084f6b86e0a15d0c20accf4de29f0bc86efd99b5daa",
+    "18f1ddd867ef8f05dc8d838f187d01b3109493f74fcee83b89af088c5ac2ebcc1eb8313c0b140f6c11d5e50da2eacedb0ecbe8c7",
+    "79b336b5976a31e9305f0a64396f2378766a906951290c04cc4db32902c5dca5357b00358c74f80889414fa610501840d0f9c88c",
+    "a534d6ae62bd6d380a33174af80706d2598ac6fc60a56f8a83c6a9018115aa9cf229fb9245bfcd961b5a3b2317d60ac7e563a8f7",
+    "ef69b9dd6108f6c67bd2a4df735319fa400ed8890aef08f62664338e766b0fbda032d6f57e3d234b9e1b6c0818e036b463dd0bab",
 );
+
+/// This build's default RISC Zero seal selector, derived as `run.rs` derives it from the linked risc0.
+fn build_selector() -> [u8; 4] {
+    use risc0_zkvm::sha::Digestible;
+    let d = risc0_zkvm::Groth16ReceiptVerifierParameters::default().digest();
+    d.as_bytes()[..4].try_into().unwrap()
+}
+
+/// Whether the real risc0 worker's proofs can verify on the fork: zkminer-chain pins an audited
+/// verifier for this build's seal selector (`deployment::risc0_verifier_pin`, B9-ZK), so the gate
+/// follows the pin: on risc0 3.1 it opens by itself once `pins::RISC0_V3_1_GROTH16_VERIFIER` is
+/// filled. Until then (P31-19: the 743111 verifier is v3.0) the test reports SKIPPED unless
+/// `ZKMINER_LOCALNET_FORCE_RISC0=1`.
+fn risc0_proofs_verify_on_the_fork(test: &str) -> bool {
+    let pin = zkminer_chain::deployment::risc0_verifier_pin(build_selector());
+    if pin.is_ok() || env_flag("ZKMINER_LOCALNET_FORCE_RISC0") {
+        return true;
+    }
+    eprintln!(
+        "localnet: SKIPPED {test} (it did not run): this build's risc0 seals carry selector 0x{} and \
+         no verifier is pinned for it ({}), so every risc0 claim is refused; set \
+         ZKMINER_LOCALNET_FORCE_RISC0=1 on a fork with a matching verifier",
+        alloy::hex::encode(build_selector()),
+        pin.err().unwrap_or_default()
+    );
+    false
+}
+
 /// Every job but [`Case::HighCollateral`]'s is fixed-price at this.
 const JOB_PRICE: u128 = 5 * HEMI;
 const PROVER_STAKE: u128 = 1_000 * HEMI;
@@ -332,8 +374,13 @@ impl Case {
             Case::FullExclusiveForAnother => {
                 format!("assigned to prover {ANOTHER_PROVER}, and its exclusivity has not lapsed")
             }
-            // Staked or not, the quote's simulated claim reverts: the lock overruns the free stake
-            // (the staking contract's assert, Panic(0x01)) or there is no stake at all.
+            // Staked, the collateral cap sets it aside before any claim is simulated: its lock is
+            // over the share of the stake one job may lock (half, by default). With no stake the
+            // cap is not reached and the quote's simulated claim reverts.
+            Case::HighCollateral if staked => format!(
+                "binding satisfied; it would lock up to {} HEMI of collateral",
+                hemi(HIGH_COLLATERAL_PRICE * MAX_COLLATERAL_BPS as u128 / 10_000)
+            ),
             Case::HighCollateral => {
                 "binding satisfied; the claim would be refused (StakeShort)".into()
             }
@@ -1729,6 +1776,15 @@ impl Miner {
                 }
             }
         }
+        // A config that names a selector other than this build's (the 3.0 one, in
+        // `refuses_to_claim_without_a_matching_verifier`) is refused unless acknowledged (P31-19);
+        // acknowledge it so that the refusal under test is zkminer-chain's verifier pin.
+        if std::fs::read_to_string(config)
+            .map(|c| c.contains("risc0_groth16_selector"))
+            .unwrap_or(false)
+        {
+            cmd.env("ZKMINER_RISC0_SELECTOR_OVERRIDE_UNSAFE", "1");
+        }
         cmd.env("HOME", dir)
             .env("PATH", path_without_workers())
             .stdin(Stdio::null())
@@ -1965,6 +2021,9 @@ async fn watch_and_check(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the release risc0 worker and the 743111 RPC; see the module docs"]
 async fn watch_only_reports_every_job() {
+    if !risc0_proofs_verify_on_the_fork("watch_only_reports_every_job") {
+        return;
+    }
     let dir = RunDir::new("watch");
     let worker = risc0_worker();
     let program = Program::fibonacci(&worker, &dir.0);
@@ -2697,6 +2756,30 @@ async fn refuses_to_claim_while_its_adapter_is_disabled() {
     no_claims_after(world, dir, &config, &needle, 1, true).await;
 }
 
+/// P31-19 / B9-CHAIN, the 3.0 negative case: a miner whose seals carry the risc0 3.0 selector
+/// (0x73c457ba, configured and acknowledged) against the fork's risc0 3.1 verifier. Its startup check
+/// refuses risczero.groth16.v1 (`deployment::risc0_verifier_pin` refuses a 3.0 seal prefix before
+/// any verifier call), so the brain holds the job and nothing is sent: a claim would lock collateral
+/// for a fulfil that can only revert.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
+async fn refuses_to_claim_without_a_matching_verifier() {
+    let old = zkminer_chain::deployment::pins::RISC0_V3_0_SELECTOR;
+    assert_ne!(build_selector(), old, "this build proves risc0 3.1");
+    let dir = RunDir::new("selector");
+    let worker = mock_worker();
+    let world = World::new(&dir.0, Program::fixture(), &[Case::Full], Clock::Wall).await;
+    let config = world.write_config(&dir.0, &worker, false);
+    let mut c = ZkMinerConfig::load(Some(&config)).expect("read the miner config back");
+    c.prover.risc0_groth16_selector = Some(format!("0x{}", alloy::hex::encode(old)));
+    c.save(Some(&config)).expect("write the miner config");
+    let needle = format!(
+        "Skipping {}: risczero.groth16.v1 is not verified claimable right now",
+        short_id(world.jobs[0].id)
+    );
+    no_claims_after(world, dir, &config, &needle, 1, true).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs anvil, the mock worker and the 743111 RPC; see the module docs"]
 async fn refuses_to_claim_on_a_skewed_clock() {
@@ -2737,6 +2820,9 @@ async fn mines_the_claimable_jobs() {
         eprintln!(
             "localnet: SKIPPED the mining test (it did not run); set ZKMINER_LOCALNET_MINE=1 to run it"
         );
+        return;
+    }
+    if !risc0_proofs_verify_on_the_fork("mines_the_claimable_jobs") {
         return;
     }
     let timeout = Duration::from_secs(
@@ -2785,6 +2871,9 @@ async fn mines_on_every_gpu() {
         eprintln!(
             "localnet: SKIPPED the every-GPU test; set ZKMINER_LOCALNET_MINE_ALL=1 to run it"
         );
+        return;
+    }
+    if !risc0_proofs_verify_on_the_fork("mines_on_every_gpu") {
         return;
     }
     let timeout = Duration::from_secs(
@@ -3376,6 +3465,32 @@ async fn check_settlement(
                             "{:?}: claimed or fulfilled by another prover",
                             job.case
                         ));
+                    }
+                    // Handoff §4/§13 test 6: payout = settledPrice + speedBonus - 1% protocol fee
+                    // (100 bps on 743111), paid to the prover's wallet.
+                    let gross = U256::from(f.event.settledPrice) + f.event.speedBonus;
+                    let fee = gross * U256::from(100u64) / U256::from(10_000u64);
+                    if f.event.protocolFee != fee || f.event.proverPayout != gross - fee {
+                        failures.push(format!(
+                            "{:?}: JobFulfilled pays {} with fee {}, not settledPrice {} + \
+                             speedBonus {} - 1% ({} with fee {fee})",
+                            job.case,
+                            f.event.proverPayout,
+                            f.event.protocolFee,
+                            f.event.settledPrice,
+                            f.event.speedBonus,
+                            gross - fee
+                        ));
+                    } else {
+                        eprintln!(
+                            "localnet: {:?}: JobFulfilled payout {} = settledPrice {} + speedBonus \
+                             {} - fee {}",
+                            job.case,
+                            f.event.proverPayout,
+                            f.event.settledPrice,
+                            f.event.speedBonus,
+                            f.event.protocolFee
+                        );
                     }
                     if f.event.publicValues.as_ref() != world.program_of(job).journal.as_slice() {
                         failures.push(format!(

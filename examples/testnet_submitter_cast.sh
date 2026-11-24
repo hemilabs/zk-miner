@@ -1,4 +1,8 @@
 #!/bin/bash
+# STALE (B9-CHAIN, 2026-11-17): this script targets an abandoned 743111 stack and the old descriptor and
+# proof-system id ("risczero.v1"). The live deployment (2026-11-16) is router
+# 0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58, tHEMI 0x46955EdCF61b23a8c0b0d71428A9F1C07Bbf36cc, id
+# keccak256("risczero.groth16.v1"), a 10-field JobDescriptor and risc0 3.1 receipts. Kept for reference only.
 # Cast-based job submitter for the Hemi testnet HemiProve market (2026-07-14 deploy).
 # Submits the correct 9-field JobDescriptor via `submitJob` directly with `cast`
 # (the forge-script submitter compiled against stale 8-field source and reverts).

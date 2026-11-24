@@ -8,16 +8,17 @@ worth taking, claims the ones that are, generates the proof on a local GPU, and 
 it on-chain. Proving runs in separate worker processes — one per GPU — so a wedged or
 OOM-killed prover can't take the miner down with it.
 
-Backends: **RISC Zero** (CUDA, ROCm and Intel), **SP1**, **OpenVM**.
+Backends: **RISC Zero** (CUDA, ROCm, Intel, and Metal on Apple Silicon Macs), **SP1**, **OpenVM**.
 
 ## Requirements
 
 | | |
 |---|---|
-| Rust | 1.93.0 (pinned in `rust-toolchain.toml`) |
+| Rust | 1.97.1 (pinned in `rust-toolchain.toml`) |
 | RISC Zero toolchain | `rzup`, see below — **required to build, and to prove** |
 | CUDA | toolkit with `nvcc` (12.8–13.x tested) for NVIDIA workers |
 | ROCm | 6.4+ with `hipcc` for AMD workers |
+| Metal | macOS on Apple Silicon: the Metal shader compiler (`xcrun --sdk macosx metal`), see [macOS](#macos-apple-silicon-metal) |
 | oneAPI | DPC++/C++ compiler `icpx` (2026.0 tested) and `ocloc` (the `intel-ocloc` package, the same version as the installed compute runtime) for Intel workers; at run time the Level Zero loader, the compute runtime and `intel-ocloc` |
 | Build deps | `build-essential cmake pkg-config protobuf-compiler libclang-dev` (+ `libhipcub-dev librocthrust-dev` for ROCm) |
 | Foundry | `cast` — only for the example job submitters under `examples/` |
@@ -32,12 +33,37 @@ export PATH="$HOME/.risc0/bin:$PATH"
 rzup install rust
 ```
 
-Running needs RISC Zero's `risc0-groth16` component (the Groth16 proving key, 5.8 GB), but not
-`rzup`: the risc0 worker installs it in its one-time setup, before the miner claims any risc0 job,
-when `~/.risc0/extensions/v0.2.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It
-downloads the 2.4 GB archive rzup itself uses from RISC Zero's artifact store and checks its
-SHA-256 (`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16`
-installs the same files.
+Running needs RISC Zero's `risc0-groth16` component, version 0.2.0 for risc0 3.1 (the Groth16
+proving key of the 2026-10-20 setup; 5.8 GB installed), but not `rzup`: the risc0 worker installs
+it in its one-time setup, before the miner claims any risc0 job, when
+`~/.risc0/extensions/v0.2.0-risc0-groth16` (or `RISC0_GROTH16_DIR`) does not hold it. It downloads
+the 2.4 GB archive rzup itself uses from RISC Zero's artifact store and checks its SHA-256
+(`crates/zkminer-prove-risc0/src/groth16_component.rs`). `rzup install risc0-groth16` installs the
+same files. risc0 3.1 refuses the 3.0 component (`v0.1.0-risc0-groth16`), which can be deleted.
+
+### risc0 3.1 and the on-chain verifier
+
+zk-miner builds against risc0 **3.1** (risc0-zkvm 3.1.0, risc0-groth16 3.0.6,
+risc0-circuit-recursion 4.1.0; the GHSA-g6qg-9j8p-7j87 circuit and verifier fixes). Its Groth16
+seals carry the selector `0xe71e6620` and go on chain as risc0-ethereum-contracts 3.1.0's
+`encode_seal` makes them: 260 bytes, the selector then the 256-byte proof. The HemiProve deployment
+of 2026-11-16 on Hemi testnet (743111) verifies exactly these: its `risczero.groth16.v1` adapter wraps
+a risc0-ethereum v3.1.0 `RiscZeroGroth16Verifier` (`SELECTOR()` `0xe71e6620`). risc0 3.0 receipts
+(selector `0x73c457ba`) are refused there, and zkminer refuses to claim risc0 jobs with a 3.0
+selector (`prover.risc0_groth16_selector` left over in an old config: remove it).
+
+On macOS the Groth16 wrap runs natively on the Metal GPU (no Docker, no x86 host). risc0 falls back
+to its Docker prover only if Metal is unavailable or one of `RISC0_METAL=0`,
+`RISC0_METAL_SKIP=groth16` or `RISC0_GROTH16_METAL_PROVER=docker` is set: do not set them.
+
+Before claiming any risc0 job, `zkminer run` checks the chain end to end: the adapter and verifier
+code against their pins, `SELECTOR()` against the build's selector, and an `eth_call` of
+`Registry.verifyProof` with a known-good risc0 3.1 receipt from the Metal worker
+(`zkminer_chain::deployment::risc0_preflight`; `ZKMINER_SKIP_RISC0_RECEIPT_PREFLIGHT=1` skips that
+call).
+
+Workers and the CLI must come from the same tree: the CLI refuses a worker with another protocol
+version or another risc0 (`risc0-zkvm 3.0.x`) at the handshake.
 
 ## Build
 
@@ -98,6 +124,8 @@ Never set `RISC0_SKIP_BUILD=1` — it produces empty guest ELF stubs, and every
 benchmark then silently reports zero work.
 
 `make` wraps portable Docker builds: `make cli | cuda | rocm | sp1 | openvm | all | test`.
+On a Mac, `make -f Makefile.mac` builds, tests and installs the Metal worker natively, see
+[macOS](#macos-apple-silicon-metal).
 
 ## Install the workers
 
@@ -111,6 +139,7 @@ no error.**
 ├── zkminer-prove-risc0-rocm
 ├── zkminer-rocm/               (ROCm 7.1's HIP runtime, which the risc0 AMD prover loads)
 ├── zkminer-prove-risc0-intel
+├── zkminer-prove-risc0-metal    (macOS, Apple Silicon)
 ├── zkminer-intel/              (the Intel provers' libraries and Intel's compute runtime)
 ├── zkminer-prove-sp1
 ├── sp1-gpu-server
@@ -195,6 +224,238 @@ job does *not* source `~/.bashrc`), install a small wrapper script under the exp
 name that sets it up and then `exec`s the real binary — `exec` preserves the PID and
 process group the dispatcher relies on.
 
+## macOS (Apple Silicon, Metal)
+
+The RISC Zero worker also runs on Apple Silicon Macs, on the GPU through Metal:
+`zkminer-prove-risc0-metal`. It is built from the Metal port of the risc0 3.1 fork, which
+`Cargo.toml`'s `[patch.crates-io]` pins by git rev (hemilabs/risc0 branch `zkminer/metal-3.1`:
+hemilabs `release-3.1`, risc0 v3.1.0, with the Metal port merged onto it; one pin for every
+platform). `make -f Makefile.mac RISC0_SRC=local` builds against a checkout at `../deps/risc0-3.1`
+instead (`RELEASE-DEPS.md`). The
+segment proofs, the recursion and the Groth16 wrap run on the GPU (two steps still run on the CPU
+for now: the rv32im witness generation and the last recursion step before the wrap), and neither
+Docker nor a CUDA/ROCm toolkit is involved. SP1 and OpenVM have no Mac worker; the miner never gives an Apple
+GPU an SP1 slot.
+
+### Install the beta (prebuilt kit)
+
+The macOS beta ships as `zkminer-<version>-macos-arm64.tar.gz`, built by
+`scripts/ci/assemble-macos.sh`. It needs **macOS 26.0 (Tahoe) or later** on an Apple Silicon Mac
+with **16 GB or more**. It contains the CLI, the Metal worker, an installer, a
+smoke test (`tools/macos-smoke.sh`, run from the kit folder after `./install.sh --with-groth16`) and a
+README. It has no offline GPU pipeline archives (its `metal-aot/` is empty). The kit is about
+0.2 GB; the Groth16 component adds 5.8 GB (5.4 GiB), and about 8.3 GB must be free while it installs
+(its 2.4 GB archive and the unpacked files are on disk together).
+
+```sh
+shasum -a 256 -c --ignore-missing SHA256SUMS   # the release's SHA256SUMS, beside the tarball: "...: OK"
+tar -xzf zkminer-<version>-macos-arm64.tar.gz
+cd zkminer-<version>-macos-arm64
+./install.sh                    # ~/.zkminer/zkminer and ~/.zkminer/provers/; --help for options
+export PATH="$HOME/.zkminer:$PATH"
+zkminer init                    # testnet config; prints the next steps
+export ZKMINER_PRIVATE_KEY=0x... # then testnet ETH and tHEMI from the HemiProve team
+zkminer stake 100 && zkminer run
+```
+
+`zkminer init` is needed once, on the first install (`--with-groth16` or not); it leaves an existing
+config alone, so an update needs none. There is no `zkminer --version`:
+the kit's `BUILDINFO` names its version and commit, and `zkminer help` lists the commands.
+
+- **Unsigned.** The kit has no Developer ID and is not notarized. Download it only from the GitHub
+  release over HTTPS and check its SHA-256 against the release's `SHA256SUMS` before unpacking: the
+  kit's own `SHA256SUMS` only catches damage. `install.sh` checks the kit's
+  `SHA256SUMS` and removes `com.apple.quarantine` from the files it installs. To run a binary from the
+  kit directly, use `xattr -d com.apple.quarantine <file>`, or System Settings → Privacy & Security →
+  Open Anyway. Over SSH a quarantined binary hangs without output instead of showing a dialog.
+- **Groth16 component.** It is not in the kit (2.4 GB). The worker downloads it at its first warm-up,
+  checked against its pinned SHA-256; `./install.sh --with-groth16` fetches it at install time instead.
+- **First start.** Every Mac compiles its GPU pipelines once, at the worker's first start: about a
+  minute on an M5 Max (60.3 s measured for the beta) and longer on base M1-M4 chips. Later starts
+  take about 2.5 s from the cache.
+
+The kit's own `README.md` covers the details for users. Maintainers: see
+[docs/macos-beta.md](docs/macos-beta.md) for how the kit is built, why macOS 26, and which GPU
+families get archives.
+
+### Supported Macs
+
+| Tier | Hardware | What to expect |
+|---|---|---|
+| Not supported | Intel Macs; any Mac with 8 GB (including the A18 Pro MacBook Neo); an x86_64 build or a shell under Rosetta | The worker refuses, with the reason in its log: Capabilities reports no GPU, Prove, Warmup and Benchmark answer with the refusal, and `--benchmark` exits 2. Executing guests (job measurement) still works. |
+| Minimum | M1–M6 base chip with 16 GB (7–10 GPU cores) | po2 19 at the 8 GiB tier the miner gives it (po2 18 under a 4 GiB budget). Simulated on the M5 Max only, see the limitations below. |
+| Primary target | M4/M5 base (10 cores) with 24 GB; M4/M5 Pro with 24–48 GB | po2 19–20 |
+| High end | Max (36–128 GB), Ultra | po2 20 |
+
+The worker's check: an aarch64 build, not translated by Rosetta (`sysctl.proc_translated`), a Metal
+device with unified memory, and `hw.memsize` of at least 12 GiB (so 8 GB Macs are refused, and a
+16 GB Mac is never refused over rounding). It never assumes a core count or a share of RAM: it
+sizes everything from the device's `recommendedMaxWorkingSetSize` (about 75% of RAM; 28.1 GiB on a
+36 GB M5 Max), lowered by `RISC0_METAL_MAX_WORKING_SET_BYTES` if set and by the miner's own figure
+(`hw.memsize` minus an 8 GiB host reserve). Only a 36 GB M5 Max has been measured so far; the rows
+for smaller Macs come from budget runs on it.
+
+Default segment size (po2) when the job names none, and what risc0 3.1 measured at that size on
+the M5 Max (`--benchmark` of memory-merkle under `RISC0_METAL_MAX_WORKING_SET_BYTES`; Metal peak per
+phase, segments / recursion / Groth16 wrap; process peak footprint):
+
+| Working-set limit | po2 | STARK, memory-merkle | Wrap | Peak GPU memory, MiB | Footprint | Typical Mac |
+|---|---|---|---|---|---|---|
+| < 6 GiB (4 GiB measured) | 18 | 13.9 s (602K c/s) | 1.72 s | 2404 / 2199 / 3944 | 4.9 GB | 16 GB under a ~4 GB budget |
+| 6 to < 10 GiB (8 GiB) | 19 | 10.2 s (770K c/s) | 1.74 s | 4738 / 4337 / 5635 | 7.3 GB | 16 / 18 GB |
+| ≥ 10 GiB (28.1 GiB) | 20 | 8.35 s (879K c/s) | 1.58 s | 9437 / 9437 / 5635 | 13.2 GB | 24 GB and up |
+
+(The footprint model can keep a smaller po2 than the limit allows on a Mac with little RAM: a
+simulated 18 GB Mac proves at po2 19.) `--benchmark` at po2 20 proves main's suite: the discarded
+fibonacci warm-up and the five programs (154.5M cycles) in 169.6-171.1 s of STARK (903-911K c/s),
+each wrapped in 1.57-1.60 s, then the two zkOP/s scoring proofs of zkop-mix (4.2M and 61.9M cycles,
+no wrap) in 73 s: 254 s of wall time (BASELINES '3.1', W10-INT). The worker keeps the
+Groth16 proving key loaded between proofs only when the working-set limit holds the largest STARK
+phase, the resident key and 12 GiB of host headroom (`keep_groth16_cache` in
+`crates/zkminer-prover/src/metal_sizing.rs`: about 29.5 GiB at po2 20), so 36 GB Macs and smaller,
+the M5 Max above included, load the key for each wrap and free it after (it logs `Groth16 proving
+key released: ... MiB of device memory freed (prover layout ...)` per proof). A po2 larger than
+the limit allows is refused as ResourceExhausted instead of being swapped through (`ZKMINER_METAL_NO_PO2_CEILING=1` disables that, for diagnostics only).
+
+### Prerequisites
+
+- Rust from `rust-toolchain.toml`, and RISC Zero's guest toolchain (`rzup install rust`, see
+  [above](#risc-zero-toolchain-easy-to-miss)). The fork's own `risc0-zkvm` tests also need the C++
+  guest toolchain: `rzup install cpp` (`env.sh` below then points cargo at its archiver).
+- The **Metal shader compiler**. The Command Line Tools do not include it. With Xcode 26 or later,
+  download it as a component: `xcodebuild -downloadComponent MetalToolchain`. Check with
+  `xcrun --sdk macosx metal --version`; the fork's build scripts call exactly that, and stop with a
+  hint if it is missing. Release kits are compiled with Metal Toolchain 27B47 (`Apple metal version
+  32023.922`), the compiler the beta was validated with: `scripts/ci/fetch-metal-toolchain.sh`
+  fetches it (no Xcode needed), and `assemble-macos.sh` refuses metallibs from another compiler
+  unless `METAL_COMPILER_UNVALIDATED=1` is set.
+  Xcode 26's own component is another compiler build, whose GPU code was never validated
+  ([docs/macos-beta.md](docs/macos-beta.md), "Metal compiler").
+- Without Xcode (no admin rights, Command Line Tools only), the toolchain can be fetched the way
+  Xcode does it; this is how the development machine got it. Apple's downloadable index
+  (`index2.dvtdownloadableindex`) maps an Xcode build to its Metal Toolchain build (Xcode 27.2 →
+  27B47); Apple's asset server answers a `com.apple.MobileAsset.MetalToolchain` query for that build
+  with an encrypted archive and its key (no Apple ID); `aea decrypt` and `aa extract` give
+  `MetalToolchain-<build>.dmg`, and a user-level `hdiutil attach -nobrowse -readonly` mounts
+  `Metal.xctoolchain`. With its `usr/bin` on `PATH`, `xcrun --sdk macosx metal` finds it (if xcrun
+  keeps resolving an old path, `xcrun --kill-cache`). The exact requests are in
+  `deps/metal-toolchain/README.md` beside the fork on that machine.
+- No Docker, no CUDA, no ROCm. Builds set `NVCC=off HIPCC=off` so sppark looks for neither.
+
+### env.sh
+
+Source one small script before any cargo command. `Makefile.mac` sources it for you, from
+`ENV_SH` (default: `env.sh` in the directory that holds `zk-miner/` and `deps/`). On the
+development machine it is:
+
+```bash
+# ~/zkminer/env.sh
+export PATH="$HOME/.cargo/bin:$HOME/.risc0/bin:$PATH"
+# Metal shader compiler mounted from the toolchain dmg (skip this block if Xcode's component is installed).
+METAL_TC="$HOME/zkminer/deps/metal-toolchain/mnt/Metal.xctoolchain"
+if [ ! -x "$METAL_TC/usr/bin/metal" ]; then          # remount after a reboot
+  hdiutil attach -nobrowse -readonly -mountpoint "$HOME/zkminer/deps/metal-toolchain/mnt" \
+      "$HOME/zkminer/deps/metal-toolchain/MetalToolchain-27B47.dmg" >/dev/null || echo "WARN: could not mount Metal toolchain dmg" >&2
+fi
+export PATH="$METAL_TC/usr/bin:$PATH"
+# The C++ guest crates (the fork's risc0-zkvm tests) need RISC Zero's riscv32 archiver; without it
+# their link fails with undefined blst_* symbols.
+_R0_AR="$(ls -d "$HOME"/.risc0/toolchains/*-cpp-aarch64-apple-darwin/riscv32im-osx-arm64/bin/riscv32-unknown-elf-ar 2>/dev/null | tail -1)"
+[ -n "$_R0_AR" ] && export AR_riscv32im_risc0_zkvm_elf="$_R0_AR"
+```
+
+Never set `RISC0_SKIP_BUILD` (the Makefile refuses to run with it).
+
+### Build, test, install: `Makefile.mac`
+
+```bash
+make -f Makefile.mac mac-check            # this Mac and its toolchains, then cargo check
+make -f Makefile.mac mac-build-worker     # target/release/zkminer-prove-risc0-metal and zkminer
+make -f Makefile.mac mac-install-worker   # into ~/.zkminer/provers, then warm the GPU pipelines
+make -f Makefile.mac mac-test-miner       # zk-miner's macOS tests
+make -f Makefile.mac mac-test-risc0       # the fork's Metal conformance suites
+make -f Makefile.mac mac-bench BENCH_ONLY=fibonacci
+```
+
+| Target | What it runs | Time on a 36 GB M5 Max (warm caches, other work running) |
+|---|---|---|
+| `mac-check` | prerequisite checks (the worker's own refusal rules, the Metal compiler, rzup toolchains, the Groth16 component, the fork), then `cargo check` of the Metal worker and the CLI | ~4.5 min from an empty target dir |
+| `mac-build-worker` | `cargo build --release` of `zkminer-prove-risc0-metal` (`--features metal`) and `zkminer-cli` | ~6 min from an empty target dir (with the compiled Metal libraries already in the risc0 build cache, `~/Library/Caches/com.risczero.RISC-Zero.risc0`; a machine's first build also compiles those); ~35 s with nothing changed (the worker's build script always reruns) |
+| `mac-install-worker` | copies the worker into `PROVERS_DIR` (default `~/.zkminer/provers`; copy then rename, so a running worker is never modified in place), then proves fibonacci once with it to warm the pipelines (`WARM=0` skips) | ~1 min warm; add the cold warm-up below on a new machine |
+| `mac-test-miner` | the worker's unit tests, `zkminer-prover` `discovery::`/`dispatcher::`, and the real worker over its IPC protocol: Capabilities, Warmup (pipelines + a verified Groth16 proof), one Prove (`MINER_IPC=0` skips this one) | ~4 min |
+| `mac-test-risc0` | in `RISC0_DIR`: `risc0-zkp` `hal::metal`, `risc0-circuit-rv32im` `prove::`, `risc0-circuit-recursion`, `risc0-circuit-keccak`, `risc0-groth16-sys` and `risc0-groth16`; each also alone as `mac-test-risc0-{zkp,rv32im,recursion,keccak,groth16}` | ~5 min once built |
+| `mac-bench` | builds, then `zkminer-prove-risc0-metal --benchmark` (the miner's suite: a discarded fibonacci warm-up, the five programs, then the zkOP/s scoring proofs; about 4.2 min (254 s) at po2 20; `BENCH_ONLY=<program>` runs the warm-up and that program) | ~1 min for fibonacci (the warm-up alone) |
+
+Every target sources `env.sh`, sets `NVCC=off HIPCC=off`, passes `--locked` (never `cargo update`,
+see [Layout](#layout)), and builds with `-j` = `CARGO_BUILD_JOBS` if set, else the number of
+performance cores, never below 4. Override `ENV_SH`, `RISC0_DIR`, `PROVERS_DIR` or `JOBS` on the
+make command line. `zkminer benchmark` drives the installed worker the way the miner does.
+
+### First start: building the GPU pipelines
+
+Metal compiles each kernel for the GPU the first time a process creates its pipeline, and the
+translated circuits are large. With no cache at all (`MTL_SHADER_CACHE_SIZE=0 RISC0_METAL_ARCHIVE=0`)
+the worker's warm-up took **242 s** on the M5 Max while other builds ran (four circuits in parallel:
+rv32im+zkp 242 s, groth16 188 s, recursion 108 s, keccak 59 s); with the caches warm it takes 0.1 s.
+The compile runs on the CPU, so a base chip with fewer cores takes longer (not yet measured).
+
+The results are kept in the OS Metal shader cache (per user, shared with every app, can be
+evicted) and, for keccak, in a binary archive of the worker's own under
+`~/Library/Caches/com.risczero.RISC-Zero.risc0/metal-archives` (`RISC0_METAL_ARCHIVE_DIR` moves it).
+A new build of the worker only recompiles what changed. The worker builds every pipeline in its
+Warmup, which the miner sends once, before the worker's first benchmark or proof and outside any
+job's deadline (it allows the warm-up an hour); `mac-install-worker` does the same at install time.
+
+### Groth16 without Docker
+
+The Metal worker wraps STARKs in Groth16 natively on the GPU (no Docker, no x86 emulation). It needs
+RISC Zero's `risc0-groth16` component, which it downloads in its one-time setup like the other
+workers (`~/.risc0/extensions/v0.2.0-risc0-groth16`, or `RISC0_GROTH16_DIR`). A wrap takes
+1.58 s on the M5 Max (1.72-1.74 s under a 4 or 8 GiB budget) and peaks at 5.6 GB of GPU memory
+(3.9 GB under a 4 GiB budget, where the prover takes its smallest layout); the worker keeps the
+~4.1 GB proving key loaded between proofs only when the working-set limit has room for it beside a
+full STARK and 12 GiB of host state (about 29.5 GiB at po2 20, so not on 36 GB Macs and
+smaller). `RISC0_GROTH16_METAL_PROVER=docker` switches to RISC Zero's Docker prover. The CPU-only
+worker (`--features cpu`) has no native wrap and needs Docker for it.
+
+### Environment knobs
+
+Read at run time by the worker (they pass through the miner's environment):
+
+| Variable | Effect |
+|---|---|
+| `RISC0_METAL_MAX_WORKING_SET_BYTES` | A GPU memory budget below `recommendedMaxWorkingSetSize`, in bytes or with a `K`/`M`/`G`/`T` suffix (`8G`, `4GiB`). The worker picks its default po2 and its po2 ceiling from it, and every Metal allocation that would exceed it fails early with "Metal working-set budget exceeded" (a Prove then answers ResourceExhausted) instead of pushing the Mac into swap. Use it to leave the owner room on a shared Mac. Under 4 GiB no Groth16 wrap fits. |
+| `RISC0_METAL_RV32IM_GPU_PHASES=witgen` | Run the rv32im witness generation on the GPU. **Off by default**: the generated GPU witgen kernel is not deterministic on real segments (a proof made with it can fail verification); the default runs that phase's CPU kernel over the GPU buffers and the rest (accum, eval_check, NTTs, hashing) on the GPU. For debugging that issue only. |
+| `RISC0_METAL_RV32IM_CPU_PHASES` | Comma list of `witgen`, `accum`, `eval`: run those rv32im phases' CPU kernels over the GPU buffers (wins over `..._GPU_PHASES`). Diagnostics. |
+| `RISC0_METAL=0`, `RISC0_METAL_SKIP=<units>` | Disable Metal entirely, or for some of `zkp`, `rv32im`, `recursion`, `keccak`, `groth16` (comma list); those fall back to the CPU prover (groth16: Docker). Diagnostics. |
+| `RISC0_GROTH16_METAL_PROVER=docker` | Use the Docker Groth16 prover. |
+| `RISC0_GROTH16_DIR` | Directory holding the `risc0-groth16` component. |
+| `RISC0_KECCAK_METAL_WITGEN` | `auto` (default: GPU from po2 13), `gpu`, or `host` (the CPU's witness generator). |
+| `RISC0_METAL_REC_KERNELS` | `monolith` (default) or `split`: which recursion eval_check kernels to use. |
+| `RISC0_METAL_ARCHIVE=0`, `RISC0_METAL_ARCHIVE_DIR` | Disable or move the keccak pipeline archive. |
+| `RISC0_METAL_DEBUG=1` (with `MTL_DEBUG_LAYER=1`) | Metal API validation and extra checks; slow, for debugging. |
+| `ZKMINER_METAL_PREWARM_KECCAK` | `auto` (default): build the keccak pipelines at start unless the Groth16 prover would then not fit the limit beside them (it fits from 4 GiB up); `on` / `off` force it. |
+| `ZKMINER_METAL_NO_PO2_CEILING=1` | Let a po2 above what the working-set limit allows run anyway. Diagnostics. |
+| `ZKMINER_CUDA_VRAM_BYTES` | Set by the miner for each Mac worker (`hw.memsize` − 8 GiB); also caps the worker's limit. |
+
+### Known limitations
+
+- **Not yet run on a real 16 GB Mac.** The 16 GB rows above come from budget runs on a 36 GB M5 Max
+  (`RISC0_METAL_MAX_WORKING_SET_BYTES`, and `ZKMINER_METAL_HOST_RAM_BYTES` for the footprint model);
+  a simulated 16 GB Mac proves memory-merkle at po2 19 with a 7.4 GB process footprint. Fewer GPU
+  cores and less memory bandwidth will make it slower than these numbers.
+- Under a 4 GiB budget every job wraps, keccak jobs included (since risc0 B9-4G the Groth16 prover
+  plans 3885 MiB there and leaves ~150 MiB of headroom beside the worker's pipelines). It relies on
+  the worker freeing the key after each proof; two wraps with the key kept do not fit.
+- **Beta.** The Mac build is a beta. It is unsigned (no Developer ID, not notarized), so Gatekeeper
+  blocks a downloaded binary until its quarantine flag is removed. The kit's `install.sh` removes it,
+  and building the worker yourself avoids it.
+- The rv32im GPU witness generation is disabled by default (see the knob above).
+- The benchmark takes about 4.2 minutes at po2 20 on an M5 Max for `--benchmark` (254 s of wall
+  time) and 4.4-5.2 minutes for `zkminer benchmark` with its warm-up (262-314 s), longer on smaller
+  Macs.
+- GPU power is not read on macOS; the miner's cost model assumes its 300 W default.
+
 ## Configure
 
 Copy or write `~/.zkminer/config.toml`:
@@ -204,12 +465,12 @@ Copy or write `~/.zkminer/config.toml`:
 rpc_url  = "https://testnet.rpc.hemi.network/rpc"
 chain_id = 743111                   # Hemi testnet (43111 is mainnet)
 
-[contracts]
-hemi_prove          = "0x..."       # router (diamond proxy)
-hemi_prove_staking  = "0x..."
-hemi_prove_registry = "0x..."
-hemi_token          = "0x..."
-program_registry    = "0x..."       # where programs' ELF sources are read; defaults to the known deployment's
+[contracts]                         # Hemi testnet, HemiProve deployment of 2026-11-16
+hemi_prove          = "0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58"   # router (diamond proxy)
+hemi_prove_staking  = "0xF3498fCF729Eb7d4E0323880e4E6aD1EB6da2e2D"
+hemi_prove_registry = "0xA80D9172931521f9bce0491C6374A5f28e79f10F"
+hemi_token          = "0x46955EdCF61b23a8c0b0d71428A9F1C07Bbf36cc"   # tHEMI (owner-minted)
+program_registry    = "0xeBB9Fb9B82f80518f74725eFc2f3FD24ded7695D"   # where programs' ELF sources are read
 
 [wallet]
 key_source  = "env"                 # reads $ZKMINER_PRIVATE_KEY
@@ -229,9 +490,17 @@ chain zkminer knows (743111), `run` checks the addresses, their wiring and their
 against the live deployment; a mismatch starts the miner without claiming anything (it
 still drives locks it already holds) and logs a `PAGE:` line naming the difference, so
 fix `[contracts]` and restart. On 743111 the live deployment is the 2026-11-16 one (router
-`0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58`, risc0 3.1 verifier); a config written for the
-2026-10-29 stack (router `0xE1a492Dc…470e`) names an abandoned deployment, so rewrite it with
-`zkminer init --network testnet --force`.
+`0xD931725db336B57dBB9A3123F2238A4FE3c6Ed58`, risc0 3.1 verifier). Log scans start at block
+7226094, the deployment's first block (`chain.scan_from_block`).
+
+Every older 743111 stack is abandoned. A config that still names the 2026-10-29 stack (router
+`0xE1a492Dc6D57fCC2B6deb5B64087E69666cA470e`) or the old free-mint tHEMI
+`0x60525eEBB1BD630Fb093d433675E28221DE1E698` is refused as abandoned, even with `ZKMINER_ALLOW_UNKNOWN_DEPLOYMENT=1`:
+rewrite it with `zkminer init --network testnet --force`.
+
+The code pins (`crates/zkminer-chain/src/deployment.rs`) are the contracts repo's
+`script/lib/ReleaseCorePins.sol` and `VerifierPins.sol` at 3bc441d (8e1808b); `ZKMINER_CONTRACTS_REPO=<checkout>
+cargo test -p zkminer-chain --lib the_pins_match_the_contracts_repo` checks them against those files.
 
 ### Network guard: `[egress]` and `[dev]`
 
@@ -243,8 +512,9 @@ neighbour on a network it is connected to or routes to other than through its de
 (the kernel is asked, per destination and port, how it would route the connection, policy rules
 included), an address a `local` route delivers to this host, the rest of its IPv6 site (a /32)
 or of the IPv4 /16 around a public address on its interfaces, the DNS servers it uses, a
-private address behind NAT64, a destination that answers within 2 hops of this host (its router,
-a neighbour in the same VPC: a hop-limited probe asks right before each connection), or a name
+private address behind NAT64, a destination within 2 hops of this host (its router, a neighbour
+in the same VPC: hop-limited probes ask right before each connection, and a destination is taken
+as farther only when a router past the limit says a probe ran out of hops, never on silence), or a name
 only a local resolver answers (`localhost`, `*.local`, `*.internal`, `*.lan`, single-label
 names, …). Requester host names are resolved over DNS-over-HTTPS by public resolvers, never
 through this host's own resolver. Anycast service addresses (`2001:1::/32`, AMT, AS112) are
@@ -261,6 +531,64 @@ and stops making requester connections if that happens later (a VPN that comes u
 Run the miner with the host's network (`--network host` in a container): inside a container
 it sees only the container's interfaces and routes, so list the host's networks and addresses
 in `[egress] deny_cidrs` if it cannot.
+
+**macOS.** The guard makes the same decisions on a Mac, unprivileged: the routing table comes
+from the BSD routing socket's sysctl (what `netstat -rn` shows), the kernel is asked per
+destination with an `RTM_GET` (what `route -n get` shows), and the near-hop probes follow the
+same rule as on Linux: the routers' ICMP "time exceeded" is read from an unprivileged ICMP socket
+and matched to its probe by addresses, ports and initial sequence number, which macOS gives only
+through a private `TCP_INFO` option (a Mac where either cannot be read refuses every requester
+connection, and says so once at startup). macOS has no
+policy-routing rules; its interface-scoped routes (netstat's `I` flag, such as the system's
+`utun` interfaces' IPv6 defaults) carry no ordinary connection, so they are neither default
+routes nor uplinks, and a connection whose socket would leave by another interface than its
+route names (a Network Extension VPN) is refused. A `utun` or `ppp` default route needs
+`[egress] internal_ranges`, as a tunnel does on Linux. Details and residual differences:
+[docs/netguard-macos.md](docs/netguard-macos.md). Windows still refuses every requester
+connection in public mode (no route oracle there).
+
+*Troubleshooting (macOS):* if every requester connection is refused with `this host's network
+facts ... could not be read again`, the message names what failed. A file in `/etc/resolver`
+that this user may not read (`Permission denied`) or that is larger than 1 MiB stops the guard,
+because the system reads that file's DNS servers and the guard must refuse them: make it
+readable (`sudo chmod 644 /etc/resolver/<name>`) or remove it. A symbolic link there that loops
+is skipped with a warning. `the system configuration daemon did not answer` means `configd` is
+not responding (restarting the Mac clears it). Every requester connection refused as near
+(`within 2 hops ... accepted a connection`) while a VPN app is on that adds no `utun` route
+points to a Network Extension proxy VPN (flow divert, app proxy): it is expected to accept every
+connection itself, so every probe connects, and the guard cannot see past it.
+`this kernel refused a route query sent as RTM_GET_SILENT` means the macOS version lacks a
+routing-socket call the guard needs (none known among those the miner supports).
+
+*Troubleshooting (Linux and macOS):* the hardening the macOS reviews added applies on every
+platform ([docs/netguard-hardening.md](docs/netguard-hardening.md)). If every requester
+connection is refused with `this host's network facts ... could not be read again`, the message
+names what failed (on Linux a netlink read: the interfaces, routes, rules). A download refused
+with `could not tell how near ... is (whether it is within 2 hops of this host): no router past 2
+hops said a probe ran out of hops (a time exceeded), and silence is not taken as far (...)` comes
+from a path whose routers at hops 2 to 4 sent no ICMP "time exceeded" for the probes (they filter
+or rate-limit ICMP, as many cloud and corporate networks do, or the destination was down): the
+guard admits a destination only on that evidence, so it refuses. Another attempt usually gets the
+evidence on a rate-limited path; on a host whose first hops never send ICMP, every destination is
+refused every time (cloud servers such as EC2 are not supported for now). This applies to every
+store alike, AWS S3 included: from a path whose routers send ICMP, S3 is judged by distance like
+any other server. Right after a host with IPv6
+and no IPv4 (or IPv4 only through a CLAT, 464XLAT) joins a network, IPv6 destinations are refused
+for up to 2 s (`NAT64 prefix is still being learned`); on any host they are refused while the
+network names NAT64 prefixes the guard does not believe or cannot hold (more than two in one DNS
+answer, more than four live ones in one router's advertisements): the refusal names the source,
+and it clears as soon as that source names what fits (a router's next advertisement replaces what
+it named before, and a PREF64 lifetime is believed for 30 minutes at most). Withdrawn, expired
+and other networks' prefixes stay refused for an hour, then are forgotten; if a network names so
+many that one withdrawn less than an hour ago must make room, IPv6 is refused there until that
+hour ends. Once a forger on the network stops, such a refusal ends within about 95 minutes (one
+forged advertisement: at the real router's next one). `its public ... address there is being
+learned again` follows a move to another network (on Linux also a default gateway that shows
+another link-layer address, until it shows the known one again or the new one holds; or a
+gateway whose neighbour entry is gone and does not come back when asked): it clears by itself
+within seconds. `the connection to ... was dropped
+once made` means the route changed between the check and the connection (a VPN coming up): the
+next attempt is judged on the new route.
 
 **Witness jobs.** The witness broker, which talks to your `[[evm_rpc]]`, mirror and artifact
 endpoints for builders, has no network of its own: its sandbox denies every socket call. The
@@ -285,7 +613,7 @@ the job is retried unblamed (up to 6 times) when its builder gave up or trapped.
 | `[egress] ipv4_site_prefix_len` | `16` | The site refused around each global IPv4 address on this host's interfaces: its enclosing /N, 8 to 32. |
 | `[egress] discover_public_addresses` | `true` | Learn this host's public addresses (behind NAT) at startup and every 5 minutes from fixed reflectors — `ns1.google.com` and `1.1.1.1` over DNS, and Cloudflare's `https://1.1.1.1/cdn-cgi/trace` over HTTPS (also over IPv6, and on an IPv6-only host through its NAT64 prefix) — and refuse every address any reports. A family counts as known only when the HTTPS reflector or both DNS reflectors confirm it (and the DNS agreement counts for nothing when the HTTPS reflector's connection was made but its TLS or answer failed), for 10 minutes after the last confirmation, and only on the uplink it was learned on (discovery runs again when the default route changes); while a family this host routes is unknown, requester connections over it are refused. Off: `public_addresses` must name an address of every family this host routes, or the miner does not start. |
 | `[egress] public_addresses` | `[]` | This host's public addresses as you know them (behind NAT, your router's; on an IPv6-only host, the NAT64 translator's IPv4 address). Refused as its own, and a family named here counts as known: set it where outbound DNS or HTTPS to the reflectors is filtered or intercepted. |
-| `[egress] near_hop_limit` | `2` | Right before every requester-caused connection, a probe whose packets may cross at most this many hops connects to the destination: one that answers (accepts, or refuses with a reset) is this host's own network and is refused. When the probe gets no answer, a check connection decides: once connected, its FIN, limited to the same hop count, must go unanswered. 2 to 16. |
+| `[egress] near_hop_limit` | `2` | Right before every requester-caused connection, probes limited to this many hops, one more and two more (`N`, `N+1`, `N+2`) connect to the destination at once, from the address the connection will use (a second round a second later if the first told nothing): a destination that answers one limited to `N` hops or fewer (accepts, or refuses with a reset) is this host's own network and is refused; it is admitted only when a router past the limit sends an ICMP "time exceeded" for a probe (and the destination answered none at that limit or below), and the connection is then made from the probes' source address and interface, from a new local port. Silence, an unreachable or anything else refuses (`could not tell how near`). A "hop" is a router that decrements the hop count: a box that hides one (a second NAT router behind the ISP's, a VM's NAT, a VPN) moves the limit. 2 to 16. |
 | `[egress] doh_resolvers` | Cloudflare, Google, Quad9 | The DNS-over-HTTPS resolvers requester host names are resolved with (never this host's resolver, `/etc/hosts` or a local stub): `https://` URLs whose host is a public IP literal, e.g. `["https://9.9.9.9/dns-query"]`. |
 | `[egress] nat64_prefixes` | `[]` | NAT64 prefixes this host's translator uses besides the well-known `64:ff9b::/96` (RFC 6052: a `/32`, `/40`, `/48`, `/56`, `/64` or `/96`, e.g. `"2001:db8:64::/96"`). An address under one is judged by the IPv4 address it carries, so `<prefix>::10.0.0.1` is refused. The prefix a DNS64 resolver uses is learned at startup from this host's DNS servers (`ipv4only.arpa`, RFC 7050); name it here when it cannot be. |
 | `[dev] private_network` | `false` | **Developer mode.** Lets those connections reach private destinations, so a local test network can serve programs from this machine (names then resolve through the system resolver, and no near-hop probe is sent). The only way to turn the guard off (there is no environment variable or flag). Needs `[dev] chain_id`; refused on Hemi mainnet (43111); while it is on, every start logs `DEV MODE: private network access enabled — never run on a public market`, `zkminer status` prints it, and the TUI's status bar shows a red `DEV MODE` badge. Never set it on a miner that serves a public market. |
@@ -433,7 +761,7 @@ Worth knowing:
 
 Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
 - the size set for it, keyed by its benchmark device id in lower case (`gpu0`, `gpu1`, … for
-  NVIDIA cards, `gpu-rocm0`, … for AMD, `gpu-intel0`, … for Intel):
+  NVIDIA cards, `gpu-rocm0`, … for AMD, `gpu-intel0`, … for Intel, `gpu-metal0` for a Mac's GPU):
 
   ```toml
   [prover.risc0_job_po2]
@@ -445,7 +773,9 @@ Each card proves risc0 jobs at its own segment size (po2), between 16 and 22:
   and names a configured card that isn't here;
 - else po2 20, or none for a card with less than 14 GiB of VRAM (po2 20 peaks around 12.1 GiB).
   A card whose VRAM isn't known gets 20: an Intel card, a CUDA query that failed, or the card
-  behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card);
+  behind a risc0 worker named in `[prover.worker_binaries]` (which isn't pinned to a card).
+  A Mac's GPU instead takes the Metal tier of its RAM (19 on a 16 GB Mac, 20 from 24 GB; see
+  [Supported Macs](#supported-macs));
 - `benchmark --calibrate` proves a 62M-cycle Groth16 job at each size, on a card whose VRAM
   is known (NVIDIA; an AMD card under 14 GiB needs a size set for it). Run it with the miner
   stopped. A card then uses its fastest size,
@@ -534,7 +864,7 @@ A `measured` report also says whether its count is evidence of the proven run:
 
 A count is evidence when `proven` is `matches`, `binding` is not `fails`, `hostInputReads` is
 present and `sizeCheck` is not `differs`. risc0 guests' `sys_rand` is seeded by a public rule (`SYS_RAND_RULE`) that zkminer's proofs
-use from protocol 13: a function of the image id and every byte the guest reads, so a guest's random
+use from protocol 13 (on the macOS line from its 14; one line since 17): a function of the image id and every byte the guest reads, so a guest's random
 bytes, and the path it takes on them, are the same here as in a proof zkminer makes under that rule.
 The figure is the cost of that run at the size the report names (a miner proves at its own card's).
 
@@ -879,10 +1209,10 @@ chain id only against a node on loopback (a local fork).
 | `zkminer-tui` | ratatui interface |
 | `zkminer-config` | TOML config and wallet key loading |
 
-RISC Zero and SP1 are patched to the `hemilabs` forks (GPU + AMD support) via
-`[patch.crates-io]`, pinned by `Cargo.lock`. **Don't run `cargo update`** — those two are
-referenced by moving branch heads, so the lockfile is what holds the build on validated
-commits. (sppark is pinned by immutable rev and is not exposed to that drift.)
+RISC Zero, SP1 and sppark are patched to the `hemilabs` forks (GPU + AMD support, and Metal for
+risc0) via `[patch.crates-io]`, each pinned by an immutable git rev in `Cargo.toml` and recorded in
+`Cargo.lock`. **Don't run `cargo update`**: builds use `--locked`, and the lockfile is what holds every
+other dependency on the versions that were validated.
 
 ## Testing
 
@@ -894,6 +1224,9 @@ ZKVM_ALLOW_SKIP=1 cargo test                  # skip tests needing GPUs/guest EL
 cargo test -p zkminer-prover --features risc0,sp1 --test comprehensive_zkvm_test \
     -- --test-threads=1 --nocapture
 ```
+
+On a Mac, `make -f Makefile.mac mac-test-miner mac-test-risc0` runs the macOS and Metal suites
+(see [macOS](#macos-apple-silicon-metal)).
 
 The zkVM suite is **fail-closed**: a missing worker or guest ELF fails the test rather
 than skipping, so a half-installed box can't look green. Set `ZKVM_ALLOW_SKIP=1` to skip
@@ -947,13 +1280,17 @@ cargo build -p zkminer-prover --features testing --bin mock-worker
 cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-threads=1
 ```
 
+On a Mac, build the Metal worker (`--features metal --bin zkminer-prove-risc0-metal`) and point
+`ZKMINER_LOCALNET_RISC0_WORKER` at `target/release/zkminer-prove-risc0-metal`. Foundry 1.5.1
+(`anvil`) is the version the HemiProve reference daemons support.
+
 - **`watch_only_reports_every_job`** (CPU only) runs `zkminer run --watch-only`, as the staked
   prover and then as an unstaked address, with an unknown `RISC0_EXECUTOR` that the worker must
   ignore. It checks every job's verdict, that exactly the claimable jobs would be claimed, that
   every measured cycle count is a power of two, and that nothing was sent.
-- **`fulfils_with_a_replayed_receipt`** (CPU only) mines for real on the contract suite's RISC
-  Zero receipt fixture, which the deployed verifier accepts: the mock worker replays the receipt
-  instead of proving. It requires exactly the claimable jobs to be claimed and then fulfilled in a
+- **`fulfils_with_a_replayed_receipt`** (CPU only) mines for real on a risc0 3.1 Groth16 receipt
+  that the Metal worker made (the fibonacci guest), which the deployed v3.1.0 verifier accepts: the
+  mock worker replays the receipt instead of proving. It requires exactly the claimable jobs to be claimed and then fulfilled in a
   later transaction, the exclusive and over-collateralised jobs never even dispatched, nothing
   released, and no collateral left locked.
 - **`holds_its_lock_through_a_pause`**: a lock held while the router pauses is kept, then
@@ -961,8 +1298,11 @@ cargo test -p zkminer-cli --test localnet -- --ignored --nocapture --test-thread
 - **`holds_off_while_the_router_is_paused`**, **`refuses_to_claim_while_its_adapter_is_disabled`**,
   **`refuses_to_claim_on_a_skewed_clock`**: the miner's own gates hold every claim (none is even
   dispatched).
+- **`refuses_to_claim_without_a_matching_verifier`**: a miner configured with the risc0 3.0
+  selector refuses every risc0 claim.
 - **`mines_the_claimable_jobs`** (`ZKMINER_LOCALNET_MINE=1`, needs a GPU) is the replay test with
-  real risc0 proofs of the fibonacci guest.
+  real risc0 proofs of the fibonacci guest; it also checks each `JobFulfilled` payout
+  (settled price + speed bonus - 1% protocol fee).
 - **`serves_witness_jobs`** (Linux, CPU only, a delegated cgroup) serves witness-construction jobs
   with the real broker, builder runner and CPU worker under the rootless sandbox: one simulated,
   claimed, proven and fulfilled with `fulfillJobHashed`; one whose binding the guest does not meet,
@@ -985,7 +1325,9 @@ header. Move its `FORK_BLOCK` forward whenever `zkminer-chain/src/deployment.rs`
 signing key from the environment (`SUBMITTER_KEY`, `REQUESTER_KEY`) and refuse to run
 without it — never commit a funded key. The forge-based submitters additionally need
 `CONTRACTS_DIR` pointing at a HemiProve Foundry checkout; `testnet_submitter_cast.sh`
-needs only `cast`.
+needs only `cast`. The two `testnet_submitter*.sh` scripts still target an abandoned stack and the
+old descriptor and proof-system id: they are kept for reference and do not work against the
+2026-11-16 deployment.
 
 ## License
 

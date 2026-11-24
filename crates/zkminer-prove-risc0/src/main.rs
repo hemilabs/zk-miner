@@ -11,6 +11,20 @@ mod groth16_component;
 mod groth16_wrap;
 mod segments;
 mod witness;
+#[cfg(feature = "metal")]
+mod metal_host;
+/// The Metal sizing table and the macOS footprint ceiling, shared with the host (single source of
+/// truth, M6). The worker does not depend on `zkminer-prover`, so it compiles that crate's
+/// dependency-free file into itself.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "../../zkminer-prover/src/metal_sizing.rs"]
+mod metal_sizing;
+#[cfg(feature = "metal")]
+mod metal_start;
+// `mac_footprint`: inline at the end of this file.
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("feature `metal` builds the Apple Silicon worker: build it on macOS (aarch64-apple-darwin)");
 
 use anyhow::{Context, Result};
 use risc0_zkvm::Prover as _;
@@ -19,7 +33,7 @@ use zkminer_prover_protocol::{
     is_gpu_oom, read_message, write_message, BenchmarkEntry, BenchmarkProgramSpec, ErrorKind,
     WorkerCommand, WorkerResponse, BACKEND_RISC0, BENCH_BIGINT_MUL, BENCH_CHACHA_MIX,
     BENCH_ECDSA_VERIFY, BENCH_MEMORY_MERKLE, BENCH_SHA256_CHAIN, EXECUTE_JOURNAL_MAX_BYTES,
-    PROTOCOL_VERSION, RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
+    PROTOCOL_VERSION, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods.rs"));
@@ -66,6 +80,34 @@ fn use_shipped_level_zero_driver() {
     std::env::set_var("ZE_ENABLE_ALT_DRIVERS", driver);
 }
 
+/// Test only (cargo feature `testing`, never in a release build's defaults): a worker that leaks
+/// `ZKMINER_TEST_LEAK_MIB_PER_PROOF` MiB of touched host memory after every successful proof, so
+/// `tests/metal_worker.rs` can drive the dispatcher's memory-growth recycle net (M9) against a real
+/// leaking Metal worker.
+#[cfg(feature = "testing")]
+mod test_leak {
+    pub(crate) const ENV: &str = "ZKMINER_TEST_LEAK_MIB_PER_PROOF";
+
+    pub(crate) fn after_proof() {
+        static LEAKED: std::sync::Mutex<Vec<Box<[u8]>>> = std::sync::Mutex::new(Vec::new());
+        let Some(mib) = std::env::var(ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&m| m > 0)
+        else {
+            return;
+        };
+        // Written, not just allocated: untouched pages are not in the footprint.
+        let block = vec![0xA5u8; mib << 20].into_boxed_slice();
+        let mut leaked = LEAKED.lock().unwrap_or_else(|e| e.into_inner());
+        leaked.push(block);
+        tracing::warn!(
+            "testing: leaked {mib} MiB after this proof ({} MiB in all, {ENV})",
+            leaked.len() * mib
+        );
+    }
+}
+
 fn main() {
     // `--groth16-docker-helper`: the Docker Groth16 wrap's helper process (groth16_wrap.rs), which
     // never runs a guest. It does not return.
@@ -85,8 +127,35 @@ fn main() {
         witness::execute_main();
     }
 
+    // M9: proving threads at user-initiated QoS, and out of the Darwin background policy if started
+    // under it. First of all (after the two one-shot modes above, which never prove on Metal), so
+    // rayon's global pool is built with it before anything uses it.
+    #[cfg(feature = "metal")]
+    let qos = metal_start::apply_proving_qos();
     #[cfg(feature = "intel")]
     use_shipped_level_zero_driver();
+    // M8: drop the segment prover before recursion on every proof unless the operator chose a
+    // mode (`metal_host::release_seg_mode_default`). First thing, before any thread exists.
+    #[cfg(feature = "metal")]
+    metal_host::default_release_segment_prover_before_recursion();
+    // W7-M11: the offline Metal archives the installer packaged beside this binary, if any
+    // (`ZKMINER_METAL_AOT=0` off). Before any thread reads the environment or opens a library.
+    #[cfg(feature = "metal")]
+    metal_start::apply_packaged_aot_dir();
+
+    // `--metal-arch`: print this Mac's GPU architecture (the offline archive set it can use) for
+    // the installer, and exit. Speaks no IPC.
+    #[cfg(feature = "metal")]
+    if std::env::args().any(|a| a == "--metal-arch") {
+        match metal_start::gpu_architecture() {
+            Some(arch) => println!("{arch}"),
+            None => {
+                eprintln!("no Metal device architecture");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
 
     // A private temporary directory, named by TMPDIR from here on, while the process has one thread:
     // the confinement lets the worker write there and almost nowhere else (confinement.rs). And the
@@ -104,17 +173,102 @@ fn main() {
                     .unwrap_or_else(|_| "info".into()),
             )
             .init();
-        // The benchmark proves on the GPU, so it is confined like any proof (confinement.rs).
+        // W10-BENCH round 1: a BENCH_ONLY that names no program (a typo) ran only the warm-up and
+        // exited 0 with an empty table, so a script read it as success. Refused before any GPU work.
+        if let Some(only) = std::env::var("BENCH_ONLY").ok().filter(|o| !o.is_empty()) {
+            if !bench_only_is_known(&only) {
+                eprintln!(
+                    "BENCH_ONLY={only} names no benchmark program; use one of: {}",
+                    bench_only_names().join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+        if let Some(knob) = force_fail_knob() {
+            eprintln!(
+                "WARNING: ZKMINER_TEST_FORCE_FAIL={knob} is set: the named steps fail on purpose \
+                 (a test aid; unset it)"
+            );
+        }
+        // The benchmark proves on the GPU, so it is confined like any proof (confinement.rs), with
+        // write access to its receipt directory when one is asked for.
+        confinement::allow_benchmark_receipt_dir();
         if let Err(e) = confinement::confine() {
             eprintln!("cannot confine this worker, so it proves nothing: {e}");
             std::process::exit(1);
         }
-        let results = run_benchmarks();
+        #[cfg(feature = "metal")]
+        {
+            metal_start::log_qos(&qos);
+            metal_start::log_aot_decision();
+        }
+        if let Some(refusal) = gpu_refusal() {
+            eprintln!("{refusal}");
+            std::process::exit(2);
+        }
+        // W7-M10: here only, `ZKMINER_OWNER_ACTIVE=1` plans with the owner-active tier; with
+        // `ZKMINER_METAL_ENFORCE_BUDGET=1` the plan is enforced. Before any proof or HAL runtime
+        // (which read these variables); rayon's idle pool and the Metal device already exist.
+        #[cfg(feature = "metal")]
+        if let Some(plan) = metal_host::apply_planned_budget(true) {
+            tracing::info!("Metal budget: {}", plan.note);
+            eprintln!("Metal budget: {}", plan.note);
+        }
+        // P31-M9b: the pipelines and this Mac's specialized eval pipeline start building now, in
+        // the background (after the budget, which sets the segment po2).
+        #[cfg(feature = "metal")]
+        if gpu_refusal().is_none() {
+            metal_start::start_eval_prewarm(default_job_po2());
+        }
+        // Not orphan-watched: run by hand, its parent is a shell.
+        #[cfg(target_os = "macos")]
+        mac_footprint::start_guard(false);
+        // The witness graph builds on the CPU while the pipelines warm up and the first program
+        // proves, so the first wrap does not wait for it (M7).
+        #[cfg(feature = "metal")]
+        metal_host::start_groth16_graph_preload("benchmark start");
+        #[cfg(feature = "metal")]
+        {
+            let host = metal_host::support()
+                .as_ref()
+                .expect("checked by gpu_refusal");
+            eprintln!(
+                "Metal device {} ({:.0} GiB RAM): {:.1} GiB recommended working set, limit {:.1} \
+                 GiB, default segment po2 {}",
+                host.name,
+                host.host_memory as f64 / (1u64 << 30) as f64,
+                host.recommended_working_set as f64 / (1u64 << 30) as f64,
+                metal_host::working_set_limit().unwrap_or(0) as f64 / (1u64 << 30) as f64,
+                default_job_po2(),
+            );
+            let power = metal_start::log_power_state("benchmark start");
+            eprintln!("Power state: {}", power.describe());
+            if let Some(why) = power.reduced() {
+                eprintln!("WARNING: {why}: these results are below this Mac's full proving speed");
+            }
+            // Pipelines and the ctrl group now, the specialized eval pipeline before the first
+            // program that runs segments of its size (M9, P31-M9b), so every program is measured
+            // at the speed every later job runs at.
+            eprintln!(
+                "{}",
+                metal_start::prewarm_before_benchmark(default_job_po2())
+            );
+        }
+        let (results, failed) = run_benchmarks();
         for r in &results {
             println!(
                 "{:<16} {:>12} cycles  {:>8.2}s  {:>12.0} c/s  weight={:.2}  precompile={}",
                 r.program_name, r.cycles, r.duration_secs, r.throughput, r.weight, r.precompile,
             );
+        }
+        // W10-BENCH: a program that did not prove and verify fails the run (exit 1), after the
+        // table of the ones that did, so a script can trust the exit status.
+        if !failed.is_empty() {
+            eprintln!(
+                "BENCHMARK FAILED: {} did not prove and verify (see the errors above)",
+                failed.join(", ")
+            );
+            std::process::exit(1);
         }
         return;
     }
@@ -132,15 +286,19 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--export-guest") {
         let (Some(name), Some(path)) = (args.get(i + 1), args.get(i + 2)) else {
-            eprintln!("usage: --export-guest fibonacci|sys-rand-echo|segment-size-steer <path>");
+            eprintln!("usage: --export-guest fibonacci|memory-merkle|sys-rand-echo|segment-size-steer <path>");
             std::process::exit(2);
         };
         let elf = match name.as_str() {
             "fibonacci" => FIBONACCI_ELF,
+            // B9-ZK: a second rv32im guest for the IPC job-sequence test (tests/metal_worker.rs).
+            "memory-merkle" => MEMORY_MERKLE_ELF,
             "sys-rand-echo" => SYS_RAND_ECHO_ELF,
             "segment-size-steer" => SEGMENT_SIZE_STEER_ELF,
             other => {
-                eprintln!("unknown guest {other:?} (known: fibonacci, sys-rand-echo, segment-size-steer)");
+                eprintln!(
+                    "unknown guest {other:?} (known: fibonacci, memory-merkle, sys-rand-echo, segment-size-steer)"
+                );
                 std::process::exit(2);
             }
         };
@@ -201,6 +359,41 @@ fn main() {
     }
     // Said on stderr before logging was up; again through it.
     segments::log_fallback();
+
+    // W7-M10: with `ZKMINER_METAL_ENFORCE_BUDGET=1` the HAL enforces the limit this worker plans
+    // with (the dispatcher's figure for this job tier); set before the first request, so before
+    // any proof or HAL runtime reads it. rayon's (idle) pool and the Metal device `gpu_refusal`
+    // opens already exist; neither reads the environment. Off by default (measured slower and
+    // larger; `metal_sizing::ENFORCE_BUDGET_ENV`).
+    #[cfg(feature = "metal")]
+    if gpu_refusal().is_none() {
+        if let Some(plan) = metal_host::apply_planned_budget(false) {
+            tracing::info!("Metal budget: {}", plan.note);
+        }
+    }
+
+    // macOS: the footprint ceiling the dispatcher hands every worker (there are no cgroups), and an
+    // exit when the dispatcher dies (there is no PR_SET_PDEATHSIG): without it a worker orphaned
+    // mid-proof proved on to the end, holding up to tens of GB of the owner's unified memory (M6).
+    #[cfg(target_os = "macos")]
+    mac_footprint::start_guard(true);
+
+    // Metal: build the Groth16 witness graph in the background from the start, so the first wrap
+    // of this process does not wait ~3-5 s for it (M7). Not on an unsupported Mac, and not in a
+    // measure-only worker, which never wraps.
+    #[cfg(feature = "metal")]
+    {
+        metal_start::log_qos(&qos);
+        metal_start::log_aot_decision();
+        if gpu_refusal().is_none() && !measure_only_worker() {
+            metal_host::start_groth16_graph_preload("worker start");
+            metal_start::log_power_state("worker start");
+            // M9: the pipelines, this Mac's specialized eval pipeline and identity_p254's ctrl
+            // group, in the background, so the first job (a respawned worker gets no Warmup)
+            // runs at warm speed.
+            metal_start::start_first_job_prewarm(default_job_po2());
+        }
+    }
 
     if let Err(e) = run_worker_loop(ipc_stdout) {
         tracing::error!("Worker fatal error: {e}");
@@ -294,7 +487,17 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &refused)?;
                     continue;
                 }
-                let results = run_benchmarks_streaming(&mut stdout, &programs)?;
+                let results = if let Some(refusal) = gpu_refusal() {
+                    tracing::error!("not benchmarking: {refusal}");
+                    Vec::new()
+                } else {
+                    #[cfg(feature = "metal")]
+                    {
+                        metal_start::log_power_state("benchmark");
+                        metal_start::prewarm_before_benchmark(default_job_po2());
+                    }
+                    run_benchmarks_streaming(&mut stdout, &programs)?
+                };
                 let resp = WorkerResponse::BenchmarkResult { results };
                 write_message(&mut stdout, &resp)?;
             }
@@ -329,6 +532,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     witness::run_witness_proof(&elf, &input_data, po2, program_id, &witness)
                 }));
+                #[cfg(feature = "metal")]
+                let outcome_panicked = outcome.is_err();
                 let resp = match outcome {
                     Ok(Ok(witness::WitnessOutcome::Proved((
                         journal,
@@ -373,6 +578,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     Err(panic) => prove_panic_response(request_id, panic),
                 };
                 write_message(&mut stdout, &resp)?;
+                #[cfg(feature = "metal")]
+                if outcome_panicked {
+                    exit_after_metal_prove_panic(&mut stdout);
+                }
             }
 
             WorkerCommand::Prove {
@@ -413,10 +622,15 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                 // repeatable and drives a release-penalty/slash. Contain it here and answer with an
                 // error (typed by what panicked, below) instead of dying.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(refusal) = gpu_refusal() {
+                        anyhow::bail!("this worker cannot prove here: {refusal}");
+                    }
                     run_proof(&elf, &input_data, po2, program_id)
                 }));
                 match outcome {
                     Ok(Ok((journal, seal, duration_secs, cycles))) => {
+                        #[cfg(feature = "testing")]
+                        test_leak::after_proof();
                         let resp = WorkerResponse::ProofResult {
                             request_id,
                             journal,
@@ -428,6 +642,8 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     }
                     Err(panic) => {
                         write_message(&mut stdout, &prove_panic_response(request_id, panic))?;
+                        #[cfg(feature = "metal")]
+                        exit_after_metal_prove_panic(&mut stdout);
                     }
                     Ok(Err(e)) => {
                         write_message(&mut stdout, &prove_error_response(request_id, e))?;
@@ -531,7 +747,9 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
             }
 
             WorkerCommand::Warmup { request_id } => {
-                let resp = match warm_up(&mut |status, done_bytes, total_bytes| {
+                let resp = match forced_failure("warmup").map_or_else(
+                    || {
+                        warm_up(&mut |status, done_bytes, total_bytes| {
                     // A closed pipe is reported by the final answer's write below.
                     let _ = write_message(
                         &mut stdout,
@@ -542,7 +760,10 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                             total_bytes,
                         },
                     );
-                }) {
+                        })
+                    },
+                    |forced| Err(anyhow::anyhow!(forced)),
+                ) {
                     Ok(summary) => WorkerResponse::WarmupDone {
                         request_id,
                         summary,
@@ -605,7 +826,11 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
                     write_message(&mut stdout, &refused)?;
                     continue;
                 }
-                match run_po2_calibration(request_id, po2) {
+                let calibrated = match gpu_refusal() {
+                    Some(refusal) => Err(anyhow::anyhow!("{refusal}")),
+                    None => run_po2_calibration(request_id, po2),
+                };
+                match calibrated {
                     Ok(resp) => write_message(&mut stdout, &resp)?,
                     Err(e) => {
                         let resp = WorkerResponse::Error {
@@ -623,6 +848,18 @@ fn run_worker_loop(ipc_stdout: impl io::Write) -> Result<()> {
     Ok(())
 }
 
+/// On Metal a prove panic leaves this thread's provers unusable: a mutex the panic unwound through
+/// stays poisoned (every later proof failed with `PoisonError`), and the zkvm's cached segment prover
+/// keeps its pool, which the worker cannot drop. Called after the panic's answer is written (inline
+/// and witness proofs alike): exit, so the dispatcher starts a clean worker (it kills one on
+/// ResourceExhausted, and respawns one that died idle) instead of sending the next job to this one.
+#[cfg(feature = "metal")]
+fn exit_after_metal_prove_panic(stdout: &mut impl io::Write) -> ! {
+    let _ = stdout.flush();
+    tracing::error!("exiting after a Metal prove panic so a clean worker replaces this one");
+    std::process::exit(METAL_PANIC_EXIT_CODE);
+}
+
 /// The answer to a Prove whose proving panicked (inline and witness proofs alike).
 fn prove_panic_response(request_id: u64, panic: Box<dyn std::any::Any + Send>) -> WorkerResponse {
     // A prove-path panic is usually OURS: risc0's CUDA HAL panics on a failed
@@ -634,7 +871,8 @@ fn prove_panic_response(request_id: u64, panic: Box<dyn std::any::Any + Send>) -
         .map(String::as_str)
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("");
-    let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") {
+    let kind = if is_gpu_oom(detail) || detail.contains("allocation failed") || is_metal_oom(detail)
+    {
         ErrorKind::ResourceExhausted
     } else {
         ErrorKind::Internal
@@ -681,7 +919,7 @@ fn prove_error_response(request_id: u64, e: anyhow::Error) -> WorkerResponse {
         // The served ELF's image id is not this job's programId — permanent for the
         // program. Report ProgramMismatch so the host stops claiming its jobs.
         ErrorKind::ProgramMismatch
-    } else if is_gpu_oom(&msg) {
+    } else if is_gpu_oom(&msg) || is_metal_oom(&msg) {
         // GPU OOM — host/driver text (guest faults are handled above): tag
         // ResourceExhausted so the dispatcher kills + respawns this worker with a
         // clean GPU context (a wedged/leaked context would fail every later proof).
@@ -796,7 +1034,87 @@ fn detect_gpu() -> (bool, Option<String>) {
             _ => return (true, Some("Intel GPU".to_string())),
         }
     }
+    #[cfg(feature = "metal")]
+    {
+        // An unsupported Mac (Intel, 8 GB, Rosetta) reports no GPU: `metal_host::support` logs why.
+        if let Ok(host) = metal_host::support() {
+            return (true, Some(host.name.clone()));
+        }
+    }
     (false, None)
+}
+
+/// Why this worker refuses to use the GPU on this machine, or `None`. Only the Metal worker refuses
+/// (Intel Macs, 8 GB Macs (`hw.memsize` under 12 GiB) and x86_64 builds under Rosetta; PLAN 9.1).
+fn gpu_refusal() -> Option<String> {
+    #[cfg(feature = "metal")]
+    if let Err(msg) = metal_host::support() {
+        return Some(msg.clone());
+    }
+    None
+}
+
+/// Whether host-generated text is a Metal out-of-memory (`metal_host::is_metal_oom`); always false
+/// without the `metal` feature. Classified like `is_gpu_oom`, after any guest-fault text.
+fn is_metal_oom(text: &str) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        metal_host::is_metal_oom(text)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = text;
+        false
+    }
+}
+
+/// Exit status of a Metal worker that ends itself after a prove panic (see the Prove handler).
+#[cfg(feature = "metal")]
+const METAL_PANIC_EXIT_CODE: i32 = 70;
+
+/// Why a proof at segment `po2` must not start here (`metal_host::po2_refusal`), or `None`.
+fn po2_refusal(po2: u8) -> Option<String> {
+    #[cfg(feature = "metal")]
+    {
+        metal_host::po2_refusal(po2)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = po2;
+        None
+    }
+}
+
+/// The segment size used when the host names none: [`zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2`], or on a Mac the size its
+/// Metal working-set limit allows (`metal_sizing::job_po2_for_limit`, PLAN 9.1: the table the host
+/// sizes this Mac's jobs and benchmark row with, M6).
+fn default_job_po2() -> u8 {
+    #[cfg(feature = "metal")]
+    {
+        static PO2: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *PO2.get_or_init(|| {
+            // `metal_host` (M1) still has its own copy of the table; the shared one wins, and a
+            // disagreement (pinned by `m6_tests`) is logged rather than silently followed.
+            let local = metal_host::default_job_po2();
+            match metal_host::working_set_limit() {
+                Some(limit) => {
+                    let shared = metal_sizing::job_po2_for_limit(limit);
+                    if shared != local {
+                        tracing::warn!(
+                            "metal_host's table says po2 {local}, the shared table {shared}: using \
+                             {shared}, which is what the host sizes this Mac's jobs with"
+                        );
+                    }
+                    shared
+                }
+                None => local,
+            }
+        })
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+    }
 }
 
 /// Execute the guest WITHOUT proving, returning its true cycle count.
@@ -926,7 +1244,26 @@ fn self_vmrss_bytes() -> Option<u64> {
     None
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS: the task's resident size from `task_info(MACH_TASK_BASIC_INFO)`, the analogue of VmRSS.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)] // libc points at the mach2 crate for these; the call is the same.
+fn self_vmrss_bytes() -> Option<u64> {
+    let mut info: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
+    let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
+        / std::mem::size_of::<libc::natural_t>())
+        as libc::mach_msg_type_number_t;
+    let kr = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            (&mut info as *mut libc::mach_task_basic_info).cast(),
+            &mut count,
+        )
+    };
+    (kr == libc::KERN_SUCCESS).then_some(info.resident_size)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn self_vmrss_bytes() -> Option<u64> {
     None
 }
@@ -1035,6 +1372,21 @@ struct ExecuteOutcome {
 /// the join, so never less.
 const KECCAK_REQUEST_CYCLES: u64 = 1 << 20;
 
+/// The charge for one keccak request ([`KECCAK_REQUEST_CYCLES`]) at the request's po2.
+///
+/// The request's po2 is the po2 the request is PROVED at, not the session's keccak max po2: since
+/// risc0 K10 the executor sizes each request to the smallest circuit that holds its permutations
+/// (`request_po2`, never above the max), and the prover proves it at exactly that po2. So the charge
+/// follows the proving work. Under the default max (17) every request is charged 2^20 (a smaller one
+/// still pays for its lift and join). Under `RISC0_KECCAK_PO2=18` a partial batch that fits 17 is
+/// charged 2^20, a full one 2^21; capped to 17 (risc0 W7-V2's headroom cap below 7084 MiB) the
+/// guest makes twice the requests at 17 instead, for the same total. The charge is this build's
+/// cost estimate for pricing and the deadline (`estimated_cycles` in the miner); no receipt, journal
+/// or other host compares it, so it need not match across builds.
+fn keccak_request_charge(po2: usize) -> u64 {
+    KECCAK_REQUEST_CYCLES << po2.saturating_sub(17).min(8)
+}
+
 /// The keccak proof requests a measured guest made, checked as the prover will check them.
 #[derive(Default)]
 struct KeccakAudit {
@@ -1065,7 +1417,7 @@ impl risc0_zkvm::CoprocessorCallback for KeccakAudit {
         });
         self.cycles = self
             .cycles
-            .saturating_add(KECCAK_REQUEST_CYCLES << request.po2.saturating_sub(17).min(8));
+            .saturating_add(keccak_request_charge(request.po2));
         Ok(())
     }
 }
@@ -1101,11 +1453,11 @@ impl KeccakAudit {
     }
 }
 
-/// The segment size a job is executed or proven at: the host's, or [`RISC0_DEFAULT_JOB_PO2`]. One
+/// The segment size a job is executed or proven at: the host's, or [`default_job_po2`]. One
 /// outside [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`] is refused (an InvalidInput, by its "po2
 /// value" text): the host measures and proves a job at sizes in that range only.
 fn job_segment_po2(po2: Option<u8>) -> anyhow::Result<u8> {
-    let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
+    let po2 = po2.unwrap_or_else(default_job_po2);
     if !(RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX).contains(&po2) {
         anyhow::bail!(
             "po2 value {po2} is outside the job range {RISC0_JOB_PO2_MIN}..={RISC0_JOB_PO2_MAX}"
@@ -1430,6 +1782,25 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 fn release_groth16_cache_if_tight() {
     static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let release = *DECISION.get_or_init(|| {
+        // Unified memory: the GPU budget is the Metal working-set limit (which also honours
+        // `RISC0_METAL_MAX_WORKING_SET_BYTES` and the host's `ZKMINER_CUDA_VRAM_BYTES`), and the key
+        // is kept only if it fits beside the next proof's largest STARK phase at this Mac's segment
+        // size: a kept key is 5.6 GB of the owner's RAM held between jobs.
+        #[cfg(feature = "metal")]
+        {
+            let po2 = default_job_po2();
+            let release = metal_host::working_set_limit()
+                .is_none_or(|limit| !metal_host::keep_groth16_cache(limit, po2));
+            tracing::info!(
+                "Metal working-set limit {:.1} GiB at segment po2 {po2}: {} the Groth16 proving key \
+                 between proofs",
+                metal_host::working_set_limit().unwrap_or(0) as f64 / (1u64 << 30) as f64,
+                if release { "releasing" } else { "keeping" },
+            );
+            #[allow(clippy::needless_return)]
+            return release;
+        }
+        #[allow(unreachable_code)]
         let total = std::env::var(CUDA_VRAM_BYTES_ENV)
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok());
@@ -1448,10 +1819,23 @@ fn release_groth16_cache_if_tight() {
         release
     });
     if release {
+        #[cfg(feature = "metal")]
+        let before = metal_host::allocated_bytes();
         if let Err(e) = risc0_groth16::prove::release_srs() {
             tracing::warn!("could not release the Groth16 SRS cache: {e:#}");
         }
+        // B9-ZK: one line per release with what it freed and the prover layout that identifies.
+        #[cfg(feature = "metal")]
+        metal_host::log_groth16_release(before, metal_host::allocated_bytes());
     }
+}
+
+/// After every proof, failed or not: the Groth16 cache decision above, and on Metal the provers this
+/// thread caches, so their GPU memory (the owner's RAM on a Mac) is returned between jobs.
+fn release_after_proof() {
+    release_groth16_cache_if_tight();
+    #[cfg(feature = "metal")]
+    metal_host::release_after_proof();
 }
 
 /// The in-process prover, never one `RISC0_PROVER` names (an external r0vm, or a remote service,
@@ -1460,6 +1844,18 @@ fn release_groth16_cache_if_tight() {
 /// penalized release.
 fn local_prover() -> risc0_zkvm::LocalProver {
     risc0_zkvm::LocalProver::new("local")
+}
+
+/// Calls [`release_after_proof`] when dropped, so it also runs while a panic unwinds.
+struct ReleaseOnDrop;
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::warn!("prove panicked: releasing this thread's cached provers");
+        }
+        release_after_proof();
+    }
 }
 
 fn run_proof(
@@ -1475,9 +1871,19 @@ fn run_proof(
     if program_id.is_some() {
         job_segment_po2(po2)?;
     }
+    // Refused before any work: on a Mac a segment size whose STARK cannot fit in the working set does
+    // not fail, it thrashes swap for as long as it is left to run. Typed ResourceExhausted (the text
+    // is the fork's out-of-memory wording), so the job goes to a bigger card.
+    if let Some(refusal) = po2_refusal(po2.unwrap_or_else(default_job_po2)) {
+        anyhow::bail!("{refusal}");
+    }
     // The seed the pre-claim measurement used, so every attempt runs the guest exactly as it did.
     let seed = sys_rand_seed(&image_id, input_data);
-    prove_with_retries(|| run_proof_once(elf, input_data, po2, seed))
+    // P31-M9b: a Prove does not wait for the in-flight specialized eval pipeline (logged), unless
+    // ZKMINER_METAL_PREWARM_PROVE_JOIN=1.
+    #[cfg(feature = "metal")]
+    metal_start::before_prove(po2.unwrap_or_else(default_job_po2), elf, input_data, seed);
+    prove_with_retries(|| run_proof_once(elf, input_data, po2, seed, &image_id))
 }
 
 /// Run `prove_once` (one proof) until it succeeds, re-proving only the nondeterministic
@@ -1567,11 +1973,27 @@ fn failed_twice(segment: Option<u64>, last: Option<u64>) -> bool {
     segment.is_some() && segment == last
 }
 
+/// W7-M11 revert knob: `1` makes every proof attempt compute the image id it verifies against again
+/// (before: once per attempt, after the proof), instead of using the one [`run_proof`] computed when
+/// it bound the ELF to the job's programId.
+const RECOMPUTE_IMAGE_ID_ENV: &str = "ZKMINER_RISC0_RECOMPUTE_IMAGE_ID";
+
+/// The image id `run_proof_once` verifies the receipt against: `computed` ([`run_proof`]'s, from
+/// the same ELF bytes), or a fresh `compute_image_id` of `elf` with [`RECOMPUTE_IMAGE_ID_ENV`]`=1`.
+fn verify_image_id(elf: &[u8], computed: &[u8; 32]) -> Result<risc0_zkvm::Digest> {
+    if std::env::var(RECOMPUTE_IMAGE_ID_ENV).is_ok_and(|v| v.trim() == "1") {
+        return risc0_zkvm::compute_image_id(elf)
+            .context("Failed to compute image ID for verification");
+    }
+    Ok(risc0_zkvm::Digest::from(*computed))
+}
+
 fn run_proof_once(
     elf: &[u8],
     input_data: &[u8],
     po2: Option<u8>,
     seed: [u8; 32],
+    image_id: &[u8; 32],
 ) -> Result<(Vec<u8>, Vec<u8>, f64, u64)> {
     // TEST-ONLY: RISC0_TEST_INJECT_INVALID=N makes the first N calls return a
     // synthetic invalid-proof error before proving, to exercise the retry-on-
@@ -1589,7 +2011,7 @@ fn run_proof_once(
     let mut env_builder = job_env_builder(input_data, seed);
     // Never left to the SDK, which picks 21 on a 32 GB card: a job is measured at the size the host
     // names here, and the guest can tell the size it runs at.
-    let po2 = po2.unwrap_or(RISC0_DEFAULT_JOB_PO2);
+    let po2 = po2.unwrap_or_else(default_job_po2);
     if !(13..=24).contains(&po2) {
         anyhow::bail!("po2 value {po2} out of valid range 13..=24");
     }
@@ -1609,15 +2031,50 @@ fn run_proof_once(
     // producing a constant-size proof (~256 bytes seal) that the on-chain
     // RiscZeroVerifierAdapter can verify.
     let prover = local_prover();
+    #[cfg(feature = "metal")]
+    if let Some(limit) = metal_host::working_set_limit() {
+        // Above the default but under the hard ceiling `run_proof` enforces (`po2_refusal`).
+        if po2 > default_job_po2() {
+            tracing::warn!(
+                "segment po2 {po2} is above the default {} for this Mac's {:.1} GiB Metal working set",
+                default_job_po2(),
+                limit as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+    #[cfg(feature = "metal")]
+    let sampler = metal_host::PeakSampler::start();
+    #[cfg(target_os = "macos")]
+    let footprint = mac_footprint::Phases::start();
     let start = Instant::now();
-    let proved = groth16_wrap::prove(&prover, env, elf);
-    release_groth16_cache_if_tight();
+    let proved = {
+        // Releases on unwind too: a prove-path panic (a Metal budget panic mid-STARK) must not skip
+        // returning the recursion provers' memory. The normal path releases when this scope ends.
+        let _release = ReleaseOnDrop;
+        groth16_wrap::prove(&prover, env, elf)
+    };
+    #[cfg(feature = "metal")]
+    sampler.phase("proof");
+    #[cfg(feature = "metal")]
+    {
+        sampler.held("held after release");
+        tracing::info!("Metal peak GPU memory: {}", sampler.summary());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        footprint.phase("proof");
+        tracing::info!(
+            "peak process footprint (host + GPU): {}",
+            footprint.summary()
+        );
+    }
     let prove_info = proved?;
     let duration_secs = start.elapsed().as_secs_f64();
 
-    // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug)
-    let image_id =
-        risc0_zkvm::compute_image_id(elf).context("Failed to compute image ID for verification")?;
+    // Verify proof locally before returning — catches GPU corruption (e.g., ROCm SHA-256 bug). The
+    // image id is the one `run_proof` computed from these ELF bytes before proving (W7-M11: it was
+    // computed a second time here, per attempt).
+    let image_id = verify_image_id(elf, image_id)?;
     groth16_proof_output(prove_info, image_id, duration_secs)
 }
 
@@ -1716,8 +2173,37 @@ fn run_benchmarks_streaming<W: std::io::Write>(
     Ok(results)
 }
 
+/// Test aid (W10-BENCH): `ZKMINER_TEST_FORCE_FAIL=<what>[,<what>...]` makes the named step fail without
+/// touching the GPU, so the miner's handling of a broken worker can be checked on a working Mac.
+/// `warmup` fails the IPC `Warmup` (as a GPU whose pipelines do not build does) and the `--benchmark`
+/// warm-up proof; a program name (`memory-merkle`, `zkop-mix`, ...) fails that benchmark program.
+/// Unset in production: nothing reads it on the proving path.
+fn forced_failure(what: &str) -> Option<String> {
+    forced_failure_in(force_fail_knob().as_deref(), what)
+}
+
+fn force_fail_knob() -> Option<String> {
+    std::env::var("ZKMINER_TEST_FORCE_FAIL").ok()
+}
+
+fn forced_failure_in(knob: Option<&str>, what: &str) -> Option<String> {
+    knob?
+        .split(',')
+        .any(|w| w.trim().eq_ignore_ascii_case(what))
+        .then(|| format!("forced failure (ZKMINER_TEST_FORCE_FAIL={what})"))
+}
+
 /// Prove one requested program, if this build has its guest.
 fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
+    benchmark_spec_with(spec, force_fail_knob().as_deref())
+}
+
+/// `benchmark_spec` with the `ZKMINER_TEST_FORCE_FAIL` value passed in.
+fn benchmark_spec_with(spec: &BenchmarkProgramSpec, knob: Option<&str>) -> Option<BenchmarkEntry> {
+    if let Some(forced) = forced_failure_in(knob, &spec.name) {
+        tracing::error!("{}: {forced}", spec.name);
+        return None;
+    }
     let Some(elf) = benchmark_guest(&spec.name) else {
         tracing::warn!("{}: no guest for it in this build; skipped", spec.name);
         return None;
@@ -1734,26 +2220,74 @@ fn benchmark_spec(spec: &BenchmarkProgramSpec) -> Option<BenchmarkEntry> {
 
 /// `--benchmark`: the warm-up and suite the miner would send, then the zkOP/s score. `BENCH_ONLY=<name>` runs one
 /// program of it (or only the score, for `zkop-mix`).
-fn run_benchmarks() -> Vec<BenchmarkEntry> {
+///
+/// Returns the programs that proved and verified, and the names of those that did not (the warm-up
+/// included: `BENCH_ONLY=fibonacci` is the smoke test's one proof).
+fn run_benchmarks() -> (Vec<BenchmarkEntry>, Vec<String>) {
+    run_benchmarks_with(
+        std::env::var("BENCH_ONLY").ok().as_deref(),
+        force_fail_knob().as_deref(),
+    )
+}
+
+/// The names `BENCH_ONLY` accepts: the warm-up's program, the suite's and the zkOP/s score's.
+fn bench_only_names() -> Vec<String> {
+    use zkminer_prover_protocol::{benchmark_suite, BENCH_WARMUP, BENCH_ZKOP_MIX};
+    let mut names = vec![BENCH_WARMUP.to_string()];
+    names.extend(benchmark_suite(BACKEND_RISC0).into_iter().map(|p| p.name));
+    names.push(BENCH_ZKOP_MIX.to_string());
+    names
+}
+
+/// Whether `BENCH_ONLY=<only>` names something `--benchmark` runs (case-insensitive, as it matches).
+fn bench_only_is_known(only: &str) -> bool {
+    bench_only_names()
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(only))
+}
+
+/// `run_benchmarks` with `BENCH_ONLY` and `ZKMINER_TEST_FORCE_FAIL` passed in.
+fn run_benchmarks_with(
+    only: Option<&str>,
+    knob: Option<&str>,
+) -> (Vec<BenchmarkEntry>, Vec<String>) {
     use zkminer_prover_protocol::{
         benchmark_suite, measure_zkop_mix, warmup_spec, zkop_mix_spec, BENCH_ZKOP_MIX,
     };
-    // Discarded, as under a host: see `warmup_spec`.
-    benchmark_spec(&warmup_spec(BACKEND_RISC0));
-    let only = std::env::var("BENCH_ONLY").ok();
-    let wanted = |name: &str| only.as_ref().map_or(true, |o| name.eq_ignore_ascii_case(o));
-    let mut results: Vec<BenchmarkEntry> = benchmark_suite(BACKEND_RISC0)
+    let mut failed = Vec::new();
+    // Discarded, as under a host: see `warmup_spec`. Its failure still fails the run.
+    let warmup = warmup_spec(BACKEND_RISC0);
+    let warmed = match forced_failure_in(knob, "warmup") {
+        Some(forced) => {
+            tracing::error!("warm-up: {forced}");
+            false
+        }
+        None => benchmark_spec_with(&warmup, knob).is_some(),
+    };
+    if !warmed {
+        failed.push(format!("{} (warm-up)", warmup.name));
+    }
+    let wanted = |name: &str| only.map_or(true, |o| name.eq_ignore_ascii_case(o));
+    let mut results = Vec::new();
+    for spec in benchmark_suite(BACKEND_RISC0)
         .iter()
         .filter(|spec| wanted(&spec.name))
-        .filter_map(benchmark_spec)
-        .collect();
-    if wanted(BENCH_ZKOP_MIX) {
-        match measure_zkop_mix(|iterations| benchmark_spec(&zkop_mix_spec(iterations))) {
+    {
+        match benchmark_spec_with(spec, knob) {
             Some(entry) => results.push(entry),
-            None => tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score"),
+            None => failed.push(spec.name.clone()),
         }
     }
-    results
+    if wanted(BENCH_ZKOP_MIX) {
+        match measure_zkop_mix(|iterations| benchmark_spec_with(&zkop_mix_spec(iterations), knob)) {
+            Some(entry) => results.push(entry),
+            None => {
+                tracing::error!("{BENCH_ZKOP_MIX}: proving failed; no zkOP/s score");
+                failed.push(BENCH_ZKOP_MIX.to_string());
+            }
+        }
+    }
+    (results, failed)
 }
 
 /// Prove `elf`, timing each stage. Without `measure_wrap` it stops at the constant-size STARK, whose
@@ -1771,7 +2305,7 @@ fn benchmark_stages(
     // only says what the executor default already was.)
     let mut env = risc0_zkvm::ExecutorEnv::builder();
     env.write_slice(input)
-        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32);
+        .segment_limit_po2(default_job_po2() as u32);
     let _segments = segments::spill_here(&mut env);
     let env = env.build().ok()?;
 
@@ -1783,7 +2317,17 @@ fn benchmark_stages(
     // benchmark measured neither the recursion that folds segments together — whose cost scales with
     // segment count, i.e. with po2 — nor the wrap. `compress` consumes the previous receipt, so the
     // three stages below add up to the same work `prove_with_opts(groth16)` does in one call.
+    // P31-M9b: wait for the in-flight specialized eval pipeline when this program's segments are
+    // its size, outside the stopwatch.
+    #[cfg(feature = "metal")]
+    metal_start::before_benchmark_program(name, default_job_po2(), elf, input);
     let prover = local_prover();
+    // W7-M11: the power state the program is measured under, read before and after it.
+    let power_before = bench_power_state();
+    #[cfg(feature = "metal")]
+    let sampler = metal_host::PeakSampler::start();
+    #[cfg(target_os = "macos")]
+    let footprint = mac_footprint::Phases::start();
 
     // Stage 1: execution and the segment proofs.
     let started = Instant::now();
@@ -1799,6 +2343,10 @@ fn benchmark_stages(
         }
     };
     let composite_secs = started.elapsed().as_secs_f64();
+    #[cfg(feature = "metal")]
+    sampler.phase("segments");
+    #[cfg(target_os = "macos")]
+    footprint.phase("segments");
 
     // Stage 2: lift every segment receipt and join them into one constant-size STARK. Scales with
     // segment count, so it is STARK proving and belongs on the variable side of the split.
@@ -1814,8 +2362,38 @@ fn benchmark_stages(
         }
     };
     let recursion_secs = started.elapsed().as_secs_f64();
+    #[cfg(feature = "metal")]
+    sampler.phase("recursion");
+    #[cfg(target_os = "macos")]
+    footprint.phase("recursion");
 
     if !measure_wrap {
+        // W10-INT: the release the wrapped path makes after its wrap, here after the STARK. Without
+        // it a scoring proof (zkop-mix) kept this thread's cached provers, and the next proof ran on
+        // top of them: the process peak of a full `--benchmark` rose by ~1.5 GB, at the 8 GiB tier
+        // too. Metal only (elsewhere nothing was wrapped, so there is nothing to release); revert
+        // with ZKMINER_METAL_NOWRAP_RELEASE=0.
+        #[cfg(feature = "metal")]
+        {
+            if metal_host::nowrap_release_enabled() {
+                metal_host::release_after_proof();
+            }
+            sampler.held("held after release");
+            tracing::info!(
+                "{name}: Metal peak GPU memory at po2 {}: {}",
+                default_job_po2(),
+                sampler.summary()
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            footprint.phase("held after release");
+            tracing::info!(
+                "{name}: peak process footprint (host + GPU) at po2 {}: {}",
+                default_job_po2(),
+                footprint.summary()
+            );
+        }
         let image_id = match risc0_zkvm::compute_image_id(elf) {
             Ok(id) => id,
             Err(e) => {
@@ -1839,6 +2417,7 @@ fn benchmark_stages(
             weight,
             precompile,
             wrap_secs: None,
+            power_state: bench_power_state_over(name, power_before),
         });
     }
 
@@ -1848,9 +2427,31 @@ fn benchmark_stages(
     let started = Instant::now();
     let wrapped = groth16_wrap::compress(&prover, &succinct);
     let wrap_secs = started.elapsed().as_secs_f64();
+    #[cfg(feature = "metal")]
+    sampler.phase("wrap");
+    #[cfg(target_os = "macos")]
+    footprint.phase("wrap");
     // Outside the stopwatch: the release is not part of the wrap, and on a card that releases, the NEXT
     // wrap pays the reload — which is that card's honest per-proof cost.
-    release_groth16_cache_if_tight();
+    release_after_proof();
+    #[cfg(feature = "metal")]
+    {
+        sampler.held("held after release");
+        tracing::info!(
+            "{name}: Metal peak GPU memory at po2 {}: {}",
+            default_job_po2(),
+            sampler.summary()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        footprint.phase("held after release");
+        tracing::info!(
+            "{name}: peak process footprint (host + GPU) at po2 {}: {}",
+            default_job_po2(),
+            footprint.summary()
+        );
+    }
     let groth16 = match wrapped {
         Ok(r) => r,
         Err(e) => {
@@ -1878,6 +2479,7 @@ fn benchmark_stages(
         );
         return None;
     }
+    dump_benchmark_receipt(name, &groth16, image_id);
 
     let cycles = prove_info.stats.total_cycles;
     // STARK = segments + recursion: everything up to one constant-size proof. `throughput` is over
@@ -1892,6 +2494,8 @@ fn benchmark_stages(
          verified"
     );
 
+    let power_state = bench_power_state_over(name, power_before);
+
     Some(BenchmarkEntry {
         program_name: name.to_string(),
         prover_backend: BACKEND_RISC0.to_string(),
@@ -1901,7 +2505,69 @@ fn benchmark_stages(
         weight,
         precompile,
         wrap_secs: Some(wrap_secs),
+        power_state,
     })
+}
+
+/// Test aid (P31-19): with `ZKMINER_BENCH_RECEIPT_DIR` set, write each verified benchmark Groth16
+/// receipt there as `<name>.groth16.receipt` (bincode 1.3 `risc0_zkvm::Receipt`, the encoding an
+/// independent verifier such as risc0's `tools/stock_verify31` reads) with `<name>.image_id` (hex).
+/// Unset (the default): nothing is written. A failed write is logged, never fatal. On Linux the
+/// confinement lets only `--benchmark` write there (`confinement::allow_benchmark_receipt_dir`); a
+/// benchmark the miner drives logs a refused write.
+fn dump_benchmark_receipt(name: &str, receipt: &risc0_zkvm::Receipt, image_id: risc0_zkvm::Digest) {
+    let Some(dir) = std::env::var_os("ZKMINER_BENCH_RECEIPT_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let written = std::fs::create_dir_all(&dir)
+        .map_err(anyhow::Error::from)
+        .and_then(|()| Ok(bincode::serialize(receipt)?))
+        .and_then(|bytes| {
+            std::fs::write(dir.join(format!("{name}.groth16.receipt")), bytes)?;
+            std::fs::write(dir.join(format!("{name}.image_id")), image_id.to_string())?;
+            Ok(())
+        });
+    match written {
+        Ok(()) => tracing::info!("{name}: Groth16 receipt written to {}", dir.display()),
+        Err(e) => tracing::warn!("{name}: could not write the Groth16 receipt: {e:#}"),
+    }
+}
+
+/// The power state a benchmark entry reports (protocol v12 of the macOS line, v17 since W11-ON37; W7-M11): on a Mac, M9's reading;
+/// elsewhere, and with `ZKMINER_POWER_STATE_IN_BENCH=0`, none.
+/// The power state over a whole benchmark proof: the state read before it merged with the one now
+/// (W7-M11), with a warning when it was reduced.
+fn bench_power_state_over(
+    name: &str,
+    before: Option<zkminer_prover_protocol::BenchPowerState>,
+) -> Option<zkminer_prover_protocol::BenchPowerState> {
+    let power_state = match (before, bench_power_state()) {
+        (Some(a), Some(b)) => Some(a.merge(b)),
+        (a, b) => a.or(b),
+    };
+    if let Some(why) = power_state.and_then(|p| p.reduced()) {
+        tracing::warn!(
+            "{name}: measured in reduced power ({why}); the host prices it as measured and \
+             advises a re-benchmark once the Mac is back at full power (a thermal mark is \
+             informational)"
+        );
+    }
+    power_state
+}
+
+fn bench_power_state() -> Option<zkminer_prover_protocol::BenchPowerState> {
+    if zkminer_prover_protocol::power_state_in_bench_off() {
+        return None;
+    }
+    #[cfg(feature = "metal")]
+    {
+        Some(metal_start::power_state().to_bench())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        None
+    }
 }
 
 /// Iteration count for the po2 calibration workload.
@@ -1949,7 +2615,7 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
     let start = Instant::now();
     let mut env = risc0_zkvm::ExecutorEnv::builder();
     env.write_slice(&1000u32.to_le_bytes())
-        .segment_limit_po2(RISC0_DEFAULT_JOB_PO2 as u32);
+        .segment_limit_po2(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2 as u32);
     let _segments = segments::spill_here(&mut env);
     let env = env.build()?;
     let proved = groth16_wrap::prove(&local_prover(), env, FIBONACCI_ELF);
@@ -1965,13 +2631,68 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
     ))
 }
 
-#[cfg(not(feature = "intel"))]
+/// A dedicated measure worker: it only executes guests on the CPU (the dispatcher gives it an RSS
+/// cap and no GPU figure), so it never proves or wraps.
+#[cfg(feature = "metal")]
+fn measure_only_worker() -> bool {
+    std::env::var_os("ZKMINER_RISC0_EXECUTE_MAX_RSS_BYTES").is_some()
+        && std::env::var_os(CUDA_VRAM_BYTES_ENV).is_none()
+}
+
+/// The Metal worker's one-time setup: the `risc0-groth16` component, then every circuit's Metal
+/// pipeline states (`metal_host::warm_up_pipelines`; minutes cold on a newly built binary, PLAN 9.1),
+/// then one small verified Groth16 proof at this Mac's default segment size, so a broken GPU fails
+/// here and not on a job. A dedicated measure worker (it only executes guests on the CPU) installs
+/// the component only.
+#[cfg(feature = "metal")]
+fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
+    if let Some(refusal) = gpu_refusal() {
+        anyhow::bail!("{refusal}");
+    }
+    let component = groth16_component::ensure_installed(report)?;
+    if measure_only_worker() {
+        return Ok(component);
+    }
+    // A no-op if worker start already began it; starts it if this call just installed the component.
+    metal_host::start_groth16_graph_preload("warm-up");
+    report(
+        "Preparing the Metal pipelines for this Mac (a first run of a new build can take minutes)",
+        None,
+        None,
+    );
+    let pipelines = metal_start::prewarm_before_benchmark(default_job_po2());
+    let start = Instant::now();
+    // Its segments in this worker's segment directory, as every proof's (segments.rs).
+    let mut env = risc0_zkvm::ExecutorEnv::builder();
+    env.write_slice(&1000u32.to_le_bytes())
+        .segment_limit_po2(default_job_po2() as u32);
+    let _segments = segments::spill_here(&mut env);
+    let env = env.build()?;
+    let proved = groth16_wrap::prove(&local_prover(), env, FIBONACCI_ELF);
+    release_after_proof();
+    proved?
+        .receipt
+        .verify(FIBONACCI_ID)
+        .context("the warm-up proof does not verify")?;
+    let summary = format!(
+        "{component}; {pipelines}; verified a Groth16 proof at po2 {} in {:.1} s",
+        default_job_po2(),
+        start.elapsed().as_secs_f64()
+    );
+    tracing::info!("{summary}");
+    Ok(summary)
+}
+
+#[cfg(not(any(feature = "intel", feature = "metal")))]
 fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<String> {
     groth16_component::ensure_installed(report)
 }
 
 /// Run a po2 calibration: prove fibonacci at the specified segment po2 and measure throughput.
 fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
+    if let Some(refusal) = po2_refusal(po2) {
+        anyhow::bail!("{refusal}");
+    }
     let input = CALIBRATION_ITERS.to_le_bytes();
     let mut env = risc0_zkvm::ExecutorEnv::builder();
     env.write_slice(&input).segment_limit_po2(po2 as u32);
@@ -1997,7 +2718,7 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     // under-reports MEMORY pressure: po2=21 completes composite-only but OOMs on the
     // real groth16 path, so a composite-derived max_feasible_po2 is too optimistic.
     let proved = groth16_wrap::prove(&prover, env, FIBONACCI_ELF);
-    release_groth16_cache_if_tight();
+    release_after_proof();
     let prove_info = proved?;
     let duration = start.elapsed();
 
@@ -2053,6 +2774,46 @@ mod program_id_tests {
         // No programId supplied (benchmark/calibration/mock): nothing to match, but the image id is
         // still computed (it keys the `sys_rand` seed), so bytes that are no ELF are refused.
         assert!(verify_program_id(&[0u8; 8], None).is_err());
+    }
+
+    /// W7-M11: a Metal worker reports the power state each benchmark entry was measured under
+    /// (protocol v12); this dev Mac (mains power) reads it, at full power.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_metal_benchmark_entry_reports_its_power_state() {
+        if zkminer_prover_protocol::power_state_in_bench_off() {
+            assert_eq!(bench_power_state(), None);
+            return;
+        }
+        let p = bench_power_state().expect("a Mac reads its power state");
+        assert!(p.low_power_mode.is_some() && p.thermal.is_some(), "{p:?}");
+        assert_eq!(p, metal_start::power_state().to_bench());
+    }
+
+    /// W7-M11: `run_proof_once` verifies against the image id `run_proof` bound the ELF with; it is
+    /// the digest a recomputation gives (what it did before, per attempt). Prints what that
+    /// recomputation cost per benchmark guest.
+    #[test]
+    fn the_image_id_passed_through_is_the_recomputed_one() {
+        if FIBONACCI_ELF.is_empty() {
+            return;
+        }
+        for (name, elf) in [
+            ("fibonacci", FIBONACCI_ELF),
+            ("sha256-chain", SHA256_CHAIN_ELF),
+            ("memory-merkle", MEMORY_MERKLE_ELF),
+        ] {
+            let bound = verify_program_id(elf, None).unwrap();
+            let t = std::time::Instant::now();
+            let again = risc0_zkvm::compute_image_id(elf).unwrap();
+            let cost = t.elapsed();
+            assert_eq!(verify_image_id(elf, &bound).unwrap(), again, "{name}");
+            eprintln!(
+                "{name}: compute_image_id {:.2} ms ({} bytes ELF)",
+                cost.as_secs_f64() * 1e3,
+                elf.len()
+            );
+        }
     }
 
     // Guest-gated: only meaningful when real guests were compiled in (not RISC0_SKIP_BUILD).
@@ -2261,6 +3022,22 @@ mod sys_rand_draw_tests {
     use super::sys_rand_draws::{self, Draws};
     use super::*;
 
+    /// W7-M10 (K10 rightsizing, W7-V2 capping): pins the charge to the PROVED po2.
+    #[test]
+    fn the_keccak_charge_follows_the_proved_po2() {
+        let mib = 1u64 << 20;
+        // Rightsized requests under the default max 17 (K10: 14, 15, 16 or 17): 2^20 each.
+        for po2 in [14, 15, 16, 17] {
+            assert_eq!(keccak_request_charge(po2), mib, "po2 {po2}");
+        }
+        // Under RISC0_KECCAK_PO2=18: a full request (18) 2^21, a partial one rightsized to 17 2^20.
+        assert_eq!(keccak_request_charge(18), 2 * mib);
+        // Capped to 17 (W7-V2, below 7084 MiB): two full requests at 17 for one at 18, same total.
+        assert_eq!(2 * keccak_request_charge(17), keccak_request_charge(18));
+        // Out of range values cannot overflow.
+        assert_eq!(keccak_request_charge(usize::MAX), mib << 8);
+    }
+
     #[test]
     fn a_keccak_charge_the_guest_never_assumes_is_no_evidence() {
         assert_eq!(reads_given_keccak(Some(0), 1 << 20, 0), None, "charged, assumed by nothing");
@@ -2350,7 +3127,7 @@ mod retry_tests {
 
     #[test]
     fn a_job_runs_only_at_a_size_in_the_job_range() {
-        assert_eq!(job_segment_po2(None).unwrap(), RISC0_DEFAULT_JOB_PO2);
+        assert_eq!(job_segment_po2(None).unwrap(), default_job_po2());
         for p in [RISC0_JOB_PO2_MIN, 19, RISC0_JOB_PO2_MAX] {
             assert_eq!(job_segment_po2(Some(p)).unwrap(), p);
         }
@@ -2371,6 +3148,469 @@ mod retry_tests {
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
         let err = run_execute(FIBONACCI_ELF, &[], Some(image), Some(po2)).unwrap_err();
         assert!(format!("{err:#}").contains("po2 value"), "{err:#}");
+    }
+}
+
+/// macOS: the worker's own memory ceiling and orphan exit, and per-phase peaks of its process
+/// footprint (M6).
+///
+/// Linux bounds a worker from outside (a systemd `MemoryMax` cgroup cap, `oom_score_adj`,
+/// `PR_SET_PDEATHSIG`); macOS has none of those, so the worker does it itself. `phys_footprint` is
+/// the kernel's own accounting of what a process costs the machine (Activity Monitor's "Memory",
+/// what jetsam acts on): dirty anonymous memory, compressed pages, and on a Mac the GPU allocations
+/// the process made, which is what makes it the right figure on unified memory.
+#[cfg(target_os = "macos")]
+mod mac_footprint {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, Once};
+    use std::time::Duration;
+
+    use crate::metal_sizing::{FOOTPRINT_EXIT_CODE, WORKER_MAX_FOOTPRINT_ENV};
+
+    /// How often the guard looks. A prover allocates GiBs per second at worst, so the ceiling can be
+    /// overshot by about that much before the exit; the host reserve (3 GiB) absorbs it.
+    const POLL: Duration = Duration::from_millis(50);
+
+    /// Highest footprint seen since the last [`Phases`] boundary.
+    static PHASE_PEAK: AtomicU64 = AtomicU64::new(0);
+
+    /// `(phys_footprint, lifetime max phys_footprint)` of this process.
+    pub fn self_footprint() -> Option<(u64, u64)> {
+        // SAFETY: plain old data; the call fills at most one `rusage_info_v4`.
+        let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&mut ri as *mut libc::rusage_info_v4).cast(),
+            )
+        };
+        (rc == 0).then_some((ri.ri_phys_footprint, ri.ri_lifetime_max_phys_footprint))
+    }
+
+    /// The ceiling from the environment: `None` if unset, `0` or malformed (a malformed value is
+    /// reported, not guessed at).
+    pub fn ceiling() -> Option<u64> {
+        parse_ceiling(std::env::var(WORKER_MAX_FOOTPRINT_ENV).ok().as_deref())
+    }
+
+    /// [`ceiling`] without the environment: `None` for unset, `0` or malformed text.
+    pub fn parse_ceiling(text: Option<&str>) -> Option<u64> {
+        let text = text?;
+        match text.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::error!("{WORKER_MAX_FOOTPRINT_ENV}={text:?} is not a byte count; ignored");
+                None
+            }
+        }
+    }
+
+    /// Why the guard ends the process on one poll.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        /// The footprint `now` passed the ceiling `limit`.
+        OverCeiling { now: u64, limit: u64 },
+        /// The worker was reparented: the dispatcher that spawned it (`parent`) is gone.
+        Orphaned { parent: i32 },
+    }
+
+    impl Verdict {
+        pub fn exit_code(&self) -> i32 {
+            match self {
+                Verdict::OverCeiling { .. } => FOOTPRINT_EXIT_CODE,
+                Verdict::Orphaned { .. } => 1,
+            }
+        }
+    }
+
+    /// One poll's decision, free of side effects so it can be tested: `now` is the current
+    /// footprint (`None` if it could not be read), `parent` the parent PID at start and `ppid` the
+    /// current one. A `parent` of 0/1 (started under launchd) is never treated as orphaned.
+    pub fn guard_verdict(
+        now: Option<u64>,
+        limit: Option<u64>,
+        parent: i32,
+        ppid: i32,
+        watch_parent: bool,
+    ) -> Option<Verdict> {
+        if let (Some(now), Some(limit)) = (now, limit) {
+            if now > limit {
+                return Some(Verdict::OverCeiling { now, limit });
+            }
+        }
+        (watch_parent && parent > 1 && ppid != parent).then_some(Verdict::Orphaned { parent })
+    }
+
+    /// Start the guard thread once: tracks [`PHASE_PEAK`], exits at the ceiling, and (when
+    /// `watch_parent`) exits when the dispatcher that spawned this worker is gone.
+    pub fn start_guard(watch_parent: bool) {
+        static STARTED: Once = Once::new();
+        STARTED.call_once(|| {
+            let limit = ceiling();
+            // SAFETY: getppid has no preconditions.
+            let parent = unsafe { libc::getppid() };
+            if let Some(limit) = limit {
+                tracing::info!(
+                    "process footprint ceiling {:.1} GiB ({WORKER_MAX_FOOTPRINT_ENV})",
+                    limit as f64 / (1u64 << 30) as f64
+                );
+            }
+            let spawned = std::thread::Builder::new()
+                .name("footprint-guard".into())
+                .spawn(move || loop {
+                    let now = self_footprint().map(|f| f.0);
+                    if let Some(now) = now {
+                        PHASE_PEAK.fetch_max(now, Ordering::Relaxed);
+                    }
+                    // SAFETY: getppid has no preconditions.
+                    let ppid = unsafe { libc::getppid() };
+                    match guard_verdict(now, limit, parent, ppid, watch_parent) {
+                        Some(v @ Verdict::OverCeiling { now, limit }) => {
+                            tracing::error!(
+                                "process footprint {} MiB passed the {} MiB ceiling \
+                                 ({WORKER_MAX_FOOTPRINT_ENV}); exiting so the proof fails here \
+                                 instead of pushing the Mac into swap",
+                                now >> 20,
+                                limit >> 20
+                            );
+                            std::process::exit(v.exit_code());
+                        }
+                        // Reparented (to launchd) means the dispatcher died: nothing will read
+                        // this proof, and its memory is the owner's.
+                        Some(v @ Verdict::Orphaned { parent }) => {
+                            tracing::error!(
+                                "the dispatcher (PID {parent}) is gone; exiting instead of \
+                                 proving for nobody"
+                            );
+                            std::process::exit(v.exit_code());
+                        }
+                        None => {}
+                    }
+                    std::thread::sleep(POLL);
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("could not start the footprint guard: {e}");
+            }
+        });
+    }
+
+    /// `task_vm_info` (`<mach/task_info.h>`, through rev 7), which libc does not bind. The C struct
+    /// is declared under `#pragma pack(4)`, hence `packed(4)` (without it Rust pads after
+    /// `decompressions` and every later field is misplaced).
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        min_address: u64,
+        max_address: u64,
+        ledger: [i64; 23],
+        limit_bytes_remaining: u64,
+        decompressions: i32,
+        ledger_swapins: i64,
+        neural_nofootprint_total: i64,
+        neural_nofootprint_peak: i64,
+    }
+
+    /// Where the footprint is right now: `(internal, compressed, graphics, resident)` in bytes.
+    /// `internal` is the process's dirty anonymous memory (heap, Rust vectors); `graphics` is memory
+    /// the GPU driver charges to the process (`ledger_tag_graphics_footprint`, Metal buffers and
+    /// the driver's own allocations); `compressed` is what the compressor holds of either.
+    pub fn breakdown() -> Option<(u64, u64, u64, u64)> {
+        const TASK_VM_INFO: u32 = 22;
+        let mut info = TaskVmInfo::default();
+        let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as libc::mach_msg_type_number_t;
+        // SAFETY: `info` is `count` natural_t words long and the kernel writes at most `count`.
+        #[allow(deprecated)]
+        let kr = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                TASK_VM_INFO,
+                (&mut info as *mut TaskVmInfo).cast(),
+                &mut count,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return None;
+        }
+        // ledger[0] = phys_footprint_peak; graphics_footprint is ledger index 13.
+        let ledger = info.ledger; // copied out: no references into a packed struct
+        let graphics = ledger[13].max(0) as u64;
+        Some((info.internal, info.compressed, graphics, info.resident_size))
+    }
+
+    fn mib(b: u64) -> u64 {
+        b >> 20
+    }
+
+    /// Peak footprint per named phase, like `metal_host::PeakSampler` for GPU memory.
+    pub struct Phases {
+        phases: Mutex<Vec<(String, u64)>>,
+    }
+
+    impl Phases {
+        pub fn start() -> Self {
+            let now = self_footprint().map_or(0, |f| f.0);
+            PHASE_PEAK.store(now, Ordering::Relaxed);
+            // The baseline: what the worker already holds before this proof (pipelines, the
+            // executor's and the provers' caches), so a phase's own cost is the difference.
+            Self {
+                phases: Mutex::new(vec![("start".to_string(), now)]),
+            }
+        }
+
+        /// Close the current phase: record its peak (including the current figure, in case the
+        /// guard thread is not running) and start the next from the current figure.
+        pub fn phase(&self, name: &str) {
+            let now = self_footprint().map_or(0, |f| f.0);
+            let peak = PHASE_PEAK.swap(now, Ordering::Relaxed).max(now);
+            self.phases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((name.to_string(), peak));
+            if let Some((internal, compressed, graphics, resident)) = breakdown() {
+                tracing::info!(
+                    "footprint after {name}: {} MiB = internal {} + compressed {} + graphics {} \
+                     MiB (+ other); resident {} MiB",
+                    mib(now),
+                    mib(internal),
+                    mib(compressed),
+                    mib(graphics),
+                    mib(resident)
+                );
+            }
+        }
+
+        pub fn summary(&self) -> String {
+            let lifetime = self_footprint().map_or(0, |f| f.1);
+            let phases = self.phases.lock().unwrap_or_else(|e| e.into_inner());
+            let mut out: Vec<String> = phases
+                .iter()
+                .map(|(n, b)| format!("{n} {:.0} MiB", *b as f64 / (1u64 << 20) as f64))
+                .collect();
+            out.push(format!(
+                "process lifetime peak {:.0} MiB",
+                lifetime as f64 / (1u64 << 20) as f64
+            ));
+            out.join(", ")
+        }
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod m6_tests {
+    /// M6: the host and this worker size a Mac from ONE table. `metal_host` (M1) still carries its
+    /// own copy for `keep_groth16_cache` / the po2 ceiling; this pins the two together until that
+    /// copy is removed.
+    #[test]
+    fn the_worker_and_the_host_share_the_metal_table() {
+        for mib in (256..=256 * 1024u64).step_by(256) {
+            let limit = mib << 20;
+            assert_eq!(
+                crate::metal_sizing::job_po2_for_limit(limit),
+                crate::metal_host::job_po2_for_limit(limit),
+                "{mib} MiB"
+            );
+        }
+        for po2 in 13..=24 {
+            assert_eq!(
+                crate::metal_sizing::stark_peak_bytes(po2),
+                crate::metal_host::stark_peak_bytes(po2),
+                "po2 {po2}"
+            );
+        }
+        assert_eq!(
+            crate::metal_sizing::DEFAULT_JOB_PO2_CAP,
+            zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+        );
+    }
+}
+
+/// M6 round 1: the footprint guard's decisions (ceiling and orphan exit) and the ceiling's parsing,
+/// plus one end-to-end check that a process over the ceiling really exits with 137. None of these
+/// exist on base 7469b2a (no guard at all), so they fail to compile there.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_footprint_tests {
+    use super::mac_footprint::{guard_verdict, parse_ceiling, Verdict};
+    use crate::metal_sizing::{FOOTPRINT_EXIT_CODE, WORKER_MAX_FOOTPRINT_ENV};
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_ceiling_parses_only_a_positive_byte_count() {
+        assert_eq!(parse_ceiling(None), None);
+        assert_eq!(parse_ceiling(Some("0")), None, "0 disables the guard");
+        assert_eq!(parse_ceiling(Some("")), None);
+        assert_eq!(parse_ceiling(Some("13G")), None, "no unit suffixes");
+        assert_eq!(parse_ceiling(Some("-5")), None);
+        assert_eq!(parse_ceiling(Some("13958643712")), Some(13 * GIB));
+        assert_eq!(parse_ceiling(Some(" 4096\n")), Some(4096));
+    }
+
+    #[test]
+    fn over_the_ceiling_exits_137() {
+        let v = guard_verdict(Some(9 * GIB), Some(8 * GIB), 100, 100, true);
+        assert_eq!(
+            v,
+            Some(Verdict::OverCeiling {
+                now: 9 * GIB,
+                limit: 8 * GIB
+            })
+        );
+        assert_eq!(v.unwrap().exit_code(), FOOTPRINT_EXIT_CODE);
+        assert_eq!(FOOTPRINT_EXIT_CODE, 137);
+        // The ceiling wins over the orphan check when both apply.
+        let both = guard_verdict(Some(9 * GIB), Some(8 * GIB), 100, 1, true).unwrap();
+        assert_eq!(both.exit_code(), 137);
+    }
+
+    #[test]
+    fn at_or_under_the_ceiling_or_without_one_the_guard_stays_quiet() {
+        assert_eq!(
+            guard_verdict(Some(8 * GIB), Some(8 * GIB), 100, 100, true),
+            None
+        );
+        assert_eq!(
+            guard_verdict(Some(GIB), Some(8 * GIB), 100, 100, true),
+            None
+        );
+        assert_eq!(guard_verdict(Some(64 * GIB), None, 100, 100, true), None);
+        assert_eq!(
+            guard_verdict(None, Some(1), 100, 100, true),
+            None,
+            "unreadable footprint"
+        );
+    }
+
+    #[test]
+    fn a_reparented_worker_exits_1_only_when_watching_a_real_parent() {
+        let v = guard_verdict(Some(GIB), Some(8 * GIB), 4242, 1, true);
+        assert_eq!(v, Some(Verdict::Orphaned { parent: 4242 }));
+        assert_eq!(v.unwrap().exit_code(), 1);
+        // --benchmark (watch_parent = false) runs from a shell that may exit.
+        assert_eq!(guard_verdict(Some(GIB), None, 4242, 1, false), None);
+        // Started directly under launchd: there is no dispatcher to lose.
+        assert_eq!(guard_verdict(Some(GIB), None, 1, 1, true), None);
+        assert_eq!(guard_verdict(Some(GIB), None, 0, 1, true), None);
+        assert_eq!(guard_verdict(Some(GIB), None, 4242, 4242, true), None);
+    }
+
+    /// Child half of [`a_process_over_the_ceiling_exits_137`]: inert unless the parent test set
+    /// `M6_FOOTPRINT_GUARD_CHILD`.
+    #[test]
+    fn footprint_guard_child() {
+        if std::env::var_os("M6_FOOTPRINT_GUARD_CHILD").is_none() {
+            return;
+        }
+        super::mac_footprint::start_guard(false);
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        // Still alive: the guard did not fire. Exit with a status the parent can tell apart.
+        std::process::exit(3);
+    }
+
+    #[test]
+    fn a_process_over_the_ceiling_exits_137() {
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "mac_footprint_tests::footprint_guard_child",
+                "--nocapture",
+            ])
+            .env("M6_FOOTPRINT_GUARD_CHILD", "1")
+            // Any process's footprint is above 1 MiB.
+            .env(WORKER_MAX_FOOTPRINT_ENV, (1u64 << 20).to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(FOOTPRINT_EXIT_CODE), "{status:?}");
+    }
+}
+
+#[cfg(test)]
+mod sdk_version_tests {
+    /// The sdk_version this worker reports at its handshake ("risc0-zkvm {VERSION}") is the one the
+    /// host's protocol crate accepts: the risc0 whose seal selector the host prefixes (P31-19).
+    #[test]
+    fn the_handshake_sdk_version_is_the_hosts_risc0() {
+        let sdk = format!("risc0-zkvm {}", risc0_zkvm::VERSION);
+        assert_eq!(zkminer_prover_protocol::risc0_sdk_mismatch(&sdk), None, "{sdk}");
+    }
+}
+
+/// W10-BENCH: `--benchmark` reports every program that did not prove and verify, so it can exit 1.
+#[cfg(test)]
+mod bench_exit_tests {
+    use super::*;
+
+    #[test]
+    fn the_force_fail_knob_names_steps() {
+        assert_eq!(forced_failure_in(None, "warmup"), None);
+        assert_eq!(forced_failure_in(Some(""), "warmup"), None);
+        assert_eq!(forced_failure_in(Some("memory-merkle"), "warmup"), None);
+        assert!(forced_failure_in(Some("warmup"), "warmup").is_some());
+        assert!(forced_failure_in(Some("x, Memory-Merkle"), "memory-merkle")
+            .unwrap()
+            .contains("ZKMINER_TEST_FORCE_FAIL=memory-merkle"));
+    }
+
+    /// Every step forced to fail: nothing is proved (no GPU touched) and every step is reported, the
+    /// warm-up and the zkOP/s score included, so `--benchmark` exits 1.
+    #[test]
+    fn a_run_whose_programs_fail_reports_each_of_them() {
+        use zkminer_prover_protocol::{benchmark_suite, BENCH_ZKOP_MIX};
+        let suite: Vec<String> = benchmark_suite(BACKEND_RISC0)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let knob = format!("warmup,{},{BENCH_ZKOP_MIX}", suite.join(","));
+        let (results, failed) = run_benchmarks_with(None, Some(&knob));
+        assert!(results.is_empty());
+        assert_eq!(failed.len(), suite.len() + 2, "{failed:?}");
+        assert!(failed[0].ends_with("(warm-up)"), "{failed:?}");
+        assert_eq!(failed.last().unwrap(), BENCH_ZKOP_MIX);
+
+        // BENCH_ONLY narrows the suite, but a failed warm-up still fails the run.
+        let (_, failed) = run_benchmarks_with(Some(BENCH_ZKOP_MIX), Some(&knob));
+        assert_eq!(failed.len(), 2, "{failed:?}");
+    }
+
+    /// A BENCH_ONLY typo is refused (exit 2) rather than read as a passing, empty run.
+    #[test]
+    fn bench_only_names_are_checked() {
+        for name in [
+            "fibonacci",
+            "memory-merkle",
+            "Memory-Merkle",
+            "zkop-mix",
+            "sha256-chain",
+        ] {
+            assert!(bench_only_is_known(name), "{name}");
+        }
+        for name in ["memroy-merkle", "warmup", "all"] {
+            assert!(!bench_only_is_known(name), "{name}");
+        }
     }
 }
 

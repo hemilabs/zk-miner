@@ -372,4 +372,31 @@ mod tests {
         let n = decode(&m).name();
         assert!(!n.contains('\x1b') && !n.contains('\n'), "{n:?}");
     }
+    /// Revert data the 2026-11-16 deployment (contracts 8e1808b) actually returned on an anvil fork of
+    /// 743111 (B9-CHAIN, handoff §13 tests 5, 11, 13, 14, 15, 16), classified as §9 says.
+    #[test]
+    fn reverts_captured_from_the_8e1808b_deployment_classify_per_the_handoff() {
+        let h = |s: &str| alloy::hex::decode(s).unwrap();
+        // Test 15: a floor above the live price.
+        assert_eq!(classify_claim(&decode(&h("c8cea62ae2d513a674d664cc0afb24b6cfa01afcf9e605732656f866f32261746ffe8a850000000000000000000000000000000000000000000000004563918244f400000000000000000000000000000000000000000000000000004563918244f4000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"))), ClaimClass::Wait);
+        // Test 14: a second lock on a 100 tHEMI stake. The deployed Staking reverts
+        // InsufficientFreeStake (the handoff says Panic(0x01); both classify as a stake shortfall).
+        assert_eq!(classify_claim(&decode(&h("31ebd6fd00000000000000000000000000000000000000000000000000000000000b1b1b0000000000000000000000000000000000000000000000056bc75e2d631000000000000000000000000000000000000000000000000000000000000000000000"))), ClaimClass::StakeShort);
+        // Test 11: a wrong journal, then a re-claim within the hour after the release.
+        assert_eq!(classify_fulfil(&decode(&h("91d07f1e46792eb908089e8f5ddf0a9de9c3b18821890a7e6768174f386e087d14d84acce0282a96835f3797bd5d8a75086ca83e889f44cceec733c4b3bbedd6178c02f2"))), FulfilClass::ProofDefect);
+        assert_eq!(classify_claim(&decode(&h("71e53069aa53ee5de601392698f77cab214a82788216791b4e9dc9b9839ca5e6a499a1e400000000000000000000000000000000000000000000000000000000000b1b1b000000000000000000000000000000000000000000000000000000006afc6b65"))), ClaimClass::Wait);
+        // Test 13: the 4.5M-gas fulfil (the selector alone, as the trace returned it).
+        assert_eq!(classify_fulfil(&decode(&h("a95674c8"))), FulfilClass::Gas);
+        // Test 16: a fulfil after D + G reverts Error("Past deadline").
+        let past = alloy::sol_types::Revert::from("Past deadline").abi_encode();
+        assert_eq!(classify_fulfil(&decode(&past)), FulfilClass::Late);
+        // Test 5: a claim in the block of the first stake (selector 0x27e761d2, as traced).
+        let delay = enc(zkminer_contracts::bindings::IHemiProveErrors::StakingBlockDelayNotMet {
+            prover: alloy::primitives::Address::ZERO,
+            depositBlock: Default::default(),
+        });
+        assert_eq!(alloy::hex::encode(&delay[..4]), "27e761d2");
+        assert_eq!(classify_claim(&decode(&delay)), ClaimClass::Wait);
+    }
+
 }

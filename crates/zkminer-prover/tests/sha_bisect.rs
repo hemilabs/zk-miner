@@ -44,7 +44,7 @@ fn rocm_sha256_bisect() {
 
     let rocm_key = connected
         .iter()
-        .find(|k| k.contains("rocm"))
+        .find(|k| k.starts_with("risc0:rocm:"))
         .cloned()
         .expect("no ROCm worker discovered");
 

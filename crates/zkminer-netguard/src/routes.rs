@@ -65,8 +65,13 @@
 //! of any family the host routes, [`RouteTable::local_refuses_everything`] says so, and a
 //! public-mode policy refuses to start with that explanation rather than refuse every fetch.
 //!
-//! Only Linux (and Android) routing tables are read; elsewhere the table is empty and only the
-//! interfaces' own prefixes are known (put further ranges in `[egress] deny_cidrs`).
+//! Linux (and Android) routing tables are read over netlink. **macOS** reads its routing table
+//! and asks the kernel per destination over the BSD routing socket, with the same decisions; it
+//! has no policy-routing rules, and its interface-scoped routes are read as tables no rule sends
+//! this process's connections to (the `routes_macos.rs` module doc says how each part maps).
+//! Elsewhere the table is empty and only the interfaces' own prefixes are known (put further
+//! ranges in `[egress] deny_cidrs`), and every per-destination query fails, so a public-mode
+//! policy refuses every connection.
 
 use std::net::IpAddr;
 
@@ -219,6 +224,8 @@ pub enum RuleMatch {
 }
 
 impl RuleMatch {
+    // Only netlink's rule reader combines selectors; no other platform reads rules.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     fn and(self, other: RuleMatch) -> RuleMatch {
         use RuleMatch::*;
         match (self, other) {
@@ -621,10 +628,31 @@ pub trait RouteOracle: Send + Sync + std::fmt::Debug {
     /// How the kernel would route a TCP connection from this process to `dst` (and, when given,
     /// destination port `dport`).
     fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer>;
+
+    /// The source address the kernel would choose for a TCP connection from this process to
+    /// `dst` (on `dport`), when it can say (review round 4, cross-3: Linux's `RTA_PREFSRC` of the
+    /// TCP route query; a UDP socket's choice can differ under a rule that selects by protocol).
+    /// `None`: ask a connected UDP socket instead.
+    fn source_for(&self, _dst: IpAddr, _dport: Option<u16>) -> std::io::Result<Option<IpAddr>> {
+        Ok(None)
+    }
+
+    /// How the kernel routes a TCP connection from this process to `dst` (on `dport`) that
+    /// leaves from `src` (a socket bound to it, as the guarded client's are): a rule that selects
+    /// by source is matched against it (review round 4). By default, [`Self::route_to`].
+    fn route_from(
+        &self,
+        _src: IpAddr,
+        dst: IpAddr,
+        dport: Option<u16>,
+    ) -> std::io::Result<KernelAnswer> {
+        self.route_to(dst, dport)
+    }
 }
 
-/// The kernel, asked over netlink per destination (Linux; elsewhere every query fails, and a
-/// policy over gathered facts refuses everything: routes are only read on Linux anyway).
+/// The kernel, asked over netlink per destination (Linux; on macOS over the routing socket, see
+/// `routes_macos.rs`; elsewhere every query fails, and a policy over gathered facts refuses
+/// everything).
 ///
 /// Non-dump `RTM_GETROUTE`s, unprivileged, each with the destination, the destination port when
 /// known (`RTA_DPORT`), this process's uid and TCP, and `RTM_F_LOOKUP_TABLE` (without it an IPv4
@@ -649,6 +677,21 @@ pub struct KernelRoutes;
 impl RouteOracle for KernelRoutes {
     fn route_to(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<KernelAnswer> {
         sys::query(dst, dport)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn source_for(&self, dst: IpAddr, dport: Option<u16>) -> std::io::Result<Option<IpAddr>> {
+        sys::source(dst, dport)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn route_from(
+        &self,
+        src: IpAddr,
+        dst: IpAddr,
+        dport: Option<u16>,
+    ) -> std::io::Result<KernelAnswer> {
+        sys::query_from(src, dst, dport)
     }
 }
 
@@ -821,6 +864,8 @@ pub struct Nexthop {
     pub id: u32,
     /// The device (`NHA_OIF`; 0 when it has none).
     pub oif: u32,
+    /// The gateway (`NHA_GATEWAY`; `None` for an on-link nexthop, a group, a blackhole).
+    pub gateway: Option<IpAddr>,
     /// The member nexthops of a group (`NHA_GROUP`).
     pub group: Vec<u32>,
     pub blackhole: bool,
@@ -857,6 +902,32 @@ pub fn nexthop_interfaces(nexthops: &[Nexthop], id: u32) -> Option<Vec<u32>> {
     Some(out)
 }
 
+/// The gateways nexthop object `id` sends traffic to, each with its interface (a group's, its
+/// members'; a nexthop without a gateway or a device, and a blackhole, add none): review round
+/// 5, cross-4, so a default route through a nexthop object (`nexthop_compat_mode` 0, whose dump
+/// shows no gateway) has its gateway in the uplink's identities.
+pub fn nexthop_gateways(nexthops: &[Nexthop], id: u32) -> Vec<(IpAddr, u32)> {
+    let mut out = Vec::new();
+    if let Some(nh) = nexthops.iter().find(|n| n.id == id) {
+        let members: Vec<&Nexthop> = if nh.group.is_empty() {
+            vec![nh]
+        } else {
+            nh.group
+                .iter()
+                .filter_map(|m| nexthops.iter().find(|n| n.id == *m && n.group.is_empty()))
+                .collect()
+        };
+        for m in members {
+            if let (Some(gw), false, true) = (m.gateway, m.blackhole, m.oif != 0) {
+                out.push((gw, m.oif));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Every nexthop object (Linux 5.3 and later; none elsewhere, or where the kernel has none).
 pub(crate) fn read_nexthops() -> std::io::Result<Vec<Nexthop>> {
     sys::nexthops()
@@ -877,9 +948,42 @@ pub fn count_pppoe_sessions(text: &str) -> usize {
         .count()
 }
 
-/// Every network interface, with its kind (Linux; elsewhere none).
+/// Every network interface, with its kind (Linux; macOS from `getifaddrs`, its interface types read
+/// as Linux kinds; elsewhere none).
 pub(crate) fn read_links() -> std::io::Result<Vec<Link>> {
     sys::links()
+}
+
+/// Linux: every interface's carrier changes (`IFLA_CARRIER_CHANGES`: up and down counted), as the
+/// last [`read_links`] read them.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static CARRIER_CHANGES: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Linux: per interface, how many times its carrier went up or down, as the last [`read_links`]
+/// read it (review round 6, bypass-2 = cross-5: a move goes with a link that went down, which the
+/// uplink signature now sees even when the new network is numbered like the old).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn carrier_changes() -> Vec<(u32, u32)> {
+    CARRIER_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// One entry of the kernel's neighbour table (ARP, NDP): the interface, the neighbour's address,
+/// and its link-layer address when the entry holds a usable one (`None`: the entry is incomplete,
+/// failed, or names none).
+#[cfg(any(test, target_os = "linux", target_os = "android"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Neighbour {
+    pub ifindex: u32,
+    pub addr: IpAddr,
+    pub lladdr: Option<Vec<u8>>,
+}
+
+/// Linux: every IPv4 and IPv6 neighbour entry (`RTM_GETNEIGH` dumps, unprivileged; proxy entries
+/// left out). The uplink signature reads the default gateways' link-layer addresses from it
+/// ([`crate::HostFacts::gather_with`]; the Linux application of review round 2, bypass-2).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn read_neighbours() -> std::io::Result<Vec<Neighbour>> {
+    sys::neighbours()
 }
 
 /// The interfaces the kernel sends this host's internet traffic out of: its answer for a
@@ -944,6 +1048,17 @@ mod sys {
     const IFLA_IFNAME: u16 = 3;
     const IFLA_LINKINFO: u16 = 18;
     const IFLA_INFO_KIND: u16 = 1;
+    const RTM_NEWNEIGH: u16 = 28;
+    const RTM_GETNEIGH: u16 = 30;
+    const NDMSG_LEN: usize = 12;
+    const NDA_DST: u16 = 1;
+    const NDA_LLADDR: u16 = 2;
+    /// `ndm_flags`: a proxy entry (`ip neigh add proxy`), which names no neighbour of this host.
+    const NTF_PROXY: u8 = 0x08;
+    /// `ndm_state`s whose link-layer address is usable (`NUD_VALID`, <net/neighbour.h>:
+    /// `PERMANENT | NOARP | REACHABLE | PROBE | STALE | DELAY`); `INCOMPLETE`, `FAILED` and `NONE`
+    /// hold none.
+    const NUD_VALID: u16 = 0x80 | 0x40 | 0x02 | 0x10 | 0x04 | 0x08;
     const RTM_NEWNEXTHOP: u16 = 104;
     const RTM_GETNEXTHOP: u16 = 106;
     const NHMSG_LEN: usize = 8;
@@ -951,6 +1066,7 @@ mod sys {
     const NHA_GROUP: u16 = 2;
     const NHA_BLACKHOLE: u16 = 4;
     const NHA_OIF: u16 = 5;
+    const NHA_GATEWAY: u16 = 6;
     const RTM_NEWRULE: u16 = 32;
     const RTM_GETRULE: u16 = 34;
     const FR_ACT_TO_TBL: u8 = 1;
@@ -1493,6 +1609,22 @@ mod sys {
         Ok(KernelAnswer::Entry(entry))
     }
 
+    /// The source address the kernel chooses for a TCP connection from this process to `dst`
+    /// (on `dport`): the `RTA_PREFSRC` of the connect's first lookup (review round 4, cross-3).
+    pub(super) fn source(dst: IpAddr, dport: Option<u16>) -> io::Result<Option<IpAddr>> {
+        Ok(ask(dst, None, dport, false)?.and_then(|(_, m)| m.prefsrc))
+    }
+
+    /// How the kernel routes a TCP connection to `dst` (on `dport`) from a socket bound to
+    /// `src`: one lookup with that source, as such a socket's connect makes it (review round 4).
+    pub(super) fn query_from(
+        src: IpAddr,
+        dst: IpAddr,
+        dport: Option<u16>,
+    ) -> io::Result<KernelAnswer> {
+        Ok(ask(dst, Some(src), dport, true)?.map(|(e, _)| e).into())
+    }
+
     /// The interface the kernel would send a connection to `dst` out of (`RTA_OIF` of a plain
     /// route query), `None` without a route.
     pub(super) fn output_interface(dst: IpAddr) -> io::Result<Option<u32>> {
@@ -1668,8 +1800,9 @@ mod sys {
         }
     }
 
-    /// One `RTM_NEWNEXTHOP`: `NHA_ID`, `NHA_OIF`, `NHA_GROUP` (an array of `struct nexthop_grp`,
-    /// 8 bytes each, the id first), `NHA_BLACKHOLE`.
+    /// One `RTM_NEWNEXTHOP`: `NHA_ID`, `NHA_OIF`, `NHA_GATEWAY` (of the message's family),
+    /// `NHA_GROUP` (an array of `struct nexthop_grp`, 8 bytes each, the id first),
+    /// `NHA_BLACKHOLE`.
     pub(super) fn parse_nexthop(p: &[u8], out: &mut Vec<Nexthop>) -> io::Result<()> {
         if p.len() < NHMSG_LEN {
             return Err(malformed());
@@ -1677,13 +1810,18 @@ mod sys {
         let mut nh = Nexthop {
             id: 0,
             oif: 0,
+            gateway: None,
             group: Vec::new(),
             blackhole: false,
         };
+        // `struct nhmsg`'s family: the gateway's (an IPv6 nexthop may carry an IPv4 gateway only
+        // with RFC 5549, which names its family the same way).
+        let family = p[0];
         for (ty, data) in attrs(&p[NHMSG_LEN..])? {
             match ty {
                 NHA_ID => nh.id = u32_at(data, 0).ok_or_else(malformed)?,
                 NHA_OIF => nh.oif = u32_at(data, 0).ok_or_else(malformed)?,
+                NHA_GATEWAY => nh.gateway = addr(family, data),
                 NHA_BLACKHOLE => nh.blackhole = true,
                 NHA_GROUP => {
                     if data.len() % 8 != 0 {
@@ -1698,11 +1836,81 @@ mod sys {
         Ok(())
     }
 
-    /// Every network interface and its kind: an `RTM_GETLINK` dump (unprivileged).
+    /// Every IPv4 and IPv6 neighbour entry: an `RTM_GETNEIGH` dump per family (unprivileged).
+    pub(super) fn neighbours() -> io::Result<Vec<super::Neighbour>> {
+        let mut out = Vec::new();
+        for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+            // `struct ndmsg`: family, pad, pad, ifindex, state, flags, type.
+            let mut hdr = [0u8; NDMSG_LEN];
+            hdr[0] = family;
+            out.extend(dump_consistent_with(
+                RTM_GETNEIGH,
+                RTM_NEWNEIGH,
+                &hdr,
+                parse_neighbour,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// One `RTM_NEWNEIGH`: `ndm_family`, `ndm_ifindex`, `ndm_state`, `ndm_flags`, `NDA_DST`,
+    /// `NDA_LLADDR`. A proxy entry, or one without an IP destination of its family, is skipped;
+    /// the link-layer address is kept only for a state that holds a usable one ([`NUD_VALID`]).
+    pub(super) fn parse_neighbour(p: &[u8], out: &mut Vec<super::Neighbour>) -> io::Result<()> {
+        if p.len() < NDMSG_LEN {
+            return Err(malformed());
+        }
+        let family = p[0];
+        let ifindex = u32_at(p, 4).ok_or_else(malformed)?;
+        let state = u16_at(p, 8).ok_or_else(malformed)?;
+        let flags = p[10];
+        if flags & NTF_PROXY != 0 {
+            return Ok(());
+        }
+        let mut dst = None;
+        let mut lladdr = None;
+        for (ty, data) in attrs(&p[NDMSG_LEN..])? {
+            match ty {
+                NDA_DST => dst = addr(family, data),
+                NDA_LLADDR => lladdr = Some(data.to_vec()),
+                _ => {}
+            }
+        }
+        let Some(addr) = dst else {
+            return Ok(());
+        };
+        out.push(super::Neighbour {
+            ifindex,
+            addr,
+            lladdr: lladdr.filter(|_| state & NUD_VALID != 0),
+        });
+        Ok(())
+    }
+
+    /// Every network interface and its kind: an `RTM_GETLINK` dump (unprivileged). Each one's
+    /// `IFLA_CARRIER_CHANGES` is kept for [`super::carrier_changes`].
     pub(super) fn links() -> io::Result<Vec<Link>> {
         // `struct ifinfomsg`: family (AF_UNSPEC), pad, type, index, flags, change.
         let hdr = [0u8; IFINFOMSG_LEN];
-        dump_consistent_with(RTM_GETLINK, RTM_NEWLINK, &hdr, parse_link)
+        let both = dump_consistent_with(RTM_GETLINK, RTM_NEWLINK, &hdr, |p, out| {
+            let mut one = Vec::new();
+            parse_link(p, &mut one)?;
+            let changes = carrier_changes_of(p);
+            out.extend(one.into_iter().map(|l| (l, changes)));
+            Ok(())
+        })?;
+        *super::CARRIER_CHANGES.lock().unwrap_or_else(|e| e.into_inner()) =
+            both.iter().filter_map(|(l, c)| c.map(|c| (l.index, c))).collect();
+        Ok(both.into_iter().map(|(l, _)| l).collect())
+    }
+
+    /// `IFLA_CARRIER_CHANGES` of one `RTM_NEWLINK` (Linux 3.15 and later), if it says.
+    pub(super) fn carrier_changes_of(p: &[u8]) -> Option<u32> {
+        const IFLA_CARRIER_CHANGES: u16 = 35;
+        let a = attrs(p.get(IFINFOMSG_LEN..)?).ok()?;
+        a.into_iter()
+            .find(|(t, d)| *t == IFLA_CARRIER_CHANGES && d.len() >= 4)
+            .and_then(|(_, d)| u32_at(d, 0))
     }
 
     /// One `RTM_NEWLINK`: its index, `IFLA_IFNAME`, and `IFLA_INFO_KIND` inside `IFLA_LINKINFO`.
@@ -2767,6 +2975,44 @@ mod sys {
             assert_eq!(v6[2], 0);
         }
 
+        /// Review round 6 (fix-r6 mutation L03): the links read keep each interface's carrier
+        /// changes, as sysfs shows them.
+        #[test]
+        fn r6_the_links_read_keep_their_carrier_changes() {
+            let links = super::super::read_links().unwrap();
+            let kept = super::super::carrier_changes();
+            let mut compared = 0;
+            for l in &links {
+                let Ok(t) = std::fs::read_to_string(format!("/sys/class/net/{}/carrier_changes", l.name)) else {
+                    continue;
+                };
+                let Ok(n) = t.trim().parse::<u32>() else { continue };
+                let k = kept.iter().find(|(i, _)| *i == l.index).map(|(_, c)| *c);
+                // It may have changed since the dump; never by much.
+                assert!(k.is_some_and(|k| k <= n && n - k <= 2), "{}: kept {k:?}, sysfs {n}", l.name);
+                compared += 1;
+            }
+            if compared == 0 {
+                crate::skipped("no carrier_changes in sysfs here");
+            }
+        }
+
+        /// Review round 6: a link message's `IFLA_CARRIER_CHANGES` (35) is read; one without it
+        /// says nothing; a short one is not read.
+        #[test]
+        fn r6_carrier_changes_are_read() {
+            let mut p = vec![0u8; IFINFOMSG_LEN];
+            p[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            p.extend(attr(IFLA_IFNAME, b"eth0\0"));
+            assert_eq!(carrier_changes_of(&p), None);
+            p.extend(attr(35, &9u32.to_ne_bytes()));
+            assert_eq!(carrier_changes_of(&p), Some(9));
+            let mut short = vec![0u8; IFINFOMSG_LEN];
+            short.extend(attr(35, &[1, 2]));
+            assert_eq!(carrier_changes_of(&short), None);
+            assert_eq!(carrier_changes_of(&[0u8; 4]), None);
+        }
+
         /// Link messages parse to their index, name and kind (inside `IFLA_LINKINFO`).
         #[test]
         fn link_messages_parse() {
@@ -2801,6 +3047,121 @@ mod sys {
             assert!(parse_link(&[0u8; 4], &mut out).is_err());
         }
 
+        /// Neighbour messages (the Linux application of review round 2, bypass-2) parse to their
+        /// interface, address and link-layer address, kept only for a state that holds a usable
+        /// one; proxy entries and entries without an address of their family are skipped.
+        #[test]
+        fn neighbour_messages_parse() {
+            let entry = |family: u8, ifindex: u32, state: u16, flags: u8, dst: &[u8], ll: Option<&[u8]>| {
+                let mut p = vec![0u8; NDMSG_LEN];
+                p[0] = family;
+                p[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+                p[8..10].copy_from_slice(&state.to_ne_bytes());
+                p[10] = flags;
+                p.extend(attr(NDA_DST, dst));
+                if let Some(ll) = ll {
+                    p.extend(attr(NDA_LLADDR, ll));
+                }
+                p
+            };
+            let mac = [0xa4, 0x2b, 0xb0, 0, 0, 1];
+            let v4 = libc::AF_INET as u8;
+            let v6 = libc::AF_INET6 as u8;
+            let mut out = Vec::new();
+            // REACHABLE, STALE, DELAY, PROBE, PERMANENT, NOARP: usable.
+            for state in [0x02u16, 0x04, 0x08, 0x10, 0x80, 0x40] {
+                parse_neighbour(&entry(v4, 2, state, 0, &[192, 168, 1, 1], Some(&mac)), &mut out).unwrap();
+                assert_eq!(out.pop().unwrap().lladdr, Some(mac.to_vec()), "{state:#x}");
+            }
+            // INCOMPLETE, FAILED, NONE: none (a FAILED entry keeps its last address).
+            for state in [0x01u16, 0x20, 0x00] {
+                parse_neighbour(&entry(v4, 2, state, 0, &[192, 168, 1, 1], Some(&mac)), &mut out).unwrap();
+                assert_eq!(out.pop().unwrap().lladdr, None, "{state:#x}");
+            }
+            // A NOARP entry of a device without link-layer addresses (a tun): an empty one.
+            parse_neighbour(&entry(v4, 9, 0x40, 0, &[10, 8, 0, 1], Some(&[])), &mut out).unwrap();
+            assert_eq!(out.pop().unwrap().lladdr, Some(Vec::new()));
+            let gw6: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+            parse_neighbour(&entry(v6, 3, 0x04, 0, &gw6.octets(), Some(&mac)), &mut out).unwrap();
+            assert_eq!(
+                out.pop().unwrap(),
+                crate::routes::Neighbour { ifindex: 3, addr: IpAddr::V6(gw6), lladdr: Some(mac.to_vec()) }
+            );
+            // Proxy entries, and an address of the wrong length for its family: skipped.
+            parse_neighbour(&entry(v4, 2, 0x80, NTF_PROXY, &[192, 168, 1, 7], None), &mut out).unwrap();
+            parse_neighbour(&entry(v4, 2, 0x02, 0, &gw6.octets(), Some(&mac)), &mut out).unwrap();
+            assert!(out.is_empty(), "{out:?}");
+            assert!(parse_neighbour(&[0u8; 8], &mut out).is_err());
+        }
+
+        /// Review round 4, cross-3, live: the source the kernel chooses for a TCP connection
+        /// (`RTA_PREFSRC` of the connect's first lookup) is the one a connected socket gets (no
+        /// protocol-selective rule here), and the route query from a source is asked with it
+        /// (`RTA_SRC`): from an address that is not this host's the kernel has no route (or refuses),
+        /// from the chosen one it answers as without one. Skipped without an IPv4 route.
+        #[test]
+        fn the_tcp_source_is_the_kernels_and_routes_are_asked_from_it() {
+            let dst: IpAddr = "1.1.1.1".parse().unwrap();
+            if !matches!(query(dst, Some(443)), Ok(KernelAnswer::Entry(_))) {
+                crate::skipped("no IPv4 route here");
+                return;
+            }
+            let src = source(dst, Some(443)).unwrap().expect("the kernel names a source");
+            let udp = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            udp.connect((dst, 443)).unwrap();
+            assert_eq!(src, udp.local_addr().unwrap().ip());
+            assert_eq!(query_from(src, dst, Some(443)).unwrap(), query(dst, Some(443)).unwrap());
+            let stranger: IpAddr = "192.0.2.123".parse().unwrap();
+            let r = query_from(stranger, dst, Some(443));
+            assert!(!matches!(r, Ok(KernelAnswer::Entry(_))), "asked without RTA_SRC: {r:?}");
+        }
+
+        /// The neighbour table is read unprivileged, and every default gateway this host has
+        /// talked to has an entry; with a link-layer address unless its device has none.
+        #[test]
+        fn this_hosts_neighbour_table_is_read() {
+            let n = super::neighbours().expect("RTM_GETNEIGH is unprivileged");
+            eprintln!("{} neighbour entries", n.len());
+            let (routes, _) = super::dump().unwrap();
+            let gws: Vec<(IpAddr, u32)> = routes
+                .iter()
+                .filter(|r| r.prefix.len == 0 && r.table == super::super::RT_TABLE_MAIN)
+                .filter_map(|r| match r.hop {
+                    Hop::Via(g) => Some((g, r.ifindex)),
+                    _ => None,
+                })
+                .collect();
+            if gws.is_empty() {
+                crate::skipped("no default route through a gateway here");
+                return;
+            }
+            // Traffic to the internet goes to the gateway (a UDP connect alone sends nothing,
+            // and the kernel resolves a gateway only when sending; so send one datagram per
+            // family to a public DNS server).
+            let mut sent_v6 = false;
+            for (bind, dst) in [("0.0.0.0:0", "1.1.1.1:53"), ("[::]:0", "[2606:4700:4700::1111]:53")] {
+                if let Ok(s) = std::net::UdpSocket::bind(bind) {
+                    if s.connect(dst).is_ok() && s.send(&[0u8; 12]).is_ok() {
+                        sent_v6 |= dst.starts_with('[');
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let n = super::neighbours().unwrap();
+            for (g, ifindex) in gws {
+                let e = n.iter().find(|e| e.addr == g && e.ifindex == ifindex);
+                eprintln!("gateway {g} on {ifindex}: {e:?}");
+                match e {
+                    // An IPv6 router can be unreachable (a FAILED entry) while IPv4 works.
+                    Some(e) => assert!(e.lladdr.is_some() || g.is_ipv6(), "{e:?}"),
+                    None if g.is_ipv6() && !sent_v6 => {
+                        crate::skipped(format!("[ipv6] no IPv6 traffic could be sent to the gateway {g}"))
+                    }
+                    None => panic!("no neighbour entry for the gateway {g} after traffic to it"),
+                }
+            }
+        }
+
         /// Nexthop messages parse to their id, device, group members and blackhole flag.
         #[test]
         fn nexthop_messages_parse() {
@@ -2822,24 +3183,59 @@ mod sys {
             b.extend(attr(NHA_ID, &3u32.to_ne_bytes()));
             b.extend(attr(NHA_BLACKHOLE, &[]));
             parse_nexthop(&b, &mut out).unwrap();
+            // Review round 5, cross-4: the gateway, of the message's family.
+            let mut w = vec![0u8; NHMSG_LEN];
+            w[0] = libc::AF_INET6 as u8;
+            w.extend(attr(NHA_ID, &4u32.to_ne_bytes()));
+            w.extend(attr(NHA_OIF, &2u32.to_ne_bytes()));
+            w.extend(attr(NHA_GATEWAY, &"fe80::1".parse::<Ipv6Addr>().unwrap().octets()));
+            let mut w4 = vec![0u8; NHMSG_LEN];
+            w4[0] = libc::AF_INET as u8;
+            w4.extend(attr(NHA_ID, &5u32.to_ne_bytes()));
+            w4.extend(attr(NHA_OIF, &2u32.to_ne_bytes()));
+            w4.extend(attr(NHA_GATEWAY, &[192, 168, 1, 1]));
+            let mut gw_out = Vec::new();
+            parse_nexthop(&w, &mut gw_out).unwrap();
+            parse_nexthop(&w4, &mut gw_out).unwrap();
+            assert_eq!(gw_out[0].gateway, Some("fe80::1".parse().unwrap()));
+            assert_eq!(gw_out[1].gateway, Some("192.168.1.1".parse().unwrap()));
+            gw_out.push(Nexthop {
+                id: 6,
+                oif: 0,
+                gateway: None,
+                group: vec![4, 5, 7],
+                blackhole: false,
+            });
+            gw_out.extend(out.iter().cloned());
+            assert_eq!(
+                super::super::nexthop_gateways(&gw_out, 6),
+                vec![
+                    ("192.168.1.1".parse().unwrap(), 2),
+                    ("fe80::1".parse().unwrap(), 2)
+                ]
+            );
+            assert_eq!(super::super::nexthop_gateways(&gw_out, 7), vec![]);
             assert_eq!(
                 out,
                 vec![
                     Nexthop {
                         id: 7,
                         oif: 9,
+                        gateway: None,
                         group: vec![],
                         blackhole: false
                     },
                     Nexthop {
                         id: 8,
                         oif: 0,
+                        gateway: None,
                         group: vec![7, 3],
                         blackhole: false
                     },
                     Nexthop {
                         id: 3,
                         oif: 0,
+                        gateway: None,
                         group: vec![],
                         blackhole: true
                     },
@@ -2886,7 +3282,7 @@ mod sys {
         fn this_hosts_two_ipv4_lookups_agree() {
             let dst: IpAddr = "8.8.8.8".parse().unwrap();
             let Some((_, first)) = ask(dst, None, Some(443), false).unwrap() else {
-                eprintln!("SKIPPED: no IPv4 route here");
+                crate::skipped("no IPv4 route here");
                 return;
             };
             let src = first.prefsrc.expect("the kernel chose a source");
@@ -2920,7 +3316,12 @@ mod sys {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// macOS: the BSD routing socket and its sysctl (see that module's doc).
+#[cfg(target_os = "macos")]
+#[path = "routes_macos.rs"]
+pub(crate) mod sys;
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 mod sys {
     pub(super) fn dump() -> std::io::Result<(Vec<super::Route>, Vec<super::Rule>)> {
         Ok((Vec::new(), Vec::new()))

@@ -80,8 +80,10 @@ const ARWEAVE_GATEWAY: &str = "https://arweave.net";
 /// this host's (public NAT addresses included), not on a network it is connected to or in its
 /// IPv6 or IPv4 site, not a DNS server it uses, reached by its default route (the kernel asked
 /// with the port), not in `[egress] deny_cidrs` or `internal_ranges`, on a path whose public
-/// address is known, and — probed right before the connection — not within `[egress]
-/// near_hop_limit` hops. No proxy is used. The only way to reach a private address is `[dev]
+/// address is known, and — probed right before the connection — found farther than `[egress]
+/// near_hop_limit` hops on positive evidence only (a router past the limit said a probe ran out
+/// of hops; silence refuses), the connection then made from the probes' source address. No
+/// proxy is used. The only way to reach a private address is `[dev]
 /// private_network = true` with `[dev] chain_id` ([`NetMode::DevPrivate`]), which is refused on
 /// mainnet; there is no environment-variable bypass.
 #[derive(Debug, Clone)]
@@ -129,10 +131,11 @@ impl ElfFetcher {
     }
 
     /// What the network guard refuses for want of configuration, as lines to show the operator:
-    /// each path whose public address is not known (every requester connection over it is
-    /// refused), and, when the host now needs `[egress] internal_ranges` the config does not
-    /// state, that every requester connection is refused; with what to set. Empty when there is
-    /// none (and in developer mode).
+    /// that every requester connection is refused because the host's network facts could not be
+    /// read again (`HostFacts::unreadable_reason`, every platform), each path whose public address is not
+    /// known (every requester connection over it is refused), and, when the host now needs
+    /// `[egress] internal_ranges` the config does not state, that every requester connection is
+    /// refused; with what to set. Empty when there is none (and in developer mode).
     pub fn guard_warnings(&self) -> Vec<String> {
         if self.mode() != NetMode::Public {
             return Vec::new();
@@ -142,13 +145,31 @@ impl ElfFetcher {
             .unknown_paths()
             .into_iter()
             .map(|path| {
-                format!(
-                    "network guard: this host's public {path} address is not known, so requester \
-                     connections over {path} are refused. To fix: {}",
-                    path.advice()
-                )
+                if facts.relearning(path) {
+                    format!(
+                        "network guard: this host moved to another network; its public {path} \
+                         address there is being learned again, and requester connections over \
+                         {path} are refused until it is"
+                    )
+                } else {
+                    format!(
+                        "network guard: this host's public {path} address is not known, so \
+                         requester connections over {path} are refused. To fix: {}",
+                        path.advice()
+                    )
+                }
             })
             .collect();
+        if let Some(why) = facts.unreadable_reason() {
+            lines.insert(
+                0,
+                format!(
+                    "network guard: this host's network facts (interfaces, routes, DNS servers) \
+                     could not be read again ({why}), so every requester connection is refused \
+                     until they can be"
+                ),
+            );
+        }
         let gaps = facts.config_gaps();
         if !gaps.is_empty() {
             lines.push(format!(

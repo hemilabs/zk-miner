@@ -20,11 +20,18 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 
-/// The version risc0-groth16 3.1 asks for: 0.2.0, the ceremony of the v3.1.0 Groth16 fix
-/// (GHSA-g6qg-9j8p-7j87). Proofs from the 0.1.0 key do not verify against 3.1's verifier.
-const VERSION: &str = "0.2.0";
+/// The version risc0 3.1's risc0-groth16 asks for (`risc0/groth16/src/prove/component.rs` pins
+/// 0.2.0: the 2026-10-20 ceremony of the GHSA-g6qg-9j8p-7j87 `stark_verify` circuit; its witness graph
+/// has sha256 887aa345d6adc257..., which risc0's `fast.rs` checks at load). risc0 3.0 used 0.1.0,
+/// whose proving key makes proofs the 3.1 verifier rejects. 5.8 GB installed = 5,812,781,917 bytes.
+pub(crate) const VERSION: &str = "0.2.0";
+/// The first 16 hex digits of that version's `stark_verify_graph.bin` sha256, which risc0's
+/// `fast.rs` (`GRAPH_SHA256`) requires before it uses the graph: a log label here, not a check.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub(crate) const GRAPH_SHA256_PREFIX: &str = "887aa345d6adc257";
 /// The archive of that version, as rzup's distribution manifest lists it
 /// (`rzup/components/risc0-groth16/distribution_manifest.json`).
+/// (rzup's signed manifest, 2026-11-15: 0.2.0 = this blob, 2,406,044,780 bytes; 0.1.0 was 4b4f2b2f...).
 const ARCHIVE_SHA256: &str = "173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
 const ARCHIVE_URL: &str = "https://risc0-artifacts.s3.us-west-2.amazonaws.com/rzup/components/\
                            risc0-groth16/sha256/173354ab0bd18417ba1080a0094b4398098a62b9c7460ba1dc34988b2baa57e5";
@@ -153,6 +160,38 @@ pub fn ensure_installed(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) 
         dir.display(),
         start.elapsed().as_secs_f64()
     ))
+}
+
+/// Whether the component is already complete where [ensure_installed] would look for it, without
+/// installing anything. The Metal worker starts its witness-graph preload only then (`metal_host`,
+/// M7): risc0 caches a failed graph load for the life of the process, so a preload that raced the
+/// install would fail every later wrap.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub fn installed() -> bool {
+    match std::env::var_os("RISC0_GROTH16_DIR") {
+        Some(dir) => complete(Path::new(&dir)),
+        None => risc0_home().is_ok_and(|home| {
+            complete(
+                &home
+                    .join("extensions")
+                    .join(format!("v{VERSION}-risc0-groth16")),
+            )
+        }),
+    }
+}
+
+/// Where the component is when it is complete (`RISC0_GROTH16_DIR`, else rzup's install), without
+/// installing anything.
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+pub fn dir() -> Option<PathBuf> {
+    let dir = match std::env::var_os("RISC0_GROTH16_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => risc0_home()
+            .ok()?
+            .join("extensions")
+            .join(format!("v{VERSION}-risc0-groth16")),
+    };
+    complete(&dir).then_some(dir)
 }
 
 /// Whether `dir` holds every file of the component.
@@ -285,6 +324,13 @@ mod tests {
         fs::write(dir.join(FILES[0]), b"x").unwrap();
         assert!(complete(&dir));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// P31-19: the component risc0 3.1 resolves (0.2.0), not 3.0's.
+    #[test]
+    fn the_pinned_version_is_risc0_3_1s() {
+        assert_eq!(VERSION, "0.2.0");
+        assert!(ARCHIVE_SHA256.starts_with("173354ab"));
     }
 
     #[test]

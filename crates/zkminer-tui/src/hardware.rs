@@ -158,8 +158,8 @@ pub fn probe_static() -> HardwareInfo {
             core_ids.len() as u32
         };
     }
-    // Windows has no /proc/cpuinfo.
-    #[cfg(windows)]
+    // Windows and macOS have no /proc/cpuinfo.
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let name = zkminer_prover::benchmark::get_cpu_info();
         if name != "Unknown CPU" {

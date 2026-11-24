@@ -7,7 +7,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Environment-variable names that must NEVER be passed to a prover worker or the sp1-gpu-server it
@@ -159,13 +159,27 @@ use zkminer_prover_protocol::{
 #[derive(Debug)]
 pub struct WorkerDied {
     pub backend: String,
+    /// The worker's last stderr line, which usually says why it died (W10-BFIX: "Metal
+    /// working-set budget exceeded ..." rather than a bare EOF in `zkminer benchmark`'s failure).
+    pub last_output: Option<String>,
 }
 
 impl std::fmt::Display for WorkerDied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Worker {} process died (EOF)", self.backend)
+        write!(f, "Worker {} process died (EOF)", self.backend)?;
+        if let Some(said) = &self.last_output {
+            write!(f, " ({LAST_OUTPUT}{said})")?;
+        }
+        Ok(())
     }
 }
+
+/// How an error quotes the worker's last stderr line (W10-BFIX).
+const LAST_OUTPUT: &str = "the worker's last output: ";
+
+/// The line Rust's panic handler prints after a panic message ("note: run with `RUST_BACKTRACE=1`
+/// environment variable to display a backtrace"): never quoted as the worker's last output.
+const PANIC_BACKTRACE_NOTE: &str = "note: run with `RUST_BACKTRACE";
 
 impl std::error::Error for WorkerDied {}
 
@@ -174,6 +188,10 @@ impl std::error::Error for WorkerDied {}
 /// Defined in the protocol crate so the workers that must fit inside it can assert that they
 /// do, instead of hard-coding a copy of a number they cannot see.
 use zkminer_prover_protocol::proc::HANDSHAKE_TIMEOUT;
+
+/// How long a failed handshake waits for the worker's stderr to drain before reading its last line
+/// for the error (W10-BFIX). A worker that died closes it at once; a live one costs this wait.
+const STDERR_DRAIN_WAIT: Duration = Duration::from_millis(300);
 
 /// Outcome of a NON-REAPING exit check. See `probe_exit_nowait`.
 #[cfg(unix)]
@@ -437,6 +455,12 @@ fn may_signal_group(pid: u32) -> bool {
 /// `proc_root` is a parameter so the discriminator can be tested against a synthetic tree.
 #[cfg(unix)]
 fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>> {
+    // macOS has no `/proc`: the real tree is asked of libproc instead. A synthetic root (tests)
+    // still goes through the parser below on every platform.
+    #[cfg(target_os = "macos")]
+    if proc_root == Path::new("/proc") {
+        return macos_live_group_members(pgid);
+    }
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(proc_root) {
         Ok(e) => e,
@@ -474,6 +498,83 @@ fn live_group_members(proc_root: &Path, pgid: i32) -> Option<Vec<(i32, String)>>
             continue;
         }
         out.push((pid, comm_from_stat(&stat).unwrap_or_default()));
+    }
+    out.sort();
+    Some(out)
+}
+
+/// `live_group_members` against the real kernel on macOS: `proc_listpids(PROC_PGRP_ONLY)` names the group's
+/// members and `proc_pidinfo(PROC_PIDTBSDINFO)` gives each one's state and `comm`.
+///
+/// Before this, `/proc` was unreadable on macOS, so every sweep of a worker's group logged "cannot
+/// read /proc" and killed blind (M6). Killing blind is safe here (the caller holds the unreaped
+/// leader), but the warning fired on every worker exit and the leftover alarm could never fire.
+/// `None` only if the list call itself fails, which keeps the caller's "kill blind" fallback.
+#[cfg(target_os = "macos")]
+fn macos_live_group_members(pgid: i32) -> Option<Vec<(i32, String)>> {
+    if pgid <= 0 {
+        return Some(Vec::new());
+    }
+    // Grow until the kernel's answer fits: it returns the number of BYTES written, and a full
+    // buffer may mean it was truncated.
+    let mut cap = 64usize;
+    let pids = loop {
+        let mut buf = vec![0 as libc::pid_t; cap];
+        let bytes = (cap * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // `proc_listpids(PROC_PGRP_ONLY)` rather than `proc_listpgrppids`: the latter answers a
+        // pid COUNT, the former BYTES, and only bytes say whether the buffer was big enough
+        // (measured on macOS 27.2: 2 vs 8 for a two-member group).
+        const PROC_PGRP_ONLY: u32 = 2; // <sys/proc_info.h>
+                                       // SAFETY: the buffer holds `bytes` bytes; the call writes at most that many.
+        let n = unsafe {
+            libc::proc_listpids(PROC_PGRP_ONLY, pgid as u32, buf.as_mut_ptr().cast(), bytes)
+        };
+        if n < 0 {
+            tracing::warn!(
+                "proc_listpids(PGRP_ONLY, {pgid}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        let count = n as usize / std::mem::size_of::<libc::pid_t>();
+        if count < cap || cap >= 1 << 16 {
+            buf.truncate(count);
+            break buf;
+        }
+        cap *= 4;
+    };
+    let mut out = Vec::new();
+    for pid in pids {
+        if pid <= 0 || pid == pgid {
+            continue;
+        }
+        // SAFETY: as in `memory::proc_identity`.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        if n != size {
+            continue; // raced exit
+        }
+        // SZOMB (5): a zombie holds no memory and is not a leftover.
+        const SZOMB: u32 = 5;
+        if info.pbi_pgid as i32 != pgid || info.pbi_status == SZOMB {
+            continue;
+        }
+        let comm: Vec<u8> = info
+            .pbi_comm
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        out.push((pid, String::from_utf8_lossy(&comm).into_owned()));
     }
     out.sort();
     Some(out)
@@ -599,6 +700,10 @@ pub struct WorkerHandle {
     reader: BufReader<ChildStdout>,
     writer: BufWriter<ChildStdin>,
     stderr_task: Option<std::thread::JoinHandle<()>>,
+    /// The last non-empty line the worker wrote on stderr (sanitized, capped), recorded even when
+    /// forwarding is suppressed. A worker that dies before its handshake usually says why there
+    /// ("dyld: Library not loaded"), and the spawn error carries it to the operator (W10-BFIX).
+    last_stderr: Arc<Mutex<Option<String>>>,
     /// True once this handle has reaped its child. Every `kill(-pgid, …)` is gated on
     /// this: after the reap the pid number is free and may name an unrelated group.
     reaped: bool,
@@ -795,6 +900,30 @@ impl WorkerHandle {
             });
         }
 
+        // macOS: the per-worker memory ceiling, enforced by the worker on itself (no cgroups here;
+        // see `metal_sizing::WORKER_MAX_FOOTPRINT_ENV`). Same figure as the Linux `MemoryMax` cap.
+        #[cfg(target_os = "macos")]
+        {
+            let key = crate::metal_sizing::WORKER_MAX_FOOTPRINT_ENV;
+            if !env_overrides.contains_key(key) && std::env::var_os(key).is_none() {
+                if let Some(ceiling) = ceiling {
+                    cmd.env(key, ceiling.to_string());
+                }
+            }
+        }
+
+        // Elsewhere (macOS): the same process group, which every identity check and group kill
+        // relies on (`memory::pid_is_our_worker` requires pgid == pid). Without it a Mac worker
+        // shared the miner's group, so no watchdog, preemption or shutdown could ever signal it,
+        // and a timed-out worker ran on (M6). There is no PR_SET_PDEATHSIG here; the risc0 worker
+        // watches its parent itself (`zkminer-prove-risc0`, `exit_when_orphaned`), and the oom
+        // score is a Linux knob.
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
         let child = cmd
             .spawn()
             .with_context(|| format!("Failed to spawn worker {backend} at {}", path.display()))?;
@@ -860,6 +989,8 @@ impl WorkerHandle {
 
         // Spawn stderr reader thread that forwards to tracing
         let backend_name = backend.to_string();
+        let last_stderr: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_stderr_w = last_stderr.clone();
         let stderr_task = child_stderr.map(|stderr| {
             std::thread::Builder::new()
                 .name(format!("worker-stderr-{backend_name}"))
@@ -895,17 +1026,24 @@ impl WorkerHandle {
                         if raw.is_empty() {
                             return;
                         }
+                        // Sanitize (strip control/escape bytes, cap length) before it can reach the
+                        // operator's console or log file.
+                        let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
+                        if line.is_empty() {
+                            return;
+                        }
+                        // Kept for a failed handshake's or a dead worker's error (W10-BFIX), whatever
+                        // is forwarded. Not the panic handler's backtrace hint, which follows the
+                        // panic message and would replace the reason.
+                        if !line.starts_with(PANIC_BACKTRACE_NOTE) {
+                            *last_stderr_w.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(line.clone());
+                        }
                         // TUI mode suppresses forwarding to BOTH sinks: the eprintln would corrupt the
                         // alternate screen (a guest could force it by prefixing "[WITSUM]"), and the
                         // tracing::warn would flood the rolling log file. The pipe is still drained (we
                         // read every byte), so the worker never blocks on a full pipe regardless.
                         if SUPPRESS_WORKER_STDERR.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        // Sanitize (strip control/escape bytes, cap length) before it can reach the
-                        // operator's console or log file.
-                        let line = sanitize_worker_line(&String::from_utf8_lossy(raw));
-                        if line.is_empty() {
                             return;
                         }
                         // Refill the bucket for the time since the last forward, then spend one token.
@@ -965,6 +1103,15 @@ impl WorkerHandle {
         }).flatten();
 
         let pid_for_cap = spawn_guard.get().id();
+        // macOS: no systemd, so no `busctl` to try (every spawn used to warn that the cap failed and
+        // that `oom_score_adj` would cover it, which does not exist there either). The ceiling went
+        // to the worker in its environment instead, above.
+        #[cfg(target_os = "macos")]
+        tracing::info!(
+            "worker {backend} (PID {pid_for_cap}): memory ceiling is the worker's own footprint \
+             guard ({}), macOS has no cgroups",
+            crate::metal_sizing::WORKER_MAX_FOOTPRINT_ENV
+        );
         #[cfg(target_os = "linux")]
         let prepared = match prepared {
             Some(p) => {
@@ -984,9 +1131,16 @@ impl WorkerHandle {
         };
         #[cfg(not(target_os = "linux"))]
         let prepared = false;
+        // macOS: nothing to adopt (above); `ceiling` already reached the worker's environment.
+        #[cfg(target_os = "macos")]
+        let unit: Option<String> = {
+            let _ = (prepared, ceiling);
+            None
+        };
         // Otherwise: a kernel-enforced ceiling on this worker, best effort. Adoption of a pid we
         // already own, NOT a wrapper process — see `memory::cap_process_memory` for why that
         // distinction is load-bearing for every pid-keyed path in this file.
+        #[cfg(not(target_os = "macos"))]
         let unit = match ceiling {
             _ if prepared => None,
             Some(ceiling) => {
@@ -1054,15 +1208,47 @@ impl WorkerHandle {
             reader,
             writer,
             stderr_task,
+            last_stderr,
             reaped: false,
             oom_kills_at_spawn,
             may_lack_network: false,
         };
 
-        // Perform Hello handshake
-        handle.handshake()?;
+        // Perform Hello handshake. A worker that fails it (died at exec, a missing dylib, a crash
+        // before the handshake) has usually said why on stderr: carry its last line in the error, or
+        // the operator sees only "process died (EOF)" (W10-BFIX).
+        if let Err(e) = handle.handshake() {
+            let quoted = format!("{e:#}").contains(LAST_OUTPUT); // a `WorkerDied` already has it
+            return Err(match handle.last_stderr_line(STDERR_DRAIN_WAIT) {
+                Some(said) if !quoted => anyhow::anyhow!("{e:#} ({LAST_OUTPUT}{said})"),
+                _ => e,
+            });
+        }
 
         Ok(handle)
+    }
+
+    /// The worker's last stderr line, after waiting up to `wait` for its stderr to be drained (a
+    /// worker that died has closed it; one that is still running is not waited for longer).
+    fn last_stderr_line(&self, wait: Duration) -> Option<String> {
+        if let Some(task) = &self.stderr_task {
+            let deadline = Instant::now() + wait;
+            while !task.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // Shorter than a forwarded line: it is quoted inside an error the TUI shows on one line.
+        const MAX_QUOTED: usize = 300;
+        let line = self
+            .last_stderr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        Some(if line.chars().count() > MAX_QUOTED {
+            line.chars().take(MAX_QUOTED).chain("…".chars()).collect()
+        } else {
+            line
+        })
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -1175,6 +1361,11 @@ impl WorkerHandle {
                         self.backend
                     );
                 }
+                // risc0 3.1 (P31-19): the host's seal selector is its own risc0's; a worker on
+                // another risc0 makes proofs no such seal verifies.
+                if let Some(why) = zkminer_prover_protocol::risc0_sdk_mismatch(&sdk_version) {
+                    bail!("Worker {}: {why}", self.backend);
+                }
                 if backend != self.backend {
                     tracing::warn!(
                         "Worker reports backend '{backend}' but expected '{}'",
@@ -1242,6 +1433,7 @@ impl WorkerHandle {
         read_message(&mut self.reader).map_err(|e| match e {
             FrameError::UnexpectedEof => WorkerDied {
                 backend: self.backend.clone(),
+                last_output: self.last_stderr_line(STDERR_DRAIN_WAIT),
             }
             .into(),
             other => anyhow::anyhow!("Recv error from {}: {other}", self.backend),
@@ -2527,8 +2719,12 @@ mod tests {
         let pid = child.id();
         wait_for_zombie(pid);
 
-        // The old guard: a zombie keeps its own group non-empty.
+        // The old guard: a zombie keeps its own group non-empty. Linux only: XNU answers ESRCH
+        // for a group whose only member is a zombie (measured, macOS 27.2), so there the old guard
+        // never misfired; the new predicate below is what matters on both.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let old_guard_fires = unsafe { libc::kill(-(pid as i32), 0) } == 0;
+        #[cfg(target_os = "linux")]
         assert!(
             old_guard_fires,
             "precondition: the old kill(-pgid, 0) guard must still succeed for a zombie \
@@ -2617,7 +2813,9 @@ mod tests {
                 }
                 other => panic!("probe {i} lost the zombie: {other:?}"),
             }
-            // Still signallable, i.e. the group number is still ours.
+            // Still signallable, i.e. the group number is still ours. (Linux: XNU answers ESRCH for
+            // a group whose only member is a zombie, though the zombie still pins the number.)
+            #[cfg(target_os = "linux")]
             assert_eq!(unsafe { libc::kill(-(pid as i32), 0) }, 0);
         }
         let _ = child.wait();

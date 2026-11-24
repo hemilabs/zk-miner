@@ -10,6 +10,8 @@
 //! For each backend, GPU-suffixed variants are searched first:
 //!   `zkminer-prove-{backend}-cuda`  → gpu_tag = "cuda"
 //!   `zkminer-prove-{backend}-rocm`  → gpu_tag = "rocm"
+//!   `zkminer-prove-{backend}-intel` → gpu_tag = "intel"
+//!   `zkminer-prove-{backend}-metal` → gpu_tag = "metal" (macOS, Apple silicon)
 //!   `zkminer-prove-{backend}`       → gpu_tag = "generic"
 //!
 //! GPU binaries are auto-expanded: one worker entry per detected physical GPU of that vendor.
@@ -25,16 +27,17 @@ use zkminer_prover_protocol::{BACKEND_OPENVM, BACKEND_RISC0, BACKEND_SP1};
 const ALL_BACKENDS: &[&str] = &[BACKEND_RISC0, BACKEND_SP1, BACKEND_OPENVM];
 
 /// GPU variant suffixes to search, in order. "generic" means no suffix.
-const GPU_TAGS: &[&str] = &["cuda", "rocm", "intel", "generic"];
+const GPU_TAGS: &[&str] = &["cuda", "rocm", "intel", "metal", "generic"];
 
 /// A detected physical GPU.
 #[derive(Debug, Clone)]
 pub struct DetectedGpu {
-    /// "cuda" or "rocm"
+    /// "cuda", "rocm", "intel" or "metal"
     pub gpu_tag: String,
     /// Sequential index within vendor (0, 1, ...)
     pub device_index: u32,
-    /// PCI bus ID, e.g. "0000:01:00.0" — used for *_VISIBLE_DEVICES
+    /// PCI bus ID, e.g. "0000:01:00.0" — used for *_VISIBLE_DEVICES. An Apple GPU is not on PCI
+    /// and gets the stable pseudo id [`APPLE_GPU_PSEUDO_BUS_ID`].
     pub pci_bus_id: String,
     /// Human-readable GPU name
     pub name: String,
@@ -48,7 +51,7 @@ pub struct DetectedGpu {
 #[derive(Debug, Clone)]
 pub struct DiscoveredWorker {
     pub backend: String,
-    /// GPU variant: "cuda", "rocm", or "generic".
+    /// GPU variant: "cuda", "rocm", "intel", "metal", or "generic".
     pub gpu_tag: String,
     /// Device index within vendor (None for "generic" or explicit binaries).
     pub device_index: Option<u32>,
@@ -72,7 +75,7 @@ fn worker_binary_name(backend: &str, gpu_tag: &str) -> String {
     }
 }
 
-/// Detect all physical GPUs (NVIDIA + AMD + Intel).
+/// Detect all physical GPUs (NVIDIA + AMD + Intel, and Apple on macOS).
 pub fn detect_all_gpus() -> Vec<DetectedGpu> {
     detect_all_gpus_with(&HashMap::new(), &[], &|_| {})
 }
@@ -144,7 +147,408 @@ fn detect_all_gpus_with(
         gpus.extend(intel);
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        let apple = detect_apple_gpus();
+        if !apple.is_empty() {
+            let names: Vec<_> = apple
+                .iter()
+                .map(|g| format!("[{}] {} ({})", g.device_index, g.name, g.pci_bus_id))
+                .collect();
+            tracing::info!(
+                "Detected {} Apple GPU(s): {}",
+                apple.len(),
+                names.join(", ")
+            );
+            gpus.extend(apple);
+        }
+    }
+
     gpus
+}
+
+/// The pseudo PCI bus id of the Apple GPU. Apple silicon's GPU sits on the SoC, not on PCI, but
+/// everything downstream (benchmark rows' `pci_bus_id`, cache migration, the dashboard) keys a card
+/// by this string, so it must be non-empty and stable across runs. It contains no `:`, so
+/// `normalize_pci_bus_id` leaves it alone and it can never equal a real bus id.
+pub const APPLE_GPU_PSEUDO_BUS_ID: &str = "apple-gpu0";
+
+/// Detect the Apple silicon GPU on macOS: exactly one, device index 0, which is the device
+/// `MTLCreateSystemDefaultDevice` returns and the only one the risc0 Metal HAL drives.
+///
+/// `system_profiler SPDisplaysDataType -json` names it (bounded by `GPU_TOOL_TIMEOUT` like
+/// `nvidia-smi` and `rocm-smi`; it took 0.16 s on an M5 Max). If that does not answer, the SoC's
+/// brand string (`sysctl machdep.cpu.brand_string`, e.g. "Apple M5 Max") is the same name, since the
+/// GPU is part of the chip. An Intel Mac reports neither as Apple and gets no entry: the Metal port
+/// targets Apple silicon only. No compute capability: that is a CUDA notion.
+#[cfg(target_os = "macos")]
+fn detect_apple_gpus() -> Vec<DetectedGpu> {
+    let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
+        std::process::Command::new("system_profiler").args(["SPDisplaysDataType", "-json"]),
+        GPU_TOOL_TIMEOUT,
+        1024 * 1024,
+    );
+    let from_profiler = if matches!(
+        outcome,
+        zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
+    ) {
+        if let Some(cores) = apple_gpu_cores_from_profiler_json(&stdout) {
+            let _ = APPLE_GPU_CORES.set(cores);
+        }
+        apple_gpu_name_from_profiler_json(&stdout)
+    } else {
+        tracing::warn!(
+            "system_profiler did not answer ({}); naming the Apple GPU after the chip",
+            outcome.describe()
+        );
+        None
+    };
+    let name = from_profiler.or_else(|| {
+        crate::memory::sysctl_string("machdep.cpu.brand_string").filter(|b| b.starts_with("Apple"))
+    });
+    match name {
+        Some(name) => vec![apple_gpu(name)],
+        None => Vec::new(),
+    }
+}
+
+/// Where the owner-activity reading comes from (W7-M10), so the tier logic can be tested with a
+/// fake one. [`MacOwnerSource`] is the real one.
+pub trait OwnerSource {
+    /// Time since the last keyboard, mouse or trackpad input.
+    fn hid_idle(&self) -> Option<std::time::Duration>;
+    /// Whether the main display is asleep.
+    fn display_asleep(&self) -> Option<bool>;
+    /// On battery power.
+    fn on_battery(&self) -> Option<bool>;
+    /// Low Power Mode.
+    fn low_power_mode(&self) -> Option<bool>;
+}
+
+/// One owner reading from `source`.
+pub fn read_owner(source: &dyn OwnerSource) -> crate::metal_sizing::OwnerReading {
+    crate::metal_sizing::OwnerReading {
+        hid_idle: source.hid_idle(),
+        display_asleep: source.display_asleep(),
+        on_battery: source.on_battery(),
+        low_power_mode: source.low_power_mode(),
+    }
+}
+
+/// The owner reading of this Mac now ([`MacOwnerSource`]); all `None` off macOS.
+pub fn owner_reading() -> crate::metal_sizing::OwnerReading {
+    read_owner(&MacOwnerSource)
+}
+
+/// W7-M11: this host's power state now, in the form a worker's benchmark entry carries it
+/// (`BenchmarkEntry::power_state`): Low Power Mode, battery, `NSProcessInfo.thermalState`. All
+/// `None` off macOS. `benchmark::load_cached_benchmark` compares it with a cached suite's marks.
+pub fn host_power_state() -> zkminer_prover_protocol::BenchPowerState {
+    #[cfg(target_os = "macos")]
+    {
+        zkminer_prover_protocol::BenchPowerState {
+            low_power_mode: mac_owner::low_power_mode(),
+            on_battery: mac_owner::on_battery(),
+            thermal: mac_owner::thermal_state(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        zkminer_prover_protocol::BenchPowerState::default()
+    }
+}
+
+/// The real owner-activity source. Every probe works as an ordinary user, with no entitlement and
+/// no sudo:
+/// - IOKit `IOHIDSystem`'s `HIDIdleTime` (nanoseconds since the last HID event; what `ioreg -c
+///   IOHIDSystem` prints);
+/// - CoreGraphics `CGDisplayIsAsleep(CGMainDisplayID())`;
+/// - IOKit's power-source type ("Battery Power"), as M9's worker power guard reads it;
+/// - `NSProcessInfo.isLowPowerModeEnabled` (macOS 12+), as M9's power guard reads it.
+pub struct MacOwnerSource;
+
+#[cfg(not(target_os = "macos"))]
+impl OwnerSource for MacOwnerSource {
+    fn hid_idle(&self) -> Option<std::time::Duration> {
+        None
+    }
+    fn display_asleep(&self) -> Option<bool> {
+        None
+    }
+    fn on_battery(&self) -> Option<bool> {
+        None
+    }
+    fn low_power_mode(&self) -> Option<bool> {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod mac_owner {
+    use std::ffi::{c_char, c_void, CStr};
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+        fn IORegistryEntryCreateCFProperty(
+            entry: u32,
+            key: CFTypeRef,
+            allocator: CFTypeRef,
+            options: u32,
+        ) -> CFTypeRef;
+        fn IOObjectRelease(object: u32) -> i32;
+        fn IOPSCopyPowerSourcesInfo() -> CFTypeRef;
+        fn IOPSGetProvidingPowerSourceType(blob: CFTypeRef) -> CFTypeRef;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(alloc: CFTypeRef, s: *const c_char, enc: u32) -> CFTypeRef;
+        fn CFStringGetCString(s: CFTypeRef, buf: *mut c_char, size: isize, enc: u32) -> u8;
+        fn CFRelease(cf: CFTypeRef);
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFDataGetTypeID() -> usize;
+        fn CFNumberGetValue(number: CFTypeRef, the_type: isize, out: *mut c_void) -> u8;
+        fn CFDataGetLength(data: CFTypeRef) -> isize;
+        fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayIsAsleep(display: u32) -> u32;
+    }
+    #[link(name = "Foundation", kind = "framework")]
+    extern "C" {
+        // Referenced so Foundation (NSProcessInfo) is linked and loaded.
+        static NSFoundationVersionNumber: f64;
+    }
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    const UTF8: u32 = 0x0800_0100;
+    const K_CF_NUMBER_SINT64: isize = 4;
+
+    /// `HIDIdleTime` of IOHIDSystem, in nanoseconds.
+    pub fn hid_idle_ns() -> Option<u64> {
+        // SAFETY: IOKit registry API. `IOServiceGetMatchingService` consumes the matching dict;
+        // the service and the property are released here (Create/Copy rule).
+        unsafe {
+            let matching = IOServiceMatching(c"IOHIDSystem".as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            let service = IOServiceGetMatchingService(0, matching);
+            if service == 0 {
+                return None;
+            }
+            let key = CFStringCreateWithCString(std::ptr::null(), c"HIDIdleTime".as_ptr(), UTF8);
+            let prop = if key.is_null() {
+                std::ptr::null()
+            } else {
+                IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0)
+            };
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            IOObjectRelease(service);
+            if prop.is_null() {
+                return None;
+            }
+            let ty = CFGetTypeID(prop);
+            let mut ns: Option<u64> = None;
+            if ty == CFNumberGetTypeID() {
+                let mut v: i64 = 0;
+                if CFNumberGetValue(prop, K_CF_NUMBER_SINT64, (&mut v as *mut i64).cast()) != 0 {
+                    ns = u64::try_from(v).ok();
+                }
+            } else if ty == CFDataGetTypeID() && CFDataGetLength(prop) == 8 {
+                let p = CFDataGetBytePtr(prop);
+                if !p.is_null() {
+                    ns = Some(u64::from_ne_bytes(
+                        std::slice::from_raw_parts(p, 8).try_into().ok()?,
+                    ));
+                }
+            }
+            CFRelease(prop);
+            ns
+        }
+    }
+
+    /// Whether the main display is asleep; `None` on a Mac with no display.
+    pub fn display_asleep() -> Option<bool> {
+        // SAFETY: plain CoreGraphics queries.
+        unsafe {
+            let d = CGMainDisplayID();
+            (d != 0).then(|| CGDisplayIsAsleep(d) != 0)
+        }
+    }
+
+    /// The providing power source is the battery.
+    pub fn on_battery() -> Option<bool> {
+        // SAFETY: IOKit power-source API; the blob is released after use, and the source-type
+        // string is owned by the blob (Get rule), read before the release.
+        unsafe {
+            let blob = IOPSCopyPowerSourcesInfo();
+            if blob.is_null() {
+                return None;
+            }
+            let ty = IOPSGetProvidingPowerSourceType(blob);
+            let mut buf = [0 as c_char; 64];
+            let ok = !ty.is_null()
+                && CFStringGetCString(ty, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
+            let text = ok.then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned());
+            CFRelease(blob);
+            text.map(|t| t == "Battery Power")
+        }
+    }
+
+    /// `[[NSProcessInfo processInfo] thermalState]` (0 nominal .. 3 critical).
+    pub fn thermal_state() -> Option<u8> {
+        type MsgId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type MsgInt = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
+        // SAFETY: as in `low_power_mode`: `objc_msgSend` through each message's real signature;
+        // `thermalState` (macOS 10.10.3+) returns an NSInteger; the shared instance is not owned.
+        unsafe {
+            if NSFoundationVersionNumber <= 0.0 {
+                return None;
+            }
+            let class = objc_getClass(c"NSProcessInfo".as_ptr());
+            if class.is_null() {
+                return None;
+            }
+            let send = objc_msgSend as unsafe extern "C" fn();
+            let id: MsgId = std::mem::transmute(send);
+            let int: MsgInt = std::mem::transmute(send);
+            let info = id(class, sel_registerName(c"processInfo".as_ptr()));
+            if info.is_null() {
+                return None;
+            }
+            let t = int(info, sel_registerName(c"thermalState".as_ptr()));
+            (0..=3).contains(&t).then_some(t as u8)
+        }
+    }
+
+    /// `[[NSProcessInfo processInfo] isLowPowerModeEnabled]`, when the OS has it.
+    pub fn low_power_mode() -> Option<bool> {
+        type MsgId = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+        type MsgBool = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+        type MsgRespond = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+        // SAFETY: `objc_msgSend` is called through the function type of each message's real
+        // signature (arm64 requires the cast); the shared NSProcessInfo instance is not owned.
+        unsafe {
+            if NSFoundationVersionNumber <= 0.0 {
+                return None;
+            }
+            let class = objc_getClass(c"NSProcessInfo".as_ptr());
+            if class.is_null() {
+                return None;
+            }
+            let send = objc_msgSend as unsafe extern "C" fn();
+            let id: MsgId = std::mem::transmute(send);
+            let boolean: MsgBool = std::mem::transmute(send);
+            let respond: MsgRespond = std::mem::transmute(send);
+            let info = id(class, sel_registerName(c"processInfo".as_ptr()));
+            if info.is_null() {
+                return None;
+            }
+            let lpm = sel_registerName(c"isLowPowerModeEnabled".as_ptr());
+            if !respond(info, sel_registerName(c"respondsToSelector:".as_ptr()), lpm) {
+                return None;
+            }
+            Some(boolean(info, lpm))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl OwnerSource for MacOwnerSource {
+    fn hid_idle(&self) -> Option<std::time::Duration> {
+        mac_owner::hid_idle_ns().map(std::time::Duration::from_nanos)
+    }
+    fn display_asleep(&self) -> Option<bool> {
+        mac_owner::display_asleep()
+    }
+    fn on_battery(&self) -> Option<bool> {
+        mac_owner::on_battery()
+    }
+    fn low_power_mode(&self) -> Option<bool> {
+        mac_owner::low_power_mode()
+    }
+}
+
+/// The Apple GPU's core count (`sppci_cores`), recorded when discovery ran `system_profiler`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+static APPLE_GPU_CORES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// This Mac's GPU core count, if discovery read it (macOS only; `None` elsewhere or before
+/// discovery). Read at runtime, never assumed: the dev machine reports 32, the minimum tier 7-10
+/// (PLAN 9.1). Used to scale the Metal benchmark's deadline (`dispatcher::metal_benchmark_timeout`).
+pub fn apple_gpu_cores() -> Option<u32> {
+    APPLE_GPU_CORES.get().copied()
+}
+
+/// `sppci_cores` of the first Apple GPU in `system_profiler SPDisplaysDataType -json` output.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu_cores_from_profiler_json(json: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("SPDisplaysDataType")?
+        .as_array()?
+        .iter()
+        .filter(|gpu| {
+            gpu.get("spdisplays_vendor")
+                .and_then(|x| x.as_str())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("apple"))
+                || gpu
+                    .get("sppci_model")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|m| m.starts_with("Apple"))
+        })
+        .find_map(|gpu| gpu.get("sppci_cores")?.as_str()?.trim().parse::<u32>().ok())
+        .filter(|&c| c > 0)
+}
+
+/// The single Apple GPU entry, given its name.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu(name: String) -> DetectedGpu {
+    DetectedGpu {
+        gpu_tag: "metal".to_string(),
+        device_index: 0,
+        pci_bus_id: APPLE_GPU_PSEUDO_BUS_ID.to_string(),
+        name,
+        compute_cap: None,
+    }
+}
+
+/// The name of the first Apple-made GPU in `system_profiler SPDisplaysDataType -json` output, or
+/// `None` when there is none (an Intel Mac's AMD or Intel GPU is skipped) or the JSON is not the
+/// expected shape. Split out so the parse is testable without a Mac.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn apple_gpu_name_from_profiler_json(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get("SPDisplaysDataType")?
+        .as_array()?
+        .iter()
+        .filter(|gpu| {
+            let vendor = gpu.get("spdisplays_vendor").and_then(|x| x.as_str());
+            let model = gpu.get("sppci_model").and_then(|x| x.as_str());
+            vendor.is_some_and(|v| v.to_ascii_lowercase().contains("apple"))
+                || model.is_some_and(|m| m.starts_with("Apple"))
+        })
+        .find_map(|gpu| {
+            ["sppci_model", "_name"]
+                .iter()
+                .filter_map(|k| gpu.get(*k).and_then(|x| x.as_str()))
+                .map(str::trim)
+                .find(|n| !n.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// Says so, once, when this user cannot open the device nodes an AMD (`/dev/kfd`) or Intel
@@ -1882,6 +2286,9 @@ fn infer_gpu_tag(path: &Path) -> String {
         if name.ends_with("-intel") {
             return "intel".to_string();
         }
+        if name.ends_with("-metal") {
+            return "metal".to_string();
+        }
     }
     "generic".to_string()
 }
@@ -2174,7 +2581,11 @@ mod tests {
     /// whatever is installed now.
     #[test]
     fn the_sp1_server_checked_is_the_one_the_worker_will_run() {
-        let root = std::env::temp_dir().join(format!(
+        // Canonical, because `sp1_named_server_for` canonicalizes the worker's path: on macOS the
+        // temp dir is `/var/folders/...`, a symlink into `/private/var/folders/...`.
+        let tmp =
+            std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        let root = tmp.join(format!(
             "zk-sp1-server-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2425,7 +2836,201 @@ mod tests {
     }
 
     #[test]
-    fn parses_windows_intel_display_devices() {
+    fn metal_is_a_gpu_tag_with_a_suffixed_binary() {
+        assert!(GPU_TAGS.contains(&"metal"));
+        // Searched before the generic name, like every other vendor suffix.
+        let metal = GPU_TAGS.iter().position(|t| *t == "metal").unwrap();
+        let generic = GPU_TAGS.iter().position(|t| *t == "generic").unwrap();
+        assert!(metal < generic);
+        assert_eq!(
+            worker_binary_name("risc0", "metal"),
+            "zkminer-prove-risc0-metal"
+        );
+        assert_eq!(
+            infer_gpu_tag(Path::new(
+                "/Users/x/.zkminer/provers/zkminer-prove-risc0-metal"
+            )),
+            "metal"
+        );
+        // Only a suffix counts.
+        assert_eq!(
+            infer_gpu_tag(Path::new("/x/zkminer-prove-risc0-metal-old")),
+            "generic"
+        );
+        // No SP1 build drives an Apple GPU, so SP1 is never expanded onto one.
+        assert_eq!(sp1_server_name("metal"), None);
+        assert!(!sp1_serves_card(
+            "metal",
+            Path::new("/nonexistent/zkminer-prove-sp1")
+        ));
+    }
+
+    #[test]
+    fn apple_gpu_is_named_from_system_profiler() {
+        // Trimmed from `system_profiler SPDisplaysDataType -json` on an M5 Max (macOS 27.2).
+        let m5 = r#"{
+          "SPDisplaysDataType" : [
+            {
+              "_name" : "Apple M5 Max",
+              "spdisplays_mtlgpufamilysupport" : "spdisplays_metal4",
+              "spdisplays_ndrvs" : [ { "_name" : "Some Display" } ],
+              "spdisplays_vendor" : "sppci_vendor_Apple",
+              "sppci_bus" : "spdisplays_builtin",
+              "sppci_cores" : "32",
+              "sppci_device_type" : "spdisplays_gpu",
+              "sppci_model" : "Apple M5 Max"
+            }
+          ]
+        }"#;
+        assert_eq!(
+            apple_gpu_name_from_profiler_json(m5).as_deref(),
+            Some("Apple M5 Max")
+        );
+        // An Intel Mac's discrete AMD GPU is not an Apple GPU: no entry.
+        let intel_mac = r#"{"SPDisplaysDataType":[{"_name":"AMD Radeon Pro 5500M",
+            "spdisplays_vendor":"sppci_vendor_amd","sppci_model":"AMD Radeon Pro 5500M"}]}"#;
+        assert_eq!(apple_gpu_name_from_profiler_json(intel_mac), None);
+        // Falls back to `_name` when the model is missing.
+        let no_model = r#"{"SPDisplaysDataType":[{"_name":"Apple M1",
+            "spdisplays_vendor":"sppci_vendor_Apple"}]}"#;
+        assert_eq!(
+            apple_gpu_name_from_profiler_json(no_model).as_deref(),
+            Some("Apple M1")
+        );
+        assert_eq!(apple_gpu_name_from_profiler_json(""), None);
+        assert_eq!(apple_gpu_name_from_profiler_json("{}"), None);
+        assert_eq!(apple_gpu_name_from_profiler_json("not json"), None);
+        // The core count, for the Metal benchmark deadline (M6).
+        assert_eq!(apple_gpu_cores_from_profiler_json(m5), Some(32));
+        assert_eq!(apple_gpu_cores_from_profiler_json(intel_mac), None);
+        assert_eq!(apple_gpu_cores_from_profiler_json(no_model), None);
+
+        let gpu = apple_gpu("Apple M5 Max".into());
+        assert_eq!(gpu.gpu_tag, "metal");
+        assert_eq!(gpu.device_index, 0);
+        assert_eq!(gpu.pci_bus_id, APPLE_GPU_PSEUDO_BUS_ID);
+        assert_eq!(gpu.compute_cap, None);
+        // The pseudo id must survive normalisation unchanged, or rows keyed by it would not join.
+        assert_eq!(normalize_pci_bus_id(APPLE_GPU_PSEUDO_BUS_ID), "apple-gpu0");
+    }
+
+    /// On an Apple silicon Mac, discovery reports exactly one Apple GPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_mac_reports_one_apple_gpu() {
+        let apple = detect_apple_gpus();
+        assert_eq!(apple.len(), 1, "{apple:?}");
+        assert!(apple[0].name.starts_with("Apple"), "{apple:?}");
+        assert_eq!(apple[0].gpu_tag, "metal");
+        assert_eq!(apple[0].device_index, 0);
+        assert_eq!(apple[0].pci_bus_id, "apple-gpu0");
+        let all = detect_all_gpus();
+        assert_eq!(all.iter().filter(|g| g.gpu_tag == "metal").count(), 1);
+    }
+
+    /// W7-M10: a fake owner source drives the reading and, through it, the tier.
+    #[test]
+    fn a_fake_owner_source_drives_the_tier() {
+        use crate::metal_sizing::{OwnerForce, OwnerTier, OwnerTierState};
+        use std::cell::Cell;
+        use std::time::Duration;
+        struct Fake {
+            idle: Cell<Option<u64>>,
+            asleep: Cell<Option<bool>>,
+            battery: Option<bool>,
+            lpm: Option<bool>,
+        }
+        impl OwnerSource for Fake {
+            fn hid_idle(&self) -> Option<Duration> {
+                self.idle.get().map(Duration::from_secs)
+            }
+            fn display_asleep(&self) -> Option<bool> {
+                self.asleep.get()
+            }
+            fn on_battery(&self) -> Option<bool> {
+                self.battery
+            }
+            fn low_power_mode(&self) -> Option<bool> {
+                self.lpm
+            }
+        }
+        let fake = Fake {
+            idle: Cell::new(Some(4)),
+            asleep: Cell::new(Some(false)),
+            battery: Some(false),
+            lpm: None,
+        };
+        let r = read_owner(&fake);
+        assert_eq!(r.hid_idle, Some(Duration::from_secs(4)));
+        assert_eq!(
+            (r.display_asleep, r.on_battery, r.low_power_mode),
+            (Some(false), Some(false), None)
+        );
+        assert!(r.describe().contains("input idle 4 s"), "{}", r.describe());
+        let t = Duration::from_secs(300);
+        let mut s = OwnerTierState::default();
+        assert_eq!(
+            s.update(&read_owner(&fake), t, OwnerForce::Auto),
+            OwnerTier::Active
+        );
+        fake.idle.set(Some(400));
+        assert_eq!(
+            s.update(&read_owner(&fake), t, OwnerForce::Auto),
+            OwnerTier::Active
+        );
+        fake.asleep.set(Some(true));
+        assert_eq!(
+            s.update(&read_owner(&fake), t, OwnerForce::Auto),
+            OwnerTier::Idle
+        );
+        // An unreadable source (every probe None): no change.
+        let none = Fake {
+            idle: Cell::new(None),
+            asleep: Cell::new(None),
+            battery: None,
+            lpm: None,
+        };
+        assert_eq!(
+            s.update(&read_owner(&none), t, OwnerForce::Auto),
+            OwnerTier::Idle
+        );
+    }
+
+    /// The real probes answer on this Mac, as an ordinary user (no sudo).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_macs_owner_probes_answer() {
+        let r = owner_reading();
+        eprintln!("owner reading: {}", r.describe());
+        assert!(r.hid_idle.is_some(), "{r:?}");
+        assert!(r.low_power_mode.is_some(), "{r:?}");
+        assert!(r.on_battery.is_some(), "{r:?}");
+        // What a reading costs (the dispatcher reads at every Metal job start and claim-side
+        // sizing read).
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(owner_reading().hid_idle.is_some());
+        }
+        eprintln!("one owner reading: {:.1} us", t.elapsed().as_secs_f64() * 1e4);
+    }
+
+    /// W7-M11: the host's power state answers here too (a Mac Studio on mains power, thermal
+    /// nominal or fair at rest), and is full power, so a marked cached suite would get re-benchmark
+    /// advice.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn this_macs_power_state_answers_and_is_full() {
+        let p = host_power_state();
+        eprintln!("host power state: {p:?}");
+        assert!(p.low_power_mode.is_some() && p.thermal.is_some(), "{p:?}");
+        assert_eq!(p.on_battery, owner_reading().on_battery);
+        if p.thermal.unwrap() < zkminer_prover_protocol::THERMAL_THROTTLED {
+            assert_eq!(p.reduced(), None, "{p:?}");
+        }
+    }
+
+    #[test]
+        fn parses_windows_intel_display_devices() {
         // As listed on a Windows box with an Arc Pro B70 and a Ryzen iGPU, plus an Intel iGPU
         // (Meteor Lake, 0x7d55) and a second B70 on a lower bus, to check filtering and order.
         let out = [

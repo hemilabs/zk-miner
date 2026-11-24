@@ -34,9 +34,19 @@ Every connection a requester can cause goes through one guard
   **network-specific NAT64 prefix** — RFC 6052, any /32 to /96 a network picks for its
   translator) is judged by that IPv4 address, which the translator would connect to from its
   own IPv4 side; IPv4-compatible addresses are refused. The network-specific prefix is learned
-  at startup and every 5 minutes by asking the host's own DNS servers for `ipv4only.arpa`
-  (RFC 7050: a DNS64 resolver answers under its prefix), or named in `[egress]
-  nat64_prefixes`. Deny CIDRs and the host's prefixes match every such spelling too
+  per network by asking the host's own DNS servers for `ipv4only.arpa` (RFC 7050: a DNS64
+  resolver answers under its prefix; the servers in use first, those of a family the host does
+  not route skipped), at startup, at once whenever the uplink changes, every 15 seconds while a
+  host with IPv6 and no IPv4 route has found none, and every 5 minutes; also from a router
+  advertisement's PREF64 option (RFC 8781: macOS's configuration daemon, and on Linux the
+  advertisements the kernel processes, from the IPv6 default gateway only); or named in
+  `[egress] nat64_prefixes`, which are always in force. A DNS answer reveals a prefix only where
+  both of `ipv4only.arpa`'s addresses sit under it, at most two per answer; a router names at
+  most four; learned prefixes are kept per network and source and synthesized with only on the
+  network they were learned on (every one is still refused). A source that names more, or a
+  prefix that cannot be held, refuses every IPv6 destination on that network. Until the round
+  for a new network has finished, a host with IPv6 and no IPv4 route refuses every IPv6
+  destination (an address under a prefix not learned yet can carry a private IPv4 one). Deny CIDRs and the host's prefixes match every such spelling too
   (`64:ff9b::808:808/128` denies `8.8.8.8`, and a deny of `64:ff9b::/64` holds the addresses it
   holds as written).
 - **Not this host, not its neighbours, not its site.** Refused, whatever the spelling:
@@ -55,8 +65,12 @@ Every connection a requester can cause goes through one guard
     of the host's own DNS servers (an intercepting resolver reporting itself) confirms nothing
     either. A confirmation lasts 10 minutes (two discovery rounds): a family no round has
     confirmed for that long is unknown again. Discovery also runs again at once when the host's
-    uplink changes (its default routes, or the interface its internet traffic leaves by), and
-    until it has, nothing confirmed on the old uplink counts. Only a confirmed address gives
+    uplink changes (its default routes, or the interface its internet traffic leaves by; and the
+    router behind them: on Linux each default gateway's link-layer address from the neighbour
+    table, on macOS the configuration daemon's network signature, so two networks whose routers
+    have the same address are two uplinks; on Linux a gateway with no neighbour entry makes every
+    facts read an uplink of its own until one appears), and until it has, nothing confirmed on
+    the old uplink counts. Only a confirmed address gives
     its IPv6 site (below), so one forged answer cannot refuse someone else's whole site. Facts
     read while the first discovery runs wait for it. `[egress] public_addresses` states the
     public addresses instead (or as well); `[egress] discover_public_addresses = false` turns the
@@ -105,12 +119,16 @@ Every connection a requester can cause goes through one guard
     routing entry matched" and "which table matched" flags), which applies every rule exactly,
     port rules included; only a unicast route through a default route's gateway, or a default
     route of an ordinary table, is admitted (a local route, no route, a default route a
-    selector picks, an on-link route or another gateway is refused). For IPv4 it is asked twice,
+    selector picks, an on-link route or another gateway is refused); a default route must also
+    be one of the facts' own default routes (its family, gateway and interface), or it is
+    refused until the facts, read again at once, hold it (a VPN or a network that came up since
+    the facts were read is not admitted on facts that do not know it). For IPv4 it is asked twice,
     as a `connect` does (`ip_route_connect`): once without a source address, which tells the
     source the kernel picks, then with that source; a `from` rule that sends the connection to
     another table than the first lookup used is refused. (IPv6 looks the route up once, matching
     source rules inside that lookup, and is asked once.) Answers are reused for the life of one
-    facts snapshot (about a second). Linux only;
+    facts snapshot (about a second). On Linux; macOS asks its routing socket instead (below),
+    and elsewhere every query fails, so a public-mode miner refuses every requester connection;
   - **the site around each of the host's global IPv6 addresses**: its enclosing `/32`
     (`[egress] ipv6_site_prefix_len`, 16 to 64), what an organisation (a campus, a company)
     usually holds, whose other networks hold its other machines. This also refuses the rest of
@@ -145,29 +163,78 @@ Every connection a requester can cause goes through one guard
     `127.0.0.53` stub), which may answer only their own customers.
 
   These facts are read again once they are a second old, and again before any refusal that
-  rests on them. **Run the miner on the host's network:** a containerized miner sees only the
+  rests on them. A re-read that fails (a netlink, `getifaddrs` or configuration-daemon error)
+  leaves the last good facts in force, without their cached kernel answers, for 2 seconds past
+  their one-second life; after that **every requester connection is refused**, naming what
+  failed, until a re-read succeeds (tried again at most every 100 ms). One re-read runs at a
+  time; other callers wait for it at most 500 ms. The checks run off the async runtime's
+  worker threads. **Run the miner on the host's network:** a containerized miner sees only the
   container's interfaces and routes, so use host networking (`--network host`), or list the
   host's networks and addresses in `[egress] deny_cidrs`.
 - **Nothing within two hops.** Right before every connection (each hop of the ELF fetch, and
-  each connection the witness connector makes), a **probe** asks whether the destination is
-  near: a fresh TCP socket whose packets may cross at most `[egress] near_hop_limit` hops
-  (`IP_TTL` / `IPV6_UNICAST_HOPS`, default 2: the first-hop router and what sits directly
-  behind it) connects to the exact address and port, for at most 1.5 s, and is closed without
-  sending data. If something answers — the connection is accepted, refused or reset — the
-  destination is this host's own network (the home router's own global address on its WAN
-  side, which many routers serve their admin page, DNS and UPnP on; a NAT router or NAT64
-  translator hairpinning its own public address; a neighbour in the same cloud VPC; the far
-  side of a tunnel) and is refused. If the probe runs out of hops (Linux reports the router's
-  "time exceeded" as host unreachable), the destination is farther and the real connection is
-  made, on a new socket with the usual hop limit. **No answer in time decides nothing** (a path
-  that filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
-  limit, a device waking up): a **check connection** is made with the usual hop limit, and once
-  it is established its hop limit is lowered to the probe's and it is half-closed, without a
-  byte written. Its FIN reaches the peer only if the peer is within the limit, and a peer that
-  gets it acknowledges it: acknowledged (or reset) within a few round trips, refused; a "time
-  exceeded" or no acknowledgement, farther, and the real connection is made. A check connection
-  that does not connect refuses. Any other probe error (a local firewall's) refuses.
-  Unprivileged; developer mode sends no probe.
+  each connection the witness connector makes), **probes** ask whether the destination is near,
+  and it is admitted as far **only on positive evidence (a router past the limit said a probe ran
+  out of hops), never on silence**. Three fresh TCP sockets connect at once to the exact address
+  and port with hop limits (`IP_TTL` / `IPV6_UNICAST_HOPS`) `N`, `N+1` and `N+2`, `N` being
+  `[egress] near_hop_limit` (default 2: the first-hop router and what sits directly behind it),
+  each from the source address (and interface) the real connection will use; a round waits at
+  most 1.5 s and ends as soon as it is decided, and a second round follows 1 s later only when
+  the first decided nothing (8 s at most for the whole decision). No data is ever written; a
+  probe that connected is closed with a reset.
+  - **Near** (refused): the destination answered (accepted, refused or reset) a probe limited to
+    `N` hops or fewer. It is this host's own network: the home router's own global address on
+    its WAN side, which many routers serve their admin page, DNS and UPnP on; a NAT router or
+    NAT64 translator hairpinning its own public address; a neighbour in the same cloud VPC; the
+    far side of a tunnel.
+  - **Far** (admitted) only when a probe limited to `t >= N` hops got an ICMP "time exceeded",
+    code 0 (IPv4 type 11, ICMPv6 type 3), that the kernel matched to that probe (its addresses,
+    ports and initial sequence number), from a unicast, specified sender that is not the
+    destination, and the destination answered no probe limited to `t` hops or fewer. Linux and
+    Android read it from the socket's error queue (`IP_RECVERR` / `IPV6_RECVERR`,
+    `MSG_ERRQUEUE`: the ICMP type, code and offender); macOS as described under "macOS" below.
+  - **Everything else refuses** (`could not tell how near ... is`): no answer (a path that
+    filters ICMP, or a near host dropping SYNs for a while: a full accept queue, a SYN rate
+    limit, a device waking up; refused, never far), any destination unreachable, a "time
+    exceeded" with code 1 or sent by the destination itself, an answer only beyond the limit,
+    an unreachable whose ICMP message could not be read, inconsistent results, any local error
+    (a local firewall's). An answer always outweighs an ICMP error queued for the same probe.
+
+  **The connection that follows** leaves as the probes did: from the same source address, on
+  the same interface (macOS `IP_BOUND_IF` / `IPV6_BOUND_IF`; Linux sets `IP_UNICAST_IF` /
+  `IPV6_UNICAST_IF`, which a TCP connect does not follow there, measured on kernel 7.0, so on
+  Linux the source address and the check once connected pin the path), and on Linux with the
+  IPv6 flow label fixed (`IPV6_AUTOFLOWLABEL` off on the probes and the connection), but from a
+  new local port. It does not reuse the far probe's port (the owner's decision after the S3
+  review): stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
+  probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
+  probe's port timed out, a new port connected at once). So a per-connection
+  multi-WAN balancer that routes connections over unequal paths can send the connection another
+  way than its probe (a documented residual, as before the S3 review). A far verdict is not
+  remembered for other connections: every connection is decided afresh. At most two rounds at a time per address
+  family, started at most six in a burst and three a second (one token per round of three
+  probes: each router expires at most one of them, so its ICMP load is that of a single probe),
+  first come first served; a name's addresses one after another per family (the two families
+  at once, a family given up after two decisions that could not tell) until one of each family
+  passes; and an IPv4-mapped destination is probed as its IPv4 address. Unprivileged;
+  developer mode sends no probe.
+
+  **What "within two hops" means, and what the far verdict assumes.** A hop is a router that
+  decrements the hop count: "within `N` hops" is `N - 1` such routers before the destination,
+  and a "time exceeded" proves only that the probe's own path crossed that many. The far verdict
+  holds under four assumptions: (1) no party that sees the probe's SYN forges ICMP (root on a
+  near host, an on-path or on-link attacker: **a hostile LAN gets no protection from this
+  check**, as from any distance test); (2) routers send "time exceeded" only for packets they
+  forward (RFC 1812 5.3.1), not for their own addresses reached through policy routing or a VRF
+  leak; (3) the real connection follows the probe's path (the pin above; a stateless per-packet
+  balancer, a transient loop or a route change in between can still break it); (4) the
+  kernel's matching of the ICMP error to the probe (on macOS through a private `TCP_INFO`
+  layout). A box that hides hops (a second NAT router behind the ISP's, a VM's NAT, a VPN, a
+  userspace NAT64) moves the limit: at `near_hop_limit` 2 it then does not reach the ISP's first
+  box. Paths whose first hops send no "time exceeded" refuse every destination. Windows has no
+  way to read the ICMP errors yet (`TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are
+  a possible path, unverified), so every decision there refuses; it already refuses every
+  requester connection in public mode. See "The near-hop probe's own limits" below and
+  [docs/netguard-hardening.md](docs/netguard-hardening.md), "Near-hop rule: positive evidence".
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`
   (`home.arpa`), `corp`, `intranet`, `private`, `localdomain`, `svc`, `consul`, `test`,
@@ -199,7 +266,12 @@ Every connection a requester can cause goes through one guard
   kernel asked with the port, the near-hop probe), and the hop's HTTP client is pinned to
   exactly the addresses that passed (it resolves nothing itself), so a name that answers
   differently a moment later (DNS rebinding) cannot move the connection. An IP-literal URL is
-  checked the same way.
+  checked the same way. **Once the connection is made**, before any request is written on it
+  (for `https`, after the TLS handshake, which reqwest's connector makes), its own peer and
+  source addresses must be the checked ones (the source the kernel chose for it right before,
+  which only the route's interface holds) and the destination is admitted again with the kernel
+  asked afresh; otherwise it is dropped: a route or VPN that changed between the check and the
+  connection is seen. The witness connector checks its connections the same way.
 - **No proxies, no automatic redirects:** proxy settings are ignored (a proxy would resolve
   the name itself). Redirects are followed by hand, at most 5, each target checked like the
   first URL before anything connects to it, within one time budget.
@@ -210,6 +282,101 @@ Every connection a requester can cause goes through one guard
 - On top of that, unchanged: every ELF is checked against its registry and content hashes,
   capped at 248 MiB, and fetched within a time budget, no compression is decoded, and the
   `User-Agent` is a constant `zkminer`.
+
+### The network guard on macOS
+
+The same decisions, from what macOS shows an unprivileged process (evidence, commands and tests:
+[docs/netguard-macos.md](docs/netguard-macos.md)):
+
+- **Routing table:** the `NET_RT_DUMP` sysctl of the BSD routing socket (a consistent snapshot,
+  read again if the table grew meanwhile), parsed from bytes with every length checked; a
+  malformed message (a non-contiguous netmask included) fails the read. `RTF_GATEWAY` routes go
+  through their gateway, others are
+  on-link; `RTF_LOCAL` and `RTF_BROADCAST` routes deliver to this host; reject, blackhole, down
+  and multicast routes and the kernel's clones are not read, as on Linux.
+- **No policy rules; scoped routes.** macOS has no `ip rule`. Interface-scoped routes
+  (`RTF_IFSCOPE`) are used only by sockets bound to their interface, so each interface's scoped
+  routes are read as a table no rule reaches: a scoped default route (the system `utun`
+  interfaces' IPv6 defaults, a second network interface's default, a VPN that does not take over
+  the default route) is no default route and no uplink, and any other scoped route off the
+  default path still refuses what it holds.
+- **The kernel per destination:** an `RTM_GET` on a fresh routing socket, sent as
+  `RTM_GET_SILENT` (the answer goes to this socket alone; a kernel that refuses that type fails
+  the query, and the destination is refused: there is no fallback to a plain `RTM_GET`, whose
+  answers every routing socket sees), with a sequence number drawn for it from the system
+  CSPRNG. Only a datagram received whole (into 16 KiB, without `MSG_TRUNC`) that is exactly one
+  `RTM_GET` message (its length its `rtm_msglen`) with the kernel-set `rtm_pid` of this process
+  and that sequence number is the answer: the kernel hands a write it refuses to every routing
+  socket as written, so another local process can put this process's pid and sequence number in
+  front of it, but never in a message of that exact shape (measured for 134 kinds of write,
+  oversized ones included). Its `RTA_IFP` must be the
+  header's interface, and it is judged exactly as the Linux answer is (`ESRCH` is no route;
+  0.0.0.0 and `::` are this host). A default-like answer must also be one of the facts' own
+  default routes (its gateway and interface), or it is refused until the facts are read again: a
+  VPN or network that came up since is not admitted on facts that do not know it. A local
+  process that floods every routing socket can still make queries time out, which refuses (fail
+  closed). Network Extension policies (a per-app or include-all-networks VPN, a
+  content filter) can send a socket elsewhere with no route saying so; so for an answer that could
+  be admitted, a UDP socket is connected to the destination (no packet is sent) and the source
+  address the kernel chose must be on the interface the route names and on no other, or the
+  destination is refused.
+- **Uplinks:** interface types from `getifaddrs` (Apple's own Ethernet and Wi-Fi interfaces, by
+  name, are physical; another Ethernet-type interface such as ZeroTier's `feth` is not; `utun` is
+  a tunnel, `ppp` always needs `[egress] internal_ranges` since macOS lists no PPPoE sessions,
+  any type the guard does not know is not physical).
+- **DNS servers:** `/etc/resolv.conf`, `/etc/resolver/*` and every resolver the configuration
+  daemon knows (`State:/Network/Service/*/DNS`, `State:/Network/Global/DNS`: scoped, VPN and
+  secondary-interface resolvers; `Setup:/Network/Service/*/DNS`: servers set by hand for any
+  service), each `nameserver` read as every macOS parser reads it (a daemon entry no parser reads,
+  which the system skips too, is skipped with a warning); a configuration that cannot be read (a
+  resolver file this user may not read, a daemon that does not answer within 2 s) fails the facts
+  read.
+- **Facts that cannot be read again:** the last good facts stay in force (without their cached
+  kernel verdicts) for 2 s past their one-second life; after that every requester connection is
+  refused, naming what failed, until a re-read succeeds. One re-read runs at a time, and other
+  callers wait for it at most 500 ms (then the facts in force within their grace, or a refusal).
+- **NAT64 prefixes** are learned again whenever the network changes (and every 15 s while a host
+  with IPv6 and no IPv4 route, or with IPv4 only through a CLAT, has found none), also from the
+  configuration daemon's NAT64 state; until the new network's round has finished, such a host
+  refuses every IPv6 destination.
+- **Near hops:** the probes are the same hop-limited TCP connects and the same rule. macOS gives
+  an unprivileged process no per-socket ICMP error, so an unprivileged `SOCK_DGRAM`
+  `IPPROTO_ICMP` (`IPPROTO_ICMPV6`) socket is opened before the probes, and a copy of an ICMP
+  error counts for a probe only when it quotes the probe's destination address and port, source
+  address and port and initial sequence number, and the probe's own socket failed with
+  `EHOSTUNREACH` / `ENETUNREACH` (late copies are drained for 30 ms). The sequence number comes
+  from the **private** `getsockopt(IPPROTO_TCP, TCP_INFO)` (0x200: `tcpi_snd_nxt` - 1, read only
+  in `SYN_SENT`, its length checked; a zero or repeated number refuses): an undocumented layout
+  Apple may change, and a Mac where the ICMP socket cannot be opened or `TCP_INFO` cannot be read
+  refuses every requester connection (said once at startup). An error `connect` itself reports
+  before the connection is in progress (Local Network privacy, a Network Extension policy) is a
+  local failure, refused, never evidence. The connection is bound to the probe's interface with
+  `IP_BOUND_IF` / `IPV6_BOUND_IF`. An IPv4-mapped destination is probed as its IPv4 address.
+- **Public addresses:** a public address is confirmed for one network, which macOS identifies by
+  its routes and by the configuration daemon's network signature (the router's address and
+  hardware address); moving to another network behind a router of the same address learns it
+  again.
+- **Not seen on macOS** (list what they reach in `[egress] deny_cidrs`): `pf` rules (`route-to`,
+  NAT), which need root to read; Network Extension policies that treat TCP differently from UDP.
+  A VPN built as a Network Extension flow-divert or app proxy is expected to accept every probe
+  itself, so every requester connection is refused as near (it fails closed): see
+  docs/netguard-macos.md.
+
+### The same hardening on every platform
+
+What the macOS review rounds added to shared decisions applies on Linux (and Android), and on
+Windows where it has the code path (details, what was run on Linux and what was only
+type-checked: [docs/netguard-hardening.md](docs/netguard-hardening.md)): facts that cannot be
+read again refuse after their grace; one re-read at a time, callers waiting at most 500 ms, and
+the checks off the async runtime's workers; the uplink signature tells two networks behind the
+same router address apart (Linux: the gateways' link-layer addresses); IPv4-mapped addresses
+unmapped before the near-hop probes (Windows too; the near-hop rule itself is the S3 review's
+positive-evidence rule above); a default-like kernel answer must be a default
+route the facts hold (on Linux, through the same nexthop object); NAT64 prefixes learned per
+network (Linux also from the default gateway's PREF64), configured ones always in force, IPv6
+refused on an IPv6-only host (or one behind a CLAT) until the new network's round ends; and every connection checked
+again once made, from the source the kernel chose for it, before anything (a TLS ClientHello
+included) is written on it (macOS too: new everywhere).
 
 ## Developer mode: `[dev] private_network`
 
@@ -262,7 +429,7 @@ job there could then reach this host's private network.
 | The connector's DNS resolver (in the miner) | the operator (`[dns] servers`, else `/etc/resolv.conf`) | dials only those servers, for the operator's endpoint names only; never a fetch destination |
 | Public-address discovery (miner and broker, at startup and every 5 minutes; every 15 seconds while a family is unknown) | fixed in the build: `ns1.google.com` and `1.1.1.1` (and their IPv6 addresses), UDP port 53; `https://1.1.1.1/cdn-cgi/trace` and its IPv6 twin (the miner); on an IPv6-only host, the same IPv4 reflectors through the NAT64 prefix | none needed: requesters cannot change them; `[egress] discover_public_addresses = false` turns it off |
 | DNS-over-HTTPS resolution of requester names (public mode) | fixed in the build (Cloudflare, Google, Quad9 by IP literal), or the operator's `[egress] doh_resolvers`; the **name** from the requester | the resolver's address must pass the floor (being one of the host's DNS servers is allowed); certificate verified for the IP literal |
-| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | a SYN with no data, closed without data; when it gets no answer, a check connection to the same address and port (a handshake, then a FIN and a reset limited to `near_hop_limit` hops; never data) |
+| The near-hop probe (public mode, right before each guarded connection) | the destination being vetted, with at most `near_hop_limit` hops | three SYNs with no data, limited to `near_hop_limit`, one more and two more hops (a second round a second later when the first told nothing); one that connects is reset, never data |
 | The builder runner and the execute worker | none | seccomp denies `socket`, `socketpair`, `connect`, and every `setsockopt` but the socket timeouts |
 | The broker itself | none | seccomp denies `socket`, `connect`, `bind`, `listen`, `accept*` (and `socketpair` once its runtime is up), and every `setsockopt` but `TCP_NODELAY`; Landlock grants no TCP port |
 | The inline measure and prove workers (risc0, SP1, OpenVM) and `sp1-gpu-server` | none | confined before their first guest: no sockets, Unix ones included; Landlock (below) |
@@ -509,8 +676,11 @@ connected TCP socket (`SCM_RIGHTS`) or a refusal. The connector:
   mode only from the miner's own `[dev] private_network`;
 - right before each connection the floor applies to (public mode, or a DNS-named endpoint),
   checks the exact address and port again: the kernel's route with the port, and the near-hop
-  probe; an address that answers within `near_hop_limit` hops (an operator node in the same VPC
-  by its public address) is refused and never connected to;
+  probes; an address that answers within `near_hop_limit` hops (an operator node in the same VPC
+  by its public address) is refused and never connected to, and so is one no router past the
+  limit sent a "time exceeded" for (no evidence: refused, so an endpoint on a path whose routers
+  send no ICMP is lost); the connection is made from the probes' source address and
+  interface, from a new port;
 - connects with the configured connect timeout, and paces attempts (64 at once, 16 a second: a
   hard budget of `64 + 16·t` connections in any `t` seconds; at most each endpoint's
   `max_concurrency` in flight);
@@ -619,7 +789,7 @@ no second one):
   host's interfaces, routes, sites and public addresses, refuses the IPv6 /32 and the IPv4 /16
   around them, makes a host with a public IPv4 interface address or an uplink that is not
   plainly physical list its `internal_ranges` (at startup and whenever that appears later), and
-  refuses whatever answers within `near_hop_limit` hops. What remains is your organisation's own
+  refuses whatever is not shown to be past `near_hop_limit` hops. What remains is your organisation's own
   space beyond all of that: a VPC neighbour or campus subnet more than two hops away and outside
   the sites and the ranges you listed, an IPv6 organisation wider than `ipv6_site_prefix_len`
   on a host without a public IPv4 address, a policy-based IPsec tunnel that installs no routing
@@ -628,16 +798,44 @@ no second one):
   internal_ranges` or `deny_cidrs` (and raise `near_hop_limit` where your network is deeper).
   On a cloud host, also block the metadata service inside the instance (IMDSv2 required, hop
   limit 1, or the endpoint off) as defense in depth.
-- **The near-hop probe's own limits.** The probe is a SYN with no data, and the check
-  connection a handshake, a FIN and a reset with no data, but a near host does receive them
-  before the connection is refused. A near host that drops the probe's SYNs **and** the check
-  connection's FIN (but answers the real connection) reads as far: a firewall that filters by
-  hop count could do that. A transparent proxy within the limit answers for every destination,
-  so every connection through it is refused. A router that does not decrement the hop count is
-  invisible to the probe. A far destination whose path drops ICMP costs the probe's 1.5 seconds
-  plus a check connection (a round trip and a few hundred milliseconds) per address, and leaves
-  that destination a half-open connection. The probe and the connection are connects a moment
-  apart; a route that changes in between is not followed.
+- **The near-hop probe's own limits.** The guard admits a destination as far only on positive
+  evidence (a router past the limit said the probe ran out of hops), never on silence; it is
+  not a proof that the destination is far, only that the probe's own path crossed
+  `near_hop_limit` decrementing routers, under the four assumptions under "Nothing within two
+  hops" above. What that leaves:
+  - **A forger that sees the probe's SYN** (root on a near host, an on-path or on-link
+    attacker) can send the "time exceeded" itself and have a near destination admitted: a
+    hostile LAN gets no protection from this check, as from any distance test. (macOS and Linux
+    abort a connecting socket on the first ICMP error they accept, so a forged one that arrives
+    before the destination's answer is enough; no drop is needed.) Unprivileged processes on
+    Linux and macOS cannot send one (tested), nor can an off-path party without the probe's
+    sequence number.
+  - **Definitional cases read far**, as they did before the S3 review: a router reached on its
+    own addresses through policy routing or a VRF leak (it sends "time exceeded" for its own
+    address), a userspace NAT64 (tayga) that uses several hop-limit units in one box, a VM's
+    NAT or a second NAT router that hides a hop (at the default limit the ISP's first box is
+    then far), a carrier-grade NAT hairpinning to the operator's own port mapping (PCP), a
+    transient routing loop, a stateless per-packet balancer that sends the connection another
+    way than the probe.
+  - **Silent paths refuse.** A path whose routers at hops `N` to `N+2` send no "time exceeded"
+    (many cloud providers' networks, EC2 included, and corporate edges that filter ICMP)
+    refuses every destination, every time; a router rate-limiting its ICMP refuses some. Cloud
+    servers are out of scope for now. Windows refuses every decision (no ICMP plumbing yet).
+  - **Per-connection balancers.** The connection is made from a new local port, not the far
+    probe's (the owner's decision: stateful home or carrier-grade NATs keep the probe's session and drop a second SYN on the
+    probe's 4-tuple (measured on this project's own IPv4 home path: every connection that reused the
+    probe's port timed out, a new port connected at once). A per-connection multi-WAN balancer
+    (mwan3 style) that routes connections over unequal paths can therefore send the connection another way than its probe:
+    in the lab, with paths of 2 and 4 hops to the same near host, 4 of 13 and 8 of 17 connections
+    after a far verdict (two runs) reached it over the 2-hop path (with the probe's port reused, 0 of 18). The same
+    residual as before the S3 review.
+  - **What the probes cost.** A near host does receive the probes' SYNs (and answers them: a
+    handshake or a reset, never data) before the connection is refused. A transparent proxy
+    within the limit answers for every destination, so every connection through it is refused.
+    A router that does not decrement the hop count is invisible to the probes. A destination
+    whose evidence comes late costs up to 1.5 s a round (two rounds and a 1 s pause at most),
+    and every connection is decided afresh (three decisions a second per family after a burst
+    of six).
 - **What the routing checks cannot see.** The kernel is asked as a connection's route
   lookups are made: with the destination port and (IPv4) the source address the kernel picks,
   firewall mark 0, and no source port (one is chosen after these lookups; a rule that selects by
@@ -648,7 +846,8 @@ no second one):
   not the default path, and every destination rule's prefix. If you route the miner's own
   traffic by source port, mark or cgroup, list what those paths reach in `[egress] deny_cidrs`.
   A destination rule into a table that routes it out the same uplink is refused all the same
-  (refusing too much). Routes and rules are read on Linux only.
+  (refusing too much). Routes and rules are read on Linux; macOS reads its routes (it has no
+  rules; see "The network guard on macOS"); elsewhere neither.
 - **Public-address discovery depends on outside services.** If the reflectors cannot confirm
   a family's address (a firewall blocking outbound DNS and HTTPS to them, an outage), no
   requester connection goes out over that family until they can or `[egress]
@@ -663,10 +862,15 @@ no second one):
   caught at the next discovery, at most 5 minutes later; while the reflectors are unreachable,
   the last confirmed address counts for at most 10 minutes after it was confirmed.
 - **The facts can be a second stale.** A host that just joined a network is judged on facts at
-  most a second old (a refusal re-reads them at once).
+  most a second old (a refusal re-reads them at once, and every connection is checked again once
+  made). Facts that cannot be read again are trusted for 2 seconds more, then refuse.
 - **NAT64 prefixes the host cannot learn.** A network-specific NAT64 prefix is learned from
   the host's DNS servers (RFC 7050); a translator reached without DNS64 (a static route to a
-  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On an
+  NAT64 box, a DNS64 the host does not use) must be named in `[egress] nat64_prefixes`. On Linux
+  a router's PREF64 is read only from advertisements the kernel processes while the miner runs,
+  and only from the IPv6 default gateway (none where systemd-networkd or NetworkManager handle
+  router advertisements themselves, which keep it to their own interfaces). A DNS64 that answers
+  `ipv4only.arpa` with one of its two addresses only reveals nothing. On an
   IPv6-only host, addresses under a prefix are refused until the translator's IPv4 address is
   learned through it (or stated in `public_addresses`). The
   witness broker learns the prefix itself at startup and also gets, from the miner, the

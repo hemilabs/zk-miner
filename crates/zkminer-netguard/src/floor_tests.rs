@@ -473,6 +473,7 @@ fn every_uplink_that_is_not_plainly_physical_needs_the_statement() {
         vec![Nexthop {
             id: 10,
             oif: 7,
+            gateway: None,
             group: vec![],
             blackhole: false,
         }],
@@ -638,6 +639,40 @@ fn internal_ranges_are_needed_where_the_host_says_so_and_refused() {
     ));
 }
 
+/// Review round 4, cross-5, and the S3 review: a probe that failed, or probes that found no
+/// positive evidence (silence, a Destination Unreachable, an unreachable without its ICMP
+/// message, an answer only beyond the limit, a Time Exceeded from the destination itself), is
+/// refused as a failed check, saying so, not as a near destination "on its own network".
+#[test]
+fn r4_a_failed_near_check_is_not_called_near() {
+    let facts = HostFacts::new(vec![], vec![]);
+    let addr: SocketAddr = "52.216.0.1:443".parse().unwrap();
+    let d = addr.ip();
+    for (probe, says) in [
+        (FixedProbe::answering(ProbeOutcome::Failed("Operation not permitted".into())), "Operation not permitted"),
+        (FixedProbe::answering(ProbeOutcome::TimedOut), "silence is not taken as far"),
+        (FixedProbe::answering(ProbeOutcome::Unreachable), "no router past 2 hops"),
+        (FixedProbe::answering(ProbeOutcome::Icmp { kind: 3, code: 1, from: d }), "no router past 2 hops"),
+        (FixedProbe::answering(ProbeOutcome::Icmp { kind: 11, code: 0, from: d }), "no router past 2 hops"),
+        (FixedProbe::staged(vec![(1, Some(ProbeOutcome::Connected))], None), "no router past 2 hops"),
+    ] {
+        let p = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new())
+            .with_near_probe(probe.clone());
+        let e = p.vet_connection(addr).unwrap_err();
+        assert!(
+            matches!(&e, Denied::NearCheckFailed { addr: a, hops: 2, why } if *a == addr && why.contains(says)),
+            "{probe:?}: {e:?}"
+        );
+        let text = e.to_string();
+        assert!(text.contains("could not tell how near 52.216.0.1:443 is"), "{text}");
+        assert!(!text.contains("on its own network"), "{text}");
+    }
+    // A real near answer is still NearHop.
+    let p = NetPolicy::with_facts(NetMode::Public, facts, Vec::new())
+        .with_near_probe(FixedProbe::answering(ProbeOutcome::Connected));
+    assert!(matches!(p.vet_connection(addr), Err(Denied::NearHop { .. })));
+}
+
 /// The home router's own global IPv6 address (its WAN side, outside the delegated prefix) is a
 /// global stranger to every address check, and reached through the default route. The near-hop
 /// probe refuses it: it answers within 2 hops. A far destination is connected to.
@@ -650,7 +685,6 @@ fn a_destination_within_two_hops_is_refused_before_connecting() {
         ProbeOutcome::Connected,
         ProbeOutcome::Refused,
         ProbeOutcome::Reset,
-        ProbeOutcome::Failed("Operation not permitted".into()),
     ] {
         let probe = FixedProbe::answering(outcome.clone());
         let p = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new())
@@ -664,10 +698,15 @@ fn a_destination_within_two_hops_is_refused_before_connecting() {
         // The exact address and port were probed, at the hop limit.
         assert_eq!(*probe.asked.lock().unwrap(), vec![(cpe_wan, 2)]);
     }
-    for far in [ProbeOutcome::Unreachable, ProbeOutcome::TimedOut] {
+    // Far only on a router's Time Exceeded; an unreachable or silence is refused (the S3 review:
+    // before it, both were admitted, the second after a check connection).
+    let p = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new())
+        .with_near_probe(FixedProbe::far());
+    assert_eq!(p.vet_connection(cpe_wan), Ok(()));
+    for silent in [ProbeOutcome::Unreachable, ProbeOutcome::TimedOut] {
         let p = NetPolicy::with_facts(NetMode::Public, facts.clone(), Vec::new())
-            .with_near_probe(FixedProbe::answering(far));
-        assert_eq!(p.vet_connection(cpe_wan), Ok(()));
+            .with_near_probe(FixedProbe::answering(silent.clone()));
+        assert!(matches!(p.vet_connection(cpe_wan), Err(Denied::NearCheckFailed { .. })), "{silent:?}");
     }
     // An IPv4-mapped destination is probed as the IPv4 address a socket connects to.
     let probe = FixedProbe::far();

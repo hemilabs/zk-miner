@@ -1,1 +1,13 @@
 Vendored from github.com/hemilabs/hemiprove-contracts @ 3bc441d (master), `abi/`, byte-identical to github.com/max-sanchez/hemi-prove-contracts @ 8e1808b (main) apart from LICENSE: the HemiProve v2 stack deployed on Hemi testnet 743111 on 2026-11-16 (risc0 3.1 verifier). Regenerate from that commit; do not hand-edit. zkminer's bindings are pinned against these files by tests in crates/zkminer-contracts.
+
+Cross-checks (2026-11-17, B9-CHAIN; docs/metal-port-notes/B9-CHAIN.md, W10-INT.md):
+- All 23 abi/*.abi.json files here are identical (as JSON) to the repo's abi/ at 8e1808b, and to the ABIs of the
+  verified contracts deployed on 743111 (testnet.explorer.hemi.xyz). INTERACTION_GUIDE.md, CHANGELOG_ABI.md and
+  README.md are copied verbatim from abi/ at 8e1808b. Two independent vendorings (main's f7f0abe from 3bc441d and the
+  macOS beta's bb4de8b from 8e1808b) produced byte-identical files.
+- Every pin in crates/zkminer-chain/src/deployment.rs (proxy, 4 implementations, 5 facets, both adapters, the
+  risc0-ethereum v3.1.0 verifier 26e455ef..., the SP1 v6.1.0 verifier and its hash) appears under its matching
+  constant in script/lib/ReleaseCorePins.sol / VerifierPins.sol:
+  ZKMINER_CONTRACTS_REPO=<checkout> cargo test -p zkminer-chain --lib the_pins_match_the_contracts_repo
+  checks this; crates/zkminer-chain/tests/abi_pins.rs and tests/live_743111.rs (ignored, read-only RPC) check the
+  ABIs and the live deployment.

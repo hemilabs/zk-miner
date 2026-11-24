@@ -1,0 +1,114 @@
+name: Network guard (Linux)
+
+# Only when the guard, its callers, or what builds them changed (review round 6, cross-8).
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "crates/zkminer-netguard/**"
+      - "crates/zkminer-chain/**"
+      - "crates/zkminer-config/**"
+      - "crates/zkminer-witness/**"
+      - "crates/zkminer-witness-broker/**"
+      - "crates/zkminer-witness-sandbox/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/netguard-linux.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "crates/zkminer-netguard/**"
+      - "crates/zkminer-chain/**"
+      - "crates/zkminer-config/**"
+      - "crates/zkminer-witness/**"
+      - "crates/zkminer-witness-broker/**"
+      - "crates/zkminer-witness-sandbox/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/netguard-linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  netguard:
+    # zkminer-netguard's suite and clippy on Linux. ZKMINER_CI_STRICT=1 makes every test that
+    # cannot check what it is for here fail instead of printing SKIPPED and passing; GitHub's
+    # hosted runners have no IPv6, so skips naming it are allowed (docs/netguard-hardening.md,
+    # "CI"). The suite needs outbound DNS and HTTPS, and the near-hop probes' ICMP "time
+    # exceeded" from the runner's hops N..N+2 (2 to 4 by default). ZKMINER_CI_ALLOW_SKIP names
+    # skip tokens exactly (a skip reason starting "[ipv6] "), not parts of a reason's text.
+    # TEMPORARY: no automatic CI on PRs from the beta branches (metal-3.1, metal-3.1-v2,
+    # netguard-mac-v2) while they are tested by hand; run it with workflow_dispatch instead.
+    # To re-enable, drop the !contains(fromJSON(...), github.head_ref) condition.
+    if: ${{ !contains(fromJSON('["metal-3.1","metal-3.1-v2","netguard-mac-v2"]'), github.head_ref) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ZKMINER_CI_STRICT: "1"
+      ZKMINER_CI_ALLOW_SKIP: "ipv6"
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Toolchain (rust-toolchain.toml)"
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: "Cargo cache"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: netguard-linux-netguard-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: netguard-linux-netguard-
+      - name: "Tests"
+        run: cargo test --locked -p zkminer-netguard
+      - name: "Clippy"
+        run: cargo clippy --locked -p zkminer-netguard --all-targets -- -D warnings
+
+  callers:
+    # The guard's callers on x86_64 Linux: the program fetcher (zkminer-chain) and the witness
+    # broker's connector (zkminer-witness-broker's library tests), which drive the guarded client
+    # and the connector's checks before and after connecting. The broker's integration tests need
+    # anvil and run its sandboxed binary; they are not run here. Strict like the netguard job
+    # (review round 5, cross-4): a test that needs a public peer it cannot reach fails.
+    # TEMPORARY: no automatic CI on PRs from the beta branches (metal-3.1, metal-3.1-v2,
+    # netguard-mac-v2) while they are tested by hand; run it with workflow_dispatch instead.
+    # To re-enable, drop the !contains(fromJSON(...), github.head_ref) condition.
+    if: ${{ !contains(fromJSON('["metal-3.1","metal-3.1-v2","netguard-mac-v2"]'), github.head_ref) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ZKMINER_CI_STRICT: "1"
+      ZKMINER_CI_ALLOW_SKIP: "ipv6"
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Toolchain (rust-toolchain.toml)"
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: "Cargo cache"
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: netguard-linux-callers-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: netguard-linux-callers-
+      - name: "zkminer-chain"
+        run: cargo test --locked -p zkminer-chain
+      - name: "zkminer-chain: real downloads in public mode (ignored by default: they need the network)"
+        run: cargo test --locked -p zkminer-chain -- --ignored a_real_elf_downloads_in_public_mode real_stores_that_redirect_across_hosts_are_followed
+      - name: "zkminer-witness-broker"
+        run: cargo test --locked -p zkminer-witness-broker --lib

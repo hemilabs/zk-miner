@@ -30,6 +30,10 @@ tracing-appender = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
+# The RISC Zero Groth16 seal selector is derived from the linked risc0 (its default Groth16 verifier
+# parameters digest, first 4 bytes), so it follows the risc0 the worker is built with (3.1: e71e6620).
+# Verify-only: no prover, no GPU kernels. "3.1" refuses a 3.0 resolve, whose selector is 0x73c457ba.
+risc0-zkvm = { version = "3.1", default-features = false, features = ["std"] }
 # Witness-construction jobs: the envelope tag and the record types are plain data on every platform.
 zkminer-witness = { workspace = true }
 # Only needed by the optional `sp1-demo` command; made optional so the `zkminer`
@@ -60,6 +64,11 @@ hmac = "0.12"
 aes = "0.8"
 ctr = "0.9"
 hex = { workspace = true }
+libc = "0.2"
+
+# `run::segment_disk::free_bytes` (statvfs) on every Unix; Linux has it in the table above. Without it
+# the miner did not build on macOS (W11-ON37).
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

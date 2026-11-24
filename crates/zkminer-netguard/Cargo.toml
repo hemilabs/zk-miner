@@ -9,7 +9,18 @@ description = "zkminer's network guard: nothing a requester controls makes the m
 default = ["client"]
 # The guarded DNS resolver and HTTP client (reqwest, tokio). Without it, only the pure parts: the
 # address predicate, host-name hygiene, URL checks, the admission decision and the host's facts.
-client = ["dep:reqwest", "dep:tokio", "dep:rustls", "dep:webpki-roots"]
+client = [
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http",
+    "dep:http-body",
+    "dep:bytes",
+    "dep:tokio-rustls",
+]
 # Test seams for the tests of crates that depend on this one: a resolver that connects to another
 # address than the one it admitted (so a public-mode fetch can be served by a server on loopback).
 # Only ever enabled from a `[dev-dependencies]` entry; nothing in a release build turns it on.
@@ -29,11 +40,27 @@ tokio = { workspace = true, optional = true }
 # reqwest's rustls uses) and its compiled-in roots.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "1", optional = true }
+# The guarded client's own connector for each hop (review round 4, bypass-2: the TCP
+# connection checked once made, before the TLS handshake, then one HTTP/1.1 exchange): hyper's
+# HTTP/1.1 client, hyper-util's tokio glue, tokio-rustls, http's types, the body trait. The
+# versions reqwest already brings in; the lock gains no package.
+hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 # The near-hop probe's socket (hop limit set before connecting).
 socket2 = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# macOS: the DNS servers the configuration daemon knows (SCDynamicStore), the versions reqwest's
+# system-proxy support already brings in.
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = "0.7"
+core-foundation = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

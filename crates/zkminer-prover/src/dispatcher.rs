@@ -42,6 +42,253 @@ pub struct SlotBenchmarkResult {
     pub host_peak_bytes: Option<u64>,
 }
 
+/// The failure of a slot that answered its benchmark but proved none of the programs.
+pub const NO_BENCHMARK_ROWS: &str =
+    "the worker proved none of the benchmark programs (its own log lines above say why)";
+
+/// A worker slot whose benchmark produced no result, and why (W10-BENCH).
+///
+/// Reported, not only logged: a caller that sees no rows must be able to tell "this slot failed"
+/// from "there was nothing to benchmark", or it shows made-up numbers as a benchmark (the simulated
+/// table `zkminer benchmark` printed, with exit 0, after a Metal warm-up failed).
+#[derive(Debug, Clone)]
+pub struct SlotBenchmarkFailure {
+    pub slot_key: String,
+    pub gpu_name: Option<String>,
+    /// "cuda", "rocm", "intel", "metal" or "generic".
+    pub gpu_tag: String,
+    /// The error, with its causes (`{:#}`).
+    pub error: String,
+}
+
+/// What a benchmark of every slot produced: the slots that measured, the slots that failed, and the
+/// slots that were not running when it started.
+#[derive(Debug, Clone, Default)]
+pub struct BenchmarkRun {
+    /// One per slot that answered with rows. A slot whose suite came back short is here too (its rows
+    /// can be shown) AND in `failures`.
+    pub results: Vec<SlotBenchmarkResult>,
+    /// The slots whose benchmark failed: an error, no rows, or not every program of the suite (and,
+    /// on risc0 and SP1, the zkOP/s score) proved. Any entry makes the run a failure.
+    pub failures: Vec<SlotBenchmarkFailure>,
+    /// Slots this run could not benchmark that do not fail it, each with its reason (warnings):
+    ///  * the worker DECLINED at startup (it cannot prove here, so it is not even tried; a declined
+    ///    SP1 beside a working RISC Zero card must not block that card's benchmark);
+    ///  * it could not be started or respawned, AND another slot of the SAME backend measured on a
+    ///    GPU (one card of a multi-card rig is down). A down slot with no such stand-in is a
+    ///    failure: a CPU (`generic`) worker or another backend never covers for it (W10-BENCH
+    ///    round 2);
+    ///  * its worker only SIMULATES a benchmark (the OpenVM stub, which cannot prove): its rows are
+    ///    discarded, never shown, cached or priced as measurements (W10-BENCH round 2).
+    ///
+    /// When no slot measured, they are the run's failures instead (W10-BENCH round 1).
+    pub not_benchmarked: Vec<SlotBenchmarkFailure>,
+    /// Down slots whose classification waits for the end of the run: `(backend, failure)`.
+    down: Vec<(String, SlotBenchmarkFailure)>,
+    /// Backends of which a GPU slot (cuda/rocm/intel/metal) measured a complete suite.
+    measured_gpu_backends: Vec<String>,
+}
+
+/// The tags of a GPU slot (everything but the CPU-only `generic`).
+fn is_gpu_tag(gpu_tag: &str) -> bool {
+    matches!(gpu_tag, "cuda" | "rocm" | "intel" | "metal")
+}
+
+/// Backends whose worker cannot prove and answers `Benchmark` with a SIMULATED workload under its
+/// own backend name: OpenVM (`zkminer-prove-openvm` returns an error for every `Prove`; its
+/// `run_benchmarks` times a busy loop). Its rows are never measurements (W10-BENCH round 2).
+const SIMULATED_BENCHMARK_BACKENDS: &[&str] = &[zkminer_prover_protocol::BACKEND_OPENVM];
+
+/// Why a slot's benchmark rows are not measurements, if they are not: the worker labelled any row
+/// `simulated`, or its backend is one whose worker only simulates (W10-BENCH round 2).
+pub fn simulated_benchmark_reason(backend: &str, entries: &[BenchmarkEntry]) -> Option<String> {
+    if SIMULATED_BENCHMARK_BACKENDS.contains(&backend) {
+        return Some(format!(
+            "{SIMULATED_BENCHMARK}: the {backend} worker cannot prove yet, and its benchmark \
+             only times a stand-in workload, so it is not run"
+        ));
+    }
+    let simulated: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.prover_backend == "simulated")
+        .map(|e| e.program_name.as_str())
+        .collect();
+    (!simulated.is_empty()).then(|| {
+        format!(
+            "{SIMULATED_BENCHMARK}: the worker reported simulated results ({}); its rows were \
+             discarded",
+            simulated.join(", ")
+        )
+    })
+}
+
+/// The start of the reason a slot whose rows are simulated was not benchmarked (W10-BENCH round 2).
+pub const SIMULATED_BENCHMARK: &str = "not measured (SIMULATED)";
+
+impl BenchmarkRun {
+    /// Files one slot's benchmark outcome (W10-BENCH). `was_down`: the slot had no worker when the
+    /// benchmark started, so an error is "not benchmarked" rather than a failure of a running worker.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        key: &str,
+        backend: &str,
+        was_down: bool,
+        outcome: Result<Vec<BenchmarkEntry>>,
+        entries_into: impl FnOnce(Vec<BenchmarkEntry>) -> SlotBenchmarkResult,
+        gpu_name: Option<String>,
+        gpu_tag: &str,
+    ) {
+        let failure = |error: String| SlotBenchmarkFailure {
+            slot_key: key.to_string(),
+            gpu_name: gpu_name.clone(),
+            gpu_tag: gpu_tag.to_string(),
+            error,
+        };
+        match outcome {
+            Ok(entries) if !entries.is_empty() => {
+                if let Some(reason) = simulated_benchmark_reason(backend, &entries) {
+                    tracing::warn!("{key} was not benchmarked: {reason}");
+                    self.not_benchmarked.push(failure(reason));
+                    return;
+                }
+                let missing = missing_benchmark_rows(backend, &entries);
+                if !missing.is_empty() {
+                    let error = format!(
+                        "{} {}: {} (the worker's own log lines above say why)",
+                        INCOMPLETE_BENCHMARK,
+                        if missing.len() == 1 {
+                            "program"
+                        } else {
+                            "programs"
+                        },
+                        missing.join(", ")
+                    );
+                    tracing::error!("Benchmark failed for {key}: {error}");
+                    self.failures.push(failure(error));
+                } else if is_gpu_tag(gpu_tag) {
+                    self.measured_gpu_backends.push(backend.to_string());
+                }
+                self.results.push(entries_into(entries));
+            }
+            Ok(_) => {
+                let error = NO_BENCHMARK_ROWS.to_string();
+                tracing::error!("Benchmark failed for {key}: {error}");
+                self.failures.push(failure(error));
+            }
+            Err(e) if was_down => {
+                // Classified in `finish`, once it is known whether a same-backend GPU slot measured.
+                self.down
+                    .push((backend.to_string(), failure(format!("{e:#}"))));
+            }
+            Err(e) => {
+                tracing::error!("Benchmark failed for {key}: {e:#}");
+                self.failures.push(failure(format!("{e:#}")));
+            }
+        }
+    }
+
+    /// Files a slot that declined at startup: never benchmarked (W10-BENCH round 1).
+    fn record_declined(
+        &mut self,
+        key: &str,
+        reason: &str,
+        gpu_name: Option<String>,
+        gpu_tag: &str,
+    ) {
+        tracing::info!("Skipping benchmark for {key}: it declined at startup ({reason})");
+        self.not_benchmarked.push(SlotBenchmarkFailure {
+            slot_key: key.to_string(),
+            gpu_name,
+            gpu_tag: gpu_tag.to_string(),
+            error: format!("declined at startup: {reason}"),
+        });
+    }
+
+    /// Files a slot whose worker only simulates a benchmark: never run, never a measurement
+    /// (W10-BENCH round 2).
+    fn record_simulated(
+        &mut self,
+        key: &str,
+        reason: String,
+        gpu_name: Option<String>,
+        gpu_tag: &str,
+    ) {
+        tracing::warn!("Skipping benchmark for {key}: {reason}");
+        self.not_benchmarked.push(SlotBenchmarkFailure {
+            slot_key: key.to_string(),
+            gpu_name,
+            gpu_tag: gpu_tag.to_string(),
+            error: reason,
+        });
+    }
+
+    /// The finished run: with nothing measured, the slots that could not be benchmarked are its
+    /// failures (a lone Metal worker that never started fails the benchmark, with its reason).
+    fn finish(mut self) -> Self {
+        // A down slot is only "not benchmarked" when a GPU slot of its own backend measured: one
+        // card of a rig is down, and the rig's rows for that backend are still real GPU rows.
+        // Otherwise (a lone GPU worker that crashed at start with a CPU `generic` worker or another
+        // backend measured instead) the run did not measure what this host proves with, and it
+        // fails: exit 1, nothing cached or priced (W10-BENCH round 2).
+        for (backend, down) in std::mem::take(&mut self.down) {
+            if self.measured_gpu_backends.contains(&backend) {
+                tracing::warn!(
+                    "{} was not running and could not be benchmarked (another {backend} GPU \
+                     measured): {}",
+                    down.slot_key,
+                    down.error
+                );
+                self.not_benchmarked.push(down);
+            } else {
+                tracing::error!("Benchmark failed for {}: {}", down.slot_key, down.error);
+                self.failures.push(down);
+            }
+        }
+        if self.results.is_empty() && !self.not_benchmarked.is_empty() {
+            self.failures.append(&mut self.not_benchmarked);
+        }
+        self
+    }
+}
+
+/// The start of the failure of a slot that had no worker during the benchmark (W10-BFIX).
+pub const COULD_NOT_START: &str = "could not start: ";
+
+/// The failure of a down slot: its last spawn error, or failing that the benchmark's own attempt,
+/// which is only context when it differs (see [`WorkerPool::down_slot_error`]).
+fn down_slot_message(last_spawn_error: Option<&str>, attempt: &str) -> String {
+    match last_spawn_error {
+        Some(last) if last != attempt => {
+            format!("{COULD_NOT_START}{last} (then, when the benchmark tried it: {attempt})")
+        }
+        Some(last) => format!("{COULD_NOT_START}{last}"),
+        None => format!("{COULD_NOT_START}{attempt}"),
+    }
+}
+
+/// The start of the failure of a slot whose suite came back short (W10-BENCH round 1).
+pub const INCOMPLETE_BENCHMARK: &str = "the benchmark is incomplete: no result for";
+
+/// The rows a complete benchmark of a `backend` worker has and `entries` lacks, by name: every
+/// program of `benchmark_suite(backend)`, and on risc0 and SP1 (the zkVMs a zkOP/s score is defined
+/// for) the `zkop-mix` score. A worker drops a program that fails to prove and verify, and the
+/// dispatcher drops a score that failed, so a short list is a failed benchmark (W10-BENCH round 1).
+pub fn missing_benchmark_rows(backend: &str, entries: &[BenchmarkEntry]) -> Vec<String> {
+    use zkminer_prover_protocol::{benchmark_suite, BACKEND_RISC0, BACKEND_SP1, BENCH_ZKOP_MIX};
+    let mut wanted: Vec<String> = benchmark_suite(backend)
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    if backend == BACKEND_RISC0 || backend == BACKEND_SP1 {
+        wanted.push(BENCH_ZKOP_MIX.to_string());
+    }
+    wanted
+        .into_iter()
+        .filter(|name| !entries.iter().any(|e| &e.program_name == name))
+        .collect()
+}
+
 /// A streaming benchmark progress update from a specific worker slot.
 #[derive(Debug, Clone)]
 pub struct BenchmarkProgressEvent {
@@ -356,6 +603,593 @@ fn recycle_after_proofs() -> u32 {
     })
 }
 
+/// Item M9: a Metal worker's count-based recycle, when `ZKMINER_RECYCLE_AFTER_PROOFS` is not set.
+///
+/// The 20-proof recycle exists for discrete cards, where a long-lived CUDA context, buffer pool and
+/// persistent stream can wedge a flaky card mid-proof. A Mac has none of those failure modes, and
+/// its worker's warm state is worth keeping: 25 consecutive Proves in one Metal worker (M9 note) ran
+/// the first at 6.43 s and every later one at 6.05-6.14 s (no drift), while the idle footprint rose
+/// from 5.14 GB after the first proof to a plateau of ~5.65 GB by the seventh and stayed there. A
+/// recycle therefore costs one first-job penalty (~0.3 s) and buys nothing measurable. 200 keeps a
+/// backstop; the growth net below catches a real leak long before it. Overridable with
+/// `ZKMINER_METAL_RECYCLE_AFTER_PROOFS` (20 restores the old behaviour, 0 disables the count).
+const METAL_RECYCLE_AFTER_PROOFS: u32 = 200;
+
+/// W7-M10 revert knob: `ZKMINER_METAL_RESPAWN_EARLY=0` respawns a due Metal worker before the next
+/// proof, as M9 did, instead of right after the last one.
+pub const METAL_RESPAWN_EARLY_ENV: &str = "ZKMINER_METAL_RESPAWN_EARLY";
+
+fn metal_respawn_early() -> bool {
+    !std::env::var(METAL_RESPAWN_EARLY_ENV).is_ok_and(|v| v.trim() == "0")
+}
+
+/// The tier a Metal job proves at, as [`WorkerPool::metal_job_tier`] decides it.
+#[derive(Debug, Clone)]
+struct MetalJobTier {
+    tier: crate::metal_sizing::OwnerTier,
+    /// The live worker runs at another figure: respawn it at this tier's.
+    respawn: bool,
+    /// The live worker's tier cannot hold the job's po2 (it would refuse the proof).
+    worker_refuses: bool,
+    /// For the log.
+    why: String,
+}
+
+/// The count-based recycle threshold for a slot of `gpu_tag` (see [`recycle_after_proofs`] and
+/// [`METAL_RECYCLE_AFTER_PROOFS`]). `ZKMINER_RECYCLE_AFTER_PROOFS`, when set, applies to every slot.
+fn recycle_after_proofs_for(gpu_tag: &str) -> u32 {
+    static METAL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if gpu_tag != "metal" || std::env::var_os("ZKMINER_RECYCLE_AFTER_PROOFS").is_some() {
+        return recycle_after_proofs();
+    }
+    *METAL.get_or_init(|| {
+        std::env::var("ZKMINER_METAL_RECYCLE_AFTER_PROOFS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(METAL_RECYCLE_AFTER_PROOFS)
+    })
+}
+
+/// M9's memory-growth safety net for a long-lived Metal worker. Before each proof the dispatcher
+/// reads the idle worker's `phys_footprint` and recycles the worker once its SETTLED footprint has
+/// grown more than a margin above its baseline (the settled level of its first proofs).
+///
+/// Why "settled" needs care (reclaim profile, M9 note, 8 traces at 4 and 8 GiB with 20 ms
+/// sampling): right after a proof the footprint still holds ~2.6 GB of GPU pages the worker just
+/// freed (the wrap's; 2643-2644 MiB in every trace, at both budgets). The OS takes them back in
+/// steps: about half 90-310 ms after the proof, the rest by 1.0-1.3 s. So:
+/// - a reading at least [`METAL_IDLE_RECLAIM`] after the worker's last use is settled by
+///   definition and is compared directly;
+/// - a reading taken sooner is only an upper bound of the settled level: at or under the line it
+///   passes as it is (the settled level can only be lower), and over the line it is settled first
+///   (a bounded wait, [`METAL_IDLE_SETTLE`]) before any verdict;
+/// - except for a FRESH reading (at most [`METAL_IDLE_FRESH`] after a proof, before any reclaim
+///   step; the dispatcher also reads the footprint as each Metal proof ends and judges a
+///   mid-reclaim reading on that one), where the whole transient is still there: it is judged as
+///   reading minus the transient measured at the last full settle of a fresh reading, or by the
+///   last settled-by-time reading after a proof whose end was read (the allowance), and settled
+///   before any recycle. The allowance is the latest measurement (never above the largest),
+///   capped at [`METAL_IDLE_ALLOWANCE_CAP_QUARTERS`] quarters of the working-set limit,
+///   re-measured whenever a fresh reading falls [`METAL_IDLE_TOLERANCE`] below the fresh
+///   reading it was measured on (its anchor: a smaller transient would make the estimate too low),
+///   checked against the line itself by a pass/fail settle every [`METAL_IDLE_VERIFY_EVERY`] fresh
+///   readings judged with it, and dropped with the worker. Every other regime compares a settled
+///   level.
+///
+/// The baseline is the maximum SETTLED level over the first [`METAL_IDLE_BASELINE_PROOFS`] proofs
+/// (settled by time, or by a wait whenever a reading could raise it by more than the tolerance), so
+/// ten back-to-back proofs no longer put the transient into it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+const METAL_IDLE_BASELINE_PROOFS: u32 = 10;
+/// The margin is a quarter of the worker's working-set limit, between these bounds, and at most
+/// half the room between that limit and M6's footprint ceiling (see [`metal_growth_margin`]).
+/// `ZKMINER_METAL_RECYCLE_GROWTH_BYTES` overrides it; 0 turns the net off.
+const METAL_IDLE_GROWTH_MIN: u64 = 1 << 30;
+const METAL_IDLE_GROWTH_MAX: u64 = 2 << 30;
+/// The floor when M6's ceiling sits closer than two minimum margins above the limit.
+const METAL_IDLE_GROWTH_FLOOR: u64 = 512 << 20;
+/// After this long since the worker's last use its footprint is settled: the slowest measured
+/// reclaim finished 1.30 s after the proof (the earlier review trace: 1.6 s), plus headroom.
+const METAL_IDLE_RECLAIM: Duration = Duration::from_secs(2);
+/// A reading this soon after a proof still carries the whole transient: the first reclaim step
+/// came 90 ms after the proof at the earliest (8 traces).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+const METAL_IDLE_FRESH: Duration = Duration::from_millis(50);
+/// The longest one settle wait may take (it runs under the slot lock, before a proof): it waits
+/// until [`METAL_IDLE_RECLAIM`] after the last use, then until two readings agree.
+const METAL_IDLE_SETTLE: Duration = Duration::from_secs(3);
+const METAL_IDLE_SETTLE_POLL: Duration = Duration::from_millis(250);
+/// Two settled readings agree when this close (consecutive settled readings in the traces differed
+/// by 0-1 MiB).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+const METAL_IDLE_AGREE: u64 = 64 << 20;
+/// How far an estimate may rise above the baseline during the baseline proofs before a settle
+/// re-measures it, and how far a fresh reading may drop below the allowance's anchor (the fresh
+/// reading it was measured on) before the allowance is re-measured. The healthy caches grow by
+/// 70-150 MiB a proof over the first five to seven proofs. A healthy worker's settled level is
+/// also trimmed by 240-400 MiB about every sixth proof (36-proof 4 GiB trace); against the
+/// anchor (see [`IdleTrack::measured`]) that costs one re-measure, after which the anchor sits at
+/// a trimmed level (the trims stay within ~120 MiB of each other), where the previous per-proof
+/// comparison paid one every trim.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+const METAL_IDLE_TOLERANCE: u64 = 256 << 20;
+/// After this many fresh readings judged with the allowance, the next one over the line is
+/// checked against the line itself (a pass/fail settle: under the line as soon as any reading is,
+/// which is the first reclaim step, 0.5 s, at the 8 GiB tier and the second, 1.5 s, at 4 GiB).
+/// It bounds what a transient turning into retained memory (the fresh reading flat, the settled
+/// level rising) can hide to this many proofs' growth, and at most one allowance. 50 keeps a
+/// back-to-back 4 GiB worker's checks at 1.5 s per 50 proofs, 0.75 % of the shortest (4 s) Metal
+/// proofs; any settled-by-time reading after a proof re-measures the allowance for free.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+const METAL_IDLE_VERIFY_EVERY: u32 = 50;
+/// The allowance's cap, in quarters of the working-set limit: 3/4 of it, which clears the measured
+/// 2644 MiB transient (65 % of a 4 GiB limit) at every tier PLAN 9.1 names.
+const METAL_IDLE_ALLOWANCE_CAP_QUARTERS: u64 = 3;
+
+/// The growth margin for a worker with working-set limit `limit` and footprint ceiling `ceiling`
+/// (M6, `ZKMINER_WORKER_MAX_FOOTPRINT_BYTES`): `clamp(limit / 4, 1 GiB, 2 GiB)`, and at most half
+/// of `ceiling - limit` (never below 512 MiB), so a leak is caught while the worker's proof peak
+/// (about limit + 2 GiB of host memory, M9 note) plus the leak is still under the ceiling.
+/// `override_bytes` (`ZKMINER_METAL_RECYCLE_GROWTH_BYTES`) wins; 0 turns the net off.
+fn metal_growth_margin(
+    limit: Option<u64>,
+    ceiling: Option<u64>,
+    override_bytes: Option<u64>,
+) -> u64 {
+    if let Some(m) = override_bytes {
+        return m;
+    }
+    let Some(limit) = limit else {
+        return METAL_IDLE_GROWTH_MAX;
+    };
+    let mut m = (limit / 4).clamp(METAL_IDLE_GROWTH_MIN, METAL_IDLE_GROWTH_MAX);
+    if let Some(c) = ceiling {
+        m = m.min((c.saturating_sub(limit) / 2).max(METAL_IDLE_GROWTH_FLOOR));
+    }
+    m
+}
+
+fn metal_growth_override() -> Option<u64> {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ZKMINER_METAL_RECYCLE_GROWTH_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// What a worker slot last ran: a Prove (whose end leaves the ~2.6 GB transient the allowance is
+/// measured on) or anything else (benchmark, warm-up, measurement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UseKind {
+    Proof,
+    Other,
+}
+
+/// When a worker slot's last exchange ended, and what it was.
+#[derive(Debug, Clone, Copy)]
+struct LastUse {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    at: Instant,
+    kind: UseKind,
+    /// A Metal worker's footprint read right as its proof ended (a fresh reading, with the whole
+    /// transient), so a later mid-reclaim reading can be judged on it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    footprint: Option<u64>,
+}
+
+/// How settled a reading is, from the time since the worker's last use (see
+/// [`METAL_IDLE_BASELINE_PROOFS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+enum ReadingAge {
+    /// At least [`METAL_IDLE_RECLAIM`] after the last use: settled.
+    Settled,
+    /// At most [`METAL_IDLE_FRESH`] after a proof: the whole transient is still there.
+    Fresh,
+    /// Anything else (mid-reclaim, after a non-proof use, or no last use known): an upper bound.
+    Partial,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+fn reading_age(since_last_use: Option<Duration>, kind: UseKind) -> ReadingAge {
+    match since_last_use {
+        Some(d) if d >= METAL_IDLE_RECLAIM => ReadingAge::Settled,
+        Some(d) if kind == UseKind::Proof && d <= METAL_IDLE_FRESH => ReadingAge::Fresh,
+        _ => ReadingAge::Partial,
+    }
+}
+
+/// The net's configuration for one slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NetConfig {
+    /// Growth margin over the baseline (0: the net is off).
+    margin: u64,
+    /// Upper bound of the allowance ([`METAL_IDLE_ALLOWANCE_CAP_QUARTERS`] quarters of the working-set limit).
+    allowance_cap: u64,
+}
+
+/// A Metal worker's idle-footprint history (see [`METAL_IDLE_BASELINE_PROOFS`]), per slot key.
+#[derive(Debug, Default, Clone, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+struct IdleTrack {
+    pid: u32,
+    /// Maximum settled level over the first [`METAL_IDLE_BASELINE_PROOFS`] proofs.
+    baseline: Option<u64>,
+    /// Transient measured at the last settle of a fresh reading (reading minus settled level).
+    allowance: Option<u64>,
+    /// The fresh reading the allowance was measured on (the lowest one while re-measures agree).
+    anchor: u64,
+    /// Fresh readings judged with the allowance since it was measured or last verified.
+    relied: u32,
+}
+
+impl IdleTrack {
+    /// Records a measured transient: fresh reading `fresh`, settled level `settled`, after
+    /// `proofs` proofs. After the baseline proofs (while the caches still grow the anchor follows
+    /// them), a re-measure that agrees with the allowance (within [`METAL_IDLE_AGREE`]) keeps the
+    /// lower anchor, so the healthy cache trims (the settled level falling 240-400 MiB about every
+    /// sixth proof and growing back) cost one re-measure per worker rather than one per trim; a
+    /// different transient moves the anchor to its own reading.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn measured(&mut self, proofs: u32, fresh: u64, settled: u64, cap: u64) {
+        let a = fresh.saturating_sub(settled).min(cap);
+        let agrees = proofs > METAL_IDLE_BASELINE_PROOFS
+            && self
+                .allowance
+                .is_some_and(|old| old.abs_diff(a) <= METAL_IDLE_AGREE);
+        self.anchor = if agrees {
+            self.anchor.min(fresh)
+        } else {
+            fresh
+        };
+        self.allowance = Some(a);
+        self.relied = 0;
+    }
+}
+
+/// Why the net waited for a reading to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+enum SettleWhy {
+    /// A baseline proof's reading could raise the baseline.
+    Baseline,
+    /// A reading (or its estimate) is over the line.
+    OverLine,
+    /// A settled-by-time reading is over the line: confirm before recycling.
+    Confirm,
+    /// A fresh reading fell below the allowance's anchor: re-measure the allowance.
+    Shrank,
+    /// The allowance was relied on [`METAL_IDLE_VERIFY_EVERY`] times: check the line itself.
+    Verify,
+}
+
+/// What [`metal_idle_growth`] asks of its settle callback: why, and whether it may stop as soon as
+/// a reading is at most `pass_below` (a pass/fail question) or must return the settled level (to
+/// measure a baseline or an allowance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+struct SettleAsk {
+    why: SettleWhy,
+    pass_below: Option<u64>,
+}
+
+/// Why [`metal_idle_growth`] recycles: the baseline and the settled footprint over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+struct Outgrown {
+    baseline: u64,
+    settled: u64,
+}
+
+/// Records `reading`, the idle footprint of worker `pid` before its next proof after
+/// `proofs_since_spawn` completed ones, taken `since_last_use` after the slot's last exchange (of
+/// kind `kind`), and returns `Some` when the worker's settled footprint is more than the margin
+/// over its baseline. `settle(ask)` waits for the footprint to settle and returns it (or, with
+/// `ask.pass_below`, the first reading at most that); `None` means no time to wait or an
+/// unreadable footprint, and then nothing is learned and nothing recycles. A new pid starts a new
+/// history. Every judgement compares a settled level or an upper bound of one with the line; the
+/// one estimate (fresh readings minus the allowance) is described on
+/// [`METAL_IDLE_BASELINE_PROOFS`].
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+fn metal_idle_growth(
+    track: &mut IdleTrack,
+    pid: u32,
+    proofs_since_spawn: u32,
+    reading: u64,
+    since_last_use: Option<Duration>,
+    kind: UseKind,
+    at_proof_end: Option<u64>,
+    cfg: NetConfig,
+    settle: impl FnOnce(SettleAsk) -> Option<u64>,
+) -> Option<Outgrown> {
+    if track.pid != pid {
+        *track = IdleTrack {
+            pid,
+            ..IdleTrack::default()
+        };
+    }
+    if cfg.margin == 0 || proofs_since_spawn == 0 {
+        return None;
+    }
+    let mut age = reading_age(since_last_use, kind);
+    let mut reading = reading;
+    // Mid-reclaim, but the footprint read as the proof ended is fresh: judge that one (the
+    // reclaim since then can only have lowered the settled level's upper bound, not the level).
+    if let (ReadingAge::Partial, UseKind::Proof, Some(end)) = (age, kind, at_proof_end) {
+        (reading, age) = (end.max(reading), ReadingAge::Fresh);
+    }
+    // A full settle of a fresh reading also measures the transient.
+    let learn = |track: &mut IdleTrack, settled: u64| {
+        if age == ReadingAge::Fresh {
+            track.measured(proofs_since_spawn, reading, settled, cfg.allowance_cap);
+        }
+    };
+    let full = |why| SettleAsk {
+        why,
+        pass_below: None,
+    };
+    // Settled by time after a proof whose end was read: the transient, measured for free.
+    if let (ReadingAge::Settled, UseKind::Proof, Some(end)) = (age, kind, at_proof_end) {
+        track.measured(proofs_since_spawn, end, reading, cfg.allowance_cap);
+    }
+    // The allowance applies to this reading: fresh, measured, and the reading has not dropped
+    // below the anchor (which a smaller transient would do). The anchor moves only when the
+    // allowance is measured, so a transient shrinking a little every proof adds up to a re-measure.
+    let allowance = match (age, track.allowance) {
+        (ReadingAge::Fresh, Some(a))
+            if reading.saturating_add(METAL_IDLE_TOLERANCE) >= track.anchor =>
+        {
+            Ok(a)
+        }
+        (ReadingAge::Fresh, Some(_)) => Err(SettleWhy::Shrank),
+        _ => Err(SettleWhy::OverLine),
+    };
+
+    let baseline = match track.baseline {
+        Some(b) if proofs_since_spawn > METAL_IDLE_BASELINE_PROOFS => b,
+        // The baseline proofs (and later ones while no baseline could be settled yet).
+        current => {
+            if age == ReadingAge::Settled {
+                track.baseline = Some(current.unwrap_or(0).max(reading));
+                return None;
+            }
+            // An upper bound that cannot raise the baseline needs no settling.
+            if current.is_some_and(|b| reading <= b) {
+                return None;
+            }
+            if let (Some(b), Ok(a)) = (current, allowance) {
+                if reading.saturating_sub(a) <= b + METAL_IDLE_TOLERANCE {
+                    return None;
+                }
+            }
+            // A fresh reading is settled in full (it measures the allowance too); any other
+            // one only until it shows it cannot raise the baseline.
+            let s = settle(SettleAsk {
+                why: SettleWhy::Baseline,
+                pass_below: if age == ReadingAge::Fresh {
+                    None
+                } else {
+                    current
+                },
+            })?;
+            learn(track, s);
+            track.baseline = Some(current.unwrap_or(0).max(s));
+            return None;
+        }
+    };
+    let line = baseline.saturating_add(cfg.margin);
+    let outgrown = |settled: u64| (settled > line).then_some(Outgrown { baseline, settled });
+
+    match age {
+        ReadingAge::Settled => {
+            if reading <= line {
+                return None;
+            }
+            // Settled by time; one more agreeing reading before a recycle.
+            let s = settle(SettleAsk {
+                why: SettleWhy::Confirm,
+                pass_below: Some(line),
+            })?;
+            outgrown(s)
+        }
+        // An upper bound at or under the line: the settled level is too. A fresh one under the
+        // anchor shows the transient may have shrunk: the next fresh reading over the line is
+        // checked against the line itself (a verification) rather than judged with the allowance.
+        _ if reading <= line => {
+            if allowance == Err(SettleWhy::Shrank) {
+                track.relied = METAL_IDLE_VERIFY_EVERY;
+            }
+            None
+        }
+        ReadingAge::Fresh => match allowance {
+            // Relied on often enough: check the line itself, which also bounds what a transient
+            // turning into retained memory can hide. Stops at the first reading under the line.
+            Ok(_) if track.relied >= METAL_IDLE_VERIFY_EVERY => {
+                let s = settle(SettleAsk {
+                    why: SettleWhy::Verify,
+                    pass_below: Some(line),
+                })?;
+                track.relied = 0;
+                outgrown(s)
+            }
+            Ok(a) if reading.saturating_sub(a) <= line => {
+                track.relied += 1;
+                None
+            }
+            Ok(_) => {
+                let s = settle(full(SettleWhy::OverLine))?;
+                learn(track, s);
+                outgrown(s)
+            }
+            Err(why) => {
+                let s = settle(full(why))?;
+                learn(track, s);
+                outgrown(s)
+            }
+        },
+        ReadingAge::Partial => {
+            let s = settle(SettleAsk {
+                why: SettleWhy::OverLine,
+                pass_below: Some(line),
+            })?;
+            outgrown(s)
+        }
+    }
+}
+
+/// Waits for an idle worker's footprint to settle: until [`METAL_IDLE_RECLAIM`] after its last use,
+/// then until two consecutive readings agree within [`METAL_IDLE_AGREE`], at most `budget`. With
+/// `pass_below`, returns as soon as a reading is at most that (the settled level can only be lower).
+/// `elapsed` is the time since the worker's last use (`None`: unknown, then the reclaim time counts
+/// from the start of this wait). Returns the settled reading; `None` when the footprint cannot be
+/// read or the budget ran out before the reclaim time (an unsettled reading must not judge).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // the macOS idle-footprint net (and its tests)
+fn settle_footprint(
+    mut read: impl FnMut() -> Option<u64>,
+    mut elapsed: impl FnMut() -> Option<Duration>,
+    mut sleep: impl FnMut(Duration),
+    pass_below: Option<u64>,
+    budget: Duration,
+) -> Option<u64> {
+    let mut waited = Duration::ZERO;
+    let mut prev: Option<u64> = None;
+    loop {
+        let cur = read()?;
+        if pass_below.is_some_and(|l| cur <= l) {
+            return Some(cur);
+        }
+        let reclaimed = elapsed().unwrap_or(waited) >= METAL_IDLE_RECLAIM;
+        if reclaimed {
+            if prev.is_some_and(|p| p.abs_diff(cur) <= METAL_IDLE_AGREE) {
+                return Some(cur);
+            }
+            prev = Some(cur);
+        }
+        if waited + METAL_IDLE_SETTLE_POLL > budget {
+            // Past the reclaim time a reading is settled by definition, agreeing or not.
+            return reclaimed.then_some(cur);
+        }
+        sleep(METAL_IDLE_SETTLE_POLL);
+        waited += METAL_IDLE_SETTLE_POLL;
+    }
+}
+
+/// The allowance's cap for a worker with working-set limit `limit` (unknown: a 16 GiB one).
+fn metal_allowance_cap(limit: Option<u64>) -> u64 {
+    limit.unwrap_or(16 << 30) / 4 * METAL_IDLE_ALLOWANCE_CAP_QUARTERS
+}
+
+/// [`NetConfig`] for a Metal slot spawned with `spawn_env` on a GPU of `vram_bytes`: the worker's
+/// working-set limit (the host figure and `RISC0_METAL_MAX_WORKING_SET_BYTES`, from the slot's own
+/// environment first, as the worker sees them) and its footprint ceiling (M6: the slot's or the
+/// miner's `ZKMINER_WORKER_MAX_FOOTPRINT_BYTES`, else the figure the spawn hands it; 0 = none).
+fn metal_net_config(spawn_env: &HashMap<String, String>, vram_bytes: Option<u64>) -> NetConfig {
+    use crate::metal_sizing as ms;
+    let from_env = |k: &str| spawn_env.get(k).cloned().or_else(|| std::env::var(k).ok());
+    let budget = from_env(ms::MAX_WORKING_SET_ENV).and_then(|v| ms::parse_bytes(&v));
+    let limit = ms::working_set_limit_of(vram_bytes, budget);
+    let ceiling = match from_env(ms::WORKER_MAX_FOOTPRINT_ENV) {
+        Some(v) => v.trim().parse::<u64>().ok().filter(|&c| c > 0),
+        None => {
+            crate::memory::worker_memory_ceiling_bytes(crate::memory::DEFAULT_HOST_RESERVE_BYTES)
+        }
+    };
+    NetConfig {
+        margin: metal_growth_margin(limit, ceiling, metal_growth_override()),
+        allowance_cap: metal_allowance_cap(limit.or_else(crate::memory::mem_total_bytes)),
+    }
+}
+
+/// Whether the idle Metal worker `pid` of slot `key` has outgrown its baseline (and why), recording
+/// this reading. `wait_budget`: how long a settle may wait (`None`: no time, then no recycle and
+/// nothing learned). `None` off macOS or when its footprint cannot be read.
+fn metal_idle_outgrown(
+    key: &str,
+    pid: u32,
+    proofs_since_spawn: u32,
+    last_use: Option<LastUse>,
+    cfg: NetConfig,
+    wait_budget: Option<Duration>,
+) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        static TRACKS: std::sync::OnceLock<Mutex<HashMap<String, IdleTrack>>> =
+            std::sync::OnceLock::new();
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let read = || crate::memory::macos_pid_footprint(pid).map(|f| f.current);
+        let now = read()?;
+        let tracks = || {
+            TRACKS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        };
+        // Work on a copy so a settle wait (up to METAL_IDLE_SETTLE of sleeping) does not hold the
+        // process-wide map; the caller holds this slot's lock, so no one else updates `key`.
+        let mut track = tracks().get(key).cloned().unwrap_or_default();
+        let since = last_use.map(|u| u.at.elapsed());
+        let kind = last_use.map_or(UseKind::Other, |u| u.kind);
+        let at_proof_end = last_use.and_then(|u| u.footprint);
+        let mut waited_for = None;
+        let settle = |ask: SettleAsk| {
+            let budget = wait_budget?.min(METAL_IDLE_SETTLE);
+            let t0 = Instant::now();
+            let s = settle_footprint(
+                read,
+                || last_use.map(|u| u.at.elapsed()),
+                std::thread::sleep,
+                ask.pass_below,
+                budget,
+            );
+            let took = t0.elapsed();
+            tracing::info!(
+                "Metal worker {pid} ({key}, {proofs_since_spawn} proofs): waited {:.2} s for its idle \
+                 footprint to settle ({:?}): {:.2} GiB {:.2} s after its last use -> {}",
+                took.as_secs_f64(),
+                ask.why,
+                gib(now),
+                since.unwrap_or_default().as_secs_f64(),
+                s.map_or("unreadable".to_string(), |s| format!("{:.2} GiB", gib(s)))
+            );
+            waited_for = Some(took);
+            s
+        };
+        let verdict = metal_idle_growth(
+            &mut track,
+            pid,
+            proofs_since_spawn,
+            now,
+            since,
+            kind,
+            at_proof_end,
+            cfg,
+            settle,
+        );
+        tracks().insert(key.to_string(), track);
+        verdict.map(|o| {
+            format!(
+                "its idle footprint is {:.2} GiB ({:.2} GiB settled{}), more than {:.2} GiB above its \
+                 {:.2} GiB baseline",
+                gib(now),
+                gib(o.settled),
+                waited_for.map_or(String::new(), |d| format!(
+                    " after {:.2} s of waiting",
+                    d.as_secs_f64()
+                )),
+                gib(cfg.margin),
+                gib(o.baseline)
+            )
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (key, pid, proofs_since_spawn, last_use, cfg, wait_budget);
+        None
+    }
+}
+
 /// Runs `attempt` on each of `keys` in turn and returns the first success, with its key (see
 /// `WorkerPool::warm_up`). A failure moves on to the next key, except a host-memory shortage, which
 /// is returned at once: it is the host's, and every other slot would meet it too. When every key
@@ -422,6 +1256,10 @@ struct WorkerSlot {
     /// never eligible: only a fresh worker that passes its handshake clears it, which
     /// `retry_due_declines` tries after the slot's backoff (`decline_retry`).
     declined: Option<String>,
+    /// The error of this slot's last failed spawn or respawn (the handshake error, with the
+    /// worker's last stderr line), cleared when a worker starts. A benchmark of a slot that never
+    /// came up reports THIS, not the respawn backoff its own retry ran into (W10-BFIX).
+    last_spawn_error: Option<String>,
     /// When a declined slot is next tried with a fresh worker, and the backoff that set it.
     decline_retry: DeclineRetry,
     /// Number of proofs this worker instance has completed since it was (re)spawned.
@@ -429,6 +1267,30 @@ struct WorkerSlot {
     /// the accumulated GPU context / buffer pool / persistent stream is reset to a
     /// clean slate. Reset to 0 on every (re)spawn.
     proofs_since_spawn: u32,
+    /// When this slot's last exchange with its worker (a proof, benchmark, warm-up or
+    /// measurement) ended: M9's growth net tells a settled idle footprint by it.
+    last_use: Option<LastUse>,
+}
+
+impl WorkerSlot {
+    /// Records the end of an exchange with the worker (see [`WorkerSlot::last_use`]).
+    fn note_used(&mut self, kind: UseKind) {
+        // A Metal worker's footprint as its proof ends (one `proc_pid_rusage`): the fresh reading
+        // the growth net judges a later mid-reclaim one on.
+        #[cfg(target_os = "macos")]
+        let footprint = (kind == UseKind::Proof && self.gpu_tag == "metal")
+            .then(|| self.handle.as_ref().map(|h| h.pid()))
+            .flatten()
+            .and_then(crate::memory::macos_pid_footprint)
+            .map(|f| f.current);
+        #[cfg(not(target_os = "macos"))]
+        let footprint = None;
+        self.last_use = Some(LastUse {
+            at: Instant::now(),
+            kind,
+            footprint,
+        });
+    }
 }
 
 /// The first wait before a declined slot is tried again with a fresh worker.
@@ -837,7 +1699,7 @@ fn slot_key(backend: &str, gpu_tag: &str, device_index: Option<u32>) -> String {
 /// workers and for explicit binaries without a device index (a 2-part key): we
 /// can't know which physical GPU those target, so they are left unguarded and keep
 /// their prior behavior. The guarded gpu_tags MUST match the set counted as a
-/// physical GPU by `proving_gpu_count` (`cuda`/`rocm`/`intel`) — otherwise a card
+/// physical GPU by `proving_gpu_count` (`cuda`/`rocm`/`intel`/`metal`) — otherwise a card
 /// that inflates auto `max_concurrent` could go unguarded and double-book VRAM.
 /// Mirrors the `slot_key` format — keep the two in sync.
 fn physical_gpu_id(key: &str) -> Option<String> {
@@ -845,7 +1707,7 @@ fn physical_gpu_id(key: &str) -> Option<String> {
     let _backend = parts.next()?;
     let gpu_tag = parts.next()?;
     let device_index = parts.next()?; // absent ⇒ 2-part key (generic/explicit) ⇒ unguarded
-    if matches!(gpu_tag, "cuda" | "rocm" | "intel") {
+    if matches!(gpu_tag, "cuda" | "rocm" | "intel" | "metal") {
         Some(format!("{gpu_tag}:{device_index}"))
     } else {
         None
@@ -883,6 +1745,10 @@ fn gpu_vram_bytes(
         // see `discovery::intel_vram`.
         return crate::discovery::intel_vram(pci_bus_id?).map(|(total, _)| total);
     }
+    if gpu_tag == "metal" {
+        // Unified memory: the GPU's "VRAM" is host RAM less what the host keeps for itself.
+        return metal_vram_budget_bytes(crate::memory::mem_total_bytes()?);
+    }
     if gpu_tag != "cuda" {
         return None;
     }
@@ -916,6 +1782,68 @@ fn gpu_vram_bytes(
     }
     let mib: u64 = stdout.trim().parse().ok()?;
     Some(mib * 1024 * 1024)
+}
+
+/// Host RAM withheld from an Apple GPU's "VRAM" figure (see [`metal_vram_budget_bytes`]).
+///
+/// Apple silicon has unified memory: every byte the Metal prover allocates comes out of the same RAM
+/// as the miner, the OS, WindowServer and the prover's own host-side state (the executor, segments,
+/// witness generation), so the GPU cannot be sized as if it had all of `hw.memsize`. 8 GiB is
+/// chosen to agree with Metal's own ceiling: on the 36 GiB M5 Max this was written on,
+/// `MTLDevice.recommendedMaxWorkingSetSize` is 30.15 GB, i.e. macOS itself keeps ~8.5 GB of the
+/// 38.65 GB back, and 36 GiB − 8 GiB = 30.06 GB. It is larger than `DEFAULT_HOST_RESERVE_BYTES`
+/// (3 GiB, the reserve for a host whose provers' big buffers live on a discrete card) because here
+/// the GPU working set and the host-side proving state compete for the same pages.
+pub const METAL_HOST_RESERVE_BYTES: u64 = crate::metal_sizing::HOST_RESERVE_BYTES;
+
+/// The "VRAM" of an Apple GPU, as reported to routing, benchmark rows and the worker's
+/// `ZKMINER_CUDA_VRAM_BYTES`: `hw.memsize` (`mem_total`) minus [`METAL_HOST_RESERVE_BYTES`].
+/// `None` on a host too small to leave anything, which reads as "unknown" downstream.
+fn metal_vram_budget_bytes(mem_total: u64) -> Option<u64> {
+    mem_total
+        .checked_sub(METAL_HOST_RESERVE_BYTES)
+        .filter(|b| *b > 0)
+}
+
+/// GPU-core-seconds the risc0 benchmark suite may take on an Apple GPU at the protocol's default
+/// segment size, safety margin included.
+///
+/// Measured (M1, M5 Max reporting 32 GPU cores, po2 20, warm pipelines, GPU otherwise idle): 1136 s
+/// for the six programs, STARK plus wraps, i.e. ~36,400 core-seconds. Three times that is the budget:
+/// the owner's own GPU work slows the run (measured in M6 with other GPU jobs on the same Mac:
+/// sha256-chain 697 s against 313 s idle, x2.2), and a deadline here only exists to stop a HUNG
+/// worker, so being generous costs little while being tight kills a healthy benchmark, which is what
+/// the CUDA-sized 600 s default did, 10 minutes into the 19-minute run (M6).
+pub const METAL_BENCHMARK_CORE_SECS: u64 = 109_200;
+
+/// GPU cores assumed when discovery could not read the count: the bottom of PLAN 9.1's minimum tier
+/// (7-10 cores), so an unknown Mac gets the longest deadline, never a shorter one.
+const METAL_FALLBACK_GPU_CORES: u32 = 7;
+
+/// The deadline for a risc0 benchmark (or calibration proof) on an Apple GPU: the configured one, or
+/// longer when the Mac needs longer. Scales with the GPU's core count and with the segment size the
+/// worker will use: each step below po2 20 costs x1.5 (recursion per segment; a 62M-cycle proof on a
+/// 4090 took 44.0 / 57.6 / 87.2 s at po2 20 / 19 / 18, x1.31 then x1.51). `None` (no deadline
+/// configured) stays `None`. Real job deadlines are not touched: callers pass them to `prove`.
+pub fn metal_benchmark_timeout(
+    configured: Option<Duration>,
+    gpu_cores: Option<u32>,
+    job_po2: u8,
+) -> Option<Duration> {
+    let configured = configured?;
+    let cores = u64::from(
+        gpu_cores
+            .filter(|&c| c > 0)
+            .unwrap_or(METAL_FALLBACK_GPU_CORES),
+    );
+    let steps_down = u32::from(
+        zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+            .saturating_sub(job_po2)
+            .min(6),
+    );
+    let secs = (METAL_BENCHMARK_CORE_SECS / cores).saturating_mul(3u64.pow(steps_down))
+        / 2u64.pow(steps_down);
+    Some(configured.max(Duration::from_secs(secs)))
 }
 
 /// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker whose card's memory cannot be read: above the ~7.6 GB
@@ -2011,7 +2939,7 @@ fn is_intel_slot(key: &str) -> bool {
 }
 
 /// How long a backend's warm-up may take: SP1's circuit artifacts are ~8 GB to download, risc0's
-/// Groth16 component 2.3 GB.
+/// Groth16 component (v0.2.0, risc0 3.1) 2.4 GB (5.4 GB installed).
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The default bound on setting an SP1 measure worker up before a sizing request runs on it (see
@@ -2100,8 +3028,21 @@ pub struct WorkerPool {
     /// When set, `discover_and_spawn` starts the dedicated measure pools only, and no prove worker
     /// (see [`Self::measure_only`]).
     measure_only: bool,
+    /// W7-M10: the owner tier with its hysteresis (`metal_sizing::OwnerTierState`), host-wide.
+    owner: Mutex<crate::metal_sizing::OwnerTierState>,
+    /// Tests: a forced owner tier in place of `ZKMINER_OWNER_ACTIVE` (process-wide, so tests that
+    /// run in parallel cannot use it).
+    owner_force_override: Mutex<Option<crate::metal_sizing::OwnerForce>>,
+    /// Tests: whether Metal workers enforce their figure, in place of `ZKMINER_METAL_ENFORCE_BUDGET`.
+    enforce_override: Mutex<Option<bool>>,
+    /// Tests: a per-slot count-based recycle threshold in place of the process-wide one.
+    recycle_override: Mutex<HashMap<String, u32>>,
+    /// Metal proofs completed at the idle and at the owner-active tier (W7-M10).
+    metal_tier_jobs: [AtomicU64; 2],
     /// Why workers could not start, in words for the operator. See [`Self::startup_problems`].
     startup_problems: Vec<String>,
+    /// The slots `discover_and_spawn` found but could not start, and whether each declined (W10-BFIX).
+    not_started: Vec<(String, bool)>,
     /// What each slot's one-time setup is doing now, by slot key. See [`Self::setup_status`].
     setup_status: Mutex<HashMap<String, zkminer_prover_protocol::SetupStep>>,
 }
@@ -2179,7 +3120,13 @@ impl WorkerPool {
             only_backends: None,
             progress: None,
             measure_only: false,
+            owner: Mutex::new(crate::metal_sizing::OwnerTierState::default()),
+            owner_force_override: Mutex::new(None),
+            enforce_override: Mutex::new(None),
+            recycle_override: Mutex::new(HashMap::new()),
+            metal_tier_jobs: [AtomicU64::new(0), AtomicU64::new(0)],
             startup_problems: Vec::new(),
+            not_started: Vec::new(),
             setup_status: Mutex::new(HashMap::new()),
         }
     }
@@ -2191,6 +3138,12 @@ impl WorkerPool {
 
     /// Why workers could not start in `discover_and_spawn`, in words for the operator: without
     /// this a card missing a zkVM has no explanation outside the log file.
+    /// The workers `discover_and_spawn` found but could not start, as `(slot key, declined)`: the
+    /// CLI names them instead of saying there is no worker (W10-BFIX).
+    pub fn not_started(&self) -> &[(String, bool)] {
+        &self.not_started
+    }
+
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
     }
@@ -2287,6 +3240,7 @@ impl WorkerPool {
     /// CUDA uses PCI bus IDs with CUDA_DEVICE_ORDER=PCI_BUS_ID.
     /// ROCm uses numeric device indices for HIP_VISIBLE_DEVICES.
     /// Intel uses device index for ZE_AFFINITY_MASK (Level Zero) and ONEAPI_DEVICE_SELECTOR.
+    /// Metal has one device and no visibility variable; it gets only the unified-memory budget.
     fn gpu_env(
         backend: &str,
         gpu_tag: &str,
@@ -2471,6 +3425,32 @@ impl WorkerPool {
                         zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
                         vram.to_string(),
                     );
+                }
+            }
+            "metal" => {
+                // Apple silicon has exactly one GPU, the default Metal device, so there is nothing to
+                // pin and no `*_VISIBLE_DEVICES` analogue to set. What the worker cannot work out for
+                // itself is how much of the unified memory it may treat as its card: the risc0 worker
+                // reads `ZKMINER_CUDA_VRAM_BYTES` (`release_groth16_cache_if_tight`), so it is given
+                // `hw.memsize` less `METAL_HOST_RESERVE_BYTES`. Only for an enumerated device, as for
+                // CUDA: an explicitly configured binary keeps whatever its own environment says
+                // (`gpu_vram_bytes` is `None` without a device index).
+                if let Some(vram) = gpu_vram_bytes(gpu_tag, device_index, pci_bus_id) {
+                    env.insert(
+                        zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                        vram.to_string(),
+                    );
+                    // W7-M11: with the R2 tier table (opt-in), the footprints it was sized with
+                    // assume risc0 W7-G1's witness-graph release, which needs libmalloc's large
+                    // cache off from the worker's start (`metal_sizing::spawn_without_malloc_large_cache`).
+                    let ms = crate::metal_sizing::MALLOC_LARGE_CACHE_ENV;
+                    if crate::metal_sizing::spawn_without_malloc_large_cache(
+                        crate::metal_sizing::host_working_set_limit(Some(vram)).unwrap_or(vram),
+                        crate::metal_sizing::env_po2_table(),
+                        std::env::var_os(ms).is_some(),
+                    ) {
+                        env.insert(ms.into(), "0".into());
+                    }
                 }
             }
             _ => {}
@@ -2767,8 +3747,10 @@ impl WorkerPool {
                                 consecutive_failures: 0,
                                 last_failure: None,
                                 declined: None,
+                                last_spawn_error: None,
                                 decline_retry: DeclineRetry::default(),
                                 proofs_since_spawn: 0,
+                                last_use: None,
                             }),
                             vram_bytes: gpu_vram_bytes(
                                 &gpu_tag,
@@ -2805,6 +3787,7 @@ impl WorkerPool {
                     ));
                     let vram_bytes = gpu_vram_bytes(&gpu_tag, device_index, pci_bus_id.as_deref());
                     let entry_bus_id = pci_bus_id.clone().filter(|b| !b.is_empty());
+                    self.not_started.push((key.clone(), declined.is_some()));
                     let mut slot = WorkerSlot {
                         handle: None,
                         path,
@@ -2818,7 +3801,9 @@ impl WorkerPool {
                         last_failure: Some(Instant::now()),
                         declined: None,
                         decline_retry: DeclineRetry::default(),
+                        last_spawn_error: Some(msg),
                         proofs_since_spawn: 0,
+                        last_use: None,
                     };
                     if let Some(reason) = declined {
                         Self::note_decline(&mut slot, &format!("{key}{device_desc}"), reason);
@@ -2926,8 +3911,10 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        last_spawn_error: None,
                         decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -3032,8 +4019,10 @@ impl WorkerPool {
                         consecutive_failures: failures,
                         last_failure,
                         declined: None,
+                        last_spawn_error: None,
                         decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -3047,6 +4036,46 @@ impl WorkerPool {
         }
 
         connected
+    }
+
+    /// Whether any worker was started at all: a proving slot or a measure worker (W10-BENCH). When
+    /// one was, a benchmark that produced nothing FAILED; only a pool with none may fall back to the
+    /// simulated suite.
+    pub fn has_any_worker(&self) -> bool {
+        !self.workers.is_empty() || self.measure_workers.values().any(|pool| !pool.is_empty())
+    }
+
+    /// A slot's state as a benchmark sees it (W10-BENCH round 1): why it DECLINED at startup, if it
+    /// did, and whether it has no worker running.
+    fn benchmark_slot_state(&self, key: &str) -> (Option<String>, bool) {
+        self.workers.get(key).map_or((None, true), |entry| {
+            let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
+            (slot.declined.clone(), slot.handle.is_none())
+        })
+    }
+
+    /// Whether `key` has no worker running now.
+    /// The benchmark error of a slot that had no worker and still has none: "could not start: "
+    /// and the error of its last failed spawn (a handshake that died, with the worker's last stderr
+    /// line), with the benchmark's own attempt (usually "Backoff: waiting ... before respawning",
+    /// which says nothing about the worker) only as context (W10-BFIX).
+    fn down_slot_error(&self, key: &str, attempt: anyhow::Error) -> anyhow::Error {
+        let last = self.workers.get(key).and_then(|entry| {
+            entry
+                .slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_spawn_error
+                .clone()
+        });
+        anyhow::anyhow!(
+            "{}",
+            down_slot_message(last.as_deref(), &format!("{attempt:#}"))
+        )
+    }
+
+    fn slot_has_no_worker(&self, key: &str) -> bool {
+        self.benchmark_slot_state(key).1
     }
 
     /// Get all compound keys that have registered worker slots.
@@ -3118,7 +4147,7 @@ impl WorkerPool {
         for key in self.workers.keys() {
             let parts: Vec<&str> = key.split(':').collect();
             // "backend:gpu_tag:device_index" with a real GPU tag = a pinned physical GPU.
-            if parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel") {
+            if parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel" | "metal") {
                 gpus.insert((parts[1].to_string(), parts[2].to_string()));
             }
         }
@@ -3137,14 +4166,27 @@ impl WorkerPool {
     }
 
     /// The (benchmark device id, backend) pair of every GPU prove worker: the rows a complete
-    /// benchmark suite has. Reads only the slot keys, so it never waits on a running proof.
+    /// benchmark suite has. Never waits on a running proof.
+    ///
+    /// A slot whose worker DECLINED at startup is not one (W10-BENCH round 1): it is never
+    /// benchmarked, so counting it made every start re-run the benchmark for a row that cannot come.
+    /// `try_lock`: a slot busy proving is not a declined one.
     pub fn benchmark_targets(&self) -> Vec<(String, String)> {
         self.workers
-            .keys()
-            .filter_map(|key| {
+            .iter()
+            .filter(|(_, entry)| match entry.slot.try_lock() {
+                Ok(slot) => slot.declined.is_none(),
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().declined.is_none(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            })
+            .filter_map(|(key, _)| {
                 let parts: Vec<&str> = key.split(':').collect();
-                (parts.len() == 3 && matches!(parts[1], "cuda" | "rocm" | "intel"))
-                    .then(|| (Self::benchmark_device_id(key), parts[0].to_string()))
+                // A backend whose worker only simulates a benchmark never yields a saved row, so
+                // it is no target: it would re-run the startup benchmark forever (W10-BENCH r2).
+                (parts.len() == 3
+                    && matches!(parts[1], "cuda" | "rocm" | "intel")
+                    && !SIMULATED_BENCHMARK_BACKENDS.contains(&parts[0]))
+                .then(|| (Self::benchmark_device_id(key), parts[0].to_string()))
             })
             .collect()
     }
@@ -3462,8 +4504,12 @@ impl WorkerPool {
         // the same card is the worst case of the double-booking the lock prevents. Bounded by
         // `benchmark_timeout`. See `acquire_gpu_guard`.
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard =
-            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, self.benchmark_timeout)?;
+        let _gpu_guard = Self::acquire_gpu_guard(
+            gpu_lock.as_ref(),
+            key,
+            None,
+            self.benchmark_timeout_for(key),
+        )?;
 
         // Size the segment to what is actually free, rather than refusing the card.
         //
@@ -3547,6 +4593,8 @@ impl WorkerPool {
             }
         };
 
+        // W7-M10: a calibration measures the Mac at its idle tier, like a benchmark.
+        Self::metal_idle_tier_for_benchmark(&mut slot, entry, key);
         self.ensure_alive(&mut slot, entry)?;
         if let Some(h) = slot.handle.as_ref() {
             entry.publish_pid(h.pid());
@@ -3566,7 +4614,7 @@ impl WorkerPool {
         }
 
         // A calibration run is a full proof — reuse the benchmark timeout budget.
-        let _watchdog = self.benchmark_timeout.map(|t| {
+        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
             ProvingWatchdog::new(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -3882,6 +4930,7 @@ impl WorkerPool {
             }
         };
         self.set_setup_status(key, None);
+        slot.note_used(UseKind::Other);
         if response.is_err() {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -4040,8 +5089,12 @@ impl WorkerPool {
         // lock exists to prevent. Bounded by `benchmark_timeout` so a wedged holder cannot park the
         // benchmark forever. See `acquire_gpu_guard`.
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard =
-            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, self.benchmark_timeout)?;
+        let _gpu_guard = Self::acquire_gpu_guard(
+            gpu_lock.as_ref(),
+            key,
+            None,
+            self.benchmark_timeout_for(key),
+        )?;
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
         // concerned, and an OOM here poisons the throughput row that prices every later job on it.
@@ -4111,6 +5164,8 @@ impl WorkerPool {
             host
         };
 
+        // W7-M10: a benchmark prices the Mac at its idle tier.
+        Self::metal_idle_tier_for_benchmark(&mut slot, entry, key);
         self.ensure_alive(&mut slot, entry)?;
 
         // Update external PID after ensure_alive (may have respawned)
@@ -4129,7 +5184,7 @@ impl WorkerPool {
 
         // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
         let clock = WatchdogClock::new();
-        let _watchdog = self.benchmark_timeout.map(|t| {
+        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
             ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -4142,6 +5197,7 @@ impl WorkerPool {
 
         let requests =
             Self::run_benchmark_requests(handle, key, &|_, _, _| {}, &|| {}, &|| clock.touch());
+        slot.note_used(UseKind::Other);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -4170,8 +5226,8 @@ impl WorkerPool {
 
     /// Run benchmarks on all connected workers, returning device metadata alongside results.
     /// This allows callers to build per-device benchmark records with real GPU identification.
-    pub fn benchmark_all_with_device_info(&self) -> Vec<SlotBenchmarkResult> {
-        let mut results = Vec::new();
+    pub fn benchmark_all_with_device_info(&self) -> BenchmarkRun {
+        let mut run = BenchmarkRun::default();
         let mut keys: Vec<String> = self.registered_backends();
 
         // Sort keys so GPU workers (cuda/rocm) run first. This ensures the GPU
@@ -4205,7 +5261,10 @@ impl WorkerPool {
                     .slot
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if slot.gpu_tag != "generic" && slot.handle.is_some() {
+                // A GPU slot that is down but not declined counts too (W10-BENCH round 2): it is
+                // still tried (a respawn may bring it up), and if it stays down the run fails, so a
+                // CPU benchmark of the same backend would only take hours to show a failed run.
+                if slot.gpu_tag != "generic" && slot.declined.is_none() {
                     Some(slot.backend.clone())
                 } else {
                     None
@@ -4246,6 +5305,20 @@ impl WorkerPool {
                 continue;
             }
 
+            // W10-BENCH round 1: a declined worker cannot prove here and is never respawned; trying
+            // it only re-declines, and must not fail the other slots' benchmark. A slot with no
+            // worker is still tried (a respawn may bring it up), but its error is "not benchmarked".
+            let (declined, was_down) = self.benchmark_slot_state(&key);
+            if let Some(reason) = declined {
+                run.record_declined(&key, &reason, gpu_name, &gpu_tag);
+                continue;
+            }
+            // W10-BENCH round 2: a worker that only simulates a benchmark is not run either.
+            if let Some(reason) = simulated_benchmark_reason(&backend, &[]) {
+                run.record_simulated(&key, reason, gpu_name, &gpu_tag);
+                continue;
+            }
+
             let outcome = self.benchmark_slot(&key);
             // Never got the card: the guard timed out behind a proof. Nothing ran, so there is
             // nothing to recycle — and recycling would wait the whole guard timeout again first.
@@ -4253,29 +5326,38 @@ impl WorkerPool {
                 e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
                     .is_some()
             });
-            match outcome {
-                Ok(entries) if !entries.is_empty() => {
-                    results.push(SlotBenchmarkResult {
-                        slot_key: key.clone(),
-                        gpu_name,
-                        device_index,
-                        pci_bus_id: slot_pci_bus_id.clone(),
-                        gpu_tag: gpu_tag.clone(),
-                        entries,
-                        vram_bytes,
-                        host_peak_bytes: self.host_peak_for_slot(&key),
-                    });
-                }
-                Ok(_) => {} // empty results, skip
-                Err(e) => {
-                    tracing::error!("Benchmark failed for {key}: {e:#}");
-                }
-            }
+            // Still down after the attempt: it never came up, so this run could not benchmark it.
+            let was_down = was_down && self.slot_has_no_worker(&key);
+            // Its error is why it never came up, not the respawn backoff the retry ran into.
+            let outcome = if was_down {
+                outcome.map_err(|e| self.down_slot_error(&key, e))
+            } else {
+                outcome
+            };
+            let host_peak_bytes = self.host_peak_for_slot(&key);
+            run.record(
+                &key,
+                &backend,
+                was_down,
+                outcome,
+                |entries| SlotBenchmarkResult {
+                    slot_key: key.clone(),
+                    gpu_name: gpu_name.clone(),
+                    device_index,
+                    pci_bus_id: slot_pci_bus_id.clone(),
+                    gpu_tag: gpu_tag.clone(),
+                    entries,
+                    vram_bytes,
+                    host_peak_bytes,
+                },
+                gpu_name.clone(),
+                &gpu_tag,
+            );
 
-            // After benchmarking a GPU-specific worker (cuda/rocm/intel), shut it down
+            // After benchmarking a GPU-specific worker (cuda/rocm/intel/metal), shut it down
             // to free VRAM. GPU prover processes hold buffer pools that prevent
-            // other backends from using the same GPU.
-            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
+            // other backends from using the same GPU (on Metal, the same unified memory).
+            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel" | "metal") {
                 if let Some(entry) = self.workers.get(&key) {
                     // Under the card's guard. Without it — `benchmark_slot*` has already released it —
                     // a proof waiting for this card could take it in between and start beside the
@@ -4288,7 +5370,7 @@ impl WorkerPool {
                         gpu_lock.as_ref(),
                         &key,
                         None,
-                        self.benchmark_timeout,
+                        self.benchmark_timeout_for(&key),
                     ) {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -4397,7 +5479,7 @@ impl WorkerPool {
             }
         }
 
-        results
+        run.finish()
     }
 
     /// Run benchmarks on a specific worker slot with per-program progress streaming.
@@ -4414,8 +5496,12 @@ impl WorkerPool {
         // lock exists to prevent. Bounded by `benchmark_timeout` so a wedged holder cannot park the
         // benchmark forever. See `acquire_gpu_guard`.
         let gpu_lock = self.gpu_lock_for(key);
-        let _gpu_guard =
-            Self::acquire_gpu_guard(gpu_lock.as_ref(), key, None, self.benchmark_timeout)?;
+        let _gpu_guard = Self::acquire_gpu_guard(
+            gpu_lock.as_ref(),
+            key,
+            None,
+            self.benchmark_timeout_for(key),
+        )?;
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
         // concerned, and an OOM here poisons the throughput row that prices every later job on it.
@@ -4491,6 +5577,8 @@ impl WorkerPool {
             host
         };
 
+        // W7-M10: a benchmark prices the Mac at its idle tier.
+        Self::metal_idle_tier_for_benchmark(&mut slot, entry, key);
         self.ensure_alive(&mut slot, entry)?;
 
         // Update external PID after ensure_alive (may have respawned)
@@ -4509,7 +5597,7 @@ impl WorkerPool {
 
         // Start benchmark timeout watchdog if configured: per step, rearmed as each completes.
         let clock = WatchdogClock::new();
-        let _watchdog = self.benchmark_timeout.map(|t| {
+        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
             ProvingWatchdog::with_clock(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -4539,6 +5627,7 @@ impl WorkerPool {
         let warmed = || on_progress(event(BenchmarkProgressKind::WarmedUp));
 
         let requests = Self::run_benchmark_requests(handle, key, &cb, &warmed, &|| clock.touch());
+        slot.note_used(UseKind::Other);
         if requests.broken {
             if entry.intentional_kill.load(Ordering::Acquire) {
                 Self::mark_slot_dead(&mut slot, entry);
@@ -4579,8 +5668,8 @@ impl WorkerPool {
     pub fn benchmark_all_streaming(
         &self,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
-    ) -> Vec<SlotBenchmarkResult> {
-        let mut results = Vec::new();
+    ) -> BenchmarkRun {
+        let mut run = BenchmarkRun::default();
         let mut keys: Vec<String> = self.registered_backends();
 
         keys.sort_by(|a, b| {
@@ -4607,7 +5696,10 @@ impl WorkerPool {
                     .slot
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if slot.gpu_tag != "generic" && slot.handle.is_some() {
+                // A GPU slot that is down but not declined counts too (W10-BENCH round 2): it is
+                // still tried (a respawn may bring it up), and if it stays down the run fails, so a
+                // CPU benchmark of the same backend would only take hours to show a failed run.
+                if slot.gpu_tag != "generic" && slot.declined.is_none() {
                     Some(slot.backend.clone())
                 } else {
                     None
@@ -4619,7 +5711,9 @@ impl WorkerPool {
         for key in &keys {
             let skipped = self.workers.get(key).is_some_and(|entry| {
                 let slot = entry.slot.lock().unwrap_or_else(|e| e.into_inner());
-                slot.gpu_tag == "generic" && gpu_backends.contains(&slot.backend)
+                (slot.gpu_tag == "generic" && gpu_backends.contains(&slot.backend))
+                    || slot.declined.is_some()
+                    || SIMULATED_BENCHMARK_BACKENDS.contains(&slot.backend.as_str())
             });
             if !skipped {
                 if let Some(event) = self.benchmark_event(key, BenchmarkProgressKind::Queued) {
@@ -4655,11 +5749,30 @@ impl WorkerPool {
                 continue;
             }
 
+            // W10-BENCH round 1: a declined worker cannot prove here and is never respawned; trying
+            // it only re-declines, and must not fail the other slots' benchmark. A slot with no
+            // worker is still tried (a respawn may bring it up), but its error is "not benchmarked".
+            let (declined, was_down) = self.benchmark_slot_state(&key);
+            if let Some(reason) = declined {
+                run.record_declined(&key, &reason, gpu_name, &gpu_tag);
+                continue;
+            }
+            // W10-BENCH round 2: a worker that only simulates a benchmark is not run either.
+            if let Some(reason) = simulated_benchmark_reason(&backend, &[]) {
+                run.record_simulated(&key, reason, gpu_name, &gpu_tag);
+                continue;
+            }
+
             if let Some(event) = self.benchmark_event(&key, BenchmarkProgressKind::Started) {
                 on_progress(event);
             }
             let outcome = self.benchmark_slot_streaming(&key, on_progress);
-            let succeeded = matches!(&outcome, Ok(entries) if !entries.is_empty());
+            // A short suite is a failed card too (W10-BENCH round 1), and so are simulated rows
+            // (round 2).
+            let succeeded = matches!(&outcome, Ok(entries)
+                if !entries.is_empty()
+                    && simulated_benchmark_reason(&backend, entries).is_none()
+                    && missing_benchmark_rows(&backend, entries).is_empty());
             if let Some(event) =
                 self.benchmark_event(&key, BenchmarkProgressKind::Finished { succeeded })
             {
@@ -4670,26 +5783,35 @@ impl WorkerPool {
                 e.downcast_ref::<zkminer_prover_protocol::types::ProofDeadlineReached>()
                     .is_some()
             });
-            match outcome {
-                Ok(entries) if !entries.is_empty() => {
-                    results.push(SlotBenchmarkResult {
-                        slot_key: key.clone(),
-                        gpu_name,
-                        device_index,
-                        pci_bus_id: slot_pci_bus_id.clone(),
-                        gpu_tag: gpu_tag.clone(),
-                        entries,
-                        vram_bytes,
-                        host_peak_bytes: self.host_peak_for_slot(&key),
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("Benchmark failed for {key}: {e:#}");
-                }
-            }
+            // Still down after the attempt: it never came up, so this run could not benchmark it.
+            let was_down = was_down && self.slot_has_no_worker(&key);
+            // Its error is why it never came up, not the respawn backoff the retry ran into.
+            let outcome = if was_down {
+                outcome.map_err(|e| self.down_slot_error(&key, e))
+            } else {
+                outcome
+            };
+            let host_peak_bytes = self.host_peak_for_slot(&key);
+            run.record(
+                &key,
+                &backend,
+                was_down,
+                outcome,
+                |entries| SlotBenchmarkResult {
+                    slot_key: key.clone(),
+                    gpu_name: gpu_name.clone(),
+                    device_index,
+                    pci_bus_id: slot_pci_bus_id.clone(),
+                    gpu_tag: gpu_tag.clone(),
+                    entries,
+                    vram_bytes,
+                    host_peak_bytes,
+                },
+                gpu_name.clone(),
+                &gpu_tag,
+            );
 
-            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel") {
+            if !card_was_busy && matches!(gpu_tag.as_str(), "cuda" | "rocm" | "intel" | "metal") {
                 if let Some(entry) = self.workers.get(&key) {
                     // Under the card's guard. Without it — `benchmark_slot*` has already released it —
                     // a proof waiting for this card could take it in between and start beside the
@@ -4702,7 +5824,7 @@ impl WorkerPool {
                         gpu_lock.as_ref(),
                         &key,
                         None,
-                        self.benchmark_timeout,
+                        self.benchmark_timeout_for(&key),
                     ) {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -4805,7 +5927,7 @@ impl WorkerPool {
             }
         }
 
-        results
+        run.finish()
     }
 
     /// Submit a proof to a backend worker.
@@ -5328,6 +6450,7 @@ impl WorkerPool {
                 }
             }
         };
+        slot.note_used(UseKind::Other);
         match response {
             WorkerResponse::ExecuteResult {
                 cycles,
@@ -5502,6 +6625,7 @@ impl WorkerPool {
                 ));
             }
         };
+        slot.note_used(UseKind::Other);
         match response {
             WorkerResponse::ProgramIdResult {
                 program_id,
@@ -7017,7 +8141,17 @@ impl WorkerPool {
     /// a card's job segment size is decided from (`benchmark::risc0_job_po2`), its calibration row and
     /// its Settings override being keyed by the device id. A slot whose VRAM was not read at spawn falls
     /// back to the amdgpu driver's count for an AMD card. Takes no slot lock.
+    ///
+    /// An Apple GPU's figure is its tier's claim figure (W7-M10, `metal_sizing::claim_limit`): the
+    /// owner-active tier's while the owner uses the Mac and that tier measures claims at a smaller
+    /// po2 (16 / 18 / 24 GB Macs), else the idle figure (36 GB and up: the same po2 20). Only with
+    /// `ZKMINER_OWNER_ACTIVE=auto` or `1`; the default keeps the idle tier. Reading it may move the
+    /// tier back to idle (a larger po2, which a job measured smaller still fits), never to active:
+    /// that switch happens only as a Metal job starts ([`Self::update_owner_tier`]). A job measured
+    /// at the idle po2 and still queued when that switch happens is proved at the active po2
+    /// unmeasured (run.rs sizes its prove step from this too), which is why `auto` is opt-in.
     pub fn risc0_slots(&self) -> Vec<(String, String, Option<u64>)> {
+        let owner = self.update_owner_tier(false);
         let mut slots: Vec<_> = self
             .keys_for_prefix(zkminer_prover_protocol::BACKEND_RISC0)
             .into_iter()
@@ -7031,11 +8165,496 @@ impl WorkerPool {
                         .filter(|_| rocm)
                         .and_then(amd_vram_bytes)
                 });
+                let vram = if k.split(':').nth(1) == Some("metal") {
+                    vram.map(|v| crate::metal_sizing::claim_limit(v, owner))
+                } else {
+                    vram
+                };
                 (k, device, vram)
             })
             .collect();
         slots.sort();
         slots
+    }
+
+    // ---- W7-M10: the owner-active tier for Apple GPU slots ----
+
+    /// The tier a Metal job proves at (`metal_sizing::job_tier`), read at its start; `None` for a
+    /// slot that is not an enumerated Apple GPU. A job (a `po2`) may switch the owner tier to active
+    /// here; a benchmark-style proof (`po2` `None`) only reads it and proves at the idle tier.
+    fn metal_job_tier(
+        &self,
+        key: &str,
+        slot: &WorkerSlot,
+        entry: &WorkerEntry,
+        po2: Option<u8>,
+    ) -> Option<MetalJobTier> {
+        use crate::metal_sizing as ms;
+        let (idle, spawned) = Self::metal_figures(slot, entry)?;
+        let owner = if po2.is_some() {
+            self.update_owner_tier(true)
+        } else {
+            self.owner_tier()
+        };
+        let worker = Self::metal_worker_tier(idle, spawned);
+        let active = ms::active_limit(idle);
+        let tier = ms::job_tier(owner, worker, po2, ms::max_po2_for_limit(active));
+        let limit = ms::tier_limit(idle, tier);
+        let worker_refuses =
+            po2.is_some_and(|p| ms::max_po2_for_limit(spawned).is_none_or(|c| p > c));
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let why = format!(
+            "owner {}, job po2 {}, {:.1} GiB instead of {:.1} GiB",
+            owner.name(),
+            po2.map_or("default".to_string(), |p| p.to_string()),
+            gib(limit),
+            gib(spawned)
+        );
+        if tier != owner && po2.is_some() {
+            tracing::info!(
+                "{key}: the owner is {} but this job proves at the {} tier ({why}): its po2 was \
+                 measured for that one",
+                owner.name(),
+                tier.name()
+            );
+        }
+        // Only when the worker would prove this job otherwise at the tier's figure: unenforced, a
+        // smaller figure that admits the po2 with the same Groth16 decision changes nothing but
+        // costs a cold worker (a 36 GB Mac's 28 -> 20 GiB at po2 20, or a 16 GB Mac's po2 18 job at
+        // 8 or 4 GiB). The proof then runs at, and is recorded at, the live worker's tier.
+        let respawn = !self.metal_same(limit, spawned, po2);
+        if !respawn && limit != spawned && po2.is_some() {
+            tracing::debug!(
+                "{key}: the {} tier would change nothing for this job ({why}): no respawn",
+                tier.name()
+            );
+        }
+        Some(MetalJobTier {
+            tier,
+            respawn,
+            worker_refuses,
+            why,
+        })
+    }
+
+    /// After a successful Metal proof: respawn the worker right away when it is due for a recycle
+    /// (the count) or for another tier (the owner tier as now read, which may only fall back to
+    /// idle here), so the new worker's first-job prewarm (M9) runs in the idle gap instead of in
+    /// the next job; and, once the footprint has settled (~2 s after the proof), make the growth
+    /// net's check and respawn the worker if it has outgrown its baseline.
+    ///
+    /// On the miner's pool (`engine::worker_pool`) all of it runs on a background thread, after this
+    /// proof has been handed back, so the proof's result never waits for a respawn. On any other
+    /// pool (tests) the count and tier checks run inline, before the proof returns, and the growth
+    /// net is left to the check before the next proof, as before. `ZKMINER_METAL_RESPAWN_EARLY=0`
+    /// turns all of this off.
+    ///
+    /// `po2`: the proof's segment po2 (`None`: a benchmark-style proof), which predicts the next
+    /// queued job's (see [`Self::idle_gap_tier`]).
+    fn after_metal_proof(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        po2: Option<u8>,
+    ) {
+        if !metal_respawn_early() || slot.handle.is_none() || self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let pid = slot.handle.as_ref().map(|h| h.pid()).unwrap_or(0);
+        let proofs = slot.proofs_since_spawn;
+        let Some(pool) = crate::engine::worker_pool().filter(|p| std::ptr::eq(*p, self)) else {
+            if let Some((why, tier)) = self.early_respawn_due(key, slot, entry, po2) {
+                self.respawn_metal_now(key, slot, entry, &why, tier);
+            }
+            return;
+        };
+        let key = key.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("metal-respawn-early".into())
+            .spawn(move || pool.respawn_early_in_background(&key, pid, proofs, po2));
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the early respawn check: {e}");
+        }
+    }
+
+    /// The background half of [`Self::after_metal_proof`]: takes the slot once the proof's caller
+    /// has let it go (polling, up to [`METAL_IDLE_RECLAIM`]), and only while it still holds the same
+    /// idle worker with no proof since. A proof that starts first makes its own checks.
+    fn respawn_early_in_background(&self, key: &str, pid: u32, proofs: u32, po2: Option<u8>) {
+        let Some(entry) = self.workers.get(key) else {
+            return;
+        };
+        let unchanged = |slot: &WorkerSlot| {
+            slot.handle.as_ref().map(|h| h.pid()) == Some(pid) && slot.proofs_since_spawn == proofs
+        };
+        let started = Instant::now();
+        let mut slot = loop {
+            match entry.slot.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= METAL_IDLE_RECLAIM {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        };
+        if !unchanged(&slot) || self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some((why, tier)) = self.early_respawn_due(key, &slot, entry, po2) {
+            self.respawn_metal_now(key, &mut slot, entry, &why, tier);
+            return;
+        }
+        if metal_net_config(&slot.spawn_env, entry.vram_bytes).margin == 0 {
+            return;
+        }
+        drop(slot);
+        self.early_growth_check(key, pid, proofs);
+    }
+
+    /// Why the slot's worker should be respawned right after its proof, with the tier to respawn it
+    /// at (`None`: the figure it has), or `None` to keep it. `last_po2`: the po2 of the proof that
+    /// just ended.
+    fn early_respawn_due(
+        &self,
+        key: &str,
+        slot: &WorkerSlot,
+        entry: &WorkerEntry,
+        last_po2: Option<u8>,
+    ) -> Option<(String, Option<crate::metal_sizing::OwnerTier>)> {
+        let retier = self.idle_gap_tier(slot, entry, last_po2);
+        let recycle_n = self.recycle_after_for_slot(key, &slot.gpu_tag);
+        if recycle_n > 0 && slot.proofs_since_spawn >= recycle_n {
+            return Some((
+                format!("{} proofs, fresh GPU state", slot.proofs_since_spawn),
+                retier,
+            ));
+        }
+        let tier = retier?;
+        let (idle, _) = Self::metal_figures(slot, entry)?;
+        Some((
+            format!(
+                "the owner tier is now {}: {:.1} GiB",
+                tier.name(),
+                Self::metal_tier_limit(idle, tier) as f64 / (1u64 << 30) as f64
+            ),
+            Some(tier),
+        ))
+    }
+
+    /// The tier to move the slot's idle worker to in the gap after a proof (the owner tier as now
+    /// read), or `None` to leave it. Only when the next job would otherwise make its own respawn,
+    /// and only once per switch, not per job (W7-M10 review findings):
+    /// - to active: only after a job whose po2 (`last_po2`, the size the jobs queued behind it were
+    ///   measured at) the active tier holds and proves otherwise ([`Self::metal_same`]). After a job
+    ///   measured at the idle po2 (19 on a 16 GB Mac, above the 4 GiB tier's 18) the worker stays:
+    ///   moving it would make the next queued po2 19 job respawn it back before its proof, two
+    ///   respawns per queued job. The first po2 18 job's start makes the one respawn instead.
+    /// - to idle: when the worker proves otherwise a job at the idle po2 (what is claimed from now)
+    ///   or at `last_po2`.
+    ///
+    /// Unenforced, the active tier never changes a job's proof (it admits the po2 or the job stays
+    /// idle, and keeps the same Groth16 decision on every Mac size measured), so no move happens.
+    fn idle_gap_tier(
+        &self,
+        slot: &WorkerSlot,
+        entry: &WorkerEntry,
+        last_po2: Option<u8>,
+    ) -> Option<crate::metal_sizing::OwnerTier> {
+        use crate::metal_sizing as ms;
+        let (idle, spawned) = Self::metal_figures(slot, entry)?;
+        let owner = self.update_owner_tier(false);
+        let target = Self::metal_tier_limit(idle, owner);
+        if target == spawned {
+            return None;
+        }
+        let differs = |p: u8| !self.metal_same(target, spawned, Some(p));
+        let due = match owner {
+            ms::OwnerTier::Active => {
+                let p = last_po2?;
+                ms::admits_po2(target, p) && differs(p)
+            }
+            ms::OwnerTier::Idle => {
+                let next = ms::job_po2_for_limit(ms::host_working_set_limit(Some(idle))?);
+                differs(next) || last_po2.is_some_and(differs)
+            }
+        };
+        due.then_some(owner)
+    }
+
+    /// Whether a worker spawned at figure `a` proves a job of `po2` as one spawned at `b` would
+    /// (`metal_sizing::same_for_job`, with this pool's enforcement setting).
+    fn metal_same(&self, a: u64, b: u64, po2: Option<u8>) -> bool {
+        let enforced = self
+            .enforce_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|| !crate::metal_sizing::enforce_budget_off());
+        crate::metal_sizing::same_for_job(a, b, po2, enforced)
+    }
+
+    /// Kills the slot's worker and spawns its replacement now, at `tier`'s figure (`None`: the
+    /// figure it has).
+    fn respawn_metal_now(
+        &self,
+        key: &str,
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        why: &str,
+        tier: Option<crate::metal_sizing::OwnerTier>,
+    ) {
+        let t = Instant::now();
+        if let Some(tier) = tier {
+            Self::set_metal_spawn_tier(slot, entry, tier);
+        }
+        entry.clear_pid();
+        if let Some(h) = slot.handle.as_mut() {
+            h.kill();
+        }
+        slot.handle = None;
+        if self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.ensure_alive(slot, entry) {
+            Ok(_) => {
+                if let Some(h) = slot.handle.as_ref() {
+                    entry.publish_pid(h.pid());
+                }
+                if self.closing.load(Ordering::SeqCst) {
+                    Self::mark_slot_dead(slot, entry);
+                    return;
+                }
+                tracing::info!(
+                    "Respawned worker {key} right after its proof ({why}) in {:.2} s: it warms up \
+                     before the next job",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            // The next dispatch's `ensure_alive` tries again (with the usual backoff).
+            Err(e) => {
+                tracing::warn!("{key}: early respawn failed ({e:#}); retried at the next job")
+            }
+        }
+    }
+
+    /// The growth net's check right after a proof, on its own thread (see [`Self::after_metal_proof`]):
+    /// once the footprint has settled, if the slot is still idle with the same worker and no proof
+    /// since, the same check the next proof would make, and a respawn if it fails.
+    fn early_growth_check(&self, key: &str, pid: u32, proofs: u32) {
+        std::thread::sleep(METAL_IDLE_RECLAIM + METAL_IDLE_SETTLE_POLL);
+        let Some(entry) = self.workers.get(key) else {
+            return;
+        };
+        let Ok(mut slot) = entry.slot.try_lock() else {
+            return; // a proof (or anything else) has the slot: its own checks run
+        };
+        let same = slot.handle.as_ref().map(|h| h.pid()) == Some(pid)
+            && slot.proofs_since_spawn == proofs
+            && slot.last_use.is_some_and(|u| u.kind == UseKind::Proof);
+        if !same || self.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let outgrown = metal_idle_outgrown(
+            key,
+            pid,
+            slot.proofs_since_spawn,
+            slot.last_use,
+            metal_net_config(&slot.spawn_env, entry.vram_bytes),
+            Some(METAL_IDLE_SETTLE),
+        );
+        if let Some(why) = outgrown {
+            tracing::warn!(
+                "Recycling worker {key} after {proofs} proofs, before the next job: {why}"
+            );
+            self.respawn_metal_now(key, &mut slot, entry, &why, None);
+        }
+    }
+
+    /// The working-set figure of `tier` for an Apple GPU whose idle figure is `idle`
+    /// (`metal_sizing::tier_limit`).
+    pub fn metal_tier_limit(idle: u64, tier: crate::metal_sizing::OwnerTier) -> u64 {
+        crate::metal_sizing::tier_limit(idle, tier)
+    }
+
+    fn owner_force(&self) -> crate::metal_sizing::OwnerForce {
+        self.owner_force_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(crate::metal_sizing::owner_force)
+    }
+
+    /// Reads the owner's activity now (IOKit `HIDIdleTime`, display sleep, battery, Low Power Mode;
+    /// nothing is read when `ZKMINER_OWNER_ACTIVE` forces a tier) and moves the owner tier by it
+    /// (`metal_sizing::OwnerTierState`). `allow_active`: whether this read may switch the tier to
+    /// active (only at a job's start, see [`Self::risc0_slots`]). Returns the tier now.
+    pub fn update_owner_tier(&self, allow_active: bool) -> crate::metal_sizing::OwnerTier {
+        use crate::metal_sizing as ms;
+        let force = self.owner_force();
+        let reading = match force {
+            ms::OwnerForce::Auto => crate::discovery::owner_reading(),
+            _ => ms::OwnerReading::default(),
+        };
+        let mut state = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = state.tier;
+        let mut next = *state;
+        let tier = next.update(&reading, ms::owner_idle_after(), force);
+        if tier == ms::OwnerTier::Active
+            && before == ms::OwnerTier::Idle
+            && !allow_active
+            && force == ms::OwnerForce::Auto
+        {
+            return before;
+        }
+        *state = next;
+        if tier != before {
+            tracing::info!(
+                "Owner tier {} -> {} ({}{})",
+                before.name(),
+                tier.name(),
+                match force {
+                    ms::OwnerForce::Auto => "",
+                    _ => "forced by ZKMINER_OWNER_ACTIVE; ",
+                },
+                reading.describe()
+            );
+        }
+        tier
+    }
+
+    /// The owner tier as last read (no new reading).
+    pub fn owner_tier(&self) -> crate::metal_sizing::OwnerTier {
+        self.owner.lock().unwrap_or_else(|e| e.into_inner()).tier
+    }
+
+    /// Metal proofs completed at the idle and at the owner-active tier, as `(idle, active)`.
+    pub fn metal_tier_jobs(&self) -> (u64, u64) {
+        (
+            self.metal_tier_jobs[0].load(Ordering::Relaxed),
+            self.metal_tier_jobs[1].load(Ordering::Relaxed),
+        )
+    }
+
+    /// The Metal slot's idle figure (its `vram_bytes`) and the figure its live worker was spawned
+    /// with, or `None` for a slot that is not an enumerated Apple GPU (no figure to scale).
+    fn metal_figures(slot: &WorkerSlot, entry: &WorkerEntry) -> Option<(u64, u64)> {
+        if slot.gpu_tag != "metal" {
+            return None;
+        }
+        let idle = entry.vram_bytes?;
+        let spawned = slot
+            .spawn_env
+            .get(zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(idle);
+        Some((idle, spawned))
+    }
+
+    /// The tier the slot's worker was spawned at.
+    fn metal_worker_tier(idle: u64, spawned: u64) -> crate::metal_sizing::OwnerTier {
+        if spawned < idle {
+            crate::metal_sizing::OwnerTier::Active
+        } else {
+            crate::metal_sizing::OwnerTier::Idle
+        }
+    }
+
+    /// Points the slot's NEXT spawn at `tier`'s figure; `true` when that differs from the live
+    /// worker's (which must then be respawned for the tier to apply: the worker sizes its default
+    /// segment, its po2 ceiling and its Groth16 decisions from its figure at its start, and enforces
+    /// it as its Metal budget with `ZKMINER_METAL_ENFORCE_BUDGET=1`; W7-M10).
+    fn set_metal_spawn_tier(
+        slot: &mut WorkerSlot,
+        entry: &WorkerEntry,
+        tier: crate::metal_sizing::OwnerTier,
+    ) -> bool {
+        let Some((idle, spawned)) = Self::metal_figures(slot, entry) else {
+            return false;
+        };
+        let want = Self::metal_tier_limit(idle, tier);
+        if want == spawned {
+            return false;
+        }
+        slot.spawn_env.insert(
+            zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+            want.to_string(),
+        );
+        true
+    }
+
+    /// Before a benchmark or a calibration on an Apple GPU: back to the idle tier, so the row
+    /// prices this Mac at its idle rate (the worker sizes the suite from its spawn figure). The live
+    /// worker is stopped when it ran at another tier, and `ensure_alive` respawns it.
+    fn metal_idle_tier_for_benchmark(slot: &mut WorkerSlot, entry: &WorkerEntry, key: &str) {
+        if Self::set_metal_spawn_tier(slot, entry, crate::metal_sizing::OwnerTier::Idle)
+            && slot.handle.is_some()
+        {
+            tracing::info!("{key}: respawning the Metal worker at the idle tier for a benchmark");
+            entry.clear_pid();
+            if let Some(h) = slot.handle.as_mut() {
+                h.kill();
+            }
+            slot.handle = None;
+        }
+    }
+
+    /// Tests: whether Metal workers count as enforcing their figure (`ZKMINER_METAL_ENFORCE_BUDGET`),
+    /// or `None` for the environment.
+    pub fn test_force_enforce(&self, enforced: Option<bool>) {
+        *self
+            .enforce_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = enforced;
+    }
+
+    /// Tests: force the owner tier (`Some(OwnerForce::Active)` etc.), or `None` for the environment.
+    pub fn test_force_owner(&self, force: Option<crate::metal_sizing::OwnerForce>) {
+        *self
+            .owner_force_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = force;
+    }
+
+    /// Tests: the count-based recycle threshold of one slot.
+    pub fn test_set_recycle_after(&self, key: &str, proofs: u32) {
+        self.recycle_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), proofs);
+    }
+
+    /// Tests: give a slot an Apple GPU figure (`vram_bytes`) and spawn it at that figure.
+    pub fn test_set_vram(&mut self, key: &str, vram: u64) {
+        if let Some(e) = self.workers.get_mut(key) {
+            e.vram_bytes = Some(vram);
+            let mut slot = e.slot.lock().unwrap_or_else(|p| p.into_inner());
+            slot.spawn_env.insert(
+                zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV.into(),
+                vram.to_string(),
+            );
+        }
+    }
+
+    /// Tests: the figure a slot's worker is (re)spawned with.
+    pub fn test_spawn_vram(&self, key: &str) -> Option<u64> {
+        let e = self.workers.get(key)?;
+        let slot = e.slot.lock().unwrap_or_else(|p| p.into_inner());
+        slot.spawn_env
+            .get(zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV)?
+            .parse()
+            .ok()
+    }
+
+    /// The count-based recycle threshold for one slot.
+    fn recycle_after_for_slot(&self, key: &str, gpu_tag: &str) -> u32 {
+        self.recycle_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| recycle_after_proofs_for(gpu_tag))
     }
 
     /// This slot's card as the admission gate reads it, before it makes any room: what anything other
@@ -7246,6 +8865,31 @@ impl WorkerPool {
         } else {
             format!("gpu-{gpu_tag}{idx}")
         }
+    }
+
+    /// The benchmark deadline for one slot: the configured `benchmark_timeout`, except on an Apple
+    /// GPU, whose risc0 suite takes ~19 minutes on a 32-core M5 Max and longer on smaller Macs, so it
+    /// gets `metal_benchmark_timeout` (M6).
+    fn benchmark_timeout_for(&self, key: &str) -> Option<Duration> {
+        let mut parts = key.split(':');
+        let (backend, tag) = (parts.next(), parts.next());
+        if backend != Some(zkminer_prover_protocol::BACKEND_RISC0) || tag != Some("metal") {
+            return self.benchmark_timeout;
+        }
+        let vram = self.workers.get(key).and_then(|e| e.vram_bytes);
+        let (cores, po2) = (
+            crate::discovery::apple_gpu_cores(),
+            crate::benchmark::metal_job_po2(vram),
+        );
+        let scaled = metal_benchmark_timeout(self.benchmark_timeout, cores, po2);
+        if scaled != self.benchmark_timeout {
+            tracing::debug!(
+                "{key}: benchmark deadline {scaled:?} (configured {:?}; {} GPU cores, po2 {po2})",
+                self.benchmark_timeout,
+                cores.map_or("unknown".to_string(), |c| c.to_string()),
+            );
+        }
+        scaled
     }
 
     /// Get-or-create the per-physical-GPU proving lock for a slot key (see
@@ -7972,26 +9616,80 @@ impl WorkerPool {
         // check first, a slot whose worker was due for recycling could be refused for the very
         // memory that recycling would have freed — the gate blocking the only action that unblocks
         // the gate, permanently, because `proofs_since_spawn` never advances past the wedge point.
-        let recycle_n = recycle_after_proofs();
+        let recycle_n = self.recycle_after_for_slot(key, &slot.gpu_tag);
+        // W7-M10: the tier this Metal job proves at (owner active or idle), read now, at the job's
+        // start. Its po2 is already fixed; a tier that differs from the live worker's means a
+        // respawn at the tier's figure, which the new worker plans with.
+        let metal_tier = self.metal_job_tier(key, &slot, entry, po2);
+        let retier = metal_tier.as_ref().is_some_and(|t| t.respawn);
+        // A worker whose tier cannot hold this job's po2 must be respawned whatever the time left:
+        // it would refuse the proof.
+        let retier_needed = metal_tier
+            .as_ref()
+            .is_some_and(|t| t.respawn && t.worker_refuses);
         // Not this close to the deadline: the recycle and the wait for its memory would eat the time
         // the proof needs to start, and the worker can as well be recycled after its next proof.
         let give_up_at = abort_at.map(|a| a.checked_sub(MIN_ABORT_START_BUDGET).unwrap_or(a));
-        let time_to_recycle = abort_at.is_none_or(|a| {
-            a.saturating_duration_since(Instant::now())
-                >= MIN_ABORT_START_BUDGET + VRAM_RECLAIM_WAIT
-        });
-        if recycle_n > 0
-            && time_to_recycle
+        let time_left = || {
+            abort_at.is_none_or(|a| {
+                a.saturating_duration_since(Instant::now())
+                    >= MIN_ABORT_START_BUDGET + VRAM_RECLAIM_WAIT
+            })
+        };
+        let time_to_recycle = time_left();
+        // M9: a Metal worker is also recycled when its idle footprint outgrows its baseline.
+        let outgrown = (slot.gpu_tag == "metal")
+            .then(|| slot.handle.as_ref().map(|h| h.pid()))
+            .flatten()
+            .and_then(|pid| {
+                // A settle wait must leave the start floor intact (and never runs while closing).
+                let wait_budget = (time_to_recycle && !self.closing.load(Ordering::SeqCst)).then(
+                    || match abort_at {
+                        None => METAL_IDLE_SETTLE,
+                        Some(a) => a
+                            .saturating_duration_since(Instant::now())
+                            .saturating_sub(MIN_ABORT_START_BUDGET + VRAM_RECLAIM_WAIT)
+                            .min(METAL_IDLE_SETTLE),
+                    },
+                );
+                metal_idle_outgrown(
+                    key,
+                    pid,
+                    slot.proofs_since_spawn,
+                    slot.last_use,
+                    metal_net_config(&slot.spawn_env, entry.vram_bytes),
+                    wait_budget,
+                )
+            });
+        // Re-checked: the growth net may have spent up to METAL_IDLE_SETTLE re-reading.
+        let time_to_recycle = time_to_recycle && time_left();
+        let count_due = recycle_n > 0 && slot.proofs_since_spawn >= recycle_n;
+        if (time_to_recycle || retier_needed)
             && !self.closing.load(Ordering::SeqCst)
             && slot.handle.is_some()
-            && slot.proofs_since_spawn >= recycle_n
+            && (count_due || outgrown.is_some() || retier)
         {
-            tracing::info!(
-                "Recycling worker {}:{} after {} proofs (fresh GPU state)",
-                slot.backend,
-                slot.gpu_tag,
-                slot.proofs_since_spawn
-            );
+            match &outgrown {
+                Some(why) => tracing::warn!(
+                    "Recycling worker {}:{} after {} proofs: {why}",
+                    slot.backend,
+                    slot.gpu_tag,
+                    slot.proofs_since_spawn
+                ),
+                None if retier && !count_due => tracing::info!(
+                    "Respawning worker {}:{} at the owner-{} Metal tier ({})",
+                    slot.backend,
+                    slot.gpu_tag,
+                    metal_tier.as_ref().map_or("idle", |t| t.tier.name()),
+                    metal_tier.as_ref().map_or(String::new(), |t| t.why.clone()),
+                ),
+                None => tracing::info!(
+                    "Recycling worker {}:{} after {} proofs (fresh GPU state)",
+                    slot.backend,
+                    slot.gpu_tag,
+                    slot.proofs_since_spawn
+                ),
+            }
             // Zero the PID BEFORE the kill, not before the drop. `kill()` →
             // `force_kill_group()` ends with `child.wait()`, so the reap happens THERE — and
             // once reaped the OS may reuse the number, while the watchdogs that read this
@@ -8002,6 +9700,9 @@ impl WorkerPool {
             // Read the card first, with the worker still alive and credited to this slot: that is
             // what must be back before `ensure_alive` spawns the replacement into it.
             let before = self.read_card(key).map(|c| c.available_to(key));
+            if let Some(t) = metal_tier.as_ref().filter(|t| t.respawn) {
+                Self::set_metal_spawn_tier(&mut slot, entry, t.tier);
+            }
             entry.clear_pid();
             if let Some(h) = slot.handle.as_mut() {
                 h.kill();
@@ -8014,6 +9715,13 @@ impl WorkerPool {
                 Self::set_spawn_vram(&mut slot, before);
             }
             self.await_own_vram_release(key, before, give_up_at);
+        }
+
+        // A dead worker (no handle) is respawned below by `ensure_alive`: at this job's tier.
+        if slot.handle.is_none() {
+            if let Some(t) = metal_tier.as_ref().filter(|t| t.respawn) {
+                Self::set_metal_spawn_tier(&mut slot, entry, t.tier);
+            }
         }
 
         // Host memory admission, taken AFTER the slot guard so a contender blocked on the mutex is
@@ -8173,6 +9881,17 @@ impl WorkerPool {
         // Captured now (shared borrow, before the &mut handle borrow below) for the
         // completion log so operators can see which physical GPU ran each proof.
         let gpu_name = slot.gpu_name.clone();
+        // W7-M10: the tier this proof runs at (the job's: its po2 is the tier's, and its worker
+        // either runs at the tier's figure or proves it exactly as that one would) and the live
+        // worker's figure, recorded with it.
+        let ran_tier = Self::metal_figures(&slot, entry).map(|(idle, spawned)| {
+            (
+                metal_tier
+                    .as_ref()
+                    .map_or(Self::metal_worker_tier(idle, spawned), |t| t.tier),
+                spawned,
+            )
+        });
 
         // Re-borrow handle after PID update
         let handle = slot
@@ -8222,6 +9941,7 @@ impl WorkerPool {
         let on_progress: Option<Box<dyn Fn(f64) + Send>> = on_progress
             .map(|cb| Box::new(move |f: f64| cb(f, &key_for_cb)) as Box<dyn Fn(f64) + Send>);
         let proof_response = handle.recv_proof(request_id, &on_progress);
+        slot.note_used(UseKind::Proof);
 
         // If recv_proof failed (EOF, stream corruption, protocol desync),
         // kill the worker to prevent reusing a corrupted IPC stream.
@@ -8354,12 +10074,27 @@ impl WorkerPool {
                 ..
             } => {
                 tracing::info!(
-                    "Proof complete on {} [{}]: {} cycles in {:.1}s",
+                    "Proof complete on {} [{}]: {} cycles in {:.1}s{}",
                     key,
                     gpu_name.as_deref().unwrap_or("cpu"),
                     cycles,
                     duration_secs,
+                    ran_tier.map_or(String::new(), |(tier, limit)| format!(
+                        " (Metal tier {}, worker figure {:.1} GiB, po2 {})",
+                        tier.name(),
+                        limit as f64 / (1u64 << 30) as f64,
+                        po2.map_or("default".to_string(), |p| p.to_string()),
+                    )),
                 );
+                if let Some((tier, _)) = ran_tier {
+                    let i = usize::from(tier == crate::metal_sizing::OwnerTier::Active);
+                    self.metal_tier_jobs[i].fetch_add(1, Ordering::Relaxed);
+                }
+                // W7-M10: a worker due for a recycle (or for another tier) is respawned now, so
+                // its first-job prewarm runs in the idle gap before the next job.
+                if slot.gpu_tag == "metal" {
+                    self.after_metal_proof(key, &mut slot, entry, po2);
+                }
                 Ok(SlotProof::Proved(ProofOutput {
                     journal,
                     seal,
@@ -8602,6 +10337,7 @@ impl WorkerPool {
                     slot.decline_retry.at = None;
                     slot.consecutive_failures = 0;
                     slot.last_failure = None;
+                    slot.last_spawn_error = None;
                     slot.proofs_since_spawn = 0;
                     tracing::warn!(
                         "Worker {key} passed its handshake after its decline, and is offered again"
@@ -8609,6 +10345,8 @@ impl WorkerPool {
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
+                    // What a benchmark of this slot reports (W10-BFIX), as after any failed spawn.
+                    slot.last_spawn_error = Some(msg.clone());
                     let reason = if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED) {
                         msg
                     } else {
@@ -8750,6 +10488,7 @@ impl WorkerPool {
                 slot.handle = Some(handle);
                 slot.consecutive_failures = 0;
                 slot.last_failure = None;
+                slot.last_spawn_error = None;
                 slot.proofs_since_spawn = 0;
                 Ok(())
             }
@@ -8767,8 +10506,9 @@ impl WorkerPool {
                 let msg = format!("{e:#}");
                 if msg.contains(zkminer_prover_protocol::types::WORKER_DECLINED) {
                     let key = format!("{}:{}", slot.backend, slot.gpu_tag);
-                    Self::note_decline(slot, &key, msg);
+                    Self::note_decline(slot, &key, msg.clone());
                 }
+                slot.last_spawn_error = Some(msg);
                 slot.consecutive_failures += 1;
                 slot.last_failure = Some(Instant::now());
                 Err(e)
@@ -9070,8 +10810,10 @@ impl WorkerPool {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    last_spawn_error: None,
                     decline_retry: DeclineRetry::default(),
                     proofs_since_spawn: 0,
+                    last_use: None,
                 }),
                 vram_bytes: None,
                 pci_bus_id: None,
@@ -9084,6 +10826,48 @@ impl WorkerPool {
             },
         );
         Ok(())
+    }
+
+    /// Register a slot with NO worker, as `discover_and_spawn` leaves one whose worker could not
+    /// start: `declined` is the reason a worker that declined gave (no retry is scheduled here, so it
+    /// is never respawned: `retry_due_declines` needs a wait), or `None` for a spawn that failed (it
+    /// backs off before a respawn is tried). W10-BENCH round 1.
+    pub fn insert_test_down_worker(
+        &mut self,
+        key: &str,
+        backend: &str,
+        gpu_tag: &str,
+        path: PathBuf,
+        declined: Option<&str>,
+    ) {
+        self.workers.insert(
+            key.to_string(),
+            WorkerEntry {
+                slot: Mutex::new(WorkerSlot {
+                    handle: None,
+                    path,
+                    backend: backend.to_string(),
+                    gpu_tag: gpu_tag.to_string(),
+                    device_index: key.rsplit(':').next().and_then(|i| i.parse().ok()),
+                    pci_bus_id: None,
+                    gpu_name: None,
+                    spawn_env: HashMap::new(),
+                    consecutive_failures: 1,
+                    last_failure: Some(Instant::now()),
+                    declined: declined.map(str::to_string),
+                    decline_retry: DeclineRetry::default(),
+                    last_spawn_error: None,
+                    proofs_since_spawn: 0,
+                    last_use: None,
+                }),
+                vram_bytes: None,
+                pci_bus_id: None,
+                pid: Arc::new(AtomicU32::new(0)),
+                pid_starttime: Arc::new(AtomicU64::new(0)),
+                intentional_kill: Arc::new(AtomicBool::new(false)),
+                build: WorkerBuild::default(),
+            },
+        );
     }
 
     /// The decline of prove slot `key`, if it is declined: its reason and the backoff it waits.
@@ -9129,8 +10913,10 @@ impl WorkerPool {
                 consecutive_failures: 0,
                 last_failure: None,
                 declined: None,
+                last_spawn_error: None,
                 decline_retry: DeclineRetry::default(),
                 proofs_since_spawn: 0,
+                last_use: None,
             }),
             vram_bytes: None,
             pci_bus_id: None,
@@ -9197,6 +10983,13 @@ impl WorkerPool {
         self.workers
             .get(key)
             .map(|e| e.intentional_kill.load(Ordering::Acquire))
+    }
+
+    /// Set a test worker's GPU tag (e.g. `metal`, whose recycle policy differs; M9).
+    pub fn test_set_gpu_tag(&self, key: &str, tag: &str) {
+        if let Some(mut s) = self.workers.get(key).and_then(|e| e.slot.lock().ok()) {
+            s.gpu_tag = tag.to_string();
+        }
     }
 
     /// Get the external PID (test inspection).
@@ -9332,6 +11125,900 @@ mod tests {
 
     use super::*;
 
+    // ---- M9 Metal recycle policy ----
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    /// The 8 GiB and 4 GiB tiers' configurations (margin `clamp(limit / 4, 1 GiB, 2 GiB)`, the
+    /// allowance capped at 3/4 of the limit).
+    const CFG8: NetConfig = NetConfig {
+        margin: 2 * GIB,
+        allowance_cap: 6 * GIB,
+    };
+    const CFG4: NetConfig = NetConfig {
+        margin: GIB,
+        allowance_cap: 3 * GIB,
+    };
+
+    #[test]
+    fn the_allowance_cap_is_three_quarters_of_the_limit() {
+        assert_eq!(metal_allowance_cap(Some(8 * GIB)), CFG8.allowance_cap);
+        assert_eq!(metal_allowance_cap(Some(4 * GIB)), CFG4.allowance_cap);
+        assert_eq!(metal_allowance_cap(None), 12 * GIB);
+        // It clears the measured 2644 MiB transient at the smallest tier.
+        assert!(metal_allowance_cap(Some(4 * GIB)) > 2_644 * MIB);
+    }
+
+    #[test]
+    fn the_margin_scales_with_the_working_set_limit_and_the_ceiling() {
+        let m = |l: Option<u64>, c: Option<u64>| metal_growth_margin(l, c, None);
+        assert_eq!(m(Some(4 * GIB), None), GIB, "4 GiB tier");
+        assert_eq!(m(Some(8 * GIB), Some(13 * GIB)), 2 * GIB, "16 GB Mac");
+        assert_eq!(m(Some(6 * GIB), None), 3 * GIB / 2);
+        assert_eq!(m(Some(28 * GIB), Some(33 * GIB)), 2 * GIB, "36 GB Mac");
+        assert_eq!(m(Some(2 * GIB), None), GIB, "floor");
+        assert_eq!(m(None, None), 2 * GIB, "unknown limit");
+        // M6's ceiling close above the limit: half the room, never below 512 MiB.
+        assert_eq!(m(Some(8 * GIB), Some(10 * GIB)), GIB);
+        assert_eq!(m(Some(8 * GIB), Some(8 * GIB)), 512 * MIB);
+        // ZKMINER_METAL_RECYCLE_GROWTH_BYTES wins; 0 is off.
+        assert_eq!(metal_growth_margin(Some(4 * GIB), None, Some(0)), 0);
+        assert_eq!(
+            metal_growth_margin(Some(4 * GIB), None, Some(3 * GIB)),
+            3 * GIB
+        );
+    }
+
+    #[test]
+    fn a_reading_is_settled_by_the_time_since_the_last_use() {
+        let ms = Duration::from_millis;
+        assert_eq!(reading_age(Some(ms(5)), UseKind::Proof), ReadingAge::Fresh);
+        assert_eq!(reading_age(Some(ms(50)), UseKind::Proof), ReadingAge::Fresh);
+        assert_eq!(
+            reading_age(Some(ms(51)), UseKind::Proof),
+            ReadingAge::Partial
+        );
+        assert_eq!(
+            reading_age(Some(ms(5)), UseKind::Other),
+            ReadingAge::Partial
+        );
+        assert_eq!(reading_age(None, UseKind::Proof), ReadingAge::Partial);
+        assert_eq!(
+            reading_age(Some(ms(2000)), UseKind::Other),
+            ReadingAge::Settled
+        );
+        assert_eq!(
+            reading_age(Some(ms(1999)), UseKind::Proof),
+            ReadingAge::Partial
+        );
+    }
+
+    /// The settle loop against the measured reclaim shape (8 GiB, proof 2: 4984 MiB, 3630 MiB from
+    /// ~0.3 s, 2341 MiB from ~1.3 s), on a fake clock.
+    #[test]
+    fn the_settle_wait_waits_out_the_reclaim_and_is_bounded() {
+        use std::cell::Cell;
+        let profile = |t: Duration| -> u64 {
+            match t.as_millis() {
+                0..=299 => 4_984 * MIB,
+                300..=1_299 => 3_630 * MIB,
+                _ => 2_341 * MIB,
+            }
+        };
+        let run = |g0: Option<Duration>, pass: Option<u64>, budget: Duration| {
+            let clock = Cell::new(g0.unwrap_or_default());
+            let waited = Cell::new(Duration::ZERO);
+            let s = settle_footprint(
+                || Some(profile(clock.get())),
+                || g0.map(|_| clock.get()),
+                |d| {
+                    clock.set(clock.get() + d);
+                    waited.set(waited.get() + d);
+                },
+                pass,
+                budget,
+            );
+            (s, waited.get())
+        };
+        // A full settle waits until the reclaim time, then for two agreeing readings.
+        let (s, w) = run(Some(Duration::ZERO), None, METAL_IDLE_SETTLE);
+        assert_eq!(s, Some(2_341 * MIB));
+        assert_eq!(w, Duration::from_millis(2_250));
+        // A pass/fail settle stops at the first reading under the line.
+        let (s, w) = run(Some(Duration::ZERO), Some(4_000 * MIB), METAL_IDLE_SETTLE);
+        assert_eq!((s, w), (Some(3_630 * MIB), Duration::from_millis(500)));
+        // A reading already past the reclaim time needs one more agreeing reading.
+        let (s, w) = run(Some(Duration::from_secs(5)), None, METAL_IDLE_SETTLE);
+        assert_eq!((s, w), (Some(2_341 * MIB), Duration::from_millis(250)));
+        // Too little budget to reach the reclaim time: no verdict, never an unsettled reading.
+        let (s, w) = run(Some(Duration::ZERO), None, Duration::from_secs(1));
+        assert_eq!(s, None);
+        assert!(w <= Duration::from_secs(1));
+        // No known last use: the reclaim time counts from the start of the wait.
+        let (s, w) = run(None, None, METAL_IDLE_SETTLE);
+        assert_eq!((s, w), (Some(2_341 * MIB), Duration::from_millis(2_250)));
+        // An unreadable footprint: no verdict.
+        let s = settle_footprint(|| None, || None, |_| {}, None, METAL_IDLE_SETTLE);
+        assert_eq!(s, None);
+    }
+
+    /// How a simulated proof leaves the worker before the next one.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Gap {
+        /// The next proof arrives at once: the whole transient is in the reading.
+        B2b,
+        /// After an idle gap of 3 s: settled.
+        Idle,
+        /// 0.6 s later, mid-reclaim: half the transient left.
+        Mid,
+    }
+
+    /// The measured reclaim shape (M9 note: 8 traces at 4 and 8 GiB, and the 36-proof 4 GiB trace
+    /// of the fix-round-3 review): the whole transient `tr` for up to 300 ms after a proof, about
+    /// half of it until 1.3 s, then the settled level `s`.
+    fn footprint_at(s: u64, tr: u64, t: Duration) -> u64 {
+        match t.as_millis() {
+            0..300 => s + tr,
+            300..1_300 => s + tr / 2,
+            _ => s,
+        }
+    }
+
+    /// The settle wait the dispatcher runs ([`settle_footprint`] with its real budget), on a fake
+    /// clock starting `since` after the proof, over [`footprint_at`]: the result and the time it
+    /// waited.
+    fn fake_settle(s: u64, tr: u64, since: Duration, ask: SettleAsk) -> (Option<u64>, Duration) {
+        use std::cell::Cell;
+        let clock = Cell::new(since);
+        let r = settle_footprint(
+            || Some(footprint_at(s, tr, clock.get())),
+            || Some(clock.get()),
+            |d| clock.set(clock.get() + d),
+            ask.pass_below,
+            METAL_IDLE_SETTLE,
+        );
+        (r, clock.get() - since)
+    }
+
+    /// One simulated worker life.
+    #[derive(Debug)]
+    struct SimRun {
+        /// The proof after which the net recycled the worker.
+        caught: Option<u32>,
+        /// (proof, why, time waited) of every settle wait.
+        waits: Vec<(u32, SettleWhy, Duration)>,
+        /// The net's baseline after the baseline proofs, and the true maximum settled level of
+        /// those proofs.
+        baseline: Option<u64>,
+        true_baseline: u64,
+        /// The first proof whose settled level passes the NET's baseline + margin (the net's
+        /// baseline can sit up to [`METAL_IDLE_TOLERANCE`] under the true one; see
+        /// [`check_baseline`]).
+        first_over: Option<u32>,
+    }
+
+    impl SimRun {
+        fn waited(&self) -> Duration {
+            self.waits.iter().map(|w| w.2).sum()
+        }
+    }
+
+    /// A healthy settled level that rises to a plateau and stays (8 GiB traces: 2341 MiB after
+    /// proof 2, caches growing ~70 MiB a proof to a plateau by the seventh).
+    fn plateau_level(n: u32) -> u64 {
+        2_271 * MIB + 70 * MIB * u64::from(n.min(7))
+    }
+
+    /// The settled level after each proof of the fix-round-3 review's healthy run (4 GiB budget,
+    /// `m9_proofs_in_one_worker`, fibonacci 100000, 36 proofs, read 1.4 s after each; log
+    /// `scratch/w7/W7-M9-review1/healthy4g.log`): the caches grow over five proofs, then the
+    /// level is trimmed by 240-400 MiB about every sixth proof and grows back. No drift.
+    const TRIMMED_TRACE_MIB: [u64; 36] = [
+        1936, 2082, 2214, 2349, 2465, 2475, 2476, 2472, 2474, 2474, 2473, 2191, 2291, 2340, 2374,
+        2416, 2416, 2167, 2214, 2323, 2399, 2424, 2423, 2134, 2229, 2270, 2362, 2417, 2416, 2071,
+        2164, 2269, 2364, 2410, 2410, 2169,
+    ];
+
+    /// [`TRIMMED_TRACE_MIB`], proofs past 36 repeating proofs 12-36.
+    fn trimmed_level(n: u32) -> u64 {
+        let i = if n <= 36 {
+            n as usize - 1
+        } else {
+            11 + (n as usize - 37) % 25
+        };
+        TRIMMED_TRACE_MIB[i] * MIB
+    }
+
+    /// The healthy settled-level shapes every regime runs with.
+    type Level = (&'static str, fn(u32) -> u64);
+    const LEVELS: [Level; 2] = [
+        ("plateau", plateau_level),
+        ("measured trims", trimmed_level),
+    ];
+
+    /// The measured transient (2643-2644 MiB in all 8 traces and the 36-proof one) with +-16 MiB of
+    /// deterministic jitter.
+    fn transient(n: u32) -> u64 {
+        2_628 * MIB + u64::from(n * 7_919 % 33) * MIB
+    }
+
+    /// Drives [`metal_idle_growth`] like the dispatcher would: proof `n` leaves settled level
+    /// `level(n)` and transient `trans(n)`, the next proof's reading is taken as `gap(n)` says, and
+    /// a settle runs the real wait loop on [`fake_settle`].
+    fn simulate(
+        cfg: NetConfig,
+        proofs: u32,
+        gap: impl Fn(u32) -> Gap,
+        level: impl Fn(u32) -> u64,
+        trans: impl Fn(u32) -> u64,
+    ) -> SimRun {
+        let mut t = IdleTrack::default();
+        let mut run = SimRun {
+            caught: None,
+            waits: Vec::new(),
+            baseline: None,
+            true_baseline: (1..=METAL_IDLE_BASELINE_PROOFS).map(&level).max().unwrap(),
+            first_over: None,
+        };
+        for n in 1..=proofs {
+            let (s, tr) = (level(n), trans(n));
+            let since = match gap(n) {
+                Gap::B2b => Duration::from_millis(5),
+                Gap::Idle => Duration::from_secs(3),
+                Gap::Mid => Duration::from_millis(600),
+            };
+            let reading = footprint_at(s, tr, since);
+            let mut asked = None;
+            let v = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                reading,
+                Some(since),
+                UseKind::Proof,
+                Some(s + tr),
+                cfg,
+                |a| {
+                    let (r, w) = fake_settle(s, tr, since, a);
+                    asked = Some((n, a.why, w));
+                    r
+                },
+            );
+            run.waits.extend(asked);
+            if n == METAL_IDLE_BASELINE_PROOFS {
+                run.baseline = t.baseline;
+            }
+            if n > METAL_IDLE_BASELINE_PROOFS && run.first_over.is_none() {
+                if let Some(b) = run.baseline {
+                    if s > b + cfg.margin {
+                        run.first_over = Some(n);
+                    }
+                }
+            }
+            if v.is_some() {
+                run.caught = Some(n);
+                break;
+            }
+        }
+        run
+    }
+
+    type Regime = (&'static str, fn(u32) -> Gap);
+    const REGIMES: [Regime; 8] = [
+        ("back-to-back", |_| Gap::B2b),
+        ("idle", |_| Gap::Idle),
+        ("mixed: one b2b, then idle", |n| {
+            if n == 11 {
+                Gap::B2b
+            } else {
+                Gap::Idle
+            }
+        }),
+        (
+            "alternating",
+            |n| if n % 2 == 1 { Gap::B2b } else { Gap::Idle },
+        ),
+        ("bursty: 5 b2b, 1 idle", |n| {
+            if n % 6 == 0 {
+                Gap::Idle
+            } else {
+                Gap::B2b
+            }
+        }),
+        ("10 b2b baseline, then idle", |n| {
+            if n <= 10 {
+                Gap::B2b
+            } else {
+                Gap::Idle
+            }
+        }),
+        ("bursty: 3 idle, 7 b2b", |n| {
+            if n % 10 < 3 {
+                Gap::Idle
+            } else {
+                Gap::B2b
+            }
+        }),
+        ("mid-reclaim (0.6 s gaps)", |_| Gap::Mid),
+    ];
+
+    fn check_baseline(name: &str, r: &SimRun) {
+        let b = r.baseline.unwrap_or_else(|| panic!("{name}: no baseline"));
+        assert!(
+            b <= r.true_baseline && r.true_baseline - b <= METAL_IDLE_TOLERANCE,
+            "{name}: baseline {} MiB from settled readings, true {} MiB",
+            b / MIB,
+            r.true_baseline / MIB
+        );
+    }
+
+    /// The most a healthy worker may wait per 500 proofs, after its baseline proofs: 20 s, 1 %
+    /// of 500 proofs of fibonacci 100000 at 4 GiB (~4 s each, the shortest Metal proof the
+    /// dispatcher sees; a memory-merkle-sized proof takes ~16 s).
+    const HEALTHY_WAIT_PER_500: Duration = Duration::from_secs(20);
+
+    /// A healthy worker is never recycled over 500 proofs in any regime, at either tier, on either
+    /// level shape (including the measured cache trims), with or without one huge transient that
+    /// settles back, and waits at most [`HEALTHY_WAIT_PER_500`] after its baseline proofs.
+    #[test]
+    fn the_growth_net_never_recycles_a_healthy_worker() {
+        for (tier, cfg) in [("8 GiB", CFG8), ("4 GiB", CFG4)] {
+            for (level_name, level) in LEVELS {
+                for (name, gap) in REGIMES {
+                    for huge in [false, true] {
+                        let trans = |n: u32| {
+                            if huge && n == 37 {
+                                7 * GIB
+                            } else {
+                                transient(n)
+                            }
+                        };
+                        let r = simulate(cfg, 500, gap, level, trans);
+                        let name = format!(
+                            "{tier} {level_name}, {name}{}",
+                            if huge { " + huge transient" } else { "" }
+                        );
+                        assert_eq!(r.caught, None, "{name}: recycled a healthy worker: {r:?}");
+                        check_baseline(&name, &r);
+                        let after: Duration = r
+                            .waits
+                            .iter()
+                            .filter(|w| w.0 > METAL_IDLE_BASELINE_PROOFS)
+                            .map(|w| w.2)
+                            .sum();
+                        let count = |why| r.waits.iter().filter(|w| w.1 == why).count();
+                        eprintln!(
+                            "M9 sim healthy | {name} | 500 proofs | {} waits, {:.2} s (baseline {} \
+                             {:.2} s; shrank {}, verify {}, over {}) | after the baseline {:.2} s",
+                            r.waits.len(),
+                            r.waited().as_secs_f64(),
+                            count(SettleWhy::Baseline),
+                            r.waits
+                                .iter()
+                                .filter(|w| w.1 == SettleWhy::Baseline)
+                                .map(|w| w.2)
+                                .sum::<Duration>()
+                                .as_secs_f64(),
+                            count(SettleWhy::Shrank),
+                            count(SettleWhy::Verify),
+                            count(SettleWhy::OverLine) + count(SettleWhy::Confirm),
+                            after.as_secs_f64(),
+                        );
+                        assert!(
+                            after <= HEALTHY_WAIT_PER_500,
+                            "{name}: waited {:.2} s after the baseline: {:?}",
+                            after.as_secs_f64(),
+                            r.waits
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each leak (50, 100, 300 MiB of settled growth per proof from proof 11, or from proof 1, and
+    /// 1.5 and 3 GiB steps at proof 40), on either healthy level shape, is caught at the first proof
+    /// whose settled level passes the baseline + margin (or the next), in every regime, at either
+    /// tier, with at most 2 settle waits for the crossing.
+    #[test]
+    fn the_growth_net_catches_every_leak_at_its_crossing() {
+        type Leak = (&'static str, fn(u32) -> u64);
+        const LEAKS: [Leak; 6] = [
+            ("50 MiB/proof", |n| {
+                50 * MIB * u64::from(n.saturating_sub(10))
+            }),
+            ("100 MiB/proof", |n| {
+                100 * MIB * u64::from(n.saturating_sub(10))
+            }),
+            ("300 MiB/proof", |n| {
+                300 * MIB * u64::from(n.saturating_sub(10))
+            }),
+            ("100 MiB/proof from proof 1", |n| 100 * MIB * u64::from(n)),
+            ("1.5 GiB step at proof 40", |n| {
+                if n >= 40 {
+                    1_536 * MIB
+                } else {
+                    0
+                }
+            }),
+            (
+                "3 GiB step at proof 40",
+                |n| if n >= 40 { 3 * GIB } else { 0 },
+            ),
+        ];
+        for (tier, cfg) in [("8 GiB", CFG8), ("4 GiB", CFG4)] {
+            for (level_name, base) in LEVELS {
+                for (name, gap) in REGIMES {
+                    for (leak_name, leak) in LEAKS {
+                        let level = |n: u32| base(n) + leak(n);
+                        let r = simulate(cfg, 500, gap, level, transient);
+                        let name = format!("{tier} {level_name}, {name}, {leak_name}");
+                        check_baseline(&name, &r);
+                        let Some(first) = r.first_over else {
+                            // A 1.5 GiB step never passes the 8 GiB tier's 2 GiB margin.
+                            assert!(
+                                cfg.margin > 1_536 * MIB && leak_name.starts_with("1.5"),
+                                "{name}"
+                            );
+                            assert_eq!(r.caught, None, "{name}: recycled under the margin");
+                            continue;
+                        };
+                        let caught = r
+                            .caught
+                            .unwrap_or_else(|| panic!("{name}: never caught: {r:?}"));
+                        assert!(
+                            caught >= first && caught <= first + 1,
+                            "{name}: caught at proof {caught}, settled level over the line at \
+                             {first}: {r:?}"
+                        );
+                        let crossing = r
+                            .waits
+                            .iter()
+                            .filter(|(n, why, _)| {
+                                *n >= first
+                                    && matches!(
+                                        why,
+                                        SettleWhy::OverLine
+                                            | SettleWhy::Confirm
+                                            | SettleWhy::Verify
+                                    )
+                            })
+                            .count();
+                        assert!(
+                            crossing <= 2,
+                            "{name}: {crossing} waits for the crossing: {r:?}"
+                        );
+                        eprintln!(
+                            "M9 sim leak | {name} | over the line at {first} | caught at {caught} \
+                             | {} waits, {:.2} s ({crossing} for the crossing)",
+                            r.waits.len(),
+                            r.waited().as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Transients that change under the net, every regime, both tiers, both level shapes:
+    /// - shrinking 250 MiB a proof to nothing while the worker leaks 50 MiB a proof (the fix-round-1
+    ///   review's case, where the old per-proof comparison caught it at 81 instead of ~31), and
+    ///   100 + 25: caught within 2 proofs of the crossing;
+    /// - turning into retained memory (the transient shrinks by what the settled level gains, so
+    ///   the fresh reading stays flat; 50, 100 and 200 MiB a proof, the last being the review's
+    ///   "200 + 200" case): nothing in a back-to-back reading shows it, so it is caught by the next
+    ///   verification or once the fresh reading rises past the line plus the allowance, within
+    ///   [`METAL_IDLE_VERIFY_EVERY`] + 1 proofs of the crossing (an open issue in the M9 note);
+    /// - alternating between 2644 and 1600 MiB (two job shapes) on a healthy worker: never
+    ///   recycled (its cost is printed: at the 4 GiB tier the smaller transient's estimate sits
+    ///   over the line, so it settles often).
+    #[test]
+    fn the_growth_net_handles_changing_transients() {
+        type Case = (&'static str, fn(u32) -> u64, fn(u32) -> u64, u32);
+        let cases: [Case; 5] = [
+            (
+                "transient -250 MiB/proof, leak 50 MiB/proof",
+                |n| 50 * MIB * u64::from(n.saturating_sub(10)),
+                |n| (2_644 * MIB).saturating_sub(250 * MIB * u64::from(n.saturating_sub(10))),
+                2,
+            ),
+            (
+                "transient -100 MiB/proof, leak 25 MiB/proof",
+                |n| 25 * MIB * u64::from(n.saturating_sub(10)),
+                |n| (2_644 * MIB).saturating_sub(100 * MIB * u64::from(n.saturating_sub(10))),
+                2,
+            ),
+            (
+                "transient into retained memory, 50 MiB/proof",
+                |n| (50 * MIB * u64::from(n.saturating_sub(10))).min(2_644 * MIB),
+                |n| (2_644 * MIB).saturating_sub(50 * MIB * u64::from(n.saturating_sub(10))),
+                METAL_IDLE_VERIFY_EVERY + 1,
+            ),
+            (
+                "transient into retained memory, 200 MiB/proof",
+                |n| (200 * MIB * u64::from(n.saturating_sub(10))).min(2_644 * MIB),
+                |n| (2_644 * MIB).saturating_sub(200 * MIB * u64::from(n.saturating_sub(10))),
+                METAL_IDLE_VERIFY_EVERY + 1,
+            ),
+            (
+                "transient into retained memory, 100 MiB/proof",
+                |n| (100 * MIB * u64::from(n.saturating_sub(10))).min(2_644 * MIB),
+                |n| (2_644 * MIB).saturating_sub(100 * MIB * u64::from(n.saturating_sub(10))),
+                METAL_IDLE_VERIFY_EVERY + 1,
+            ),
+        ];
+        for (tier, cfg) in [("8 GiB", CFG8), ("4 GiB", CFG4)] {
+            for (level_name, base) in LEVELS {
+                for (name, gap) in REGIMES {
+                    for (case, leak, trans, late) in cases {
+                        let r = simulate(cfg, 500, gap, |n| base(n) + leak(n), trans);
+                        let name = format!("{tier} {level_name}, {name}, {case}");
+                        check_baseline(&name, &r);
+                        let first = r.first_over.unwrap_or_else(|| panic!("{name}: {r:?}"));
+                        let caught = r
+                            .caught
+                            .unwrap_or_else(|| panic!("{name}: never caught: {r:?}"));
+                        assert!(
+                            caught >= first && caught <= first + late,
+                            "{name}: caught at {caught}, over the line at {first}: {r:?}"
+                        );
+                        eprintln!(
+                            "M9 sim changing | {name} | over the line at {first} | caught at \
+                             {caught} | {} waits, {:.2} s",
+                            r.waits.len(),
+                            r.waited().as_secs_f64()
+                        );
+                    }
+                    let two_shapes = |n: u32| {
+                        if n.is_multiple_of(2) {
+                            2_644 * MIB
+                        } else {
+                            1_600 * MIB
+                        }
+                    };
+                    let r = simulate(cfg, 500, gap, base, two_shapes);
+                    let name = format!("{tier} {level_name}, {name}, two transient sizes");
+                    assert_eq!(r.caught, None, "{name}: recycled a healthy worker: {r:?}");
+                    check_baseline(&name, &r);
+                    eprintln!(
+                        "M9 sim changing | {name} | healthy | {} waits, {:.2} s",
+                        r.waits.len(),
+                        r.waited().as_secs_f64()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The round-3 finding: after one back-to-back proof, settled readings taken after idle gaps
+    /// between the line and line + allowance were never checked. Now a settled reading is compared
+    /// with the line itself, whatever transient was learned.
+    #[test]
+    fn a_settled_reading_is_compared_with_the_line_whatever_the_allowance() {
+        let mut t = IdleTrack::default();
+        let idle = Some(Duration::from_secs(3));
+        let b2b = Some(Duration::from_millis(5));
+        let never = |_: SettleAsk| -> Option<u64> { panic!("must not settle") };
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS {
+            let r = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                2_341 * MIB,
+                idle,
+                UseKind::Proof,
+                None,
+                CFG8,
+                never,
+            );
+            assert_eq!(r, None);
+        }
+        assert_eq!(t.baseline, Some(2_341 * MIB));
+        // One back-to-back proof measures the 2.6 GB transient.
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            11,
+            4_985 * MIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |a| {
+                assert_eq!((a.why, a.pass_below), (SettleWhy::OverLine, None));
+                Some(2_341 * MIB)
+            },
+        );
+        assert_eq!(r, None);
+        assert_eq!(t.allowance, Some(2_644 * MIB));
+        // A settled level 100 MiB past the line, read after an idle gap: confirmed and recycled.
+        let over = 2_341 * MIB + 2 * GIB + 100 * MIB;
+        let r = metal_idle_growth(&mut t, 1, 12, over, idle, UseKind::Proof, None, CFG8, |a| {
+            assert_eq!(a.why, SettleWhy::Confirm);
+            Some(over)
+        });
+        assert_eq!(
+            r,
+            Some(Outgrown {
+                baseline: 2_341 * MIB,
+                settled: over
+            })
+        );
+        // A respawned worker (new pid) starts over: no baseline, no allowance.
+        let r = metal_idle_growth(
+            &mut t,
+            2,
+            1,
+            9 * GIB,
+            idle,
+            UseKind::Proof,
+            None,
+            CFG8,
+            never,
+        );
+        assert_eq!(r, None);
+        assert_eq!(
+            t,
+            IdleTrack {
+                pid: 2,
+                baseline: Some(9 * GIB),
+                ..IdleTrack::default()
+            }
+        );
+        // Margin 0 turns the net off; no time to wait means no verdict and nothing learned.
+        let off = NetConfig { margin: 0, ..CFG8 };
+        assert_eq!(
+            metal_idle_growth(
+                &mut t,
+                2,
+                50,
+                99 * GIB,
+                idle,
+                UseKind::Proof,
+                None,
+                off,
+                never
+            ),
+            None
+        );
+        let before = t.clone();
+        for n in 11..15 {
+            let r = metal_idle_growth(
+                &mut t,
+                2,
+                n,
+                99 * GIB,
+                b2b,
+                UseKind::Proof,
+                None,
+                CFG8,
+                |_| None,
+            );
+            assert_eq!(r, None);
+        }
+        assert_eq!(t, before);
+    }
+
+    /// One huge transient no longer widens the margin for the worker's life: the next normal
+    /// back-to-back reading falls below it, which re-measures the allowance.
+    #[test]
+    fn one_huge_transient_does_not_widen_the_margin() {
+        let mut t = IdleTrack::default();
+        let b2b = Some(Duration::from_millis(5));
+        let s = 2_341 * MIB;
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS {
+            let _ = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                s,
+                Some(Duration::from_secs(3)),
+                UseKind::Proof,
+                None,
+                CFG8,
+                |_| None,
+            );
+        }
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            11,
+            s + 7 * GIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |_| Some(s),
+        );
+        // Learned, but capped at 3/4 of the 8 GiB limit.
+        assert_eq!((r, t.allowance), (None, Some(6 * GIB)));
+        let mut why = None;
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            12,
+            s + 2_644 * MIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |a| {
+                why = Some(a.why);
+                Some(s)
+            },
+        );
+        assert_eq!(
+            (r, why, t.allowance),
+            (None, Some(SettleWhy::Shrank), Some(2_644 * MIB))
+        );
+        // Capped at 3/4 of the working-set limit.
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            13,
+            s + 20 * GIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |_| Some(s),
+        );
+        assert_eq!((r, t.allowance), (None, Some(6 * GIB)));
+    }
+
+    /// A settled-by-time reading after a proof whose end was read measures the transient without
+    /// a wait; after [`METAL_IDLE_VERIFY_EVERY`] fresh readings judged with it, the next one over
+    /// the line is checked against the line itself (pass/fail), and passing resets the count.
+    #[test]
+    fn the_allowance_is_measured_for_free_and_verified_against_the_line() {
+        let mut t = IdleTrack::default();
+        let s = 2_341 * MIB;
+        let never = |_: SettleAsk| -> Option<u64> { panic!("must not settle") };
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS + 1 {
+            let r = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                s,
+                Some(Duration::from_secs(3)),
+                UseKind::Proof,
+                Some(s + 2_644 * MIB),
+                CFG4,
+                never,
+            );
+            assert_eq!(r, None);
+        }
+        assert_eq!(
+            (t.allowance, t.anchor),
+            (Some(2_644 * MIB), s + 2_644 * MIB)
+        );
+        let b2b = Some(Duration::from_millis(5));
+        let fresh = s + 2_644 * MIB;
+        for n in 0..METAL_IDLE_VERIFY_EVERY {
+            let r = metal_idle_growth(
+                &mut t,
+                1,
+                12 + n,
+                fresh,
+                b2b,
+                UseKind::Proof,
+                None,
+                CFG4,
+                never,
+            );
+            assert_eq!(r, None);
+        }
+        let mut asked = None;
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            12 + METAL_IDLE_VERIFY_EVERY,
+            fresh,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG4,
+            |a| {
+                asked = Some(a);
+                Some(s)
+            },
+        );
+        assert_eq!(r, None);
+        assert_eq!(
+            asked,
+            Some(SettleAsk {
+                why: SettleWhy::Verify,
+                pass_below: Some(s + GIB)
+            })
+        );
+        assert_eq!((t.relied, t.allowance), (0, Some(2_644 * MIB)));
+    }
+
+    /// A reading right after a benchmark or a measurement is never judged with the allowance (it
+    /// was measured on proofs): over the line, it is settled first.
+    #[test]
+    fn the_allowance_applies_only_right_after_a_proof() {
+        let mut t = IdleTrack::default();
+        let b2b = Some(Duration::from_millis(5));
+        let s = 2_341 * MIB;
+        for n in 1..=METAL_IDLE_BASELINE_PROOFS {
+            let _ = metal_idle_growth(
+                &mut t,
+                1,
+                n,
+                s,
+                Some(Duration::from_secs(3)),
+                UseKind::Proof,
+                None,
+                CFG8,
+                |_| None,
+            );
+        }
+        let _ = metal_idle_growth(
+            &mut t,
+            1,
+            11,
+            s + 2_644 * MIB,
+            b2b,
+            UseKind::Proof,
+            None,
+            CFG8,
+            |_| Some(s),
+        );
+        let over = s + 2 * GIB + 10 * MIB;
+        let mut asked = None;
+        let r = metal_idle_growth(
+            &mut t,
+            1,
+            12,
+            over + 2_644 * MIB,
+            b2b,
+            UseKind::Other,
+            None,
+            CFG8,
+            |a| {
+                asked = Some(a);
+                Some(over)
+            },
+        );
+        assert_eq!(
+            asked,
+            Some(SettleAsk {
+                why: SettleWhy::OverLine,
+                pass_below: Some(s + 2 * GIB)
+            })
+        );
+        assert_eq!(
+            r,
+            Some(Outgrown {
+                baseline: s,
+                settled: over
+            })
+        );
+    }
+
+    #[test]
+    fn only_metal_slots_get_the_long_recycle_count() {
+        if std::env::var_os("ZKMINER_RECYCLE_AFTER_PROOFS").is_some()
+            || std::env::var_os("ZKMINER_METAL_RECYCLE_AFTER_PROOFS").is_some()
+        {
+            return;
+        }
+        assert_eq!(
+            recycle_after_proofs_for("cuda"),
+            DEFAULT_RECYCLE_AFTER_PROOFS
+        );
+        assert_eq!(
+            recycle_after_proofs_for("rocm"),
+            DEFAULT_RECYCLE_AFTER_PROOFS
+        );
+        assert_eq!(
+            recycle_after_proofs_for("metal"),
+            METAL_RECYCLE_AFTER_PROOFS
+        );
+    }
+
     // ---- slot_key tests ----
 
     #[test]
@@ -9394,8 +12081,10 @@ mod tests {
                         consecutive_failures: 0,
                         last_failure: None,
                         declined: None,
+                        last_spawn_error: None,
                         decline_retry: DeclineRetry::default(),
                         proofs_since_spawn: 0,
+                        last_use: None,
                     }),
                     vram_bytes: None,
                     pci_bus_id: None,
@@ -11320,6 +14009,120 @@ mod tests {
         assert_eq!(cpu_only.proving_gpu_count(), 1);
     }
 
+    // ---- metal (Apple silicon, unified memory) ----
+
+    #[test]
+    fn metal_slot_keys_device_ids_and_locks() {
+        assert_eq!(slot_key("risc0", "metal", Some(0)), "risc0:metal:0");
+        // One card: the per-GPU lock and the capacity count must cover it like any other GPU.
+        assert_eq!(physical_gpu_id("risc0:metal:0").as_deref(), Some("metal:0"));
+        // An explicit binary (no device index) is unguarded, as for every vendor.
+        assert_eq!(physical_gpu_id("risc0:metal"), None);
+        // Tag-qualified, so it can never collide with CUDA's bare `gpu0`.
+        assert_eq!(WorkerPool::gpu_device_id("metal", "0"), "gpu-metal0");
+        assert_eq!(
+            WorkerPool::benchmark_device_id("risc0:metal:0"),
+            "gpu-metal0"
+        );
+        assert_eq!(WorkerPool::benchmark_device_id("risc0:metal"), "gpu-metal0");
+        let pool = pool_with_keys(&["risc0:metal:0", "risc0"]);
+        assert_eq!(pool.proving_gpu_count(), 1);
+        let mixed = pool_with_keys(&["risc0:metal:0", "risc0:cuda:0"]);
+        assert_eq!(mixed.proving_gpu_count(), 2);
+    }
+
+    /// M6: the CUDA-sized 600 s benchmark deadline fired 10 minutes into the Metal worker's
+    /// 19-minute benchmark on a 32-core M5 Max. On a Mac it scales with the GPU and segment size;
+    /// everything else, and "no deadline", is unchanged.
+    #[test]
+    fn a_metal_benchmark_gets_a_deadline_it_can_meet() {
+        let configured = Some(Duration::from_secs(600));
+        // The measured run: 1136 s on 32 cores at po2 20. It must fit, with room.
+        let m5 = metal_benchmark_timeout(configured, Some(32), 20).unwrap();
+        assert!(m5 >= Duration::from_secs(3 * 1136), "{m5:?}");
+        // Fewer cores and a smaller segment: longer, never shorter (4x the cores, two steps down).
+        let base = metal_benchmark_timeout(configured, Some(8), 18).unwrap();
+        assert!(base >= m5 * 4 * 2, "{base:?} vs {m5:?}");
+        // Unknown cores: as long as the smallest supported Mac's.
+        let unknown = metal_benchmark_timeout(configured, None, 18).unwrap();
+        assert!(unknown >= base, "{unknown:?} vs {base:?}");
+        // A longer configured deadline is kept, and none stays none.
+        let long = Some(Duration::from_secs(100_000));
+        assert_eq!(metal_benchmark_timeout(long, Some(32), 20), long);
+        assert_eq!(metal_benchmark_timeout(None, Some(32), 20), None);
+
+        // Per slot: only a risc0 Metal slot is scaled.
+        let pool = WorkerPool::new(HashMap::new(), Vec::new(), configured);
+        assert_eq!(pool.benchmark_timeout_for("risc0:cuda:0"), configured);
+        assert_eq!(pool.benchmark_timeout_for("sp1:cuda:0"), configured);
+        assert_eq!(pool.benchmark_timeout_for("risc0:cpu"), configured);
+        assert!(pool.benchmark_timeout_for("risc0:metal:0").unwrap() > Duration::from_secs(600));
+    }
+
+    #[test]
+    fn metal_vram_budget_is_host_ram_less_the_reserve() {
+        let gib = 1024 * 1024 * 1024u64;
+        assert_eq!(metal_vram_budget_bytes(36 * gib), Some(28 * gib));
+        // The M5 Max this was written on: within 0.2 GB of Metal's own recommendedMaxWorkingSetSize.
+        assert_eq!(
+            metal_vram_budget_bytes(38_654_705_664),
+            Some(38_654_705_664 - METAL_HOST_RESERVE_BYTES)
+        );
+        assert_eq!(metal_vram_budget_bytes(METAL_HOST_RESERVE_BYTES), None);
+        assert_eq!(metal_vram_budget_bytes(4 * gib), None);
+        // `gpu_vram_bytes` reports exactly that budget for an enumerated Apple GPU, and nothing for
+        // an explicit binary (no index), as for every other vendor.
+        assert_eq!(
+            gpu_vram_bytes("metal", Some(0), Some("apple-gpu0")),
+            crate::memory::mem_total_bytes().and_then(metal_vram_budget_bytes)
+        );
+        assert_eq!(gpu_vram_bytes("metal", None, Some("apple-gpu0")), None);
+    }
+
+    #[test]
+    fn gpu_env_metal() {
+        let env = WorkerPool::gpu_env("risc0", "metal", Some("apple-gpu0"), Some(0));
+        // No device pin of any vendor: there is one GPU and Metal has no visibility variable.
+        for k in env.keys() {
+            assert!(
+                !k.ends_with("_VISIBLE_DEVICES"),
+                "metal worker env must not carry {k}"
+            );
+        }
+        for k in [
+            "CUDA_DEVICE_ORDER",
+            "ZE_AFFINITY_MASK",
+            "ONEAPI_DEVICE_SELECTOR",
+            "NVCC",
+            "HSA_SCRATCH_SINGLE_LIMIT",
+            zkminer_prover_protocol::types::CUDA_DEVICE_ID_ENV,
+        ] {
+            assert!(!env.contains_key(k), "metal worker env must not carry {k}");
+        }
+        // The unified-memory budget, which the risc0 worker reads as its card's capacity.
+        // (A host with 8 GiB or less has no budget and gets no figure, which the worker reads as
+        // "unknown"; every host this runs on in practice has more.)
+        let total = crate::memory::mem_total_bytes().expect("this host reports its memory size");
+        let want = metal_vram_budget_bytes(total).map(|b| b.to_string());
+        assert_eq!(
+            env.get(zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV),
+            want.as_ref()
+        );
+        assert_eq!(
+            zkminer_prover_protocol::types::CUDA_VRAM_BYTES_ENV,
+            "ZKMINER_CUDA_VRAM_BYTES"
+        );
+        assert_eq!(
+            env.len(),
+            usize::from(want.is_some()),
+            "unexpected metal worker env: {env:?}"
+        );
+
+        // An explicitly configured binary (no device index) gets nothing: its own env stands.
+        let explicit = WorkerPool::gpu_env("risc0", "metal", None, None);
+        assert!(explicit.is_empty(), "{explicit:?}");
+    }
+
     #[test]
     fn gpu_env_explicit_binary_no_pin() {
         // device_index=None (explicit binary): must NOT inject *_VISIBLE_DEVICES,
@@ -11485,8 +14288,10 @@ mod tests {
             consecutive_failures: failures,
             last_failure: last_failure_ago.map(|d| Instant::now() - d),
             declined: None,
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
         }
     }
 
@@ -11611,8 +14416,10 @@ mod tests {
             consecutive_failures: MAX_RESPAWN_FAILURES,
             last_failure: Some(Instant::now()),
             declined: None,
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = WorkerPool::respawn(&mut slot);
         assert!(result.is_err());
@@ -11637,8 +14444,10 @@ mod tests {
             consecutive_failures: 1,
             last_failure: Some(Instant::now()), // just failed
             declined: None,
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
         };
         // With consecutive_failures=1, backoff is RESPAWN_BACKOFF[1] = 5s.
         // Since last_failure is ~now, respawn should be rejected.
@@ -11662,13 +14471,70 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = WorkerPool::respawn(&mut slot);
         assert!(result.is_err());
         assert_eq!(slot.consecutive_failures, 1);
         assert!(slot.last_failure.is_some());
+        // W10-BFIX: the failure is kept for the operator, and a backoff bail does not replace it.
+        let spawn_error = slot.last_spawn_error.clone().expect("spawn error recorded");
+        assert!(spawn_error.contains("/nonexistent/binary"), "{spawn_error}");
+        let backoff = format!("{:#}", WorkerPool::respawn(&mut slot).unwrap_err());
+        assert!(backoff.starts_with("Backoff"), "{backoff}");
+        assert_eq!(slot.last_spawn_error.as_deref(), Some(spawn_error.as_str()));
+    }
+
+    /// W10-BFIX: a worker that dies before its handshake is reported with its last stderr line,
+    /// which is where it says why (the round-3 reviewer's `h_crash`).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_respawn_keeps_the_workers_last_words() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zkminer-bfix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dies-at-start");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho 'dyld: Library not loaded: @rpath/libx.dylib' >&2\nexit 134\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut slot = WorkerSlot::test_dead_slot(path);
+        assert!(WorkerPool::respawn(&mut slot).is_err());
+        let error = slot.last_spawn_error.clone().expect("spawn error recorded");
+        assert!(error.contains("Handshake"), "{error}");
+        assert!(
+            error.contains("the worker's last output: dyld: Library not loaded"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W10-BFIX: a down slot's benchmark failure leads with why it never started; the benchmark's
+    /// own attempt (a respawn backoff) is context only, and stands alone only when nothing else is
+    /// known.
+    #[test]
+    fn a_down_slot_reports_its_spawn_error_before_the_backoff() {
+        use super::{down_slot_message, COULD_NOT_START};
+        let backoff = "Backoff: waiting 4.7s before respawning /x";
+        let died =
+            "Handshake with worker risc0 failed (timeout=10s): Worker risc0 process died (EOF)";
+        assert_eq!(
+            down_slot_message(Some(died), backoff),
+            format!("{COULD_NOT_START}{died} (then, when the benchmark tried it: {backoff})")
+        );
+        assert_eq!(
+            down_slot_message(Some(died), died),
+            format!("{COULD_NOT_START}{died}")
+        );
+        assert_eq!(
+            down_slot_message(None, backoff),
+            format!("{COULD_NOT_START}{backoff}")
+        );
     }
 
     // ---- ensure_alive tests ----
@@ -11691,8 +14557,10 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
         assert!(result.is_err());
@@ -11721,8 +14589,10 @@ mod tests {
             consecutive_failures: 0,
             last_failure: None,
             declined: None,
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
         };
         let result = pool.ensure_alive(&mut slot, &pid);
         assert!(result.is_err());
@@ -11846,8 +14716,66 @@ mod declined_backend_tests {
             consecutive_failures: cf,
             last_failure: Some(Instant::now()),
             declined: declined.map(str::to_string),
+            last_spawn_error: None,
             decline_retry: DeclineRetry::default(),
             proofs_since_spawn: 0,
+            last_use: None,
+        }
+    }
+
+    /// W7-M10: an Apple GPU slot's figure follows the owner tier on the claim side, per Mac size,
+    /// and a read on that side never switches the tier to active.
+    #[test]
+    fn a_macs_risc0_slot_figure_follows_the_owner_tier() {
+        use crate::metal_sizing::{OwnerForce, OwnerTier};
+        // The rows below are M8's (W7 decides alike for them); the opt-in R2 table has its own,
+        // pinned in `metal_sizing`.
+        if crate::metal_sizing::env_po2_table() == crate::metal_sizing::Po2Table::R2 {
+            return;
+        }
+        let gib = 1u64 << 30;
+        for (ram, idle_po2, active_po2) in [(16, 19, 18), (18, 19, 18), (24, 20, 19), (36, 20, 20)]
+        {
+            let idle = metal_vram_budget_bytes(ram * gib).unwrap();
+            let mut sl = slot(None, 0);
+            sl.backend = "risc0".into();
+            sl.gpu_tag = "metal".into();
+            let mut pool = pool_with(vec![("risc0:metal:0", sl)]);
+            pool.workers.get_mut("risc0:metal:0").unwrap().vram_bytes = Some(idle);
+            let figure = |pool: &WorkerPool| pool.risc0_slots()[0].2.unwrap();
+            // The table alone: the test must not depend on a budget in the environment.
+            let po2 = |v: u64| {
+                crate::metal_sizing::job_po2_for_limit_in(v, crate::metal_sizing::Po2Table::M8)
+            };
+            pool.test_force_owner(Some(OwnerForce::Idle));
+            assert_eq!(
+                (figure(&pool), po2(figure(&pool))),
+                (idle, idle_po2),
+                "{ram} GB idle"
+            );
+            pool.test_force_owner(Some(OwnerForce::Active));
+            let active = figure(&pool);
+            // An explicit budget (gpu-run's) caps both figures alike: nothing to compare then.
+            let budget = crate::metal_sizing::env_working_set_budget().is_some();
+            if !budget {
+                assert_eq!(po2(active), active_po2, "{ram} GB active");
+            // The tier's own figure where it claims at a smaller po2; else the idle one (36 GB:
+            // po2 20 at 28 and at 20 GiB), so that tier moves nothing.
+            let want = if active_po2 == idle_po2 {
+                idle
+            } else {
+                crate::metal_sizing::active_limit(idle)
+            };
+            assert_eq!(active, want, "{ram} GB active figure");
+            }
+            // The benchmark row keeps the idle figure (it reads `vram_bytes`, not this).
+            assert_eq!(pool.workers["risc0:metal:0"].vram_bytes, Some(idle));
+            // Auto: the claim-side read never moves the tier up to active by itself.
+            pool.test_force_owner(Some(OwnerForce::Idle));
+            figure(&pool);
+            pool.test_force_owner(Some(OwnerForce::Auto));
+            figure(&pool);
+            assert_eq!(pool.owner_tier(), OwnerTier::Idle);
         }
     }
 
@@ -12091,8 +15019,32 @@ impl WorkerSlot {
             consecutive_failures: self.consecutive_failures,
             last_failure: self.last_failure,
             declined: self.declined.clone(),
+            last_spawn_error: self.last_spawn_error.clone(),
             decline_retry: self.decline_retry,
             proofs_since_spawn: self.proofs_since_spawn,
+            last_use: self.last_use,
+        }
+    }
+
+    /// Test-only: a dead risc0 CPU slot for `path` that may respawn at once.
+    #[cfg(test)]
+    fn test_dead_slot(path: PathBuf) -> Self {
+        WorkerSlot {
+            handle: None,
+            path,
+            backend: "risc0".to_string(),
+            gpu_tag: "generic".to_string(),
+            device_index: None,
+            pci_bus_id: None,
+            gpu_name: None,
+            spawn_env: HashMap::new(),
+            consecutive_failures: 0,
+            last_failure: None,
+            declined: None,
+            decline_retry: DeclineRetry::default(),
+            last_spawn_error: None,
+            proofs_since_spawn: 0,
+            last_use: None,
         }
     }
 }
@@ -12127,8 +15079,10 @@ mod bus_id_locking_tests {
                     consecutive_failures: 0,
                     last_failure: None,
                     declined: None,
+                    last_spawn_error: None,
                     decline_retry: DeclineRetry::default(),
                     proofs_since_spawn: 0,
+                    last_use: None,
                 }),
                 vram_bytes: None,
                 pci_bus_id: bus.map(|b| b.to_string()),
@@ -12421,5 +15375,177 @@ mod preemption_tests {
             budget <= left - MIN_ABORT_START_BUDGET,
             "reclaim wait {budget:?} would eat the {MIN_ABORT_START_BUDGET:?} start floor of a {left:?} deadline"
         );
+    }
+}
+
+/// W10-BENCH round 2: the bookkeeping of `BenchmarkRun` on its own, without workers.
+#[cfg(test)]
+mod benchmark_run_tests {
+    use super::*;
+
+    fn row(program: &str, prover_backend: &str) -> BenchmarkEntry {
+        BenchmarkEntry {
+            program_name: program.to_string(),
+            prover_backend: prover_backend.to_string(),
+            cycles: 1_000,
+            duration_secs: 1.0,
+            throughput: 1_000.0,
+            weight: 0.2,
+            precompile: false,
+            wrap_secs: None,
+            power_state: None,
+        }
+    }
+
+    fn full_suite(backend: &str) -> Vec<BenchmarkEntry> {
+        zkminer_prover_protocol::benchmark_suite(backend)
+            .into_iter()
+            .map(|p| p.name)
+            .chain([zkminer_prover_protocol::BENCH_ZKOP_MIX.to_string()])
+            .map(|name| row(&name, backend))
+            .collect()
+    }
+
+    fn measured(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
+        run.record(
+            key,
+            backend,
+            false,
+            Ok(full_suite(backend)),
+            |entries| SlotBenchmarkResult {
+                slot_key: key.to_string(),
+                gpu_name: None,
+                device_index: None,
+                pci_bus_id: None,
+                gpu_tag: tag.to_string(),
+                entries,
+                vram_bytes: None,
+                host_peak_bytes: None,
+            },
+            None,
+            tag,
+        );
+    }
+
+    fn down(run: &mut BenchmarkRun, key: &str, backend: &str, tag: &str) {
+        run.record(
+            key,
+            backend,
+            true,
+            Err(anyhow::anyhow!("Backoff: waiting before respawning")),
+            |_| unreachable!(),
+            None,
+            tag,
+        );
+    }
+
+    fn keys(slots: &[SlotBenchmarkFailure]) -> Vec<&str> {
+        slots.iter().map(|f| f.slot_key.as_str()).collect()
+    }
+
+    #[test]
+    fn only_a_same_backend_gpu_covers_for_a_down_slot() {
+        // A CPU worker of the same backend: failure.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:generic", "risc0", "generic");
+        down(&mut run, "risc0:metal:0", "risc0", "metal");
+        let run = run.finish();
+        assert_eq!(keys(&run.failures), ["risc0:metal:0"]);
+        assert!(run.not_benchmarked.is_empty());
+
+        // A GPU of another backend: failure.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
+        down(&mut run, "sp1:cuda:0", "sp1", "cuda");
+        let run = run.finish();
+        assert_eq!(keys(&run.failures), ["sp1:cuda:0"]);
+
+        // A GPU of the same backend, whichever order the slots ran in: not benchmarked.
+        for down_first in [true, false] {
+            let mut run = BenchmarkRun::default();
+            if down_first {
+                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+            }
+            measured(&mut run, "risc0:cuda:0", "risc0", "cuda");
+            if !down_first {
+                down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+            }
+            let run = run.finish();
+            assert!(run.failures.is_empty(), "{:?}", run.failures);
+            assert_eq!(keys(&run.not_benchmarked), ["risc0:cuda:1"]);
+        }
+
+        // A same-backend GPU whose suite came back short does not cover for it either.
+        let mut run = BenchmarkRun::default();
+        let mut short = full_suite("risc0");
+        short.pop();
+        run.record(
+            "risc0:cuda:0",
+            "risc0",
+            false,
+            Ok(short),
+            |entries| SlotBenchmarkResult {
+                slot_key: "risc0:cuda:0".to_string(),
+                gpu_name: None,
+                device_index: None,
+                pci_bus_id: None,
+                gpu_tag: "cuda".to_string(),
+                entries,
+                vram_bytes: None,
+                host_peak_bytes: None,
+            },
+            None,
+            "cuda",
+        );
+        down(&mut run, "risc0:cuda:1", "risc0", "cuda");
+        let mut failed = keys(&run.clone().finish().failures)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        failed.sort();
+        assert_eq!(failed, ["risc0:cuda:0", "risc0:cuda:1"]);
+    }
+
+    #[test]
+    fn simulated_rows_are_never_results() {
+        assert!(simulated_benchmark_reason("openvm", &[]).is_some());
+        assert!(simulated_benchmark_reason("risc0", &full_suite("risc0")).is_none());
+        let mut rows = full_suite("risc0");
+        rows[0].prover_backend = "simulated".to_string();
+        let reason = simulated_benchmark_reason("risc0", &rows).unwrap();
+        assert!(reason.starts_with(SIMULATED_BENCHMARK), "{reason}");
+
+        // A worker that labels a row simulated: not a result, and alone, the run's failure.
+        let mut run = BenchmarkRun::default();
+        run.record(
+            "risc0:cuda:0",
+            "risc0",
+            false,
+            Ok(rows.clone()),
+            |_| panic!("simulated rows must not become a result"),
+            None,
+            "cuda",
+        );
+        let run = run.finish();
+        assert!(run.results.is_empty());
+        assert_eq!(keys(&run.failures), ["risc0:cuda:0"]);
+
+        // Beside a measured card: reported, and the card's run is clean; it covers for nothing.
+        let mut run = BenchmarkRun::default();
+        measured(&mut run, "risc0:metal:0", "risc0", "metal");
+        run.record(
+            "openvm:cuda:0",
+            "openvm",
+            false,
+            Ok(full_suite("openvm")),
+            |_| panic!("simulated rows must not become a result"),
+            None,
+            "cuda",
+        );
+        down(&mut run, "openvm:cuda:1", "openvm", "cuda");
+        let run = run.finish();
+        assert_eq!(keys(&run.not_benchmarked), ["openvm:cuda:0"]);
+        assert_eq!(keys(&run.failures), ["openvm:cuda:1"]);
+        assert_eq!(run.results.len(), 1);
     }
 }

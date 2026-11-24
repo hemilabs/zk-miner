@@ -9,6 +9,13 @@
 //!   empty = respond normally. `"execute"` holds a measurement in flight until it is SIGKILLed.
 //! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
 //!   immediately with code 1 on the specified command type, simulating a worker crash.
+//! - `MOCK_FAIL_ON`: `"warmup"` or `"benchmark"` — answers that command with an `Error` (the worker
+//!   stays up), as a real worker does when its GPU pipelines fail to build (W10-BENCH). The message is
+//!   `MOCK_FAIL_MESSAGE` (default "mock: forced failure").
+//! - `MOCK_BENCH_ROWS`: `"all"` answers each `Benchmark` request with one made-up row per requested
+//!   program (1M cycles in 1 s), as a worker on which everything proved; unset = no rows (W10-BENCH).
+//!   `MOCK_BENCH_DROP`: comma-separated program names left out of those rows, as a real worker leaves
+//!   out a program that failed to prove and verify (`zkop-mix` drops the score).
 //! - `MOCK_CRASH_CODE`: the exit code for `MOCK_CRASH_ON` on `"prove"` and `"benchmark"`. Default: 1.
 //! - `MOCK_SERVER_OOM`: set to anything to have a child, standing in for a prover's server, allocate
 //!   until the kernel kills it, before `MOCK_CRASH_ON` applies on `"prove"`: a host OOM killing a
@@ -17,6 +24,9 @@
 //! - `MOCK_HOLD_SHM`: a `/dev/shm` name to create and map before hanging on an Execute, as SP1's native
 //!   executor stages a guest there, and leaves it behind if killed.
 //! - `MOCK_BACKEND`: backend name for the HelloAck response. Default: `"mock"`.
+//! - `MOCK_SDK_VERSION` / `MOCK_PROTOCOL_VERSION`: the HelloAck's `sdk_version` (default
+//!   `"mock 0.1.0"`) and `protocol_version` (default this build's), to stand in for a worker built on
+//!   another risc0 or protocol (P31-19).
 //! - `MOCK_JOURNAL_HEX` / `MOCK_SEAL_HEX`: replay a fixed receipt. Execute reports the journal, and
 //!   Prove returns the journal and the seal, whatever the ELF and input. With a real receipt (the
 //!   contract suite's RISC Zero fixture), the miner can claim and fulfil on a chain whose verifier
@@ -87,6 +97,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    let fail_on = std::env::var("MOCK_FAIL_ON").unwrap_or_default();
+    let fail_message =
+        std::env::var("MOCK_FAIL_MESSAGE").unwrap_or_else(|_| "mock: forced failure".to_string());
     let backend = std::env::var("MOCK_BACKEND").unwrap_or_else(|_| "mock".to_string());
     let journal = hex_env("MOCK_JOURNAL_HEX");
     let seal = hex_env("MOCK_SEAL_HEX");
@@ -139,7 +152,8 @@ fn main() {
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(PROTOCOL_VERSION),
                     backend: backend.clone(),
-                    sdk_version: "mock 0.1.0".to_string(),
+                    sdk_version: std::env::var("MOCK_SDK_VERSION")
+                        .unwrap_or_else(|_| "mock 0.1.0".to_string()),
                     worker_version: "0.1.0".to_string(),
                 };
                 write_message(&mut stdout, &resp).unwrap();
@@ -156,7 +170,7 @@ fn main() {
                 write_message(&mut stdout, &resp).unwrap();
             }
 
-            WorkerCommand::Benchmark { .. } => {
+            WorkerCommand::Benchmark { programs } => {
                 if crash_on == "benchmark" || crash_on == "both" {
                     std::process::exit(crash_code);
                 }
@@ -167,7 +181,17 @@ fn main() {
                     }
                 }
                 std::thread::sleep(benchmark_delay);
-                let resp = WorkerResponse::BenchmarkResult { results: vec![] };
+                let resp = if fail_on == "benchmark" {
+                    WorkerResponse::Error {
+                        request_id: 0,
+                        kind: zkminer_prover_protocol::types::ErrorKind::ProofFailed,
+                        message: fail_message.clone(),
+                    }
+                } else {
+                    WorkerResponse::BenchmarkResult {
+                        results: mock_benchmark_rows(&backend, &programs),
+                    }
+                };
                 write_message(&mut stdout, &resp).unwrap();
             }
 
@@ -286,6 +310,13 @@ fn main() {
 
             WorkerCommand::Warmup { request_id } => {
                 if crash_on == "warmup" {
+                    // A dying worker's last words, which the dispatcher quotes (W10-BFIX).
+                    eprintln!("mock worker: crashing on warmup");
+                    // What Rust's panic handler prints last, which is not the reason.
+                    eprintln!(
+                        "note: run with `RUST_BACKTRACE=1` environment variable to display a \
+                         backtrace"
+                    );
                     std::process::exit(1);
                 }
                 if let Some(log) = std::env::var_os("MOCK_WARMUP_LOG") {
@@ -304,10 +335,18 @@ fn main() {
                     }
                 }
                 set_up();
-                let resp = WorkerResponse::WarmupDone {
-                    request_id,
-                    summary: "nothing to warm up".to_string(),
-                    groth16_helper: false,
+                let resp = if fail_on == "warmup" {
+                    WorkerResponse::Error {
+                        request_id,
+                        kind: zkminer_prover_protocol::types::ErrorKind::ProofFailed,
+                        message: fail_message.clone(),
+                    }
+                } else {
+                    WorkerResponse::WarmupDone {
+                        request_id,
+                        summary: "nothing to warm up".to_string(),
+                        groth16_helper: false,
+                    }
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }
@@ -405,6 +444,33 @@ fn hex_env(name: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&v[i..i + 2], 16).unwrap_or_else(|_| panic!("{name} is not hex"))
+        })
+        .collect()
+}
+
+/// The rows `MOCK_BENCH_ROWS` / `MOCK_BENCH_DROP` ask for (see the module docs).
+fn mock_benchmark_rows(
+    backend: &str,
+    programs: &[zkminer_prover_protocol::BenchmarkProgramSpec],
+) -> Vec<zkminer_prover_protocol::BenchmarkEntry> {
+    if std::env::var("MOCK_BENCH_ROWS").as_deref() != Ok("all") {
+        return Vec::new();
+    }
+    let drop = std::env::var("MOCK_BENCH_DROP").unwrap_or_default();
+    let dropped: Vec<&str> = drop.split(',').map(str::trim).collect();
+    programs
+        .iter()
+        .filter(|p| !dropped.contains(&p.name.as_str()))
+        .map(|p| zkminer_prover_protocol::BenchmarkEntry {
+            program_name: p.name.clone(),
+            prover_backend: backend.to_string(),
+            cycles: 1_000_000,
+            duration_secs: 1.0,
+            throughput: 1_000_000.0,
+            weight: p.weight,
+            precompile: p.precompile,
+            wrap_secs: p.measure_wrap.then_some(0.5),
+            power_state: None,
         })
         .collect()
 }

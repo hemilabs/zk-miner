@@ -445,8 +445,18 @@ mod client {
 
         /// Whether `server` may be asked: the floor admits its address, or refuses it only as one
         /// of the host's own DNS servers or for a path whose public address is not known yet.
-        fn usable(&self, server: &DohServer) -> Result<(), Denied> {
-            match self.policy.admit(server.addr.ip()) {
+        /// `admit` blocks (a facts re-read, a route query), so it runs on the blocking pool, never
+        /// on a runtime worker (review round 2, cross-3; the Linux application).
+        async fn usable(&self, server: &DohServer) -> Result<(), Denied> {
+            let policy = self.policy.clone();
+            let ip = server.addr.ip();
+            let verdict = tokio::task::spawn_blocking(move || policy.admit(ip))
+                .await
+                .map_err(|e| Denied::RouteQueryFailed {
+                    ip,
+                    why: format!("the check did not finish: {e}"),
+                })?;
+            match verdict {
                 Ok(()) | Err(Denied::DnsServer(_)) | Err(Denied::PublicAddressUnknown { .. }) => {
                     Ok(())
                 }
@@ -495,7 +505,7 @@ mod client {
             let name = name.trim_end_matches('.').to_ascii_lowercase();
             let mut errors = Vec::new();
             for server in self.servers.iter() {
-                if let Err(d) = self.usable(server) {
+                if let Err(d) = self.usable(server).await {
                     errors.push(format!("{}: {d}", server.addr));
                     continue;
                 }
@@ -547,13 +557,16 @@ mod client {
             )))
         }
 
-        /// On a host that routes IPv6 but not IPv4, with a NAT64 prefix in force: what a DNS64
-        /// resolver would answer for `a` when the name has no `AAAA` (RFC 6147).
-        fn synthesize(&self, aaaa: &[IpAddr], a: &[IpAddr]) -> Vec<IpAddr> {
+        /// On a host that routes IPv6 but not IPv4, with a NAT64 prefix in force for the uplink in
+        /// use ([`crate::nat64::in_force`]): what a DNS64 resolver would answer for `a` when the
+        /// name has no `AAAA` (RFC 6147).
+        pub(crate) fn synthesize(&self, aaaa: &[IpAddr], a: &[IpAddr]) -> Vec<IpAddr> {
             if !aaaa.is_empty() || a.is_empty() {
                 return Vec::new();
             }
-            let facts = self.policy.facts();
+            // The facts in force, never re-read here: this runs on a runtime worker (review
+            // round 4, parse-3); every address synthesized is admitted later on fresh facts.
+            let facts = self.policy.facts_in_force();
             if facts.routes().routes_family(false) || !facts.routes().routes_family(true) {
                 return Vec::new();
             }
@@ -800,5 +813,74 @@ mod tests {
             parse_response(&ok, "elfs.example.com", TYPE_A).unwrap(),
             Some(vec!["1.2.3.4".parse().unwrap()])
         );
+    }
+
+    /// Review round 4, parse-3: synthesizing addresses for an `A` answer reads the facts in
+    /// force and never re-reads them on the runtime worker it runs on (a re-read waits up to
+    /// `REFRESH_WAIT` for another, or runs the whole re-read, a configuration daemon's 2 s, a
+    /// NAT64 round, itself).
+    #[cfg(feature = "client")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn r4_synthesis_never_rereads_the_facts_on_a_worker() {
+        let opts = crate::FactsOptions {
+            discover_public_addresses: false,
+            public_addresses: vec!["198.51.99.7".parse().unwrap(), "2a02:db8:99::7".parse().unwrap()],
+            ..crate::FactsOptions::default()
+        };
+        let Ok(policy) = crate::NetPolicy::with_options(crate::NetMode::Public, Vec::new(), opts)
+        else {
+            crate::skipped("this host's facts cannot be read here".to_string());
+            return;
+        };
+        let before = policy.stage_slow_refresh(std::time::Duration::from_secs(3));
+        let lookup = DohLookup::new(&policy).unwrap();
+        // Stale: a facts() call would re-read them (3 s).
+        std::thread::sleep(crate::FACTS_TTL + std::time::Duration::from_millis(100));
+        let t = std::time::Instant::now();
+        let _ = lookup.synthesize(&[], &["8.8.8.8".parse().unwrap()]);
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(300), "synthesis took {took:?}");
+        assert_eq!(policy.stage_slow_refresh(std::time::Duration::ZERO), before, "a re-read ran");
+    }
+
+    /// Review round 2, cross-3 (the Linux application): whether a server may be asked is judged
+    /// by `admit`, which blocks (facts re-reads, route queries), on the blocking pool. On a
+    /// single-threaded runtime a ticker keeps ticking while each server's check takes 200 ms; were
+    /// the check on the runtime's thread, it would not tick until every check ended.
+    #[cfg(feature = "client")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_server_check_runs_off_the_runtime() {
+        #[derive(Debug)]
+        struct SlowOracle;
+        impl crate::routes::RouteOracle for SlowOracle {
+            fn route_to(
+                &self,
+                _: IpAddr,
+                _: Option<u16>,
+            ) -> std::io::Result<crate::routes::KernelAnswer> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(crate::routes::KernelAnswer::NoRoute)
+            }
+        }
+        let facts =
+            crate::HostFacts::new(Vec::new(), Vec::new()).with_route_oracle(std::sync::Arc::new(SlowOracle));
+        let policy = crate::NetPolicy::with_facts(crate::NetMode::Public, facts, Vec::new());
+        let lookup = DohLookup::new(&policy).unwrap();
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                t.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let start = std::time::Instant::now();
+        // Every server is refused (no route), after its check.
+        assert!(lookup.resolve("example.com").await.is_err());
+        let took = start.elapsed();
+        ticker.abort();
+        let n = ticks.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(took >= std::time::Duration::from_millis(400), "{took:?}");
+        assert!(n * 30 >= took.as_millis() as usize, "the ticker ticked {n} times in {took:?}");
     }
 }

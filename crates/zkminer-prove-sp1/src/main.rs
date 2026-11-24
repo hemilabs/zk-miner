@@ -3441,6 +3441,8 @@ fn benchmark_program(
         weight,
         precompile,
         wrap_secs,
+        // Protocol v12 of the macOS line, v17 since W11-ON37 (W7-M11): only the Metal worker reads a power state.
+        power_state: None,
     })
 }
 

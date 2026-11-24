@@ -34,6 +34,20 @@ mod imp {
     static TMPDIR: OnceLock<PathBuf> = OnceLock::new();
     /// The temporary directory before [`prepare`] pointed `TMPDIR` at the private one.
     static ORIGINAL_TMPDIR: OnceLock<PathBuf> = OnceLock::new();
+    /// `--benchmark`'s receipt directory (`ZKMINER_BENCH_RECEIPT_DIR`), writable once confined.
+    static BENCHMARK_RECEIPT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Before [`confine`], in `--benchmark` mode only: lets the confined worker write the benchmark's
+    /// Groth16 receipts to `ZKMINER_BENCH_RECEIPT_DIR` when it is set (made now: once confined it
+    /// could not make it). Without this the confinement refuses the write, so the test aid wrote
+    /// nothing on Linux. A worker the miner drives never calls it.
+    pub fn allow_benchmark_receipt_dir() {
+        if let Some(dir) = std::env::var_os("ZKMINER_BENCH_RECEIPT_DIR").filter(|d| !d.is_empty()) {
+            let dir = PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = BENCHMARK_RECEIPT_DIR.set(dir);
+        }
+    }
 
     /// The temporary directory this process was started with: outside every path the confined
     /// worker may write (the Docker Groth16 helper works there).
@@ -114,6 +128,10 @@ mod imp {
         c.allow(tmp, Rights::WRITE);
         // Its proofs' segment files (segments.rs), made at startup.
         if let Some(dir) = crate::segments::dir() {
+            c.allow(dir, Rights::WRITE);
+        }
+        // `--benchmark`'s receipts, when asked for (`allow_benchmark_receipt_dir`).
+        if let Some(dir) = BENCHMARK_RECEIPT_DIR.get() {
             c.allow(dir, Rights::WRITE);
         }
         // The risc0-groth16 component: rzup's home and the component itself.
@@ -219,7 +237,11 @@ mod imp {
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{confine, is_confined, original_tmpdir, prepare};
+pub use imp::{allow_benchmark_receipt_dir, confine, is_confined, original_tmpdir, prepare};
+
+/// No confinement off Linux, so the receipt directory needs no grant.
+#[cfg(not(target_os = "linux"))]
+pub fn allow_benchmark_receipt_dir() {}
 
 /// No Landlock or seccomp off Linux: nothing to confine with.
 #[cfg(not(target_os = "linux"))]
