@@ -813,12 +813,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Still serving: an answer after them arrives.
+        // Still serving: an answer after them arrives. The one frame past the bound is sent only
+        // once the test has looked (it raced the check before).
+        let (checked, wait_checked) = tokio::sync::oneshot::channel::<()>();
         let fake = tokio::spawn({
             let broker = broker.clone();
             async move {
                 let (msg, _) = request(&broker).await;
                 answer(&broker, msg.id, ControlResponse::Provisioned { ok: Vec::new() }, None).await.unwrap();
+                wait_checked.await.unwrap();
                 send_with_fd_async(&broker, KIND_CONTROL, b"not json", None).await.unwrap();
             }
         });
@@ -827,6 +830,7 @@ mod tests {
             Vec::<bool>::new()
         );
         assert!(client.violation().is_none());
+        checked.send(()).unwrap();
         fake.await.unwrap();
         assert!(violated_soon(&client).await.contains("do not decode"));
     }
