@@ -1174,6 +1174,28 @@ mod fetch_tests {
         ElfFetcher::new(&NetPolicy::new(mode, Vec::new()).unwrap()).unwrap()
     }
 
+    /// Whether a public-mode failure is the guard refusing for want of a router's time exceeded
+    /// (a host whose network drops them, e.g. a hosted CI runner): the test cannot check what it
+    /// is for there. It says so and passes; under `ZKMINER_CI_STRICT=1` it fails unless
+    /// `ZKMINER_CI_ALLOW_SKIP` names `time-exceeded` (the netguard crate's rule).
+    fn no_time_exceeded_here(err: &str) -> bool {
+        if !err.contains("no router past") || !err.contains("silence is not taken as far") {
+            return false;
+        }
+        let strict = std::env::var("ZKMINER_CI_STRICT").ok().as_deref() == Some("1");
+        let allowed = std::env::var("ZKMINER_CI_ALLOW_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .any(|t| t.trim() == "time-exceeded");
+        if strict && !allowed {
+            panic!(
+                "SKIPPED under ZKMINER_CI_STRICT=1 (not in ZKMINER_CI_ALLOW_SKIP): [time-exceeded] no router's time exceeded reaches this host: {err}"
+            );
+        }
+        eprintln!("SKIPPED: [time-exceeded] no router's time exceeded reaches this host: {err}");
+        true
+    }
+
     /// A lookup that answers from a table.
     struct Staged(HashMap<&'static str, Vec<IpAddr>>);
 
@@ -1443,7 +1465,7 @@ mod fetch_tests {
     #[ignore = "needs the network"]
     async fn a_real_elf_downloads_in_public_mode() {
         let fetcher = real(NetMode::Public);
-        let elf = download_elf(
+        let elf = match download_elf(
             &fetcher,
             &[http(
                 "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox".into(),
@@ -1451,7 +1473,11 @@ mod fetch_tests {
             None,
         )
         .await
-        .expect("a public ELF downloads");
+        {
+            Ok(elf) => elf,
+            Err(e) if no_time_exceeded_here(&format!("{e:#}")) => return,
+            Err(e) => panic!("a public ELF downloads: {e:#}"),
+        };
         assert_eq!(&elf[..4], b"\x7fELF");
         eprintln!("downloaded {} bytes of ELF in public mode", elf.len());
     }
@@ -1466,11 +1492,15 @@ mod fetch_tests {
             "https://arweave.net/bNbA3TEQVL60xlgCcqdz4ZPHFZ711cZ3hmkpGttDt_U",
             "https://github.com/risc0/risc0/releases/download/v1.0.0/cargo-risczero-x86_64-unknown-linux-gnu.tgz",
         ] {
-            let response = fetcher
+            let response = match fetcher
                 .client
                 .get_following_redirects(url, MAX_ELF_REDIRECTS, Duration::from_secs(60))
                 .await
-                .unwrap_or_else(|e| panic!("{url}: {e}"));
+            {
+                Ok(response) => response,
+                Err(e) if no_time_exceeded_here(&e.to_string()) => return,
+                Err(e) => panic!("{url}: {e}"),
+            };
             assert!(response.status().is_success(), "{url}: {}", response.status());
             assert_ne!(
                 response.url().host_str(),

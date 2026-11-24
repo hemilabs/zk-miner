@@ -2350,7 +2350,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        crate::skipped(format!("no Time Exceeded from the first router here: {seen:?}"));
+        crate::skipped(format!(
+            "[time-exceeded] no Time Exceeded from the first router here: {seen:?}"
+        ));
     }
 
     /// A destination nothing answers (TEST-NET-1, at a hop limit past every router): two rounds,
