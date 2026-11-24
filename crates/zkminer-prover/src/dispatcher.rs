@@ -10941,7 +10941,9 @@ impl WorkerPool {
                 // The number was reaped and may have been reused — do not signal a stranger. The
                 // `preempt` flag is already set; if that measurement is in fact still ours and merely
                 // between pids, its own death/return clears the registration and the caller retries.
-                tracing::debug!("not preempting measurement {key}: pid {pid} is no longer our worker");
+                tracing::debug!(
+                    "not preempting measurement {key}: pid {pid} is no longer our worker"
+                );
                 false
             }
         }
@@ -15224,7 +15226,11 @@ impl WorkerPool {
         // worker calls setpgid(0,0) at spawn) so forked GPU/helper children die
         // too instead of leaking as orphans between suites. pid is non-zero here,
         // so kill(-pid) can never degenerate into kill(0)/kill(-1).
-        for entry in self.workers.values().chain(self.measure_workers.values().flatten()) {
+        for entry in self
+            .workers
+            .values()
+            .chain(self.measure_workers.values().flatten())
+        {
             // Identity-checked, as everywhere a pid from this atomic is signalled.
             let Some((pid, expected_start)) = entry.signal_target() else {
                 continue;
@@ -15252,7 +15258,11 @@ impl WorkerPool {
         // and 3 read it — a respawn finishing mid-shutdown — and would then hold the slot for a whole
         // proof while that worker's `sp1-gpu-server` outlives us. So each held slot is polled, and any
         // pid published in the meantime is killed, whose EOF ends the dispatch and frees the slot.
-        for entry in self.workers.values().chain(self.measure_workers.values().flatten()) {
+        for entry in self
+            .workers
+            .values()
+            .chain(self.measure_workers.values().flatten())
+        {
             let mut slot = loop {
                 match entry.slot.try_lock() {
                     Ok(slot) => break slot,
@@ -18989,7 +18999,10 @@ mod tests {
         // no GPU) and `execute_cycles` reports that the backend was down and could not be revived —
         // never a silent success that would let an unmeasured job be sized.
         let pool = pool_with_keys(&["risc0:cuda:0", "risc0:cuda:1"]);
-        assert!(!pool.has_idle_worker("risc0"), "a handle=None slot is not idle");
+        assert!(
+            !pool.has_idle_worker("risc0"),
+            "a handle=None slot is not idle"
+        );
         assert!(
             pool.has_idle_or_revivable_worker("risc0"),
             "a lockable handle=None slot IS revivable for measurement"
@@ -20157,14 +20170,14 @@ mod declined_backend_tests {
             let budget = crate::metal_sizing::env_working_set_budget().is_some();
             if !budget {
                 assert_eq!(po2(active), active_po2, "{ram} GB active");
-            // The tier's own figure where it claims at a smaller po2; else the idle one (36 GB:
-            // po2 20 at 28 and at 20 GiB), so that tier moves nothing.
-            let want = if active_po2 == idle_po2 {
-                idle
-            } else {
-                crate::metal_sizing::active_limit(idle)
-            };
-            assert_eq!(active, want, "{ram} GB active figure");
+                // The tier's own figure where it claims at a smaller po2; else the idle one (36 GB:
+                // po2 20 at 28 and at 20 GiB), so that tier moves nothing.
+                let want = if active_po2 == idle_po2 {
+                    idle
+                } else {
+                    crate::metal_sizing::active_limit(idle)
+                };
+                assert_eq!(active, want, "{ram} GB active figure");
             }
             // The benchmark row keeps the idle figure (it reads `vram_bytes`, not this).
             assert_eq!(pool.workers["risc0:metal:0"].vram_bytes, Some(idle));
@@ -22375,7 +22388,9 @@ mod recycle_tests {
     fn a_proof_whose_worker_was_recycled_fails_as_worker_recycled() {
         let src = include_str!("dispatcher.rs");
         let prove = src.split_once("    fn prove_on_slot(").unwrap().1;
-        let prove = &prove[..prove.find("
+        let prove = &prove[..prove
+            .find(
+                "
     }
 ").unwrap()];
         let pid = prove

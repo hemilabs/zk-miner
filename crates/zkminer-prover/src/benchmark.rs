@@ -5209,8 +5209,14 @@ mod tests {
             risc0_slot_job_po2("gpu-metal0", "metal", Some(17), None, mac36),
             Some(17)
         );
-        assert_eq!(risc0_slot_job_po2("gpu0", "cuda", None, None, mac24), Some(20));
-        assert_eq!(risc0_slot_job_po2("gpu-rocm0", "rocm", None, None, mac16), None);
+        assert_eq!(
+            risc0_slot_job_po2("gpu0", "cuda", None, None, mac24),
+            Some(20)
+        );
+        assert_eq!(
+            risc0_slot_job_po2("gpu-rocm0", "rocm", None, None, mac16),
+            None
+        );
         // A calibrated Mac: its measured size stands below the table's (the table's size failed
         // there), and is raised to the table's when the calibration proved it.
         let calibrated = |ceiling: u8| {

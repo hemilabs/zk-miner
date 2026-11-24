@@ -849,7 +849,11 @@ mod tests {
         pin_call!(r, IHemiProveCore::claimJobBatchCall, "claimJobBatch");
         pin_call!(r, IHemiProveCore::topUpDepositCall, "topUpDeposit");
         pin_call!(r, IHemiProveCore::withdrawCall, "withdraw");
-        pin_call!(r, IHemiProveCore::withdrawableBalancesCall, "withdrawableBalances");
+        pin_call!(
+            r,
+            IHemiProveCore::withdrawableBalancesCall,
+            "withdrawableBalances"
+        );
         pin_call!(r, IHemiProveCore::jobIndexCall, "jobIndex");
         pin_call!(r, IHemiProveFulfill::fulfillJobCall, "fulfillJob");
         pin_call!(r, IHemiProveFulfill::fulfillJobHashedCall, "fulfillJobHashed");
@@ -1156,8 +1160,16 @@ mod tests {
         pin_call!(s, IHemiProveStaking::requestUnstakeCall, "requestUnstake");
         pin_call!(s, IHemiProveStaking::withdrawUnstakedCall, "withdrawUnstaked");
         pin_call!(s, IHemiProveStaking::cancelUnstakeCall, "cancelUnstake");
-        pin_call!(s, IHemiProveStaking::lastProverActivityAtCall, "lastProverActivityAt");
-        pin_call!(s, IHemiProveStaking::getAvailableCollateralCall, "getAvailableCollateral");
+        pin_call!(
+            s,
+            IHemiProveStaking::lastProverActivityAtCall,
+            "lastProverActivityAt"
+        );
+        pin_call!(
+            s,
+            IHemiProveStaking::getAvailableCollateralCall,
+            "getAvailableCollateral"
+        );
         pin_call!(s, IHemiProveStaking::hemiTokenCall, "hemiToken");
         let f = pin_call!(s, IHemiProveStaking::getProverStakeCall, "getProverStake");
         assert_eq!(outputs(&f), "((uint128,uint128,uint128,uint40,uint40))");

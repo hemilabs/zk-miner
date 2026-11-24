@@ -65,7 +65,9 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
         }
         // Where the near-hop check cannot find anything far (Windows), every vet refuses.
         if let Err(why) = zkminer_netguard::nearhop::supported() {
-            skipped(format!("the near-hop check refuses every destination here: {why}"));
+            skipped(format!(
+                "the near-hop check refuses every destination here: {why}"
+            ));
             continue;
         }
         let first = SocketAddr::new(admitted[0], 443);
@@ -90,8 +92,14 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
         .await;
     if zkminer_netguard::nearhop::supported().is_err() {
         // Fails closed: the fetch is refused, never made unchecked.
-        eprintln!("GET https://github.com/ refused here: {:?}", r.as_ref().err());
-        assert!(r.is_err(), "fetched with a near-hop check that finds nothing far");
+        eprintln!(
+            "GET https://github.com/ refused here: {:?}",
+            r.as_ref().err()
+        );
+        assert!(
+            r.is_err(),
+            "fetched with a near-hop check that finds nothing far"
+        );
     } else {
         let r = r.expect("a guarded GET of github.com");
         eprintln!("GET https://github.com/ -> {}", r.status());
@@ -162,7 +170,9 @@ fn this_hosts_facts_are_read() {
 #[test]
 fn public_hosts_are_far_and_reachable() {
     if let Err(why) = zkminer_netguard::nearhop::supported() {
-        skipped(format!("the near-hop check refuses every destination here: {why}"));
+        skipped(format!(
+            "the near-hop check refuses every destination here: {why}"
+        ));
         return;
     }
     for addr in ["1.1.1.1:443", "[2606:4700:4700::1111]:443"] {

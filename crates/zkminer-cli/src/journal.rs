@@ -1173,8 +1173,12 @@ mod tests {
     /// recorded (then stamped at its next save) is taken over.
     #[test]
     fn a_journal_of_another_address_is_not_taken_over() {
-        let a: Address = "0x00000000000000000000000000000000000000aa".parse().unwrap();
-        let b: Address = "0x00000000000000000000000000000000000000bb".parse().unwrap();
+        let a: Address = "0x00000000000000000000000000000000000000aa"
+            .parse()
+            .unwrap();
+        let b: Address = "0x00000000000000000000000000000000000000bb"
+            .parse()
+            .unwrap();
         let mut j = JobJournal::default();
         j.record_claim_intent(B256::repeat_byte(1), 1, None);
         // Written before the owner was recorded: accepted, and stamped with the new owner.
@@ -1188,7 +1192,9 @@ mod tests {
         j.save_to(&path).unwrap();
         let loaded = JobJournal::load_checked_from(&path).unwrap();
         assert_eq!(loaded.prover, Some(a));
-        let why = loaded.key_changed_refusal(b).expect("another key is refused");
+        let why = loaded
+            .key_changed_refusal(b)
+            .expect("another key is refused");
         assert!(
             why.contains(&format!("{a:?}"))
                 && why.contains(&format!("{b:?}"))

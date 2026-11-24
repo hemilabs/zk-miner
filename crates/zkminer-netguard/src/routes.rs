@@ -3680,7 +3680,12 @@ mod sys {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
 mod sys {
     pub(super) fn dump() -> std::io::Result<(Vec<super::Route>, Vec<super::Rule>)> {
         Ok((Vec::new(), Vec::new()))

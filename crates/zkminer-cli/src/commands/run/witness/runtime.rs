@@ -244,8 +244,15 @@ fn take_card(tasks: &mut HashMap<B256, Task>, cards: Option<(usize, usize)>, bus
     let card = if fits.is_empty() {
         None
     } else {
-        let booked: Vec<&String> = tasks.values().filter(|t| t.phase.holds_card()).filter_map(|t| t.card.as_ref()).collect();
-        match fits.iter().find(|d| !busy.contains(d) && !booked.contains(d)) {
+        let booked: Vec<&String> = tasks
+            .values()
+            .filter(|t| t.phase.holds_card())
+            .filter_map(|t| t.card.as_ref())
+            .collect();
+        match fits
+            .iter()
+            .find(|d| !busy.contains(d) && !booked.contains(d))
+        {
             Some(d) => Some(d.clone()),
             None => return false,
         }
@@ -4372,21 +4379,39 @@ mod tests {
         let mut tasks: HashMap<B256, Task> = [(a, task(Phase::Simulating)), (b, task(Phase::Simulating))].into();
         assert!(take_card(&mut tasks, one_card, &[], a, &[]));
         assert_eq!(tasks[&a].phase, Phase::Claiming);
-        assert!(!take_card(&mut tasks, one_card, &[], b, &[]), "the card is taken");
-        assert!(take_card(&mut tasks, one_card, &[], a, &[]), "the claim's second check keeps its own card");
+        assert!(
+            !take_card(&mut tasks, one_card, &[], b, &[]),
+            "the card is taken"
+        );
+        assert!(
+            take_card(&mut tasks, one_card, &[], a, &[]),
+            "the claim's second check keeps its own card"
+        );
         give_back_card(&mut tasks, a);
         assert_eq!(tasks[&a].phase, Phase::Simulating);
-        assert!(take_card(&mut tasks, one_card, &[], b, &[]), "given back: the other claims");
+        assert!(
+            take_card(&mut tasks, one_card, &[], b, &[]),
+            "given back: the other claims"
+        );
         tasks.get_mut(&b).unwrap().phase = Phase::Locked;
         give_back_card(&mut tasks, b);
         assert_eq!(tasks[&b].phase, Phase::Locked, "a held lock keeps its card");
         assert!(!take_card(&mut tasks, one_card, &[], a, &[]));
         tasks.remove(&b);
-        assert!(take_card(&mut tasks, one_card, &[], a, &[]), "the lock ended");
+        assert!(
+            take_card(&mut tasks, one_card, &[], a, &[]),
+            "the lock ended"
+        );
         // Inline work needing a card, and no word from the brain yet.
-        assert!(!take_card(&mut tasks, Some((1, 2)), &[], b, &[]), "no task for it");
+        assert!(
+            !take_card(&mut tasks, Some((1, 2)), &[], b, &[]),
+            "no task for it"
+        );
         tasks.insert(b, task(Phase::Simulating));
-        assert!(!take_card(&mut tasks, Some((1, 2)), &[], b, &[]), "a's claim and one inline job fill two cards");
+        assert!(
+            !take_card(&mut tasks, Some((1, 2)), &[], b, &[]),
+            "a's claim and one inline job fill two cards"
+        );
         assert!(!take_card(&mut tasks, None, &[], b, &[]));
     }
 
@@ -4397,25 +4422,65 @@ mod tests {
         let (a, b) = (B256::repeat_byte(0xa), B256::repeat_byte(0xb));
         let two_cards = Some((0, 2));
         let (fast, slow) = ("gpu0".to_string(), "gpu1".to_string());
-        let mut tasks: HashMap<B256, Task> = [(a, task(Phase::Simulating)), (b, task(Phase::Simulating))].into();
+        let mut tasks: HashMap<B256, Task> =
+            [(a, task(Phase::Simulating)), (b, task(Phase::Simulating))].into();
         // The 5090 proves an inline job: a job fitting only it waits, though a card is free by count.
-        assert!(!take_card(&mut tasks, two_cards, std::slice::from_ref(&fast), a, std::slice::from_ref(&fast)));
+        assert!(!take_card(
+            &mut tasks,
+            two_cards,
+            std::slice::from_ref(&fast),
+            a,
+            std::slice::from_ref(&fast)
+        ));
         assert_eq!(tasks[&a].phase, Phase::Simulating);
         // One that fits both books the free 4070.
-        assert!(take_card(&mut tasks, two_cards, std::slice::from_ref(&fast), a, &[fast.clone(), slow.clone()]));
+        assert!(take_card(
+            &mut tasks,
+            two_cards,
+            std::slice::from_ref(&fast),
+            a,
+            &[fast.clone(), slow.clone()]
+        ));
         assert_eq!(tasks[&a].card.as_deref(), Some("gpu1"));
         // The 4070 booked: the next job fitting only it waits; the 5090 once free takes the other.
-        assert!(!take_card(&mut tasks, two_cards, &[], b, std::slice::from_ref(&slow)));
-        assert!(take_card(&mut tasks, two_cards, &[], b, &[fast.clone(), slow.clone()]));
+        assert!(!take_card(
+            &mut tasks,
+            two_cards,
+            &[],
+            b,
+            std::slice::from_ref(&slow)
+        ));
+        assert!(take_card(
+            &mut tasks,
+            two_cards,
+            &[],
+            b,
+            &[fast.clone(), slow.clone()]
+        ));
         assert_eq!(tasks[&b].card.as_deref(), Some("gpu0"));
         // Given back, the booking goes with it.
         give_back_card(&mut tasks, a);
         assert_eq!(tasks[&a].card, None);
-        assert!(take_card(&mut tasks, two_cards, &[], a, std::slice::from_ref(&slow)));
+        assert!(take_card(
+            &mut tasks,
+            two_cards,
+            &[],
+            a,
+            std::slice::from_ref(&slow)
+        ));
         // A job that fits any card (none named) goes by the count alone.
         tasks.insert(B256::repeat_byte(0xc), task(Phase::Simulating));
-        assert!(!take_card(&mut tasks, two_cards, &[], B256::repeat_byte(0xc), &[]), "two cards, two held");
-        assert!(take_card(&mut tasks, Some((0, 3)), &[], B256::repeat_byte(0xc), &[]));
+        assert!(
+            !take_card(&mut tasks, two_cards, &[], B256::repeat_byte(0xc), &[]),
+            "two cards, two held"
+        );
+        assert!(take_card(
+            &mut tasks,
+            Some((0, 3)),
+            &[],
+            B256::repeat_byte(0xc),
+            &[]
+        ));
         assert_eq!(tasks[&B256::repeat_byte(0xc)].card, None);
     }
 

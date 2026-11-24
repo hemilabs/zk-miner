@@ -863,7 +863,13 @@ async fn run(cli: Cli, early: Early) -> Result<()> {
     // claim), then the refusal.
     #[cfg(windows)]
     if let Some(refusal) = &early.refused_account {
-        let release_held = matches!(cli.command, Commands::Run { release_held: true, .. });
+        let release_held = matches!(
+            cli.command,
+            Commands::Run {
+                release_held: true,
+                ..
+            }
+        );
         return commands::run::release_for_refused_account(config_path, refusal, release_held)
             .await;
     }

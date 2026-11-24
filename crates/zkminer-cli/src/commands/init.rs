@@ -403,9 +403,7 @@ fn summary(network: &str) -> Vec<String> {
 fn funding_steps(network: &str, address_hint: &str) -> Vec<String> {
     let mut lines = if network == "testnet" {
         vec![
-            format!(
-                "  2. Send testnet ETH (gas) and tHEMI to the address{address_hint}. tHEMI is"
-            ),
+            format!("  2. Send testnet ETH (gas) and tHEMI to the address{address_hint}. tHEMI is"),
             "     minted only by its owner: ask the HemiProve team. A claim typically locks"
                 .to_string(),
             "     about 150 tHEMI, so stake at least that per job you want to hold at once."

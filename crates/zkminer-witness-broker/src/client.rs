@@ -38,8 +38,9 @@ use alloy_primitives::{Address, B256};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
 use zkminer_witness::ipc::{
-    decode_control, encode_control, ArtifactFailure, ArtifactSource, ControlErrorCode, ControlMessage, ControlRequest,
-    ControlResponse, FrameError, IpPrefix, JobBudget, SelfTestCheck, KIND_CONTROL, MAX_CONTROL_BYTES,
+    decode_control, encode_control, ArtifactFailure, ArtifactSource, ControlErrorCode,
+    ControlMessage, ControlRequest, ControlResponse, FrameError, IpPrefix, JobBudget,
+    SelfTestCheck, KIND_CONTROL, MAX_CONTROL_BYTES,
 };
 
 use crate::fdpass::{check_sealed, recv_with_fd_async, send_with_fd_async};
@@ -131,7 +132,10 @@ struct InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.id);
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
     }
 }
 
@@ -364,7 +368,8 @@ impl BrokerClient {
         match sent {
             Ok(r) => Ok(r?),
             Err(_) => {
-                self.violation.raise(format!("it took no request for {SEND_TIMEOUT:?}"));
+                self.violation
+                    .raise(format!("it took no request for {SEND_TIMEOUT:?}"));
                 Err(ClientError::Violation)
             }
         }
@@ -414,7 +419,10 @@ impl BrokerClient {
             budget: reg.budget,
             held_lock: reg.held_lock,
         };
-        match self.call(body, Some(broker_end.as_fd()), CALL_TIMEOUT).await? {
+        match self
+            .call(body, Some(broker_end.as_fd()), CALL_TIMEOUT)
+            .await?
+        {
             (ControlResponse::Registered { job_key }, None) if job_key == reg.job_key => Ok(()),
             _ => Err(ClientError::Protocol),
         }
@@ -422,7 +430,10 @@ impl BrokerClient {
 
     /// `EndJob`: stops the broker serving the job and returns its account.
     pub async fn end_job(&self, job_key: B256) -> Result<JobStats, ClientError> {
-        match self.call(ControlRequest::EndJob { job_key }, None, CALL_TIMEOUT).await? {
+        match self
+            .call(ControlRequest::EndJob { job_key }, None, CALL_TIMEOUT)
+            .await?
+        {
             (
                 ControlResponse::JobStats {
                     job_key: k,
@@ -493,12 +504,14 @@ impl BrokerClient {
                     let asked = tokio::time::Instant::now();
                     let proceed = charge(ArtifactCharge { length, chunks }).await;
                     deadline += asked.elapsed();
-                    self.send(req.id, ControlRequest::ChargeDecision { proceed }, None).await?;
+                    self.send(req.id, ControlRequest::ChargeDecision { proceed }, None)
+                        .await?;
                 }
                 // The broker charges a fetch once, before its first chunk read (and reads nothing
                 // after a refusal): another charge would be admitted twice, or answered forever.
                 (ControlResponse::ArtifactCharge { .. }, None) => {
-                    self.violation.raise("a second ArtifactCharge for one fetch".into());
+                    self.violation
+                        .raise("a second ArtifactCharge for one fetch".into());
                     return Err(ClientError::Protocol);
                 }
                 (ControlResponse::Artifact { len, sha256, cached }, Some(fd)) => {
@@ -524,7 +537,10 @@ impl BrokerClient {
     }
 
     pub async fn self_test(&self) -> Result<SelfTestResult, ClientError> {
-        match self.call(ControlRequest::SelfTest, None, SELF_TEST_TIMEOUT).await? {
+        match self
+            .call(ControlRequest::SelfTest, None, SELF_TEST_TIMEOUT)
+            .await?
+        {
             (ControlResponse::SelfTest { ok, checks }, None) => Ok(SelfTestResult { ok, checks }),
             _ => Err(ClientError::Protocol),
         }
@@ -565,7 +581,9 @@ async fn read_loop(sock: Arc<tokio::net::UnixStream>, pending: Pending, next_id:
             }
             undecodable += 1;
             if undecodable > MAX_UNDECODABLE {
-                break Some(format!("more than {MAX_UNDECODABLE} frames that do not decode"));
+                break Some(format!(
+                    "more than {MAX_UNDECODABLE} frames that do not decode"
+                ));
             }
             continue;
         };
@@ -661,7 +679,9 @@ mod tests {
     }
 
     async fn violated_soon(c: &BrokerClient) -> String {
-        tokio::time::timeout(Duration::from_secs(5), c.violated()).await.expect("a violation")
+        tokio::time::timeout(Duration::from_secs(5), c.violated())
+            .await
+            .expect("a violation")
     }
 
     #[tokio::test]
@@ -689,7 +709,10 @@ mod tests {
         )
         .await
         .expect("the fetch ends");
-        assert!(matches!(r, Err(ClientError::Protocol | ClientError::Violation)), "{r:?}");
+        assert!(
+            matches!(r, Err(ClientError::Protocol | ClientError::Violation)),
+            "{r:?}"
+        );
         assert!(charges.load(Ordering::SeqCst) <= 1);
         violated_soon(&client).await;
         assert_eq!(pending_len(&client), 0);
@@ -705,7 +728,10 @@ mod tests {
                 let (msg, _) = request(&broker).await;
                 answer(&broker, msg.id, ControlResponse::ArtifactCharge { length: 1, chunks: 1 }, None).await.unwrap();
                 let (decision, _) = request(&broker).await;
-                assert_eq!((decision.id, decision.body), (msg.id, ControlRequest::ChargeDecision { proceed: false }));
+                assert_eq!(
+                    (decision.id, decision.body),
+                    (msg.id, ControlRequest::ChargeDecision { proceed: false })
+                );
                 // After a refusal, and a second one at that.
                 answer(&broker, msg.id, ControlResponse::ArtifactCharge { length: 2, chunks: 1 }, None).await.unwrap();
             }
@@ -719,10 +745,15 @@ mod tests {
             .await;
         assert!(matches!(r, Err(ClientError::Protocol)), "{r:?}");
         assert_eq!(charges.load(Ordering::SeqCst), 1);
-        assert!(violated_soon(&client).await.contains("second ArtifactCharge"));
+        assert!(violated_soon(&client)
+            .await
+            .contains("second ArtifactCharge"));
         fake.await.unwrap();
         // The reader stopped: a new request fails at once.
-        assert!(matches!(client.check_provisioned(Vec::new()).await, Err(ClientError::Violation)));
+        assert!(matches!(
+            client.check_provisioned(Vec::new()).await,
+            Err(ClientError::Violation)
+        ));
     }
 
     #[tokio::test]
@@ -757,7 +788,10 @@ mod tests {
         let _ = fake.await;
         drop(client);
         drop(broker);
-        assert!(all_copies_closed(&probe).await, "the miner kept a passed descriptor");
+        assert!(
+            all_copies_closed(&probe).await,
+            "the miner kept a passed descriptor"
+        );
     }
 
     #[tokio::test]
@@ -775,7 +809,9 @@ mod tests {
     async fn frames_that_do_not_decode_are_tolerated_up_to_a_bound() {
         let (client, broker) = pair();
         for _ in 0..MAX_UNDECODABLE {
-            send_with_fd_async(&broker, KIND_CONTROL, b"not json", None).await.unwrap();
+            send_with_fd_async(&broker, KIND_CONTROL, b"not json", None)
+                .await
+                .unwrap();
         }
         // Still serving: an answer after them arrives.
         let fake = tokio::spawn({
@@ -786,7 +822,10 @@ mod tests {
                 send_with_fd_async(&broker, KIND_CONTROL, b"not json", None).await.unwrap();
             }
         });
-        assert_eq!(client.check_provisioned(Vec::new()).await.unwrap(), Vec::<bool>::new());
+        assert_eq!(
+            client.check_provisioned(Vec::new()).await.unwrap(),
+            Vec::<bool>::new()
+        );
         assert!(client.violation().is_none());
         fake.await.unwrap();
         assert!(violated_soon(&client).await.contains("do not decode"));
@@ -807,9 +846,15 @@ mod tests {
         }
         let client = BrokerClient::new(miner).unwrap();
         let t0 = tokio::time::Instant::now();
-        let r = client.fetch_artifact(fetch_request(), |_| async { true }).await;
+        let r = client
+            .fetch_artifact(fetch_request(), |_| async { true })
+            .await;
         assert!(matches!(r, Err(ClientError::Violation)), "{r:?}");
-        assert!(t0.elapsed() >= SEND_TIMEOUT && t0.elapsed() < SEND_TIMEOUT + Duration::from_secs(1), "{:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() >= SEND_TIMEOUT && t0.elapsed() < SEND_TIMEOUT + Duration::from_secs(1),
+            "{:?}",
+            t0.elapsed()
+        );
         assert!(client.violation().unwrap().contains("took no request"));
         assert_eq!(pending_len(&client), 0);
         drop(broker);
@@ -829,11 +874,19 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let r = client.check_provisioned(Vec::new()).await;
         assert!(matches!(r, Err(ClientError::Timeout)), "{r:?}");
-        assert!(t0.elapsed() >= CALL_TIMEOUT && t0.elapsed() < CALL_TIMEOUT + Duration::from_secs(1), "{:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() >= CALL_TIMEOUT && t0.elapsed() < CALL_TIMEOUT + Duration::from_secs(1),
+            "{:?}",
+            t0.elapsed()
+        );
         assert_eq!(pending_len(&client), 0);
-        assert!(client.violation().is_none(), "a slow answer is not a violation");
+        assert!(
+            client.violation().is_none(),
+            "a slow answer is not a violation"
+        );
         // A dropped request leaves nothing pending either.
-        let _ = tokio::time::timeout(Duration::from_secs(1), client.check_provisioned(Vec::new())).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), client.check_provisioned(Vec::new()))
+            .await;
         assert_eq!(pending_len(&client), 0);
         fake.abort();
     }
@@ -855,10 +908,15 @@ mod tests {
             }
         });
         let dropped = client.fetch_artifact(fetch_request(), |_| async { true });
-        assert!(tokio::time::timeout(Duration::from_millis(50), dropped).await.is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(50), dropped)
+            .await
+            .is_err());
         assert_eq!(pending_len(&client), 0);
         // Answered after the late artifact: the reader has handled (and closed) it.
-        assert_eq!(client.check_provisioned(Vec::new()).await.unwrap(), Vec::<bool>::new());
+        assert_eq!(
+            client.check_provisioned(Vec::new()).await.unwrap(),
+            Vec::<bool>::new()
+        );
         fake.await.unwrap();
         assert!(client.violation().is_none());
         assert!(all_copies_closed(&probe).await);

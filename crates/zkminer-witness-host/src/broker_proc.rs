@@ -218,7 +218,9 @@ impl BrokerProcess {
                 match end {
                     Some(end) => end,
                     // The broker was killed: its connector session ends with it.
-                    None => tokio::time::timeout(BROKER_EXIT_GRACE, serve).await.unwrap_or(SessionEnd::Closed),
+                    None => tokio::time::timeout(BROKER_EXIT_GRACE, serve)
+                        .await
+                        .unwrap_or(SessionEnd::Closed),
                 }
             }
         });

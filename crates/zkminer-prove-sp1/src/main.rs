@@ -1893,7 +1893,9 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
             .unwrap_or_else(|| "no limit".into()),
         from_vram.unwrap_or_else(|| "unknown".into()),
         card_cap
-            .map(|c| format!(", this card's record allows {c} (a proof here ran out of GPU memory)"))
+            .map(|c| format!(
+                ", this card's record allows {c} (a proof here ran out of GPU memory)"
+            ))
             .unwrap_or_default(),
     );
     // SAFETY: single-threaded startup, before any prover, server or thread exists.
@@ -4856,7 +4858,9 @@ mod threshold_tests {
         }
         // Without it, a failed proof says nothing of why: not an out-of-memory.
         assert!(matches!(
-            kind("CudaClientError: The server returned an internal error \n controller task failed"),
+            kind(
+                "CudaClientError: The server returned an internal error \n controller task failed"
+            ),
             ErrorKind::ProofFailed
         ));
         assert!(matches!(

@@ -1778,7 +1778,11 @@ impl Miner {
         args: &[&str],
         env: &[(&str, String)],
     ) -> Command {
-        let exe = dir.join(if cfg!(windows) { "zkminer.exe" } else { "zkminer" });
+        let exe = dir.join(if cfg!(windows) {
+            "zkminer.exe"
+        } else {
+            "zkminer"
+        });
         let _ = std::fs::remove_file(&exe);
         let zkminer = zkminer_exe();
         if std::fs::hard_link(&zkminer, &exe).is_err() {

@@ -455,7 +455,12 @@ pub fn supported() -> Result<(), String> {
     {
         Err(WINDOWS_NO_TIME_EXCEEDED.into())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
     {
         Err(UNSUPPORTED.into())
     }
@@ -834,7 +839,12 @@ pub(crate) fn new_socket(addr: SocketAddr) -> io::Result<socket2::Socket> {
     Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+))]
 fn set_hops(sock: &socket2::Socket, addr: SocketAddr, hops: u8) -> io::Result<()> {
     if addr.is_ipv4() {
         sock.set_ttl_v4(u32::from(hops))
@@ -1006,7 +1016,13 @@ fn unmapped(addr: SocketAddr) -> SocketAddr {
 /// skeptic); an unreachable is the ICMP error that caused it when one kind was matched (several
 /// different ones: a failure), a plain unreachable when none was; an ICMP error the socket did not
 /// end on is no evidence (no answer).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos", windows))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+))]
 fn settle(end: Option<ProbeOutcome>, icmp: &[(u8, u8, IpAddr)]) -> ProbeOutcome {
     match end {
         None => ProbeOutcome::TimedOut,
@@ -1027,7 +1043,13 @@ fn settle(end: Option<ProbeOutcome>, icmp: &[(u8, u8, IpAddr)]) -> ProbeOutcome 
 /// the round ends at once and the connection can follow its probe closely: an answer within the
 /// limit (near), or a far verdict whose every probe at or below its hop limit has ended (no later
 /// answer can contradict it: only an answer at or below that hop limit could).
-#[cfg(any(test, target_os = "linux", target_os = "android", target_os = "macos", windows))]
+#[cfg(any(
+    test,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+))]
 fn decided(dst: IpAddr, hops: u8, seen: &[(u8, Option<ProbeOutcome>)]) -> bool {
     let ended: Vec<Obs> = seen
         .iter()
@@ -1559,7 +1581,8 @@ fn observe(
     let mut probes = Vec::new();
     for t in hops..=hops.saturating_add(extra) {
         probes.push(
-            win::Probe::open(addr, t, pin).map_err(|e| format!("a probe could not be sent: {e}"))?,
+            win::Probe::open(addr, t, pin)
+                .map_err(|e| format!("a probe could not be sent: {e}"))?,
         );
     }
     let end = Instant::now() + wait;
@@ -1569,7 +1592,10 @@ fn observe(
             .iter()
             .map(|p| (p.ttl, p.end.as_ref().map(|_| settle(p.end.clone(), &p.icmp))))
             .collect();
-        if left.is_zero() || probes.iter().all(|p| p.end.is_some()) || decided(addr.ip(), hops, &seen) {
+        if left.is_zero()
+            || probes.iter().all(|p| p.end.is_some())
+            || decided(addr.ip(), hops, &seen)
+        {
             break;
         }
         win::poll(&mut probes, left)?;
@@ -1790,12 +1816,22 @@ const WINDOWS_NO_TIME_EXCEEDED: &str = "Windows TCP does not report a router's I
      publish)";
 
 /// Why no destination is found far on this platform.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
 const UNSUPPORTED: &str = "this platform gives the near-hop check no way to read which router's \
                            ICMP error ended a probe, so no destination is found far";
 
 /// Elsewhere (the BSDs): no round can be read; every decision refuses.
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    windows
+)))]
 fn observe(_: SocketAddr, _: u8, _: u8, _: &Pin, _: Duration) -> Result<Vec<Obs>, String> {
     Err(UNSUPPORTED.into())
 }
@@ -2098,7 +2134,10 @@ mod tests {
         assert_eq!(win::ended(&os(10060)), ProbeOutcome::TimedOut);
         for e in [10013, 10049, 10022] {
             assert!(matches!(win::ended(&os(e)), ProbeOutcome::Failed(_)), "{e}");
-            assert!(matches!(win::at_once(os(e)), ProbeOutcome::Failed(_)), "{e}");
+            assert!(
+                matches!(win::at_once(os(e)), ProbeOutcome::Failed(_)),
+                "{e}"
+            );
         }
         assert!(matches!(win::at_once(os(10065)), ProbeOutcome::Failed(_)));
         assert_eq!(win::at_once(os(10061)), ProbeOutcome::Refused);
@@ -2112,7 +2151,10 @@ mod tests {
     fn a_local_listener_is_near_on_windows() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        assert_eq!(decide(&TtlProbe, addr, 2), Verdict::Near("accepted a connection"));
+        assert_eq!(
+            decide(&TtlProbe, addr, 2),
+            Verdict::Near("accepted a connection")
+        );
         drop(l);
         let v = decide(&TtlProbe, addr, 2);
         assert!(refused(&v), "{v:?}");

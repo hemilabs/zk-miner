@@ -3838,8 +3838,7 @@ pub async fn run(
     // already, and refusing would only leave held locks undriven.
     #[cfg(windows)]
     if config.wallet.key_source == "env" {
-        for copy in
-            zkminer_config::wallet_win::persisted_key_env_copies(&config.wallet.key_env_var)
+        for copy in zkminer_config::wallet_win::persisted_key_env_copies(&config.wallet.key_env_var)
         {
             let steps = zkminer_config::wallet::key_env_move_steps(
                 &config.wallet.key_env_var,
@@ -19112,7 +19111,10 @@ mod tests {
             elf_hash: None,
         };
         let none = elf_download_note(id, &info);
-        assert!(none.starts_with("No ELF download for program 0x5e5e5e5e"), "{none}");
+        assert!(
+            none.starts_with("No ELF download for program 0x5e5e5e5e"),
+            "{none}"
+        );
         assert!(none.contains("skipped for 10 min"), "{none}");
         info.name = "fibonacci".into();
         info.storage_uris.push(ResolvedURI {
@@ -20953,9 +20955,16 @@ mod r2_sizing_tests {
         };
         for submitter in [0xA1, 0xA2, 0xA3] {
             note_post_claim_divergence_for(prog, "sp1", addr(submitter), "test", false);
-            assert!(divergence_blocks_claim(addr(submitter), B256::repeat_byte(0xA8), "sp1"));
+            assert!(divergence_blocks_claim(
+                addr(submitter),
+                B256::repeat_byte(0xA8),
+                "sp1"
+            ));
         }
-        assert!(!program_marked(), "a lever decoy must not mark the program it names");
+        assert!(
+            !program_marked(),
+            "a lever decoy must not mark the program it names"
+        );
         // Without a lever, two distinct submitters mark it.
         note_post_claim_divergence_for(prog, "sp1", addr(0xA4), "test", true);
         note_post_claim_divergence_for(prog, "sp1", addr(0xA5), "test", true);
