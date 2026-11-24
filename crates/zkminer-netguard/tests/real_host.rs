@@ -77,6 +77,12 @@ async fn ordinary_public_hosts_are_admitted_on_this_host() {
         })
         .await
         .unwrap();
+        if let Err(e) = &vetted {
+            if no_time_exceeded(&e.to_string()) {
+                skipped(format!("[time-exceeded] {name}: {first}: {e}"));
+                continue;
+            }
+        }
         assert_eq!(vetted, Ok(()), "{name}: {first}");
     }
     // An NXDOMAIN is no such name.
@@ -183,13 +189,22 @@ fn public_hosts_are_far_and_reachable() {
         eprintln!("{addr} within 2 hops: {decided:?}");
         if reachable.is_err() {
             let family = if addr.is_ipv6() { "[ipv6] " } else { "" };
-            skipped(format!("{family}{addr} is not reachable here: {reachable:?}"));
+            skipped(format!(
+                "{family}{addr} is not reachable here: {reachable:?}"
+            ));
             continue;
         }
         match decided {
             Verdict::Far(e) => {
                 assert!(e.ttl >= 2 && e.from != addr.ip(), "{e:?}");
                 assert!(e.local.is_some_and(|l| l.port() != 0), "{e:?}");
+            }
+            // A host whose routers send no time exceeded (GitHub's hosted runners): nothing can
+            // be shown far here, so this cannot check what it is for.
+            Verdict::NoEvidence(seen) if no_time_exceeded(&seen) => {
+                skipped(format!(
+                    "[time-exceeded] {addr}: no router's time exceeded reaches this host: {seen}"
+                ));
             }
             other => panic!("{addr}: {other:?}"),
         }
@@ -236,6 +251,12 @@ fn a_near_target_is_near() {
 /// test: review round 3, cross-2) it fails instead, unless `why` starts with a token in brackets
 /// (`"[ipv6] …"`) that `ZKMINER_CI_ALLOW_SKIP` (comma-separated tokens) names exactly (review
 /// round 4, cross-7).
+/// Whether the probes saw only silence past the hop limit, which is what a host whose routers send
+/// no ICMP time exceeded gives (the refusal names it "no router past ... silence is not taken as far").
+fn no_time_exceeded(seen: &str) -> bool {
+    seen.contains("silence is not taken as far")
+}
+
 fn skipped(why: impl std::fmt::Display) {
     let why = why.to_string();
     if std::env::var("ZKMINER_CI_STRICT").is_ok_and(|v| v == "1") {
