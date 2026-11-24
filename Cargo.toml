@@ -192,8 +192,8 @@ hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 # build work, #27's memory fixes for small Intel cards, and #28's AMD RDNA3/RDNA4 speedups, which
 # rewrite most of the ROCm proving path (validated upstream on ROCm 7.2; prove on an AMD card before
 # trusting a new ROCm toolchain with it).
-# The pin is 81ee699e3 (hemilabs/risc0 branch `zkminer/metal-3.1-v2`), the macOS/Metal fork branch rebased onto hemilabs/risc0 `release-3.1` @ eb847a1af
-# (W12-REBASE; it must be pushed to hemilabs/risc0 before this rev resolves): `release-3.1` (upstream
+# The base is 81ee699e3 (hemilabs/risc0 branch `zkminer/metal-3.1-v2`), the macOS/Metal fork branch rebased onto hemilabs/risc0 `release-3.1` @ eb847a1af
+# (W12-REBASE): `release-3.1` (upstream
 # v3.1.0, with the GHSA-g6qg-9j8p-7j87 Groth16 fix whose receipts the risc0-ethereum v3.1.0 verifier
 # accepts: SELECTOR 0xe71e6620, control root e6feef13..., with the fork's work above, #39's zkr decode
 # cache, #40's Intel Poseidon-254 S-box, #41's ROCm eval_check regenerated for the 3.1 circuit, before
@@ -207,8 +207,8 @@ hemiprove-proxy-slots = { path = "reference/proxy-slots/statement" }
 # docs/metal-port-notes/W10-PIN.md the move to 37b434755, and docs/metal-port-notes/W12-REBASE.md the
 # move to 81ee699e3 (37b434755 rebased onto release-3.1 eb847a1af; same tree plus #42).
 # 3.1 receipts are not accepted by a 3.0 verifier, and 3.0 receipts are not accepted by a 3.1 verifier.
-# Now a424eda4b (hemilabs/risc0 branch `zkminer/metal-3.1-v2-titanv`; not yet on hemilabs/risc0, so
-# it resolves only once pushed): 81ee699e3 plus three CUDA-only commits, outside the Metal build: the
+# The pin is a424eda4b (hemilabs/risc0 branch `zkminer/metal-3.1-v2-titanv`): 81ee699e3 plus three
+# CUDA-only commits, outside the Metal build: the
 # rv32im eval_check_ef compare-and-subtract on sm_70 (Volta), the CUDA wrap releasing its stack
 # reservation and preloading the SRS after the pool, and an opt-in pinned copy of the Groth16 key.
 # Build at -j 4 or more: from #21, three -sys build scripts can deadlock on cargo's jobserver at -j 1..3.

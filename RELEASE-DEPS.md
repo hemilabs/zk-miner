@@ -6,17 +6,21 @@ evidence in `docs/metal-port-notes/B9-DEP.md`. The pin moved to `28b4bef33` when
 into the macOS beta (W10-INT, `docs/metal-port-notes/W10-INT.md`), then to `37b434755`, which gates the
 fork's non-Metal changes to Metal builds (W10-GATE; W10-PIN, `docs/metal-port-notes/W10-PIN.md`), then
 to `81ee699e3`, the same branch rebased onto hemilabs/risc0 `release-3.1` @ `eb847a1af` (W12-REBASE,
-`docs/metal-port-notes/W12-REBASE.md`).
+`docs/metal-port-notes/W12-REBASE.md`), then to `a424eda4b` (hemilabs/risc0 branch
+`zkminer/metal-3.1-v2-titanv`): `81ee699e3` plus three CUDA-only commits that a Metal build does not
+compile (the rv32im `eval_check_ef` compare-and-subtract on sm_70, the CUDA wrap releasing its stack
+reservation and preloading the SRS after the pool, and an opt-in pinned copy of the Groth16 key,
+`RISC0_GROTH16_PINNED_KEY`). For a Mac, `a424eda4b` builds what `81ee699e3` built.
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1`** | `rev = "81ee699e3df4a08e9950f3374571ddeb250e6009"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1-v2-titanv`** (on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "a424eda4b7…"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
-| SP1 crates | `hemilabs/sp1` | rev `a4df7c8f7…` (`zkminer/windows-server-connect`, from GitHub main; was `9a0de746…`) |
+| SP1 crates | `hemilabs/sp1` | rev `820d55ef6…` (hemilabs/sp1 `main`, the merge of #25; see `Cargo.toml`) |
 | guest crates (`crates/zkminer-prover/guests/risc0/*`) | crates.io (`risc0-zkvm` 3.0.5) and the RustCrypto risc0 forks on GitHub | each guest's own `Cargo.lock` (unchanged) |
 
 **W12-REBASE:** `81ee699e3` is branch `rebase/metal-3.1` of the risc0 repository
@@ -25,8 +29,7 @@ which is `5beab26b5` plus #42 (`7ae63a70d`, recursion-sys `build.rs`: the ROCm f
 Windows, ROCm only). Only the five commits that descend from `5beab26b5` were rewritten (W10-R0's merge
 of release-3.1 now merges `eb847a1af`); every other fork commit keeps its sha. Its tree is exactly
 `git merge-tree eb847a1af 37b434755` (`66f7770fa`): `37b434755`'s tree plus #42's 7-line `build.rs`
-change. **`81ee699e3` has to be pushed to hemilabs/risc0 before this pin resolves** (as
-`zkminer/metal-3.1`, which needs a force-push over `37b434755`, or under a new branch name); the
+change. `81ee699e3` is on hemilabs/risc0 as branch `zkminer/metal-3.1-v2`; the
 paragraphs below describe `37b434755`, which is unchanged in `81ee699e3` apart from #42.
 
 `37b434755` is `/Users/user/zkminer/deps/risc0-3.1` after the Wave 10 phase-2 merge
