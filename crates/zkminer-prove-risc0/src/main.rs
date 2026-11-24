@@ -546,6 +546,19 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                         write_message(&mut stdout, &refused)?;
                         continue;
                     }
+                    // The job path's ceiling (`po2_refusal`): on a Mac a size whose STARK does not
+                    // fit the working set thrashes swap instead of failing, whoever chose it (an
+                    // explicitly configured worker has no budget on the host, which then sends 20).
+                    if let Some(refusal) = po2_refusal(po2) {
+                        tracing::error!("not benchmarking: {refusal}");
+                        let resp = WorkerResponse::Error {
+                            request_id: 0,
+                            message: refusal,
+                            kind: ErrorKind::ResourceExhausted,
+                        };
+                        write_message(&mut stdout, &resp)?;
+                        continue;
+                    }
                     let results = if let Some(refusal) = gpu_refusal() {
                         tracing::error!("not benchmarking: {refusal}");
                         Vec::new()

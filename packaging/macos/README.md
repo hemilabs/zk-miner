@@ -110,8 +110,9 @@ Run `zkminer init` once, on the first install (with or without `--with-groth16`)
 existing `~/.zkminer/config.toml` alone, so an update needs no `init`. Do not run
 `zkminer init --force` after an update: it overwrites your config.
 
-Neither `zkminer` nor the worker has a `--version` flag: the kit's version, commit and risc0
-revision are in its `BUILDINFO` file, and `zkminer help` lists the commands.
+`zkminer --version` prints the CLI's version; the worker has no `--version` flag. The kit's
+version, commit and risc0 revision are in its `BUILDINFO` file, and `zkminer help` lists the
+commands.
 
 `~/.zkminer/provers/zkminer-prove-risc0-metal --benchmark` exits with status 1 when any program
 (the warm-up included) does not prove and verify, after printing the rows of those that did.

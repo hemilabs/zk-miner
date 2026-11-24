@@ -5511,7 +5511,13 @@ mod tests {
     #[test]
     fn a_mac_is_benchmarked_at_the_metal_tables_size() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        for vram in [Some(4 * GIB), Some(8 * GIB), Some(10 * GIB), Some(16 * GIB), None] {
+        for vram in [
+            Some(4 * GIB),
+            Some(8 * GIB),
+            Some(10 * GIB),
+            Some(16 * GIB),
+            None,
+        ] {
             assert_eq!(
                 risc0_benchmark_po2(vram, "metal"),
                 metal_job_po2(vram),
@@ -5539,11 +5545,15 @@ mod tests {
             assert_eq!(job_po2_for_limit_in(10 * GIB, M8), 19);
             assert_eq!(job_po2_for_limit_in(4 * GIB, M8), 18);
             assert_eq!(job_po2_for_limit_in(16 * GIB, M8), 20);
-            assert!(risc0_benchmark_po2(Some(8 * GIB), "metal") <= 19);
-            assert!(risc0_benchmark_po2(Some(10 * GIB), "metal") <= 19);
-            assert!(risc0_benchmark_po2(Some(4 * GIB), "metal") <= 18);
+            // The default table on the Macs these budgets belong to (16, 18 and 12 GB of RAM), not
+            // on this host's: on a Mac with 21 GB or more W7's footprint rule admits 20 at 10 GiB.
+            use crate::metal_sizing::{job_po2_in, Po2Table::W7};
+            assert_eq!(job_po2_in(8 * GIB, W7, Some(16 * GIB)), 19);
+            assert_eq!(job_po2_in(10 * GIB, W7, Some(18 * GIB)), 19);
+            assert_eq!(job_po2_in(4 * GIB, W7, Some(12 * GIB)), 18);
         }
-        // Unknown budget: the protocol default, as the worker then sizes itself.
+        // Unknown budget (an explicitly configured worker): the protocol default, which the host
+        // then sends; the worker refuses it where it does not fit (`po2_refusal`, as for a job).
         if std::env::var_os(crate::metal_sizing::MAX_WORKING_SET_ENV).is_none() {
             assert_eq!(
                 risc0_benchmark_po2(None, "metal"),
