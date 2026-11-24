@@ -1593,6 +1593,29 @@ const SPILL_RETRY_AFTER: Duration = if cfg!(test) {
     Duration::from_secs(30)
 };
 
+/// The pause before a benchmark refused for lack of room beside memory already in use on the card
+/// runs again (`WorkerPool::after_spills`): [`SPILL_RETRY_AFTER`] times the attempt, so 30, 60 and
+/// 90 s, three minutes in all, before the card is left without a row for the run.
+fn room_wait(attempt: u32) -> Duration {
+    SPILL_RETRY_AFTER.saturating_mul(attempt.max(1))
+}
+
+/// "X GiB free, need Y GiB" from a refusal for lack of room on the card, for the log.
+fn card_busy(e: &anyhow::Error) -> String {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    match e.downcast_ref::<zkminer_prover_protocol::types::GpuMemoryShortage>() {
+        Some(s) => match s.needed_bytes {
+            Some(need) => format!(
+                "{:.1} GiB free, need {:.1} GiB",
+                gib(s.available_bytes),
+                gib(need)
+            ),
+            None => format!("{:.1} GiB free", gib(s.available_bytes)),
+        },
+        None => format!("{e:#}"),
+    }
+}
+
 /// What an SP1 benchmark answers when its card was sized down after it ran out of GPU memory
 /// (`WorkerPool::finish_benchmark`): measure it again, at the new size.
 #[derive(Debug)]
@@ -6311,7 +6334,7 @@ impl WorkerPool {
     /// (`after_spills`): a sample taken while paged would pick the segment size from a rate several
     /// times too low.
     pub fn calibrate_slot_po2(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
-        self.after_spills(key, "calibration", || {
+        self.after_spills(key, "calibration", false, || {
             self.calibrate_slot_po2_once(key, po2)
         })
     }
@@ -7030,7 +7053,7 @@ impl WorkerPool {
     /// [`benchmark_slot_once`](Self::benchmark_slot_once), measured again after a pause when
     /// another program's memory paged it off its card (`after_spills`).
     fn benchmark_slot(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
-        self.after_spills(key, "benchmark", || self.benchmark_slot_once(key))
+        self.after_spills(key, "benchmark", true, || self.benchmark_slot_once(key))
     }
 
     fn benchmark_slot_once(&self, key: &str) -> Result<Vec<BenchmarkEntry>> {
@@ -7053,10 +7076,14 @@ impl WorkerPool {
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
         // concerned, and an OOM here poisons the throughput row that prices every later job on it.
-        // See `check_vram_budget`. Unlike `calibrate_slot_po2` there is no parameter to clamp: the
-        // suite's sizing is chosen inside the worker from its spawn environment, which is where the
-        // available-VRAM figure is handed to it.
-        let _vram_budget = self.check_vram_budget(key, None, None)?;
+        // See `check_vram_budget`. Unlike `calibrate_slot_po2` there is no parameter to clamp: a
+        // risc0 benchmark proves at its card's job size (`benchmark_po2`), so it must find that
+        // size's free-VRAM floor on the card, as a job does. Run beside memory already in use on the
+        // card without it, a 5080 benchmark took 280 s for a 14 s STARK and saved a rate 15 times too
+        // low, which sent every later job elsewhere. Refused here, typed, and waited out by
+        // `after_spills`; a card still short after that gets no row, so nothing is saved.
+        let po2 = self.benchmark_po2(key);
+        let _vram_budget = self.check_vram_budget(key, None, po2)?;
 
         let entry = self
             .workers
@@ -7168,7 +7195,6 @@ impl WorkerPool {
             self.gpu_spills.clone(),
         );
 
-        let po2 = self.benchmark_po2(key);
         let requests =
             Self::run_benchmark_requests(handle, key, po2, &|_, _, _| {}, &|| {}, &|| {
                 clock.touch()
@@ -7483,7 +7509,7 @@ impl WorkerPool {
         key: &str,
         on_progress: &dyn Fn(BenchmarkProgressEvent),
     ) -> Result<Vec<BenchmarkEntry>> {
-        self.after_spills(key, "benchmark", || {
+        self.after_spills(key, "benchmark", true, || {
             self.benchmark_slot_streaming_once(key, on_progress)
         })
     }
@@ -7511,10 +7537,14 @@ impl WorkerPool {
 
         // Enough of this card free for this backend? A benchmark is a proof as far as the card is
         // concerned, and an OOM here poisons the throughput row that prices every later job on it.
-        // See `check_vram_budget`. Unlike `calibrate_slot_po2` there is no parameter to clamp: the
-        // suite's sizing is chosen inside the worker from its spawn environment, which is where the
-        // available-VRAM figure is handed to it.
-        let _vram_budget = self.check_vram_budget(key, None, None)?;
+        // See `check_vram_budget`. Unlike `calibrate_slot_po2` there is no parameter to clamp: a
+        // risc0 benchmark proves at its card's job size (`benchmark_po2`), so it must find that
+        // size's free-VRAM floor on the card, as a job does. Run beside memory already in use on the
+        // card without it, a 5080 benchmark took 280 s for a 14 s STARK and saved a rate 15 times too
+        // low, which sent every later job elsewhere. Refused here, typed, and waited out by
+        // `after_spills`; a card still short after that gets no row, so nothing is saved.
+        let po2 = self.benchmark_po2(key);
+        let _vram_budget = self.check_vram_budget(key, None, po2)?;
 
         let entry = self
             .workers
@@ -7650,7 +7680,6 @@ impl WorkerPool {
             self.gpu_spills.clone(),
         );
 
-        let po2 = self.benchmark_po2(key);
         let requests =
             Self::run_benchmark_requests(handle, key, po2, &cb, &warmed, &|| clock.touch());
         slot.note_used(UseKind::Other);
@@ -12045,16 +12074,41 @@ impl WorkerPool {
     /// gone (a game, a render, a model loaded for a moment) by a later try. Once it has been seen,
     /// a run refused for lack of room beside another program's memory is waited out the same way
     /// rather than ending the measurement. Not once the pool is closing.
+    ///
+    /// `wait_for_room`: a run refused for lack of room beside memory already in use on the card is
+    /// waited out from the FIRST refusal, with a growing pause ([`room_wait`]), not only after a
+    /// spill (a benchmark, whose size is its card's job size and is not lowered to fit). Still
+    /// refused at the last attempt, that refusal is the answer: the slot gets no row this run, so no
+    /// rate measured beside that memory is saved.
     fn after_spills<T>(
         &self,
         key: &str,
         what: &str,
+        wait_for_room: bool,
         mut run: impl FnMut() -> Result<T>,
     ) -> Result<T> {
         let mut attempt = 1;
         let mut disturbed = false;
         loop {
             match run() {
+                Err(e)
+                    if wait_for_room
+                        && !disturbed
+                        && attempt < SPILL_RUN_ATTEMPTS
+                        && refused_for_another_programs_memory(&e)
+                        && !self.closing.load(Ordering::Relaxed) =>
+                {
+                    let pause = room_wait(attempt);
+                    tracing::warn!(
+                        "{key}: card busy ({}); memory already in use on the card leaves too little \
+                         room for the {what}; trying again in {}s (attempt {}/{SPILL_RUN_ATTEMPTS})",
+                        card_busy(&e),
+                        pause.as_secs(),
+                        attempt + 1
+                    );
+                    std::thread::sleep(pause);
+                    attempt += 1;
+                }
                 Err(e)
                     if attempt < SPILL_RUN_ATTEMPTS
                         && (stopped_by_a_spill(&e)
@@ -12074,6 +12128,15 @@ impl WorkerPool {
                 // Sized down after running out of memory: measured again at once, at the new size.
                 Err(e) if attempt < SPILL_RUN_ATTEMPTS && e.is::<BenchmarkLowered>() => {
                     attempt += 1;
+                }
+                Err(e) if wait_for_room && refused_for_another_programs_memory(&e) => {
+                    tracing::warn!(
+                        "{key}: not measured: card still busy ({}) after {attempt} attempts; memory \
+                         already in use on the card leaves too little room for the {what}, and no \
+                         rate is saved for this card this run",
+                        card_busy(&e)
+                    );
+                    return Err(e);
                 }
                 outcome => return outcome,
             }
@@ -13323,8 +13386,8 @@ impl WorkerPool {
         key: &str,
         abort_at: Option<Instant>,
         // The segment size of the risc0 proof about to run here, for its free-VRAM floor
-        // (`discovery::risc0_proof_vram_bytes`). `None`: no floor (a benchmark or
-        // calibration, which pick their own sizes, or another backend).
+        // (`discovery::risc0_proof_vram_bytes`): a job's, or a benchmark's (`benchmark_po2`).
+        // `None`: no floor (a calibration, which sizes itself to what is free, or another backend).
         risc0_po2: Option<u8>,
     ) -> Result<Option<VramBudget>> {
         let backend = key.split(':').next().unwrap_or(key);
@@ -17232,7 +17295,7 @@ mod tests {
             })
         };
         let runs = std::cell::Cell::new(0);
-        let r = pool.after_spills("risc0:cuda:1", "benchmark", || {
+        let r = pool.after_spills("risc0:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             if runs.get() < 3 {
                 Err(spilled())
@@ -17244,7 +17307,7 @@ mod tests {
         assert_eq!(runs.get(), 3);
         // Still spilled at the last attempt: that error is the answer.
         runs.set(0);
-        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             Err(spilled())
         });
@@ -17252,7 +17315,7 @@ mod tests {
         assert_eq!(runs.get(), SPILL_RUN_ATTEMPTS);
         // Any other failure, and an admission refusal (nothing evicted), is not measured again.
         runs.set(0);
-        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             Err(anyhow::anyhow!("worker died"))
         });
@@ -17272,7 +17335,7 @@ mod tests {
         // A run refused for another program's memory is waited out once a disturbance was seen,
         // but a refusal on the first run is the answer.
         runs.set(0);
-        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             match runs.get() {
                 1 => Err(spilled()),
@@ -17294,7 +17357,7 @@ mod tests {
         assert_eq!(r.unwrap(), 9);
         assert_eq!(runs.get(), 4);
         runs.set(0);
-        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             Err(anyhow::Error::new(
                 zkminer_prover_protocol::types::GpuMemoryShortage {
@@ -17314,12 +17377,129 @@ mod tests {
         // Nor once the pool is closing.
         pool.closing.store(true, Ordering::Relaxed);
         runs.set(0);
-        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", || {
+        let r: Result<()> = pool.after_spills("risc0:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             Err(spilled())
         });
         assert!(r.is_err());
         assert_eq!(runs.get(), 1);
+    }
+
+    /// A benchmark refused for lack of room beside memory already in use on the card is waited out
+    /// from its first refusal, with a growing pause, and measured once there is room; still refused
+    /// at the last attempt, the refusal is the answer (the slot gets no row, so nothing is saved).
+    /// Room ours to make, a spill and any other failure keep their own handling.
+    #[test]
+    fn a_benchmark_waits_for_room_on_a_busy_card_and_saves_nothing_without_it() {
+        let pool = pool_with_keys(&["risc0:cuda:1"]);
+        let short = |ours: bool| {
+            anyhow::Error::new(zkminer_prover_protocol::types::GpuMemoryShortage {
+                slot_key: "risc0:cuda:1".into(),
+                foreign_bytes: 5 << 30,
+                sibling_bytes: 0,
+                available_bytes: 10 << 30,
+                needed_bytes: Some(12 << 30),
+                ours_in_the_way: ours,
+                total_bytes: 16 << 30,
+                evicted_bytes: 0,
+            })
+        };
+        assert_eq!(card_busy(&short(false)), "10.0 GiB free, need 12.0 GiB");
+        // Room comes back before the last attempt: measured then.
+        let runs = std::cell::Cell::new(0);
+        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", true, || {
+            runs.set(runs.get() + 1);
+            if runs.get() < 3 {
+                Err(short(false))
+            } else {
+                Ok(5)
+            }
+        });
+        assert_eq!(r.unwrap(), 5);
+        assert_eq!(runs.get(), 3);
+        // Never any room: SPILL_RUN_ATTEMPTS runs, then the refusal itself.
+        runs.set(0);
+        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", true, || {
+            runs.set(runs.get() + 1);
+            Err(short(false))
+        });
+        assert!(refused_for_another_programs_memory(&r.unwrap_err()));
+        assert_eq!(runs.get(), SPILL_RUN_ATTEMPTS);
+        // Room ours to make is not waited for here (it is where it arises), nor is another failure.
+        let others: [fn() -> anyhow::Error; 2] = [short_ours, || anyhow::anyhow!("worker died")];
+        for err in others {
+            runs.set(0);
+            let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", true, || {
+                runs.set(runs.get() + 1);
+                Err(err())
+            });
+            assert!(r.is_err());
+            assert_eq!(runs.get(), 1);
+        }
+        // Without `wait_for_room` (a calibration, which sizes itself down), the first refusal is
+        // still the answer.
+        runs.set(0);
+        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "calibration", false, || {
+            runs.set(runs.get() + 1);
+            Err(short(false))
+        });
+        assert!(r.is_err());
+        assert_eq!(runs.get(), 1);
+        // Nor once the pool is closing.
+        pool.closing.store(true, Ordering::Relaxed);
+        runs.set(0);
+        let r: Result<u32> = pool.after_spills("risc0:cuda:1", "benchmark", true, || {
+            runs.set(runs.get() + 1);
+            Err(short(false))
+        });
+        assert!(r.is_err());
+        assert_eq!(runs.get(), 1);
+        // 30, 60 and 90 s outside the tests: three minutes before a card is left without a row.
+        assert_eq!(room_wait(1), SPILL_RETRY_AFTER);
+        assert_eq!(room_wait(3), SPILL_RETRY_AFTER * 3);
+        fn short_ours() -> anyhow::Error {
+            anyhow::Error::new(zkminer_prover_protocol::types::GpuMemoryShortage {
+                slot_key: "risc0:cuda:1".into(),
+                foreign_bytes: 0,
+                sibling_bytes: 5 << 30,
+                available_bytes: 10 << 30,
+                needed_bytes: Some(12 << 30),
+                ours_in_the_way: true,
+                total_bytes: 16 << 30,
+                evicted_bytes: 0,
+            })
+        }
+    }
+
+    /// Both benchmark paths check their card's free VRAM at the size they prove at, as a job does,
+    /// and are waited out for room; the calibration sizes itself to what is free instead.
+    #[test]
+    fn a_benchmark_checks_the_free_vram_its_size_needs() {
+        let src = include_str!("dispatcher.rs")
+            .split_once("\n#[cfg(test)]")
+            .unwrap()
+            .0;
+        let body = |header: &str| {
+            let start = src.find(header).unwrap_or_else(|| panic!("{header}"));
+            let rest = &src[start..];
+            &rest[..rest.find("\n    }\n").unwrap()]
+        };
+        for f in [
+            "    fn benchmark_slot_once(",
+            "    fn benchmark_slot_streaming_once(",
+        ] {
+            let b = body(f);
+            let po2 = b.find("let po2 = self.benchmark_po2(key);").expect(f);
+            let gate = b
+                .find("let _vram_budget = self.check_vram_budget(key, None, po2)?;")
+                .expect(f);
+            let run = b.find("Self::run_benchmark_requests(").expect(f);
+            assert!(po2 < gate && gate < run, "{f}");
+        }
+        let waits = "\"benchmark\", true,";
+        assert!(body("    fn benchmark_slot(&self").contains(waits));
+        assert!(body("    fn benchmark_slot_streaming(\n").contains(waits));
+        assert!(body("    pub fn calibrate_slot_po2(").contains("\"calibration\", false,"));
     }
 
     /// Every path that measures a rate the miner saves watches for spills and drops a run the
@@ -17347,7 +17527,7 @@ mod tests {
         for (wrapper, call) in [
             (
                 "    fn benchmark_slot(&self",
-                "self.after_spills(key, \"benchmark\", || self.benchmark_slot_once(key))",
+                "self.after_spills(key, \"benchmark\", true, || self.benchmark_slot_once(key))",
             ),
             (
                 "    fn benchmark_slot_streaming(
@@ -17425,7 +17605,7 @@ mod tests {
         // And a lowering is measured again at once, but only within the attempts.
         let pool = pool_with_keys(&["sp1:cuda:1"]);
         let runs = std::cell::Cell::new(0);
-        let r: Result<()> = pool.after_spills("sp1:cuda:1", "benchmark", || {
+        let r: Result<()> = pool.after_spills("sp1:cuda:1", "benchmark", false, || {
             runs.set(runs.get() + 1);
             Err(anyhow::Error::new(BenchmarkLowered {
                 slot_key: "sp1:cuda:1".to_string(),
