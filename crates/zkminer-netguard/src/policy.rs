@@ -868,11 +868,13 @@ impl FactsCell {
     }
 }
 
-/// Why public mode admits nothing on this platform, where it cannot work: the kernel's route for
-/// each destination ([`crate::KernelRoutes`]), the routing table and the near-hop probes' ICMP
-/// errors are read on Linux, Android, macOS and Windows only. Elsewhere (the BSDs) the guard
-/// fails closed: every requester-caused connection is refused, so ELF, IPFS and Arweave
-/// downloads and `artifact publish` cannot work. `None` where public mode works.
+/// Why public mode admits nothing on this platform, where the guard cannot read routes: the
+/// kernel's route for each destination ([`crate::KernelRoutes`]) and the routing table are read on
+/// Linux, Android, macOS and Windows only. Elsewhere (the BSDs) the guard fails closed: every
+/// requester-caused connection is refused, so ELF, IPFS and Arweave downloads and `artifact
+/// publish` cannot work. `None` where routes are read. Windows reads routes but still cannot run
+/// public mode: its near-hop check never finds a public destination far, so it refuses each one
+/// ([`crate::nearhop::supported`] says why, at start and in `zkminer status`).
 pub fn public_mode_unsupported() -> Option<&'static str> {
     if cfg!(any(
         target_os = "linux",
@@ -885,8 +887,8 @@ pub fn public_mode_unsupported() -> Option<&'static str> {
         Some(
             "public mode cannot work on this platform: the network guard reads routes and probes \
              destinations on Linux, macOS and Windows only, so it refuses every requester-caused \
-             connection here (ELF, IPFS and Arweave downloads, artifact publish). Run the miner \
-             on Linux, macOS or Windows",
+             connection here (ELF, IPFS and Arweave downloads, artifact publish). Run public \
+             mode on Linux or macOS",
         )
     }
 }

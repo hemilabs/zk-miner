@@ -1070,6 +1070,32 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
              nothing)",
         );
     }
+    if let Some((level, detail)) = near_hop_finding(
+        config.dev.private_network,
+        zkminer_chain::programs::near_hop_supported(),
+    ) {
+        report.say(level, "network guard", detail);
+    }
+}
+
+/// Whether the network guard's near-hop check can work here (public mode only: developer mode
+/// does not run it). Where it cannot (Windows), every requester connection is refused: ELF, IPFS
+/// and Arweave downloads and `artifact publish`.
+fn near_hop_finding(
+    private_network: bool,
+    supported: Result<(), String>,
+) -> Option<(Level, String)> {
+    match supported {
+        Ok(()) => None,
+        Err(_) if private_network => None,
+        Err(why) => Some((
+            Level::Warn,
+            format!(
+                "public mode refuses every requester connection on this host (ELF, IPFS and \
+                 Arweave downloads, artifact publish): {why}"
+            ),
+        )),
+    }
 }
 
 /// Windows: the services that run this miner, as a service logon will find them (review 6 OJ-1):
@@ -1540,6 +1566,22 @@ mod tests {
     }
 
     /// The RPC URL is shown by host only: providers put API keys in the path or query.
+    #[test]
+    fn doctor_says_when_public_mode_refuses_every_requester_connection() {
+        assert!(near_hop_finding(false, Ok(())).is_none());
+        assert!(near_hop_finding(true, Err("no".into())).is_none());
+        let (level, detail) = near_hop_finding(false, Err("why".into())).unwrap();
+        assert!(matches!(level, Level::Warn));
+        assert!(
+            detail.contains("refuses every requester connection"),
+            "{detail}"
+        );
+        assert!(detail.ends_with(": why"), "{detail}");
+        // This host's own answer: Windows cannot run public mode.
+        let here = near_hop_finding(false, zkminer_chain::programs::near_hop_supported());
+        assert_eq!(here.is_some(), cfg!(windows));
+    }
+
     #[test]
     fn rpc_urls_lose_their_secrets() {
         assert_eq!(

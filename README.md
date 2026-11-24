@@ -551,8 +551,9 @@ policy-routing rules; its interface-scoped routes (netstat's `I` flag, such as t
 routes nor uplinks, and a connection whose socket would leave by another interface than its
 route names (a Network Extension VPN) is refused. A `utun` or `ppp` default route needs
 `[egress] internal_ranges`, as a tunnel does on Linux. Details and residual differences:
-[docs/netguard-macos.md](docs/netguard-macos.md). Windows still refuses every requester
-connection in public mode (no route oracle there).
+[docs/netguard-macos.md](docs/netguard-macos.md). Public mode is not supported on Windows: its TCP
+never reports a router's "time exceeded", so every requester connection is refused there (said
+at start and in `zkminer status`); run public mode on Linux or macOS.
 
 *Troubleshooting (macOS):* if every requester connection is refused with `this host's network
 facts ... could not be read again`, the message names what failed. A file in `/etc/resolver`

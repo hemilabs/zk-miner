@@ -240,9 +240,10 @@ Every connection a requester can cause goes through one guard
   (measured on Windows 11 with `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO`: every
   hop-limited SYN to a public host times out, though `tracert` shows the routers answer), so
   every decision there refuses: ELF, IPFS and Arweave downloads and `artifact publish` cannot
-  work. The miner says so at start and in `zkminer status`. On Windows use developer mode
-  (`[dev] private_network`) for a testnet or a local chain, or run public mode on Linux or
-  macOS. See "The near-hop probe's own limits" below and
+  work, and each is refused at once with that reason. The miner says so at start and in
+  `zkminer status`. Run public mode on Linux or macOS. Developer mode (`[dev]
+  private_network`) is no substitute on a shared market, the Hemi testnet included: it lets
+  every requester reach this host's network (below). See "The near-hop probe's own limits" below and
   [docs/netguard-hardening.md](docs/netguard-hardening.md), "Near-hop rule: positive evidence".
 - **Host-name hygiene** before any lookup: single-label names, `localhost` and `*.localhost`,
   and names under `local`, `internal` (`metadata.google.internal`), `lan`, `home`, `arpa`

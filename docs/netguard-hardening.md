@@ -209,8 +209,9 @@ everywhere are listed per item, and six nearhop tests lost their `_on_macos` suf
 and `Nat64Unsettled`, NAT64 per uplink with the ordered servers, the probe asked twice and
 unmapped, the post-connect check in the guarded client, the admit loops off the runtime, and the
 check-connection stub's message ("Linux and macOS only"; since the S3 review every near-hop
-decision on Windows refuses, for want of a way to read the routers' ICMP errors). Windows still refuses every requester
-connection in public mode (it has no route oracle), so none of these changes what it admits.
+decision on Windows refuses, for want of a way to read the routers' ICMP errors). (At the time Windows refused every requester
+connection in public mode for want of a route oracle; it has one since, and still refuses every
+one, for want of the ICMP errors: public mode is unsupported there.)
 
 **Mutation run.** `fix-linux/mut/run.py` and `muts.py`, on macOS over a copy of the branch:
 38 mutants of the decisions this application shares or adds (L01 to L38: the grace, the verdict
@@ -428,7 +429,9 @@ signature (parsed from built messages; the compat-0 repro ran the route side); A
   while an unprivileged `tracert` from the same host gets each router's Time Exceeded (so the
   firewall is not withholding it). Every public host is refused there; `nearhop::supported()`
   now says so, at start and in `zkminer status`, and public mode is documented as unsupported
-  on Windows (`[dev] private_network` for a testnet). A different evidence source, such as an
+  on Windows (run it on Linux or macOS; `[dev] private_network` is for a local test chain, not
+  a shared market). Each public address is refused at once with that reason, nothing sent
+  (`TtlProbe::round`). A different evidence source, such as an
   unprivileged `IcmpSendEcho2Ex` with a TTL, would need its own review.
 - **CLAT detection** is by address and interface name; a CLAT numbered otherwise is not seen
   (its host then admits `<NSP>::10.x` until the prefix is learned, as before).
@@ -684,8 +687,8 @@ past the limit said the probe ran out of hops), never on silence."
   socket failed with `EHOSTUNREACH` / `ENETUNREACH`; late copies are drained for 30 ms. A Mac
   where the ICMP socket or `TCP_INFO` cannot be read refuses everything (warned once at
   startup). An error `connect` reports at once (Local Network privacy, a Network Extension
-  policy) is a local failure, never evidence. **Windows:** no implementation; every decision
-  refuses (it already refused every requester connection in public mode).
+  policy) is a local failure, never evidence. **Windows:** the probe sets
+  `TCP_FAIL_CONNECT_ON_ICMP_ERROR` and reads `TCP_ICMP_ERROR_INFO`, but every decision refuses.
   `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` were measured since on Windows 11
   and give nothing for a Time Exceeded; it fails closed, and says so.
 

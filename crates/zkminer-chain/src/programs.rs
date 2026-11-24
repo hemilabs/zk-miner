@@ -91,6 +91,13 @@ pub struct ElfFetcher {
     client: GuardedClient,
 }
 
+/// Whether the network guard's near-hop check can work on this host, or why not (Windows: its TCP
+/// never reports a router's time exceeded). Where it cannot, public mode refuses every requester
+/// connection; `zkminer doctor` says so without connecting to a chain.
+pub fn near_hop_supported() -> Result<(), String> {
+    zkminer_netguard::nearhop::supported()
+}
+
 impl ElfFetcher {
     /// A fetcher under `config`'s network mode, deny CIDRs and `[egress]` facts options, over this
     /// host's facts (own and public addresses, connected and site prefixes, DNS servers, routing

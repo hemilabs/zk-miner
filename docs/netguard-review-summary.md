@@ -79,9 +79,10 @@ their round and are covered (the live forge test; the NAT64 caps).
   systemd-networkd's or NetworkManager's own RA handling); a CLAT is recognised by address, name
   or a tun device; an ARP spoofer on the LAN still costs IPv4 one relearning (fail-closed); a
   real IPv6-only host, a real CLAT and Android never ran.
-- **Windows**: no way to read the routers' ICMP errors yet, so every near-hop decision refuses
-  (as every requester connection in public mode already was);
-  `TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO` are unverified.
+- **Windows**: public mode is unsupported. Routes are read, but Windows TCP never reports a
+  router's Time Exceeded (`TCP_FAIL_CONNECT_ON_ICMP_ERROR` / `TCP_ICMP_ERROR_INFO`, measured on
+  Windows 11), so the near-hop check finds no public destination far and refuses each one at once
+  (said at start, in `zkminer status` and in `zkminer doctor`).
 - **macOS**: the near-hop rule rests on a private `TCP_INFO` layout (the probe's initial sequence
   number); a macOS where it cannot be read refuses every requester connection.
 - **All**: an attacker on the link who keeps forging RAs or DNS64 answers keeps IPv6 refused while

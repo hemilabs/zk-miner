@@ -84,10 +84,11 @@
 //! hosts all time out, while an unprivileged `tracert` from the same host, and the ICMPv6
 //! firewall rule, show the routers do answer: the firewall is not the cause), so every probe ends
 //! in silence and every decision refuses. [`supported`] therefore reports Windows as unable to
-//! run public mode, said at start and in `zkminer status`; use `[dev] private_network` for a
-//! testnet or a local chain. A new evidence source (an ICMP echo with a hop limit, say) needs its
-//! own review. There is no interface pin on Windows; the probes and the connection share the
-//! source address.
+//! run public mode, said at start and in `zkminer status`: run public mode on Linux or macOS
+//! (`[dev] private_network` is for a local test chain only, never a shared market). Each public
+//! address is refused at once, nothing sent ([`TtlProbe`]); a local one is still probed. A new
+//! evidence source (an ICMP echo with a hop limit, say) needs its own review. There is no
+//! interface pin on Windows; the probes and the connection share the source address.
 //!
 //! **What it cannot help:** a probe that connects still reaches a near host (a SYN, a handshake,
 //! a reset; never data) before the refusal; a transparent proxy within the limit answers for every
@@ -390,6 +391,13 @@ impl NearProbe for TtlProbe {
         if wait.is_zero() {
             return Err(OUT_OF_TIME.into());
         }
+        // Windows: TCP never reports the Time Exceeded the rule needs ([`supported`]), so a round
+        // to a public address could only time out and be refused as silence. Refuse it at once,
+        // with the reason, and send nothing. (A local address is still probed: it answers, near.)
+        #[cfg(windows)]
+        if crate::is_global(addr.ip()) {
+            return Err(WINDOWS_REFUSED.into());
+        }
         observe(addr, hops, extra, pin, wait)
     }
 }
@@ -408,8 +416,8 @@ pub fn warn_if_unsupported() {
     ONCE.call_once(|| {
         if let Err(why) = supported() {
             tracing::warn!(
-                "network guard: the near-hop check cannot read ICMP errors on this host ({why}): \
-                 every requester connection will be refused"
+                "network guard: the near-hop check cannot work on this host, so every requester \
+                 connection will be refused: {why}"
             );
         }
     });
@@ -1810,10 +1818,16 @@ mod win {
 /// Why no destination is found far on Windows ([`supported`]).
 #[cfg(windows)]
 const WINDOWS_NO_TIME_EXCEEDED: &str = "Windows TCP does not report a router's ICMP time exceeded \
-     to a connecting socket (TCP_FAIL_CONNECT_ON_ICMP_ERROR ends a connect on destination \
-     unreachable only), so the near-hop check never finds a destination far: public mode \
-     refuses every requester connection on Windows (ELF, IPFS and Arweave downloads, artifact \
-     publish)";
+     to a connecting socket (with or without TCP_FAIL_CONNECT_ON_ICMP_ERROR), so the near-hop \
+     check never finds a destination far: public mode refuses every requester connection on \
+     Windows (ELF, IPFS and Arweave downloads, artifact publish). Run public mode on Linux or \
+     macOS; `[dev] private_network` is for a local test chain only, never a shared market (it lets requesters reach this host's network)";
+
+/// The near-hop check's refusal of a public address on Windows ([`TtlProbe::round`]): short, as
+/// a round's failure is quoted in at most 160 characters.
+#[cfg(windows)]
+const WINDOWS_REFUSED: &str = "public mode is not supported on Windows: its TCP never reports a \
+     router's time exceeded, so the near-hop check finds nothing far (see `zkminer status`)";
 
 /// Why no destination is found far on this platform.
 #[cfg(not(any(
@@ -2159,6 +2173,22 @@ mod tests {
         let v = decide(&TtlProbe, addr, 2);
         assert!(refused(&v), "{v:?}");
     }
+
+    /// Windows: a public address is refused at once, with the reason, and nothing is sent (no
+    /// round could find it far there: [`supported`]).
+    #[cfg(windows)]
+    #[test]
+    fn a_public_address_is_refused_at_once_on_windows() {
+        let addr: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let t = Instant::now();
+        let v = decide(&TtlProbe, addr, 2);
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(
+            matches!(&v, Verdict::Failed(w) if w == WINDOWS_REFUSED),
+            "{v:?}"
+        );
+    }
+
     /// The S3 review's lab cases (rounds 1-3: `S3REV/r1-measure`, `r2-evidence/lab2.sh`,
     /// `r3-evidence`), as the observations they produced, through the decision. Topology: the
     /// miner, r1 (hop 1), the near host or r2 (hop 2), the far host or r3 (hop 3), far4 (hop 4);
