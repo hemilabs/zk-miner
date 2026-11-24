@@ -53,7 +53,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show prover status (held locks, recent pages, balance, stake, stats). Exits 2 while a page
-    /// is unacknowledged or locks are held with no miner running to drive them.
+    /// is unacknowledged, locks are held with no miner running to drive them, or the slash latch is
+    /// tripped (no new claims until it is cleared).
     Status {
         /// Acknowledge the pages shown (`~/.zkminer/logs/pages.log`): they no longer make the
         /// exit code 2
@@ -602,7 +603,25 @@ impl Early {
     }
 }
 
-fn main() -> Result<()> {
+/// Runs the command; an error it returns is printed as `main -> Result` would print it, but with
+/// every URL cut to its scheme and host: an RPC client's error embeds the request URL, and an
+/// operator's RPC URL carries its API key in the path, the query or the userinfo.
+fn main() -> std::process::ExitCode {
+    match run_cli() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {}", main_error_text(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// What [`main`] prints for an error: its chain (`{:?}`), URLs redacted.
+fn main_error_text(e: &anyhow::Error) -> String {
+    commands::simulate::redact_urls(&format!("{e:?}"))
+}
+
+fn run_cli() -> Result<()> {
     // The miner holds the operator's signing key. Non-dumpable, its `/proc/<pid>` entries belong to
     // root, so no other process of this uid can read its memory or environment (`mem`, `environ`,
     // `maps`, `fd`), whatever the host's `ptrace_scope`, and it leaves no core dump. Its own reads of
@@ -622,7 +641,8 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     if let Err(e) = zkminer_prover::windows_sandbox::lock_down_this_process() {
         eprintln!(
-            "warning: the miner's process could not be locked to this user ({e}): other processes              of this user can read its memory"
+            "warning: the miner's process could not be locked to this user ({e}): other processes \
+             of this user can read its memory"
         );
     }
     // Windows Error Reporting cannot open the locked-down process, so a crash would hang it: record
@@ -1190,6 +1210,21 @@ fn simulate_bound(flag: &str, secs: u64) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start-up error that embeds the RPC URL (the API key in its path, query or userinfo) is
+    /// printed with the URL cut to its scheme and host, its context chain kept.
+    #[test]
+    fn a_startup_error_never_prints_the_rpc_urls_key() {
+        let e = anyhow::anyhow!(
+            "error sending request for url (https://user:pw@rpc.example.com/v2/SECRETKEY?key=SECRET2)"
+        )
+        .context("reading the chain ID");
+        let text = main_error_text(&e);
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(!text.contains("pw"), "{text}");
+        assert!(text.contains("https://rpc.example.com/…"), "{text}");
+        assert!(text.contains("reading the chain ID"), "{text}");
+    }
 
     #[test]
     fn simulate_bounds_are_clamped_to_their_minimum() {
