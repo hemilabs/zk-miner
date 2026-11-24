@@ -3982,6 +3982,10 @@ pub struct WorkerPool {
     /// the card (`Po2Sample::vram_needed`), for `risc0_size_that_fits`. Published with the host-memory
     /// figures (`set_risc0_po2_samples`); a card missing from here proves at its own size, as before.
     risc0_po2_samples: Mutex<HashMap<String, Vec<crate::benchmark::Po2Sample>>>,
+    /// Each measured card's own host-memory budget, by (backend, benchmark device id): what a proof on
+    /// THAT card is charged at dispatch (`host_want`), where `expected_peaks` is the backend's worst
+    /// card, which the claim gate keeps (a claimed job must fit whichever card proves it).
+    expected_peaks_by_device: Mutex<HashMap<(String, String), u64>>,
     /// Host memory in-flight proofs have laid claim to. See `memory::MemoryLedger`.
     memory_ledger: crate::memory::MemoryLedger,
     /// Backends whose one-time setup has completed on this host; see `warm_up`.
@@ -4525,6 +4529,7 @@ impl WorkerPool {
             proof_tails: Arc::new(Mutex::new(HashMap::new())),
             commit_ledger: crate::memory::MemoryLedger::default(),
             risc0_po2_samples: Mutex::new(HashMap::new()),
+            expected_peaks_by_device: Mutex::new(HashMap::new()),
             memory_ledger: crate::memory::MemoryLedger::default(),
             warmed: Mutex::new(HashSet::new()),
             measure_warm_pids: Mutex::new(HashMap::new()),
@@ -10190,6 +10195,25 @@ impl WorkerPool {
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
         let ceiling = crate::memory::max_admissible_budget(total);
+        // Each measured card's own figure, for dispatch to the card it was measured on. SP1's host
+        // memory follows the card's shard tier: 31.9 GiB measured on an RTX 4090 against 37.7 on an RX
+        // 7900 XTX beside it (2026-11-24), each card's proofs peaking within 1% of its own figure or
+        // below it, which the budget's safety factor covers.
+        let by_device: HashMap<(String, String), u64> = suite
+            .device_benchmarks
+            .iter()
+            .filter(|d| d.device_id != crate::benchmark::CPU_DEVICE_ID)
+            .filter_map(|d| {
+                let measured = d.host_peak_bytes.filter(|&m| m > 0)?;
+                let budget =
+                    crate::memory::budget_from_measurement(measured, &d.prover_backend, total);
+                Some(((d.prover_backend.clone(), d.device_id.clone()), budget))
+            })
+            .collect();
+        *self
+            .expected_peaks_by_device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = by_device;
         let mut map = HashMap::new();
         for backend in ["risc0", "sp1", "openvm"] {
             map.insert(backend.to_string(), suite.expected_host_peak_bytes(backend));
@@ -10290,10 +10314,20 @@ impl WorkerPool {
         }
     }
 
-    /// What a proof at `po2` on the slot `key` is charged in host memory: what that card's real
-    /// proofs at this po2 or above reached (`memory::learned_host_peak`), else the published figure.
-    fn slot_host_peak(&self, key: &str, po2: Option<u8>) -> u64 {
+    /// The figure published for `key`'s own card at `po2` (`expected_host_peak_for_card`), else the
+    /// backend's (`published_host_peak_at_po2`).
+    fn published_card_host_peak_at_po2(&self, key: &str, po2: Option<u8>) -> u64 {
         let backend = key.split(':').next().unwrap_or(key);
+        match self.expected_host_peak_for_card(key) {
+            Some(base) => po2.map_or(base, |p| crate::memory::peak_for_po2(base, p)),
+            None => self.published_host_peak_at_po2(backend, po2),
+        }
+    }
+
+    /// What a proof at `po2` on the slot `key` is charged in host memory: what that card's real
+    /// proofs at this po2 or above reached (`memory::learned_host_peak`), else the figure published
+    /// for that card (`published_card_host_peak_at_po2`).
+    fn slot_host_peak(&self, key: &str, po2: Option<u8>) -> u64 {
         let learned = self
             .learned_peaks
             .lock()
@@ -10306,7 +10340,7 @@ impl WorkerPool {
                     crate::memory::mem_total_bytes().unwrap_or(u64::MAX),
                 )
             });
-        learned.unwrap_or_else(|| self.published_host_peak_at_po2(backend, po2))
+        learned.unwrap_or_else(|| self.published_card_host_peak_at_po2(key, po2))
     }
 
     /// The most a proof at `po2` is charged on any of `backend`'s cards (`slot_host_peak`), or the
@@ -10792,6 +10826,17 @@ impl WorkerPool {
                 self.slot_commit_peak(key, po2) as f64 / GIB,
             );
         }
+    }
+
+    /// The host-memory budget measured on `key`'s own card (see `expected_peaks_by_device`), or `None`
+    /// when that card was not measured: the backend's figure then stands.
+    fn expected_host_peak_for_card(&self, key: &str) -> Option<u64> {
+        let backend = key.split(':').next().unwrap_or(key);
+        self.expected_peaks_by_device
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(backend.to_string(), Self::benchmark_device_id(key)))
+            .copied()
     }
 
     /// As `expected_host_peak`, scaled to the segment size the proof will actually use.
@@ -17910,6 +17955,49 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Dispatch charges a proof its own card's measured host budget; the backend's worst card's figure
+    /// stands for a card measured nowhere.
+    #[test]
+    fn a_proof_is_charged_its_own_cards_host_budget() {
+        const GIB: u64 = 1 << 30;
+        let row = |device: &str, peak: Option<u64>| crate::benchmark::DeviceBenchmark {
+            device_id: device.to_string(),
+            device_label: String::new(),
+            prover_backend: "sp1".to_string(),
+            throughput: 1e6,
+            power_watts: 300.0,
+            optimal_po2: 20,
+            memory_usage_bytes: 0,
+            max_feasible_po2: 20,
+            program_throughputs: HashMap::new(),
+            po2_samples: Vec::new(),
+            program_stages: Vec::new(),
+            pci_bus_id: String::new(),
+            host_peak_bytes: peak,
+            benchmark_po2: None,
+            highest_proved_po2: None,
+        };
+        let rtx4090 = 31_900 << 20;
+        let rx7900 = 37_700 << 20;
+        let suite = crate::benchmark::BenchmarkSuite {
+            device_benchmarks: vec![row("gpu0", Some(rtx4090)), row("gpu-rocm0", Some(rx7900))],
+            host_peaks: HashMap::from([("sp1".to_string(), rx7900)]),
+            ..Default::default()
+        };
+        let pool = pool_with_keys(&["sp1:cuda:0", "sp1:rocm:0", "sp1:intel:0"]);
+        pool.set_expected_host_peaks(&suite);
+        let total = crate::memory::mem_total_bytes().unwrap_or(u64::MAX);
+        let budget = |m| crate::memory::budget_from_measurement(m, "sp1", total);
+        assert_eq!(pool.host_want("sp1:cuda:0", None, 0), budget(rtx4090));
+        assert_eq!(pool.host_want("sp1:rocm:0", None, 0), budget(rx7900));
+        assert_eq!(
+            pool.host_want("sp1:intel:0", None, 0),
+            pool.expected_host_peak("sp1"),
+            "an unmeasured card: the backend's worst"
+        );
+        assert!(budget(rtx4090) < budget(rx7900) || total < 64 * GIB);
     }
 
     /// A job falls back to a smaller size it was measured at only when the card has less room than the

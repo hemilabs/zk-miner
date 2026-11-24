@@ -2083,11 +2083,33 @@ pub fn budget_from_measurement(measured: u64, backend: &str, host_total: u64) ->
     let base = if measured < MIN_TRUSTED_PEAK_BYTES {
         unmeasured_peak_for(backend)
     } else {
-        measured
-            .saturating_mul(MEASUREMENT_SAFETY_FACTOR)
-            .max(unmeasured_peak_for(backend))
+        scaled_measurement(measured, backend).max(unmeasured_peak_for(backend))
     };
     base.min(max_admissible_budget(host_total))
+}
+
+/// SP1's own safety factor over its measured host peak, in percent, instead of
+/// [`MEASUREMENT_SAFETY_FACTOR`].
+///
+/// The doubling answers a measurement that can under-state a job: a smaller workload, a different
+/// segment size. Neither holds for SP1, whose host memory follows its shard tier (which the benchmark
+/// runs at, on the same host) rather than the job: measured in each worker's cgroup (worker, server and
+/// their memfd staging) on an RTX 4090 (2026-11-24), a 4.3M-cycle job peaked at 24.7 GiB, a 170M one at
+/// 29.4 and a 1.7e9-cycle one at 30.6, against 31.9 GiB the benchmark measured on that card; 1.7e9-cycle
+/// jobs peaked at 36.4 GiB on an RX 7900 XTX (benchmark 37.7) and 30.5 on an Arc Pro B70 (benchmark
+/// 30.2, the one job above its card's figure, by 1%: the quarter covers that). Doubled, the worst card's
+/// 37.7 charged every SP1 proof 75 GiB, so on a 158 GiB host the fastest card's SP1 slot never fit
+/// beside two other SP1 proofs: 0 of its proofs in two mining runs, every one "waiting for host RAM"
+/// with 42-51 GiB available.
+pub const SP1_MEASUREMENT_SAFETY_PERCENT: u64 = 125;
+
+/// A measured host peak with its backend's safety factor applied (see [`budget_from_measurement`]).
+pub fn scaled_measurement(measured: u64, backend: &str) -> u64 {
+    if backend == zkminer_prover_protocol::BACKEND_SP1 {
+        measured.saturating_mul(SP1_MEASUREMENT_SAFETY_PERCENT) / 100
+    } else {
+        measured.saturating_mul(MEASUREMENT_SAFETY_FACTOR)
+    }
 }
 
 /// Running total of host memory that in-flight proofs have laid claim to.
@@ -3348,6 +3370,35 @@ mod budget_tests {
             scaled_concurrency * 2 <= unscaled_concurrency,
             "scaling must materially reduce admitted concurrency: {scaled_concurrency} vs \
              {unscaled_concurrency}"
+        );
+    }
+
+    /// SP1's host memory follows its shard tier, which its benchmark runs at, so its measurement is
+    /// scaled by a quarter, not doubled: the 7900 XTX's 37.7 GiB charges 47 GiB, not 75, and three SP1
+    /// proofs (30-31 GiB each, measured) fit on a 158 GiB host as the ledger sees them.
+    #[test]
+    fn an_sp1_measurement_is_scaled_by_its_own_factor() {
+        let big = 512 * GIB;
+        let xtx = 37_700 * 1024 * 1024;
+        assert_eq!(budget_from_measurement(xtx, "sp1", big), xtx * 5 / 4);
+        assert_eq!(budget_from_measurement(xtx, "risc0", big), xtx * 2);
+        // Still never below knowing nothing.
+        assert_eq!(
+            budget_from_measurement(12 * GIB, "sp1", big),
+            unmeasured_peak_for("sp1")
+        );
+        let host = 158 * GIB;
+        let budget = budget_from_measurement(xtx, "sp1", host);
+        assert!(
+            can_admit(
+                budget,
+                0,
+                2 * budget,
+                60 * GIB,
+                host,
+                DEFAULT_HOST_RESERVE_BYTES
+            ),
+            "a third SP1 proof beside two in flight on a 158 GiB host"
         );
     }
 
