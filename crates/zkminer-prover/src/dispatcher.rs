@@ -6690,7 +6690,8 @@ impl WorkerPool {
             .ok_or_else(|| anyhow::anyhow!("No worker registered for '{key}'"))?;
         let mut slot = entry.slot.lock().unwrap_or_else(|e| {
             tracing::warn!(
-                "worker slot {key} was poisoned by an earlier panic; recovering it rather                      than retiring the slot"
+                "worker slot {key} was poisoned by an earlier panic; recovering it rather \
+                 than retiring the slot"
             );
             e.into_inner()
         });
@@ -10965,7 +10966,8 @@ impl WorkerPool {
             }
             if crate::memory::terminate_if_our_worker(pid, Some(start)) {
                 tracing::warn!(
-                    "preempted in-flight measurement {key} (pid {pid}) to free resources for a                      claimed proof"
+                    "preempted in-flight measurement {key} (pid {pid}) to free resources for a \
+                     claimed proof"
                 );
                 true
             } else {

@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 ///   skew within one protocol version.
 ///   14 (W10-INT, never on main): the union of both lines, `power_state` and risc0 3.1 with main's
 ///   12 and 13. Main's own 14 (below) is a different wire; this beta number was retired at 17.
+///
 /// 14: witness-construction jobs (plan §15.3). `Prove` gained `witness` ([`WitnessProve`]): the input
 /// is `prefix ‖ W`, read by the worker from a file and checked against the bundle's length and
 /// `sha256(prefix ‖ W)` (a mismatch is the new [`ErrorKind::InputMismatch`]), executed once with its

@@ -953,8 +953,10 @@ fn host_checks(report: &mut Report, config: &ZkMinerConfig) {
     // Disk: the first proof downloads the zkVMs' artifacts.
     let user_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let fetched = |dir: &str| user_home.join(dir).is_dir();
+    // A Mac proves risc0 only (Metal): nothing is fetched into ~/.sp1 there.
     let missing: Vec<&str> = [".risc0", ".sp1"]
         .into_iter()
+        .filter(|d| !(cfg!(target_os = "macos") && *d == ".sp1"))
         .filter(|d| !fetched(d))
         .collect();
     match free_bytes(&user_home) {
