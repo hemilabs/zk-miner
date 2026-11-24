@@ -1723,6 +1723,9 @@ struct Miner {
     lines: Arc<Mutex<Vec<String>>>,
     /// Its HOME, which holds its log.
     dir: PathBuf,
+    /// Started with `--watch-only`, which takes no stop request on Windows (see `stop`).
+    #[cfg(windows)]
+    watch_only: bool,
 }
 
 impl Miner {
@@ -1765,6 +1768,8 @@ impl Miner {
             child,
             lines,
             dir: dir.to_path_buf(),
+            #[cfg(windows)]
+            watch_only: args.contains(&"--watch-only"),
         }
     }
 
@@ -1867,6 +1872,17 @@ impl Miner {
         }
         #[cfg(unix)]
         signal(&self.child, libc::SIGINT);
+        // Windows, watch-only: it takes no stop request (it holds no instance lock and may run
+        // beside the real miner, so `run.rs` starts no stop watcher for it), and there is no
+        // signal to send. It holds nothing and sends nothing, so it is ended, and that counts as
+        // its clean exit.
+        #[cfg(windows)]
+        if self.watch_only {
+            use std::os::windows::process::ExitStatusExt;
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            return Some(ExitStatus::from_raw(0));
+        }
         // Windows: `zkminer stop` (drain) through its request file, which a headless miner polls.
         #[cfg(windows)]
         std::fs::write(self.dir.join(".zkminer").join("stop-request"), "drain")
@@ -2022,7 +2038,15 @@ async fn watch_and_check(
         for job in &world.jobs {
             let verdicts = watch_lines(&lines, job.id);
             let want = job.case.inspector_verdict(staked);
-            if !verdicts.iter().any(|v| v.contains(&want)) {
+            // A wrong-journal job may instead be reported as dropped at measure: the measurement
+            // that finds the binding failed also marks the job undecodable
+            // (`mark_job_undecodable`), and an inspection that loses the race to it reads no
+            // measurement and reports the drop. Both refuse the job for good; neither claims it.
+            let dropped = matches!(job.case, Case::FullWrongJournal | Case::FieldsWrongJournal)
+                && verdicts
+                    .iter()
+                    .any(|v| v.contains("dropped while measuring"));
+            if !dropped && !verdicts.iter().any(|v| v.contains(&want)) {
                 missing.push(format!("{:?}: a verdict containing {want:?}", job.case));
             }
             if expect_claims

@@ -53,9 +53,15 @@ fn sigkill_worker(pool: &WorkerPool, key: &str) -> Option<u32> {
             libc::kill(pid as i32, libc::SIGKILL);
         }
         #[cfg(windows)]
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .status();
+        {
+            let status = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .status();
+            assert!(
+                matches!(status, Ok(s) if s.success()),
+                "could not kill worker pid {pid}: {status:?}"
+            );
+        }
     }
     Some(pid)
 }
@@ -63,6 +69,14 @@ fn sigkill_worker(pool: &WorkerPool, key: &str) -> Option<u32> {
 #[test]
 #[ignore = "needs a real GPU worker; run explicitly"]
 fn a_backoff_blocked_single_slot_is_waited_out_not_failed_instantly() {
+    // Windows: a Low-IL worker (the default) cannot be killed by another process of the user
+    // (taskkill: "Access is denied"), only by the miner through its own handle. This test needs
+    // an outside kill mid-proof and is about the backoff, not the sandbox: run the workers at
+    // Medium unless the caller chose a level.
+    #[cfg(windows)]
+    if std::env::var_os("ZKMINER_WINDOWS_LOW_IL_WORKERS").is_none() {
+        std::env::set_var("ZKMINER_WINDOWS_LOW_IL_WORKERS", "0");
+    }
     let elf = match find_risc0_elf("fibonacci") {
         Some(e) if !e.is_empty() => e,
         _ => panic!("REQUIRED: fibonacci risc0 ELF not built"),
