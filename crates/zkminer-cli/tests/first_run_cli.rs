@@ -56,9 +56,9 @@ fn init_names_the_stake_command() {
     assert!(out.status.success(), "init failed:\n{stdout}\n{stderr}");
     assert!(home.join(".zkminer/config.toml").is_file());
     for step in [
-        "export ZKMINER_PRIVATE_KEY=",
+        "set ZKMINER_PRIVATE_KEY",
         "HemiProve team",
-        "zkminer stake 100",
+        "zkminer stake 150",
         "zkminer status",
         "zkminer run",
     ] {

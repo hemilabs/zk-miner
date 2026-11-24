@@ -45,7 +45,9 @@ fn the_metal_worker_warms_up_and_proves_over_ipc() {
         loop {
             match read_message(&mut from).unwrap() {
                 // Streamed before the answer (`SetupProgress`, main's protocol 12: a Warmup's setup steps).
-                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
+                WorkerResponse::Progress { .. }
+                | WorkerResponse::SetupProgress { .. }
+                | WorkerResponse::ProveStage { .. } => continue,
                 other => return other,
             }
         }
@@ -166,7 +168,7 @@ fn a_first_prove_without_warmup_proves() {
     to.flush().unwrap();
     loop {
         match read_message(&mut from).unwrap() {
-            WorkerResponse::Progress { .. } => continue,
+            WorkerResponse::Progress { .. } | WorkerResponse::ProveStage { .. } => continue,
             WorkerResponse::ProofResult { seal, cycles, .. } => {
                 eprintln!(
                     "M7 first prove: {cycles} cycles, {} seal bytes, {:.2} s (worker spawned {:.2} s \
@@ -291,7 +293,9 @@ fn a_tight_worker_wraps_after_keccak_and_releases_the_key_between_jobs() {
         loop {
             match read_message(&mut from).unwrap() {
                 // Streamed before the answer (`SetupProgress`, main's protocol 12: a Warmup's setup steps).
-                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
+                WorkerResponse::Progress { .. }
+                | WorkerResponse::SetupProgress { .. }
+                | WorkerResponse::ProveStage { .. } => continue,
                 other => return other,
             }
         }
@@ -473,7 +477,9 @@ fn m9_proofs_in_one_worker() {
         loop {
             match read_message(&mut from).unwrap() {
                 // Streamed before the answer (`SetupProgress`, main's protocol 12: a Warmup's setup steps).
-                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => continue,
+                WorkerResponse::Progress { .. }
+                | WorkerResponse::SetupProgress { .. }
+                | WorkerResponse::ProveStage { .. } => continue,
                 other => return other,
             }
         }

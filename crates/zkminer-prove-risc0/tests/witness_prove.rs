@@ -119,7 +119,7 @@ impl Worker {
         });
         loop {
             match self.recv() {
-                WorkerResponse::Progress { .. } => continue,
+                WorkerResponse::Progress { .. } | WorkerResponse::ProveStage { .. } => continue,
                 other => return other,
             }
         }

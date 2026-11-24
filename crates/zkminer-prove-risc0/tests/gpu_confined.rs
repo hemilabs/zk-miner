@@ -47,7 +47,9 @@ impl Worker {
         write_message(&mut self.stdin, cmd).unwrap();
         loop {
             match self.recv() {
-                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => {}
+                WorkerResponse::Progress { .. }
+                | WorkerResponse::SetupProgress { .. }
+                | WorkerResponse::ProveStage { .. } => {}
                 other => return other,
             }
         }
