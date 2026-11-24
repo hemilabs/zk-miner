@@ -20110,7 +20110,12 @@ mod tests {
         let mut slot = WorkerSlot::test_dead_slot(path);
         assert!(WorkerPool::respawn(&mut slot).is_err());
         let error = slot.last_spawn_error.clone().expect("spawn error recorded");
-        assert!(error.contains("Handshake"), "{error}");
+        // Either step of the handshake can see it gone: reading its answer, or, on a host quick enough
+        // that the script has already exited, writing the Hello (EPIPE).
+        assert!(
+            error.contains("Handshake") || error.contains("Send error"),
+            "{error}"
+        );
         assert!(
             error.contains("the worker's last output: dyld: Library not loaded"),
             "{error}"
