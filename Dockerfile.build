@@ -25,15 +25,15 @@ ARG NVCC_THREADS=2
 # their own, keyed on Cargo.lock and the manifests (see the planner stage).
 ARG CARGO_CHEF_VERSION=0.1.78
 # AMD: AMD's ROCm 10.1 for Ubuntu 22.04 (earlier ROCm gives invalid SP1 proofs, hemilabs/sp1 #19 needs
-# 7.2 or later), and the GPUs compiled for: gfx1100 (RX 7900), gfx1101 (RX 7800/7700), gfx1102
-# (RX 7600), gfx1200 (RX 9060), gfx1201 (RX 9070).
+# 7.2 or later), and the GPUs compiled for: gfx1030 (RX 6800/6900/6950), gfx1100 (RX 7900), gfx1101
+# (RX 7800/7700), gfx1102 (RX 7600), gfx1200 (RX 9060), gfx1201 (RX 9070).
 ARG ROCM_VERSION=10.1
 ARG ROCM_PKG_VERSION=10.1.0-3
-ARG AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
-# The risc0 prover, compiled with ROCm 7.1, for the same five exact targets. Not gfx11-generic, the one
+ARG AMD_GPU_TARGETS=gfx1030,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+# The risc0 prover, compiled with ROCm 7.1, for the same six exact targets. Not gfx11-generic, the one
 # code object every RX 7000 could run: built for it, the prover's proofs fail verification on an RX
 # 7900 XTX (all six benchmarks, "check != result"), where the same build for gfx1100 proves them all.
-ARG RISC0_AMD_GPU_TARGETS=gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
+ARG RISC0_AMD_GPU_TARGETS=gfx1030,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201
 # hipcc compiles a file's GPU targets this many at a time (clang's -parallel-jobs), which multiplies
 # the compiler's memory by as much. CI raises it on a runner with the memory for it.
 ARG HIP_PARALLEL_JOBS=1
