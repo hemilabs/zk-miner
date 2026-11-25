@@ -2618,7 +2618,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         }
         let start = PO2_MIN.min(max_po2);
         tracing::info!("{key}: calibrating po2 from {start}, up to {max_po2}");
+        // The quickest run so far, which bounds the next (`calibration_run_limit`).
+        let mut fastest_secs: Option<f64> = None;
         let (samples, ceiling, highest) = sweep_po2(start, max_po2, |po2| {
+            let limit = calibration_run_limit(fastest_secs);
             // Retry once on failure. A worker can be SIGKILLed out from under us
             // between `ensure_alive`'s liveness check and the response — the worker
             // inherits PR_SET_PDEATHSIG, which is THREAD-scoped, so a retired tokio
@@ -2628,8 +2631,13 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             let mut attempt = 0;
             let sample = loop {
                 attempt += 1;
-                match pool.calibrate_slot_po2(&key, po2) {
+                match pool.calibrate_slot_po2_within(&key, po2, limit) {
                     Ok(s) => break Some(s),
+                    // Not retried: the size does not fit the card (see `calibration_run_limit`).
+                    Err(e) if e.is::<crate::dispatcher::CalibrationTooSlow>() => {
+                        tracing::warn!("{e}");
+                        break None;
+                    }
                     Err(e) if attempt == 1 => {
                         // The first EOF marks the slot failed, so `respawn` now imposes
                         // an exponential backoff (5s after one failure). Retrying
@@ -2649,6 +2657,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
                 }
             };
             if let Some(s) = &sample {
+                if s.duration_secs > 0.0 {
+                    fastest_secs =
+                        Some(fastest_secs.map_or(s.duration_secs, |f| f.min(s.duration_secs)));
+                }
                 tracing::info!(
                     "{key}: po2={} segments={} cycles={} {:.2}s → {:.0} c/s",
                     s.po2,
@@ -2722,6 +2734,32 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         }
         db.po2_samples = samples;
     }
+}
+
+/// How many times the quickest size so far a calibration run may take before it is stopped as a size
+/// the card cannot hold (`calibration_run_limit`).
+pub const CALIBRATION_SLOW_FACTOR: f64 = 3.0;
+
+/// The least a calibration run is given, whatever the quickest size so far took
+/// (`calibration_run_limit`).
+pub const CALIBRATION_MIN_RUN: Duration = Duration::from_secs(60);
+
+/// How long a calibration run may take before it is stopped (`WorkerPool::calibrate_slot_po2_within`),
+/// given the quickest size the sweep has proved so far: [`CALIBRATION_SLOW_FACTOR`] times it, at
+/// least [`CALIBRATION_MIN_RUN`]; no limit before any size has proved.
+///
+/// Every size proves the same workload, so a larger one takes about as long as a smaller one, or
+/// less: fewer segments to fold. One that takes several times longer does not fit the card. Under
+/// Windows a CUDA card does not refuse such a size: the driver puts what does not fit in system
+/// memory, the proof runs on, and nothing is evicted, so the spill watch sees no spill. On a 16 GB
+/// RTX 5080 po2 20 proved in 19 s; 21 took 259 s with 7-15 GB of the worker's memory in system
+/// memory, and 22 ran 9 minutes twice, both times to a proof that failed its own verification. Such
+/// a size can never be the fastest, and the larger ones after it would spill more, so the sweep ends
+/// there, as at a size that failed.
+pub fn calibration_run_limit(fastest_secs: Option<f64>) -> Option<Duration> {
+    let fastest = fastest_secs.filter(|s| s.is_finite() && *s > 0.0)?;
+    let limit = Duration::try_from_secs_f64(fastest * CALIBRATION_SLOW_FACTOR).ok()?;
+    Some(limit.max(CALIBRATION_MIN_RUN))
 }
 
 /// A card's po2 sweep for `calibrate_po2_for_suite`: every size that proved, in order, and the ceiling,
@@ -5636,6 +5674,69 @@ mod tests {
         // Capped at 19 by free VRAM: 19 is the highest, and 20 never ran.
         assert_eq!(highest(18, 19, Some(22)), Some(19));
         assert_eq!(highest(18, 22, None), None);
+    }
+
+    #[test]
+    fn a_calibration_run_is_limited_by_the_quickest_size_so_far() {
+        assert_eq!(calibration_run_limit(None), None);
+        assert_eq!(calibration_run_limit(Some(0.0)), None);
+        assert_eq!(calibration_run_limit(Some(f64::NAN)), None);
+        assert_eq!(calibration_run_limit(Some(f64::MAX)), None);
+        // Never under a minute...
+        assert_eq!(calibration_run_limit(Some(1.0)), Some(CALIBRATION_MIN_RUN));
+        assert_eq!(
+            calibration_run_limit(Some(18.86)),
+            Some(CALIBRATION_MIN_RUN)
+        );
+        // ...and otherwise three times the quickest.
+        assert_eq!(
+            calibration_run_limit(Some(41.15)),
+            Some(Duration::from_secs_f64(41.15 * 3.0))
+        );
+    }
+
+    /// The sweep `calibrate_po2_for_suite` runs, with each size taking `secs[po2 - 18]` and stopped
+    /// at the limit as the pool stops it: the sizes asked for, the ceiling, the highest that proved,
+    /// and the limit each run was given.
+    fn timed_sweep(secs: &[f64]) -> (Vec<u8>, Option<u8>, Option<u8>, Vec<Option<Duration>>) {
+        let mut fastest: Option<f64> = None;
+        let (mut asked, mut limits) = (Vec::new(), Vec::new());
+        let (_, ceiling, highest) = sweep_po2(18, 22, |p| {
+            let limit = calibration_run_limit(fastest);
+            asked.push(p);
+            limits.push(limit);
+            let took = secs[usize::from(p - 18)];
+            if limit.is_some_and(|l| took >= l.as_secs_f64()) {
+                return None;
+            }
+            fastest = Some(fastest.map_or(took, |f| f.min(took)));
+            Some(Po2Sample {
+                duration_secs: took,
+                ..sample(p, 4, 1e6 / took)
+            })
+        });
+        (asked, ceiling, highest, limits)
+    }
+
+    #[test]
+    fn a_size_that_spills_ends_the_sweep_at_its_limit() {
+        // RTX 5080 (Windows, 16 GB, driving a display), 2026-11-25: 18-20 fit; 21 spilled to system
+        // memory and took 259 s; 22 spilled more (9+ minutes, and an invalid proof). 21 is now
+        // stopped at a minute, 22 never runs, and 20 still proved: ceiling 19, highest 20, so the
+        // card keeps its default size, 20 (`risc0_job_po2`).
+        let (asked, ceiling, highest, limits) = timed_sweep(&[38.91, 25.23, 18.86, 259.16, 540.0]);
+        assert_eq!(asked, vec![18, 19, 20, 21]);
+        assert_eq!((ceiling, highest), (Some(19), Some(20)));
+        assert_eq!(limits[3], Some(CALIBRATION_MIN_RUN));
+        // RX 9070 XT, same run: 21 (77 s, under three times 20's 41 s) still proves; 22 (328 s) is
+        // stopped at 123 s.
+        let (asked, ceiling, highest, limits) = timed_sweep(&[79.58, 52.29, 41.15, 77.34, 328.13]);
+        assert_eq!(asked, vec![18, 19, 20, 21, 22]);
+        assert_eq!((ceiling, highest), (Some(20), Some(21)));
+        assert_eq!(limits[4], Some(Duration::from_secs_f64(41.15 * 3.0)));
+        // A card on which every size fits runs to the job range's top as before.
+        let (asked, ceiling, _, _) = timed_sweep(&[40.0, 30.0, 22.0, 20.0, 21.0]);
+        assert_eq!((asked.len(), ceiling), (5, Some(21)));
     }
 
     #[test]

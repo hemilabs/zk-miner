@@ -1656,6 +1656,33 @@ impl std::fmt::Display for MeasurementDisturbed {
 
 impl std::error::Error for MeasurementDisturbed {}
 
+/// What a calibration run answers when it was stopped at its limit
+/// (`WorkerPool::calibrate_slot_po2_within`): the size does not fit the card, and is not measured
+/// again (`benchmark::calibration_run_limit`).
+#[derive(Debug)]
+pub struct CalibrationTooSlow {
+    /// The slot whose run was stopped.
+    pub slot_key: String,
+    /// The size it was proving.
+    pub po2: u8,
+    /// How long it was given.
+    pub limit: Duration,
+}
+
+impl std::fmt::Display for CalibrationTooSlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: stopped po2={} after {}s, several times longer than a smaller size took: it does              not fit this card (on Windows, memory that does not fit a card goes to system memory              instead of failing)",
+            self.slot_key,
+            self.po2,
+            self.limit.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for CalibrationTooSlow {}
+
 /// What an SP1 shard-size lowering made by a benchmark is recorded against, in place of a job's
 /// program (`lower_sp1_shard_cap`): the suite, which is the same on every run.
 const BENCHMARK_SUITE_PROGRAM: &[u8] = b"zkminer SP1 benchmark suite";
@@ -6335,12 +6362,29 @@ impl WorkerPool {
     /// (`after_spills`): a sample taken while paged would pick the segment size from a rate several
     /// times too low.
     pub fn calibrate_slot_po2(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
+        self.calibrate_slot_po2_within(key, po2, None)
+    }
+
+    /// [`calibrate_slot_po2`](Self::calibrate_slot_po2), with the run stopped once it has taken
+    /// `limit` (`benchmark::calibration_run_limit`): the worker is killed and the answer is a
+    /// [`CalibrationTooSlow`], which is not measured again.
+    pub fn calibrate_slot_po2_within(
+        &self,
+        key: &str,
+        po2: u8,
+        limit: Option<Duration>,
+    ) -> Result<crate::benchmark::Po2Sample> {
         self.after_spills(key, "calibration", false, || {
-            self.calibrate_slot_po2_once(key, po2)
+            self.calibrate_slot_po2_once(key, po2, limit)
         })
     }
 
-    fn calibrate_slot_po2_once(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
+    fn calibrate_slot_po2_once(
+        &self,
+        key: &str,
+        po2: u8,
+        limit: Option<Duration>,
+    ) -> Result<crate::benchmark::Po2Sample> {
         // The per-card guard. A calibration run is a full proof swept upward through po2 — by this
         // module's own description the hungriest path in the program — so running it beside a proof on
         // the same card is the worst case of the double-booking the lock prevents. Bounded by
@@ -6466,8 +6510,14 @@ impl WorkerPool {
             return Err(e);
         }
 
-        // A calibration run is a full proof — reuse the benchmark timeout budget.
-        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
+        // A calibration run is a full proof — reuse the benchmark timeout budget, or the sweep's
+        // limit when that is shorter.
+        let sent = Instant::now();
+        let timeout = match (self.benchmark_timeout_for(key), limit) {
+            (Some(t), Some(l)) => Some(t.min(l)),
+            (t, l) => t.or(l),
+        };
+        let _watchdog = timeout.map(|t| {
             ProvingWatchdog::new(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
@@ -6494,6 +6544,19 @@ impl WorkerPool {
         if let Some(evicted_mib) = spill_watch.stopped() {
             Self::mark_slot_dead(&mut slot, entry);
             return Err(self.spill_shortage(key, evicted_mib));
+        }
+        if let Some(limit) = limit {
+            if resp.is_err()
+                && entry.intentional_kill.load(Ordering::Acquire)
+                && sent.elapsed() >= limit
+            {
+                Self::mark_slot_dead(&mut slot, entry);
+                return Err(anyhow::Error::new(CalibrationTooSlow {
+                    slot_key: key.to_string(),
+                    po2,
+                    limit,
+                }));
+            }
         }
         if let Some(grew_mib) = spill_watch.disturbed() {
             if matches!(resp, Ok(WorkerResponse::CalibrationResult { .. })) {
@@ -17500,7 +17563,7 @@ mod tests {
         let waits = "\"benchmark\", true,";
         assert!(body("    fn benchmark_slot(&self").contains(waits));
         assert!(body("    fn benchmark_slot_streaming(\n").contains(waits));
-        assert!(body("    pub fn calibrate_slot_po2(").contains("\"calibration\", false,"));
+        assert!(body("    pub fn calibrate_slot_po2_within(").contains("\"calibration\", false,"));
     }
 
     /// Every path that measures a rate the miner saves watches for spills and drops a run the
@@ -17536,8 +17599,8 @@ mod tests {
                 "self.benchmark_slot_streaming_once(key, on_progress)",
             ),
             (
-                "    pub fn calibrate_slot_po2(",
-                "self.calibrate_slot_po2_once(key, po2)",
+                "    pub fn calibrate_slot_po2_within(",
+                "self.calibrate_slot_po2_once(key, po2, limit)",
             ),
         ] {
             assert!(body(wrapper).contains(call), "{wrapper}");

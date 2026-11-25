@@ -4,9 +4,10 @@
 //! answers to Execute and CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
-//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — hangs (sleeps
-//!   forever) on the specified command type. `"both"` covers benchmark + prove + execute. Unset or
-//!   empty = respond normally. `"execute"` holds a measurement in flight until it is SIGKILLed.
+//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"`, `"warmup"` or `"calibrate"` —
+//!   hangs (sleeps forever) on the specified command type. `"both"` covers benchmark + prove +
+//!   execute. Unset or empty = respond normally. `"execute"` holds a measurement in flight until it
+//!   is SIGKILLed.
 //! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
 //!   immediately with code 1 on the specified command type, simulating a worker crash.
 //! - `MOCK_FAIL_ON`: `"warmup"` or `"benchmark"` — answers that command with an `Error` (the worker
@@ -367,6 +368,12 @@ fn main() {
 
             // Measures nothing either: one segment of 1,000 cycles at whatever po2 was asked for.
             WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
+                if hang_on == "calibrate" {
+                    // Hang forever — the watchdog will SIGKILL us
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
                 let resp = WorkerResponse::CalibrationResult {
                     request_id,
                     po2,
