@@ -1680,7 +1680,9 @@ impl std::fmt::Display for CalibrationTooSlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}: stopped po2={} after {}s, several times longer than a smaller size took: it does              not fit this card (on Windows, memory that does not fit a card goes to system memory              instead of failing)",
+            "{}: stopped po2={} after {}s, several times longer than a smaller size took: it does \
+             not fit this card (on Windows, memory that does not fit a card goes to system memory \
+             instead of failing)",
             self.slot_key,
             self.po2,
             self.limit.as_secs()
