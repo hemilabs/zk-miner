@@ -812,6 +812,15 @@ pub fn intel_vram_bytes(device_index: u32) -> Option<u64> {
 /// The Intel discrete GPUs on Windows with their VRAM (see `WINDOWS_DISPLAY_DEVICES_PS`).
 #[cfg(windows)]
 fn query_windows_intel_gpus() -> Vec<(DetectedGpu, Option<u64>)> {
+    run_windows_display_devices_ps("Intel GPUs")
+        .map(|stdout| parse_windows_intel_gpus_with_vram(&stdout))
+        .unwrap_or_default()
+}
+
+/// The output of `WINDOWS_DISPLAY_DEVICES_PS`, or `None` (logged, as listing them for `what`) if
+/// it failed or timed out.
+#[cfg(windows)]
+fn run_windows_display_devices_ps(what: &str) -> Option<String> {
     // PowerShell's own start-up takes a second or so: allow it more than a GPU tool.
     let (outcome, stdout) = zkminer_prover_protocol::proc::output_with_timeout_capturing_stdout(
         std::process::Command::new("powershell").args([
@@ -828,12 +837,12 @@ fn query_windows_intel_gpus() -> Vec<(DetectedGpu, Option<u64>)> {
         zkminer_prover_protocol::proc::Outcome::Ran { success: true, .. }
     ) {
         tracing::warn!(
-            "listing display devices for Intel GPUs failed ({})",
+            "listing display devices for {what} failed ({})",
             outcome.describe()
         );
-        return Vec::new();
+        return None;
     }
-    parse_windows_intel_gpus_with_vram(&stdout)
+    Some(stdout)
 }
 
 /// Whether an Intel PCI device ID is a discrete GPU: Arc Alchemist / Flex (DG2, 0x56xx), Arc
@@ -1319,6 +1328,11 @@ fn detect_amd_gpus_windows(
         return Vec::new();
     }
     let gpus = parse_hip_device_list_with_vram(&stdout);
+    if let Ok(mut known) = AMD_HIP_GFX.lock() {
+        known
+            .get_or_insert_with(HashMap::new)
+            .extend(parse_hip_arch_list(&stdout));
+    }
     if let Ok(mut known) = AMD_HIP_VRAM.lock() {
         let known = known.get_or_insert_with(HashMap::new);
         for (gpu, vram) in &gpus {
@@ -1334,6 +1348,54 @@ fn detect_amd_gpus_windows(
 /// `detect_amd_gpus_windows`, by PCI bus id. Windows has no amdgpu sysfs to read it from.
 #[cfg(windows)]
 static AMD_HIP_VRAM: std::sync::Mutex<Option<HashMap<String, u64>>> = std::sync::Mutex::new(None);
+
+/// Each AMD GPU's target (`gfx1201`) as the HIP runtime reported it to the last
+/// `detect_amd_gpus_windows`, by PCI bus id. Windows has no KFD topology to read it from.
+#[cfg(windows)]
+static AMD_HIP_GFX: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// The target of the AMD GPU at `pci_bus_id` as the HIP runtime reported it at discovery
+/// (`--list-hip-devices`, on Windows). `None` elsewhere, before discovery, from a worker that
+/// predates reporting it, or if unknown.
+fn amd_hip_gfx_target(pci_bus_id: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        AMD_HIP_GFX.lock().ok()?.as_ref()?.get(pci_bus_id).cloned()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pci_bus_id;
+        None
+    }
+}
+
+/// Parse the `arch|pci_bus_id|gcnArchName` lines of a ROCm worker's `--list-hip-devices` into
+/// each device's target by PCI bus id (see `gfx_target_from_gcn_arch_name`).
+#[cfg(any(windows, test))]
+fn parse_hip_arch_list(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(3, '|');
+            if parts.next()?.trim() != "arch" {
+                return None;
+            }
+            let pci_bus_id = normalize_pci_bus_id(parts.next()?);
+            let gfx = gfx_target_from_gcn_arch_name(parts.next()?)?;
+            (!pci_bus_id.is_empty()).then_some((pci_bus_id, gfx))
+        })
+        .collect()
+}
+
+/// The target a HIP `gcnArchName` names, without its feature flags: `gfx90a:sramecc+:xnack-` ->
+/// `gfx90a`, as a HIP binary's code objects are listed (`gpu_code::EmbeddedHipCode`). `None`
+/// for anything that is not a `gfx` target.
+#[cfg(any(windows, test))]
+fn gfx_target_from_gcn_arch_name(name: &str) -> Option<String> {
+    let target = name.trim().split(':').next()?.trim().to_ascii_lowercase();
+    let suffix = target.strip_prefix("gfx")?;
+    (!suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_alphanumeric())).then_some(target)
+}
 
 /// The memory of the AMD GPU at `pci_bus_id`, where the platform reports it without sysfs: on
 /// Windows, what the HIP runtime said at discovery (`--list-hip-devices`). `None` elsewhere, before
@@ -1574,14 +1636,134 @@ fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
         .collect()
 }
 
-/// The target of the AMD GPU at `pci_bus_id` (`gfx1100` for an RX 7900 XTX), from the KFD topology,
-/// for checking a HIP binary carries code for it (`gpu_code::EmbeddedHipCode`).
+/// The target of the AMD GPU at `pci_bus_id` (`gfx1100` for an RX 7900 XTX), for checking a HIP
+/// binary carries code for it (`gpu_code::EmbeddedHipCode`). From the first source that knows it:
+/// the kernel's KFD topology (Linux), what the HIP runtime reported at discovery (Windows, which
+/// has no KFD), then the card's PCI device id (`amd_gfx_target_for_device_id`), for a worker that
+/// does not report its runtime's target.
 pub fn amd_gfx_target(pci_bus_id: &str) -> Option<String> {
     let bus = normalize_pci_bus_id(pci_bus_id);
+    first_gfx_target(
+        &bus,
+        &[
+            ("the KFD topology", &kfd_gfx_target),
+            ("the HIP runtime", &amd_hip_gfx_target),
+            ("its PCI device id", &pci_id_gfx_target),
+        ],
+    )
+}
+
+/// A source of AMD GPU targets, by PCI bus id, and what to call it in the log.
+type GfxTargetSource<'a> = (&'a str, &'a dyn Fn(&str) -> Option<String>);
+
+/// The target the first of `sources` that knows one gives for the card at `bus`.
+fn first_gfx_target(bus: &str, sources: &[GfxTargetSource]) -> Option<String> {
+    sources.iter().find_map(|(what, source)| {
+        let gfx = source(bus)?;
+        tracing::debug!("AMD GPU {bus} is {gfx}, from {what}");
+        Some(gfx)
+    })
+}
+
+/// The target of the AMD GPU at `bus` in the kernel's KFD topology, which a Linux host with the
+/// amdgpu driver has.
+fn kfd_gfx_target(bus: &str) -> Option<String> {
     kfd_gpu_nodes(Path::new("/sys/class/kfd/kfd/topology"))?
         .into_iter()
-        .find(|(b, _)| *b == bus)?
+        .find(|(b, _)| b == bus)?
         .1
+}
+
+/// The target of the AMD GPU at `bus` from its PCI device id, which Windows lists with the display
+/// devices (`WINDOWS_DISPLAY_DEVICES_PS`; read once). `None` elsewhere: a Linux host has the KFD
+/// topology.
+fn pci_id_gfx_target(bus: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        static DEVICE_IDS: std::sync::OnceLock<HashMap<String, u16>> = std::sync::OnceLock::new();
+        let ids = DEVICE_IDS.get_or_init(|| {
+            run_windows_display_devices_ps("AMD GPU device ids")
+                .map(|out| parse_windows_amd_device_ids(&out))
+                .unwrap_or_default()
+        });
+        amd_gfx_target_for_device_id(*ids.get(bus)?).map(str::to_string)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = bus;
+        None
+    }
+}
+
+/// Parse `name|PNPDeviceID|location[|memory]` lines (`WINDOWS_DISPLAY_DEVICES_PS`) into each AMD
+/// display device's PCI device id, by PCI bus id.
+#[cfg(any(windows, test))]
+fn parse_windows_amd_device_ids(output: &str) -> HashMap<String, u16> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(4, '|');
+            let _name = parts.next()?;
+            let pnp_id = parts.next()?.trim().to_uppercase();
+            let location = parts.next().unwrap_or("").trim();
+            let ids = pnp_id.strip_prefix("PCI\\VEN_1002&DEV_")?;
+            let device_id = u16::from_str_radix(ids.get(..4)?, 16).ok()?;
+            Some((pci_bus_id_from_location_info(location)?, device_id))
+        })
+        .collect()
+}
+
+/// The HIP target of an AMD (vendor 0x1002) GPU by PCI device id, for the RDNA 2, 3 and 4 parts;
+/// `None` for any other, which is then not checked.
+///
+/// The ids are the amdgpu driver's for its RDNA 2 dies (Linux `drivers/gpu/drm/amd/amdgpu/
+/// amdgpu_drv.c` `pciidlist`: SIENNA_CICHLID = Navi 21, NAVY_FLOUNDER = Navi 22,
+/// DIMGREY_CAVEFISH = Navi 23, BEIGE_GOBY = Navi 24, YELLOW_CARP = Rembrandt). The driver matches
+/// newer dies by class and reads their IP versions instead, so for those, and for Van Gogh and
+/// Raphael, the ids are the PCI ID Repository's (pci-ids.ucw.cz, vendor 1002) for each die. The
+/// target is the one the kernel's KFD reports for the die's GC IP version
+/// (`drivers/gpu/drm/amd/amdkfd/kfd_device.c`, `gfx_target_version`), which is what the HIP
+/// runtime names it: Navi 31 (GC 11.0.0) gfx1100, Navi 32 (11.0.3) gfx1101, Navi 33 (11.0.2)
+/// gfx1102, Phoenix and Hawk Point (11.0.1, 11.0.4) gfx1103, Strix (11.5.0) gfx1150, Strix Halo
+/// (11.5.1) gfx1151, Krackan (11.5.2) gfx1152, Navi 44 (12.0.0) gfx1200, Navi 48 (12.0.1)
+/// gfx1201; Mendocino (10.3.7) is reported as gfx1036, as Raphael is.
+#[cfg(any(windows, test))]
+fn amd_gfx_target_for_device_id(device_id: u16) -> Option<&'static str> {
+    Some(match device_id {
+        // Navi 21: RX 6800 / 6800 XT / 6900 XT / 6950 XT, PRO W6800, V620.
+        0x73a0..=0x73a3 | 0x73a5 | 0x73a8 | 0x73a9 | 0x73ab..=0x73af | 0x73bf => "gfx1030",
+        // Navi 22: RX 6700 / 6700 XT / 6750 XT, 6800M.
+        0x73c0 | 0x73c1 | 0x73c3 | 0x73da..=0x73df => "gfx1031",
+        // Navi 23: RX 6600 / 6600 XT / 6650 XT, PRO W6600.
+        0x73e0..=0x73e3 | 0x73e8..=0x73ed | 0x73ef | 0x73ff => "gfx1032",
+        // Van Gogh (Steam Deck).
+        0x163f => "gfx1033",
+        // Navi 24: RX 6400 / 6500 XT, PRO W6400.
+        0x7420..=0x7424 | 0x743f => "gfx1034",
+        // Rembrandt: Radeon 660M / 680M.
+        0x164d | 0x1681 => "gfx1035",
+        // Raphael, Granite Ridge, Mendocino: Radeon 610M.
+        0x164e | 0x13c0 | 0x1506 => "gfx1036",
+        // Navi 31: RX 7900 XT / XTX / GRE, PRO W7800 / W7900.
+        0x7448..=0x744c | 0x745e => "gfx1100",
+        // Navi 32: RX 7700 XT / 7800 XT, PRO W7700, V710.
+        0x7460 | 0x7461 | 0x7470 | 0x747e => "gfx1101",
+        // Navi 33: RX 7600 / 7600 XT / 7500 / 7400, PRO W7600 / W7500.
+        0x73f0 | 0x7480 | 0x7481 | 0x7483 | 0x7487 | 0x7489 | 0x748b | 0x7499 | 0x749f => "gfx1102",
+        // Phoenix, Hawk Point: Radeon 740M / 760M / 780M.
+        0x15bf | 0x15c8 | 0x164f | 0x1900 | 0x1901 => "gfx1103",
+        // Strix: Radeon 880M / 890M.
+        0x150e => "gfx1150",
+        // Strix Halo: Radeon 8050S / 8060S.
+        0x1586 => "gfx1151",
+        // Krackan: Radeon 840M / 860M.
+        0x1114 => "gfx1152",
+        // Navi 44: RX 9060 XT.
+        0x7590 => "gfx1200",
+        // Navi 48: RX 9070 / 9070 XT / 9070 GRE, AI PRO R9700.
+        0x7550 | 0x7551 => "gfx1201",
+        _ => return None,
+    })
 }
 
 /// The binary holding a backend's HIP device code, for `gpu_code::EmbeddedHipCode` to read: the
@@ -2608,6 +2790,176 @@ mod tests {
             odd.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
             [None, None]
         );
+    }
+
+    #[test]
+    fn hip_arch_lines_give_each_card_its_target_and_old_hosts_skip_them() {
+        // A worker's `--list-hip-devices`: each device line followed by its runtime's target.
+        let out = "0|0000:03:00.0|0|17095983104|AMD Radeon RX 9070 XT
+                   arch|0000:03:00.0|gfx1201
+                   1|0000:16:00.0|1|62477336576|AMD Radeon(TM) Graphics
+                   arch|0000:16:00.0|gfx1036
+                   2|00000000:2D:00.0|0|68702699520|AMD Instinct MI210
+                   arch|00000000:2D:00.0|gfx90a:sramecc+:xnack-
+                   arch|0000:2e:00.0|not-a-target
+                   arch|0000:2f:00.0
+";
+        let gfx = parse_hip_arch_list(out);
+        assert_eq!(gfx.len(), 3, "{gfx:?}");
+        assert_eq!(gfx["0000:03:00.0"], "gfx1201");
+        assert_eq!(gfx["0000:16:00.0"], "gfx1036");
+        // Keyed as the device lines are, and without the feature flags.
+        assert_eq!(gfx["0000:2d:00.0"], "gfx90a");
+        // The device list a host that predates the arch lines reads is unchanged by them.
+        let gpus = parse_hip_device_list(out);
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].name, "AMD Radeon RX 9070 XT");
+        assert_eq!(gpus[1].pci_bus_id, "0000:2d:00.0");
+        // And a worker that predates them gives no targets.
+        assert!(
+            parse_hip_arch_list("0|0000:03:00.0|0|17095983104|AMD Radeon RX 9070 XT").is_empty()
+        );
+    }
+
+    #[test]
+    fn gcn_arch_names_lose_their_feature_flags() {
+        for (name, want) in [
+            ("gfx1201", Some("gfx1201")),
+            ("gfx1030", Some("gfx1030")),
+            (" gfx90a:sramecc+:xnack- ", Some("gfx90a")),
+            ("gfx942:sramecc-:xnack+", Some("gfx942")),
+            ("GFX1100", Some("gfx1100")),
+            ("gfx", None),
+            ("gfx11-generic", None),
+            ("sm_89", None),
+            ("", None),
+            (":xnack-", None),
+        ] {
+            assert_eq!(
+                gfx_target_from_gcn_arch_name(name).as_deref(),
+                want,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn amd_pci_device_ids_map_to_their_targets() {
+        for (id, want) in [
+            // RDNA 2: RX 6950 XT, 6900 XT, 6800 XT, 6700 XT, 6600 XT, 6500 XT, iGPUs.
+            (0x73a5, Some("gfx1030")),
+            (0x73af, Some("gfx1030")),
+            (0x73bf, Some("gfx1030")),
+            (0x73df, Some("gfx1031")),
+            (0x73ff, Some("gfx1032")),
+            (0x73ef, Some("gfx1032")),
+            (0x743f, Some("gfx1034")),
+            (0x1681, Some("gfx1035")),
+            (0x13c0, Some("gfx1036")),
+            (0x164e, Some("gfx1036")),
+            // RDNA 3: RX 7900 XTX, 7800 XT, 7600 (and the 7600M XT's 0x73f0), Phoenix, Strix.
+            (0x744c, Some("gfx1100")),
+            (0x747e, Some("gfx1101")),
+            (0x7480, Some("gfx1102")),
+            (0x73f0, Some("gfx1102")),
+            (0x15bf, Some("gfx1103")),
+            (0x150e, Some("gfx1150")),
+            (0x1586, Some("gfx1151")),
+            (0x1114, Some("gfx1152")),
+            // RDNA 4: RX 9060 XT, 9070 XT, AI PRO R9700.
+            (0x7590, Some("gfx1200")),
+            (0x7550, Some("gfx1201")),
+            (0x7551, Some("gfx1201")),
+            // Unknown, and not a gap in a range: no target, so the card is not checked.
+            (0x73a4, None), // Navi 21's USB controller
+            (0x731f, None), // RDNA 1, which no build targets
+            (0x74a1, None), // MI300X
+            (0xffff, None),
+        ] {
+            assert_eq!(amd_gfx_target_for_device_id(id), want, "{id:#06x}");
+        }
+    }
+
+    #[test]
+    fn windows_display_devices_give_amd_device_ids_by_bus() {
+        let out = [
+            r"AMD Radeon RX 9070 XT|PCI\VEN_1002&DEV_7550&SUBSYS_24161EAE&REV_C0\6&2BA1C4D7&0&00000019|PCI bus 3, device 0, function 0|17095983104",
+            r"AMD Radeon(TM) Graphics|PCI\VEN_1002&DEV_13C0&SUBSYS_D0001458&REV_C9\4&16012499&0&0041|PCI bus 19, device 0, function 0",
+            r"AMD Radeon RX 6950 XT|pci\ven_1002&dev_73a5&subsys_0e3a1002&rev_c0\6&1&0&0|PCI bus 45, device 0, function 0|",
+            r"Intel(R) Arc(TM) Pro B70 Graphics|PCI\VEN_8086&DEV_E223&SUBSYS_60251849&REV_00\6&81E8C03&0&00080009|PCI bus 4, device 0, function 0|34359738368",
+            r"AMD Radeon RX 7900 XTX|PCI\VEN_1002&DEV_744C&SUBSYS_0E3B1002&REV_C8\6&3&0&0|",
+        ]
+        .join("\n");
+        let ids = parse_windows_amd_device_ids(&out);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids["0000:03:00.0"], 0x7550);
+        assert_eq!(ids["0000:13:00.0"], 0x13c0);
+        assert_eq!(ids["0000:2d:00.0"], 0x73a5);
+        assert_eq!(
+            amd_gfx_target_for_device_id(ids["0000:03:00.0"]),
+            Some("gfx1201")
+        );
+        assert_eq!(
+            amd_gfx_target_for_device_id(ids["0000:2d:00.0"]),
+            Some("gfx1030")
+        );
+    }
+
+    #[test]
+    fn gfx_target_comes_from_the_first_source_that_knows_it() {
+        use std::cell::RefCell;
+        let asked = RefCell::new(Vec::new());
+        let source = |name: &'static str, gfx: Option<&'static str>| {
+            let asked = &asked;
+            move |bus: &str| {
+                asked.borrow_mut().push((name, bus.to_string()));
+                gfx.map(str::to_string)
+            }
+        };
+        let (kfd, hip, pci) = (
+            source("kfd", Some("gfx1100")),
+            source("hip", Some("gfx1201")),
+            source("pci", Some("gfx1030")),
+        );
+        let (no_kfd, no_hip, no_pci) = (
+            source("kfd", None),
+            source("hip", None),
+            source("pci", None),
+        );
+        let bus = "0000:03:00.0";
+        let names = |asked: &RefCell<Vec<(&'static str, String)>>| -> Vec<&'static str> {
+            asked.borrow_mut().drain(..).map(|(n, _)| n).collect()
+        };
+
+        // KFD (Linux) wins, and nothing after it is asked.
+        let got = first_gfx_target(bus, &[("kfd", &kfd), ("hip", &hip), ("pci", &pci)]);
+        assert_eq!(got.as_deref(), Some("gfx1100"));
+        assert_eq!(names(&asked), ["kfd"]);
+        // No KFD (Windows): the HIP runtime's.
+        let got = first_gfx_target(bus, &[("kfd", &no_kfd), ("hip", &hip), ("pci", &pci)]);
+        assert_eq!(got.as_deref(), Some("gfx1201"));
+        assert_eq!(names(&asked), ["kfd", "hip"]);
+        // A worker that does not report its runtime's target: the PCI device id's.
+        let got = first_gfx_target(bus, &[("kfd", &no_kfd), ("hip", &no_hip), ("pci", &pci)]);
+        assert_eq!(got.as_deref(), Some("gfx1030"));
+        assert_eq!(names(&asked), ["kfd", "hip", "pci"]);
+        // None knows: unknown, which the spawn gate does not refuse.
+        let got = first_gfx_target(bus, &[("kfd", &no_kfd), ("hip", &no_hip), ("pci", &no_pci)]);
+        assert_eq!(got, None);
+        assert_eq!(names(&asked), ["kfd", "hip", "pci"]);
+        // Each is asked for the card's bus id as given.
+        first_gfx_target(bus, &[("kfd", &no_kfd)]);
+        assert_eq!(asked.borrow().as_slice(), [("kfd", bus.to_string())]);
+    }
+
+    #[test]
+    fn amd_gfx_target_without_kfd_or_discovery_is_unknown_off_windows() {
+        // This host's sources: on Linux the KFD topology, which a CI runner has no AMD GPU in;
+        // nothing reported a HIP target, and no PCI id is read off Windows.
+        if cfg!(windows) || Path::new("/sys/class/kfd/kfd/topology").exists() {
+            return;
+        }
+        assert_eq!(amd_gfx_target("0000:03:00.0"), None);
     }
 
     #[test]
