@@ -162,8 +162,8 @@ binaries beside it: `zkminer-witness-sandbox-probe`, `zkminer-witness-builder`,
 `zkminer-witness-broker` and `zkminer-prove-risc0-cpu`. A miner serving witness jobs looks for them
 in its own directory, and without them serves none, saying which is missing. Each
 prover carries the GPU runtime it loads, so a host needs only its GPU's driver: NVIDIA's driver for
-RTX cards, and for AMD (Radeon RX 7000 and 9000) and Intel (Arc A and B) cards just the kernel
-driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
+RTX cards, and for AMD (Radeon RX 6800/6900/6950, 7000 and 9000) and Intel (Arc A and B) cards just
+the kernel driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
 oneAPI install, and a ROCm the distribution has is not used. A miner run outside a desktop session
 (a systemd unit, SSH) needs its user in the `render` group for AMD and Intel cards
 (`sudo usermod -aG render $USER`). Run it as such a user, not as root: its workers drop every
