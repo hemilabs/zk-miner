@@ -813,12 +813,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Still serving: an answer after them arrives.
+        // Still serving: an answer after them arrives. The one frame more waits until that is
+        // checked: sent right behind the answer, the client's reader took both before this task
+        // looked, and the violation it is meant to cause was already there.
+        let (go, wait_for_go) = tokio::sync::oneshot::channel::<()>();
         let fake = tokio::spawn({
             let broker = broker.clone();
             async move {
                 let (msg, _) = request(&broker).await;
                 answer(&broker, msg.id, ControlResponse::Provisioned { ok: Vec::new() }, None).await.unwrap();
+                wait_for_go.await.unwrap();
                 send_with_fd_async(&broker, KIND_CONTROL, b"not json", None).await.unwrap();
             }
         });
@@ -827,6 +831,7 @@ mod tests {
             Vec::<bool>::new()
         );
         assert!(client.violation().is_none());
+        go.send(()).unwrap();
         fake.await.unwrap();
         assert!(violated_soon(&client).await.contains("do not decode"));
     }
