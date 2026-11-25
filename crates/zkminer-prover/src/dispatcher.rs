@@ -1680,12 +1680,13 @@ impl std::fmt::Display for CalibrationTooSlow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}: stopped po2={} after {}s, several times longer than a smaller size took: it does \
-             not fit this card (on Windows, memory that does not fit a card goes to system memory \
+            "{}: po2 {} stopped after {} s: slower than {}x the fastest size so far, treated as not \
+             fitting this card (on Windows, memory that does not fit a card goes to system memory \
              instead of failing)",
             self.slot_key,
             self.po2,
-            self.limit.as_secs()
+            self.limit.as_secs(),
+            crate::benchmark::CALIBRATION_SLOW_FACTOR
         )
     }
 }
@@ -2005,8 +2006,49 @@ impl ProvingWatchdog {
         )
     }
 
+    /// [`new`](Self::new) for a deadline the caller reports itself when it is reached (a calibration
+    /// run's limit, `CalibrationTooSlow`): the kill is logged at debug, not as a proving timeout.
+    fn quiet(
+        pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_clock_logged(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            WatchdogClock::new(),
+            false,
+        )
+    }
+
     /// [`new`](Self::new) with a deadline of `clock`'s last touch plus `timeout`, re-read every second.
     fn with_clock(
+        pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+        clock: WatchdogClock,
+    ) -> Self {
+        Self::with_clock_logged(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            clock,
+            true,
+        )
+    }
+
+    /// [`with_clock`](Self::with_clock), the kill logged as a proving timeout (an error) when
+    /// `as_timeout`, else at debug.
+    fn with_clock_logged(
         pid_ref: Arc<AtomicU32>,
         // Only the identity-checked group kill reads it, and that is Unix-only.
         #[cfg_attr(not(unix), allow(unused_variables))] starttime_ref: Arc<AtomicU64>,
@@ -2014,6 +2056,7 @@ impl ProvingWatchdog {
         slot_key: String,
         intentional_kill: Arc<AtomicBool>,
         clock: WatchdogClock,
+        as_timeout: bool,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -2044,9 +2087,15 @@ impl ProvingWatchdog {
                             );
                             return;
                         }
-                        tracing::error!(
-                            "Proving timeout ({timeout:?}) exceeded for {slot_key}, killing worker PID {current_pid}"
-                        );
+                        if as_timeout {
+                            tracing::error!(
+                                "Proving timeout ({timeout:?}) exceeded for {slot_key}, killing worker PID {current_pid}"
+                            );
+                        } else {
+                            tracing::debug!(
+                                "{slot_key}: run past its {timeout:?} limit, killing worker PID {current_pid}"
+                            );
+                        }
                         intentional_kill.store(true, Ordering::Release);
                         // Kill the worker's ENTIRE process group (the worker calls
                         // setpgid(0,0) at spawn) so forked GPU/helper children die
@@ -6611,19 +6660,28 @@ impl WorkerPool {
         // A calibration run is a full proof — reuse the benchmark timeout budget, or the sweep's
         // limit when that is shorter.
         let sent = Instant::now();
-        let timeout = match (self.benchmark_timeout_for(key), limit) {
-            (Some(t), Some(l)) => Some(t.min(l)),
-            (t, l) => t.or(l),
-        };
-        let _watchdog = timeout.map(|t| {
-            ProvingWatchdog::new(
+        let benchmark_timeout = self.benchmark_timeout_for(key);
+        // The sweep's limit, when it is the deadline, is reported as `CalibrationTooSlow` below, not
+        // as a proving timeout.
+        let limited = limit.filter(|l| benchmark_timeout.is_none_or(|t| *l < t));
+        let _watchdog = match (limited, benchmark_timeout) {
+            (Some(l), _) => Some(ProvingWatchdog::quiet(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
-                t,
+                l,
                 key.to_string(),
                 entry.intentional_kill.clone(),
-            )
-        });
+            )),
+            (None, t) => t.map(|t| {
+                ProvingWatchdog::new(
+                    entry.pid.clone(),
+                    entry.pid_starttime.clone(),
+                    t,
+                    key.to_string(),
+                    entry.intentional_kill.clone(),
+                )
+            }),
+        };
 
         let spill_watch = SpillWatch::new(
             entry.pid.clone(),
@@ -6660,7 +6718,7 @@ impl WorkerPool {
             Self::mark_slot_dead(&mut slot, entry);
             return Err(self.spill_shortage(key, evicted_mib));
         }
-        if let Some(limit) = limit {
+        if let Some(limit) = limited {
             if resp.is_err()
                 && entry.intentional_kill.load(Ordering::Acquire)
                 && sent.elapsed() >= limit
