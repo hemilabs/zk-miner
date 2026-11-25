@@ -6521,9 +6521,20 @@ impl WorkerPool {
                     throughput: total_cycles as f64 / prove_duration_secs.max(1e-9),
                 })
             }
-            Ok(WorkerResponse::Error { message, .. }) => {
+            Ok(WorkerResponse::Error { kind, message, .. }) => {
                 // A refusal (unsupported backend) is not a worker fault — leave the
-                // slot healthy so it stays usable for proving.
+                // slot healthy so it stays usable for proving. Nor is a size that does not fit
+                // (the HAL's failed allocation, which the worker answers ResourceExhausted): the
+                // sweep looks for exactly that size. That worker is replaced for a clean GPU
+                // state, as after a proof's, but the slot is charged no failure.
+                if matches!(kind, ErrorKind::ResourceExhausted) {
+                    // PID first: `kill()` reaps, after which the number may be reused.
+                    entry.clear_pid();
+                    if let Some(h) = slot.handle.as_mut() {
+                        h.kill();
+                    }
+                    Self::mark_slot_dead(&mut slot, entry);
+                }
                 Err(anyhow::anyhow!("{key} rejected calibration: {message}"))
             }
             Ok(other) => Err(anyhow::anyhow!(

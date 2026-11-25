@@ -913,7 +913,34 @@ fn run_worker_loop(ipc_stdout: impl io::Write + Send + 'static) -> Result<()> {
                 }
                 let calibrated = match gpu_refusal() {
                     Some(refusal) => Err(anyhow::anyhow!("{refusal}")),
-                    None => run_po2_calibration(request_id, po2),
+                    // Contained as a Prove's is. A calibration sweeps up to the size that no longer
+                    // fits, where risc0's HAL panics on the failed allocation (`evaluated`, 13.2 GiB
+                    // at po2 22): uncaught, that ended this worker, which the sweep then waited out
+                    // and the slot was charged a respawn failure for.
+                    None => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_po2_calibration(request_id, po2)
+                    })) {
+                        Ok(calibrated) => calibrated,
+                        Err(panic) => {
+                            let resp = match prove_panic_response(request_id, panic) {
+                                WorkerResponse::Error {
+                                    request_id,
+                                    kind,
+                                    message,
+                                } => WorkerResponse::Error {
+                                    request_id,
+                                    kind,
+                                    message: format!("Po2 calibration at po2={po2}: {message}"),
+                                },
+                                other => other,
+                            };
+                            write_message(&mut stdout, &resp)?;
+                            #[cfg(feature = "metal")]
+                            exit_after_metal_prove_panic(&mut stdout);
+                            #[cfg(not(feature = "metal"))]
+                            continue;
+                        }
+                    },
                 };
                 match calibrated {
                     Ok(resp) => write_message(&mut stdout, &resp)?,
