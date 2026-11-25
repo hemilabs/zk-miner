@@ -357,8 +357,10 @@ pub fn risc0_benchmark_po2(vram_bytes: Option<u64>, gpu_tag: &str) -> u8 {
 /// [`RISC0_JOB_MIN_VRAM_BYTES_UNMEASURED`], or nothing on a card too small; a calibration (real
 /// Groth16 proofs at each size, see `calibrate_po2_for_suite`) can raise that default to its
 /// measured-fastest size or give a smaller card one, but never lowers it below a size it proved: its
-/// ceiling keeps a step of headroom below the highest size that succeeded, which on the 16 GB 5080 is
-/// 19 where 20 proves. A calibration that saw the default size fail stands.
+/// ceiling keeps a step of headroom below the highest size that succeeded, except that a default
+/// size it proved is the ceiling at least (`calibrated_ceiling`: 20 on the 16 GB 5080, where 21 does
+/// not fit). The raise here still covers rows calibrated before that. A calibration that saw the
+/// default size fail stands.
 /// Always within [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`]. The size is the card's, not the
 /// job's: a guest can tell the size it runs at, so every job is measured at the size of each card that
 /// may prove it.
@@ -2686,6 +2688,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         // po2=22 against a real ~14 GB (on a 4090, po2=22 died with "allocation of 14159970304 bytes
         // for evaluated failed"). No size above it may win the argmax; the samples above it are kept
         // only as the rates of the sizes they measured (see `sweep_po2`).
+        let ceiling = calibrated_ceiling(ceiling, highest, db.benchmark_po2);
         if ceiling != db.max_feasible_po2 {
             tracing::info!(
                 "{key}: max_feasible_po2 {} → {ceiling} (measured)",
@@ -2733,6 +2736,22 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             tracing::info!("{key}: adopting po2 {ceiling} as this card's ceiling");
         }
         db.po2_samples = samples;
+    }
+}
+
+/// The ceiling a calibration records (`max_feasible_po2`): the sweep's (`sweep_po2`, a step below the
+/// highest size that proved when a larger one failed), raised to the card's default job size
+/// (`default`, its `benchmark_po2`) when the sweep proved that size.
+///
+/// A card proves jobs at its default size whenever the calibration proved it (`risc0_job_po2`), so a
+/// ceiling below it was never the card's limit: the 16 GB RTX 5080 proved 20 at full speed and
+/// recorded 19 (21 does not fit), the size the summary and table then showed as its size and
+/// fastest while every job ran at 20. Above the default the step of headroom stays: a size past
+/// the default is the calibration's to give, and the top of what proved once is marginal there.
+fn calibrated_ceiling(sweep_ceiling: u8, highest: Option<u8>, default: Option<u8>) -> u8 {
+    match (highest, default) {
+        (Some(highest), Some(default)) if highest >= default => sweep_ceiling.max(default),
+        _ => sweep_ceiling,
     }
 }
 
@@ -5677,6 +5696,21 @@ mod tests {
     }
 
     #[test]
+    fn a_proved_default_size_is_the_ceiling_at_least() {
+        // The 5080: 21 did not fit, 20 (its default) proved: 20, not the sweep's 19.
+        assert_eq!(calibrated_ceiling(19, Some(20), Some(20)), 20);
+        // A 12 GB card: 20 failed, 19 (its default) proved: 19.
+        assert_eq!(calibrated_ceiling(18, Some(19), Some(19)), 19);
+        // Above the default the step of headroom stays: 22 failed, 21 proved, default 20.
+        assert_eq!(calibrated_ceiling(20, Some(21), Some(20)), 20);
+        assert_eq!(calibrated_ceiling(21, Some(22), Some(20)), 21);
+        // The default did not prove (a display holding VRAM), or is unknown: the sweep's.
+        assert_eq!(calibrated_ceiling(18, Some(19), Some(20)), 18);
+        assert_eq!(calibrated_ceiling(19, Some(20), None), 19);
+        assert_eq!(calibrated_ceiling(19, None, Some(20)), 19);
+    }
+
+    #[test]
     fn a_calibration_run_is_limited_by_the_quickest_size_so_far() {
         assert_eq!(calibration_run_limit(None), None);
         assert_eq!(calibration_run_limit(Some(0.0)), None);
@@ -5722,11 +5756,12 @@ mod tests {
     fn a_size_that_spills_ends_the_sweep_at_its_limit() {
         // RTX 5080 (Windows, 16 GB, driving a display), 2026-11-25: 18-20 fit; 21 spilled to system
         // memory and took 259 s; 22 spilled more (9+ minutes, and an invalid proof). 21 is now
-        // stopped at a minute, 22 never runs, and 20 still proved: ceiling 19, highest 20, so the
-        // card keeps its default size, 20 (`risc0_job_po2`).
+        // stopped at a minute, 22 never runs, and 20 still proved: the sweep's ceiling 19, highest
+        // 20, so the card's ceiling is its default size, 20 (`calibrated_ceiling`).
         let (asked, ceiling, highest, limits) = timed_sweep(&[38.91, 25.23, 18.86, 259.16, 540.0]);
         assert_eq!(asked, vec![18, 19, 20, 21]);
         assert_eq!((ceiling, highest), (Some(19), Some(20)));
+        assert_eq!(calibrated_ceiling(19, highest, Some(20)), 20);
         assert_eq!(limits[3], Some(CALIBRATION_MIN_RUN));
         // RX 9070 XT, same run: 21 (77 s, under three times 20's 41 s) still proves; 22 (328 s) is
         // stopped at 123 s.

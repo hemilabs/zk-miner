@@ -208,13 +208,20 @@ pub async fn run(config_path: Option<&Path>, json: bool, calibrate: bool) -> Res
             // ("risc0 job sizes"). The table's "po2" column is this value for a calibrated card, and
             // a guess from VRAM for any other.
             for d in calibrated {
+                let highest = d
+                    .highest_proved_po2
+                    .map(|h| format!(", highest proved {h}"))
+                    .unwrap_or_default();
                 if benchmark::calibration_is_usable(&d.po2_samples) {
                     println!(
-                        "  {}: po2 ceiling {}, fastest {}",
+                        "  {}: po2 ceiling {}, fastest {}{highest}",
                         d.device_id, d.max_feasible_po2, d.optimal_po2
                     );
                 } else {
-                    println!("  {}: po2 ceiling {}", d.device_id, d.max_feasible_po2);
+                    println!(
+                        "  {}: po2 ceiling {}{highest}",
+                        d.device_id, d.max_feasible_po2
+                    );
                 }
             }
         }
