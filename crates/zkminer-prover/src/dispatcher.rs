@@ -2301,8 +2301,9 @@ fn spawn_refusal(
     // The same for an AMD card: a HIP binary carries code objects for a list of targets
     // (RX 7000 and 9000 in a release), with no JIT to fall back on, and a card outside it
     // fails every launch with "invalid device function". The card's target comes from the
-    // kernel's KFD topology; the binary is the risc0 worker, or the HIP server the SP1 worker
-    // runs. Unknown is again not "cannot".
+    // kernel's KFD topology, else (Windows) the HIP runtime or the card's PCI device id (see
+    // `discovery::amd_gfx_target`); the binary is the risc0 worker, or the HIP server the SP1
+    // worker runs. Unknown is again not "cannot".
     if gpu_tag == "rocm" && crate::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_none() {
         if let (Some(gfx), Some(binary)) = (
             pci_bus_id.and_then(crate::discovery::amd_gfx_target),

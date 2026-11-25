@@ -130,7 +130,7 @@ impl EmbeddedGpuCode {
 /// `host-x86_64-unknown-linux-gnu` (empty). A card runs a module only with a code object for its own
 /// target or a generic target that covers it (`gfx11-generic`); there is no JIT fallback, and a
 /// launch without one fails with "invalid device function". Every module must be runnable, as for
-/// CUDA.
+/// CUDA. A Windows (PE) binary carries the same bundles in `.hip_fat`, PE's eight-character name.
 ///
 /// As for CUDA, anything not understood (compressed bundles, an unknown generic target, no
 /// `.hip_fatbin`) is unknown, never "cannot run".
@@ -141,18 +141,24 @@ pub struct EmbeddedHipCode {
 }
 
 const HIP_SECTION: &[u8] = b".hip_fatbin";
+/// The same section in a PE, whose section names are at most eight bytes.
+const HIP_SECTION_PE: &[u8] = b".hip_fat";
 const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
 /// A bundle's header is far smaller than this; it bounds what one read takes.
 const MAX_BUNDLE_HEADER: usize = 64 << 10;
 
 impl EmbeddedHipCode {
-    /// The HIP device code in the ELF at `path`, or `None` if there is none it can read.
+    /// The HIP device code in the ELF or PE at `path`, or `None` if there is none it can read.
     pub fn read(path: &Path) -> io::Result<Option<Self>> {
         Self::from_reader(&mut File::open(path)?)
     }
 
     fn from_reader<R: Read + Seek>(r: &mut R) -> io::Result<Option<Self>> {
-        let Some((offset, size)) = find_section(r, HIP_SECTION)? else {
+        let section = match find_section(r, HIP_SECTION)? {
+            Some(section) => Some(section),
+            None => find_pe_section(r, HIP_SECTION_PE)?,
+        };
+        let Some((offset, size)) = section else {
             return Ok(None);
         };
         let end = offset.saturating_add(size);
@@ -554,6 +560,29 @@ mod tests {
             None
         );
         assert_eq!(read(b"#!/bin/sh\n".to_vec()), None);
+    }
+
+    /// A Windows binary's bundles are read from `.hip_fat`, its raw data's padding skipped.
+    #[test]
+    fn a_pe_hip_binary_is_read_from_its_truncated_section_name() {
+        let read = |pe: Vec<u8>| EmbeddedHipCode::from_reader(&mut Cursor::new(pe)).unwrap();
+        let code = read(pe(&[
+            (".text", vec![0x90; 100]),
+            (
+                ".hip_fat",
+                [bundle(&["gfx1030"]), bundle(&["gfx1030"])].concat(),
+            ),
+            (".hipFatB", vec![0x11; 48]),
+        ]))
+        .unwrap();
+        assert_eq!(code.describe(), "gfx1030");
+        assert!(code.runs_on("gfx1030"));
+        assert!(!code.runs_on("gfx1201"), "an RX 9070 card has no code here");
+        assert_eq!(read(pe(&[(".text", vec![0x90; 64])])), None);
+        assert_eq!(
+            read(pe(&[(".hip_fat", b"CCOB compressed bytes".to_vec())])),
+            None
+        );
     }
 
     /// One fatbin entry: a 64-byte header and `payload` bytes of stand-in code.
