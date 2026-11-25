@@ -233,7 +233,7 @@ jobs:
           | `sp1-gpu-server` | the NVIDIA GPU server `zkminer-prove-sp1` drives, built from the pinned hemilabs/sp1; keep it beside `zkminer-prove-sp1`, which installs it into `~/.sp1/bin` |
           | `libcudart.so.12` | NVIDIA's CUDA 12 runtime, which `sp1-gpu-server` links; keep it beside `zkminer-prove-sp1`, so a host needs only the NVIDIA driver. NVIDIA's software under NVIDIA's CUDA EULA, not zkminer's MIT license: see `libcudart.so.12.LICENSE.txt` |
           | `libcudart.so.12.LICENSE.txt` | the notice and NVIDIA's license for `libcudart.so.12` |
-          | `zkminer-provers-amd-linux-x86_64.tar.zst` | AMD (Radeon RX 7000 and 9000 series): the RISC Zero prover with AMD's ROCm 7.1 HIP runtime (`zkminer-rocm/`), and SP1's HIP server with ROCm 10.1's (`sp1-gpu-server-hip-lib/`); licenses in each `LICENSES/` |
+          | `zkminer-provers-amd-linux-x86_64.tar.zst` | AMD (Radeon RX 6800/6900/6950, RX 7000 and 9000 series): the RISC Zero prover with AMD's ROCm 7.1 HIP runtime (`zkminer-rocm/`), and SP1's HIP server with ROCm 10.1's (`sp1-gpu-server-hip-lib/`); licenses in each `LICENSES/` |
           | `zkminer-provers-intel-linux-x86_64.tar.zst` | Intel (Arc A and B series): the RISC Zero prover, SP1's SYCL server, and the oneAPI SYCL runtime and Intel compute runtime they load (`zkminer-intel/`; licenses in `zkminer-intel/LICENSES`) |
           | `zkminer-prove-openvm` | OpenVM prover |
 
