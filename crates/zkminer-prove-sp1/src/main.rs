@@ -4113,7 +4113,9 @@ mod usability_tests {
     /// Serialised against the other env-mutating test.
     #[test]
     fn unset_home_is_an_error_not_a_panic() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("HOME").ok();
         unsafe { std::env::remove_var("HOME") };
         let r = sp1_usability();
@@ -4129,7 +4131,9 @@ mod usability_tests {
     /// reported as unusable, carrying the loader's own message so it is actionable.
     #[test]
     fn a_present_but_unrunnable_server_is_unusable() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("sp1probe-{}", std::process::id()));
         let bin = tmp.join(".sp1/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -4169,7 +4173,9 @@ mod usability_tests {
     /// The override must come FIRST, so an operator can always win.
     #[test]
     fn the_override_has_top_priority() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(super::CUDA_DIR_OVERRIDE).ok();
         unsafe { std::env::set_var(super::CUDA_DIR_OVERRIDE, "/zz-override") };
         let got = super::cuda12_candidate_dirs();
@@ -4193,8 +4199,17 @@ mod usability_tests {
         // Takes the env lock: this reads HOME/VIRTUAL_ENV/CONDA_PREFIX, and a sibling test
         // that removes HOME would otherwise delete the pip branch mid-read and fail this
         // intermittently. Passing in isolation and failing in a full run is the signature.
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A HOME of its own with a user site dir in it: the pip branch lists the wheel's layout
+        // for each Python under `~/.local/lib`, so it is checked whatever this host has installed
+        // (a CI runner, or a test HOME, has none).
+        let home = std::env::temp_dir().join(format!("cudart-home-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".local/lib/python3.12")).unwrap();
+        let _home = super::usability_tests::SetEnv::to("HOME", &home);
         let dirs = super::cuda12_candidate_dirs();
+        let _ = std::fs::remove_dir_all(&home);
         let joined: Vec<String> = dirs
             .iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -4220,7 +4235,9 @@ mod usability_tests {
     /// shadowing it with a different copy would regress a working setup.
     #[test]
     fn an_existing_working_library_path_is_not_disturbed() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("cudart-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join(super::CUDART_SONAME), b"x").unwrap();
@@ -4249,7 +4266,9 @@ mod usability_tests {
     /// operator's own entries keep precedence.
     #[test]
     fn resolution_appends_rather_than_prepends() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("cudart-ap-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join(super::CUDART_SONAME), b"x").unwrap();
@@ -4306,7 +4325,9 @@ mod usability_tests {
     /// decide the GPU is absent, because /proc still knows better.
     #[test]
     fn an_unreachable_nvidia_smi_does_not_mean_no_gpu() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !super::nvidia_gpu_in_proc() {
             return; // no GPU on this machine at all: nothing to assert
         }
@@ -4335,7 +4356,9 @@ mod usability_tests {
     /// and the SDK ignores the exit status entirely.
     #[test]
     fn a_non_loader_failure_is_left_to_the_sdk() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("sp1probe-nz-{}", std::process::id()));
         let bin = tmp.join(".sp1/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -4374,7 +4397,9 @@ mod usability_tests {
     /// re-download reproduces it) and must still be declined.
     #[test]
     fn a_loader_failure_is_still_declined() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("sp1probe-ld-{}", std::process::id()));
         let bin = tmp.join(".sp1/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -4410,7 +4435,9 @@ mod usability_tests {
     /// worker starts its server only once it has no network, so SP1 must not be advertised.
     #[test]
     fn an_absent_server_is_unusable() {
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("sp1probe-empty-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let saved = std::env::var("HOME").ok();
@@ -4434,6 +4461,31 @@ mod usability_tests {
     pub(super) fn env_lock() -> &'static std::sync::Mutex<()> {
         static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         L.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// An environment variable set for one test, and put back as it was when dropped, so an
+    /// assertion that fails in between does not leave it changed for the tests after it. Hold
+    /// [`env_lock`] while it lives.
+    pub(super) struct SetEnv {
+        key: &'static str,
+        was: Option<std::ffi::OsString>,
+    }
+
+    impl SetEnv {
+        pub(super) fn to(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let was = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, was }
+        }
+    }
+
+    impl Drop for SetEnv {
+        fn drop(&mut self) {
+            match &self.was {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }
 
@@ -4525,7 +4577,9 @@ mod capability_tests {
     #[test]
     fn the_handshake_declines_a_server_without_the_capability() {
         use std::os::unix::fs::PermissionsExt;
-        let _g = super::usability_tests::env_lock().lock().unwrap();
+        let _g = super::usability_tests::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let version = sp1_primitives::SP1_CRATE_VERSION;
         let old = format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n\
