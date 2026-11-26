@@ -1927,6 +1927,11 @@ pub fn is_gpu_oom(message: &str) -> bool {
         // UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ("Native API returns: 39"), and SYCL's own wording.
         || m.contains("out_of_device_memory")
         || m.contains("out of device memory")
+        // And their OUT_OF_RESOURCES (UR 40), which an Arc Pro B70 answers about as often as 39 at
+        // a segment size too large for it (risc0 po2 22: "level_zero backend failed with error: 40
+        // (UR_RESULT_ERROR_OUT_OF_RESOURCES)"); its device is then lost to that worker.
+        || m.contains("ur_result_error_out_of_resources")
+        || m.contains("ze_result_error_out_of_resources")
 }
 
 /// One program of a benchmark request: the worker proves its own build of the guest `name` on
@@ -2642,6 +2647,15 @@ mod tests {
         assert!(is_gpu_oom("CUDA_ERROR_OUT_OF_MEMORY"));
         assert!(is_gpu_oom("hipErrorOutOfMemory"));
         assert!(is_gpu_oom("cudaMalloc failed"));
+        // An Arc Pro B70's two answers to a risc0 segment size too large for it.
+        assert!(is_gpu_oom(
+            "Intel GPU error: level_zero backend failed with error: 39 \
+             (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)"
+        ));
+        assert!(is_gpu_oom(
+            "Intel GPU error: level_zero backend failed with error: 40 \
+             (UR_RESULT_ERROR_OUT_OF_RESOURCES)"
+        ));
         assert!(is_gpu_oom(
             "Native API failed. Native API returns: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)"
         ));
