@@ -22288,7 +22288,7 @@ mod spill_and_cap_tests {
         assert!(!path.exists(), "nothing recorded");
     }
 
-    /// SP1's spawn refusals: the server's own floor is more than 11 GiB, and a 12-16 GB NVIDIA card
+    /// SP1's spawn refusals: the server's own floor is more than 10 GiB, and an 11-16 GB NVIDIA card
     /// with the server's memory savers switched off gets no slot; turning the free-VRAM checks off
     /// lifts the "can never free enough" refusal, but not the server's floor.
     #[test]
@@ -22298,9 +22298,10 @@ mod spill_and_cap_tests {
             |tag: &str, mib: u64| spawn_refusal("sp1", tag, None, None, path, Some(mib * MIB));
         {
             let _env = Hermetic::new(&[]);
-            let why = refuse("cuda", 11 * 1024).expect("11 GiB is the server's to refuse");
-            assert!(why.contains("requires more than 11.0 GiB"), "{why}");
-            assert_eq!(refuse("cuda", 11 * 1024 + 1), None);
+            let why = refuse("cuda", 10 * 1024).expect("10 GiB is the server's to refuse");
+            assert!(why.contains("requires more than 10.0 GiB"), "{why}");
+            assert_eq!(refuse("cuda", 10 * 1024 + 1), None);
+            assert_eq!(refuse("cuda", 11_264), None, "an RTX 2080 Ti");
             assert_eq!(refuse("cuda", 12_282), None);
             assert!(refuse("intel", 12 * 1024).is_some());
         }
@@ -22329,7 +22330,8 @@ mod spill_and_cap_tests {
         }
         let _env = Hermetic::new(&[(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV, "0")]);
         assert_eq!(refuse("intel", 12 * 1024), None);
-        assert!(refuse("intel", 11 * 1024).is_some());
+        assert_eq!(refuse("intel", 11 * 1024), None);
+        assert!(refuse("intel", 10 * 1024).is_some());
     }
 
     /// The risc0 worker proves a benchmark at the size the host names, and refuses one outside the

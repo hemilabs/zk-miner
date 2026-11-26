@@ -180,7 +180,7 @@ fn running_verdict(
             );
             if measured == u64::MAX {
                 return Verdict::Idle(
-                    "SP1's GPU server refuses cards of 11 GiB or less, so it gets no SP1 work"
+                    "SP1's GPU server refuses cards of 10 GiB or less, so it gets no SP1 work"
                         .to_string(),
                 );
             }
@@ -454,7 +454,7 @@ mod tests {
         let Verdict::Idle(why) = verdict(&rows, "GPU 2", "SP1") else {
             panic!("{rows:#?}")
         };
-        assert!(why.contains("11 GiB or less"), "{why}");
+        assert!(why.contains("10 GiB or less"), "{why}");
         assert!(anything_proves(&rows));
         // A size set for the card makes RISC Zero prove there.
         let sizes = HashMap::from([("gpu2".to_string(), 18u8)]);

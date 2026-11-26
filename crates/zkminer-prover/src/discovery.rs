@@ -2400,11 +2400,18 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
 /// `ceil(GiB) + 4 = 16`, so a 12 GB card (11.x GiB) runs, in the same element tier as a 16 GB one; an
 /// RTX 4070 and an Arc B580 proved SP1 Groth16 fibonacci on it. The floor is therefore the server's
 /// own: more than 11 GiB (an 11,264 MiB card is `11 + 4 = 15` and refused), in bytes as the card
-/// totals are read. Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s
-/// measured question, answered for 12-16 GB CUDA cards from an RTX 4070's peaks (2026-11-16).
+/// totals are read.
+///
+/// **hemilabs/sp1 #26 (`zkminer/turing-11gb`):** its server takes an 11 GB card (`11 + 4 = 15`)
+/// too, at 134,217,728 elements a shard (an RTX 2080 Ti proved the SP1 suite in 8,971 MiB), so the
+/// floor is now more than 10 GiB.
+///
+/// Whether a card has ROOM for a job is still [`min_available_vram_bytes_for_backend`]'s measured
+/// question, answered for 12-16 GB CUDA cards from an RTX 4070's peaks (2026-11-16) and for 11 GB
+/// ones from an RTX 2080 Ti's (2026-11-26).
 pub fn min_vram_bytes_for_backend(backend: &str) -> Option<u64> {
     match backend {
-        "sp1" => Some(11 * 1024 * 1024 * 1024 + 1),
+        "sp1" => Some(10 * 1024 * 1024 * 1024 + 1),
         _ => None,
     }
 }

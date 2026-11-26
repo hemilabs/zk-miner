@@ -1023,7 +1023,19 @@ pub struct Sp1Table {
     pub sets_savers: bool,
 }
 
-/// A CUDA card of 16 GiB or less, where the server runs lean by itself.
+/// A CUDA card of 11 GB (more than 10 GiB, at most 11: `ceil(GiB) + 4 = 15`), which the server
+/// takes at 134,217,728 elements a shard, lean, since hemilabs/sp1 #26.
+///
+/// Measured 2026-11-26 on an 11,264 MiB RTX 2080 Ti under Windows, driving no display, with the SP1
+/// benchmark suite through to a Groth16 seal (every program verified, Groth16 on the CPU): 8,971 MiB
+/// at peak under `zkminer benchmark` (8,555 run by the worker alone), nothing moved off the card,
+/// 3.3M cycles/s. 268M took 11,377 MiB on a 12 GB card, more than such a card has.
+const SP1_CUDA_11GB: Sp1Table = Sp1Table {
+    configs: &[(Sp1Config::lean(SP1_134M), 8_971 * MIB)],
+    sets_savers: true,
+};
+
+/// A CUDA card of 12-16 GiB, where the server runs lean by itself.
 ///
 /// Measured 2026-11-16 on a 12,282 MiB RTX 4070 under Windows, driving no display, with the SP1
 /// benchmark suite through to Groth16 seals (`nvidia-smi`'s figure, every program verified):
@@ -1135,8 +1147,9 @@ const SP1_OTHER_SERVER: Sp1Table = Sp1Table {
 };
 
 /// The largest card total `sp1-gpu-server` refuses: it panics at start-up ("Unsupported GPU memory")
-/// when `ceil(total GiB) + 4 < 16`, so on any card of 11 GiB or less.
-const SP1_UNSUPPORTED_CARD_MAX_TOTAL: u64 = 11 * 1024 * MIB;
+/// when `ceil(total GiB) + 4 < 15`, so on any card of 10 GiB or less (hemilabs/sp1 #26 took 11 GB
+/// cards in).
+const SP1_UNSUPPORTED_CARD_MAX_TOTAL: u64 = 10 * 1024 * MIB;
 
 /// `gpu`'s measured configurations on a card of `total` bytes, largest first: none for a card the
 /// server refuses, [`SP1_OTHER_SERVER`] for a class nothing has measured or a card whose total is not
@@ -1154,6 +1167,7 @@ pub fn sp1_measured_configs(gpu: Sp1Gpu, total: Option<u64>, lean: Option<bool>)
         };
     }
     let table = match (gpu, sp1_fork_gpu_memory_gb(total)) {
+        (Sp1Gpu::Cuda, ..=15) => SP1_CUDA_11GB,
         (Sp1Gpu::Cuda, ..=20) => SP1_CUDA_16GB,
         (Sp1Gpu::Cuda, ..=30) => SP1_CUDA_24GB,
         (Sp1Gpu::Cuda, _) => SP1_CUDA_32GB,
@@ -1564,7 +1578,8 @@ pub fn sp1_smallest_measured_threshold() -> u64 {
 /// The element threshold `sp1-gpu-server` picks for itself from the card's TOTAL VRAM, before any cap.
 ///
 /// Mirrors `local_gpu_opts` in the pinned server (`sp1-gpu/crates/prover_components/src/builder.rs`):
-/// it computes `gpu_memory_gb = ceil(total / 1 GiB) + 4`; at most 20 (a card of 16 GiB or less) a CUDA
+/// it computes `gpu_memory_gb = ceil(total / 1 GiB) + 4`; at most 15 (an 11 GB card) it takes
+/// 134,217,728; at most 20 (a card of 16 GiB or less) a CUDA
 /// server takes 268,435,456 (`1 << 28`), above that 285,212,672 up to 30 and the full
 /// `ELEMENT_THRESHOLD` = 402,653,184 above 30 or with `FULL_SIZE_SHARDS`, and then it uses the minimum
 /// of that and `SP1_GPU_ELEMENT_THRESHOLD` if the variable parses.
@@ -1581,7 +1596,9 @@ pub fn sp1_smallest_measured_threshold() -> u64 {
 pub fn sp1_fork_threshold_for_total_vram(total: u64) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
     let gpu_memory_gb = total.div_ceil(GIB) + 4;
-    if gpu_memory_gb <= 20 {
+    if gpu_memory_gb <= 15 {
+        134_217_728
+    } else if gpu_memory_gb <= 20 {
         1 << 28
     } else {
         SP1_FORK_DEFAULT_THRESHOLD
@@ -2533,7 +2550,8 @@ mod tests {
     #[test]
     fn the_server_runs_its_savers_on_cards_it_accepts_up_to_16_gib() {
         const MIB: u64 = 1 << 20;
-        assert!(!super::sp1_savers_are_the_default(11 * 1024 * MIB));
+        assert!(!super::sp1_savers_are_the_default(10 * 1024 * MIB));
+        assert!(super::sp1_savers_are_the_default(11_264 * MIB));
         assert!(super::sp1_savers_are_the_default(12_282 * MIB));
         assert!(super::sp1_savers_are_the_default(16 * 1024 * MIB));
         assert!(!super::sp1_savers_are_the_default(24_564 * MIB));
@@ -2869,27 +2887,51 @@ mod tests {
         );
     }
 
-    /// The server panics at start-up on a card of 11 GiB or less (`ceil(total GiB) + 4 < 16`), so no
+    /// The server panics at start-up on a card of 10 GiB or less (`ceil(total GiB) + 4 < 15`), so no
     /// amount of free memory there buys a configuration, and the floor is out of reach.
     #[test]
     fn a_card_the_server_refuses_has_no_tier() {
         use super::{sp1_config_for_available_vram as config, Sp1Config, MIB};
-        let eleven = Some(11 * 1024 * MIB);
-        assert_eq!(config(Cuda, eleven, 11 * 1024 * MIB, None, None), None);
+        let ten = Some(10 * 1024 * MIB);
+        assert_eq!(config(Cuda, ten, 10 * 1024 * MIB, None, None), None);
+        assert_eq!(super::sp1_min_available_vram_bytes(Cuda, ten, None), u64::MAX);
         assert_eq!(
-            super::sp1_min_available_vram_bytes(Cuda, eleven, None),
-            u64::MAX
-        );
-        assert_eq!(
-            super::sp1_vram_required(Cuda, eleven, Sp1Config::lean(134_217_728), None),
+            super::sp1_vram_required(Cuda, ten, Sp1Config::lean(134_217_728), None),
             None
         );
-        // A byte over 11 GiB is a 12 GB card to the server.
-        let twelve = Some(11 * 1024 * MIB + 1);
+        // A byte over 10 GiB is an 11 GB card to the server.
+        let eleven = Some(10 * 1024 * MIB + 1);
         assert_eq!(
-            config(Cuda, twelve, 11 * 1024 * MIB, None, None),
+            config(Cuda, eleven, 10 * 1024 * MIB, None, None),
             Some(Sp1Config::lean(134_217_728))
         );
+    }
+
+    /// An 11 GB card (an RTX 2080 Ti, 11,264 MiB) gets the one configuration its server runs there,
+    /// 134,217,728 lean, when its measured peak fits with margin, and never 268,435,456, which took
+    /// more than such a card has on a 12 GB one. Only on CUDA: nothing has measured another
+    /// vendor's 11 GB card.
+    #[test]
+    fn an_11_gb_card_runs_sp1_at_134m_lean_only() {
+        use super::{sp1_config_for_available_vram as config, Sp1Config, MIB};
+        let rtx2080ti = Some(11_264 * MIB);
+        let lean134 = Some(Sp1Config::lean(134_217_728));
+        assert_eq!(config(Cuda, rtx2080ti, 11_264 * MIB, None, None), lean134);
+        assert_eq!(config(Cuda, rtx2080ti, 9_483 * MIB, None, None), lean134);
+        assert_eq!(config(Cuda, rtx2080ti, 9_482 * MIB, None, None), None);
+        assert_eq!(
+            super::sp1_vram_required(Cuda, rtx2080ti, Sp1Config::lean(268_435_456), None),
+            None
+        );
+        assert_eq!(
+            super::sp1_fork_threshold_for_total_vram(11_264 * MIB),
+            134_217_728
+        );
+        assert_eq!(
+            super::sp1_fork_threshold_for_total_vram(12_282 * MIB),
+            268_435_456
+        );
+        assert_eq!(config(Rocm, rtx2080ti, 11_264 * MIB, None, None), None);
     }
 
     /// The floor and the table must agree about whether a card is usable at all. Two independent
