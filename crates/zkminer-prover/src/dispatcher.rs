@@ -17443,10 +17443,14 @@ mod tests {
             (12_282 - 272 - 300) * MIB - WINDOWS_SHARED_CARD_MARGIN
         );
         assert_eq!(
-            zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+            zkminer_prover_protocol::types::sp1_config_for_available_vram(
+                zkminer_prover_protocol::types::Sp1Gpu::Cuda,
+                Some(12_282 * MIB),
                 shared.available_to("sp1:cuda:1"),
-                Some(12_282 * MIB)
-            ),
+                None,
+                None,
+            )
+            .map(|c| c.threshold),
             Some(134_217_728)
         );
         // Seen shared once, a card keeps the margin a while, so it does not come and go between
