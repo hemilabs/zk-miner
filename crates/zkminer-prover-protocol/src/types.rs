@@ -2894,7 +2894,10 @@ mod tests {
         use super::{sp1_config_for_available_vram as config, Sp1Config, MIB};
         let ten = Some(10 * 1024 * MIB);
         assert_eq!(config(Cuda, ten, 10 * 1024 * MIB, None, None), None);
-        assert_eq!(super::sp1_min_available_vram_bytes(Cuda, ten, None), u64::MAX);
+        assert_eq!(
+            super::sp1_min_available_vram_bytes(Cuda, ten, None),
+            u64::MAX
+        );
         assert_eq!(
             super::sp1_vram_required(Cuda, ten, Sp1Config::lean(134_217_728), None),
             None

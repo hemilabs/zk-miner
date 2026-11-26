@@ -2807,8 +2807,11 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             std::thread::sleep(wait + Duration::from_millis(250));
         }
         settle_top_two(&mut samples, ceiling, |po2| {
-            match pool.calibrate_slot_po2_within(&key, po2, calibration_run_limit(fastest_secs.get()))
-            {
+            match pool.calibrate_slot_po2_within(
+                &key,
+                po2,
+                calibration_run_limit(fastest_secs.get()),
+            ) {
                 Ok(s) => {
                     tracing::info!(
                         "{key}: po2={} (top two, in alternation) {:.2}s → {:.0} c/s",
