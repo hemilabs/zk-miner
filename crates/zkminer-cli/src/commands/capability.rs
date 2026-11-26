@@ -123,6 +123,9 @@ fn running_verdict(
                 Some(po2) => Verdict::Ready(format!(
                     "segment size 2^{po2}{}",
                     match (over, row.is_some_and(|r| !r.po2_samples.is_empty())) {
+                        (Some(o), _) if o > po2 => {
+                            " (the config's size is more than the card's VRAM holds)"
+                        }
                         (Some(_), _) => " (set in the config)",
                         (None, true) => " (calibrated)",
                         (None, false) => "",

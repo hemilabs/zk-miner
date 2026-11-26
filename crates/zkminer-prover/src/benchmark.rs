@@ -393,7 +393,10 @@ pub fn risc0_benchmark_po2(vram_bytes: Option<u64>, gpu_tag: &str) -> u8 {
 /// Groth16 proofs at each size, see `calibrate_po2_for_suite`) can raise that default to its
 /// measured-fastest size or give a smaller card one, but never lowers it below a size it proved: its
 /// ceiling keeps a step of headroom below the highest size that succeeded, which on the 16 GB 5080 is
-/// 19 where 20 proves. A calibration that saw the default size fail stands.
+/// 19 where 20 proves. A calibration that saw the default size fail stands. On a CUDA card of known
+/// VRAM, an operator's size is held to the largest the card can hold at all
+/// ([`risc0_po2_vram_ceiling`]: 20 on the 5080), which a configured 21 or 22 would otherwise spill
+/// past. A calibrated size is not: it is a size the card proved twice in a row.
 /// Always within [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`]. The size is the card's, not the
 /// job's: a guest can tell the size it runs at, so every job is measured at the size of each card that
 /// may prove it.
@@ -410,7 +413,8 @@ pub fn risc0_job_po2(
     use zkminer_prover_protocol::{RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let in_range = |p: u8| p.clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX);
     if let Some(p) = override_po2 {
-        return Some(in_range(p));
+        let p = in_range(p);
+        return Some(risc0_po2_vram_ceiling(vram_bytes, gpu_tag).map_or(p, |c| p.min(c)));
     }
     // A card whose VRAM could not be read this time proves at the size its benchmark ran at, which
     // was its default when it was read: its rate is that size's, and 20 may not fit it.
@@ -504,6 +508,32 @@ pub fn metal_job_po2(vram_bytes: Option<u64>) -> u8 {
         Some(limit) => crate::metal_sizing::job_po2_for_limit(limit),
         None => zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2,
     }
+}
+
+/// The largest segment size a CUDA card of `vram` bytes can hold at all: the largest whose peak
+/// (`risc0_gpu_peak`: measured to 20, extrapolated above) is within the card's total, with no
+/// margin. This is not the default size ([`risc0_default_job_po2_for_vram`]) but the size above which
+/// a proof cannot fit, which [`risc0_job_po2`] holds an operator's size to and a calibration sweep
+/// stops at. The Groth16 cache is not counted: a worker on a card of 20-48 GiB releases it before a
+/// proof above the default size, and on a larger card it fits beside any size.
+///
+/// A size past it does not fail under Windows: the driver's system-memory fallback spills it, and
+/// a spilled proof runs several times slower and can come out invalid (po2 22 on the 16 GB RTX 5080:
+/// 3 invalid of 8), and has left the driver needing a reboot to recover the card (po2 21 on the
+/// 5080). On Linux it runs out of memory after the time of a proof.
+///
+/// `None`, no ceiling: another vendor's card (nothing has measured their peaks), a card of unknown
+/// size or one too small for the smallest size (it gets no default size either), and with the
+/// free-VRAM checks off (`ZKMINER_MIN_AVAILABLE_VRAM_MB=0`, which lifts this as it lifts them).
+pub fn risc0_po2_vram_ceiling(vram: Option<u64>, gpu_tag: &str) -> Option<u8> {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let vram = vram.filter(|_| gpu_tag == "cuda")?;
+    if crate::discovery::free_vram_checks_off() {
+        return None;
+    }
+    (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX)
+        .rev()
+        .find(|p| risc0_gpu_peak(*p) <= vram)
 }
 
 /// The largest job size whose peak (`risc0_gpu_peak`: measured to 20, extrapolated above) plus
@@ -2625,8 +2655,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         // as their memory comes back, and memory on its way back still counts as held (`draining`),
         // so the sweep would be capped too low.
         pool.settle_vram(&key);
+        let mut card_total = None;
         let free_po2 = match pool.vram_budget_for_slot(&key) {
             Some(budget) if budget.total > 0 => {
+                card_total = Some(budget.total);
                 // What physically fits: calibration's own 10% is its headroom, not the Windows
                 // growth margin, which would cap a display card a size down for good.
                 let (fits, _) = find_optimal_gpu_po2(
@@ -2650,6 +2682,19 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             _ => db.max_feasible_po2.min(PO2_MAX),
         };
         let max_po2 = max_po2.min(zkminer_prover_protocol::RISC0_JOB_PO2_MAX);
+        // Never a size the card cannot hold at all (`risc0_po2_vram_ceiling`): under Windows it
+        // spills rather than failing, until the run's time limit stops it, and one such run left the
+        // driver needing a reboot.
+        let max_po2 = match risc0_po2_vram_ceiling(card_total, gpu_tag) {
+            Some(held) if held < max_po2 => {
+                tracing::info!(
+                    "{key}: capping the po2 sweep at {held} rather than {max_po2} — a larger size \
+                     needs more than the card's VRAM"
+                );
+                held
+            }
+            _ => max_po2,
+        };
         if max_po2 < zkminer_prover_protocol::RISC0_JOB_PO2_MIN {
             tracing::warn!(
                 "{key}: skipping po2 calibration — not enough free VRAM for even po2={}",
@@ -5770,6 +5815,37 @@ mod tests {
             fits.filter(|f| p <= *f).map(|_| sample(p, 4, 1e6))
         });
         (samples.iter().map(|s| s.po2).collect(), ceiling, asked)
+    }
+
+    #[test]
+    fn a_risc0_size_past_what_the_card_holds_is_lowered_to_it() {
+        const MIB: u64 = 1 << 20;
+        let ceiling = |mib: u64| risc0_po2_vram_ceiling(Some(mib * MIB), "cuda");
+        // The 16 GB RTX 5080 holds 20 (12,436 MiB) and not 21 (about 20,950); a 4090 (24 GB) and a
+        // 5090 (32 GB) hold 21 and not 22 (about 37,978); a 12 GB 4070 holds 19.
+        assert_eq!(ceiling(16_303), Some(20));
+        assert_eq!(ceiling(24_564), Some(21));
+        assert_eq!(ceiling(32_607), Some(21));
+        assert_eq!(ceiling(12_282), Some(19));
+        // Too small for the smallest size, another vendor's card or an unknown size: no ceiling.
+        assert_eq!(ceiling(4_096), None);
+        assert_eq!(risc0_po2_vram_ceiling(Some(16_303 * MIB), "rocm"), None);
+        assert_eq!(risc0_po2_vram_ceiling(None, "cuda"), None);
+
+        let rtx5080 = Some(16_303 * MIB);
+        // An operator's 21 or 22 on the 5080 proves at 20; a size it holds stands.
+        assert_eq!(risc0_job_po2(Some(21), None, rtx5080, "cuda"), Some(20));
+        assert_eq!(risc0_job_po2(Some(22), None, rtx5080, "cuda"), Some(20));
+        assert_eq!(risc0_job_po2(Some(19), None, rtx5080, "cuda"), Some(19));
+        assert_eq!(
+            risc0_slot_job_po2("gpu0", "cuda", Some(22), None, rtx5080),
+            Some(20)
+        );
+        let card6gb = Some(6_144 * MIB);
+        assert_eq!(risc0_job_po2(Some(19), None, card6gb, "cuda"), Some(18));
+        // Not on an AMD card of the same size, or a CUDA card whose VRAM was not read.
+        assert_eq!(risc0_job_po2(Some(22), None, rtx5080, "rocm"), Some(22));
+        assert_eq!(risc0_job_po2(Some(22), None, None, "cuda"), Some(22));
     }
 
     #[test]
