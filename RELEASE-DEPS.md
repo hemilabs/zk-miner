@@ -12,13 +12,16 @@ Metal build runs (the rv32im `eval_check_ef` compare-and-subtract on sm_70, the 
 reservation and preloading the SRS after the pool, and an opt-in pinned copy of the Groth16 key,
 `RISC0_GROTH16_PINNED_KEY`). For a Mac, `a424eda4b` builds what `81ee699e3` built. Then to `bffe8d996`,
 `a424eda4b` plus rzup's download host moved to `artifacts.risczero.net`, as upstream risc0 did: the old
-S3 bucket now answers 403, and the new host serves the same blobs.
+S3 bucket now answers 403, and the new host serves the same blobs. Then to `531017d2f` (hemilabs/risc0
+branch `zkminer/sycl-exception-safety`): `bffe8d996` plus the Intel SYCL layer's entry points no longer
+letting a C++ exception into Rust (a segment size too large for an Intel card aborted the worker; it is
+now a typed out-of-memory answer). Intel only: a Mac or CUDA/HIP build compiles none of it.
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1-v2-titanv`** (on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "bffe8d996d…"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/sycl-exception-safety`** (on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "531017d2f6…"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
