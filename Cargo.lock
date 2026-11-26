@@ -6293,7 +6293,7 @@ checksum = "3df6368f71f205ff9c33c076d170dd56ebf68e8161c733c0caa07a7a5509ed53"
 [[package]]
 name = "risc0-binfmt"
 version = "3.0.6"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "borsh",
@@ -6314,7 +6314,7 @@ dependencies = [
 [[package]]
 name = "risc0-build"
 version = "3.0.7"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "cargo_metadata 0.19.2",
@@ -6337,7 +6337,7 @@ dependencies = [
 [[package]]
 name = "risc0-build-kernel"
 version = "2.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "cc",
  "directories",
@@ -6351,7 +6351,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-keccak"
 version = "4.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6373,7 +6373,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-keccak-sys"
 version = "4.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "cc",
  "cust",
@@ -6388,7 +6388,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion"
 version = "4.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -6425,7 +6425,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-recursion-sys"
 version = "4.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "cc",
  "glob",
@@ -6450,7 +6450,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-rv32im"
 version = "4.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "bit-vec",
@@ -6485,7 +6485,7 @@ dependencies = [
 [[package]]
 name = "risc0-circuit-rv32im-sys"
 version = "4.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "cc",
  "cust",
@@ -6501,7 +6501,7 @@ dependencies = [
 [[package]]
 name = "risc0-core"
 version = "3.0.2"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "bytemuck",
  "nvtx",
@@ -6512,7 +6512,7 @@ dependencies = [
 [[package]]
 name = "risc0-groth16"
 version = "3.0.6"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -6543,7 +6543,7 @@ dependencies = [
 [[package]]
 name = "risc0-groth16-sys"
 version = "0.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -6563,7 +6563,7 @@ dependencies = [
 [[package]]
 name = "risc0-sys"
 version = "1.5.1"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "blst",
@@ -6576,7 +6576,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkos-v1compat"
 version = "2.2.3"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "include_bytes_aligned",
  "no_std_strings",
@@ -6586,7 +6586,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkp"
 version = "3.0.6"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "anyhow",
  "blake2",
@@ -6617,7 +6617,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm"
 version = "3.1.0"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "addr2line 0.24.2",
  "anyhow",
@@ -6665,7 +6665,7 @@ dependencies = [
 [[package]]
 name = "risc0-zkvm-platform"
 version = "2.2.3"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -6945,7 +6945,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "rzup"
 version = "0.5.2"
-source = "git+https://github.com/hemilabs/risc0?rev=bffe8d996d8e9682c937ca76e7b40d7de994c2d8#bffe8d996d8e9682c937ca76e7b40d7de994c2d8"
+source = "git+https://github.com/hemilabs/risc0?rev=a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e#a29bdad55d8b1f28be77f7e3fdb6ae8261e21e6e"
 dependencies = [
  "hex",
  "rsa",

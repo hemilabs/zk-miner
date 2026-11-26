@@ -12,13 +12,20 @@ Metal build runs (the rv32im `eval_check_ef` compare-and-subtract on sm_70, the 
 reservation and preloading the SRS after the pool, and an opt-in pinned copy of the Groth16 key,
 `RISC0_GROTH16_PINNED_KEY`). For a Mac, `a424eda4b` builds what `81ee699e3` built. Then to `bffe8d996`,
 `a424eda4b` plus rzup's download host moved to `artifacts.risczero.net`, as upstream risc0 did: the old
-S3 bucket now answers 403, and the new host serves the same blobs.
+S3 bucket now answers 403, and the new host serves the same blobs. Then to `a29bdad55` (hemilabs/risc0
+branch `zkminer/metal-3.1-v2-racefix`), `bffe8d996` plus one Metal-only commit with two fixes from the
+synchronization review: rv32im GPU witness generation reads a snapshot of the rows taken before it
+starts, not rows neighbouring threads are still writing (`RISC0_METAL_WITGEN_SINGLE_BUFFER=1` restores
+the old single-buffer mode); and a failed Metal command buffer that the runtime retired outside a sync
+now fails the next host read instead of returning incomplete data. Measured on an M5 Max at po2 20:
+`--benchmark` 253.3 s -> 254.6 s (+0.5%), peak GPU memory 9612 -> 9823 MiB, all of it the snapshot.
+Other platforms build what `bffe8d996` built.
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1-v2-titanv`** (on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "bffe8d996d…"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-3.1-v2-racefix`** (on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`) | `rev = "a29bdad55d…"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
