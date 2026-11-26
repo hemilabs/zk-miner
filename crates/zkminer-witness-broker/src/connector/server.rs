@@ -158,6 +158,9 @@ pub struct ConnectorStats {
     pub refused: AtomicU64,
     /// TCP connect attempts made (each admitted address tried).
     pub attempts: AtomicU64,
+    /// Sessions whose answer writer failed (the broker shut its reading side, or exited): nothing
+    /// more is connected for them.
+    pub answer_writes_failed: AtomicU64,
 }
 
 struct Bucket {
@@ -672,11 +675,15 @@ impl Connector {
                             if matches!(w, Ok(WriterEnd::Stalled)) {
                                 break SessionEnd::CutOff(CutOff::AnswersStalled);
                             }
+                            let failed = matches!(w, Ok(WriterEnd::Failed(_)));
                             if let Ok(WriterEnd::Failed(e)) = &w {
                                 tracing::debug!(error = %e, "connector: writing an answer failed");
                             }
                             writer_end = Some(w);
                             writer_gone_at = Some(Instant::now());
+                            if failed {
+                                self.stats.answer_writes_failed.fetch_add(1, Ordering::Relaxed);
+                            }
                             continue;
                         }
                     }
