@@ -425,3 +425,44 @@ fn calibration_sizes_against_what_physically_fits() {
         .expect("the mock calibrates");
     assert_eq!(sample.po2, 19);
 }
+
+/// A calibration run past the sweep's limit (`benchmark::calibration_run_limit`) is stopped and
+/// answered as a size that does not fit, not left to run; one inside it is unaffected.
+#[test]
+fn a_calibration_run_past_its_limit_is_stopped_as_too_slow() {
+    use zkminer_prover::dispatcher::CalibrationTooSlow;
+    let key = "risc0:cuda:0";
+    let vram_mib = 16_303;
+    let reading = TestCard {
+        total_mib: vram_mib,
+        ..card(0)
+    };
+    let env = HashMap::from([
+        ("MOCK_BACKEND".to_string(), "risc0".to_string()),
+        ("MOCK_HANG_ON".to_string(), "calibrate".to_string()),
+    ]);
+    let mut pool = WorkerPool::new(HashMap::new(), Vec::new(), None);
+    pool.insert_test_worker(key, "risc0", mock_worker_path(), env)
+        .expect("spawn the mock worker");
+    pool.test_set_card_identity(key, "cuda", Some(BUS), Some(NAME), Some(vram_mib * MIB));
+    pool.test_set_cards(key, vec![Some(reading.clone())]);
+    let started = std::time::Instant::now();
+    let e = pool
+        .calibrate_slot_po2_within(key, 21, Some(Duration::from_secs(2)))
+        .expect_err("the run hangs past its limit");
+    let slow = e
+        .downcast_ref::<CalibrationTooSlow>()
+        .unwrap_or_else(|| panic!("typed as too slow: {e:#}"));
+    assert_eq!((slow.slot_key.as_str(), slow.po2), (key, 21));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "stopped at its limit"
+    );
+
+    let dir = TempDir::new("risc0-calibrate-in-time");
+    let pool = risc0_pool(&dir, vram_mib, reading);
+    let sample = pool
+        .calibrate_slot_po2_within(key, 20, Some(Duration::from_secs(60)))
+        .expect("a run inside its limit is unaffected");
+    assert_eq!(sample.po2, 20);
+}
