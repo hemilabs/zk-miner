@@ -1111,6 +1111,9 @@ Worth knowing:
   for, too little VRAM. The ones that need attention also go to the dashboard's activity log.
   `zkminer doctor` prints the same table on demand, with the config, chain, gas and stake
   checks, and starts nothing.
+- **11 GB NVIDIA cards prove SP1 too** (measured on an RTX 2080 Ti): at the smaller shard size,
+  from about 9.3 GiB free, at 3.3M cycles/s. SP1's server now carries code for RTX 20 series
+  (Turing) cards as well.
 - **12 GB NVIDIA cards prove both zkVMs** (measured on an RTX 4070). SP1 runs at its larger
   shard size when about 11.6 GiB of the card is free, which an idle 12 GB card has, and at the
   smaller one (about 20% slower) from 9 GiB, so a card driving a display steps down by itself.

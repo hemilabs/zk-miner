@@ -83,7 +83,7 @@ env:
     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89
     -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100
     -gencode arch=compute_120,code=[sm_120,compute_120]
-  SP1_CUDA_ARCHS: '80,86,89,90,100,120'
+  SP1_CUDA_ARCHS: '75,80,86,89,90,100,120'
 
 jobs:
   # -----------------------------------------------------------------------

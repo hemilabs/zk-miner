@@ -405,13 +405,14 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # fails the build rather than going into it.
 ENV GOPROXY="https://proxy.golang.org,https://goproxy.cn,direct"
 
-# GPU targets: the families the fork itself builds by default on CUDA 12.8 and later — sm_80 (A100), sm_86
-# (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200), sm_100 (B200, and B300 runs
-# it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it). No PTX: with relocatable device code the
-# linked image the runtime loads is native code only, whatever the objects carry. SP1 needs 16 GB of
-# VRAM, which leaves few cards older than these. One outside the list is refused when the miner
-# starts, as for the risc0 worker above (crates/zkminer-prover/src/gpu_code.rs).
-ARG SP1_CUDA_ARCHS=80,86,89,90,100,120
+# GPU targets: sm_75 (RTX 20, T4), then the families the fork itself builds by default on CUDA 12.8 and
+# later — sm_80 (A100), sm_86 (RTX 30, A10, A40, A6000), sm_89 (RTX 40, L4, L40), sm_90 (H100, H200),
+# sm_100 (B200, and B300 runs it) and sm_120 (RTX 50, RTX PRO 6000, and GB10 runs it). No PTX: with
+# relocatable device code the linked image the runtime loads is native code only, whatever the
+# objects carry. The server takes cards of more than 10 GiB (an 11 GB RTX 2080 Ti proves SP1 since
+# hemilabs/sp1 #26), so Turing is listed too. One outside the list is refused when the miner starts,
+# as for the risc0 worker above (crates/zkminer-prover/src/gpu_code.rs).
+ARG SP1_CUDA_ARCHS=75,80,86,89,90,100,120
 
 COPY Cargo.lock /build/Cargo.lock
 
