@@ -360,7 +360,10 @@ pub fn risc0_benchmark_po2(vram_bytes: Option<u64>, gpu_tag: &str) -> u8 {
 /// ceiling keeps a step of headroom below the highest size that succeeded, except that a default
 /// size it proved is the ceiling at least (`calibrated_ceiling`: 20 on the 16 GB 5080, where 21 does
 /// not fit). The raise here still covers rows calibrated before that. A calibration that saw the
-/// default size fail stands.
+/// default size fail stands. On a CUDA card of known VRAM, an operator's size is held to the largest
+/// the card can hold at all ([`risc0_po2_vram_ceiling`]: 20 on the 5080), which a configured 21 or 22
+/// would otherwise spill past. A calibrated size is not: it is the fastest size the card proved, and
+/// a spilled size is several times slower than the one below it.
 /// Always within [`RISC0_JOB_PO2_MIN`]..=[`RISC0_JOB_PO2_MAX`]. The size is the card's, not the
 /// job's: a guest can tell the size it runs at, so every job is measured at the size of each card that
 /// may prove it.
@@ -377,7 +380,8 @@ pub fn risc0_job_po2(
     use zkminer_prover_protocol::{RISC0_DEFAULT_JOB_PO2, RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
     let in_range = |p: u8| p.clamp(RISC0_JOB_PO2_MIN, RISC0_JOB_PO2_MAX);
     if let Some(p) = override_po2 {
-        return Some(in_range(p));
+        let p = in_range(p);
+        return Some(risc0_po2_vram_ceiling(vram_bytes, gpu_tag).map_or(p, |c| p.min(c)));
     }
     // A card whose VRAM could not be read this time proves at the size its benchmark ran at, which
     // was its default when it was read: its rate is that size's, and 20 may not fit it.
@@ -409,6 +413,36 @@ pub fn risc0_job_po2(
         }
         None => default,
     }
+}
+
+/// The largest segment size a CUDA card of `vram` bytes can hold at all: the largest whose peak
+/// (`risc0_gpu_peak`: measured to 20, extrapolated above), plus the Groth16 cache a worker keeps on
+/// a card of 20 GiB or more, is within the card's total. No margin: this is not the default size
+/// ([`risc0_default_job_po2_for_vram`]) but the size above which a proof cannot fit, which
+/// [`risc0_job_po2`] holds an operator's size to and a calibration sweep stops at.
+///
+/// A size past it does not fail under Windows: the driver's system-memory fallback spills it, and
+/// a spilled proof runs several times slower and can come out invalid (po2 22 on the 16 GB RTX 5080:
+/// 3 invalid of 8), and has left the driver needing a reboot to recover the card (po2 21 on the
+/// 5080). On Linux it runs out of memory after the time of a proof.
+///
+/// `None`, no ceiling: another vendor's card (nothing has measured their peaks), a card of unknown
+/// size or one too small for the smallest size (it gets no default size either), and with the
+/// free-VRAM checks off (`ZKMINER_MIN_AVAILABLE_VRAM_MB=0`, which lifts this as it lifts them).
+pub fn risc0_po2_vram_ceiling(vram: Option<u64>, gpu_tag: &str) -> Option<u8> {
+    use zkminer_prover_protocol::{RISC0_JOB_PO2_MAX, RISC0_JOB_PO2_MIN};
+    let vram = vram.filter(|_| gpu_tag == "cuda")?;
+    if crate::discovery::free_vram_checks_off() {
+        return None;
+    }
+    let resident = if vram >= crate::discovery::RISC0_KEEPS_GROTH16_FROM_BYTES {
+        crate::discovery::RISC0_RESIDENT_GROTH16_BYTES
+    } else {
+        0
+    };
+    (RISC0_JOB_PO2_MIN..=RISC0_JOB_PO2_MAX)
+        .rev()
+        .find(|p| risc0_gpu_peak(*p).saturating_add(resident) <= vram)
 }
 
 /// [`risc0_job_po2`] for one risc0 slot, by its benchmark device id (`WorkerPool::risc0_slots`).
@@ -2586,8 +2620,10 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         // as their memory comes back, and memory on its way back still counts as held (`draining`),
         // so the sweep would be capped too low.
         pool.settle_vram(&key);
+        let mut card_total = None;
         let free_po2 = match pool.vram_budget_for_slot(&key) {
             Some(budget) if budget.total > 0 => {
+                card_total = Some(budget.total);
                 // What physically fits: calibration's own 10% is its headroom, not the Windows
                 // growth margin, which would cap a display card a size down for good.
                 let (fits, _) = find_optimal_gpu_po2(
@@ -2611,6 +2647,23 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
             _ => db.max_feasible_po2.min(PO2_MAX),
         };
         let max_po2 = max_po2.min(zkminer_prover_protocol::RISC0_JOB_PO2_MAX);
+        // Never a size the card cannot hold at all (`risc0_po2_vram_ceiling`): under Windows it
+        // spills rather than failing, until the run's time limit stops it, and one such run left the
+        // driver needing a reboot. A ceiling past the measured sizes is an extrapolation, so a sweep
+        // that reaches it backs off a step, as at the job range's top (`sweep_po2_with`).
+        let largest_measured = RISC0_GPU_MEASURED_PEAK_MIB[RISC0_GPU_MEASURED_PEAK_MIB.len() - 1].0;
+        let (max_po2, backoff_at) = match risc0_po2_vram_ceiling(card_total, gpu_tag) {
+            Some(held) if held < max_po2 => {
+                tracing::info!(
+                    "{key}: capping the po2 sweep at {held} rather than {max_po2} — a larger size \
+                     needs more than the card's VRAM"
+                );
+                let extrapolated = held > largest_measured;
+                let backoff_at = if extrapolated { held } else { u8::MAX };
+                (held, backoff_at)
+            }
+            _ => (max_po2, zkminer_prover_protocol::RISC0_JOB_PO2_MAX),
+        };
         if max_po2 < zkminer_prover_protocol::RISC0_JOB_PO2_MIN {
             tracing::warn!(
                 "{key}: skipping po2 calibration — not enough free VRAM for even po2={}",
@@ -2622,7 +2675,7 @@ pub fn calibrate_po2_for_suite(suite: &mut BenchmarkSuite, pool: &crate::dispatc
         tracing::info!("{key}: calibrating po2 from {start}, up to {max_po2}");
         // The quickest run so far, which bounds the next (`calibration_run_limit`).
         let mut fastest_secs: Option<f64> = None;
-        let (samples, ceiling, highest) = sweep_po2(start, max_po2, |po2| {
+        let (samples, ceiling, highest) = sweep_po2_with(start, max_po2, backoff_at, |po2| {
             let limit = calibration_run_limit(fastest_secs);
             // Retry once on failure. A worker can be SIGKILLed out from under us
             // between `ensure_alive`'s liveness check and the response — the worker
@@ -2810,9 +2863,23 @@ pub fn calibration_run_limit(fastest_secs: Option<f64>) -> Option<Duration> {
 ///
 /// `prove(p)` proves the calibration workload at `p` and returns its sample. Also returns the
 /// highest size that proved, which the kept samples may not include.
+#[cfg(test)]
 fn sweep_po2(
     start: u8,
     top: u8,
+    prove: impl FnMut(u8) -> Option<Po2Sample>,
+) -> (Vec<Po2Sample>, Option<u8>, Option<u8>) {
+    use zkminer_prover_protocol::RISC0_JOB_PO2_MAX;
+    sweep_po2_with(start, top, RISC0_JOB_PO2_MAX, prove)
+}
+
+/// [`sweep_po2`], backing off a step from `backoff_at` (or above) as from the job range's top: a
+/// top set by an extrapolated peak ([`risc0_po2_vram_ceiling`] past the measured sizes) is no more
+/// a measured limit than the range's top is. `u8::MAX`: no such top.
+fn sweep_po2_with(
+    start: u8,
+    top: u8,
+    backoff_at: u8,
     mut prove: impl FnMut(u8) -> Option<Po2Sample>,
 ) -> (Vec<Po2Sample>, Option<u8>, Option<u8>) {
     use zkminer_prover_protocol::RISC0_JOB_PO2_MIN;
@@ -2851,8 +2918,10 @@ fn sweep_po2(
     };
     // Reaching the job range's top proves nothing about headroom: the prover refuses anything larger,
     // so no failure above it could be seen. A top set by the card's memory is a MEASURED size that fit
-    // with 10% to spare (`find_optimal_gpu_po2` never caps at an extrapolated one), so it keeps.
-    let ceiling = if failed || highest >= zkminer_prover_protocol::RISC0_JOB_PO2_MAX {
+    // with 10% to spare (`find_optimal_gpu_po2` never caps at an extrapolated one), so it keeps; a
+    // top set by an extrapolated peak (`backoff_at`) does not.
+    let unproven_top = backoff_at.min(zkminer_prover_protocol::RISC0_JOB_PO2_MAX);
+    let ceiling = if failed || highest >= unproven_top {
         highest.saturating_sub(1)
     } else {
         highest
@@ -5538,6 +5607,50 @@ mod tests {
         assert_eq!(risc0_job_throughput(&a770, 19, None), 77_113.0);
     }
 
+    #[test]
+    fn a_risc0_size_past_what_the_card_holds_is_lowered_to_it() {
+        const MIB: u64 = 1 << 20;
+        let ceiling = |mib: u64| risc0_po2_vram_ceiling(Some(mib * MIB), "cuda");
+        // The 16 GB RTX 5080 holds 20 (12,436 MiB) and not 21 (about 20,950); a 4090 (24 GB, with
+        // the Groth16 cache kept) and a 5090 (32 GB) hold 21 and not 22; a 12 GB 4070 holds 19.
+        assert_eq!(ceiling(16_303), Some(20));
+        assert_eq!(ceiling(24_564), Some(21));
+        assert_eq!(ceiling(32_607), Some(21));
+        assert_eq!(ceiling(12_282), Some(19));
+        // Too small for the smallest size, another vendor's card or an unknown size: no ceiling.
+        assert_eq!(ceiling(4_096), None);
+        assert_eq!(risc0_po2_vram_ceiling(Some(16_303 * MIB), "rocm"), None);
+        assert_eq!(risc0_po2_vram_ceiling(None, "cuda"), None);
+
+        let rtx5080 = Some(16_303 * MIB);
+        // An operator's 21 or 22 on the 5080 proves at 20; a size it holds stands.
+        assert_eq!(risc0_job_po2(Some(21), None, rtx5080, "cuda"), Some(20));
+        assert_eq!(risc0_job_po2(Some(22), None, rtx5080, "cuda"), Some(20));
+        assert_eq!(risc0_job_po2(Some(19), None, rtx5080, "cuda"), Some(19));
+        assert_eq!(
+            risc0_slot_job_po2("gpu0", "cuda", Some(22), None, rtx5080),
+            Some(20)
+        );
+        // A calibrated size is the card's measured best, and stands.
+        let calibrated = risc0_row(vec![sample(18, 16, 1.0e6), sample(19, 8, 1.5e6)], 19, 19);
+        let card6gb = Some(6_144 * MIB);
+        assert_eq!(
+            risc0_job_po2(None, Some(&calibrated), card6gb, "cuda"),
+            Some(19)
+        );
+        assert_eq!(risc0_job_po2(Some(19), None, card6gb, "cuda"), Some(18));
+        // Not on an AMD card of the same size, or a CUDA card whose VRAM was not read.
+        assert_eq!(risc0_job_po2(Some(22), None, rtx5080, "rocm"), Some(22));
+        assert_eq!(risc0_job_po2(Some(22), None, None, "cuda"), Some(22));
+
+        // A calibration sweep stops at the ceiling. At a measured one (20 on the 5080) that is
+        // the ceiling; at an extrapolated one (21 on a 4090) it backs off a step, as when 22 failed.
+        let proves = |p: u8| Some(sample(p, 1 << (22 - p), 1.0e6));
+        let (_, ceiling, highest) = sweep_po2_with(18, 20, u8::MAX, proves);
+        assert_eq!((ceiling, highest), (Some(20), Some(20)));
+        let (_, ceiling, highest) = sweep_po2_with(18, 21, 21, proves);
+        assert_eq!((ceiling, highest), (Some(20), Some(21)));
+    }
     #[test]
     fn a_card_is_benchmarked_at_its_own_default_size() {
         const GIB: u64 = 1024 * 1024 * 1024;
