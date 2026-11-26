@@ -40,7 +40,9 @@ impl Worker {
                 let log = self.log.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 panic!("{e}; log:\n{log}")
             }) {
-                WorkerResponse::Progress { .. } | WorkerResponse::SetupProgress { .. } => {}
+                WorkerResponse::Progress { .. }
+                | WorkerResponse::SetupProgress { .. }
+                | WorkerResponse::ProveStage { .. } => {}
                 other => return other,
             }
         }

@@ -366,13 +366,29 @@ fn main() {
             }
 
             // Measures nothing either: one segment of 1,000 cycles at whatever po2 was asked for.
+            // `MOCK_CALIBRATION_OOM_AT=<po2>`: from that size up, the answer the risc0 worker gives
+            // when its HAL's allocation fails (the size does not fit the card).
             WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
-                let resp = WorkerResponse::CalibrationResult {
-                    request_id,
-                    po2,
-                    segment_count: 1,
-                    total_cycles: 1000,
-                    prove_duration_secs: 0.01,
+                let oom_at = std::env::var("MOCK_CALIBRATION_OOM_AT")
+                    .ok()
+                    .map(|v| v.trim().parse::<u8>().expect("MOCK_CALIBRATION_OOM_AT"));
+                let resp = if oom_at.is_some_and(|at| po2 >= at) {
+                    WorkerResponse::Error {
+                        request_id,
+                        kind: ErrorKind::ResourceExhausted,
+                        message: format!(
+                            "Po2 calibration at po2={po2}: risc0 prover panicked: allocation \
+                             failed on evaluated (mock)"
+                        ),
+                    }
+                } else {
+                    WorkerResponse::CalibrationResult {
+                        request_id,
+                        po2,
+                        segment_count: 1,
+                        total_cycles: 1000,
+                        prove_duration_secs: 0.01,
+                    }
                 };
                 write_message(&mut stdout, &resp).unwrap();
             }

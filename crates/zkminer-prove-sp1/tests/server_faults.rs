@@ -324,11 +324,11 @@ impl Worker {
         let _ = write_message(&mut self.stdin, command);
     }
 
-    /// The next answer that is not progress. `None` is EOF.
+    /// The next answer that is not progress (a proof's stages included). `None` is EOF.
     fn answer(&mut self) -> Option<WorkerResponse> {
         loop {
             match read_message(self.stdout.as_mut().unwrap()) {
-                Ok(WorkerResponse::Progress { .. }) => continue,
+                Ok(WorkerResponse::Progress { .. } | WorkerResponse::ProveStage { .. }) => continue,
                 Ok(answer) => return Some(answer),
                 Err(_) => return None,
             }
