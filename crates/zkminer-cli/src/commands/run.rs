@@ -7508,11 +7508,28 @@ fn risc0_job_cards(
         .collect()
 }
 
-/// The distinct sizes of `cards`, ascending. A risc0 job is measured at every one before it is claimed,
-/// and claimed only if it measures clean at all of them with one journal, since any of these cards may
-/// prove it and a guest can tell the size it runs at. One card size, as on most rigs: one measurement.
+/// The distinct sizes of `cards`, ascending, each with the size below it (a GPU card's fallback). A
+/// risc0 job is measured at every one before it is claimed, and claimed only if it measures clean at
+/// all of them with one journal, since any of these cards may prove it and a guest can tell the size it
+/// runs at. One card size, as on most rigs: two measurements, run side by side.
+///
+/// The size below is where a card proves the job when another program on it (a desktop, a game) has
+/// taken more of it than the card's own size needs, or when a proof at its size runs out of memory
+/// (`WorkerPool::risc0_size_that_fits`, and the out-of-memory arm of the prove loop): about half the
+/// device memory, and a card may only prove a job at a size the job measured at. Without it, the only
+/// answer to an outside program's memory was another card, which a single-card rig does not have.
+/// Apple GPUs keep their own sizing (the owner-active tier) and measure as before.
 fn risc0_job_sizes(cards: &[Risc0Card]) -> Vec<u8> {
-    let mut sizes: Vec<u8> = cards.iter().map(|c| c.po2).collect();
+    let floor = zkminer_prover_protocol::RISC0_JOB_PO2_MIN;
+    let mut sizes: Vec<u8> = cards
+        .iter()
+        .flat_map(|c| {
+            let fallback = (!zkminer_prover::benchmark::is_metal_device_id(&c.device)
+                && c.po2 > floor)
+                .then(|| c.po2 - 1);
+            std::iter::once(c.po2).chain(fallback)
+        })
+        .collect();
     sizes.sort_unstable();
     sizes.dedup();
     sizes
@@ -7546,34 +7563,41 @@ async fn current_risc0_cards(
     risc0_job_cards(&sizes, &disabled, off)
 }
 
-/// The slots a claimed risc0 job measured at `measured` (sizes) may be proven on, each with the size to
-/// prove it at, and whether those sizes are ones it measured at. On each card, the largest measured
-/// size that fits it: its own size or below, since a smaller segment needs less of the card (its size
-/// can have moved since the claim: a restart, a re-benchmark, Settings). With none recorded (a lock from
+/// The slots a claimed risc0 job measured at `measured` (sizes) may be proven on, each with the sizes to
+/// prove it at (largest first), and whether those sizes are ones it measured at. On each card, the
+/// measured sizes that fit it: its own size or below, since a smaller segment needs less of the card
+/// (its size can have moved since the claim: a restart, a re-benchmark, Settings). The largest is the
+/// size it proves at; the others are where it falls back to when the card has less room than that one
+/// needs (see `risc0_job_sizes`). With none recorded (a lock from
 /// an earlier build, or found on chain with no breadcrumb) the guess is `RISC0_DEFAULT_JOB_PO2`, which
 /// every earlier build measured at, but not as a measured size. When no card holds a measured size,
 /// each proves the job at its own size, unmeasured: a guest can behave otherwise there, but only a
 /// hostile one would. That can cost the GPU time of its attempts as well as the release it would
 /// otherwise have had at once, but releasing costs an honest job a certain penalty.
-fn risc0_prove_sizes(cards: &[Risc0Card], measured: &[u8]) -> (HashMap<String, u8>, bool) {
+fn risc0_prove_sizes(cards: &[Risc0Card], measured: &[u8]) -> (HashMap<String, Vec<u8>>, bool) {
     let guess = [zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2];
     let sizes = if measured.is_empty() {
         &guess[..]
     } else {
         measured
     };
-    let fitted: HashMap<String, u8> = cards
+    let fitted: HashMap<String, Vec<u8>> = cards
         .iter()
         .filter_map(|c| {
-            let fits = sizes.iter().copied().filter(|&m| m <= c.po2).max()?;
-            Some((c.slot.clone(), fits))
+            let mut fits: Vec<u8> = sizes.iter().copied().filter(|&m| m <= c.po2).collect();
+            fits.sort_unstable_by(|a, b| b.cmp(a));
+            fits.dedup();
+            (!fits.is_empty()).then(|| (c.slot.clone(), fits))
         })
         .collect();
     if !fitted.is_empty() {
         return (fitted, !measured.is_empty());
     }
     (
-        cards.iter().map(|c| (c.slot.clone(), c.po2)).collect(),
+        cards
+            .iter()
+            .map(|c| (c.slot.clone(), vec![c.po2]))
+            .collect(),
         false,
     )
 }
@@ -8832,6 +8856,7 @@ async fn miner_brain(
         if let (Some(pool), Some(b)) = (zkminer_prover::engine::worker_pool(), benchmarks.as_ref())
         {
             pool.set_expected_host_peaks(b);
+            pool.set_risc0_po2_samples(b);
         }
 
         // THE BRAKE. Before deciding anything, ask how hard the host is struggling.
@@ -9402,6 +9427,9 @@ async fn miner_brain(
             None => (risc0_cards, 0),
         };
         let risc0_sizes = risc0_job_sizes(&risc0_cards);
+        // The cards' own sizes, without the fallbacks a job is also measured at: what planning
+        // describes (a job is planned at the size its card proves it at).
+        let risc0_card_sizes: Vec<u8> = risc0_cards.iter().map(|c| c.po2).collect();
 
         let device_backend_throughputs: Vec<(String, String, f64)> = {
             // Each risc0 card's VRAM, so a size it is not known to hold is priced as such.
@@ -10562,7 +10590,7 @@ async fn miner_brain(
                 .map(|(id, _)| id.clone());
             // The conservative floor, charged for a risc0 card at a size below the one rows describe.
             let conservative_cps = if backend_name == zkminer_prover_protocol::BACKEND_RISC0 {
-                risc0_conservative_cps(&risc0_sizes)
+                risc0_conservative_cps(&risc0_card_sizes)
             } else {
                 CONSERVATIVE_SIZING_CPS
             };
@@ -13436,6 +13464,10 @@ async fn process_job_lifecycle(
     // ran out of GPU memory there (`WorkerPool::take_sp1_retry_card`), preferred for the next
     // attempt.
     let mut retry_card: Option<(String, String)> = None;
+    // A risc0 slot that ran out of memory proving this job at a size, with a smaller size the job was
+    // measured at: the largest size it may use from then on, so its next attempt steps down rather than
+    // leaving the card (an equal or larger card may not exist; a smaller size needs about half).
+    let mut po2_caps: HashMap<String, u8> = HashMap::new();
 
     // Scale the proving-watchdog deadline to the job so a wedged GPU is
     // caught in minutes, not the full (large) configured timeout. Committed-cycle
@@ -13630,7 +13662,7 @@ async fn process_job_lifecycle(
             if risc0_job {
                 disabled_slots = operator_disabled_slots(state).await;
             }
-            let job_sizes: Option<HashMap<String, u8>> = if risc0_job {
+            let job_sizes: Option<HashMap<String, Vec<u8>>> = if risc0_job {
                 let measured = if snapshot.measured_po2s.is_empty() {
                     journal
                         .lock()
@@ -13643,7 +13675,16 @@ async fn process_job_lifecycle(
                 // same list), whatever their size.
                 let mut cards = current_risc0_cards(state, false).await;
                 cards.retain(|c| !disabled_slots.contains(&c.slot));
-                let (sizes, measured_here) = risc0_prove_sizes(&cards, &measured);
+                let (mut sizes, measured_here) = risc0_prove_sizes(&cards, &measured);
+                // A slot that ran out of memory at a size proves this job a size down from then on
+                // (see `po2_caps`).
+                for (slot, list) in sizes.iter_mut() {
+                    if let Some(&cap) = po2_caps.get(slot) {
+                        if list.iter().any(|&p| p <= cap) {
+                            list.retain(|&p| p <= cap);
+                        }
+                    }
+                }
                 let recorded = if measured.is_empty() {
                     "no recorded sizes".to_string()
                 } else {
@@ -13691,7 +13732,7 @@ async fn process_job_lifecycle(
                 if !measured_here && !warned_unmeasured {
                     warned_unmeasured = true;
                     let default = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2;
-                    if measured.is_empty() && sizes.values().all(|&p| p == default) {
+                    if measured.is_empty() && sizes.values().all(|l| l.first() == Some(&default)) {
                         tracing::info!(
                             "{}: no recorded sizes (a lock from an earlier build, or found without \
                              its breadcrumb): proving it at po2 {default}, which earlier builds \
@@ -13777,6 +13818,8 @@ async fn process_job_lifecycle(
             .await;
             let started_flag = proof_started.clone();
             let counted_start = prove_start.clone();
+            // For the out-of-memory arm, which steps a slot down a size (see `po2_caps`).
+            let sizes_this_attempt = job_sizes.clone();
             let (proof_result, used_slot) = match tokio::task::spawn_blocking(move || {
                 let mut used = None;
                 // Flip Queued -> Proving the moment the dispatcher actually starts
@@ -13868,7 +13911,12 @@ async fn process_job_lifecycle(
                     }
                     let _ = events_tx.send((event, slot_key.to_string()));
                 };
-                let size_on = |slot: &str| job_sizes.as_ref().and_then(|s| s.get(slot).copied());
+                let size_on = |slot: &str| {
+                    job_sizes
+                        .as_ref()
+                        .and_then(|s| s.get(slot).cloned())
+                        .unwrap_or_default()
+                };
                 // As this job, so a wait for memory keeps its place across attempts.
                 let r = zkminer_prover::dispatcher::with_job_tag(job_tag(job_id), || {
                     zkminer_prover::dispatcher::with_slot_estimates(estimates_for_prove, || {
@@ -14381,6 +14429,38 @@ async fn process_job_lifecycle(
                         // Excluding cannot strand a job: `prove_min_vram` restores the
                         // full set when pruning empties it.
                         //
+                        // A risc0 slot that ran out of memory at a size, with a smaller size this
+                        // job measured at, proves it a size down next, on the same card, as SP1 does
+                        // at a smaller shard size: a strictly bigger card (below) does not exist on a
+                        // rig of equal cards, and another program's memory on this one is what a
+                        // smaller segment (about half the device memory) is for. Only when it has
+                        // none does it leave the card.
+                        //
+                        // Down from the size that RAN, which the dispatcher reports: it may have
+                        // taken one below the job's size for the card already (another program's
+                        // memory), and a retry there at that size would run out again.
+                        let ran_at = used_slot
+                            .as_deref()
+                            .and_then(|k| pool.take_risc0_oom_po2(k));
+                        let risc0_smaller_here = if real_oom && sp1_smaller_here.is_none() {
+                            used_slot.as_deref().and_then(|k| {
+                                let list = sizes_this_attempt.as_ref()?.get(k)?;
+                                let ran = ran_at.filter(|p| list.contains(p)).unwrap_or(list[0]);
+                                let below = list.iter().copied().find(|&p| p < ran)?;
+                                Some((k.to_string(), ran, below))
+                            })
+                        } else {
+                            None
+                        };
+                        let risc0_smaller_here = risc0_smaller_here.map(|(k, ran, below)| {
+                            po2_caps.insert(k.clone(), below);
+                            tracing::warn!(
+                                "{}: {k} ran out of memory at po2 {ran}; its next attempt proves \
+                                 the job at po2 {below}, a size the job was measured at",
+                                short_id(job_id)
+                            );
+                            zkminer_prover::dispatcher::WorkerPool::benchmark_device_id(&k)
+                        });
                         // A VRAM OOM means the job did not fit THAT card, so ask for a
                         // strictly bigger one. A fixed floor cannot do that job:
                         // LARGE_JOB_MIN_VRAM_BYTES is 30 GiB and exceeds every card on
@@ -14402,7 +14482,9 @@ async fn process_job_lifecycle(
                             used_slot.as_deref(),
                             invalid,
                             real_oom,
-                            sp1_smaller_here.as_deref(),
+                            sp1_smaller_here
+                                .as_deref()
+                                .or(risc0_smaller_here.as_deref()),
                             |k| pool.vram_bytes_for_slot(k),
                         );
                         // invalid ⇒ just re-prove (round-robin may pick another worker).
@@ -14419,6 +14501,8 @@ async fn process_job_lifecycle(
                             },
                             if sp1_smaller_here.is_some() {
                                 " on the same GPU, one shard size smaller"
+                            } else if risc0_smaller_here.is_some() {
+                                " on the same GPU, one segment size smaller"
                             } else if real_oom {
                                 " on a high-VRAM GPU"
                             } else if health_fail {
@@ -22405,6 +22489,7 @@ mod r2_sizing_tests {
                     segment_count: 4,
                     duration_secs: 60.0,
                     throughput: 1_000_000.0,
+                    ..Default::default()
                 })
                 .collect(),
             program_stages: Vec::new(),
@@ -22486,14 +22571,20 @@ mod r2_sizing_tests {
             po2,
         };
         let (fit, measured_here) = risc0_prove_sizes(&[card(19)], &[18]);
-        assert_eq!((fit["risc0:metal:0"], measured_here), (18, true));
+        assert_eq!(
+            (fit["risc0:metal:0"].clone(), measured_here),
+            (vec![18], true)
+        );
         // The other direction is why `risc0_slots` never switches to the active tier on a read
         // (only a Metal job's start does): a job measured at 19 that meets an active card (18)
         // proves at 18 unmeasured. That remains possible for a job claimed at 19 and still queued
         // when another job's start switches the tier, which is why `auto` is opt-in until the
         // prove step sizes from the idle figure (W7-M10 note, open issues).
         let (fit, measured_here) = risc0_prove_sizes(&[card(18)], &[19]);
-        assert_eq!((fit["risc0:metal:0"], measured_here), (18, false));
+        assert_eq!(
+            (fit["risc0:metal:0"].clone(), measured_here),
+            (vec![18], false)
+        );
     }
 
     #[test]
@@ -22539,7 +22630,7 @@ mod r2_sizing_tests {
                 "risc0:cuda:5"
             ]
         );
-        assert_eq!(risc0_job_sizes(&cards), vec![18, 19, 20]);
+        assert_eq!(risc0_job_sizes(&cards), vec![17, 18, 19, 20]);
         assert!(
             risc0_job_cards(&sizes, &[], true).is_empty(),
             "risc0 switched off"
@@ -22561,47 +22652,68 @@ mod r2_sizing_tests {
         };
         let sorted = |cards: &[Risc0Card], measured: &[u8]| {
             let (sizes, measured_here) = risc0_prove_sizes(cards, measured);
-            let mut v: Vec<(String, u8)> = sizes.into_iter().collect();
+            let mut v: Vec<(String, Vec<u8>)> = sizes.into_iter().collect();
             v.sort();
             (v, measured_here)
         };
+        let s = |slot: &str, sizes: &[u8]| (slot.to_string(), sizes.to_vec());
         let cards = vec![card("a", 18), card("b", 20), card("c", 21)];
-        // Each card at the largest measured size it holds: its own, or below it.
+        // Each card at the largest measured size it holds (its own, or below it), then the smaller
+        // measured sizes it falls back to.
         assert_eq!(
             sorted(&cards, &[18, 20]),
             (
-                vec![
-                    ("a".to_string(), 18),
-                    ("b".to_string(), 20),
-                    ("c".to_string(), 20)
-                ],
+                vec![s("a", &[18]), s("b", &[20, 18]), s("c", &[20, 18])],
                 true
             )
         );
         // A card too small for every measured size takes no part...
         assert_eq!(
             sorted(&cards, &[19, 21]),
-            (vec![("b".to_string(), 19), ("c".to_string(), 21)], true)
+            (vec![s("b", &[19]), s("c", &[21, 19])], true)
         );
         // ...and when every card is (a restart or a re-benchmark moved them since the claim), each
         // proves it at its own size rather than releasing it.
         assert_eq!(
             sorted(&[card("a", 18), card("b", 19)], &[20]),
-            (vec![("a".to_string(), 18), ("b".to_string(), 19)], false)
+            (vec![s("a", &[18]), s("b", &[19])], false)
         );
         // No recorded sizes (a lock from an earlier build, or found with no breadcrumb): the
         // default size every earlier build measured at, on the cards that hold it, as a guess...
         assert_eq!(
             sorted(&cards, &[]),
-            (vec![("b".to_string(), 20), ("c".to_string(), 20)], false)
+            (vec![s("b", &[20]), s("c", &[20])], false)
         );
         // ...and on a rig with none, each card at its own size.
-        assert_eq!(
-            sorted(&[card("a", 18)], &[]),
-            (vec![("a".to_string(), 18)], false)
-        );
+        assert_eq!(sorted(&[card("a", 18)], &[]), (vec![s("a", &[18])], false));
         // No card at all: nothing (the caller keeps the lock for later).
         assert_eq!(sorted(&[], &[20]), (vec![], false));
+    }
+
+    /// A GPU card measures every job a size down too, so it can fall back there; an Apple GPU keeps
+    /// its own sizing, and nothing goes below the job range.
+    #[test]
+    fn a_gpu_card_measures_its_fallback_size_too() {
+        let card = |device: &str, po2| Risc0Card {
+            slot: format!("risc0:{device}"),
+            device: device.to_string(),
+            po2,
+        };
+        assert_eq!(risc0_job_sizes(&[card("gpu0", 20)]), vec![19, 20]);
+        assert_eq!(
+            risc0_job_sizes(&[card("gpu0", 21), card("gpu-rocm0", 20)]),
+            vec![19, 20, 21]
+        );
+        assert_eq!(risc0_job_sizes(&[card("gpu-metal0", 19)]), vec![19]);
+        let floor = zkminer_prover_protocol::RISC0_JOB_PO2_MIN;
+        assert_eq!(risc0_job_sizes(&[card("gpu0", floor)]), vec![floor]);
+        // So the card's job has both, its own first.
+        let (fit, measured_here) =
+            risc0_prove_sizes(&[card("gpu0", 20)], &risc0_job_sizes(&[card("gpu0", 20)]));
+        assert_eq!(
+            (fit["risc0:gpu0"].clone(), measured_here),
+            (vec![20, 19], true)
+        );
     }
 
     #[test]

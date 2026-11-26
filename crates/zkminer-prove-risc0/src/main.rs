@@ -1880,65 +1880,163 @@ const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 #[cfg(all(feature = "intel", windows))]
 const RELEASE_GROTH16_CACHE_BELOW_BYTES: u64 = 48 * 1024 * 1024 * 1024;
 
-/// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
+/// Cards with at least [`RELEASE_GROTH16_CACHE_BELOW_BYTES`] but less than this keep the Groth16
+/// cache only beside proofs at the default segment size or below.
 ///
-/// The cache is the Groth16 prover's: `shrink_wrap` uploads the SRS once and keeps it for the life of
-/// the process, in a C++ static nothing frees. Whether to drop it is a property of the CARD, which the
-/// library cannot see from where it sits, so the decision lives here. The card's size arrives from the
-/// dispatcher in `CUDA_VRAM_BYTES_ENV`: `nvidia-smi` ignores `CUDA_VISIBLE_DEVICES`, so this pinned
-/// worker cannot ask about its own card. When the size is UNKNOWN the cache is released — that costs
-/// at most ~0.1 s per proof, while keeping it on a card that cannot afford it costs the proof.
-///
-/// Called whether the proof succeeded or not: a wrap that failed part-way can still have built the
-/// cache, and the retry that follows needs the room most.
-fn release_groth16_cache_if_tight() {
-    static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let release = *DECISION.get_or_init(|| {
-        // Unified memory: the GPU budget is the Metal working-set limit (which also honours
-        // `RISC0_METAL_MAX_WORKING_SET_BYTES` and the host's `ZKMINER_CUDA_VRAM_BYTES`), and the key
-        // is kept only if it fits beside the next proof's largest STARK phase at this Mac's segment
-        // size: a kept key is 5.6 GB of the owner's RAM held between jobs.
-        #[cfg(feature = "metal")]
-        {
-            let po2 = default_job_po2();
-            let release = metal_host::working_set_limit()
-                .is_none_or(|limit| !metal_host::keep_groth16_cache(limit, po2));
-            tracing::info!(
-                "Metal working-set limit {:.1} GiB at segment po2 {po2}: {} the Groth16 proving key \
-                 between proofs",
-                metal_host::working_set_limit().unwrap_or(0) as f64 / (1u64 << 30) as f64,
-                if release { "releasing" } else { "keeping" },
-            );
-            #[allow(clippy::needless_return)]
-            return release;
-        }
-        #[allow(unreachable_code)]
+/// Above it the next STARK does not fit beside the cache on a 24 GB card: on an RTX 4090 at po2 21 a
+/// first proof completed (the card peaking at 24,162 of 24,564 MiB), the worker then held 7,510 MiB
+/// with the cache resident, and the next STARK ran out of memory 9.4 s in (2026-11-24). Windows'
+/// Intel threshold above, also 48 GiB, is the same lesson at po2 21.
+const KEEP_GROTH16_CACHE_ABOVE_DEFAULT_PO2_BYTES: u64 = 48 * 1024 * 1024 * 1024;
+
+/// The operator's (or a test's) say over the Groth16 cache, beside the card's size: `keep` or
+/// `release`. Unset, the card's size and each proof's segment size decide.
+const GROTH16_CACHE_ENV: &str = "ZKMINER_RISC0_GROTH16_CACHE";
+
+/// Whether a card of `total` bytes keeps the Groth16 cache beside a proof at segment size `po2`.
+/// Unknown size: no. Below [`RELEASE_GROTH16_CACHE_BELOW_BYTES`]: no. Up to
+/// [`KEEP_GROTH16_CACHE_ABOVE_DEFAULT_PO2_BYTES`]: at the default segment size or below only.
+fn keeps_groth16_cache(total: Option<u64>, po2: u8) -> bool {
+    total.is_some_and(|t| {
+        t >= RELEASE_GROTH16_CACHE_BELOW_BYTES
+            && (po2 <= zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+                || t >= KEEP_GROTH16_CACHE_ABOVE_DEFAULT_PO2_BYTES)
+    })
+}
+
+/// The segment size of the proof this worker is running or ran last (0 = none yet: the default's).
+static PROOF_PO2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether a proof may have left the Groth16 cache resident (kept, not released, after it).
+static GROTH16_CACHE_KEPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called as a proof starts at segment size `po2`, before its STARK: records the size for the cache
+/// decision after it, and releases a cache that a smaller proof left resident if it cannot stay beside
+/// this one (a card that proves jobs at po2 21 after a warm-up or benchmark at 20).
+fn begin_proof_at(po2: u8) {
+    use std::sync::atomic::Ordering;
+    PROOF_PO2.store(po2, Ordering::Relaxed);
+    if GROTH16_CACHE_KEPT.load(Ordering::Relaxed) && !keeps_groth16_cache_now() {
+        tracing::info!(
+            "releasing the Groth16 SRS cache before a proof at po2 {po2}: it does not fit beside one"
+        );
+        release_groth16_cache();
+    }
+}
+
+/// The card's size as the dispatcher gave it (`CUDA_VRAM_BYTES_ENV`), and the operator's override, read
+/// once and logged once.
+fn groth16_cache_inputs() -> (Option<u64>, Option<bool>) {
+    static INPUTS: std::sync::OnceLock<(Option<u64>, Option<bool>)> = std::sync::OnceLock::new();
+    *INPUTS.get_or_init(|| {
         let total = std::env::var(CUDA_VRAM_BYTES_ENV)
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok());
-        let release = total.is_none_or(|t| t < RELEASE_GROTH16_CACHE_BELOW_BYTES);
-        match total {
-            Some(t) => tracing::info!(
-                "card has {:.1} GiB of VRAM: {} the Groth16 SRS cache between proofs",
-                t as f64 / (1u64 << 30) as f64,
-                if release { "releasing" } else { "keeping" },
+        let forced = match std::env::var(GROTH16_CACHE_ENV).ok().as_deref().map(str::trim) {
+            Some("keep") => Some(true),
+            Some("release") => Some(false),
+            Some(other) => {
+                tracing::warn!("{GROTH16_CACHE_ENV}={other:?} is neither keep nor release: ignored");
+                None
+            }
+            None => None,
+        };
+        let gib = |t: u64| t as f64 / (1u64 << 30) as f64;
+        match (forced, total) {
+            (Some(keep), _) => tracing::info!(
+                "{GROTH16_CACHE_ENV}: {} the Groth16 SRS cache between proofs",
+                if keep { "keeping" } else { "releasing" }
             ),
-            None => tracing::info!(
+            (None, Some(t)) if keeps_groth16_cache(total, u8::MAX) => tracing::info!(
+                "card has {:.1} GiB of VRAM: keeping the Groth16 SRS cache between proofs",
+                gib(t)
+            ),
+            (None, Some(t)) if keeps_groth16_cache(total, 0) => tracing::info!(
+                "card has {:.1} GiB of VRAM: keeping the Groth16 SRS cache between proofs at po2 {} \
+                 and below, releasing it after larger ones",
+                gib(t),
+                zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2
+            ),
+            (None, Some(t)) => tracing::info!(
+                "card has {:.1} GiB of VRAM: releasing the Groth16 SRS cache between proofs",
+                gib(t)
+            ),
+            (None, None) => tracing::info!(
                 "card VRAM unknown ({CUDA_VRAM_BYTES_ENV} unset): releasing the Groth16 SRS cache \
                  between proofs"
             ),
         }
-        release
-    });
-    if release {
-        #[cfg(feature = "metal")]
-        let before = metal_host::allocated_bytes();
-        if let Err(e) = risc0_groth16::prove::release_srs() {
-            tracing::warn!("could not release the Groth16 SRS cache: {e:#}");
-        }
-        // B9-ZK: one line per release with what it freed and the prover layout that identifies.
-        #[cfg(feature = "metal")]
-        metal_host::log_groth16_release(before, metal_host::allocated_bytes());
+        (total, forced)
+    })
+}
+
+/// Whether the cache may stay resident after (or beside) the proof [`begin_proof_at`] last named.
+fn keeps_groth16_cache_now() -> bool {
+    // Unified memory: the GPU budget is the Metal working-set limit (which also honours
+    // `RISC0_METAL_MAX_WORKING_SET_BYTES` and the host's `ZKMINER_CUDA_VRAM_BYTES`), and the key
+    // is kept only if it fits beside the next proof's largest STARK phase at this Mac's segment
+    // size: a kept key is 5.6 GB of the owner's RAM held between jobs.
+    #[cfg(feature = "metal")]
+    {
+        static DECISION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        #[allow(clippy::needless_return)]
+        return *DECISION.get_or_init(|| {
+            let po2 = default_job_po2();
+            let keep = metal_host::working_set_limit()
+                .is_some_and(|limit| metal_host::keep_groth16_cache(limit, po2));
+            tracing::info!(
+                "Metal working-set limit {:.1} GiB at segment po2 {po2}: {} the Groth16 proving key \
+                 between proofs",
+                metal_host::working_set_limit().unwrap_or(0) as f64 / (1u64 << 30) as f64,
+                if keep { "keeping" } else { "releasing" },
+            );
+            keep
+        });
+    }
+    #[allow(unreachable_code)]
+    let (total, forced) = groth16_cache_inputs();
+    if let Some(keep) = forced {
+        return keep;
+    }
+    let po2 = match PROOF_PO2.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => default_job_po2(),
+        p => p,
+    };
+    keeps_groth16_cache(total, po2)
+}
+
+/// Free the Groth16 prover and its SRS cached on the GPU.
+fn release_groth16_cache() {
+    #[cfg(feature = "metal")]
+    let before = metal_host::allocated_bytes();
+    if let Err(e) = risc0_groth16::prove::release_srs() {
+        tracing::warn!("could not release the Groth16 SRS cache: {e:#}");
+    }
+    // B9-ZK: one line per release with what it freed and the prover layout that identifies.
+    #[cfg(feature = "metal")]
+    metal_host::log_groth16_release(before, metal_host::allocated_bytes());
+    GROTH16_CACHE_KEPT.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Free the Groth16 prover and SRS cached on the GPU if this card cannot also hold the next STARK.
+///
+/// The cache is the Groth16 prover's: `shrink_wrap` uploads the SRS once and keeps it for the life of
+/// the process, in a C++ static nothing frees. Whether to drop it is a property of the CARD and of the
+/// segment size it proves at, which the library cannot see from where it sits, so the decision lives
+/// here ([`keeps_groth16_cache`]). The card's size arrives from the dispatcher in
+/// `CUDA_VRAM_BYTES_ENV`: `nvidia-smi` ignores `CUDA_VISIBLE_DEVICES`, so this pinned worker cannot ask
+/// about its own card. When the size is UNKNOWN the cache is released — that costs at most ~0.2-0.6 s
+/// per proof (measured on an RX 7900 XTX and an Arc Pro B70, 2026-11-24), while keeping it on a card
+/// that cannot afford it costs the proof.
+///
+/// Called whether the proof succeeded or not: a wrap that failed part-way can still have built the
+/// cache, and the retry that follows needs the room most.
+fn release_groth16_cache_if_tight() {
+    if keeps_groth16_cache_now() {
+        GROTH16_CACHE_KEPT.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        release_groth16_cache();
     }
 }
 
@@ -2216,6 +2314,7 @@ fn run_proof_once(
     }
     tracing::info!("Setting segment_limit_po2 = {po2}");
     env_builder.segment_limit_po2(po2 as u32);
+    begin_proof_at(po2);
     if let Some(limit) = prove_session_cycle_limit() {
         tracing::info!("Setting session_limit = {limit} cycles (operator override)");
         env_builder.session_limit(Some(limit));
@@ -2514,6 +2613,7 @@ fn benchmark_stages(
     // into shared memory and run several times slower than any job it proves.
     let mut env = risc0_zkvm::ExecutorEnv::builder();
     env.write_slice(input).segment_limit_po2(po2 as u32);
+    begin_proof_at(po2);
     let _segments = segments::spill_here(&mut env);
     let env = env.build().ok()?;
 
@@ -2824,6 +2924,7 @@ fn warm_up(report: &mut dyn FnMut(&str, Option<u64>, Option<u64>)) -> Result<Str
     let mut env = risc0_zkvm::ExecutorEnv::builder();
     env.write_slice(&1000u32.to_le_bytes())
         .segment_limit_po2(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2 as u32);
+    begin_proof_at(zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2);
     let _segments = segments::spill_here(&mut env);
     let env = env.build()?;
     let proved = groth16_wrap::prove(&local_prover(), env, FIBONACCI_ELF);
@@ -2901,6 +3002,7 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
     if let Some(refusal) = po2_refusal(po2) {
         anyhow::bail!("{refusal}");
     }
+    begin_proof_at(po2);
     let input = CALIBRATION_ITERS.to_le_bytes();
     let mut env = risc0_zkvm::ExecutorEnv::builder();
     env.write_slice(&input).segment_limit_po2(po2 as u32);
@@ -2952,6 +3054,33 @@ fn run_po2_calibration(request_id: u64, po2: u8) -> Result<WorkerResponse> {
 fn serial_guest_execution() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod groth16_cache_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The 24 GB card that kept its cache at po2 21 and ran out of memory in the next STARK keeps it
+    /// at 20 (as every card of its size did before) and releases it at 21; smaller and unknown cards
+    /// never keep it, and a 48 GB card keeps it at any size.
+    #[test]
+    fn the_cache_is_kept_only_where_the_next_stark_fits_beside_it() {
+        let d = zkminer_prover_protocol::RISC0_DEFAULT_JOB_PO2;
+        assert!(!keeps_groth16_cache(None, d));
+        let rtx4090 = Some(24_564 * 1024 * 1024);
+        assert!(keeps_groth16_cache(rtx4090, d));
+        assert!(keeps_groth16_cache(rtx4090, d - 1));
+        assert!(!keeps_groth16_cache(rtx4090, d + 1));
+        assert!(!keeps_groth16_cache(Some(32 * GIB), d + 1));
+        assert!(keeps_groth16_cache(Some(32 * GIB), d));
+        assert!(!keeps_groth16_cache(
+            Some(RELEASE_GROTH16_CACHE_BELOW_BYTES - 1),
+            d
+        ));
+        assert!(keeps_groth16_cache(Some(48 * GIB), d + 2));
+    }
 }
 
 #[cfg(test)]

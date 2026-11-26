@@ -2246,29 +2246,40 @@ pub const MIN_AVAILABLE_VRAM_MB_ENV: &str = "ZKMINER_MIN_AVAILABLE_VRAM_MB";
 /// inside SP1 can notice, because the sizing happens before its first allocation.
 ///
 /// Why this, rather than a flat allowance for foreign VRAM, which is what this replaced: a flat
-/// allowance refuses work the card could actually do. Measured under the pinned server on a CUDA card
-/// above 16 GiB, SP1 peaks at 17,041 MiB on the 134M-element tier and 22,944 MiB on the 268M tier. A
-/// 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free — enough for the lower tier —
-/// and a 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead admits that
-/// card and leaves the sizing to [`sp1_element_threshold_for_available_vram`], which steps the tier
-/// down to match. The floor itself is the smaller tier's measured peak plus margin — 17,553 MiB on a
-/// CUDA card above 16 GiB, 9,167 MiB on one of 16 GiB or less, whose server runs leaner, 15,604 MiB
-/// on an AMD or Intel card — so a card that clears the floor has room for the configuration it will
-/// actually be given.
+/// allowance refuses work the card could actually do. SP1 proves in anything from about 10 GiB free
+/// (134M lean on a 24 GB CUDA card) to 22 (268M full on a 32 GB one), see `sp1_measured_configs`; a
+/// 24,564 MiB 4090 with 6 GiB held by a display still has 18 GiB free — room for 268M lean — and a
+/// 512 MiB allowance refused it outright. Requiring the FLOOR to be free instead admits that card and
+/// leaves the sizing to `sp1_config_for_available_vram`, which steps the configuration down to match.
+/// The floor itself is the smallest configuration's measured need plus margin on that card — 10,344
+/// MiB on a 24 GB CUDA card, 9,167 on one of 16 GiB or less, 15,604 on a card nothing has measured —
+/// so a card that clears the floor has room for the configuration it will actually be given.
 ///
 /// risc0 and openvm have no floor here: a risc0 card proves jobs at its own segment size
 /// (`benchmark::risc0_job_po2`), and one too small for any proves none. A risc0 PROOF has one of
 /// its own, by its segment size: [`risc0_proof_vram_bytes`].
 ///
-/// `total` is the card's capacity, which picks SP1's measured table (a 16 GB card's server runs
-/// differently, see `sp1_min_available_vram_bytes`); `None` when unknown.
-pub fn min_available_vram_bytes_for_backend(backend: &str, total: Option<u64>) -> Option<u64> {
+/// `gpu_tag` and `total` (the card's capacity, `None` when unknown) pick SP1's measured table, as do
+/// the operator's savers in the miner's environment, which the workers inherit (`sp1_operator_lean`).
+pub fn min_available_vram_bytes_for_backend(
+    backend: &str,
+    gpu_tag: &str,
+    total: Option<u64>,
+) -> Option<u64> {
+    use zkminer_prover_protocol::types as t;
     let default = match backend {
         // Derived from the MEASURED tier table rather than from the installed-VRAM floor, so this and
         // the tier the worker will actually be given cannot disagree about whether a card is usable.
         // They did in the first draft: a 16e9 floor admitted cards the tier function had no
         // configuration for.
-        "sp1" => zkminer_prover_protocol::types::sp1_min_available_vram_bytes(total),
+        "sp1" => {
+            let gpu = t::Sp1Gpu::from_gpu_tag(gpu_tag);
+            t::sp1_min_available_vram_bytes(
+                gpu,
+                total,
+                t::sp1_operator_lean(crate::env::var, gpu, total),
+            )
+        }
         _ => return None,
     };
     if free_vram_checks_off() {
@@ -2336,40 +2347,13 @@ pub const RISC0_KEEPS_GROTH16_FROM_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// against 12,436 with it released (both on a 16 GB RTX 5080).
 pub const RISC0_RESIDENT_GROTH16_BYTES: u64 = (15_834 - 12_436) * 1024 * 1024;
 
-/// The sizing knob this backend should use on a card with `available` bytes of VRAM free, or `None`
-/// for a backend that has no such knob.
+/// Whether this backend sizes its workers from the VRAM free when they start — SP1, by
+/// `sp1_worker_sizing` — so that a live worker can be sized for more than is free now.
 ///
-/// Delegates to the shared arithmetic in `zkminer-prover-protocol` so the dispatcher and the worker
-/// that actually applies it cannot drift apart: the dispatcher uses this to notice that a live worker
-/// is sized for more VRAM than is now free, and the worker uses the same function to size itself.
-pub fn vram_sizing_tier(backend: &str, available: u64, total: Option<u64>) -> Option<u64> {
-    match backend {
-        "sp1" => zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
-            available, total,
-        ),
-        // risc0 and openvm size per segment from `po2`, which the dispatcher clamps per run in
-        // `calibrate_slot_po2`; there is no spawn-time tier to go stale.
-        _ => None,
-    }
-}
-
-/// How much VRAM this backend needs free to run at sizing `tier` (a value [`vram_sizing_tier`]
-/// returned), or `None` when that is unknown — a backend with no such knob, or a tier nothing has
-/// measured.
-///
-/// What the dispatcher makes room for when our other workers share the card. `None` means the
-/// requirement is unknown, and the dispatcher then makes all the room it can — recycling every idle
-/// sibling holding at least `MIN_EVICTABLE_HOLDING` (see `RoomNeeded::Unknown`), because running
-/// beside one that leaves too little kills the worker part-way through a claimed job — unless the
-/// backend's floor cannot be reached even then, in which case nothing is recycled and the floor
-/// refuses (see `room_needed`).
-pub fn vram_required_for_tier(backend: &str, tier: u64, total: Option<u64>) -> Option<u64> {
-    match backend {
-        "sp1" => zkminer_prover_protocol::types::sp1_vram_required_for_threshold(tier, total),
-        // No spawn-time tier, so no figure: risc0's need depends on the segment size of the job in
-        // hand, and nothing here has measured it per po2 yet. Unknown, so all the room is made.
-        _ => None,
-    }
+/// risc0 and openvm size per segment from `po2`, which the dispatcher picks per proof
+/// (`risc0_size_that_fits`); there is no spawn-time configuration to go stale.
+pub fn sizes_from_vram(backend: &str) -> bool {
+    backend == "sp1"
 }
 
 /// Infer GPU tag from binary filename.

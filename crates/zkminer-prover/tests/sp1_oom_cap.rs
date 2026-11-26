@@ -96,7 +96,14 @@ fn sp1_pool(dir: &TempDir, knobs: &[(&str, &str)]) -> WorkerPool {
     require_default_sizing();
     let available = (TOTAL_MIB - RESERVED_MIB) * MIB;
     assert_eq!(
-        t::sp1_element_threshold_for_available_vram(available, Some(TOTAL_MIB * MIB)),
+        t::sp1_config_for_available_vram(
+            t::Sp1Gpu::Cuda,
+            Some(TOTAL_MIB * MIB),
+            available,
+            None,
+            None
+        )
+        .map(|c| c.threshold),
         Some(268_435_456),
         "the card's larger size"
     );

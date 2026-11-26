@@ -306,6 +306,7 @@ pub(crate) fn run_witness_proof(
     // As an inline job: bound to its programId, at a job size.
     let image_id = verify_program_id(elf, program_id)?;
     let po2 = job_segment_po2(po2)?;
+    crate::begin_proof_at(po2);
     let dir = segment_dir(witness)?;
     let input = read_witness_input(witness)?;
     // The seed an inline proof of this input would use, by the public rule: the same the miner
