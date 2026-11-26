@@ -260,6 +260,18 @@ g16_url=https://artifacts.risczero.net/rzup/components/risc0-groth16/sha256/$g16
 commit=$(git -C "$repo" rev-parse HEAD 2>/dev/null || echo unknown)
 dirty=$( [ -z "$(git -C "$repo" status --porcelain --untracked-files=no 2>/dev/null)" ] && echo no || echo yes)
 risc0_rev=$(sed -n 's/^risc0-zkvm = { git = "https:\/\/github.com\/hemilabs\/risc0", rev = "\([0-9a-f]*\)" }.*/\1/p' "$repo/Cargo.toml")
+# RISC0_SRC=local builds the checkout at RISC0_DIR (Makefile.mac's default path when unset), not the
+# pinned rev: record the commit that was built, whether its tracked files had changes, and the pin.
+risc0_local=
+if [ "$risc0_src" = local ]; then
+  r0dir=${RISC0_DIR:-$(dirname "$repo")/deps/risc0-3.1}
+  risc0_pinned=$risc0_rev
+  risc0_rev=$(git -C "$r0dir" rev-parse HEAD 2>/dev/null || echo unknown)
+  r0_dirty=$( [ -z "$(git -C "$r0dir" -c filter.lfs.process= -c filter.lfs.required=false status --porcelain --untracked-files=no 2>/dev/null)" ] && echo no || echo yes)
+  risc0_local="risc0_dirty=$r0_dirty
+risc0_pinned_rev=$risc0_pinned
+"
+fi
 built_arches=$(cd "$kit/metal-aot" && ls | sed -n 's/^[a-z0-9_]*-[0-9a-f]\{24\}-\(applegpu_[a-z0-9]*\)-.*\.binarchive$/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//')
 built_keys=$(cd "$kit/metal-aot" && ls | sed -n 's/^[a-z0-9_]*-[0-9a-f]\{24\}-applegpu_[a-z0-9]*-\(macos[0-9]*\)-.*\.binarchive$/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//')
 # Recomputed from the files (an AOT_SRC set included); check-macos-release.sh refuses them without the opt-in.
@@ -271,7 +283,7 @@ commit=$commit
 commit_dirty=$dirty
 risc0_rev=$risc0_rev
 risc0_src=$risc0_src
-min_macos=$expect_os
+${risc0_local}min_macos=$expect_os
 binaries_minos=$bin_minos
 metal_target=$metal_target
 metal_compiler=$metal_version
