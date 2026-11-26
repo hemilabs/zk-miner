@@ -20502,8 +20502,12 @@ mod tests {
             "test:generic".to_string(),
             ik.clone(),
         );
-        // PID stays unchanged — watchdog should fire
-        std::thread::sleep(Duration::from_millis(2500));
+        // PID stays unchanged — watchdog should fire, about a second in. A loaded host can hold
+        // its thread back for longer, so wait for it (dropping it early would cancel it).
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ik.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         drop(watchdog);
         // intentional_kill SHOULD be set (kill was attempted, PID unchanged)
         assert!(ik.load(Ordering::Acquire));
@@ -20528,7 +20532,11 @@ mod tests {
             clock.touch();
         }
         assert!(!ik.load(Ordering::Acquire), "fired while touched");
-        std::thread::sleep(Duration::from_millis(3500));
+        // Due about 1.5-2.5 s after the last touch; a loaded host can take longer.
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ik.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             ik.load(Ordering::Acquire),
             "did not fire after the touches stopped"
