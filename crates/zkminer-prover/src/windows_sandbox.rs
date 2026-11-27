@@ -691,6 +691,13 @@ fn label_low_writable(dir: &Path) -> io::Result<()> {
     set_dir_label(dir, LOW_WRITABLE_DIR)
 }
 
+/// For tests through the pool: [`label_low_writable`], so a mock worker, which runs at Low like any
+/// other, can write a file the test reads.
+#[cfg(feature = "testing")]
+pub fn label_low_writable_for_tests(dir: &Path) -> io::Result<()> {
+    label_low_writable(dir)
+}
+
 /// Whether `metadata` (of the path itself, not followed) is a link: a symbolic link or a junction.
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;

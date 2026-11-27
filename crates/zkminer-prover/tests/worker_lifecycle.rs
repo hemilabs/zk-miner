@@ -219,10 +219,14 @@ fn risc0_env(log: &std::path::Path, hang_on: &str) -> HashMap<String, String> {
     env
 }
 
+/// On Windows the mock worker runs at Low integrity, as every worker does, so the log's directory is
+/// labelled for it to write in.
 fn warmup_log(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zkminer-warmup-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    zkminer_prover::windows_sandbox::label_low_writable_for_tests(&dir).unwrap();
     dir.join("warmups")
 }
 
