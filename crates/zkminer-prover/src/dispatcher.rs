@@ -8775,7 +8775,6 @@ impl WorkerPool {
                 } else {
                     // A worker that exited declined found, before it ran this guest, that it cannot
                     // run here: its slot is declined, and the (program, input) is not at fault.
-                    #[cfg(unix)]
                     if e.downcast_ref::<WorkerDied>().is_some() {
                         if let Some(h) = slot.handle.as_mut() {
                             h.await_exit_visible(Duration::from_secs(1));
@@ -14636,7 +14635,6 @@ impl WorkerPool {
             // It must also not count against the slot's health. A host OOM is an environmental fact:
             // the card is fine, and three consecutive such kills would retire a healthy GPU for the
             // cooldown while the caller burnt its attempts and released the job at a penalty.
-            #[cfg(unix)]
             if is_eof {
                 if let Some(h) = slot.handle.as_mut() {
                     h.await_exit_visible(Duration::from_secs(1));

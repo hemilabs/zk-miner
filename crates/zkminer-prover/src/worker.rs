@@ -1973,9 +1973,14 @@ impl WorkerHandle {
         {
             !self.reaped && exit_is_a_decline(&probe_exit_nowait(self.child.id()))
         }
+        // The process handle the miner holds keeps the exit code readable, however often it asks.
         #[cfg(not(unix))]
         {
-            false
+            matches!(
+                self.child.try_wait(),
+                Ok(Some(status))
+                    if status.code() == Some(zkminer_prover_protocol::types::WORKER_EXIT_DECLINED)
+            )
         }
     }
 
@@ -1984,13 +1989,22 @@ impl WorkerHandle {
     ///
     /// A process closes its descriptors a moment before it can be waited for, so a reader woken by
     /// the EOF can get there first and be told "still running". That reads a host OOM as a prover
-    /// failure.
-    #[cfg(unix)]
+    /// failure, and a worker's decline (`exited_declined`) as a crash.
     pub fn await_exit_visible(&mut self, budget: Duration) {
-        if self.reaped {
-            return;
+        #[cfg(unix)]
+        {
+            if self.reaped {
+                return;
+            }
+            await_exit_visible_of(self.child.id(), budget);
         }
-        await_exit_visible_of(self.child.id(), budget);
+        #[cfg(not(unix))]
+        {
+            let started = Instant::now();
+            while matches!(self.child.try_wait(), Ok(None)) && started.elapsed() < budget {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     /// The worker's last lines of output, oldest first (at most `RECENT_OUTPUT_LINES`).
@@ -2002,12 +2016,7 @@ impl WorkerHandle {
     /// proof's error. Waits up to `budget` for the exit to show and for its last output to drain.
     pub fn death_note(&mut self, budget: Duration) -> String {
         let started = Instant::now();
-        #[cfg(unix)]
         self.await_exit_visible(budget);
-        #[cfg(not(unix))]
-        while matches!(self.child.try_wait(), Ok(None)) && started.elapsed() < budget {
-            std::thread::sleep(Duration::from_millis(10));
-        }
         // Its stderr may hold a last line or two after its stdout closed.
         let drain = Duration::from_millis(200).min(budget.saturating_sub(started.elapsed()));
         std::thread::sleep(drain);
