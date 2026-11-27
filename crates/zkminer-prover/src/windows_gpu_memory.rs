@@ -137,9 +137,23 @@ pub(crate) fn proof_card_use(pids: &[u32], pci_bus_id: &str) -> Option<ProofCard
     let dedicated = read.pop()?;
     let (_, resident_mib) = on_adapter(&[], &adapters, luid);
     Some(ProofCardUse {
-        card_full: card_is_full(resident_mib, d3dkmt::dedicated_bytes(luid)),
+        card_full: card_is_full(resident_mib, dedicated_bytes_cached(luid)),
         ..card_use(&dedicated, &local, luid, pids)
     })
+}
+
+/// The dedicated video memory of adapter `luid` (`d3dkmt::dedicated_bytes`), asked of the driver
+/// once per adapter and process: a card's size does not change, and the spill watch reads every 2 s
+/// for each proof. An adapter that comes back after a driver reset has a new LUID, and is asked again.
+fn dedicated_bytes_cached(luid: AdapterLuid) -> Option<u64> {
+    static SIZES: std::sync::Mutex<Option<HashMap<AdapterLuid, u64>>> = std::sync::Mutex::new(None);
+    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(bytes) = sizes.as_ref().and_then(|m| m.get(&luid)) {
+        return Some(*bytes);
+    }
+    let bytes = d3dkmt::dedicated_bytes(luid)?;
+    sizes.get_or_insert_with(HashMap::new).insert(luid, bytes);
+    Some(bytes)
 }
 
 /// [`ProofCardUse`] from one reading: `pids`' `dedicated` memory on `luid` that is not `local`
