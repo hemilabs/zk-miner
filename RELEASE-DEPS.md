@@ -28,13 +28,28 @@ arithmetic in private memory) and the seven commits of `zkminer/b70-perf`, which
 eval_check without the XMX chains (on the 3.1 circuit they spill), split by constraint degree; the HAL
 pooling half of a 24 GiB+ card; segment receipts lifted and joined as a tree; the witgen sort windowed.
 Intel only in effect; the shared files they touch (rv32im witgen's per-cycle columns, a HAL test, the
-recursion fold) keep every other backend's behaviour.
+recursion fold) keep every other backend's behaviour. Then to `5ac79f1c9` (hemilabs/risc0 branch
+`zkminer/metal-m2-fix`): `8e5ba7c97` plus three Metal-only commits, first tested on `bffe8d996` as
+branch `zkminer/metal-3.1-v2-racefix` @ `210f2cf29` (the same three; their Metal sources are identical
+here). `4d64956f9` fixes the two races the synchronization review confirmed: rv32im GPU witness
+generation reads a snapshot of the rows taken before it starts, not rows neighbouring threads are
+still writing (`RISC0_METAL_WITGEN_SINGLE_BUFFER=1` restores the old mode), and a failed Metal command
+buffer the runtime retired outside a sync fails the next host read instead of returning incomplete
+data; M5 Max at po2 20: `--benchmark` 253.3 s -> 254.6 s (+0.5%), peak GPU memory 9612 -> 9823 MiB.
+`f402661b0` makes every barrier around the NTT's 8-lane transposes a threadgroup barrier: with the
+`simdgroup_barrier` CUDA's `__syncwarp` was ported to, every multi-pass NTT came out wrong on an M2
+(`applegpu_g14`) at random elements, so every proof failed the NTT self-check; with barriers on both
+sides 20568 of 20568 runs were exact there, and an M5 Max measured no cost (254.78 s -> 254.88 s).
+`5ac79f1c9` makes rv32im `eval_check` skip the opt-in kernel forms an M2 cannot build (baseline, R12,
+R15e: "Compute function exceeds available stack space"; a selected one falls back to the default
+evalfast, which builds and is CPU-exact there). A 16 GB M2 then proved and verified the whole worker
+benchmark at po2 19 (~91K cycles/s) and po2 20 (~108K c/s). Other backends build what `8e5ba7c97` built.
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/intel-groth16-unroll`** (with `zkminer/sycl-exception-safety` @ `59f957601` merged in; that with #44 merged in, then #46; on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "8e5ba7c97a…"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/metal-m2-fix`** (on `zkminer/intel-groth16-unroll` @ `8e5ba7c97`, with `zkminer/sycl-exception-safety` @ `59f957601` merged in; that with #44 merged in, then #46; on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "5ac79f1c9b…"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
