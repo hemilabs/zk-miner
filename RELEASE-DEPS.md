@@ -15,13 +15,17 @@ reservation and preloading the SRS after the pool, and an opt-in pinned copy of 
 S3 bucket now answers 403, and the new host serves the same blobs. Then to `531017d2f` (hemilabs/risc0
 branch `zkminer/sycl-exception-safety`): `bffe8d996` plus the Intel SYCL layer's entry points no longer
 letting a C++ exception into Rust (a segment size too large for an Intel card aborted the worker; it is
-now a typed out-of-memory answer). Intel only: a Mac or CUDA/HIP build compiles none of it.
+now a typed out-of-memory answer). Intel only: a Mac or CUDA/HIP build compiles none of it. Then to
+`7c4909e9c` (hemilabs/risc0 #45, the merge of #44 into `zkminer/sycl-exception-safety`): `531017d2f`
+plus the CUDA four-step NTT running on Turing (RTX 20, T4), where an instance needing more than the
+card's 64 KB of shared memory a block failed every proof; it now runs with fewer columns a block. CUDA
+only: a Metal build is unchanged.
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/sycl-exception-safety`** (on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "531017d2f6…"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/sycl-exception-safety`** (with #44 merged in; on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "7c4909e9c9…"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
