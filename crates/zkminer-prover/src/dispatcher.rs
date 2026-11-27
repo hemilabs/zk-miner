@@ -1663,6 +1663,36 @@ impl std::fmt::Display for MeasurementDisturbed {
 
 impl std::error::Error for MeasurementDisturbed {}
 
+/// What a calibration run answers when it was stopped at its limit
+/// (`WorkerPool::calibrate_slot_po2_within`): the size does not fit the card, and is not measured
+/// again (`benchmark::calibration_run_limit`).
+#[derive(Debug)]
+pub struct CalibrationTooSlow {
+    /// The slot whose run was stopped.
+    pub slot_key: String,
+    /// The size it was proving.
+    pub po2: u8,
+    /// How long it was given.
+    pub limit: Duration,
+}
+
+impl std::fmt::Display for CalibrationTooSlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: po2 {} stopped after {} s: slower than {}x the fastest size so far, treated as not \
+             fitting this card (on Windows, memory that does not fit a card goes to system memory \
+             instead of failing)",
+            self.slot_key,
+            self.po2,
+            self.limit.as_secs(),
+            crate::benchmark::CALIBRATION_SLOW_FACTOR
+        )
+    }
+}
+
+impl std::error::Error for CalibrationTooSlow {}
+
 /// What an SP1 shard-size lowering made by a benchmark is recorded against, in place of a job's
 /// program (`lower_sp1_shard_cap`): the suite, which is the same on every run.
 const BENCHMARK_SUITE_PROGRAM: &[u8] = b"zkminer SP1 benchmark suite";
@@ -1976,8 +2006,49 @@ impl ProvingWatchdog {
         )
     }
 
+    /// [`new`](Self::new) for a deadline the caller reports itself when it is reached (a calibration
+    /// run's limit, `CalibrationTooSlow`): the kill is logged at debug, not as a proving timeout.
+    fn quiet(
+        pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_clock_logged(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            WatchdogClock::new(),
+            false,
+        )
+    }
+
     /// [`new`](Self::new) with a deadline of `clock`'s last touch plus `timeout`, re-read every second.
     fn with_clock(
+        pid_ref: Arc<AtomicU32>,
+        starttime_ref: Arc<AtomicU64>,
+        timeout: Duration,
+        slot_key: String,
+        intentional_kill: Arc<AtomicBool>,
+        clock: WatchdogClock,
+    ) -> Self {
+        Self::with_clock_logged(
+            pid_ref,
+            starttime_ref,
+            timeout,
+            slot_key,
+            intentional_kill,
+            clock,
+            true,
+        )
+    }
+
+    /// [`with_clock`](Self::with_clock), the kill logged as a proving timeout (an error) when
+    /// `as_timeout`, else at debug.
+    fn with_clock_logged(
         pid_ref: Arc<AtomicU32>,
         // Only the identity-checked group kill reads it, and that is Unix-only.
         #[cfg_attr(not(unix), allow(unused_variables))] starttime_ref: Arc<AtomicU64>,
@@ -1985,6 +2056,7 @@ impl ProvingWatchdog {
         slot_key: String,
         intentional_kill: Arc<AtomicBool>,
         clock: WatchdogClock,
+        as_timeout: bool,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_clone = cancel.clone();
@@ -2015,9 +2087,15 @@ impl ProvingWatchdog {
                             );
                             return;
                         }
-                        tracing::error!(
-                            "Proving timeout ({timeout:?}) exceeded for {slot_key}, killing worker PID {current_pid}"
-                        );
+                        if as_timeout {
+                            tracing::error!(
+                                "Proving timeout ({timeout:?}) exceeded for {slot_key}, killing worker PID {current_pid}"
+                            );
+                        } else {
+                            tracing::debug!(
+                                "{slot_key}: run past its {timeout:?} limit, killing worker PID {current_pid}"
+                            );
+                        }
                         intentional_kill.store(true, Ordering::Release);
                         // Kill the worker's ENTIRE process group (the worker calls
                         // setpgid(0,0) at spawn) so forked GPU/helper children die
@@ -2313,8 +2391,9 @@ fn spawn_refusal(
     // The same for an AMD card: a HIP binary carries code objects for a list of targets
     // (RX 7000 and 9000 in a release), with no JIT to fall back on, and a card outside it
     // fails every launch with "invalid device function". The card's target comes from the
-    // kernel's KFD topology; the binary is the risc0 worker, or the HIP server the SP1 worker
-    // runs. Unknown is again not "cannot".
+    // kernel's KFD topology, else (Windows) the HIP runtime or the card's PCI device id (see
+    // `discovery::amd_gfx_target`); the binary is the risc0 worker, or the HIP server the SP1
+    // worker runs. Unknown is again not "cannot".
     if gpu_tag == "rocm" && crate::env::var("ZKMINER_ALLOW_BROKEN_GPU").is_none() {
         if let (Some(gfx), Some(binary)) = (
             pci_bus_id.and_then(crate::discovery::amd_gfx_target),
@@ -6428,12 +6507,29 @@ impl WorkerPool {
     /// (`after_spills`): a sample taken while paged would pick the segment size from a rate several
     /// times too low.
     pub fn calibrate_slot_po2(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
+        self.calibrate_slot_po2_within(key, po2, None)
+    }
+
+    /// [`calibrate_slot_po2`](Self::calibrate_slot_po2), with the run stopped once it has taken
+    /// `limit` (`benchmark::calibration_run_limit`): the worker is killed and the answer is a
+    /// [`CalibrationTooSlow`], which is not measured again.
+    pub fn calibrate_slot_po2_within(
+        &self,
+        key: &str,
+        po2: u8,
+        limit: Option<Duration>,
+    ) -> Result<crate::benchmark::Po2Sample> {
         self.after_spills(key, "calibration", false, || {
-            self.calibrate_slot_po2_once(key, po2)
+            self.calibrate_slot_po2_once(key, po2, limit)
         })
     }
 
-    fn calibrate_slot_po2_once(&self, key: &str, po2: u8) -> Result<crate::benchmark::Po2Sample> {
+    fn calibrate_slot_po2_once(
+        &self,
+        key: &str,
+        po2: u8,
+        limit: Option<Duration>,
+    ) -> Result<crate::benchmark::Po2Sample> {
         // The per-card guard. A calibration run is a full proof swept upward through po2 — by this
         // module's own description the hungriest path in the program — so running it beside a proof on
         // the same card is the worst case of the double-booking the lock prevents. Bounded by
@@ -6561,16 +6657,31 @@ impl WorkerPool {
             return Err(e);
         }
 
-        // A calibration run is a full proof — reuse the benchmark timeout budget.
-        let _watchdog = self.benchmark_timeout_for(key).map(|t| {
-            ProvingWatchdog::new(
+        // A calibration run is a full proof — reuse the benchmark timeout budget, or the sweep's
+        // limit when that is shorter.
+        let sent = Instant::now();
+        let benchmark_timeout = self.benchmark_timeout_for(key);
+        // The sweep's limit, when it is the deadline, is reported as `CalibrationTooSlow` below, not
+        // as a proving timeout.
+        let limited = limit.filter(|l| benchmark_timeout.is_none_or(|t| *l < t));
+        let _watchdog = match (limited, benchmark_timeout) {
+            (Some(l), _) => Some(ProvingWatchdog::quiet(
                 entry.pid.clone(),
                 entry.pid_starttime.clone(),
-                t,
+                l,
                 key.to_string(),
                 entry.intentional_kill.clone(),
-            )
-        });
+            )),
+            (None, t) => t.map(|t| {
+                ProvingWatchdog::new(
+                    entry.pid.clone(),
+                    entry.pid_starttime.clone(),
+                    t,
+                    key.to_string(),
+                    entry.intentional_kill.clone(),
+                )
+            }),
+        };
 
         let spill_watch = SpillWatch::new(
             entry.pid.clone(),
@@ -6606,6 +6717,19 @@ impl WorkerPool {
         if let Some(evicted_mib) = spill_watch.stopped() {
             Self::mark_slot_dead(&mut slot, entry);
             return Err(self.spill_shortage(key, evicted_mib));
+        }
+        if let Some(limit) = limited {
+            if resp.is_err()
+                && entry.intentional_kill.load(Ordering::Acquire)
+                && sent.elapsed() >= limit
+            {
+                Self::mark_slot_dead(&mut slot, entry);
+                return Err(anyhow::Error::new(CalibrationTooSlow {
+                    slot_key: key.to_string(),
+                    po2,
+                    limit,
+                }));
+            }
         }
         if let Some(grew_mib) = spill_watch.disturbed() {
             if matches!(resp, Ok(WorkerResponse::CalibrationResult { .. })) {
@@ -17319,10 +17443,14 @@ mod tests {
             (12_282 - 272 - 300) * MIB - WINDOWS_SHARED_CARD_MARGIN
         );
         assert_eq!(
-            zkminer_prover_protocol::types::sp1_element_threshold_for_available_vram(
+            zkminer_prover_protocol::types::sp1_config_for_available_vram(
+                zkminer_prover_protocol::types::Sp1Gpu::Cuda,
+                Some(12_282 * MIB),
                 shared.available_to("sp1:cuda:1"),
-                Some(12_282 * MIB)
-            ),
+                None,
+                None,
+            )
+            .map(|c| c.threshold),
             Some(134_217_728)
         );
         // Seen shared once, a card keeps the margin a while, so it does not come and go between
@@ -17793,7 +17921,7 @@ mod tests {
         let waits = "\"benchmark\", true,";
         assert!(body("    fn benchmark_slot(&self").contains(waits));
         assert!(body("    fn benchmark_slot_streaming(\n").contains(waits));
-        assert!(body("    pub fn calibrate_slot_po2(").contains("\"calibration\", false,"));
+        assert!(body("    pub fn calibrate_slot_po2_within(").contains("\"calibration\", false,"));
     }
 
     /// Every path that measures a rate the miner saves watches for spills and drops a run the
@@ -17829,8 +17957,8 @@ mod tests {
                 "self.benchmark_slot_streaming_once(key, on_progress)",
             ),
             (
-                "    pub fn calibrate_slot_po2(",
-                "self.calibrate_slot_po2_once(key, po2)",
+                "    pub fn calibrate_slot_po2_within(",
+                "self.calibrate_slot_po2_once(key, po2, limit)",
             ),
         ] {
             assert!(body(wrapper).contains(call), "{wrapper}");
@@ -22160,7 +22288,7 @@ mod spill_and_cap_tests {
         assert!(!path.exists(), "nothing recorded");
     }
 
-    /// SP1's spawn refusals: the server's own floor is more than 11 GiB, and a 12-16 GB NVIDIA card
+    /// SP1's spawn refusals: the server's own floor is more than 10 GiB, and an 11-16 GB NVIDIA card
     /// with the server's memory savers switched off gets no slot; turning the free-VRAM checks off
     /// lifts the "can never free enough" refusal, but not the server's floor.
     #[test]
@@ -22170,9 +22298,10 @@ mod spill_and_cap_tests {
             |tag: &str, mib: u64| spawn_refusal("sp1", tag, None, None, path, Some(mib * MIB));
         {
             let _env = Hermetic::new(&[]);
-            let why = refuse("cuda", 11 * 1024).expect("11 GiB is the server's to refuse");
-            assert!(why.contains("requires more than 11.0 GiB"), "{why}");
-            assert_eq!(refuse("cuda", 11 * 1024 + 1), None);
+            let why = refuse("cuda", 10 * 1024).expect("10 GiB is the server's to refuse");
+            assert!(why.contains("requires more than 10.0 GiB"), "{why}");
+            assert_eq!(refuse("cuda", 10 * 1024 + 1), None);
+            assert_eq!(refuse("cuda", 11_264), None, "an RTX 2080 Ti");
             assert_eq!(refuse("cuda", 12_282), None);
             assert!(refuse("intel", 12 * 1024).is_some());
         }
@@ -22201,7 +22330,8 @@ mod spill_and_cap_tests {
         }
         let _env = Hermetic::new(&[(crate::discovery::MIN_AVAILABLE_VRAM_MB_ENV, "0")]);
         assert_eq!(refuse("intel", 12 * 1024), None);
-        assert!(refuse("intel", 11 * 1024).is_some());
+        assert_eq!(refuse("intel", 11 * 1024), None);
+        assert!(refuse("intel", 10 * 1024).is_some());
     }
 
     /// The risc0 worker proves a benchmark at the size the host names, and refuses one outside the

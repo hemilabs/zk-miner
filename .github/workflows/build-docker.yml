@@ -86,8 +86,8 @@ jobs:
             timeout: 350
             # Shipped with it: the CUDA runtime it links, and that file's license.
             extras: libcudart.so.12 libcudart.so.12.LICENSE.txt
-          # AMD: RX 7000 and 9000 (AMD_GPU_TARGETS in Dockerfile.build), each with the
-          # HIP runtime it was compiled against: ROCm 7.1 for risc0, 10.1 for SP1.
+          # AMD: RX 6800/6900/6950, 7000 and 9000 (AMD_GPU_TARGETS in Dockerfile.build), each
+          # with the HIP runtime it was compiled against: ROCm 7.1 for risc0, 10.1 for SP1.
           - target: dist-rocm
             binary: zkminer-prove-risc0-rocm
             extras: zkminer-rocm/lib/libamdhip64.so.7

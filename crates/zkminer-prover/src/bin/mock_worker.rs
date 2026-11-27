@@ -4,9 +4,10 @@
 //! answers to Execute and CalibrateSegmentLimit)
 //! and can be configured via environment variables:
 //!
-//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — hangs (sleeps
-//!   forever) on the specified command type. `"both"` covers benchmark + prove + execute. Unset or
-//!   empty = respond normally. `"execute"` holds a measurement in flight until it is SIGKILLed.
+//! - `MOCK_HANG_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"`, `"warmup"` or `"calibrate"` —
+//!   hangs (sleeps forever) on the specified command type. `"both"` covers benchmark + prove +
+//!   execute. Unset or empty = respond normally. `"execute"` holds a measurement in flight until it
+//!   is SIGKILLed.
 //! - `MOCK_CRASH_ON`: `"benchmark"`, `"prove"`, `"execute"`, `"both"` or `"warmup"` — exits
 //!   immediately with code 1 on the specified command type, simulating a worker crash.
 //! - `MOCK_FAIL_ON`: `"warmup"` or `"benchmark"` — answers that command with an `Error` (the worker
@@ -369,6 +370,12 @@ fn main() {
             // `MOCK_CALIBRATION_OOM_AT=<po2>`: from that size up, the answer the risc0 worker gives
             // when its HAL's allocation fails (the size does not fit the card).
             WorkerCommand::CalibrateSegmentLimit { request_id, po2 } => {
+                if hang_on == "calibrate" {
+                    // Hang forever — the watchdog will SIGKILL us
+                    loop {
+                        std::thread::sleep(Duration::from_secs(3600));
+                    }
+                }
                 let oom_at = std::env::var("MOCK_CALIBRATION_OOM_AT")
                     .ok()
                     .map(|v| v.trim().parse::<u8>().expect("MOCK_CALIBRATION_OOM_AT"));

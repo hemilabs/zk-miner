@@ -162,8 +162,8 @@ binaries beside it: `zkminer-witness-sandbox-probe`, `zkminer-witness-builder`,
 `zkminer-witness-broker` and `zkminer-prove-risc0-cpu`. A miner serving witness jobs looks for them
 in its own directory, and without them serves none, saying which is missing. Each
 prover carries the GPU runtime it loads, so a host needs only its GPU's driver: NVIDIA's driver for
-RTX cards, and for AMD (Radeon RX 7000 and 9000) and Intel (Arc A and B) cards just the kernel
-driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
+RTX cards, and for AMD (Radeon RX 6800/6900/6950, 7000 and 9000) and Intel (Arc A and B) cards just
+the kernel driver every distribution ships (amdgpu; i915 for Arc A, xe for Arc B): no CUDA toolkit, ROCm or
 oneAPI install, and a ROCm the distribution has is not used. A miner run outside a desktop session
 (a systemd unit, SSH) needs its user in the `render` group for AMD and Intel cards
 (`sudo usermod -aG render $USER`). Run it as such a user, not as root: its workers drop every
@@ -1111,6 +1111,9 @@ Worth knowing:
   for, too little VRAM. The ones that need attention also go to the dashboard's activity log.
   `zkminer doctor` prints the same table on demand, with the config, chain, gas and stake
   checks, and starts nothing.
+- **11 GB NVIDIA cards prove SP1 too** (measured on an RTX 2080 Ti): at the smaller shard size,
+  from about 9.3 GiB free, at 3.3M cycles/s. SP1's server now carries code for RTX 20 series
+  (Turing) cards as well.
 - **12 GB NVIDIA cards prove both zkVMs** (measured on an RTX 4070). SP1 runs at its larger
   shard size when about 11.6 GiB of the card is free, which an idle 12 GB card has, and at the
   smaller one (about 20% slower) from 9 GiB, so a card driving a display steps down by itself.

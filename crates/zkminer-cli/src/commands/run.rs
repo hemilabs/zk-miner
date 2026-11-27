@@ -8728,6 +8728,19 @@ async fn miner_brain(
                     .filter(|d| !shown.iter().any(|(s, _)| s == *d))
                     .cloned()
                     .collect();
+                // A size set above what the card holds (`risc0_po2_vram_ceiling`) was lowered.
+                for (device, po2) in &shown {
+                    if let (Some(set), Some(p)) = (risc0_overrides.get(device), po2) {
+                        if set > p {
+                            tracing::warn!(
+                                "{device}: the risc0 job size set for it, po2 {set}, needs more \
+                                 VRAM than the card has, so it proves at po2 {p}: a larger size \
+                                 would spill into system memory, where it runs several times \
+                                 slower and can fail"
+                            );
+                        }
+                    }
+                }
                 if !shown.is_empty() && !configured.is_empty() {
                     tracing::warn!(
                         "prover.risc0_job_po2 sets a size for {configured:?}, which name no risc0 \

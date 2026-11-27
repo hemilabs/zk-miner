@@ -71,9 +71,10 @@ env:
   PROTOC_VERSION: '29.3'
   PROTOC_SHA256: '57ea59e9f551ad8d71ffaa9b5cfbe0ca1f4e720972a1db7ec2d12ab44bff9383'
   # GPU targets, exact rather than generic ones (gfx11-generic proved invalid proofs on an
-  # RX 7900 XTX on Linux): RX 7900/7800/7600, RX 9070/9060. Intel: Arc A (acm-g10), B580/B570
-  # (bmg-g21), Pro B60/B70 (bmg-g31), and SPIR-V for any other device's driver to compile.
-  HIP_ARCHS: 'gfx1100,gfx1101,gfx1102,gfx1200,gfx1201'
+  # RX 7900 XTX on Linux): RX 6800/6900/6950, RX 7900/7800/7600, RX 9070/9060. Intel: Arc A
+  # (acm-g10), B580/B570 (bmg-g21), Pro B60/B70 (bmg-g31), and SPIR-V for any other device's driver
+  # to compile.
+  HIP_ARCHS: 'gfx1030,gfx1100,gfx1101,gfx1102,gfx1200,gfx1201'
   RISC0_INTEL_SYCL_TARGETS: 'intel_gpu_acm_g10,intel_gpu_bmg_g21,intel_gpu_bmg_g31,spir64'
   # NVIDIA: as Dockerfile.build's build-cuda and build-sp1-server.
   RISC0_NVCC_FLAGS: >-
@@ -82,7 +83,7 @@ env:
     -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89
     -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100
     -gencode arch=compute_120,code=[sm_120,compute_120]
-  SP1_CUDA_ARCHS: '80,86,89,90,100,120'
+  SP1_CUDA_ARCHS: '75,80,86,89,90,100,120'
 
 jobs:
   # -----------------------------------------------------------------------
@@ -356,7 +357,7 @@ jobs:
             # asserts. Built without them, the 3.1 witgen kernels fail at launch on an RX 9070 XT.
             # HIP's own device asserts compiled out and device printf buffered, as Dockerfile.build's
             # release build does (on Linux, printf and assert need hostcall).
-            # clang compiles a file's five GPU targets -parallel-jobs at a time, each adding that
+            # clang compiles a file's six GPU targets -parallel-jobs at a time, each adding that
             # compiler's memory, so the count follows the runner's RAM: one per 24 GB, 1 to 5.
             # Five at a time (with cargo's 16 jobs) starved the 16-core, 64 GB runner on a full
             # kernel rebuild until GitHub lost contact with it, twice; a 96 GB machine was fine.
