@@ -19,13 +19,15 @@ now a typed out-of-memory answer). Intel only: a Mac or CUDA/HIP build compiles 
 `7c4909e9c` (hemilabs/risc0 #45, the merge of #44 into `zkminer/sycl-exception-safety`): `531017d2f`
 plus the CUDA four-step NTT running on Turing (RTX 20, T4), where an instance needing more than the
 card's 64 KB of shared memory a block failed every proof; it now runs with fewer columns a block. CUDA
-only: a Metal build is unchanged.
+only: a Metal build is unchanged. Then to `59f957601` (hemilabs/risc0 #46, `zkminer/turing-perf`): the
+rv32im eval_check kernel at 2 blocks per SM on Turing, where 3 held it to 128 registers and it spilled
+(RTX 2080 Ti 3.7% faster). Compiled for sm_75 only: other GPUs and a Metal build are unchanged.
 
 ## The pins
 
 | what | source | pin |
 |---|---|---|
-| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/sycl-exception-safety`** (with #44 merged in; on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "7c4909e9c9…"` (`Cargo.toml` `[patch.crates-io]`) |
+| 17 risc0 crates (`risc0-zkvm`, `-zkp`, `-sys`, `-build`, `-build-kernel`, `-groth16`, `-groth16-sys`, `-circuit-{rv32im,recursion,keccak}` and their `-sys`, `-core`, `-binfmt`, `-zkos-v1compat`, `-zkvm-platform`) | `https://github.com/hemilabs/risc0`, branch **`zkminer/sycl-exception-safety`** (with #44 merged in, then #46; on `zkminer/metal-3.1-v2-titanv` @ `bffe8d996`, on `zkminer/metal-3.1-v2` @ `81ee699e3`) | `rev = "59f9576012…"` (`Cargo.toml` `[patch.crates-io]`) |
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
