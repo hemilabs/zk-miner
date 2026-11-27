@@ -142,6 +142,41 @@ pub(crate) fn proof_card_use(pids: &[u32], pci_bus_id: &str) -> Option<ProofCard
     })
 }
 
+/// One card's memory, in bytes, from one reading of Windows' counters ([`card_memory`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CardMemory {
+    /// The card's dedicated video memory, as the driver reports it.
+    pub total: u64,
+    /// What every process holds of it (the adapter's own `Dedicated Usage`).
+    pub used: u64,
+    /// What each process holds of it.
+    pub by_pid: Vec<(u32, u64)>,
+}
+
+/// The memory of the card at `pci_bus_id` (normalized, `0000:03:00.0`), for a card `nvidia-smi`
+/// does not read (AMD's): its size from the kernel thunks, what is in use and who holds it from the
+/// counters, read in one collection. `None` when the card cannot be matched to one adapter or the
+/// counters or its size cannot be read.
+pub(crate) fn card_memory(pci_bus_id: &str) -> Option<CardMemory> {
+    let luid = d3dkmt::adapters().and_then(|a| luid_for_pci(&a, pci_bus_id))?;
+    let total = dedicated_bytes_cached(luid)?;
+    let mut read = pdh::read_counter_arrays(&[
+        r"\GPU Process Memory(*)\Dedicated Usage",
+        r"\GPU Adapter Memory(*)\Dedicated Usage",
+    ])?;
+    let adapters = read.pop()?;
+    let processes = read.pop()?;
+    let (by_pid, used_mib) = on_adapter(&processes, &adapters, luid);
+    Some(CardMemory {
+        total,
+        used: used_mib?.saturating_mul(MIB),
+        by_pid: by_pid
+            .into_iter()
+            .map(|(pid, mib)| (pid, mib.saturating_mul(MIB)))
+            .collect(),
+    })
+}
+
 /// The dedicated video memory of adapter `luid` (`d3dkmt::dedicated_bytes`), asked of the driver
 /// once per adapter and process: a card's size does not change, and the spill watch reads every 2 s
 /// for each proof. An adapter that comes back after a driver reset has a new LUID, and is asked again.
