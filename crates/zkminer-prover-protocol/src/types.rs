@@ -1013,6 +1013,7 @@ const SP1_402M: u64 = 402_653_184;
 const SP1_285M: u64 = 285_212_672;
 const SP1_268M: u64 = 268_435_456;
 const SP1_134M: u64 = 134_217_728;
+const SP1_67M: u64 = 67_108_864;
 
 /// One card class's measured configurations, largest first, each with the VRAM it needs free (less
 /// [`SP1_VRAM_MARGIN`]), and whether the worker sets the savers for the configuration it picks
@@ -1139,6 +1140,33 @@ const SP1_INTEL_32GB: Sp1Table = Sp1Table {
     sets_savers: true,
 };
 
+/// A 16 GB AMD card under Windows (`ceil(GiB) + 4 <= 20`), where the server runs its savers by itself
+/// and its device allocator refuses a block past the process's video memory budget (hemilabs/sp1
+/// d88e277a1c) rather than letting Windows place it in shared system memory. "Free" is as the miner
+/// reads such a card (`read_windows_card_occupancy`): its dedicated memory as the driver gives it
+/// (15,977 MiB on an RX 9070 XT) less what the adapter has in use. Measured on a 9070 XT driving no
+/// display, with a VRAM ballast beside it (2026-11-27): 134M lean proved at 15,491 MiB free and 15,684,
+/// and was refused at 15,235 (a proof at 14,978 ran out part-way); 67M lean proved at 14,209 and
+/// 14,722, and was refused at 13,696. With nothing else on the card 134M is the faster, sha256-chain
+/// 3.64-3.77M cycles/s against 2.17-2.23M at 67M.
+///
+/// 134M is listed at 15,361 MiB, inside that and 100 MiB under what an idle card (15,973 MiB free)
+/// leaves beside [`SP1_VRAM_MARGIN`], so an idle card starts at 134M; one another program holds more
+/// than a little of starts at 67M (and keeps the shared-card growth margin), and one it holds more
+/// than about 1.2 GiB of gets no SP1. Where the card cannot be read the worker takes its total (HIP's
+/// 16,304 MiB) as free, and starts at 134M too. A 134M proof that runs out is retried at 67M, and the
+/// card goes back up once it has room again (`WorkerPool::regrow_sp1_slots`).
+///
+/// Before that allocator change a squeezed card did not run out: with 2-4 GiB held by another
+/// program a 134M proof ran 1.3-2.7x slower, nothing reported.
+const SP1_ROCM_WINDOWS_16GB: Sp1Table = Sp1Table {
+    configs: &[
+        (Sp1Config::lean(SP1_134M), 15_361 * MIB),
+        (Sp1Config::lean(SP1_67M), 14_209 * MIB),
+    ],
+    sets_savers: true,
+};
+
 /// Any other card — an AMD card outside the 24 GB class, an Intel one under 27 GiB, a card whose total
 /// is not given — and a CUDA card whose savers the operator set where its own table has none of their
 /// kind. The worker leaves the savers to the server there, and these bounds hold for either.
@@ -1182,6 +1210,7 @@ pub fn sp1_measured_configs(gpu: Sp1Gpu, total: Option<u64>, lean: Option<bool>)
         (Sp1Gpu::Cuda, ..=20) => SP1_CUDA_16GB,
         (Sp1Gpu::Cuda, ..=30) => SP1_CUDA_24GB,
         (Sp1Gpu::Cuda, _) => SP1_CUDA_32GB,
+        (Sp1Gpu::Rocm, 16..=20) if cfg!(windows) => SP1_ROCM_WINDOWS_16GB,
         (Sp1Gpu::Rocm, 21..=30) => SP1_ROCM_24GB,
         (Sp1Gpu::Intel, 31..) => SP1_INTEL_32GB,
         _ => SP1_OTHER_SERVER,
@@ -1587,9 +1616,10 @@ pub fn sp1_smallest_measured_config(
         .unwrap_or(Sp1Config::lean(SP1_134M))
 }
 
-/// The smallest SP1 element threshold with a measured VRAM figure. The same in every table.
+/// The smallest SP1 element threshold with a measured VRAM figure in any table: 67M, which only a
+/// 16 GB AMD card under Windows steps down to ([`SP1_ROCM_WINDOWS_16GB`]); 134M in every other.
 pub fn sp1_smallest_measured_threshold() -> u64 {
-    SP1_134M
+    SP1_67M
 }
 
 /// The element threshold `sp1-gpu-server` picks for itself from the card's TOTAL VRAM, before any cap.
@@ -2633,7 +2663,7 @@ mod tests {
         assert!(b70(134_217_728) < f && b70(134_217_728) > f * f);
         assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, Cuda, None), f);
         // A recorded cap is never below the smallest measured threshold, and garbage is no cap.
-        assert_eq!(super::sp1_card_cap(Some("0")), Some(134_217_728));
+        assert_eq!(super::sp1_card_cap(Some("0")), Some(67_108_864));
         assert_eq!(super::sp1_card_cap(Some("268435456")), Some(268_435_456));
         assert_eq!(super::sp1_card_cap(Some("x")), None);
         assert!(super::is_gpu_oom("Proving failed: out of GPU memory"));
@@ -2768,11 +2798,15 @@ mod tests {
                     "{gpu:?}: {c} is above any threshold measured"
                 );
             }
-            // The smallest is one threshold whatever the card: a recorded cap may only floor at it.
-            assert_eq!(
-                table.configs.last().unwrap().0.threshold,
-                super::sp1_smallest_measured_threshold()
-            );
+            // The smallest is 134M on every card but a 16 GB AMD one under Windows, whose 67M is the
+            // smallest measured anywhere: a recorded cap may only floor at that.
+            let smallest = table.configs.last().unwrap().0.threshold;
+            if cfg!(windows) && gpu == Rocm && total == RX9070XT {
+                assert_eq!(smallest, super::sp1_smallest_measured_threshold());
+            } else {
+                assert_eq!(smallest, 134_217_728, "{gpu:?} {total:?}");
+            }
+            assert!(smallest >= super::sp1_smallest_measured_threshold());
         }
     }
 
@@ -2894,14 +2928,16 @@ mod tests {
         );
     }
 
-    /// A card nothing has measured — a 16 GB AMD card, a 12 GB Intel one, one whose total is not given
-    /// — keeps the v6.0.0 figures, and its savers are its server's.
+    /// A card nothing has measured — a 16 GB AMD card off Windows, a 12 GB Intel one, one whose total
+    /// is not given — keeps the v6.0.0 figures, and its savers are its server's.
     #[test]
     fn an_unmeasured_card_keeps_the_other_servers_figures_and_its_own_savers() {
         use super::{sp1_config_for_available_vram as config, sp1_worker_sizing as sizing, MIB};
         const GIB: u64 = 1024 * 1024 * 1024;
+        // Under Windows the 16 GB AMD card is measured (`a_16_gb_amd_card_under_windows_steps_to_67m`).
+        let rx9070 = if cfg!(windows) { None } else { RX9070XT };
         assert_eq!(
-            config(Rocm, RX9070XT, 16 * GIB, None, None).map(|c| c.threshold),
+            config(Rocm, rx9070, 16 * GIB, None, None).map(|c| c.threshold),
             Some(134_217_728)
         );
         assert_eq!(config(Cuda, None, 12 * GIB, None, None), None);
@@ -2911,17 +2947,78 @@ mod tests {
             config(Rocm, RX9070XT, 16 * GIB, None, None).map(|c| c.lean),
             Some(true)
         );
-        // And the worker sets the threshold only.
-        assert_eq!(
-            sizing(Rocm, RX9070XT, None, Some(16 * GIB), None),
-            Some((134_217_728, None))
-        );
+        // And the worker sets the threshold only, off Windows.
+        if !cfg!(windows) {
+            assert_eq!(
+                sizing(Rocm, RX9070XT, None, Some(16 * GIB), None),
+                Some((134_217_728, None))
+            );
+        }
         // A CUDA card of 16 GiB or less with the operator's savers off is sized by these figures too:
         // its own table measured them on.
         assert_eq!(
             config(Cuda, RTX4070, 12_010 * MIB, None, Some(false)),
             None,
             "15,604 MiB for 134M with its savers off, more than the card"
+        );
+    }
+
+    /// A 16 GB AMD card under Windows proves at 134M when nothing else holds its memory and steps down
+    /// to 67M when a 134M proof runs out, the only card that does; off Windows it keeps 134M as its
+    /// smallest.
+    #[test]
+    fn a_16_gb_amd_card_under_windows_steps_to_67m() {
+        use super::{sp1_config_for_available_vram as config, sp1_tier_below as below, Sp1Config};
+        use super::{MIB, SP1_VRAM_MARGIN};
+        let ran_out_at_134m = below(Some(134_217_728), Rocm, RX9070XT);
+        if !cfg!(windows) {
+            assert_eq!(ran_out_at_134m, None);
+            return;
+        }
+        assert_eq!(ran_out_at_134m, Some(67_108_864));
+        assert_eq!(
+            below(Some(67_108_864), Rocm, RX9070XT),
+            None,
+            "the smallest"
+        );
+        // The server's own tier on the card (268M) steps to 134M first.
+        assert_eq!(below(None, Rocm, RX9070XT), Some(134_217_728));
+        // No other card steps below 134M.
+        for (gpu, total) in CARDS {
+            if (gpu, total) != (Rocm, RX9070XT) {
+                assert_eq!(
+                    below(Some(134_217_728), gpu, total),
+                    None,
+                    "{gpu:?} {total:?}"
+                );
+            }
+        }
+        // Where the miner reads no free figure (an AMD card under Windows), the worker takes the
+        // card's total as free: the card to itself, at 134M.
+        assert_eq!(
+            config(Rocm, RX9070XT, RX9070XT.unwrap(), None, None),
+            Some(Sp1Config::lean(134_217_728))
+        );
+        // An idle 9070 XT as Windows reads it: 15,977 MiB, 4 in use.
+        assert_eq!(
+            config(Rocm, RX9070XT, (15_977 - 4) * MIB, None, None),
+            Some(Sp1Config::lean(134_217_728))
+        );
+        // By what is free, where that is known.
+        let free = |mib: u64| mib * MIB + SP1_VRAM_MARGIN;
+        assert_eq!(
+            config(Rocm, RX9070XT, free(15_361), None, None),
+            Some(Sp1Config::lean(134_217_728))
+        );
+        assert_eq!(
+            config(Rocm, RX9070XT, free(15_360), None, None),
+            Some(Sp1Config::lean(67_108_864))
+        );
+        assert_eq!(config(Rocm, RX9070XT, free(14_208), None, None), None);
+        // A 134M proof that ran out is capped at 67M, and a 67M cap holds.
+        assert_eq!(
+            config(Rocm, RX9070XT, RX9070XT.unwrap(), Some(67_108_864), None),
+            Some(Sp1Config::lean(67_108_864))
         );
     }
 
