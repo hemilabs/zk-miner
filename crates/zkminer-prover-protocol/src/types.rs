@@ -2081,7 +2081,7 @@ pub struct GpuMemoryShortage {
     /// Total VRAM of the card, in bytes, for the operator's benefit in the log line.
     pub total_bytes: u64,
     /// Not an admission refusal: the proof was STOPPED part-way, because Windows was moving this
-    /// much of its memory off the card (bytes) to make room for another program's, which slows a
+    /// much of its memory off the full card (bytes), which slows a
     /// proof many times over. 0 for a refusal before the proof started. Either way the card is
     /// short of memory now, and the job is better tried where it fits.
     pub evicted_bytes: u64,
@@ -2109,7 +2109,7 @@ impl std::fmt::Display for GpuMemoryShortage {
             write!(
                 f,
                 "{} was stopped part-way: Windows was moving {} MiB of its proof's memory off the \
-                 card to make room for another program's",
+                 full card",
                 self.slot_key,
                 mib(self.evicted_bytes),
             )?;

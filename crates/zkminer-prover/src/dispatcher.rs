@@ -1567,7 +1567,10 @@ enum SpillVerdict {
     Confirmed,
 }
 
-/// Judges a running proof's evicted-memory samples, oldest first (see [`SPILL_CONFIRM`]).
+/// Judges a running proof's evicted-memory samples, oldest first (see [`SPILL_CONFIRM`]). A sample
+/// counts only when its card was full, or could not be read as anything else
+/// (`windows_gpu_memory::card_is_full`): memory read as moved off a card with room on it is a block
+/// on its way in or out.
 #[cfg(any(windows, test))]
 #[derive(Debug, Default)]
 struct SpillDetector {
@@ -1576,11 +1579,12 @@ struct SpillDetector {
 
 #[cfg(any(windows, test))]
 impl SpillDetector {
-    fn observe(&mut self, evicted_mib: u64) -> SpillVerdict {
+    fn observe(&mut self, evicted_mib: u64, card_full: Option<bool>) -> SpillVerdict {
         if self.recent.len() == SPILL_WINDOW {
             self.recent.pop_front();
         }
-        self.recent.push_back(evicted_mib > SPILL_EVICTED_MIB);
+        self.recent
+            .push_back(evicted_mib > SPILL_EVICTED_MIB && card_full != Some(false));
         match self.recent.iter().filter(|s| **s).count() {
             0 => SpillVerdict::Clear,
             n if n >= SPILL_CONFIRM => SpillVerdict::Confirmed,
@@ -1882,7 +1886,7 @@ impl Watched {
             let evicted = card.evicted_mib;
             let first = *others_at_start.get_or_insert(card.others_mib);
             others_grew_mib.fetch_max(card.others_mib.saturating_sub(first), Ordering::AcqRel);
-            let verdict = detector.observe(evicted);
+            let verdict = detector.observe(evicted, card.card_full);
             let mut map = spills.lock().unwrap_or_else(|e| e.into_inner());
             match verdict {
                 SpillVerdict::Clear => {
@@ -1901,9 +1905,9 @@ impl Watched {
                     if !reported {
                         reported = true;
                         tracing::warn!(
-                            "{key}: Windows is moving this proof's memory off the card ({evicted} \
-                             MiB now) to make room for another program's, which slows it many times \
-                             over; it is stopped and run again if that goes on"
+                            "{key}: the card is full and Windows is moving this proof's memory off \
+                             it ({evicted} MiB now), which slows it many times over; it is stopped \
+                             and run again if that goes on"
                         );
                     }
                 }
@@ -1920,8 +1924,8 @@ impl Watched {
                         return;
                     }
                     tracing::warn!(
-                        "{key}: stopping the proof: Windows has kept moving its memory off the card \
-                         for another program's ({evicted} MiB at the last reading); it runs again \
+                        "{key}: stopping the proof: the card is full and Windows has kept moving \
+                         its memory off it ({evicted} MiB at the last reading); it runs again \
                          where it fits"
                     );
                     stopped_mib.store(evicted.max(1), Ordering::Release);
@@ -17601,37 +17605,59 @@ mod tests {
     /// several seconds against another program's memory.
     #[test]
     fn a_proof_is_stopped_only_when_its_memory_keeps_leaving_the_card() {
+        const FULL: Option<bool> = Some(true);
         let mut d = SpillDetector::default();
         // A proof with the card to itself.
         for _ in 0..40 {
-            assert_eq!(d.observe(0), SpillVerdict::Clear);
+            assert_eq!(d.observe(0, FULL), SpillVerdict::Clear);
         }
         // Up to the threshold is not a spill (a block on its way back in).
-        assert_eq!(d.observe(SPILL_EVICTED_MIB), SpillVerdict::Clear);
+        assert_eq!(d.observe(SPILL_EVICTED_MIB, FULL), SpillVerdict::Clear);
         // Paged out, then back, then out: spilling, not yet stopped.
-        assert_eq!(d.observe(9_792), SpillVerdict::Spilling);
+        assert_eq!(d.observe(9_792, FULL), SpillVerdict::Spilling);
         for _ in 0..4 {
-            assert_eq!(d.observe(0), SpillVerdict::Spilling);
+            assert_eq!(d.observe(0, FULL), SpillVerdict::Spilling);
         }
-        assert_eq!(d.observe(9_866), SpillVerdict::Spilling);
-        assert_eq!(d.observe(0), SpillVerdict::Spilling);
+        assert_eq!(d.observe(9_866, FULL), SpillVerdict::Spilling);
+        assert_eq!(d.observe(0, FULL), SpillVerdict::Spilling);
         // The third time within the window stops it.
-        assert_eq!(d.observe(9_870), SpillVerdict::Confirmed);
+        assert_eq!(d.observe(9_870, FULL), SpillVerdict::Confirmed);
 
         // Two brief evictions, a window apart, never add up to a stop.
         let mut d = SpillDetector::default();
-        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
-        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000, FULL), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000, FULL), SpillVerdict::Spilling);
         for _ in 0..SPILL_WINDOW - 2 {
-            assert_eq!(d.observe(0), SpillVerdict::Spilling);
+            assert_eq!(d.observe(0, FULL), SpillVerdict::Spilling);
         }
         // Both have left the window.
-        assert_eq!(d.observe(0), SpillVerdict::Spilling);
-        assert_eq!(d.observe(0), SpillVerdict::Clear);
-        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
-        assert_eq!(d.observe(1_000), SpillVerdict::Spilling);
-        assert_eq!(d.observe(0), SpillVerdict::Spilling);
-        assert_eq!(d.observe(1_000), SpillVerdict::Confirmed);
+        assert_eq!(d.observe(0, FULL), SpillVerdict::Spilling);
+        assert_eq!(d.observe(0, FULL), SpillVerdict::Clear);
+        assert_eq!(d.observe(1_000, FULL), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000, FULL), SpillVerdict::Spilling);
+        assert_eq!(d.observe(0, FULL), SpillVerdict::Spilling);
+        assert_eq!(d.observe(1_000, FULL), SpillVerdict::Confirmed);
+    }
+
+    /// Memory read as moved off a card with room on it is no spill, however large or often: an
+    /// RX 9070 XT read up to 1,648 MiB that way for a sample at a time, half empty, while its worker
+    /// allocated or freed. A card whose fullness could not be read is judged as before.
+    #[test]
+    fn memory_read_as_moved_off_a_card_with_room_is_no_spill() {
+        let mut d = SpillDetector::default();
+        for _ in 0..40 {
+            assert_eq!(d.observe(1_648, Some(false)), SpillVerdict::Clear);
+        }
+        // The same readings on a full card stop the proof.
+        for expected in [
+            SpillVerdict::Spilling,
+            SpillVerdict::Spilling,
+            SpillVerdict::Confirmed,
+        ] {
+            assert_eq!(d.observe(1_648, Some(true)), expected);
+        }
+        let mut d = SpillDetector::default();
+        assert_eq!(d.observe(1_648, None), SpillVerdict::Spilling);
     }
 
     /// A watch with nothing to watch (no worker, no card, or not Windows) never stops a proof, and
