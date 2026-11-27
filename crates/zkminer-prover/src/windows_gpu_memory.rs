@@ -80,6 +80,28 @@ pub(crate) struct ProofCardUse {
     pub evicted_mib: u64,
     /// What every OTHER process has allocated on the card: other programs, and our other workers.
     pub others_mib: u64,
+    /// Whether the card was full when read ([`card_is_full`]), `None` when its size or use could
+    /// not be read.
+    pub card_full: Option<bool>,
+}
+
+/// How close to its dedicated memory a card must be for memory read as moved off it to count
+/// (`card_is_full`), in MiB: about what a WDDM process budget leaves below the card's size (768
+/// MiB here), and a little more.
+pub(crate) const CARD_FULL_WITHIN_MIB: u64 = 1024;
+
+/// Whether a card of `total_bytes` dedicated memory, `resident_mib` of it in use right now (the
+/// adapter's own `Dedicated Usage`), was full: within [`CARD_FULL_WITHIN_MIB`] of its size. `None`
+/// when either is unknown.
+///
+/// Windows moves a process's memory off a card only to make room on it, so memory read as moved off
+/// a card that is not full is no spill. A proof allocating or freeing a large block reads that way
+/// for a moment (its `Dedicated Usage` moves before its `Local Usage`): an RX 9070 XT read up to
+/// 1,648 MiB "evicted" for one sample at a time, with 2.5-13.5 GB of its 16 GB in use, in a 4-hour
+/// soak where nothing was moved off the card and no proof slowed.
+pub(crate) fn card_is_full(resident_mib: Option<u64>, total_bytes: Option<u64>) -> Option<bool> {
+    let total_mib = total_bytes? / MIB;
+    Some(resident_mib?.saturating_add(CARD_FULL_WITHIN_MIB) >= total_mib)
 }
 
 /// [`ProofCardUse`] for `pids` on the card at `pci_bus_id` (normalized, `0000:03:00.0`): `None`
@@ -99,15 +121,25 @@ pub(crate) struct ProofCardUse {
 /// memory without either of them being paged (it and ours fit together) still leaves ours less to
 /// work with: a risc0 benchmark on an RTX 4070 ran at half speed beside 6 GB of another program's,
 /// resident throughout. A measurement during which this grew is no measurement of the card.
+///
+/// `card_full` says whether the card was full at that reading ([`card_is_full`], from the adapter's
+/// `Dedicated Usage`, read in the same collection, and its size from the kernel thunks), since
+/// memory read as moved off a card that has room is a block on its way in or out, not a spill.
 pub(crate) fn proof_card_use(pids: &[u32], pci_bus_id: &str) -> Option<ProofCardUse> {
     let luid = d3dkmt::adapters().and_then(|a| luid_for_pci(&a, pci_bus_id))?;
     let mut read = pdh::read_counter_arrays(&[
         r"\GPU Process Memory(*)\Dedicated Usage",
         r"\GPU Process Memory(*)\Local Usage",
+        r"\GPU Adapter Memory(*)\Dedicated Usage",
     ])?;
+    let adapters = read.pop()?;
     let local = read.pop()?;
     let dedicated = read.pop()?;
-    Some(card_use(&dedicated, &local, luid, pids))
+    let (_, resident_mib) = on_adapter(&[], &adapters, luid);
+    Some(ProofCardUse {
+        card_full: card_is_full(resident_mib, d3dkmt::dedicated_bytes(luid)),
+        ..card_use(&dedicated, &local, luid, pids)
+    })
 }
 
 /// [`ProofCardUse`] from one reading: `pids`' `dedicated` memory on `luid` that is not `local`
@@ -135,6 +167,7 @@ fn card_use(
     ProofCardUse {
         evicted_mib,
         others_mib,
+        card_full: None,
     }
 }
 
@@ -287,6 +320,16 @@ mod d3dkmt {
         bus_type: u32,
     }
 
+    /// `D3DKMT_SEGMENTSIZEINFO`: an adapter's memory sizes, in bytes.
+    #[repr(C)]
+    #[derive(Default)]
+    struct SegmentSizeInfo {
+        dedicated_video_memory: u64,
+        dedicated_system_memory: u64,
+        shared_system_memory: u64,
+    }
+
+    const KMTQAITYPE_GETSEGMENTSIZE: i32 = 3;
     const KMTQAITYPE_ADAPTERADDRESS: i32 = 6;
     const KMTQAITYPE_PHYSICALADAPTERDEVICEIDS: i32 = 31;
     const STATUS_BUFFER_TOO_SMALL: i32 = 0xC000_0023_u32 as i32;
@@ -300,27 +343,46 @@ mod d3dkmt {
 
     /// `(luid, bus, device, function)` of every adapter, or `None` if they cannot be listed.
     pub(super) fn adapters() -> Option<Vec<(AdapterLuid, u32, u32, u32)>> {
-        listed(false).map(|all| {
+        listed(false, false).map(|all| {
             all.into_iter()
-                .map(|(luid, bus, device, function, _)| (luid, bus, device, function))
+                .map(|a| (a.luid, a.bus, a.device, a.function))
                 .collect()
         })
+    }
+
+    /// The dedicated video memory of the adapter `luid`, in bytes, as its driver reports it, or
+    /// `None` when it cannot be listed or read.
+    pub(super) fn dedicated_bytes(luid: AdapterLuid) -> Option<u64> {
+        listed(false, true)?
+            .into_iter()
+            .find(|a| a.luid == luid)?
+            .dedicated
+            .filter(|b| *b > 0)
     }
 
     /// `(bus, device, function, PCI vendor id)` of every adapter whose ids can be read, or `None`
     /// if they cannot be listed.
     pub(super) fn vendors() -> Option<Vec<(u32, u32, u32, u32)>> {
-        listed(true).map(|all| {
+        listed(true, false).map(|all| {
             all.into_iter()
-                .filter_map(|(_, bus, device, function, vendor)| {
-                    Some((bus, device, function, vendor?))
-                })
+                .filter_map(|a| Some((a.bus, a.device, a.function, a.vendor?)))
                 .collect()
         })
     }
 
-    /// [`adapters`], each with its PCI vendor id when `with_vendor` asks for it and it can be read.
-    fn listed(with_vendor: bool) -> Option<Vec<(AdapterLuid, u32, u32, u32, Option<u32>)>> {
+    /// One adapter of [`listed`].
+    struct Listed {
+        luid: AdapterLuid,
+        bus: u32,
+        device: u32,
+        function: u32,
+        vendor: Option<u32>,
+        dedicated: Option<u64>,
+    }
+
+    /// [`adapters`], each with its PCI vendor id when `with_vendor` asks for it and its dedicated
+    /// video memory when `with_size` does, each when it can be read.
+    fn listed(with_vendor: bool, with_size: bool) -> Option<Vec<Listed>> {
         let mut probe = EnumAdapters2 {
             num_adapters: 0,
             p_adapters: std::ptr::null_mut(),
@@ -362,16 +424,21 @@ mod d3dkmt {
                         .then(|| device_ids(adapter.h_adapter))
                         .flatten()
                         .map(|ids| ids.vendor_id);
-                    out.push((
-                        AdapterLuid {
+                    let dedicated = with_size
+                        .then(|| segment_sizes(adapter.h_adapter))
+                        .flatten()
+                        .map(|sizes| sizes.dedicated_video_memory);
+                    out.push(Listed {
+                        luid: AdapterLuid {
                             high: adapter.luid.high_part as u32,
                             low: adapter.luid.low_part,
                         },
-                        address.bus,
-                        address.device,
-                        address.function,
+                        bus: address.bus,
+                        device: address.device,
+                        function: address.function,
                         vendor,
-                    ));
+                        dedicated,
+                    });
                 }
                 // SAFETY: every handle the listing opened is closed, once.
                 unsafe {
@@ -398,6 +465,19 @@ mod d3dkmt {
         (unsafe { D3DKMTQueryAdapterInfo(&mut query) } == 0).then_some(ids)
     }
 
+    /// The memory sizes of the open adapter `h_adapter`.
+    fn segment_sizes(h_adapter: u32) -> Option<SegmentSizeInfo> {
+        let mut sizes = SegmentSizeInfo::default();
+        let mut query = QueryAdapterInfo {
+            h_adapter,
+            kind: KMTQAITYPE_GETSEGMENTSIZE,
+            data: (&mut sizes as *mut SegmentSizeInfo).cast(),
+            size: std::mem::size_of::<SegmentSizeInfo>() as u32,
+        };
+        // SAFETY: an open adapter handle and a buffer of the size the query names.
+        (unsafe { D3DKMTQueryAdapterInfo(&mut query) } == 0).then_some(sizes)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -409,6 +489,7 @@ mod d3dkmt {
             assert_eq!(std::mem::size_of::<QueryAdapterInfo>(), 24);
             assert_eq!(std::mem::size_of::<AdapterAddress>(), 12);
             assert_eq!(std::mem::size_of::<QueryDeviceIds>(), 28);
+            assert_eq!(std::mem::size_of::<SegmentSizeInfo>(), 24);
         }
     }
 }
@@ -546,6 +627,20 @@ mod tests {
 
     /// What Windows moved off the card is counted for the processes asked about, on this card only,
     /// and memory resident beyond what is allocated (counters a moment apart) never goes negative.
+    /// A card is full within 1 GiB of its size, and unknown when either figure is.
+    #[test]
+    fn a_card_is_full_within_a_gib_of_its_size() {
+        let rx9070xt = Some(16_304 * MIB);
+        assert_eq!(card_is_full(Some(16_000), rx9070xt), Some(true));
+        assert_eq!(card_is_full(Some(15_280), rx9070xt), Some(true));
+        assert_eq!(card_is_full(Some(15_279), rx9070xt), Some(false));
+        // The soak's readings: 2.5-13.5 GB in use.
+        assert_eq!(card_is_full(Some(13_498), rx9070xt), Some(false));
+        assert_eq!(card_is_full(Some(2_487), rx9070xt), Some(false));
+        assert_eq!(card_is_full(None, rx9070xt), None);
+        assert_eq!(card_is_full(Some(16_000), None), None);
+    }
+
     #[test]
     fn evicted_memory_is_the_allocated_less_the_resident_on_this_card() {
         let mib = |n: u64| n * MIB;
@@ -737,6 +832,24 @@ mod tests {
     }
 
     /// On this machine: a listed card's adapter is found, and the listing closes its handles.
+    /// Every display adapter's size can be read without privileges, and a discrete card's is its
+    /// VRAM, more than a GiB.
+    #[test]
+    fn the_adapters_sizes_can_be_read_without_privileges() {
+        let Some(adapters) = d3dkmt::adapters() else {
+            return;
+        };
+        let sizes: Vec<u64> = adapters
+            .iter()
+            .filter_map(|(luid, ..)| d3dkmt::dedicated_bytes(*luid))
+            .collect();
+        eprintln!(
+            "adapter sizes (MiB): {:?}",
+            sizes.iter().map(|b| b / MIB).collect::<Vec<_>>()
+        );
+        assert!(sizes.iter().all(|b| *b > 0));
+    }
+
     #[test]
     fn the_adapters_can_be_listed_without_privileges() {
         let Some(adapters) = d3dkmt::adapters() else {
