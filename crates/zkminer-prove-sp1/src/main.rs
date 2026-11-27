@@ -1906,9 +1906,8 @@ fn apply_sp1_element_threshold(scale: f64, available_vram: Option<u64>, total_vr
     ) else {
         return;
     };
-    // Only lower the fork's own default. With today's tables every computed value does (the largest
-    // measured threshold is 268M), so this is a guard for a future table that measures the default
-    // itself, not a branch that fires now.
+    // Only lower the fork's own default. Where the table measures the default itself (the B70's 402M,
+    // its server's own tier) and the card has room for it, the server is left to choose it.
     const DEFAULT_THRESHOLD: u64 = 402_653_184;
     if threshold < DEFAULT_THRESHOLD {
         // SAFETY: single-threaded startup, before any prover, server or thread exists.
@@ -4772,7 +4771,8 @@ mod threshold_tests {
     const ARC_B70: Option<u64> = Some(32_620 * 1024 * 1024);
     const SMALL: u64 = 134_217_728;
     /// The largest MEASURED configuration on a CUDA card. The fork's own defaults (285,212,672 on a
-    /// 24 GB card, 402,653,184 above) are in no table but the XTX's 285M, measured on that card.
+    /// 24 GB card, 402,653,184 above) are in no table but the XTX's 285M and the B70's 402M, each
+    /// measured on that card.
     const LARGEST_MEASURED: u64 = 268_435_456;
     /// What the fork would choose for itself, and the ceiling we may only cap.
     const FORK_DEFAULT: u64 = 402_653_184;

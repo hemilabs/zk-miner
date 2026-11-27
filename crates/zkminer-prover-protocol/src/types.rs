@@ -1009,6 +1009,7 @@ impl std::fmt::Display for Sp1Config {
     }
 }
 
+const SP1_402M: u64 = 402_653_184;
 const SP1_285M: u64 = 285_212_672;
 const SP1_268M: u64 = 268_435_456;
 const SP1_134M: u64 = 134_217_728;
@@ -1118,10 +1119,20 @@ const SP1_ROCM_24GB: Sp1Table = Sp1Table {
 };
 
 /// As [`SP1_CUDA_24GB`], on a 32 GB Arc Pro B70 (Level Zero; an Intel server keeps no separate
-/// recursion stream): 268M full proved at 9,880 MiB free, the lowest tried with it; 134M lean at 7,832.
-/// (134M full proved at 9,880 too, needing no less than 268M full, and is left out.)
+/// recursion stream). Each configuration proved at every free figure tried, down to 7,832 MiB, the
+/// lowest (2026-11-26: 402M full and 268M full at 7,832, 8,856, 9,880 MiB and more; the 425M-cycle job
+/// below at 402M with 9,880 free; 134M lean at 7,832): the server works in what it is given, so no
+/// figure separates them. Each is listed at a figure it proved at, larger configurations higher, as
+/// the table's order needs; a figure only matters with another program holding 20 GB of the card.
+/// (134M full proved at 9,880 too, and is left out.)
+///
+/// 402M, the server's own tier on a card above 30 GiB, is the faster: a 425M-cycle sha256-chain proof
+/// took 104.5-105.8 s there (four runs) against 113.6-114.8 s at 268M, alternating (2026-11-26), 8.9%
+/// more throughput. It costs ~2 GiB more host memory a proof, which the worker's measured host peak
+/// carries.
 const SP1_INTEL_32GB: Sp1Table = Sp1Table {
     configs: &[
+        (Sp1Config::full(SP1_402M), 11_928 * MIB),
         (Sp1Config::full(SP1_268M), 9_880 * MIB),
         (Sp1Config::lean(SP1_134M), 7_832 * MIB),
     ],
@@ -1339,7 +1350,13 @@ pub const SP1_ELEMENT_THRESHOLD_CAP_ENV: &str = "ZKMINER_SP1_ELEMENT_THRESHOLD_C
 /// the card's cap bounds the threshold, and the worker then picks the savers for what is free beside
 /// it (`sp1_config_for_available_vram`).
 pub fn sp1_tier_below(ran_at: Option<u64>, gpu: Sp1Gpu, total: Option<u64>) -> Option<u64> {
-    let ran_at = ran_at.unwrap_or(u64::MAX);
+    // The server's own tier, which a table may measure itself (the B70's 402M): the step is below it.
+    let ran_at = ran_at.unwrap_or_else(|| {
+        total.map_or(
+            SP1_FORK_DEFAULT_THRESHOLD,
+            sp1_fork_threshold_for_total_vram,
+        )
+    });
     sp1_measured_configs(gpu, total, None)
         .configs
         .iter()
@@ -2604,6 +2621,16 @@ mod tests {
             xtx(268_435_456)
         );
         assert!(xtx(134_217_728) < f && xtx(134_217_728) > f * 0.97);
+        // The B70's runs at its server's 402M: 268M is 0.58 of a halving below it, planned 13% slower
+        // (8% measured), and 134M 1.58 halvings.
+        let b70 = |cap| super::sp1_rate_factor_for_cap(cap, Intel, ARC_B70);
+        assert_eq!(b70(402_653_184), 1.0);
+        assert!(
+            (b70(268_435_456) - 0.871).abs() < 0.005,
+            "{}",
+            b70(268_435_456)
+        );
+        assert!(b70(134_217_728) < f && b70(134_217_728) > f * f);
         assert_eq!(super::sp1_rate_factor_for_cap(134_217_728, Cuda, None), f);
         // A recorded cap is never below the smallest measured threshold, and garbage is no cap.
         assert_eq!(super::sp1_card_cap(Some("0")), Some(134_217_728));
@@ -2618,6 +2645,11 @@ mod tests {
         assert_eq!(below(Some(268_435_456), Cuda, RTX4070), Some(134_217_728));
         // Lean or full, 268M is one threshold: the 4090 is lowered to 134M.
         assert_eq!(below(Some(268_435_456), Cuda, RTX4090), Some(134_217_728));
+        // The B70 that ran out at its server's 402M, as predicted or as nothing bounded it, is lowered
+        // to 268M, the next it has measured.
+        assert_eq!(below(Some(402_653_184), Intel, ARC_B70), Some(268_435_456));
+        assert_eq!(below(None, Intel, ARC_B70), Some(268_435_456));
+        assert_eq!(below(None, Rocm, RX7900XTX), Some(285_212_672));
         // Already at the smallest: nothing lower has been measured.
         assert_eq!(below(Some(134_217_728), Cuda, RTX4070), None);
         // Unbounded (the server's own tier): the largest measured.
@@ -2726,10 +2758,13 @@ mod tests {
                     pair[1].0
                 );
             }
-            // Nothing above 268M but the XTX's server's own 285M, measured on it.
+            // Nothing above 268M but the servers' own tiers measured on their cards: the XTX's 285M
+            // and the B70's 402M.
             for (c, _) in table.configs {
                 assert!(
-                    c.threshold <= 268_435_456 || (gpu == Rocm && c.threshold == 285_212_672),
+                    c.threshold <= 268_435_456
+                        || (gpu == Rocm && c.threshold == 285_212_672)
+                        || (gpu == Intel && c.threshold == 402_653_184),
                     "{gpu:?}: {c} is above any threshold measured"
                 );
             }
@@ -2767,13 +2802,16 @@ mod tests {
             }
         }
         // Empty 24 GB-class cards and the B70 run the largest measured configuration, full: the XTX
-        // its server's own 285M, the faster there, until less than it needs is free.
-        for (gpu, total) in [(Cuda, RTX4090), (Intel, ARC_B70)] {
-            assert_eq!(
-                config(gpu, total, 23 * GIB, None, None),
-                Some(Sp1Config::full(268_435_456))
-            );
-        }
+        // and the B70 their servers' own 285M and 402M, the faster there, until less than it needs is
+        // free.
+        assert_eq!(
+            config(Cuda, RTX4090, 23 * GIB, None, None),
+            Some(Sp1Config::full(268_435_456))
+        );
+        assert_eq!(
+            config(Intel, ARC_B70, 23 * GIB, None, None),
+            Some(Sp1Config::full(402_653_184))
+        );
         assert_eq!(
             config(Rocm, RX7900XTX, 23 * GIB, None, None),
             Some(Sp1Config::full(285_212_672))
@@ -3004,9 +3042,14 @@ mod tests {
                 required(gpu, total, smallest, None),
                 Some(super::sp1_min_available_vram_bytes(gpu, total, None))
             );
-            // An unmeasured configuration has no requirement — never a guess.
+            // An unmeasured configuration has no requirement — never a guess: 402M full on every card
+            // whose table does not measure it (only the B70's does), 402M lean on all of them.
+            let full_402m = super::Sp1Config::full(402_653_184);
+            if !table.configs.iter().any(|(c, _)| *c == full_402m) {
+                assert_eq!(required(gpu, total, full_402m, None), None);
+            }
             assert_eq!(
-                required(gpu, total, super::Sp1Config::full(402_653_184), None),
+                required(gpu, total, super::Sp1Config::lean(402_653_184), None),
                 None
             );
             assert_eq!(required(gpu, total, super::Sp1Config::full(0), None), None);
