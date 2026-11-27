@@ -107,6 +107,11 @@ async fn public_mode_refuses_every_private_answer() {
         let (b, s) = session(&c);
         let (resp, fd) = blocking(move || request_blocking(&b, &req(7, 0, port)).unwrap()).await;
         assert_eq!((resp.status, fd.is_none()), (Status::NotAdmitted, true), "{answer}");
+        // A loaded host can run the test server's count after the answer: wait for it.
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while dns.queries() == 0 && std::time::Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(dns.queries() >= 1, "{answer}: resolved by the connector");
         assert!(s.await.is_ok());
         // Every probe refused at admission too.
@@ -497,9 +502,13 @@ async fn a_broker_that_never_reads_is_held_to_the_in_flight_bound() {
     assert_eq!(end, SessionEnd::CutOff(CutOff::Flood));
     let (sent, b) = blocking(move || writer.join().unwrap()).await;
     let connected = c.stats.connected.load(Ordering::Relaxed);
-    println!("requests sent {sent}, connections made {connected}, endpoint accepts {}", ep.count());
+    let taken = c.stats.requests.load(Ordering::Relaxed);
+    println!("requests sent {sent}, taken {taken}, connections made {connected}, endpoint accepts {}", ep.count());
     assert!(connected <= MAX_INFLIGHT as u64 + 1 + KERNEL_QUEUE_SLACK, "{connected} connections for a broker that reads nothing");
-    assert!(sent <= MAX_INFLIGHT as u64 + 1 + KERNEL_QUEUE_SLACK + 2, "{sent} requests taken before the cut-off");
+    // The requests the connector took, not those the broker wrote: on a loaded host the connector
+    // reads late, and the broker writes on into the kernel's buffer until the cut-off closes it
+    // (108 written, 34 connected: val-cpu-c2, 2026-11-25).
+    assert!(taken <= MAX_INFLIGHT as u64 + 1 + KERNEL_QUEUE_SLACK + 2, "{taken} requests taken before the cut-off");
     // The broker's end goes (the miner kills a broker it cut off): every socket made for it closes.
     drop(b);
     assert_eq!(ep.still_open(Duration::from_secs(2)), 0);
@@ -545,14 +554,20 @@ async fn a_broker_that_shuts_its_reading_side_is_cut_off() {
     for misuse_after in [true, false] {
         let (c, _d) = connector_for(&evm("n", &format!("http://127.0.0.1:{port}"), "cidrs = [\"127.0.0.1/32\"]"), NetMode::DevPrivate, vec![]);
         let (b, s) = session(&c);
+        let me = c.clone();
         let b = blocking(move || {
             b.shutdown(std::net::Shutdown::Read).unwrap();
             let mut w = &b;
             w.write_all(&req(1, 0, port).encode()).unwrap();
-            // Time for the first answer's write to fail (the connector then serves nothing more).
-            // Review round 6: 300 ms was too little under Rosetta with the whole suite running
-            // (the first request answered after 290 ms: fix-r6/vm-gate-x86-broker-run*.log).
-            std::thread::sleep(Duration::from_millis(1000));
+            // Until the first answer's write has failed (the connector then serves nothing more,
+            // and takes further requests for EXITED_WITHIN). A fixed pause raced both ends: 300 ms
+            // was too little under Rosetta (review round 6: the first request answered after
+            // 290 ms), and 1 s left the requests below only the first answer's few milliseconds
+            // inside EXITED_WITHIN, which a loaded host overran (val-cpu-r1, 2026-11-25).
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            while me.stats.answer_writes_failed.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
             if misuse_after {
                 // More requests for the endpoint, then misuse past the bound.
                 for id in 2..7 {
@@ -568,6 +583,7 @@ async fn a_broker_that_shuts_its_reading_side_is_cut_off() {
         let end = tokio::time::timeout(Duration::from_secs(10), s).await.expect("ended in time").unwrap();
         let want = if misuse_after { CutOff::Misuse } else { CutOff::AnswersRefused };
         assert_eq!(end, SessionEnd::CutOff(want), "misuse after the shut: {misuse_after}");
+        assert_eq!(c.stats.answer_writes_failed.load(Ordering::Relaxed), 1);
         assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1, "only the first request was connected");
         drop(b);
     }
@@ -620,8 +636,9 @@ async fn a_cut_off_delivers_no_queued_answer() {
         frames.extend_from_slice(&req(id, 0, port).encode());
     }
     (&b).write_all(&frames).unwrap();
-    // Every request connected: their answers are written or queued, none read.
-    let until = std::time::Instant::now() + Duration::from_secs(10);
+    // Every request connected: their answers are written or queued, none read. (A loaded host took
+    // over 10 s for the 40: 19 connected by then, cpu-c2, 2026-11-24.)
+    let until = std::time::Instant::now() + Duration::from_secs(60);
     while c.stats.connected.load(Ordering::Relaxed) < n && std::time::Instant::now() < until {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -743,6 +760,11 @@ impl zkminer_netguard::NearProbe for SlowFar {
 /// within the request's time, the share bounds only the TCP connect, so the first of two far
 /// addresses is connected to. Real public peers (1.1.1.1 and 1.0.0.1 on 443; skipped where
 /// unreachable), resolved by a test DNS server.
+///
+/// A real peer's TCP connect alone now and then outlives the 2.5 s share on a loaded host or
+/// network (9.7 s for a request whose checks take 7.2: val-cpu-c1, 2026-11-25), losing the first
+/// address; the regression this guards against loses it every time. So the first address must be
+/// connected to in one of three tries.
 #[tokio::test(flavor = "multi_thread")]
 async fn r5_a_slow_near_hop_check_does_not_lose_its_address() {
     use crate::testkit::TestDns;
@@ -756,23 +778,31 @@ async fn r5_a_slow_near_hop_check_does_not_lose_its_address() {
     let text = evm("p", "https://rpc.example.com:443", "");
     let cfg = BrokerConfig::from_toml_for_connector(&config_text(dir.path(), &text), dir.path(), NetMode::Public).expect("config");
     assert_eq!(cfg.timeouts.connect(), Duration::from_secs(5));
-    let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
-    let probe = Arc::new(SlowFar { delay: Duration::from_millis(3600), asked: Mutex::new(Vec::new()) });
-    let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
-    let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
-    let (b, s) = session(&c);
-    let t = std::time::Instant::now();
-    let (resp, fd) = blocking(move || {
-        let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
-        drop(b);
-        r
-    })
-    .await;
-    eprintln!("{resp:?} after {:?}; probed {:?}", t.elapsed(), lock(&probe.asked));
-    assert_eq!(resp.status, Status::Connected, "{resp:?}");
-    assert!(fd.is_some());
-    assert_eq!(c.stats.attempts.load(Ordering::Relaxed), 1);
-    assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+    let mut lost = Vec::new();
+    for _ in 0..3 {
+        let deny = Connector::deny_for(&cfg, &[], &[dns.addr]);
+        let probe = Arc::new(SlowFar { delay: Duration::from_millis(3600), asked: Mutex::new(Vec::new()) });
+        let floor = NetPolicy::with_facts(NetMode::Public, facts(), deny).with_near_probe(probe.clone());
+        let c = Connector::with_floor(&cfg, vec![dns.addr], floor).unwrap();
+        let (b, s) = session(&c);
+        let t = std::time::Instant::now();
+        let (resp, fd) = blocking(move || {
+            let r = request_blocking(&b, &req(1, 0, 443)).unwrap();
+            drop(b);
+            r
+        })
+        .await;
+        let took = t.elapsed();
+        eprintln!("{resp:?} after {took:?}; probed {:?}", lock(&probe.asked));
+        assert_eq!(resp.status, Status::Connected, "{resp:?}");
+        assert!(fd.is_some());
+        assert_eq!(s.await.unwrap(), SessionEnd::Closed);
+        if c.stats.attempts.load(Ordering::Relaxed) == 1 {
+            return;
+        }
+        lost.push(took);
+    }
+    panic!("the first address was lost in every try (requests took {lost:?})");
 }
 
 /// Review round 5, bypass-5: an IPv4-mapped address is connected to on an IPv4 socket, from the

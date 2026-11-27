@@ -1486,7 +1486,7 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
 
     // HIP device indices from the kernel's KFD topology, which needs no ROCm install; rocm-smi's
     // where that cannot be read (and product names, where rocm-smi is installed).
-    let kfd_index = kfd_hip_indices(Path::new("/sys/class/kfd/kfd/topology"));
+    let kfd_index = kfd_hip_indices(Path::new(KFD_TOPOLOGY));
     let rocm_info = query_rocm_smi_info();
 
     let mut entries: Vec<_> = match std::fs::read_dir(drm_base) {
@@ -1583,15 +1583,37 @@ fn detect_amd_gpus() -> Vec<DetectedGpu> {
     gpus
 }
 
-/// The GPU nodes of the kernel's KFD topology (`<topology>/nodes/<n>/properties`), which a host
-/// with only the amdgpu driver has, in node order: each one's PCI bus id and target (`gfx1100`).
+/// The kernel's KFD topology, which a host with only the amdgpu driver has.
+const KFD_TOPOLOGY: &str = "/sys/class/kfd/kfd/topology";
+
+/// A GPU node of the KFD topology.
+#[derive(Debug)]
+struct KfdGpu {
+    /// Its PCI bus id.
+    bus: String,
+    /// `gfx_target_version`, `major * 10000 + minor * 100 + stepping`; `None` where the kernel
+    /// reports none (or 0).
+    gfx_version: Option<u64>,
+    /// `num_xcc`, its accelerator complex dies: 1 on a consumer card; `None` on a kernel too old
+    /// to report it.
+    num_xcc: Option<u64>,
+}
+
+impl KfdGpu {
+    /// Its target, `gfx<major><minor:x><stepping:x>` (`gfx1100` for an RX 7900 XTX).
+    fn gfx(&self) -> Option<String> {
+        self.gfx_version
+            .map(|v| format!("gfx{}{:x}{:x}", v / 10_000, (v / 100) % 100, v % 100))
+    }
+}
+
+/// The GPU nodes of the kernel's KFD topology (`<topology>/nodes/<n>/properties`), in node order.
 /// CPU nodes, which have no SIMDs, are left out. A node's `location_id` is its PCI address,
-/// `bus << 8 | device << 3 | function`, in PCI domain `domain`; its `gfx_target_version` is
-/// `major * 10000 + minor * 100 + stepping`, the target named `gfx<major><minor:x><stepping:x>`.
+/// `bus << 8 | device << 3 | function`, in PCI domain `domain`.
 ///
 /// `None` when the topology cannot be read whole: a GPU node missing from the list would shift
 /// every later HIP index, and pin a worker onto the wrong card.
-fn kfd_gpu_nodes(topology: &Path) -> Option<Vec<(String, Option<String>)>> {
+fn kfd_gpu_nodes(topology: &Path) -> Option<Vec<KfdGpu>> {
     let mut nodes: Vec<(u32, PathBuf)> = std::fs::read_dir(topology.join("nodes"))
         .ok()?
         .filter_map(|e| e.ok())
@@ -1617,10 +1639,11 @@ fn kfd_gpu_nodes(topology: &Path) -> Option<Vec<(String, Option<String>)>> {
             (location >> 3) & 0x1f,
             location & 0x7
         );
-        let gfx = value("gfx_target_version")
-            .filter(|v| *v > 0)
-            .map(|v| format!("gfx{}{:x}{:x}", v / 10_000, (v / 100) % 100, v % 100));
-        gpus.push((normalize_pci_bus_id(&bus), gfx));
+        gpus.push(KfdGpu {
+            bus: normalize_pci_bus_id(&bus),
+            gfx_version: value("gfx_target_version").filter(|v| *v > 0),
+            num_xcc: value("num_xcc"),
+        });
     }
     Some(gpus)
 }
@@ -1632,7 +1655,7 @@ fn kfd_hip_indices(topology: &Path) -> HashMap<String, u32> {
         .unwrap_or_default()
         .into_iter()
         .enumerate()
-        .map(|(index, (bus, _))| (bus, index as u32))
+        .map(|(index, gpu)| (gpu.bus, index as u32))
         .collect()
 }
 
@@ -1668,10 +1691,33 @@ fn first_gfx_target(bus: &str, sources: &[GfxTargetSource]) -> Option<String> {
 /// The target of the AMD GPU at `bus` in the kernel's KFD topology, which a Linux host with the
 /// amdgpu driver has.
 fn kfd_gfx_target(bus: &str) -> Option<String> {
-    kfd_gpu_nodes(Path::new("/sys/class/kfd/kfd/topology"))?
+    kfd_gpu(Path::new(KFD_TOPOLOGY), bus)?.gfx()
+}
+
+/// The KFD node of the AMD GPU at `pci_bus_id`.
+fn kfd_gpu(topology: &Path, pci_bus_id: &str) -> Option<KfdGpu> {
+    let bus = normalize_pci_bus_id(pci_bus_id);
+    kfd_gpu_nodes(topology)?
         .into_iter()
-        .find(|(b, _)| b == bus)?
-        .1
+        .find(|gpu| gpu.bus == bus)
+}
+
+/// The highest `HSA_SCRATCH_SINGLE_LIMIT` the ROCm runtime takes for the AMD GPU at `pci_bus_id`:
+/// 4 GiB of scratch (per-lane private memory) per XCC, ROCr's `GpuAgent::MaxScratchDevice` in ROCm
+/// 6.4 to 7.2. ROCr cuts a higher limit down to it, printing "User specified scratch limit exceeds
+/// device limits" for every queue it creates. ROCm 10.1 allows gfx12 8 GiB per XCC; there 4 GiB
+/// changes nothing, because the limit only decides which scratch ROCr gives back after its dispatch,
+/// and ROCr gives back any above an eighth of its scratch pool, at most 1 GiB per XCC, regardless
+/// (`AcquireQueueMainScratch`). `None` when the card's KFD node cannot be read.
+pub fn amd_max_scratch_bytes(pci_bus_id: &str) -> Option<u64> {
+    let gpu = kfd_gpu(Path::new(KFD_TOPOLOGY), pci_bus_id)?;
+    Some(max_scratch_bytes(gpu.num_xcc))
+}
+
+/// ROCr's scratch aperture for a card of `num_xcc` XCCs, as the KFD reports it: a kernel too old to
+/// report any has single-XCC cards.
+fn max_scratch_bytes(num_xcc: Option<u64>) -> u64 {
+    (4u64 << 30).saturating_mul(num_xcc.unwrap_or(1).max(1))
 }
 
 /// The target of the AMD GPU at `bus` from its PCI device id, which Windows lists with the display
@@ -2645,9 +2691,44 @@ mod tests {
         let gfx: Vec<String> = kfd_gpu_nodes(&root)
             .unwrap()
             .into_iter()
-            .filter_map(|g| g.1)
+            .filter_map(|g| g.gfx())
             .collect();
         assert_eq!(gfx, ["gfx1101", "gfx1201", "gfx90a", "gfx942"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scratch_maximum_follows_rocr() {
+        let gib = 1u64 << 30;
+        // RX 7900 XTX: one XCC, the 4 GiB ROCr's warning names as the maximum.
+        assert_eq!(max_scratch_bytes(Some(1)), 4 * gib);
+        // An MI300X in SPX mode: 8 XCCs.
+        assert_eq!(max_scratch_bytes(Some(8)), 32 * gib);
+        // A kernel that reports no XCCs has single-XCC cards.
+        assert_eq!(max_scratch_bytes(None), 4 * gib);
+        assert_eq!(max_scratch_bytes(Some(0)), 4 * gib);
+
+        let root = std::env::temp_dir().join(format!("zkminer-kfd-xcc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (n, properties) in [
+            (
+                1,
+                "simd_count 192\nlocation_id 256\ndomain 0\ngfx_target_version 110000\nnum_xcc 1\n",
+            ),
+            (
+                2,
+                "simd_count 64\nlocation_id 512\ndomain 0\ngfx_target_version 120001\n",
+            ),
+        ] {
+            let dir = root.join(format!("nodes/{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("properties"), properties).unwrap();
+        }
+        let gpu = kfd_gpu(&root, "0000:01:00.0").unwrap();
+        assert_eq!((gpu.gfx_version, gpu.num_xcc), (Some(110000), Some(1)));
+        let gpu = kfd_gpu(&root, "0000:02:00.0").unwrap();
+        assert_eq!((gpu.gfx_version, gpu.num_xcc), (Some(120001), None));
+        assert!(kfd_gpu(&root, "0000:03:00.0").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2673,11 +2754,9 @@ mod tests {
         );
 
         let gpus = kfd_gpu_nodes(&root).unwrap();
-        assert_eq!(
-            gpus[1],
-            ("0000:08:0f.0".to_string(), Some("gfx1100".to_string()))
-        );
-        assert_eq!(gpus[0].1, None, "a node without its target version");
+        assert_eq!(gpus[1].bus, "0000:08:0f.0");
+        assert_eq!(gpus[1].gfx().as_deref(), Some("gfx1100"));
+        assert_eq!(gpus[0].gfx(), None, "a node without its target version");
         let indices = kfd_hip_indices(&root);
         // 1280 = 0x500: 05:00.0; 2168 = 0x878: 08:0f.0; 49152 = 0xc000: c0:00.0.
         assert_eq!(indices.get("0000:05:00.0"), Some(&0), "the APU counts");

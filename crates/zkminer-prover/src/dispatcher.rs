@@ -2602,9 +2602,20 @@ pub fn metal_benchmark_timeout(
     Some(configured.max(Duration::from_secs(secs)))
 }
 
-/// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker whose card's memory cannot be read: above the ~7.6 GB
-/// the keccak eval_check asks for on a 96-CU card (see `gpu_env`).
+/// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker whose card can be read neither for its memory nor its
+/// scratch maximum: above the ~7.6 GB the keccak eval_check asks for on a 96-CU card (see
+/// `gpu_env`). ROCr cuts it down to the card's maximum.
 const ROCM_SCRATCH_LIMIT_FALLBACK: u64 = 16 * 1024 * 1024 * 1024;
+
+/// `HSA_SCRATCH_SINGLE_LIMIT` for a ROCm worker: the smaller of the card's memory and the highest
+/// limit ROCr takes for it (`amd_max_scratch_bytes`). The card's memory alone, above that maximum,
+/// came to the same limit (ROCr cuts it down) with a warning for every queue the worker made.
+fn rocm_scratch_limit(vram: Option<u64>, max_scratch: Option<u64>) -> u64 {
+    vram.into_iter()
+        .chain(max_scratch)
+        .min()
+        .unwrap_or(ROCM_SCRATCH_LIMIT_FALLBACK)
+}
 
 /// An AMD card's total VRAM in bytes, from the amdgpu driver's sysfs entry for its PCI bus id.
 fn amd_vram_bytes(pci_bus_id: &str) -> Option<u64> {
@@ -5458,12 +5469,15 @@ impl WorkerPool {
                 // (HSA_STATUS_ERROR_OUT_OF_RESOURCES, "reserved node is already in use or too
                 // small"), and a larger limit alone does not help while reclaim is off. With the
                 // limit at the card's memory and reclaim on, keccak proves, and other proofs take the
-                // same time (sha256-chain@10000, 3 proofs each way, 23.0-23.4 s). An operator's own
-                // setting, inherited from this process, wins.
+                // same time (sha256-chain@10000, 3 proofs each way, 23.0-23.4 s). ROCr held that
+                // limit to its 4 GiB maximum for the card, so the limit is now that maximum
+                // (`rocm_scratch_limit`). An operator's own setting, inherited from this process,
+                // wins.
                 if std::env::var_os("HSA_SCRATCH_SINGLE_LIMIT").is_none() {
-                    let limit = pci_bus_id
-                        .and_then(amd_vram_bytes)
-                        .unwrap_or(ROCM_SCRATCH_LIMIT_FALLBACK);
+                    let limit = rocm_scratch_limit(
+                        pci_bus_id.and_then(amd_vram_bytes),
+                        pci_bus_id.and_then(crate::discovery::amd_max_scratch_bytes),
+                    );
                     env.insert("HSA_SCRATCH_SINGLE_LIMIT".into(), limit.to_string());
                 }
                 if std::env::var_os("HSA_NO_SCRATCH_RECLAIM").is_none() {
@@ -18333,6 +18347,23 @@ mod tests {
     }
 
     #[test]
+    fn rocm_scratch_limit_is_the_cards_maximum() {
+        let gib = 1u64 << 30;
+        // A 24 GB RX 7900 XTX: ROCr's 4 GiB maximum, not its memory, which ROCr would cut down with
+        // a warning for every queue.
+        assert_eq!(
+            rocm_scratch_limit(Some(25_753_026_560), Some(4 * gib)),
+            4 * gib
+        );
+        // A card with less memory than its scratch aperture.
+        assert_eq!(rocm_scratch_limit(Some(2 * gib), Some(4 * gib)), 2 * gib);
+        // Either figure alone (no KFD topology on Windows), then neither.
+        assert_eq!(rocm_scratch_limit(Some(24 * gib), None), 24 * gib);
+        assert_eq!(rocm_scratch_limit(None, Some(8 * gib)), 8 * gib);
+        assert_eq!(rocm_scratch_limit(None, None), ROCM_SCRATCH_LIMIT_FALLBACK);
+    }
+
+    #[test]
     fn gpu_env_intel() {
         // Single device selection mechanism only: ZE_AFFINITY_MASK. ONEAPI_DEVICE_SELECTOR names
         // the backend alone (`level_zero:*`): a device index there would double-filter and select
@@ -20471,8 +20502,12 @@ mod tests {
             "test:generic".to_string(),
             ik.clone(),
         );
-        // PID stays unchanged — watchdog should fire
-        std::thread::sleep(Duration::from_millis(2500));
+        // PID stays unchanged — watchdog should fire, about a second in. A loaded host can hold
+        // its thread back for longer, so wait for it (dropping it early would cancel it).
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ik.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         drop(watchdog);
         // intentional_kill SHOULD be set (kill was attempted, PID unchanged)
         assert!(ik.load(Ordering::Acquire));
@@ -20497,7 +20532,11 @@ mod tests {
             clock.touch();
         }
         assert!(!ik.load(Ordering::Acquire), "fired while touched");
-        std::thread::sleep(Duration::from_millis(3500));
+        // Due about 1.5-2.5 s after the last touch; a loaded host can take longer.
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ik.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             ik.load(Ordering::Acquire),
             "did not fire after the touches stopped"

@@ -3204,7 +3204,7 @@ mod live_tests {
     fn capping_preserves_pid_identity_and_applies_a_real_limit() {
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("sleep 20")
+            .arg("sleep 120")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -3235,8 +3235,11 @@ mod live_tests {
                 // WAIT for it. `StartTransientUnit` returns a job, so the move is asynchronous —
                 // reading the cgroup immediately is a race, and losing that race makes the read
                 // fail intermittently. This is the same window the production code documents, and
-                // is why `oom_score_adj` is the layer that has no window.
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                // is why `oom_score_adj` is the layer that has no window. A busy user manager takes
+                // its time: with the whole suite starting scopes, it started this one 29 s after
+                // the request (val-cpu-c2, 2026-11-25), so the wait is a minute (and the child
+                // sleeps longer than that).
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
                 let mut max = String::new();
                 let mut swap = String::new();
                 let mut rel = String::new();
