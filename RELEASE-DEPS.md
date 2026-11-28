@@ -53,7 +53,7 @@ benchmark at po2 19 (~91K cycles/s) and po2 20 (~108K c/s). Other backends build
 | `rzup` (risc0-build's toolchain lookup) | same rev, through risc0-build | (follows the rev) |
 | `risc0-circuit-recursion-zkrs`, `risc0-circuit-recursion-control-zkrs` | crates.io | `=4.1.0` (`Cargo.toml` `[patch."https://github.com/hemilabs/risc0"]`); `Cargo.lock` checksums `667665b4…6fb5d` and `bc7f8b26…f1667` |
 | sppark | `hemilabs/risc0-sppark` | rev `5f68eb3e…` (unchanged) |
-| SP1 crates | `hemilabs/sp1` | rev `69eb908da…` (hemilabs/sp1 `main`, the merge of #26; see `Cargo.toml`) |
+| SP1 crates | `hemilabs/sp1` | rev `1dd270090…` (hemilabs/sp1 `main`, the merge of #28; see `Cargo.toml`) |
 | guest crates (`crates/zkminer-prover/guests/risc0/*`) | crates.io (`risc0-zkvm` 3.0.5) and the RustCrypto risc0 forks on GitHub | each guest's own `Cargo.lock` (unchanged) |
 
 **W12-REBASE:** `81ee699e3` is branch `rebase/metal-3.1` of the risc0 repository
